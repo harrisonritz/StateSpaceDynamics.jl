@@ -127,7 +127,7 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     return nothing
 end
 
-# Conveneince cosntructors
+# Convenience constructors
 function GaussianStateModel(
     A::M, Q::M, b::V, x0::V, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
