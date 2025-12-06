@@ -160,6 +160,11 @@ include("helper_functions.jl")
                 test_smooth()
             end
 
+            @testset "Priors - Poisson LDS" begin
+                test_poisson_map_step_improves_Q()
+                test_poisson_gradient_shape_and_finiteness()
+            end
+
             @testset "EM Algorithm" begin
                 test_parameter_gradient()
                 test_initial_observation_parameter_updates()

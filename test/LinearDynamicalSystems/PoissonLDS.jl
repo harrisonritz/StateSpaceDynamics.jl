@@ -402,16 +402,6 @@ function test_EM_matlab()
     @test isapprox(exp.(plds.obs_model.log_d), params_obj["d"], atol=1e-5)
 end
 
-using Random
-using Test
-using LinearAlgebra
-
-# Call from runtests.jl like:
-# @testset "PoissonLDS" begin
-#     test_poisson_map_step_improves_Q()
-#     test_poisson_gradient_shape_and_finiteness()
-# end
-
 function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
     @testset "PoissonLDS: observation MAP step improves Q (LBFGS)" begin
         D, P, Tt, N = 2, 3, 40, 3
