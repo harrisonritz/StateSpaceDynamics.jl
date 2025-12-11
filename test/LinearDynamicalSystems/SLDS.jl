@@ -57,10 +57,7 @@ function test_valid_SLDS_happy_path()
     K = 3
     lds = _make_gaussian_lds(2, 4)
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
-    @test begin
-        isvalid_SLDS(s)    # should not throw
-        true
-    end
+    @test validate_SLDS(s) === nothing  # should not throw
 end
 
 function test_valid_SLDS_dimension_mismatches()
@@ -69,11 +66,11 @@ function test_valid_SLDS_dimension_mismatches()
 
     # size(A,1)=K, but length(πₖ) ≠ K
     s_badZ0 = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K+1), LDSs=fill(lds, K))
-    @test_throws AssertionError isvalid_SLDS(s_badZ0)
+    @test_throws DimensionMismatchError validate_SLDS(s_badZ0)
 
     # size(A,1)=K, but number of LDSs ≠ K
     s_badLDSs = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K+1))
-    @test_throws AssertionError isvalid_SLDS(s_badLDSs)
+    @test_throws DimensionMismatchError validate_SLDS(s_badLDSs)
 end
 
 function test_valid_SLDS_nonstochastic_rows_and_invalid_Z0()
@@ -84,13 +81,13 @@ function test_valid_SLDS_nonstochastic_rows_and_invalid_Z0()
     A_bad = _rowstochastic(K)
     A_bad[2, :] .= (-0.1, 0.5, 0.6)  # sums to 1 but has a negative entry
     s_badA = SLDS(; A=A_bad, πₖ=_probvec(K), LDSs=fill(lds, K))
-    @test_throws AssertionError isvalid_SLDS(s_badA)
+    @test_throws InvalidProbabilityVectorError validate_SLDS(s_badA)
 
     # Z0 does not sum to 1
     Z0_bad = _probvec(K);
     Z0_bad[1] += 0.1
     s_badZ0 = SLDS(; A=_rowstochastic(K), πₖ=Z0_bad, LDSs=fill(lds, K))
-    @test_throws AssertionError isvalid_SLDS(s_badZ0)
+    @test_throws InvalidProbabilityVectorError validate_SLDS(s_badZ0)
 end
 
 function test_valid_SLDS_mixed_observation_model_types()
@@ -110,10 +107,10 @@ function test_valid_SLDS_inconsistent_latent_or_obs_dims()
     lds_b_obs = _make_gaussian_lds(2, 4) # different obs_dim
 
     s_bad_state = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds_a, lds_b_state])
-    @test_throws AssertionError isvalid_SLDS(s_bad_state)
+    @test_throws DimensionMismatchError validate_SLDS(s_bad_state)
 
     s_bad_obs = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds_a, lds_b_obs])
-    @test_throws AssertionError isvalid_SLDS(s_bad_obs)
+    @test_throws DimensionMismatchError validate_SLDS(s_bad_obs)
 end
 
 function test_SLDS_sampling_gaussian()
@@ -202,7 +199,7 @@ function test_SLDS_single_state_edge_case()
     lds = _make_gaussian_lds(2, 3)
     s = SLDS(; A=reshape([1.0], 1, 1), πₖ=[1.0], LDSs=[lds])
 
-    @test isvalid_SLDS(s)
+    @test validate_SLDS(s) === nothing
 
     z, x, y = rand(s; tsteps=10, ntrials=2)
     @test all(z .== 1)  # Should always be in state 1
@@ -223,10 +220,10 @@ end
 
 function test_valid_SLDS_probability_helper_functions()
     # Test probability vector validation
-    @test isvalid_probvec([0.3, 0.7])
-    @test isvalid_probvec([0.25, 0.25, 0.25, 0.25])
-    @test !isvalid_probvec([0.6, 0.5])   # Sums to > 1
-    @test !isvalid_probvec([-0.1, 1.1])  # Has negative
+    @test validate_probvec([0.3, 0.7]) === nothing
+    @test validate_probvec([0.25, 0.25, 0.25, 0.25]) === nothing
+    @test_throws InvalidProbabilityVectorError validate_probvec([0.6, 0.5])   # Sums to > 1
+    @test_throws InvalidProbabilityVectorError validate_probvec([-0.1, 1.1])  # Has negative
 
     # Test helper functions
     @test _probvec(4) ≈ [0.25, 0.25, 0.25, 0.25]

@@ -3,7 +3,6 @@ export block_tridiagonal_inverse, block_tridiagonal_inverse_static
 export stabilize_covariance_matrix, valid_Σ, make_posdef!, gaussian_entropy
 export random_rotation_matrix
 export print_full
-export isprobvec
 
 # Type checking utilities
 """

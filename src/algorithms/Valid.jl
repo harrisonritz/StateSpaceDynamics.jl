@@ -1,226 +1,454 @@
-export isvalid_SLDS, isvalid_LDS, isvalid_probvec
+export validate_SLDS, validate_LDS, validate_probvec
+export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
+export InvalidProbabilityVectorError, NumericalStabilityError
 
 """
-    isvalid_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
+    DimensionMismatchError <: Exception
 
-Validate that all parameters in a LinearDynamicalSystem are dimensionally consistent
-and mathematically valid.
+Custom exception for dimension mismatches in model parameters.
 
-# Checks performed:
-- Matrix dimensions are consistent
-- Covariance matrices are positive definite
-- fit_bool has correct length for the observation model type
-- All parameters have consistent data types
+# Fields
+- `parameter::String`: Name of the parameter with incorrect dimensions
+- `expected::Union{Int,Tuple{Int,Int}}`: Expected dimension(s)
+- `got::Union{Int,Tuple{Int,Int}}`: Actual dimension(s)
 """
-function isvalid_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
-    try
-        # Check state model dimensions and properties
-        if !_isvalid_state_model(lds.state_model, lds.latent_dim)
-            return false
-        end
+struct DimensionMismatchError <: Exception
+    parameter::String
+    expected::Union{Int,Tuple{Int,Int}}
+    got::Union{Int,Tuple{Int,Int}}
+end
 
-        # Check observation model dimensions and properties
-        if !_isvalid_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
-            return false
-        end
+function Base.showerror(io::IO, e::DimensionMismatchError)
+    print(io, "DimensionMismatchError: ")
+    print(io, "$(e.parameter) has dimensions $(e.got), expected $(e.expected)")
+end
 
-        # Check fit_bool length
-        expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
-        if length(lds.fit_bool) != expected_fit_length
-            @warn "fit_bool has length $(length(lds.fit_bool)), expected $expected_fit_length"
-            return false
-        end
+"""
+    NotPositiveDefiniteError <: Exception
 
-        # Check consistency between inferred and stored dimensions
-        inferred_latent = size(lds.state_model.A, 1)
-        inferred_obs = size(lds.obs_model.C, 1)
+Custom exception for matrices that should be positive definite but aren't.
 
-        if lds.latent_dim != inferred_latent
-            @warn "Stored latent_dim ($(lds.latent_dim)) ≠ inferred from A matrix ($inferred_latent)"
-            return false
-        end
+# Fields
+- `matrix_name::String`: Name of the matrix
+- `min_eigenvalue::Float64`: Minimum eigenvalue found
+"""
+struct NotPositiveDefiniteError <: Exception
+    matrix_name::String
+    min_eigenvalue::Float64
+end
 
-        if lds.obs_dim != inferred_obs
-            @warn "Stored obs_dim ($(lds.obs_dim)) ≠ inferred from C matrix ($inferred_obs)"
-            return false
-        end
+function Base.showerror(io::IO, e::NotPositiveDefiniteError)
+    print(io, "NotPositiveDefiniteError: ")
+    print(io, "$(e.matrix_name) is not positive definite ")
+    print(io, "(minimum eigenvalue: $(e.min_eigenvalue)). ")
+    print(io, "Consider adding regularization or checking for numerical issues.")
+end
 
-        return true
+"""
+    NotSymmetricError <: Exception
 
-    catch e
-        @warn "Error during LDS validation: $e"
-        return false
+Custom exception for matrices that should be symmetric but aren't.
+
+# Fields
+- `matrix_name::String`: Name of the matrix
+- `max_asymmetry::Float64`: Maximum asymmetry measure
+"""
+struct NotSymmetricError <: Exception
+    matrix_name::String
+    max_asymmetry::Float64
+end
+
+function Base.showerror(io::IO, e::NotSymmetricError)
+    print(io, "NotSymmetricError: ")
+    print(io, "$(e.matrix_name) is not symmetric ")
+    print(io, "(max asymmetry: $(e.max_asymmetry))")
+end
+
+"""
+    InvalidProbabilityVectorError <: Exception
+
+Custom exception for invalid probability vectors.
+
+# Fields
+- `vector_name::String`: Name of the probability vector
+- `sum_value::Float64`: Sum of the vector
+- `has_negative::Bool`: Whether the vector contains negative values
+- `has_greater_than_one::Bool`: Whether the vector contains values > 1.0
+"""
+struct InvalidProbabilityVectorError <: Exception
+    vector_name::String
+    sum_value::Float64
+    has_negative::Bool
+    has_greater_than_one::Bool
+end
+
+function Base.showerror(io::IO, e::InvalidProbabilityVectorError)
+    print(io, "InvalidProbabilityVectorError: ")
+    print(io, "$(e.vector_name) is not a valid probability vector. ")
+    if !isapprox(e.sum_value, 1.0; atol=1e-10)
+        print(io, "Sum is $(e.sum_value), not 1.0. ")
+    end
+    if e.has_negative
+        print(io, "Contains negative values. ")
+    end
+    if e.has_greater_than_one
+        print(io, "Contains values > 1.0.")
     end
 end
 
 """
-    _isvalid_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where T
+    NumericalStabilityError <: Exception
 
-Validate GaussianStateModel parameters.
+Custom exception for numerical stability issues.
+
+# Fields
+- `parameter::String`: Name of the parameter
+- `issue::String`: Description of the numerical issue
 """
-function _isvalid_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where {T}
+struct NumericalStabilityError <: Exception
+    parameter::String
+    issue::String
+end
+
+function Base.showerror(io::IO, e::NumericalStabilityError)
+    print(io, "NumericalStabilityError: ")
+    print(io, "$(e.parameter) - $(e.issue)")
+end
+
+"""
+    _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where T
+
+Validate GaussianStateModel parameters. Throws exceptions on validation failure.
+
+# Throws
+- `DimensionMismatchError`: If dimensions don't match expected values
+- `NotSymmetricError`: If covariance matrices aren't symmetric
+- `NotPositiveDefiniteError`: If covariance matrices aren't positive definite
+"""
+function _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where {T}
     # Check A matrix
     if size(state_model.A) != (latent_dim, latent_dim)
-        @warn "A matrix size $(size(state_model.A)) ≠ expected ($latent_dim, $latent_dim)"
-        return false
+        throw(DimensionMismatchError("A matrix", (latent_dim, latent_dim), size(state_model.A)))
     end
 
     # Check Q matrix (process noise covariance)
     if size(state_model.Q) != (latent_dim, latent_dim)
-        @warn "Q matrix size $(size(state_model.Q)) ≠ expected ($latent_dim, $latent_dim)"
-        return false
+        throw(DimensionMismatchError("Q matrix", (latent_dim, latent_dim), size(state_model.Q)))
     end
 
     if !issymmetric(state_model.Q)
-        @warn "Q matrix is not symmetric"
-        return false
+        max_asym = maximum(abs.(state_model.Q - state_model.Q'))
+        throw(NotSymmetricError("Q matrix", max_asym))
     end
 
     if !isposdef(state_model.Q)
-        @warn "Q matrix is not positive definite"
-        return false
+        min_eval = minimum(eigvals(state_model.Q))
+        throw(NotPositiveDefiniteError("Q matrix", min_eval))
     end
 
     # Check bias vector b
     if length(state_model.b) != latent_dim
-        @warn "Bias vector b length $(length(state_model.b)) ≠ expected $latent_dim"
-        return false
+        throw(DimensionMismatchError("bias vector b", latent_dim, length(state_model.b)))
     end
 
     # Check initial state x0
     if length(state_model.x0) != latent_dim
-        @warn "Initial state x0 length $(length(state_model.x0)) ≠ expected $latent_dim"
-        return false
+        throw(DimensionMismatchError("initial state x0", latent_dim, length(state_model.x0)))
     end
 
     # Check P0 matrix (initial covariance)
     if size(state_model.P0) != (latent_dim, latent_dim)
-        @warn "P0 matrix size $(size(state_model.P0)) ≠ expected ($latent_dim, $latent_dim)"
-        return false
+        throw(DimensionMismatchError("P0 matrix", (latent_dim, latent_dim), size(state_model.P0)))
     end
 
     if !issymmetric(state_model.P0)
-        @warn "P0 matrix is not symmetric"
-        return false
+        max_asym = maximum(abs.(state_model.P0 - state_model.P0'))
+        throw(NotSymmetricError("P0 matrix", max_asym))
     end
 
     if !isposdef(state_model.P0)
-        @warn "P0 matrix is not positive definite"
-        return false
+        min_eval = minimum(eigvals(state_model.P0))
+        throw(NotPositiveDefiniteError("P0 matrix", min_eval))
     end
 
-    return true
+    return nothing
 end
 
 """
-    _isvalid_obs_model(obs_model::GaussianObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
+    _validate_obs_model(obs_model::GaussianObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
 
-Validate GaussianObservationModel parameters.
+Validate GaussianObservationModel parameters. Throws exceptions on validation failure.
+
+# Throws
+- `DimensionMismatchError`: If dimensions don't match expected values
+- `NotSymmetricError`: If R matrix isn't symmetric
+- `NotPositiveDefiniteError`: If R matrix isn't positive definite
 """
-function _isvalid_obs_model(
+function _validate_obs_model(
     obs_model::GaussianObservationModel{T}, obs_dim::Int, latent_dim::Int
 ) where {T}
     # Check C matrix
     if size(obs_model.C) != (obs_dim, latent_dim)
-        @warn "C matrix size $(size(obs_model.C)) ≠ expected ($obs_dim, $latent_dim)"
-        return false
+        throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(obs_model.C)))
     end
 
     # Check R matrix (observation noise covariance)
     if size(obs_model.R) != (obs_dim, obs_dim)
-        @warn "R matrix size $(size(obs_model.R)) ≠ expected ($obs_dim, $obs_dim)"
-        return false
+        throw(DimensionMismatchError("R matrix", (obs_dim, obs_dim), size(obs_model.R)))
     end
 
     if !issymmetric(obs_model.R)
-        @warn "R matrix is not symmetric"
-        return false
+        max_asym = maximum(abs.(obs_model.R - obs_model.R'))
+        throw(NotSymmetricError("R matrix", max_asym))
     end
 
     if !isposdef(obs_model.R)
-        @warn "R matrix is not positive definite"
-        return false
+        min_eval = minimum(eigvals(obs_model.R))
+        throw(NotPositiveDefiniteError("R matrix", min_eval))
     end
 
     # Check bias vector d
     if length(obs_model.d) != obs_dim
-        @warn "Observation bias d length $(length(obs_model.d)) ≠ expected $obs_dim"
-        return false
+        throw(DimensionMismatchError("observation bias d", obs_dim, length(obs_model.d)))
     end
 
-    return true
+    return nothing
 end
 
 """
-    _isvalid_obs_model(obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
+    _validate_obs_model(obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
 
-Validate PoissonObservationModel parameters.
+Validate PoissonObservationModel parameters. Throws exceptions on validation failure.
+
+# Throws
+- `DimensionMismatchError`: If dimensions don't match expected values
+- `NumericalStabilityError`: If log_d values are extremely large/small
 """
-function _isvalid_obs_model(
+function _validate_obs_model(
     obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int
 ) where {T}
     # Check C matrix
     if size(obs_model.C) != (obs_dim, latent_dim)
-        @warn "C matrix size $(size(obs_model.C)) ≠ expected ($obs_dim, $latent_dim)"
-        return false
+        throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(obs_model.C)))
     end
 
     # Check log_d vector
     if length(obs_model.log_d) != obs_dim
-        @warn "log_d vector length $(length(obs_model.log_d)) ≠ expected $obs_dim"
-        return false
+        throw(DimensionMismatchError("log_d vector", obs_dim, length(obs_model.log_d)))
     end
 
     # Check that log_d values are reasonable (not extremely large/small)
     if any(x -> abs(x) > 50, obs_model.log_d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
-        @warn "Some log_d values are extremely large/small, may cause numerical issues"
-        return false
+        max_val = maximum(abs.(obs_model.log_d))
+        throw(NumericalStabilityError(
+            "log_d vector",
+            "contains extremely large/small values (max |log_d| = $max_val), may cause numerical overflow/underflow"
+        ))
     end
 
-    return true
+    return nothing
 end
 
 """
-    isvalid_probvec(v::AbstractVector{T}) where {T<:Real}
+    validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
 
-Check if vector is a valid probability vector (sums to 1, all non-negative).
+Validate that all parameters in a LinearDynamicalSystem are dimensionally consistent
+and mathematically valid. Throws descriptive exceptions on validation failure.
+
+# Checks performed
+- Matrix dimensions are consistent
+- Covariance matrices are positive definite and symmetric
+- fit_bool has correct length for the observation model type
+- Stored dimensions match dimensions inferred from matrices
+
+# Throws
+- `DimensionMismatchError`: If dimensions don't match
+- `NotPositiveDefiniteError`: If covariance matrices aren't positive definite
+- `NotSymmetricError`: If covariance matrices aren't symmetric
+- `NumericalStabilityError`: If numerical issues are detected
+
+# Examples
+```julia
+# This will throw DimensionMismatchError if invalid
+validate_LDS(my_lds)
+
+# Can be caught for custom handling
+try
+    validate_LDS(my_lds)
+    println("LDS is valid!")
+catch e
+    if e isa DimensionMismatchError
+        println("Dimension error: ", e)
+    end
+end
+```
 """
-function isvalid_probvec(v::AbstractVector{T}) where {T<:Real}
-    return isapprox(sum(v), one(T); atol=1e-10) &&
-           all(x -> x ≥ zero(T), v) &&
-           all(x -> x ≤ one(T), v)
+function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
+    # Check state model dimensions and properties
+    _validate_state_model(lds.state_model, lds.latent_dim)
+
+    # Check observation model dimensions and properties
+    _validate_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
+
+    # Check fit_bool length
+    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    if length(lds.fit_bool) != expected_fit_length
+        throw(DimensionMismatchError(
+            "fit_bool",
+            expected_fit_length,
+            length(lds.fit_bool)
+        ))
+    end
+
+    # Check consistency between inferred and stored dimensions
+    inferred_latent = size(lds.state_model.A, 1)
+    inferred_obs = size(lds.obs_model.C, 1)
+
+    if lds.latent_dim != inferred_latent
+        throw(DimensionMismatchError(
+            "latent_dim (stored vs inferred from A)",
+            inferred_latent,
+            lds.latent_dim
+        ))
+    end
+
+    if lds.obs_dim != inferred_obs
+        throw(DimensionMismatchError(
+            "obs_dim (stored vs inferred from C)",
+            inferred_obs,
+            lds.obs_dim
+        ))
+    end
+
+    return nothing
 end
 
 """
-    isvalid_SLDS(slds::SLDS)
+    validate_SLDS(slds::SLDS)
 
-Check if SLDS structure is valid under the following criteria:
-    - Dims of A match the length of πₖ and the number of LDSs
-    - Rows of A and πₖ sum to 1
-    - Each LDS has the same state dimension and observation dimension
- """
-function isvalid_SLDS(slds::SLDS)
+Validate SLDS structure. Throws descriptive exceptions on validation failure.
+
+# Checks performed
+- Dimensions of A match the length of πₖ and the number of LDSs
+- Rows of A and πₖ are valid probability vectors
+- Each LDS has the same state dimension and observation dimension
+- Each individual LDS is valid
+
+# Throws
+- `DimensionMismatchError`: If dimensions are inconsistent
+- `InvalidProbabilityVectorError`: If probability vectors are invalid
+- Other exceptions from `validate_LDS` for individual LDS validation
+
+# Examples
+```julia
+# This will throw if invalid
+validate_SLDS(my_slds)
+
+# Can be caught for custom handling
+try
+    validate_SLDS(my_slds)
+catch e
+    if e isa InvalidProbabilityVectorError
+        println("Probability vector error: ", e)
+    end
+end
+```
+"""
+function validate_SLDS(slds::SLDS)
     k = size(slds.A, 1)
     D = length(slds.πₖ)
     lds_count = length(slds.LDSs)
 
     # Checks for HMM components
-    @assert k == D "Dimension mismatch: size(A, 1) must equal length(πₖ)"
-    @assert k == lds_count "Dimension mismatch: size(A, 1) must equal number of LDSs"
-
-    for i in 1:k
-        @assert isprobvec(slds.A[i, :]) "Row $i of A is not a valid probability vector"
+    if k != D
+        throw(DimensionMismatchError("size(A, 1) vs length(πₖ)", D, k))
     end
 
-    @assert isprobvec(slds.πₖ) "πₖ is not a valid probability vector"
+    if k != lds_count
+        throw(DimensionMismatchError("size(A, 1) vs number of LDSs", lds_count, k))
+    end
+
+    # Validate transition matrix rows
+    for i in 1:k
+        row = slds.A[i, :]
+        sum_val = sum(row)
+        has_neg = any(x -> x < 0, row)
+        has_gt1 = any(x -> x > 1, row)
+
+        if !isapprox(sum_val, 1.0; atol=1e-10) || has_neg || has_gt1
+            throw(InvalidProbabilityVectorError(
+                "A[$i, :]",
+                sum_val,
+                has_neg,
+                has_gt1
+            ))
+        end
+    end
+
+    # Validate initial distribution
+    sum_val = sum(slds.πₖ)
+    has_neg = any(x -> x < 0, slds.πₖ)
+    has_gt1 = any(x -> x > 1, slds.πₖ)
+
+    if !isapprox(sum_val, 1.0; atol=1e-10) || has_neg || has_gt1
+        throw(InvalidProbabilityVectorError("πₖ", sum_val, has_neg, has_gt1))
+    end
 
     # Checks for LDS models
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
+
     for (i, lds) in enumerate(slds.LDSs)
-        @assert lds.latent_dim == latent_dim "LDS $i has inconsistent latent_dim"
-        @assert lds.obs_dim == obs_dim "LDS $i has inconsistent obs_dim"
-        @assert isvalid_LDS(lds) "LDS $i is not valid"
+        if lds.latent_dim != latent_dim
+            throw(DimensionMismatchError(
+                "LDS[$i].latent_dim",
+                latent_dim,
+                lds.latent_dim
+            ))
+        end
+
+        if lds.obs_dim != obs_dim
+            throw(DimensionMismatchError(
+                "LDS[$i].obs_dim",
+                obs_dim,
+                lds.obs_dim
+            ))
+        end
+
+        # This will throw if invalid
+        validate_LDS(lds)
     end
-    return true
+
+    return nothing
+end
+
+"""
+    validate_probvec(v::AbstractVector{T}; name::String="vector") where {T<:Real}
+
+Validate that a vector is a valid probability vector (sums to 1, all non-negative, all ≤ 1).
+Throws `InvalidProbabilityVectorError` if validation fails.
+
+# Arguments
+- `v`: The vector to validate
+- `name`: Optional name for the vector (used in error messages)
+
+# Examples
+```julia
+v1 = [0.3, 0.5, 0.2]
+validate_probvec(v1)  # No error
+
+v2 = [0.3, 0.5, 0.3]
+validate_probvec(v2)  # Throws InvalidProbabilityVectorError
+```
+"""
+function validate_probvec(v::AbstractVector{T}; name::String="vector") where {T<:Real}
+    sum_val = sum(v)
+    has_neg = any(x -> x < 0, v)
+    has_gt1 = any(x -> x > 1, v)
+
+    if !isapprox(sum_val, one(T); atol=1e-10) || has_neg || has_gt1
+        throw(InvalidProbabilityVectorError(name, sum_val, has_neg, has_gt1))
+    end
+
+    return nothing
 end

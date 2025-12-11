@@ -1,21 +1,21 @@
 # Tests for Valid.jl validation functions
 
-function test_isvalid_probvec()
-    # Valid probability vectors
-    @test isvalid_probvec([0.3, 0.7])
-    @test isvalid_probvec([0.25, 0.25, 0.25, 0.25])
-    @test isvalid_probvec([1.0])
-    @test isvalid_probvec(Float32[0.3, 0.7])
+function test_validate_probvec()
+    # Valid probability vectors - should not throw
+    @test validate_probvec([0.3, 0.7]) === nothing
+    @test validate_probvec([0.25, 0.25, 0.25, 0.25]) === nothing
+    @test validate_probvec([1.0]) === nothing
+    @test validate_probvec(Float32[0.3, 0.7]) === nothing
 
-    # Invalid probability vectors
-    @test !isvalid_probvec([0.3, 0.8])  # Sum > 1
-    @test !isvalid_probvec([0.3, 0.5])  # Sum < 1
-    @test !isvalid_probvec([-0.1, 1.1])  # Negative value
-    @test !isvalid_probvec([0.5, 0.5, 0.5])  # Sum > 1
-    @test !isvalid_probvec([0.0, 0.0])  # Sum = 0
+    # Invalid probability vectors - should throw
+    @test_throws InvalidProbabilityVectorError validate_probvec([0.3, 0.8])  # Sum > 1
+    @test_throws InvalidProbabilityVectorError validate_probvec([0.3, 0.5])  # Sum < 1
+    @test_throws InvalidProbabilityVectorError validate_probvec([-0.1, 1.1])  # Negative value
+    @test_throws InvalidProbabilityVectorError validate_probvec([0.5, 0.5, 0.5])  # Sum > 1
+    @test_throws InvalidProbabilityVectorError validate_probvec([0.0, 0.0])  # Sum = 0
 end
 
-function test_isvalid_LDS_gaussian()
+function test_validate_LDS_gaussian()
     # Create a valid Gaussian LDS
     A = Matrix{Float64}(I, 2, 2)
     C = Matrix{Float64}(I, 2, 2)
@@ -32,10 +32,10 @@ function test_isvalid_LDS_gaussian()
         state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
     )
 
-    @test isvalid_LDS(lds)
+    @test validate_LDS(lds) === nothing
 end
 
-function test_isvalid_LDS_poisson()
+function test_validate_LDS_poisson()
     # Create a valid Poisson LDS
     A = Matrix{Float64}(I, 2, 2)
     C = randn(3, 2)
@@ -51,10 +51,10 @@ function test_isvalid_LDS_poisson()
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
     )
 
-    @test isvalid_LDS(lds)
+    @test validate_LDS(lds) === nothing
 end
 
-function test_isvalid_LDS_dimension_mismatch()
+function test_validate_LDS_dimension_mismatch()
     # Test dimension mismatches
     A = Matrix{Float64}(I, 2, 2)
     C = Matrix{Float64}(I, 3, 2)  # obs_dim = 3
@@ -71,10 +71,10 @@ function test_isvalid_LDS_dimension_mismatch()
         state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 6)
     )
 
-    @test !isvalid_LDS(lds)
+    @test_throws DimensionMismatchError validate_LDS(lds)
 end
 
-function test_isvalid_LDS_non_positive_definite()
+function test_validate_LDS_non_positive_definite()
     # Test non-positive definite Q matrix
     A = Matrix{Float64}(I, 2, 2)
     C = Matrix{Float64}(I, 2, 2)
@@ -91,10 +91,10 @@ function test_isvalid_LDS_non_positive_definite()
         state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
     )
 
-    @test !isvalid_LDS(lds)
+    @test_throws NotPositiveDefiniteError validate_LDS(lds)
 end
 
-function test_isvalid_LDS_wrong_fit_bool_length()
+function test_validate_LDS_wrong_fit_bool_length()
     # Test wrong fit_bool length
     A = Matrix{Float64}(I, 2, 2)
     C = Matrix{Float64}(I, 2, 2)
@@ -115,10 +115,10 @@ function test_isvalid_LDS_wrong_fit_bool_length()
         fit_bool=fill(true, 5),  # Should be 6!
     )
 
-    @test !isvalid_LDS(lds)
+    @test_throws DimensionMismatchError validate_LDS(lds)
 end
 
-function test_isvalid_LDS_poisson_extreme_log_d()
+function test_validate_LDS_poisson_extreme_log_d()
     # Test Poisson with extreme log_d values
     A = Matrix{Float64}(I, 2, 2)
     C = randn(3, 2)
@@ -134,10 +134,10 @@ function test_isvalid_LDS_poisson_extreme_log_d()
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
     )
 
-    @test !isvalid_LDS(lds)
+    @test_throws NumericalStabilityError validate_LDS(lds)
 end
 
-function test_isvalid_LDS_asymmetric_covariance()
+function test_validate_LDS_asymmetric_covariance()
     # Test asymmetric Q matrix (should fail)
     A = Matrix{Float64}(I, 2, 2)
     C = Matrix{Float64}(I, 2, 2)
@@ -154,5 +154,5 @@ function test_isvalid_LDS_asymmetric_covariance()
         state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
     )
 
-    @test !isvalid_LDS(lds)
+    @test_throws NotSymmetricError validate_LDS(lds)
 end

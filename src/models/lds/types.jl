@@ -228,10 +228,8 @@ function LinearDynamicalSystem(
         state_model, obs_model, latent_dim, obs_dim, fit_bool
     )
 
-    # Validate the constructed LDS
-    if !isvalid_LDS(lds)
-        error("Invalid LinearDynamicalSystem parameters")
-    end
+    # Validate the constructed LDS (throws on error)
+    validate_LDS(lds)
 
     return lds
 end

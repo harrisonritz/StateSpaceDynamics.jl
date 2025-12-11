@@ -364,17 +364,17 @@ include("helper_functions.jl")
         include("Validation/Valid.jl")
 
         @testset "Probability Vector Validation" begin
-            test_isvalid_probvec()
+            test_validate_probvec()
         end
 
         @testset "LDS Validation" begin
-            test_isvalid_LDS_gaussian()
-            test_isvalid_LDS_poisson()
-            test_isvalid_LDS_dimension_mismatch()
-            test_isvalid_LDS_non_positive_definite()
-            test_isvalid_LDS_wrong_fit_bool_length()
-            test_isvalid_LDS_poisson_extreme_log_d()
-            test_isvalid_LDS_asymmetric_covariance()
+            test_validate_LDS_gaussian()
+            test_validate_LDS_poisson()
+            test_validate_LDS_dimension_mismatch()
+            test_validate_LDS_non_positive_definite()
+            test_validate_LDS_wrong_fit_bool_length()
+            test_validate_LDS_poisson_extreme_log_d()
+            test_validate_LDS_asymmetric_covariance()
         end
     end
 
