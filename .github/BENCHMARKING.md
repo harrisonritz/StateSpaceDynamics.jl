@@ -96,18 +96,18 @@ This requires:
 ## Interpreting Performance Changes
 
 ### Good Changes
-- ✅ Speedup > 1.05 (5% faster)
-- ✅ Memory reduction > 5%
-- ✅ Fewer allocations
+- Speedup > 1.05 (5% faster)
+- Memory reduction > 5%
+- Fewer allocations
 
 ### Acceptable Changes
-- ✓ Speedup between 0.95-1.05 (within noise)
-- ✓ Memory change < 5%
+- Speedup between 0.95-1.05 (within noise)
+- Memory change < 5%
 
 ### Concerning Changes
-- ⚠️ Speedup < 0.95 (5% slower) - investigate
-- ⚠️ Memory increase > 10% - investigate
-- ⚠️ Significant allocation increase - investigate
+- Speedup < 0.95 (5% slower) - investigate
+- Memory increase > 10% - investigate
+- Significant allocation increase - investigate
 
 ## Adding New Benchmarks
 
