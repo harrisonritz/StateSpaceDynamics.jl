@@ -1,5 +1,3 @@
-export rand, smooth, fit!
-
 function _extract_state_params(state_model::GaussianStateModel{T}) where {T}
     return (
         A=state_model.A,

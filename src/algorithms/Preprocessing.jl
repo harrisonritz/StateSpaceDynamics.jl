@@ -1,6 +1,3 @@
-# Public API
-export ProbabilisticPCA, loglikelihood, fit!
-
 mutable struct ProbabilisticPCA{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     W::M
     σ²::T

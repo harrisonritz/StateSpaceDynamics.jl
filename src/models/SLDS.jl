@@ -1,5 +1,3 @@
-export SLDS
-
 """
     SLDS{T,S,O,TM,ISV}
 

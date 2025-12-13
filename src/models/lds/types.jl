@@ -1,7 +1,3 @@
-export LinearDynamicalSystem
-export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
-export IWPrior
-
 """
     IWPrior{T<:Real, M<:AbstractMatrix}
 

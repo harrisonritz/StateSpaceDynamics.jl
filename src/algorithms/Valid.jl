@@ -1,7 +1,3 @@
-export validate_SLDS, validate_LDS, validate_probvec
-export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
-export InvalidProbabilityVectorError, NumericalStabilityError
-
 """
     DimensionMismatchError <: Exception
 
@@ -20,7 +16,7 @@ end
 
 function Base.showerror(io::IO, e::DimensionMismatchError)
     print(io, "DimensionMismatchError: ")
-    print(io, "$(e.parameter) has dimensions $(e.got), expected $(e.expected)")
+    return print(io, "$(e.parameter) has dimensions $(e.got), expected $(e.expected)")
 end
 
 """
@@ -41,7 +37,7 @@ function Base.showerror(io::IO, e::NotPositiveDefiniteError)
     print(io, "NotPositiveDefiniteError: ")
     print(io, "$(e.matrix_name) is not positive definite ")
     print(io, "(minimum eigenvalue: $(e.min_eigenvalue)). ")
-    print(io, "Consider adding regularization or checking for numerical issues.")
+    return print(io, "Consider adding regularization or checking for numerical issues.")
 end
 
 """
@@ -61,7 +57,7 @@ end
 function Base.showerror(io::IO, e::NotSymmetricError)
     print(io, "NotSymmetricError: ")
     print(io, "$(e.matrix_name) is not symmetric ")
-    print(io, "(max asymmetry: $(e.max_asymmetry))")
+    return print(io, "(max asymmetry: $(e.max_asymmetry))")
 end
 
 """
@@ -112,7 +108,7 @@ end
 
 function Base.showerror(io::IO, e::NumericalStabilityError)
     print(io, "NumericalStabilityError: ")
-    print(io, "$(e.parameter) - $(e.issue)")
+    return print(io, "$(e.parameter) - $(e.issue)")
 end
 
 """
@@ -125,15 +121,25 @@ Validate GaussianStateModel parameters. Throws exceptions on validation failure.
 - `NotSymmetricError`: If covariance matrices aren't symmetric
 - `NotPositiveDefiniteError`: If covariance matrices aren't positive definite
 """
-function _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where {T}
+function _validate_state_model(
+    state_model::GaussianStateModel{T}, latent_dim::Int
+) where {T}
     # Check A matrix
     if size(state_model.A) != (latent_dim, latent_dim)
-        throw(DimensionMismatchError("A matrix", (latent_dim, latent_dim), size(state_model.A)))
+        throw(
+            DimensionMismatchError(
+                "A matrix", (latent_dim, latent_dim), size(state_model.A)
+            ),
+        )
     end
 
     # Check Q matrix (process noise covariance)
     if size(state_model.Q) != (latent_dim, latent_dim)
-        throw(DimensionMismatchError("Q matrix", (latent_dim, latent_dim), size(state_model.Q)))
+        throw(
+            DimensionMismatchError(
+                "Q matrix", (latent_dim, latent_dim), size(state_model.Q)
+            ),
+        )
     end
 
     if !issymmetric(state_model.Q)
@@ -153,12 +159,18 @@ function _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::I
 
     # Check initial state x0
     if length(state_model.x0) != latent_dim
-        throw(DimensionMismatchError("initial state x0", latent_dim, length(state_model.x0)))
+        throw(
+            DimensionMismatchError("initial state x0", latent_dim, length(state_model.x0))
+        )
     end
 
     # Check P0 matrix (initial covariance)
     if size(state_model.P0) != (latent_dim, latent_dim)
-        throw(DimensionMismatchError("P0 matrix", (latent_dim, latent_dim), size(state_model.P0)))
+        throw(
+            DimensionMismatchError(
+                "P0 matrix", (latent_dim, latent_dim), size(state_model.P0)
+            ),
+        )
     end
 
     if !issymmetric(state_model.P0)
@@ -240,10 +252,12 @@ function _validate_obs_model(
     # Check that log_d values are reasonable (not extremely large/small)
     if any(x -> abs(x) > 50, obs_model.log_d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
         max_val = maximum(abs.(obs_model.log_d))
-        throw(NumericalStabilityError(
-            "log_d vector",
-            "contains extremely large/small values (max |log_d| = $max_val), may cause numerical overflow/underflow"
-        ))
+        throw(
+            NumericalStabilityError(
+                "log_d vector",
+                "contains extremely large/small values (max |log_d| = $max_val), may cause numerical overflow/underflow",
+            ),
+        )
     end
 
     return nothing
@@ -293,11 +307,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     # Check fit_bool length
     expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
     if length(lds.fit_bool) != expected_fit_length
-        throw(DimensionMismatchError(
-            "fit_bool",
-            expected_fit_length,
-            length(lds.fit_bool)
-        ))
+        throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end
 
     # Check consistency between inferred and stored dimensions
@@ -305,19 +315,19 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     inferred_obs = size(lds.obs_model.C, 1)
 
     if lds.latent_dim != inferred_latent
-        throw(DimensionMismatchError(
-            "latent_dim (stored vs inferred from A)",
-            inferred_latent,
-            lds.latent_dim
-        ))
+        throw(
+            DimensionMismatchError(
+                "latent_dim (stored vs inferred from A)", inferred_latent, lds.latent_dim
+            ),
+        )
     end
 
     if lds.obs_dim != inferred_obs
-        throw(DimensionMismatchError(
-            "obs_dim (stored vs inferred from C)",
-            inferred_obs,
-            lds.obs_dim
-        ))
+        throw(
+            DimensionMismatchError(
+                "obs_dim (stored vs inferred from C)", inferred_obs, lds.obs_dim
+            ),
+        )
     end
 
     return nothing
@@ -376,12 +386,7 @@ function validate_SLDS(slds::SLDS)
         has_gt1 = any(x -> x > 1, row)
 
         if !isapprox(sum_val, 1.0; atol=1e-10) || has_neg || has_gt1
-            throw(InvalidProbabilityVectorError(
-                "A[$i, :]",
-                sum_val,
-                has_neg,
-                has_gt1
-            ))
+            throw(InvalidProbabilityVectorError("A[$i, :]", sum_val, has_neg, has_gt1))
         end
     end
 
@@ -400,19 +405,11 @@ function validate_SLDS(slds::SLDS)
 
     for (i, lds) in enumerate(slds.LDSs)
         if lds.latent_dim != latent_dim
-            throw(DimensionMismatchError(
-                "LDS[$i].latent_dim",
-                latent_dim,
-                lds.latent_dim
-            ))
+            throw(DimensionMismatchError("LDS[$i].latent_dim", latent_dim, lds.latent_dim))
         end
 
         if lds.obs_dim != obs_dim
-            throw(DimensionMismatchError(
-                "LDS[$i].obs_dim",
-                obs_dim,
-                lds.obs_dim
-            ))
+            throw(DimensionMismatchError("LDS[$i].obs_dim", obs_dim, lds.obs_dim))
         end
 
         # This will throw if invalid

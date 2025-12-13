@@ -6,12 +6,6 @@ This module implements various emission models for state space modeling, includi
 - Regression-based emissions (Gaussian, Bernoulli, Poisson)
 """
 
-# Exports
-export EmissionModel, GaussianEmission
-export RegressionEmission, GaussianRegressionEmission, BernoulliRegressionEmission
-export PoissonRegressionEmission, AutoRegressionEmission
-export loglikelihood, fit!
-
 #=
 Gaussian Emission Models
 =#

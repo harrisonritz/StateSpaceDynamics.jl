@@ -37,4 +37,37 @@ include("models/MixtureModels.jl")
 include("algorithms/Preprocessing.jl")
 include("algorithms/Valid.jl")
 
+# Errors/Exceptions/Validations
+export validate_SLDS, validate_LDS, validate_probvec
+export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
+export InvalidProbabilityVectorError, NumericalStabilityError
+
+# Models and Types
+export ProbabilisticPCA,
+    SLDS,
+    LinearDynamicalSystem,
+    GaussianMixtureModel,
+    PoissonMixtureModel,
+    HiddenMarkovModel
+export RegressionEmission,
+    PoissonRegressionEmission,
+    AutoRegressionEmission,
+    GaussianEmission,
+    GaussianRegressionEmission,
+    BernoulliRegressionEmission
+export MixtureModel, EmissionModel, DynamicalSystem
+export AbstractHMM, AbstractStateModel, AbstractObservationModel
+export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
+export IWPrior
+
+# Utilities
+export kmeanspp_initialization, kmeans_clustering, fit!, block_tridgm
+export block_tridiagonal_inverse, block_tridiagonal_inverse_static
+export stabilize_covariance_matrix, valid_Σ, make_posdef!, gaussian_entropy
+export random_rotation_matrix
+export print_full
+
+# Common functions
+export rand, smooth, fit!, loglikelihood, kmeans_init!, viterbi, class_probabilities
+
 end

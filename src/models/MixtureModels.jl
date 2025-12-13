@@ -1,6 +1,3 @@
-# Public API
-export GaussianMixtureModel, PoissonMixtureModel, fit!, loglikelihood
-
 """
     GaussianMixtureModel
 

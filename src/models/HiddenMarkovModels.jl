@@ -1,7 +1,3 @@
-# Public API
-export HiddenMarkovModel
-export kmeans_init!, fit!, rand, loglikelihood, viterbi, class_probabilities
-
 """
     HiddenMarkovModel
 

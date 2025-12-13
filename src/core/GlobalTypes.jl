@@ -1,11 +1,3 @@
-"""
-The purpose of this file is to provide a common place for all global types to be defined.
-This is to avoid circular dependencies between files.
-"""
-
-export MixtureModel, EmissionModel, DynamicalSystem
-export AbstractHMM, AbstractStateModel, AbstractObservationModel
-
 # Create abstract types here
 """
 Abstract type for Mixture Models. I.e. GMM's, etc.
