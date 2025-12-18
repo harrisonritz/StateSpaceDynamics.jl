@@ -7,7 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        julia-version: ['1']  # '1' always points to the latest stable release
+        julia-version: ['1', 'pre']  # '1' always points to the latest stable release
     steps:
     - name: Check out code
       uses: actions/checkout@v2

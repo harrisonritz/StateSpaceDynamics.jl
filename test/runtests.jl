@@ -4,7 +4,6 @@ using DataFrames
 using Distributions
 using ForwardDiff
 using JET
-using JuliaFormatter
 using LinearAlgebra
 using MAT
 using Optim
@@ -27,15 +26,9 @@ include("helper_functions.jl")
             @test isempty(Test.detect_ambiguities(StateSpaceDynamics))
         end
 
-        @testset "Blue Formatting" begin
-            @test_broken JuliaFormatter.format(
-                StateSpaceDynamics; verbose=false, overwrite=false
-            )
-        end
-
         @testset "JET.jl Code Linting" begin
             if VERSION >= v"1.11"
-                JET.test_package(StateSpaceDynamics; target_defined_modules=true)
+                JET.test_package(StateSpaceDynamics; target_modules=("StateSpaceDynamics",))
             end
         end
     end
