@@ -28,7 +28,7 @@ include("helper_functions.jl")
 
         @testset "JET.jl Code Linting" begin
             if VERSION >= v"1.11"
-                JET.test_package(StateSpaceDynamics; target_modules=("StateSpaceDynamics",))
+                JET.test_package(StateSpaceDynamics; target_modules=(StateSpaceDynamics,))
             end
         end
     end
