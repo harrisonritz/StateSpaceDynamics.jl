@@ -1,4 +1,6 @@
-export SSD_LDSImplem, pykalman_LDSImplem, Dynamax_LDSImplem, build_model
+export SSD_LDSImplem, pykalman_LDSImplem, Dynamax_LDSImplem, SSA_LDSImplem, build_model
+using Accessors
+
 
 struct SSD_LDSImplem <: Implementation end
 Base.string(::SSD_LDSImplem) = "StateSpaceDynamics.jl"
@@ -99,6 +101,68 @@ function build_model(::Dynamax_LDSImplem, instance::LDSInstance, params::LDSPara
     return (dyn_params, props, lds)
 end
 
+
+
+"""
+Build SSA model.
+"""
+
+struct SSA_LDSImplem <: Implementation end
+Base.string(::SSA_LDSImplem) = "SSA"
+function build_model(::SSA_LDSImplem, instance::LDSInstance, params::LDSParams)
+   
+    (; latent_dim, obs_dim, num_trials, seq_length) = instance
+    (; A, Q, x0, P0, C, R) = params
+
+    print("num trials: $num_trials, seq length: $seq_length \n")
+
+    S = core_struct(
+        prm=param_struct(
+
+            save_path = ".",
+            load_path = ".",
+
+            seed = 99,
+            model_name = "test",
+            changelog = "run test",
+            load_name = "example",
+            pt_list = 1:1, # always has to be range
+
+            max_iter_em = 100,
+            test_iter = 1,
+            early_stop = false,
+
+            x_dim_fast = latent_dim:latent_dim,
+            ), 
+        dat=data_struct(
+            pt = 1, # pt default
+            x_dim = latent_dim , # x_dim default
+            y_dim = obs_dim,
+            n_steps = seq_length,
+            n_train = num_trials,
+            n_test = num_trials,
+            u_dim = 1,
+            u0_dim = 1,
+            ),
+
+        res=results_struct(),
+
+        est=estimates_struct(
+    
+        ),
+
+        mdl=set_model(;A=A, B=zeros(latent_dim, 1), Q=tol_PD(Q), C=C, R=tol_PD(R), B0=zeros(latent_dim, 1), P0=tol_PD(P0)),
+
+        fcn=function_struct{core_struct}(),
+
+    );
+    
+    return S
+end
+
+
+
+
 function run_benchmark(::SSD_LDSImplem, model::LinearDynamicalSystem, Y::AbstractArray)
     # Run 1 EM iteration to compile
     StateSpaceDynamics.fit!(deepcopy(model), Y, max_iter=1, tol=1e-50)
@@ -143,4 +207,60 @@ function run_benchmark(::Dynamax_LDSImplem, model::Tuple, Y::AbstractArray)
             num_iters=100)
     end samples=5
     return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
+end
+
+
+
+function run_benchmark(::SSA_LDSImplem, S::Any, Y::AbstractArray)
+    
+    @reset S.dat.y_train = deepcopy(Y)
+    @reset S.dat.u_train = ones(1, S.dat.n_steps, S.dat.n_train)
+    @reset S.dat.u0_train = ones(1, S.dat.n_train)
+
+    @reset S.dat.y_test = deepcopy(Y)
+    @reset S.dat.u_test = ones(1, S.dat.n_steps, S.dat.n_train)
+    @reset S.dat.u0_test = ones(1, S.dat.n_train)
+
+    @reset S.est = deepcopy(set_estimates(S));
+    SSA_EM!(S)
+
+    bench = @benchmark begin
+        SSA_EM!($S)
+    end samples=5
+    return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
+end
+
+
+
+
+
+function SSA_EM!(S)
+
+    # main EM loop ===================================================================
+    for em_iter = 1:S.prm.max_iter_em
+
+        # ==== E-STEP ================================================================
+        @inline StateSpaceAnalysis.ESTEP!(S);
+
+        # ==== M-STEP ================================================================
+        @reset S.mdl = deepcopy(StateSpaceAnalysis.MSTEP(S));
+
+        # ==== TOTAL LOGLIK ==========================================================
+        StateSpaceAnalysis.total_loglik!(S)
+        
+        # ==== TEST LOGLIK ==========================================================
+        # @reset S.est = deepcopy(set_estimates(S));
+        # StateSpaceAnalysis.test_loglik!(S);
+        # push!(S.res.test_R2_proj, ll_R2(S, S.res.test_loglik[end], S.res.null_loglik[end]));    
+
+
+        # garbage collect every 10 iter :(
+        if (mod(em_iter,10) == 0) && Sys.islinux() 
+            ccall(:malloc_trim, Cvoid, (Cint,), 0);
+            ccall(:malloc_trim, Int32, (Int32,), 0);
+            GC.gc(true);
+        end
+
+    end
+
 end

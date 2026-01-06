@@ -2,6 +2,7 @@ module SSD_Benchmark
 
 # Include packages
 using StateSpaceDynamics
+using StateSpaceAnalysis
 using HiddenMarkovModels
 using BenchmarkTools
 using CSV
