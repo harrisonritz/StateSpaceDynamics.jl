@@ -106,7 +106,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
 } <: AbstractObservationModel{T}
     C::M
     R::M
-    d::V=zeros(eltype(R), size(R, 1))
+    d::V=zeros(eltype(C), size(C, 1))
     R_prior::Union{Nothing,IWPrior{T}} = nothing
 end
 
