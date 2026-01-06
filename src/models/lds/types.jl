@@ -57,7 +57,7 @@ Base.@kwdef mutable struct GaussianStateModel{
 } <: AbstractStateModel{T}
     A::M
     Q::M
-    b::V
+    b::V=zeros(eltype(A), size(A, 1))
     x0::V
     P0::M
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
@@ -106,7 +106,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
 } <: AbstractObservationModel{T}
     C::M
     R::M
-    d::V
+    d::V=zeros(eltype(R), size(R, 1))
     R_prior::Union{Nothing,IWPrior{T}} = nothing
 end
 
