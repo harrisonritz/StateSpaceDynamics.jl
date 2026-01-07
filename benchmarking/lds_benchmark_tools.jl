@@ -1,5 +1,13 @@
-export SSD_LDSImplem, pykalman_LDSImplem, Dynamax_LDSImplem, SSA_LDSImplem, build_model
+export SSD_LDSImplem, pykalman_LDSImplem, Dynamax_LDSImplem, SSA_LDSImplem, build_model, run_benchmark, recover_states
 using Accessors
+
+
+
+
+global recover_iters = 10
+global bench_repeats = 5
+
+
 
 
 struct SSD_LDSImplem <: Implementation end
@@ -170,8 +178,10 @@ function run_benchmark(::SSD_LDSImplem, model::LinearDynamicalSystem, Y::Abstrac
     # run Benchmark
     bench = @benchmark begin
         StateSpaceDynamics.fit!($model, $Y; max_iter=100, tol=1e-50)
-    end samples=5
+    end samples=bench_repeats
+
     return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
+
 end
 
 function run_benchmark(::pykalman_LDSImplem, model::Any, Y::AbstractArray)
@@ -183,7 +193,7 @@ function run_benchmark(::pykalman_LDSImplem, model::Any, Y::AbstractArray)
     Y_np = np.array(Y).transpose()
     bench = @benchmark begin
         $model.em($Y_np, n_iter=100)
-    end samples=5
+    end samples=bench_repeats
     return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
 end
 
@@ -205,7 +215,7 @@ function run_benchmark(::Dynamax_LDSImplem, model::Tuple, Y::AbstractArray)
             $props,
             $Y_np,
             num_iters=100)
-    end samples=5
+    end samples=bench_repeats
     return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
 end
 
@@ -221,14 +231,79 @@ function run_benchmark(::SSA_LDSImplem, S::Any, Y::AbstractArray)
     @reset S.dat.u_test = ones(1, S.dat.n_steps, S.dat.n_train)
     @reset S.dat.u0_test = ones(1, S.dat.n_train)
 
+
     @reset S.est = deepcopy(set_estimates(S));
+
+    @reset S.prm.max_iter_em = 1
     SSA_EM!(S)
+    @reset S.prm.max_iter_em = 100
+
 
     bench = @benchmark begin
         SSA_EM!($S)
-    end samples=5
+    end samples=bench_repeats
     return (time=median(bench).time, memory=bench.memory, allocs=bench.allocs, success=true)
 end
+
+
+
+function recover_states(::SSD_LDSImplem, model::LinearDynamicalSystem, Y::AbstractArray, x::AbstractArray)
+   
+        # fit
+        StateSpaceDynamics.fit!(model, Y, max_iter=recover_iters, tol=1e-50)
+        # smooth
+        xhat, _ = smooth(model, Y)
+
+        x_long = reshape(x, size(x, 1), size(x, 2) * size(x, 3))'
+        xhat_long = reshape(xhat, size(xhat, 1), size(xhat, 2) * size(xhat, 3))'
+        b_x = xhat_long \ x_long
+
+        # compute R2 
+        r2          = 1 .- sum((x_long .- xhat_long).^2) / sum((x_long .- mean(x_long, dims=1)).^2)
+        r2_aligned  = 1 .- sum((x_long .- xhat_long*b_x).^2) / sum((x_long .- mean(x_long, dims=1)).^2)
+        println("R2: ", r2)
+        println("R2 (aligned): ", r2_aligned)
+
+        return (R2=r2, R2aligned=r2_aligned)
+
+end
+
+
+function recover_states(::SSA_LDSImplem, S::Any, Y::AbstractArray, x::AbstractArray)
+   
+    @reset S.dat.y_train = deepcopy(Y)
+    @reset S.dat.u_train = ones(1, S.dat.n_steps, S.dat.n_train)
+    @reset S.dat.u0_train = ones(1, S.dat.n_train)
+
+    @reset S.dat.y_test = deepcopy(Y)
+    @reset S.dat.u_test = ones(1, S.dat.n_steps, S.dat.n_train)
+    @reset S.dat.u0_test = ones(1, S.dat.n_train)
+
+    @reset S.est = deepcopy(set_estimates(S));
+
+    @reset S.prm.max_iter_em = recover_iters
+    
+    # fit
+    S = SSA_EM!(S)
+    # smooth
+    P = posterior_mean(S, S.dat.y_train, S.dat.y_train, S.dat.u_train, S.dat.u0_train)
+    xhat = P.smooth_mean
+
+
+    x_long = reshape(x, size(x, 1), size(x, 2) * size(x, 3))'
+    xhat_long = reshape(xhat, size(xhat, 1), size(xhat, 2) * size(xhat, 3))'
+    b_x = xhat_long \ x_long
+
+    # compute R2 
+    r2          = 1 .- sum((x_long .- xhat_long).^2) / sum((x_long .- mean(x_long, dims=1)).^2)
+    r2_aligned  = 1 .- sum((x_long .- xhat_long*b_x).^2) / sum((x_long .- mean(x_long, dims=1)).^2)
+
+    println("R2: ", r2)
+    println("R2 (aligned): ", r2_aligned)
+
+    return (R2=r2, R2aligned=r2_aligned)
+
+end 
 
 
 
@@ -246,21 +321,16 @@ function SSA_EM!(S)
         @reset S.mdl = deepcopy(StateSpaceAnalysis.MSTEP(S));
 
         # ==== TOTAL LOGLIK ==========================================================
-        StateSpaceAnalysis.total_loglik!(S)
+        StateSpaceAnalysis.total_loglik!(S);
         
         # ==== TEST LOGLIK ==========================================================
         # @reset S.est = deepcopy(set_estimates(S));
         # StateSpaceAnalysis.test_loglik!(S);
         # push!(S.res.test_R2_proj, ll_R2(S, S.res.test_loglik[end], S.res.null_loglik[end]));    
 
-
-        # garbage collect every 10 iter :(
-        if (mod(em_iter,10) == 0) && Sys.islinux() 
-            ccall(:malloc_trim, Cvoid, (Cint,), 0);
-            ccall(:malloc_trim, Int32, (Int32,), 0);
-            GC.gc(true);
-        end
-
     end
 
+    return S
+
 end
+

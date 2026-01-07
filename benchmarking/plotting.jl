@@ -9,15 +9,25 @@ using Measures
 function plot_lds_benchmark(fp::AbstractString, sp::AbstractString="benchmarking/results/lds_benchmark_results.svg")
 
     # Color palette
+    # package_colors = Dict(
+    #     "Dynamax" => "#0072B2",                # Blue
+    #     "pykalman" => "#009E73", # Green
+    #     "StateSpaceDynamics.jl" => "#E69F00"  # Orange
+    # )
+
+    # package_markers = Dict(
+    #     "Dynamax" => :circle,
+    #     "pykalman" => :square,
+    #     "StateSpaceDynamics.jl" => :diamond
+    # )
+
     package_colors = Dict(
-        "Dynamax" => "#0072B2",                # Blue
-        "pykalman" => "#009E73", # Green
+        "SSA" => "#009E73", # Green
         "StateSpaceDynamics.jl" => "#E69F00"  # Orange
     )
 
     package_markers = Dict(
-        "Dynamax" => :circle,
-        "pykalman" => :square,
+        "SSA" => :square,
         "StateSpaceDynamics.jl" => :diamond
     )
 
@@ -204,4 +214,6 @@ end
 
 # Usage:
 plot_hmm_benchmark("benchmarking/results/hmm_benchmark_results.csv")
-plot_lds_benchmark("benchmarking/results/lds_benchmark_results.csv")
+plot_lds_benchmark(
+    "benchmarking/results/lds_benchmark_results.csv",
+    "benchmarking/results/lds_benchmark_results.png")

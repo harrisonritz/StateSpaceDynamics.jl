@@ -1,72 +1,3 @@
-
-
-# using Pkg
-# Pkg.activate("benchmarking")
-
-# include("SSD_Benchmark.jl")
-# using .SSD_Benchmark
-# using BenchmarkTools
-# using StableRNGs
-# using Printf
-# using CSV
-# using DataFrames
-# using StateSpaceAnalysis
-# using Revise
-
-# # Benchmark configuration
-# struct BenchConfig
-#     latent_dims::Vector{Int}
-#     obs_dims::Vector{Int}
-#     seq_lengths::Vector{Int}
-#     n_iters::Int
-#     n_repeats::Int
-# end
-
-# BenchmarkTools.DEFAULT_PARAMETERS.seconds = 1.0
-
-# # ----------------------
-# # LDS Benchmarks
-# # ----------------------
-
-# lds_config = BenchConfig(
-#     [2, 4, 6, 8],  # latent_dims
-#     [2, 4, 6, 8],  # obs_dims
-#     [100, 500, 1000],  # seq_lengths
-#     100,  # n_iters
-#     5     # n_repeats
-# )
-
-# lds_implementations = [
-#     SSA_LDSImplem(),
-#     SSD_LDSImplem(),
-#     pykalman_LDSImplem(),
-#     Dynamax_LDSImplem()
-# ]
-
-# lds_results = []
-
-# latent_dim = 5
-# obs_dim = 10
-# seq_len = 100
-# impl = SSA_LDSImplem()
-
-
-# instance = LDSInstance(; latent_dim=latent_dim, obs_dim=obs_dim, num_trials=10, seq_length=seq_len)
-# rng = StableRNG(1234)
-# params = init_params(rng, instance)
-
-# ssd_model = build_model(SSD_LDSImplem(), instance, params)
-# _, y = build_data(rng, ssd_model, instance)
-
-# results_row = Dict{String, Any}()
-# results_row["config"] = (latent_dim=latent_dim, obs_dim=obs_dim, seq_len=seq_len)
-
-# model = build_model(impl, instance, params);
-# result = run_benchmark(impl, model, y)
-# %%
-
-
-
 using Pkg
 Pkg.activate("benchmarking")
 
@@ -79,6 +10,8 @@ using CSV
 using DataFrames
 using StateSpaceAnalysis
 using Revise
+using Accessors
+# using StateSpaceDynamics
 
 # Benchmark configuration
 struct BenchConfig
@@ -95,15 +28,25 @@ BenchmarkTools.DEFAULT_PARAMETERS.seconds = 1.0
 # LDS Benchmarks
 # ----------------------
 
-num_trials = 10
+
+save_name = "benchmarking/results/lds_benchmark_recoverx.csv"
+
+# lds_config = BenchConfig(
+#     [2, 4, 6, 8],  # latent_dims
+#     [2, 4, 6, 8],  # obs_dims
+#     [100, 500, 1000],  # seq_lengths
+#     100,  # n_iters
+#     5     # n_repeats
+# )
 
 lds_config = BenchConfig(
-    [2, 4, 6, 8],  # latent_dims
-    [2, 4, 6, 8],  # obs_dims
-    [100, 500, 1000],  # seq_lengths
-    100,  # n_iters
-    5     # n_repeats
+    [16, 64],  # latent_dims
+    [16, 64],  # obs_dims
+    [100],  # seq_lengths
+    10,  # n_trials
+    10     # n_repeats
 )
+
 
 # lds_implementations = [
 #     SSD_LDSImplem(),
@@ -123,18 +66,38 @@ lds_results = []
 # seq_len = 100
 # impl = SSA_LDSImplem()
 
+
+
+# Run 1 EM iteration to compile
+# instance = LDSInstance(; latent_dim=2, obs_dim=2, num_trials=10, seq_length=100)
+# rng = StableRNG(1234)
+# params = init_params(rng, instance)
+
+# ssd_model = build_model(SSD_LDSImplem(), instance, params)
+# x, y = build_data(rng, ssd_model, instance)
+
+# fit_model = deepcopy(model)
+# ssd_fit = StateSpaceDynamics.fit!(fit_model, y, max_iter=100, tol=1e-50)
+# xhat, phat = smooth(fit_model, y)
+
+
+
+
+
 for latent_dim in lds_config.latent_dims
     for obs_dim in lds_config.obs_dims
         # obs_dim < latent_dim && continue
         for seq_len in lds_config.seq_lengths
             println("\n→ Benchmarking LDS with latent_dim=$latent_dim, obs_dim=$obs_dim, seq_len=$seq_len")
 
-            instance = LDSInstance(; latent_dim=latent_dim, obs_dim=obs_dim, num_trials=num_trials, seq_length=seq_len)
+            instance = LDSInstance(; latent_dim=latent_dim, obs_dim=obs_dim, num_trials=lds_config.n_iters, seq_length=seq_len)
+            
             rng = StableRNG(1234)
             params = init_params(rng, instance)
+            params_init = init_params(rng, instance)
 
             ssd_model = build_model(SSD_LDSImplem(), instance, params)
-            _, y = build_data(rng, ssd_model, instance)
+            x, y = build_data(rng, ssd_model, instance)
 
             results_row = Dict{String, Any}()
             results_row["config"] = (latent_dim=latent_dim, obs_dim=obs_dim, seq_len=seq_len)
@@ -142,8 +105,14 @@ for latent_dim in lds_config.latent_dims
             for impl in lds_implementations
                 print("  Running $(string(impl))... ")
                 try
-                    model = build_model(impl, instance, params);
-                    result = run_benchmark(impl, model, y)
+                    # clear results Tuple
+                    model = build_model(impl, instance, deepcopy(params_init));
+                    result = run_benchmark(impl, deepcopy(model), y)
+                    
+                    recover = recover_states(impl, deepcopy(model), y, x)
+                    result = @insert result.R2 = recover.R2
+                    result = @insert result.R2aligned = recover.R2aligned
+                    
                     results_row[string(impl)] = result
 
                     if result.success
@@ -152,7 +121,7 @@ for latent_dim in lds_config.latent_dims
                         println("✗ failed")
                     end
                 catch e
-                    results_row[string(impl)] = (time=NaN, memory=0, allocs=0, success=false)
+                    results_row[string(impl)] = (time=NaN, memory=0, allocs=0, success=false, R2=NaN, R2aligned=NaN)
                     println("✗ exception: ", e)
                 end
             end
@@ -177,11 +146,13 @@ for row in lds_results
             time_sec = result[:time] / 1e9,
             memory = result[:memory],
             allocs = result[:allocs],
-            success = result[:success]
+            success = result[:success],
+            R2 = result[:R2],
+            R2aligned = result[:R2aligned]
         ))
     end
 end
-CSV.write("benchmarking/results/lds_benchmark_results.csv", df_lds)
+CSV.write(save_name, df_lds)
 
 
 # ----------------------
