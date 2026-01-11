@@ -28,64 +28,74 @@ function block_tridiagonal_inverse(
     B::Vector{<:AbstractMatrix{T}},
     C::Vector{<:AbstractMatrix{T}},
 ) where {T<:Real}
-    n = length(B)
-    block_size = size(B[1], 1)
 
-    # Initialize D and E arrays
-    D = Vector{Matrix{T}}(undef, n + 1)
-    E = Vector{Matrix{T}}(undef, n + 1)
-    D[1] = zeros(T, block_size, block_size)
-    E[n + 1] = zeros(T, block_size, block_size)
+    n  = length(B)
+    bs = size(B[1], 1)
 
-    # Initialize λii and λij arrays
-    λii = Array{T}(undef, block_size, block_size, n)
-    λij = Array{T}(undef, block_size, block_size, n - 1)
-    identity = Matrix{T}(I, block_size, block_size)
+    # Preallocate D and E blocks (all blocks exist and will be overwritten in-place)
+    D = [zeros(T, bs, bs) for _ in 1:(n+1)]
+    E = [zeros(T, bs, bs) for _ in 1:(n+1)]
 
-    # Use conditional indexing to avoid mutating caller arrays and reduce
-    # allocations: create a single zero block to reuse whenever an edge
-    # reference is needed instead of allocating extended vectors.
-    zero_block = zeros(T, block_size, block_size)
+    # Outputs
+    λii = Array{T}(undef, bs, bs, n)
+    λij = Array{T}(undef, bs, bs, n-1)
 
-    # Preallocate LU factorization arrays
-    lu_D = Vector{LU{T,Matrix{T}}}(undef, n)
-    lu_E = Vector{LU{T,Matrix{T}}}(undef, n)
-    lu_S = Vector{LU{T,Matrix{T}}}(undef, n)
+    Ibs = Matrix{T}(I, bs, bs)
+    Z   = zeros(T, bs, bs)  # reusable "edge" block
 
-    # Forward sweep for D (use conditional indexing to avoid allocations)
+    # Work buffers (reused; LU overwrites its input)
+    M     = zeros(T, bs, bs)
+    term1 = zeros(T, bs, bs)
+    term2 = zeros(T, bs, bs)
+    S     = zeros(T, bs, bs)
+
     for i in 1:n
-        Ai = i == 1 ? zero_block : A[i - 1]
-        Ci = i <= length(C) ? C[i] : zero_block
-        M = B[i] - Ai * D[i]
-        lu_D[i] = lu(M)
-        D[i + 1] = lu_D[i] \ Ci
+        Ai = (i == 1) ? Z : A[i-1]
+        Ci = (i <= length(C)) ? C[i] : Z
+
+        copyto!(M, B[i])                         # M = B[i]
+        mul!(M, Ai, D[i], -one(T), one(T))       # M = B[i] - Ai*D[i]
+        F = lu!(M)                               # in-place LU on M
+        ldiv!(D[i+1], F, Ci)                     # D[i+1] = F \ Ci (no alloc)
     end
 
-    # Backward sweep for E (use conditional indexing)
     for i in n:-1:1
-        Ci = i <= length(C) ? C[i] : zero_block
-        Ai = i == 1 ? zero_block : A[i - 1]
-        M = B[i] - Ci * E[i + 1]
-        lu_E[i] = lu(M)
-        E[i] = lu_E[i] \ Ai
+        Ci = (i <= length(C)) ? C[i] : Z
+        Ai = (i == 1) ? Z : A[i-1]
+
+        copyto!(M, B[i])                         # M = B[i]
+        mul!(M, Ci, E[i+1], -one(T), one(T))     # M = B[i] - Ci*E[i+1]
+        F = lu!(M)
+        ldiv!(E[i], F, Ai)                       # E[i] = F \ Ai (no alloc)
     end
 
-    # Compute λii
     for i in 1:n
-        term1 = identity - D[i + 1] * E[i + 1]
-        Ai = i == 1 ? zero_block : A[i - 1]
-        term2 = B[i] - Ai * D[i]
-        S = term2 * term1
-        lu_S[i] = lu(S)
-        λii[:, :, i] = lu_S[i] \ identity
+        # term1 = I - D[i+1]*E[i+1]
+        copyto!(term1, Ibs)
+        mul!(term1, D[i+1], E[i+1], -one(T), one(T))
+
+        # term2 = B[i] - A[i-1]*D[i]
+        Ai = (i == 1) ? Z : A[i-1]
+        copyto!(term2, B[i])
+        mul!(term2, Ai, D[i], -one(T), one(T))
+
+        # S = term2 * term1
+        mul!(S, term2, term1)
+        F = lu!(S)
+
+        @views ldiv!(λii[:, :, i], F, Ibs)        # λii[:,:,i] = F \ I
     end
 
-    # Compute λij
     for i in 2:n
-        λij[:, :, i - 1] = E[i] * λii[:, :, i - 1]
+        @views mul!(λij[:, :, i-1], E[i], λii[:, :, i-1])
     end
 
-    return λii, -λij
+    # avoid allocating -λij
+    for k in eachindex(λij)
+        λij[k] = -λij[k]
+    end
+
+    return λii, λij
 end
 
 """
