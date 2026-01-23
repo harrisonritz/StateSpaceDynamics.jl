@@ -31,3 +31,4 @@ notebooks/debugging.jl
 benchmarking/.CondaPkg
 benchmarking/.DEAD_CondaPkg
 benchmarking/benchmark.jl
+docs/testfile.jl

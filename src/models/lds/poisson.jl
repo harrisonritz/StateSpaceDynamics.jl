@@ -609,29 +609,58 @@ function gradient_observation_model!(
     log_d::AbstractVector{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractArray{T,3},
-    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
+    tasks_per_thread::Int=2,
 ) where {T<:Real}
     trials = length(tfs.FilterSmooths)
+    npar = length(grad)
 
-    fill!(grad, zero(T))
+    # Partition work into chunks and spawn tasks: 
+    # see https://julialang.org/blog/2023/07/PSA-dont-use-threadid/ for details.
+    chunk_size = max(1, trials ÷ (tasks_per_thread * Threads.nthreads()))
+    chunks = partition(1:trials, chunk_size)
 
-    # Accumulate gradients from all trials
-    @threads for k in 1:trials
-        fs = tfs[k]
-        weights = isnothing(w) ? nothing : w[k]
+    tasks = Task[]
+    @sync begin
+        for chunk in chunks
+            push!(
+                tasks,
+                Threads.@spawn begin
+                    acc = zeros(T, npar)   # task-local accumulator
+                    tmp = zeros(T, npar)   # task-local scratch
 
-        # Local gradient for this trial
-        local_grad = zeros(T, length(grad))
+                    for k in chunk
+                        fill!(tmp, zero(T))
 
-        gradient_observation_model_single_trial!(
-            local_grad, C, log_d, fs.E_z, fs.p_smooth, view(y,:,:,k), weights
-        )
+                        fs = tfs[k]
+                        weights = isnothing(w) ? nothing : w[k]
 
-        # Thread-safe update of global gradient
-        grad .+= local_grad
+                        gradient_observation_model_single_trial!(
+                            tmp, C, log_d, fs.E_z, fs.p_smooth, view(y,:,:,k), weights
+                        )
+
+                        @simd for i in 1:npar
+                            acc[i] += tmp[i]
+                        end
+                    end
+
+                    return acc
+                end
+            )
+        end
     end
 
-    return grad .*= -1
+    # Deterministic reduction on the caller thread
+    fill!(grad, zero(T))
+    for t in tasks
+        acc = fetch(t)::Vector{T}  # type assertion avoids type instability from fetch
+        @simd for i in 1:npar
+            grad[i] += acc[i]
+        end
+    end
+
+    @. grad = -grad
+    return grad
 end
 
 """

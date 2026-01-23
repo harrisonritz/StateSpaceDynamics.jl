@@ -15,7 +15,8 @@ using Statistics
 using StatsBase
 using StatsFuns
 
-using Base.Threads: @threads
+using Base.Threads: @threads, @spawn
+using Base.Iterators: partition
 using Base: show
 
 # Core types and utilities

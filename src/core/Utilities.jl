@@ -28,43 +28,42 @@ function block_tridiagonal_inverse(
     B::Vector{<:AbstractMatrix{T}},
     C::Vector{<:AbstractMatrix{T}},
 ) where {T<:Real}
-
-    n  = length(B)
+    n = length(B)
     bs = size(B[1], 1)
 
     # Preallocate D and E blocks (all blocks exist and will be overwritten in-place)
-    D = [zeros(T, bs, bs) for _ in 1:(n+1)]
-    E = [zeros(T, bs, bs) for _ in 1:(n+1)]
+    D = [zeros(T, bs, bs) for _ in 1:(n + 1)]
+    E = [zeros(T, bs, bs) for _ in 1:(n + 1)]
 
     # Outputs
     λii = Array{T}(undef, bs, bs, n)
     λij = Array{T}(undef, bs, bs, n-1)
 
     Ibs = Matrix{T}(I, bs, bs)
-    Z   = zeros(T, bs, bs)  # reusable "edge" block
+    Z = zeros(T, bs, bs)  # reusable "edge" block
 
     # Work buffers (reused; LU overwrites its input)
-    M     = zeros(T, bs, bs)
+    M = zeros(T, bs, bs)
     term1 = zeros(T, bs, bs)
     term2 = zeros(T, bs, bs)
-    S     = zeros(T, bs, bs)
+    S = zeros(T, bs, bs)
 
     for i in 1:n
-        Ai = (i == 1) ? Z : A[i-1]
+        Ai = (i == 1) ? Z : A[i - 1]
         Ci = (i <= length(C)) ? C[i] : Z
 
         copyto!(M, B[i])                         # M = B[i]
         mul!(M, Ai, D[i], -one(T), one(T))       # M = B[i] - Ai*D[i]
         F = lu!(M)                               # in-place LU on M
-        ldiv!(D[i+1], F, Ci)                     # D[i+1] = F \ Ci (no alloc)
+        ldiv!(D[i + 1], F, Ci)                     # D[i+1] = F \ Ci (no alloc)
     end
 
     for i in n:-1:1
         Ci = (i <= length(C)) ? C[i] : Z
-        Ai = (i == 1) ? Z : A[i-1]
+        Ai = (i == 1) ? Z : A[i - 1]
 
         copyto!(M, B[i])                         # M = B[i]
-        mul!(M, Ci, E[i+1], -one(T), one(T))     # M = B[i] - Ci*E[i+1]
+        mul!(M, Ci, E[i + 1], -one(T), one(T))     # M = B[i] - Ci*E[i+1]
         F = lu!(M)
         ldiv!(E[i], F, Ai)                       # E[i] = F \ Ai (no alloc)
     end
@@ -72,10 +71,10 @@ function block_tridiagonal_inverse(
     for i in 1:n
         # term1 = I - D[i+1]*E[i+1]
         copyto!(term1, Ibs)
-        mul!(term1, D[i+1], E[i+1], -one(T), one(T))
+        mul!(term1, D[i + 1], E[i + 1], -one(T), one(T))
 
         # term2 = B[i] - A[i-1]*D[i]
-        Ai = (i == 1) ? Z : A[i-1]
+        Ai = (i == 1) ? Z : A[i - 1]
         copyto!(term2, B[i])
         mul!(term2, Ai, D[i], -one(T), one(T))
 
@@ -87,7 +86,7 @@ function block_tridiagonal_inverse(
     end
 
     for i in 2:n
-        @views mul!(λij[:, :, i-1], E[i], λii[:, :, i-1])
+        @views mul!(λij[:, :, i - 1], E[i], λii[:, :, i - 1])
     end
 
     # avoid allocating -λij
