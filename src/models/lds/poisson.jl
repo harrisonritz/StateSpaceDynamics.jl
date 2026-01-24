@@ -272,9 +272,10 @@ function Hessian(
 
     # Pre-computed values for the Hessian
     state_dim = size(A, 1)
-    xt_given_xt_1 = -(Q_chol \ Matrix{T}(I, state_dim, state_dim))
+    I_mat = Matrix{T}(I, state_dim, state_dim)
+    xt_given_xt_1 = -(Q_chol \ I_mat)
     xt1_given_xt = -A' * (Q_chol \ A)
-    x_t = -(P0_chol \ Matrix{T}(I, state_dim, state_dim))
+    x_t = -(P0_chol \ I_mat)
 
     Q_middle = xt1_given_xt + xt_given_xt_1
     Q_first = x_t + xt1_given_xt
@@ -364,7 +365,8 @@ function Q_observation_model(
             mul!(h, C, Ez_t)          # h = C * E_z[:, t, k]
             h .+= d
 
-            ρ .= T(0.5) .* CC * vec(P_t)
+            mul!(ρ, CC, reshape(P_t, :))
+            ρ .*= T(0.5)
             ŷ = exp.(h .+ ρ)
 
             Q_val += sum(y_t .* h .- ŷ)
@@ -415,9 +417,7 @@ function Q_observation_model(
         end
 
         # Compute ŷ = exp(h + ρ) in-place, reusing ρ as ŷ
-        for i in 1:obs_dim
-            ρ[i] = exp(h[i] + ρ[i])
-        end
+        @. ρ = exp(h + ρ)
 
         # Compute weighted sum(y_t .* h .- ŷ)
         for i in 1:obs_dim
@@ -581,13 +581,9 @@ function gradient_observation_model_single_trial!(
         # Pre-compute CP = C * P_smooth_t
         mul!(CP, C, P_smooth_t)
 
-        # Compute ρ efficiently 
-        for i in 1:obs_dim
+        # Compute ρ and λ = exp(h + ρ)
+        @views for i in 1:obs_dim
             ρ[i] = T(0.5) * dot(C[i, :], CP[i, :])
-        end
-
-        # Compute λ = exp(h + ρ)
-        for i in 1:obs_dim
             λ[i] = exp(h[i] + ρ[i])
         end
 

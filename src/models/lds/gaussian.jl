@@ -364,10 +364,11 @@ function Hessian(
     H_super_entry = Matrix(H_sub_entry')
 
     # Calculate main diagonal terms
+    I_mat = Matrix{T}(I, state_dim, state_dim)
     yt_given_xt = -C' * (R_chol \ C)
-    xt_given_xt_1 = -(Q_chol \ Matrix{T}(I, state_dim, state_dim))
+    xt_given_xt_1 = -(Q_chol \ I_mat)
     xt1_given_xt = -A' * (Q_chol \ A)
-    x_t = -(P0_chol \ Matrix{T}(I, state_dim, state_dim))
+    x_t = -(P0_chol \ I_mat)
 
     # Build off-diagonals
     for i in 1:(tsteps - 1)
@@ -997,13 +998,13 @@ function update_Q!(
 
             @. innovation_cov = Σt - temp1 - temp2 + temp4
 
-            # Add bias terms
-            innovation_cov .-= μt * b'
-            innovation_cov .-= b * μt'
+            # Add bias terms using in-place rank-1 updates (no temporaries)
             mul!(temp5, A, μtm1)
-            innovation_cov .+= temp5 * b'
-            innovation_cov .+= b * temp5'
-            innovation_cov .+= b * b'
+            mul!(innovation_cov, μt, b', -one(T), one(T))
+            mul!(innovation_cov, b, μt', -one(T), one(T))
+            mul!(innovation_cov, temp5, b', one(T), one(T))
+            mul!(innovation_cov, b, temp5', one(T), one(T))
+            mul!(innovation_cov, b, b', one(T), one(T))
 
             Q_sum .+= weight .* innovation_cov
             total_weight += weight
