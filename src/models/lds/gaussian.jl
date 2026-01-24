@@ -347,11 +347,12 @@ function Hessian(
     C, R = lds.obs_model.C, lds.obs_model.R
 
     tsteps = size(y, 2)
+    state_dim = size(A, 1)
 
-    # Pre-compute inverses
-    inv_R = Symmetric(inv(R))
-    inv_Q = Symmetric(inv(Q))
-    inv_P0 = Symmetric(inv(P0))
+    # Pre-compute Cholesky factorizations
+    R_chol = cholesky(Symmetric(R))
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
 
     # Pre-allocate all blocks
     H_sub = Vector{Matrix{T}}(undef, tsteps - 1)
@@ -359,14 +360,14 @@ function Hessian(
     H_diag = Vector{Matrix{T}}(undef, tsteps)
 
     # Off-diagonal terms
-    H_sub_entry = inv_Q * A
+    H_sub_entry = Q_chol \ A
     H_super_entry = Matrix(H_sub_entry')
 
     # Calculate main diagonal terms
-    yt_given_xt = -C' * inv_R * C
-    xt_given_xt_1 = -inv_Q
-    xt1_given_xt = -A' * inv_Q * A
-    x_t = -inv_P0
+    yt_given_xt = -C' * (R_chol \ C)
+    xt_given_xt_1 = -(Q_chol \ Matrix{T}(I, state_dim, state_dim))
+    xt1_given_xt = -A' * (Q_chol \ A)
+    x_t = -(P0_chol \ Matrix{T}(I, state_dim, state_dim))
 
     # Build off-diagonals
     for i in 1:(tsteps - 1)

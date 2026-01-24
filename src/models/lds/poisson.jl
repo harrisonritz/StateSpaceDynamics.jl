@@ -39,9 +39,9 @@ function loglikelihood(
     # Convert the log firing rate to firing rate
     d = exp.(plds.obs_model.log_d)
 
-    # Pre-compute inverses
-    inv_p0 = inv(plds.state_model.P0)
-    inv_Q = inv(plds.state_model.Q)
+    # Pre-compute Cholesky factorizations
+    P0_chol = cholesky(Symmetric(plds.state_model.P0))
+    Q_chol = cholesky(Symmetric(plds.state_model.Q))
 
     # Get dimensions
     C = plds.obs_model.C
@@ -57,7 +57,7 @@ function loglikelihood(
 
     # Prior term p(x₁) goes to t = 1
     dx1 = @view(x[:, 1]) .- plds.state_model.x0
-    ll[1] += -R(0.5) * dot(dx1, inv_p0 * dx1)
+    ll[1] += -R(0.5) * dot(dx1, P0_chol \ dx1)
 
     # Transition terms p(xₜ|xₜ₋₁) go to their respective t (t ≥ 2)
     A = plds.state_model.A
@@ -66,7 +66,7 @@ function loglikelihood(
 
     @views for t in 2:tsteps
         trans_tmp .= x[:, t] .- (A * x[:, t - 1] .+ b)
-        ll[t] += -R(0.5) * dot(trans_tmp, inv_Q * trans_tmp)
+        ll[t] += -R(0.5) * dot(trans_tmp, Q_chol \ trans_tmp)
     end
 
     return ll
@@ -118,9 +118,9 @@ function Gradient(
     latent_dim = lds.latent_dim
     obs_dim = lds.obs_dim
 
-    # Precompute matrix inverses
-    inv_P0 = inv(P0)
-    inv_Q = inv(Q)
+    # Precompute Cholesky factorizations
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
 
     # Pre-allocate gradient
     grad = zeros(T, latent_dim, tsteps)
@@ -159,22 +159,24 @@ function Gradient(
             # Compute x[:, 2] - A * x[:, t]
             state_diff .= x[:, 2] .- Ax_t
 
-            # Compute inv_Q * (x[:, 2] - A * x[:, t])
-            mul!(temp_grad, inv_Q, state_diff)
+            # Compute Q \ (x[:, 2] - A * x[:, t])
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol, temp_grad)
 
-            # Compute A' * inv_Q * (x[:, 2] - A * x[:, t])
+            # Compute A' * Q \ (x[:, 2] - A * x[:, t])
             mul!(grad[:, t], A', temp_grad)
 
             # Add common_term
             grad[:, t] .+= common_term
 
-            # Subtract inv_P0 * (x[:, t] - x0)
+            # Subtract P0 \ (x[:, t] - x0)
             state_diff .= x[:, t] .- x0
-            mul!(temp_grad, inv_P0, state_diff)
+            copyto!(temp_grad, state_diff)
+            ldiv!(P0_chol, temp_grad)
             grad[:, t] .-= temp_grad
 
         elseif t == tsteps
-            # Last time step: common_term - inv_Q * (x[:, t] - A * x[:, t-1])
+            # Last time step: common_term - Q \ (x[:, t] - A * x[:, t-1])
 
             # Compute A * x[:, t-1]
             mul!(Ax_prev, A, x[:, t - 1])
@@ -182,29 +184,32 @@ function Gradient(
             # Compute x[:, t] - A * x[:, t-1]
             state_diff .= x[:, t] .- Ax_prev
 
-            # Compute inv_Q * (x[:, t] - A * x[:, t-1])
-            mul!(temp_grad, inv_Q, state_diff)
+            # Compute Q \ (x[:, t] - A * x[:, t-1])
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol, temp_grad)
 
-            # grad[:, t] = common_term - inv_Q * (...)
+            # grad[:, t] = common_term - Q \ (...)
             grad[:, t] .= common_term .- temp_grad
 
         else
-            # Intermediate time steps: 
-            # common_term + A' * inv_Q * (x[:, t+1] - A * x[:, t]) - inv_Q * (x[:, t] - A * x[:, t-1])
+            # Intermediate time steps:
+            # common_term + A' * Q \ (x[:, t+1] - A * x[:, t]) - Q \ (x[:, t] - A * x[:, t-1])
 
-            # First part: A' * inv_Q * (x[:, t+1] - A * x[:, t])
+            # First part: A' * Q \ (x[:, t+1] - A * x[:, t])
             mul!(Ax_t, A, x[:, t])                   # Ax_t = A * x[:, t]
-            state_diff .= x[:, t + 1] .- Ax_t          # state_diff = x[:, t+1] - A * x[:, t]
-            mul!(temp_grad, inv_Q, state_diff)       # temp_grad = inv_Q * state_diff
+            state_diff .= x[:, t + 1] .- Ax_t       # state_diff = x[:, t+1] - A * x[:, t]
+            copyto!(temp_grad, state_diff)           # temp_grad = state_diff
+            ldiv!(Q_chol, temp_grad)                 # temp_grad = Q \ state_diff
             mul!(grad[:, t], A', temp_grad)          # grad[:, t] = A' * temp_grad
 
             # Add common_term
             grad[:, t] .+= common_term
 
-            # Second part: - inv_Q * (x[:, t] - A * x[:, t-1])
-            mul!(Ax_prev, A, x[:, t - 1])              # Ax_prev = A * x[:, t-1]
-            state_diff .= x[:, t] .- Ax_prev         # state_diff = x[:, t] - A * x[:, t-1]
-            mul!(temp_grad, inv_Q, state_diff)       # temp_grad = inv_Q * state_diff
+            # Second part: - Q \ (x[:, t] - A * x[:, t-1])
+            mul!(Ax_prev, A, x[:, t - 1])           # Ax_prev = A * x[:, t-1]
+            state_diff .= x[:, t] .- Ax_prev        # state_diff = x[:, t] - A * x[:, t-1]
+            copyto!(temp_grad, state_diff)           # temp_grad = state_diff
+            ldiv!(Q_chol, temp_grad)                 # temp_grad = Q \ state_diff
             grad[:, t] .-= temp_grad                 # grad[:, t] -= temp_grad
         end
     end
@@ -237,11 +242,11 @@ function Hessian(
 
     # Pre-compute a few things
     tsteps = size(y, 2)
-    inv_Q = inv(Symmetric(Q))
-    inv_P0 = inv(Symmetric(P0))
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
 
     # Calculate super and sub diagonals
-    H_sub_entry = inv_Q * A
+    H_sub_entry = Q_chol \ A
     H_super_entry = permutedims(H_sub_entry)
 
     # Fill the super and sub diagonals
@@ -266,9 +271,10 @@ function Hessian(
     end
 
     # Pre-computed values for the Hessian
-    xt_given_xt_1 = -inv_Q
-    xt1_given_xt = -A' * inv_Q * A
-    x_t = -inv_P0
+    state_dim = size(A, 1)
+    xt_given_xt_1 = -(Q_chol \ Matrix{T}(I, state_dim, state_dim))
+    xt1_given_xt = -A' * (Q_chol \ A)
+    x_t = -(P0_chol \ Matrix{T}(I, state_dim, state_dim))
 
     Q_middle = xt1_given_xt + xt_given_xt_1
     Q_first = x_t + xt1_given_xt
