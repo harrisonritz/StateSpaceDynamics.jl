@@ -23,6 +23,8 @@ notebooks/benchmarking.ipynb
 notebooks/regression_debug.ipynb
 notebooks/benchmarking.jl
 notebooks/debugging.jl
+docs/testfile.jl
+benchmarking/testfile.jl
 
 # Paper files
 /paper/jats
@@ -31,4 +33,3 @@ notebooks/debugging.jl
 benchmarking/.CondaPkg
 benchmarking/.DEAD_CondaPkg
 benchmarking/benchmark.jl
-docs/testfile.jl
