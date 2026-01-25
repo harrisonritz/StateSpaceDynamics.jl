@@ -319,7 +319,7 @@ function forward!(
     ll = FB.loglikelihoods     # K×T (log)
     K, T = size(α, 1), size(α, 2)
 
-    @inbounds @views begin
+    @views begin
         # t = 1
         for k in 1:K
             α[k, 1] = logπ[k] + ll[k, 1]
@@ -367,7 +367,7 @@ function backward!(model::AbstractHMM, FB::ForwardBackward, logA::AbstractMatrix
     ll = FB.loglikelihoods
     K, T = size(β, 1), size(β, 2)
 
-    @inbounds @views begin
+   @views begin
         # β_T = 0 in log-space
         for i in 1:K
             β[i, T] = 0.0
@@ -408,7 +408,7 @@ function calculate_γ!(::AbstractHMM, FB::ForwardBackward)
     β = FB.β
     K, T = size(γ, 1), size(γ, 2)
 
-    @inbounds @views begin
+    @views begin
         # γ = α + β
         γ .= α .+ β
 

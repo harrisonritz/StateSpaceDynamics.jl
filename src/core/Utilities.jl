@@ -257,6 +257,767 @@ function block_tridgm(
     return sparse(I, J, V, N, N)
 end
 
+# Block Tridiagonal Workspace
+"""
+    BlockTridiagonalWorkspace{T<:Real}
+
+Pre-allocated workspace for block tridiagonal operations in LDS smoothing.
+Holds all temporary buffers needed by `Hessian!`, `block_tridgm!`, and
+`block_tridiagonal_inverse!` to avoid repeated allocations during EM iterations.
+"""
+struct BlockTridiagonalWorkspace{T<:Real}
+    block_size::Int
+    n_blocks::Int
+
+    # Hessian block storage
+    H_diag::Vector{Matrix{T}}
+    H_sub::Vector{Matrix{T}}
+    H_super::Vector{Matrix{T}}
+
+    # Sparse matrix with fixed sparsity pattern
+    H_sparse::SparseMatrixCSC{T,Int}
+    # Precomputed map from block (k, i, j) to nzval index for zero-allocation writes
+    nzval_map::Vector{Int}
+
+    # block_tridiagonal_inverse buffers
+    D::Vector{Matrix{T}}
+    E::Vector{Matrix{T}}
+    M::Matrix{T}
+    term1::Matrix{T}
+    term2::Matrix{T}
+    S::Matrix{T}
+    Ibs::Matrix{T}
+    Z::Matrix{T}
+
+    # Negated blocks
+    neg_diag::Vector{Matrix{T}}
+    neg_sub::Vector{Matrix{T}}
+    neg_super::Vector{Matrix{T}}
+end
+
+"""
+    BlockTridiagonalWorkspace(::Type{T}, block_size::Int, n_blocks::Int)
+
+Construct a preallocated workspace for block tridiagonal operations with the
+given block size (latent dimension) and number of blocks (timesteps).
+"""
+function BlockTridiagonalWorkspace(::Type{T}, block_size::Int, n_blocks::Int) where {T<:Real}
+    H_diag = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
+    H_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
+    H_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
+
+    H_sparse = _build_block_tridiag_pattern(T, block_size, n_blocks)
+    nzval_map = _build_nzval_map(H_sparse, block_size, n_blocks)
+
+    D = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
+    E = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
+    M = zeros(T, block_size, block_size)
+    term1 = zeros(T, block_size, block_size)
+    term2 = zeros(T, block_size, block_size)
+    S = zeros(T, block_size, block_size)
+    Ibs = Matrix{T}(I, block_size, block_size)
+    Z = zeros(T, block_size, block_size)
+
+    neg_diag = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
+    neg_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
+    neg_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
+
+    return BlockTridiagonalWorkspace{T}(
+        block_size, n_blocks,
+        H_diag, H_sub, H_super,
+        H_sparse, nzval_map,
+        D, E, M, term1, term2, S, Ibs, Z,
+        neg_diag, neg_sub, neg_super,
+    )
+end
+
+"""
+    SmoothWorkspace{T<:Real}
+
+Pre-allocated workspace for the full LDS smoothing + EM pipeline.
+Houses a `BlockTridiagonalWorkspace` for block tridiagonal operations, plus all
+buffers needed by `loglikelihood!`, `Gradient!`, `Hessian!`, and M-step updates
+to avoid repeated allocations during EM iterations.
+"""
+struct SmoothWorkspace{T<:Real}
+    # Sub-workspace for block tridiagonal operations
+    btd::BlockTridiagonalWorkspace{T}
+
+    # Pre-computed constant terms (filled by compute_smooth_constants!)
+    # Cholesky upper triangular factors
+    R_chol_U::Matrix{T}       # (obs_dim × obs_dim)
+    Q_chol_U::Matrix{T}       # (latent_dim × latent_dim)
+    P0_chol_U::Matrix{T}      # (latent_dim × latent_dim)
+
+    # Derived terms for Gradient
+    C_inv_R::Matrix{T}        # (R_chol \ C)' = C'inv(R), size (latent_dim × obs_dim)
+    A_inv_Q::Matrix{T}        # (Q_chol \ A)' = A'inv(Q), size (latent_dim × latent_dim)
+
+    # Derived terms for Hessian block templates
+    H_sub_entry::Matrix{T}    # Q_chol \ A, size (latent_dim × latent_dim)
+    H_super_entry::Matrix{T}  # H_sub_entry', size (latent_dim × latent_dim)
+    yt_given_xt::Matrix{T}    # -C'*(R_chol \ C), size (latent_dim × latent_dim)
+    xt_given_xt_1::Matrix{T}  # -(Q_chol \ I), size (latent_dim × latent_dim)
+    xt1_given_xt::Matrix{T}   # -A'*(Q_chol \ A), size (latent_dim × latent_dim)
+    x_t::Matrix{T}            # -(P0_chol \ I), size (latent_dim × latent_dim)
+
+    # Optimizer buffers (reused across EM iterations) 
+    X₀::Vector{T}             # Vectorized latent path (latent_dim * tsteps)
+    grad_buf::Matrix{T}       # Gradient output buffer (latent_dim × tsteps)
+    grad_vec::Vector{T}       # Vectorized gradient for TwiceDifferentiable (latent_dim * tsteps)
+    initial_h::SparseMatrixCSC{T,Int}  # Sparse Hessian (avoid copy each iteration)
+
+    # Gradient temp vectors
+    dxt::Vector{T}            # (latent_dim,)
+    dxt_next::Vector{T}       # (latent_dim,)
+    dyt::Vector{T}            # (obs_dim,)
+    tmp1::Vector{T}           # (latent_dim,)
+    tmp2::Vector{T}           # (latent_dim,)
+    tmp3::Vector{T}           # (latent_dim,)
+
+    # loglikelihood temp vectors
+    ll_vec::Vector{T}         # (tsteps,)
+    temp_dx::Vector{T}        # (latent_dim,)
+    temp_dy::Vector{T}        # (obs_dim,)
+    temp_solve_Q::Vector{T}   # (latent_dim,)
+    temp_solve_R::Vector{T}   # (obs_dim,)
+
+    # Hessian temp matrix
+    I_mat::Matrix{T}          # Identity (latent_dim × latent_dim)
+
+    # M-step buffers
+    Sxz::Matrix{T}            # (latent_dim × latent_dim+1) for update_A_b!
+    Szz_Ab::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_A_b!
+    Syz::Matrix{T}            # (obs_dim × latent_dim+1) for update_C_d!
+    Szz_Cd::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_C_d!
+    Q_sum::Matrix{T}          # (latent_dim × latent_dim)
+    R_sum::Matrix{T}          # (obs_dim × obs_dim)
+    S0_sum::Matrix{T}         # (latent_dim × latent_dim)
+    # update_Q! temps
+    temp_Q1::Matrix{T}        # (latent_dim × latent_dim)
+    temp_Q2::Matrix{T}        # (latent_dim × latent_dim)
+    temp_Q3::Matrix{T}        # (latent_dim × latent_dim)
+    temp_Q4::Matrix{T}        # (latent_dim × latent_dim)
+    temp_Q5::Vector{T}        # (latent_dim,)
+    innovation_cov::Matrix{T} # (latent_dim × latent_dim)
+    # update_R! temps
+    innovation::Vector{T}     # (obs_dim,)
+    Czt::Vector{T}            # (obs_dim,)
+    temp_R_matrix::Matrix{T}  # (obs_dim × latent_dim)
+    outer_product::Matrix{T}  # (latent_dim × latent_dim)
+    state_uncertainty::Matrix{T} # (latent_dim × latent_dim)
+    # update_C_d! temps
+    work_yz::Matrix{T}        # (obs_dim × latent_dim)
+    work_outer::Matrix{T}     # (latent_dim × latent_dim)
+end
+
+"""
+    SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int)
+
+Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
+"""
+function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) where {T<:Real}
+    btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
+
+    # Pre-computed constant terms (will be filled by compute_smooth_constants!)
+    R_chol_U = zeros(T, obs_dim, obs_dim)
+    Q_chol_U = zeros(T, latent_dim, latent_dim)
+    P0_chol_U = zeros(T, latent_dim, latent_dim)
+    C_inv_R = zeros(T, latent_dim, obs_dim)
+    A_inv_Q = zeros(T, latent_dim, latent_dim)
+    H_sub_entry = zeros(T, latent_dim, latent_dim)
+    H_super_entry = zeros(T, latent_dim, latent_dim)
+    yt_given_xt = zeros(T, latent_dim, latent_dim)
+    xt_given_xt_1 = zeros(T, latent_dim, latent_dim)
+    xt1_given_xt = zeros(T, latent_dim, latent_dim)
+    x_t = zeros(T, latent_dim, latent_dim)
+
+    # Optimizer buffers
+    X₀ = zeros(T, latent_dim * tsteps)
+    grad_buf = zeros(T, latent_dim, tsteps)
+    grad_vec = zeros(T, latent_dim * tsteps)
+    initial_h = copy(btd.H_sparse)
+
+    # Gradient temp vectors
+    dxt = zeros(T, latent_dim)
+    dxt_next = zeros(T, latent_dim)
+    dyt = zeros(T, obs_dim)
+    tmp1 = zeros(T, latent_dim)
+    tmp2 = zeros(T, latent_dim)
+    tmp3 = zeros(T, latent_dim)
+
+    # loglikelihood temp vectors
+    ll_vec = zeros(T, tsteps)
+    temp_dx = zeros(T, latent_dim)
+    temp_dy = zeros(T, obs_dim)
+    temp_solve_Q = zeros(T, latent_dim)
+    temp_solve_R = zeros(T, obs_dim)
+
+    # Hessian temp matrix
+    I_mat = Matrix{T}(I, latent_dim, latent_dim)
+
+    # M-step buffers
+    Sxz = zeros(T, latent_dim, latent_dim + 1)
+    Szz_Ab = zeros(T, latent_dim + 1, latent_dim + 1)
+    Syz = zeros(T, obs_dim, latent_dim + 1)
+    Szz_Cd = zeros(T, latent_dim + 1, latent_dim + 1)
+    Q_sum = zeros(T, latent_dim, latent_dim)
+    R_sum = zeros(T, obs_dim, obs_dim)
+    S0_sum = zeros(T, latent_dim, latent_dim)
+    temp_Q1 = zeros(T, latent_dim, latent_dim)
+    temp_Q2 = zeros(T, latent_dim, latent_dim)
+    temp_Q3 = zeros(T, latent_dim, latent_dim)
+    temp_Q4 = zeros(T, latent_dim, latent_dim)
+    temp_Q5 = zeros(T, latent_dim)
+    innovation_cov = zeros(T, latent_dim, latent_dim)
+    innovation = zeros(T, obs_dim)
+    Czt = zeros(T, obs_dim)
+    temp_R_matrix = zeros(T, obs_dim, latent_dim)
+    outer_product = zeros(T, latent_dim, latent_dim)
+    state_uncertainty = zeros(T, latent_dim, latent_dim)
+    work_yz = zeros(T, obs_dim, latent_dim)
+    work_outer = zeros(T, latent_dim, latent_dim)
+
+    return SmoothWorkspace{T}(
+        btd,
+        R_chol_U, Q_chol_U, P0_chol_U,
+        C_inv_R, A_inv_Q,
+        H_sub_entry, H_super_entry,
+        yt_given_xt, xt_given_xt_1, xt1_given_xt, x_t,
+        X₀, grad_buf, grad_vec, initial_h,
+        dxt, dxt_next, dyt, tmp1, tmp2, tmp3,
+        ll_vec, temp_dx, temp_dy, temp_solve_Q, temp_solve_R,
+        I_mat,
+        Sxz, Szz_Ab, Syz, Szz_Cd,
+        Q_sum, R_sum, S0_sum,
+        temp_Q1, temp_Q2, temp_Q3, temp_Q4, temp_Q5, innovation_cov,
+        innovation, Czt, temp_R_matrix, outer_product, state_uncertainty,
+        work_yz, work_outer,
+    )
+end
+
+"""
+    compute_smooth_constants!(ws::SmoothWorkspace{T}, lds)
+
+Pre-compute and cache all Cholesky factors and derived terms that are constant
+within a single `smooth!` call (i.e., depend only on model parameters, not on x).
+Must be called once at the start of each `smooth!` invocation.
+"""
+function compute_smooth_constants!(
+    ws::SmoothWorkspace{T},
+    lds,
+) where {T<:Real}
+    A = lds.state_model.A
+    Q = lds.state_model.Q
+    P0 = lds.state_model.P0
+    C = lds.obs_model.C
+    R = lds.obs_model.R
+
+    # Compute Cholesky factors
+    R_chol = cholesky(Symmetric(R))
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
+
+    copyto!(ws.R_chol_U, R_chol.U)
+    copyto!(ws.Q_chol_U, Q_chol.U)
+    copyto!(ws.P0_chol_U, P0_chol.U)
+
+    # Gradient terms: C_inv_R = (R_chol \ C)' and A_inv_Q = (Q_chol \ A)'
+    # R_chol \ C computes inv(R) * C via Cholesky, then transpose
+    tmp_RC = R_chol \ C   # obs_dim × latent_dim → but we want (latent_dim × obs_dim)
+    copyto!(ws.C_inv_R, tmp_RC')
+    tmp_QA = Q_chol \ A   # latent_dim × latent_dim
+    copyto!(ws.A_inv_Q, tmp_QA')
+
+    # Hessian block templates
+    copyto!(ws.H_sub_entry, tmp_QA)          # Q_chol \ A
+    copyto!(ws.H_super_entry, tmp_QA')       # (Q_chol \ A)'
+
+    # yt_given_xt = -C' * (R_chol \ C)
+    mul!(ws.yt_given_xt, C', tmp_RC)
+    ws.yt_given_xt .*= -one(T)
+
+    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
+    copyto!(ws.xt_given_xt_1, ws.I_mat)
+    ldiv!(Q_chol, ws.xt_given_xt_1)
+    ws.xt_given_xt_1 .*= -one(T)
+
+    # xt1_given_xt = -A' * (Q_chol \ A)
+    mul!(ws.xt1_given_xt, A', tmp_QA)
+    ws.xt1_given_xt .*= -one(T)
+
+    # x_t = -(P0_chol \ I) = -P0^{-1}
+    copyto!(ws.x_t, ws.I_mat)
+    ldiv!(P0_chol, ws.x_t)
+    ws.x_t .*= -one(T)
+
+    return nothing
+end
+
+"""
+    _build_nzval_map(H_sparse, bs, n)
+
+Build a mapping vector that encodes, for each logical block entry in the order
+that `block_tridgm!` iterates, the corresponding index into `H_sparse.nzval`.
+This allows `block_tridgm!` to write directly to nzval without sparse lookups.
+"""
+function _build_nzval_map(H_sparse::SparseMatrixCSC, bs::Int, n::Int)
+    total_entries = n * bs * bs + 2 * (n - 1) * bs * bs
+    nzval_map = Vector{Int}(undef, total_entries)
+
+    colptr = H_sparse.colptr
+    rowval = H_sparse.rowval
+
+    idx = 1
+    # Diagonal blocks: for k=1:n, j=1:bs, i=1:bs
+    for k in 1:n
+        base = (k - 1) * bs
+        for j in 1:bs
+            col = base + j
+            # Find row (base + i) in this column's rowval range
+            for i in 1:bs
+                row = base + i
+                # Binary search in rowval[colptr[col]:colptr[col+1]-1]
+                lo, hi = colptr[col], colptr[col + 1] - 1
+                while lo <= hi
+                    mid = (lo + hi) >> 1
+                    if rowval[mid] == row
+                        nzval_map[idx] = mid
+                        break
+                    elseif rowval[mid] < row
+                        lo = mid + 1
+                    else
+                        hi = mid - 1
+                    end
+                end
+                idx += 1
+            end
+        end
+    end
+
+    # Off-diagonal blocks: for k=1:n-1, j=1:bs, i=1:bs (upper then lower)
+    for k in 1:(n - 1)
+        base_k = (k - 1) * bs
+        base_kp1 = k * bs
+        # Upper block: row in base_k+1:base_k+bs, col in base_kp1+1:base_kp1+bs
+        for j in 1:bs
+            col = base_kp1 + j
+            for i in 1:bs
+                row = base_k + i
+                lo, hi = colptr[col], colptr[col + 1] - 1
+                while lo <= hi
+                    mid = (lo + hi) >> 1
+                    if rowval[mid] == row
+                        nzval_map[idx] = mid
+                        break
+                    elseif rowval[mid] < row
+                        lo = mid + 1
+                    else
+                        hi = mid - 1
+                    end
+                end
+                idx += 1
+            end
+        end
+        # Lower block: row in base_kp1+1:base_kp1+bs, col in base_k+1:base_k+bs
+        for j in 1:bs
+            col = base_k + j
+            for i in 1:bs
+                row = base_kp1 + i
+                lo, hi = colptr[col], colptr[col + 1] - 1
+                while lo <= hi
+                    mid = (lo + hi) >> 1
+                    if rowval[mid] == row
+                        nzval_map[idx] = mid
+                        break
+                    elseif rowval[mid] < row
+                        lo = mid + 1
+                    else
+                        hi = mid - 1
+                    end
+                end
+                idx += 1
+            end
+        end
+    end
+
+    return nzval_map
+end
+
+"""
+    _build_block_tridiag_pattern(::Type{T}, bs::Int, n::Int)
+
+Build a sparse matrix with the block tridiagonal sparsity pattern (values zeroed),
+so that subsequent calls can update values in-place.
+"""
+function _build_block_tridiag_pattern(::Type{T}, bs::Int, n::Int) where {T<:Real}
+    N = n * bs
+    total_nnz = n * bs * bs + 2 * (n - 1) * bs * bs
+
+    I_vec = Vector{Int}(undef, total_nnz)
+    J_vec = Vector{Int}(undef, total_nnz)
+    # Use ones so sparse() retains the structural entries (zeros get dropped)
+    V_vec = ones(T, total_nnz)
+
+    idx = 1
+    for k in 1:n
+        base = (k - 1) * bs
+        for i in 1:bs, j in 1:bs
+            I_vec[idx] = base + i
+            J_vec[idx] = base + j
+            idx += 1
+        end
+    end
+    for k in 1:(n - 1)
+        base_k = (k - 1) * bs
+        base_kp1 = k * bs
+        for i in 1:bs, j in 1:bs
+            I_vec[idx] = base_k + i
+            J_vec[idx] = base_kp1 + j
+            idx += 1
+        end
+        for i in 1:bs, j in 1:bs
+            I_vec[idx] = base_kp1 + i
+            J_vec[idx] = base_k + j
+            idx += 1
+        end
+    end
+
+    H = sparse(I_vec, J_vec, V_vec, N, N)
+    fill!(H.nzval, zero(T))  # Zero out values but keep the structure
+    return H
+end
+
+"""
+    block_tridgm!(ws::BlockTridiagonalWorkspace{T})
+
+Update the values of the preallocated sparse matrix `ws.H_sparse` from the
+current contents of `ws.H_diag`, `ws.H_sub`, `ws.H_super`.
+Uses the precomputed `nzval_map` for direct writes — no sparse lookups or allocations.
+"""
+function block_tridgm!(ws::BlockTridiagonalWorkspace{T}) where {T<:Real}
+    bs = ws.block_size
+    n = ws.n_blocks
+    nzval = ws.H_sparse.nzval
+    map = ws.nzval_map
+
+    idx = 1
+    # Diagonal blocks
+    for k in 1:n
+        block = ws.H_diag[k]
+        for j in 1:bs, i in 1:bs
+            nzval[map[idx]] = block[i, j]
+            idx += 1
+        end
+    end
+
+    # Off-diagonal blocks (upper then lower for each k)
+    for k in 1:(n - 1)
+        block_up = ws.H_super[k]
+        block_low = ws.H_sub[k]
+        for j in 1:bs, i in 1:bs
+            nzval[map[idx]] = block_up[i, j]
+            idx += 1
+        end
+        for j in 1:bs, i in 1:bs
+            nzval[map[idx]] = block_low[i, j]
+            idx += 1
+        end
+    end
+
+    return ws.H_sparse
+end
+
+"""
+    block_tridiagonal_inverse!(p_smooth, p_smooth_tt1, A, B, C, ws)
+
+Compute the block tridiagonal inverse, writing diagonal blocks into
+`p_smooth[:,:,i]` and off-diagonal blocks into `p_smooth_tt1[:,:,i]`.
+Uses preallocated buffers from `ws`.
+"""
+function block_tridiagonal_inverse!(
+    p_smooth::AbstractArray{T,3},
+    p_smooth_tt1::AbstractArray{T,3},
+    A::Vector{<:AbstractMatrix{T}},
+    B::Vector{<:AbstractMatrix{T}},
+    C::Vector{<:AbstractMatrix{T}},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Real}
+    n = length(B)
+
+    D = ws.D
+    E = ws.E
+    M = ws.M
+    term1 = ws.term1
+    term2 = ws.term2
+    S = ws.S
+    Ibs = ws.Ibs
+    Z = ws.Z
+
+    fill!(D[1], zero(T))
+    fill!(E[n + 1], zero(T))
+
+    # Forward sweep for D
+    for i in 1:n
+        Ai = (i == 1) ? Z : A[i - 1]
+        Ci = (i <= length(C)) ? C[i] : Z
+
+        copyto!(M, B[i])
+        mul!(M, Ai, D[i], -one(T), one(T))
+        F = lu!(M)
+        ldiv!(D[i + 1], F, Ci)
+    end
+
+    # Backward sweep for E
+    for i in n:-1:1
+        Ci = (i <= length(C)) ? C[i] : Z
+        Ai = (i == 1) ? Z : A[i - 1]
+
+        copyto!(M, B[i])
+        mul!(M, Ci, E[i + 1], -one(T), one(T))
+        F = lu!(M)
+        ldiv!(E[i], F, Ai)
+    end
+
+    # Compute diagonal blocks -> p_smooth[:,:,i]
+    for i in 1:n
+        copyto!(term1, Ibs)
+        mul!(term1, D[i + 1], E[i + 1], -one(T), one(T))
+
+        Ai = (i == 1) ? Z : A[i - 1]
+        copyto!(term2, B[i])
+        mul!(term2, Ai, D[i], -one(T), one(T))
+
+        mul!(S, term2, term1)
+        F = lu!(S)
+
+        @views ldiv!(p_smooth[:, :, i], F, Ibs)
+    end
+
+    # Compute off-diagonal blocks -> p_smooth_tt1[:,:,i] for i=2:n
+    for i in 2:n
+        @views mul!(p_smooth_tt1[:, :, i], E[i], p_smooth[:, :, i - 1])
+        @views p_smooth_tt1[:, :, i] .*= -one(T)
+    end
+
+    return nothing
+end
+
+"""
+    block_tridiagonal_inverse_logdet!(p_smooth, p_smooth_tt1, A, B, C, ws)
+
+Compute the block tridiagonal inverse and log-determinant simultaneously.
+Returns the log-determinant of the precision matrix (i.e., logdet of the input matrix).
+
+This is more efficient than calling block_tridiagonal_inverse! and gaussian_entropy
+separately, as it computes logdet during the forward sweep without additional
+matrix factorizations.
+"""
+function block_tridiagonal_inverse_logdet!(
+    p_smooth::AbstractArray{T,3},
+    p_smooth_tt1::AbstractArray{T,3},
+    A::Vector{<:AbstractMatrix{T}},
+    B::Vector{<:AbstractMatrix{T}},
+    C::Vector{<:AbstractMatrix{T}},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Real}
+    n = length(B)
+
+    D = ws.D
+    E = ws.E
+    M = ws.M
+    term1 = ws.term1
+    term2 = ws.term2
+    S = ws.S
+    Ibs = ws.Ibs
+    Z = ws.Z
+
+    fill!(D[1], zero(T))
+    fill!(E[n + 1], zero(T))
+
+    # Accumulate log-determinant during forward sweep
+    logdet_val = zero(T)
+
+    # Forward sweep for D - accumulate logdet from Schur complement factors
+    for i in 1:n
+        Ai = (i == 1) ? Z : A[i - 1]
+        Ci = (i <= length(C)) ? C[i] : Z
+
+        copyto!(M, B[i])
+        mul!(M, Ai, D[i], -one(T), one(T))
+        F = lu!(M)
+
+        # Accumulate log|det(M_i)| from LU factors
+        # det(LU) = det(L) * det(U) = 1 * prod(diag(U))
+        # With pivoting, det = (-1)^p * prod(diag(U)) where p = number of row swaps
+        # For logdet, we sum log|diag(U)|
+        # Note: F.factors stores L\U in place; diagonal is U's diagonal (L has unit diagonal)
+        factors = F.factors
+        bs = size(M, 1)
+        for j in 1:bs
+            logdet_val += log(abs(factors[j, j]))
+        end
+
+        ldiv!(D[i + 1], F, Ci)
+    end
+
+    # Backward sweep for E
+    for i in n:-1:1
+        Ci = (i <= length(C)) ? C[i] : Z
+        Ai = (i == 1) ? Z : A[i - 1]
+
+        copyto!(M, B[i])
+        mul!(M, Ci, E[i + 1], -one(T), one(T))
+        F = lu!(M)
+        ldiv!(E[i], F, Ai)
+    end
+
+    # Compute diagonal blocks -> p_smooth[:,:,i]
+    for i in 1:n
+        copyto!(term1, Ibs)
+        mul!(term1, D[i + 1], E[i + 1], -one(T), one(T))
+
+        Ai = (i == 1) ? Z : A[i - 1]
+        copyto!(term2, B[i])
+        mul!(term2, Ai, D[i], -one(T), one(T))
+
+        mul!(S, term2, term1)
+        F = lu!(S)
+
+        @views ldiv!(p_smooth[:, :, i], F, Ibs)
+    end
+
+    # Compute off-diagonal blocks -> p_smooth_tt1[:,:,i] for i=2:n
+    for i in 2:n
+        @views mul!(p_smooth_tt1[:, :, i], E[i], p_smooth[:, :, i - 1])
+        @views p_smooth_tt1[:, :, i] .*= -one(T)
+    end
+
+    return logdet_val
+end
+
+"""
+    gaussian_entropy_from_logdet(logdet_precision::T, n::Int) where {T<:Real}
+
+Compute Gaussian entropy from the log-determinant of the precision matrix.
+`n` is the dimensionality (number of variables).
+"""
+function gaussian_entropy_from_logdet(logdet_precision::T, n::Int) where {T<:Real}
+    return T(0.5) * (n * (1 + log(2π)) - logdet_precision)
+end
+
+"""
+    block_tridiagonal_solve!(x, A, B, C, b, ws)
+
+Solve a block tridiagonal system `H * x = b` where H has:
+- Lower off-diagonal blocks A[i] (size bs×bs, i=1:n-1)
+- Main diagonal blocks B[i] (size bs×bs, i=1:n)
+- Upper off-diagonal blocks C[i] (size bs×bs, i=1:n-1)
+
+Uses block LU decomposition (Thomas algorithm for blocks).
+The solution overwrites `x` (which should be length n*bs).
+
+This is much more efficient than sparse LU for block tridiagonal matrices
+as it only requires O(n) block factorizations instead of filling in a
+potentially large sparse LU.
+
+# Arguments
+- `x::AbstractVector{T}`: Output vector (length n*bs), will be overwritten with solution
+- `A::Vector{Matrix{T}}`: Lower off-diagonal blocks (length n-1)
+- `B::Vector{Matrix{T}}`: Main diagonal blocks (length n)
+- `C::Vector{Matrix{T}}`: Upper off-diagonal blocks (length n-1)
+- `b::AbstractVector{T}`: Right-hand side vector (length n*bs)
+- `ws::BlockTridiagonalWorkspace{T}`: Workspace with temp buffers
+"""
+function block_tridiagonal_solve!(
+    x::AbstractVector{T},
+    A::Vector{<:AbstractMatrix{T}},
+    B::Vector{<:AbstractMatrix{T}},
+    C::Vector{<:AbstractMatrix{T}},
+    b::AbstractVector{T},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Real}
+    n = length(B)
+    bs = size(B[1], 1)
+
+    # Reuse workspace buffers
+    # We need: modified diagonal blocks (stored in D), modified RHS (stored temporarily)
+    # D[i] will store the modified upper off-diagonal after forward elimination
+    D = ws.D
+    M = ws.M  # Temp for LU factorization
+
+    # Forward elimination (modify diagonal and upper off-diagonal, and RHS)
+    # Store modified C[i] in D[i+1] and modified b[i] in x[block i] temporarily
+
+    # First block: just copy b₁ to x₁ block and store C₁' in D[2]
+    @views copyto!(x[1:bs], b[1:bs])
+
+    # Process first block specially (no A[0])
+    copyto!(M, B[1])
+    F = lu!(M)
+    @views ldiv!(F, x[1:bs])  # x₁ = B₁⁻¹ b₁
+    ldiv!(D[2], F, C[1])       # D[2] = B₁⁻¹ C₁
+
+    # Forward sweep for blocks 2 to n
+    for i in 2:n
+        # Get block indices
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_prev_start = (i - 2) * bs + 1
+        idx_prev_end = (i - 1) * bs
+
+        # Copy b[i] to x[i] block
+        @views copyto!(x[idx_start:idx_end], b[idx_start:idx_end])
+
+        # Modify diagonal: B̃ᵢ = Bᵢ - Aᵢ₋₁ * D[i]
+        copyto!(M, B[i])
+        mul!(M, A[i - 1], D[i], -one(T), one(T))
+
+        # Modify RHS: b̃ᵢ = bᵢ - Aᵢ₋₁ * x[i-1]
+        @views mul!(x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end], -one(T), one(T))
+
+        # Factor modified diagonal
+        F = lu!(M)
+
+        # Solve for x[i] block
+        @views ldiv!(F, x[idx_start:idx_end])
+
+        # Compute modified upper off-diagonal for next iteration (if not last block)
+        if i < n
+            ldiv!(D[i + 1], F, C[i])
+        end
+    end
+
+    # Backward substitution
+    for i in (n - 1):-1:1
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_next_start = i * bs + 1
+        idx_next_end = (i + 1) * bs
+
+        # x[i] = x[i] - D[i+1] * x[i+1]
+        @views mul!(x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end], -one(T), one(T))
+    end
+
+    return x
+end
+
+"""
+    _negate_blocks!(ws::BlockTridiagonalWorkspace{T})
+
+Copy negated H_diag/H_sub/H_super into neg_diag/neg_sub/neg_super in-place.
+"""
+function _negate_blocks!(ws::BlockTridiagonalWorkspace{T}) where {T<:Real}
+    for i in eachindex(ws.H_diag)
+        ws.neg_diag[i] .= .-ws.H_diag[i]
+    end
+    for i in eachindex(ws.H_sub)
+        ws.neg_sub[i] .= .-ws.H_sub[i]
+        ws.neg_super[i] .= .-ws.H_super[i]
+    end
+    return nothing
+end
+
 # Initialization utilities
 """
     euclidean_distance(a::AbstractVector{Float64}, b::AbstractVector{Float64})

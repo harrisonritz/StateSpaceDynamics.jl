@@ -261,7 +261,7 @@ function Hessian(
     # minnimal allocation Hessian helper function
     function calculate_poisson_hess!(out::Matrix{T}, C::Matrix{T}, λ::Vector{T}) where {T}
         n, p = size(C)
-        @inbounds for j in 1:p, i in 1:p
+        for j in 1:p, i in 1:p
             acc = zero(T)
             for k in 1:n
                 acc += C[k, i] * λ[k] * C[k, j]
@@ -300,6 +300,88 @@ function Hessian(
     H = block_tridgm(H_diag, H_super, H_sub)
 
     return H, H_diag, H_super, H_sub
+end
+
+"""
+    Hessian!(ws, lds, y, x; w=nothing)
+
+In-place version of `Hessian` for Poisson LDS that writes blocks into the workspace
+and updates the sparse matrix values. Returns the workspace's sparse matrix.
+"""
+function Hessian!(
+    ws::BlockTridiagonalWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T},
+    x::AbstractMatrix{T},
+    w::Union{Nothing,AbstractVector{T}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    if w === nothing
+        w = ones(T, size(y, 2))
+    end
+
+    A, Q = lds.state_model.A, lds.state_model.Q
+    C, log_d = lds.obs_model.C, lds.obs_model.log_d
+    x0, P0 = lds.state_model.x0, lds.state_model.P0
+
+    d = exp.(log_d)
+
+    tsteps = size(y, 2)
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
+
+    H_sub_entry = Q_chol \ A
+    H_super_entry = permutedims(H_sub_entry)
+
+    for i in 1:(tsteps - 1)
+        copyto!(ws.H_sub[i], H_sub_entry)
+        copyto!(ws.H_super[i], H_super_entry)
+    end
+
+    state_dim = size(A, 1)
+    obs_dim = size(C, 1)
+    λ = zeros(T, obs_dim)
+    z = similar(λ)
+    poisson_tmp = Matrix{T}(undef, state_dim, state_dim)
+
+    function calculate_poisson_hess!(out::Matrix{T}, C::Matrix{T}, λ::Vector{T}) where {T}
+        n, p = size(C)
+        for j in 1:p, i in 1:p
+            acc = zero(T)
+            for k in 1:n
+                acc += C[k, i] * λ[k] * C[k, j]
+            end
+            out[i, j] = -acc
+        end
+    end
+
+    I_mat = Matrix{T}(I, state_dim, state_dim)
+    xt_given_xt_1 = -(Q_chol \ I_mat)
+    xt1_given_xt = -A' * (Q_chol \ A)
+    x_t = -(P0_chol \ I_mat)
+
+    Q_middle = xt1_given_xt + xt_given_xt_1
+    Q_first = x_t + xt1_given_xt
+    Q_last = xt_given_xt_1
+
+    @views for t in 1:tsteps
+        mul!(z, C, x[:, t])
+        @. λ = exp(z + d)
+
+        if t == 1
+            ws.H_diag[t] .= Q_first
+        elseif t == tsteps
+            ws.H_diag[t] .= Q_last
+        else
+            ws.H_diag[t] .= Q_middle
+        end
+
+        calculate_poisson_hess!(poisson_tmp, C, λ)
+        ws.H_diag[t] .+= poisson_tmp
+    end
+
+    block_tridgm!(ws)
+
+    return ws.H_sparse
 end
 
 """
