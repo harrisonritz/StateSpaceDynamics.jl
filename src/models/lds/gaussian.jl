@@ -947,6 +947,101 @@ function Q_state(
 end
 
 """
+    Q_state!(ws, lds, E_z, E_zz, E_zz_prev)
+
+In-place version of `Q_state` that uses pre-allocated buffers from `SmoothWorkspace`.
+Uses cached Cholesky factors from `compute_smooth_constants!`.
+"""
+function Q_state!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    E_z::AbstractMatrix{T},
+    E_zz::AbstractArray{T,3},
+    E_zz_prev::AbstractArray{T,3},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    tstep = size(E_z, 2)
+    D = lds.latent_dim
+    A = lds.state_model.A
+    b = lds.state_model.b
+    x0 = lds.state_model.x0
+
+    # Use cached Cholesky factors (already computed by compute_smooth_constants!)
+    Q_U = UpperTriangular(ws.Q_chol_U)
+    P0_U = UpperTriangular(ws.P0_chol_U)
+
+    # Compute log determinants from cached Cholesky factors
+    log_det_Q = zero(T)
+    log_det_P0 = zero(T)
+    for j in 1:D
+        log_det_Q += 2 * log(Q_U[j, j])
+        log_det_P0 += 2 * log(P0_U[j, j])
+    end
+
+    # Use workspace buffers
+    temp = ws.elbo_temp
+    sum_E_zz = ws.elbo_sum_E_zz
+    sum_E_zzm1 = ws.elbo_sum_E_zzm1
+    sum_E_cross = ws.elbo_sum_E_cross
+    sum_mu_t = ws.elbo_sum_mu_t
+    sum_mu_tm1 = ws.elbo_sum_mu_tm1
+    temp2 = ws.elbo_temp2
+
+    # Initial-state part: temp = E_zz[:,:,1] - E_z[:,1]*x0' - x0*E_z[:,1]' + x0*x0'
+    fill!(temp, zero(T))
+    @views begin
+        temp .+= E_zz[:, :, 1]
+        mul!(temp, E_z[:, 1:1], x0', -one(T), one(T))  # temp -= E_z[:,1] * x0'
+        mul!(temp, x0, E_z[:, 1:1]', -one(T), one(T))  # temp -= x0 * E_z[:,1]'
+        mul!(temp, x0, x0', one(T), one(T))            # temp += x0 * x0'
+    end
+
+    # Solve P0_chol \ temp using ldiv! with upper triangular
+    ldiv!(P0_U, temp)  # temp = P0_U \ temp (solves P0_U * result = temp)
+    Q_val = T(-0.5) * (log_det_P0 + tr(temp))
+
+    # Transition part: accumulate sums over t=2:tstep
+    fill!(sum_E_zz, zero(T))
+    fill!(sum_E_zzm1, zero(T))
+    fill!(sum_E_cross, zero(T))
+    fill!(sum_mu_t, zero(T))
+    fill!(sum_mu_tm1, zero(T))
+
+    @views for t in 2:tstep
+        sum_E_zz .+= E_zz[:, :, t]
+        sum_E_zzm1 .+= E_zz[:, :, t - 1]
+        sum_E_cross .+= E_zz_prev[:, :, t]
+        sum_mu_t .+= E_z[:, t]
+        sum_mu_tm1 .+= E_z[:, t - 1]
+    end
+
+    # Build temp = sum_E_zz - A*sum_E_cross' - sum_E_cross*A' + A*sum_E_zzm1*A'
+    copyto!(temp, sum_E_zz)
+    mul!(temp, A, sum_E_cross', -one(T), one(T))       # temp -= A * sum_E_cross'
+    mul!(temp, sum_E_cross, A', -one(T), one(T))       # temp -= sum_E_cross * A'
+    mul!(temp2, A, sum_E_zzm1)                          # temp2 = A * sum_E_zzm1
+    mul!(temp, temp2, A', one(T), one(T))              # temp += temp2 * A'
+
+    # Bias terms (use rank-1 updates to avoid allocations)
+    # temp -= sum_mu_t * b'
+    mul!(temp, sum_mu_t, b', -one(T), one(T))
+    # temp -= b * sum_mu_t'
+    mul!(temp, b, sum_mu_t', -one(T), one(T))
+    # temp += A * sum_mu_tm1 * b' (use temp2 as intermediate)
+    mul!(ws.tmp1, A, sum_mu_tm1)  # tmp1 = A * sum_mu_tm1
+    mul!(temp, ws.tmp1, b', one(T), one(T))
+    # temp += b * (A * sum_mu_tm1)'  = b * sum_mu_tm1' * A'
+    mul!(temp, b, ws.tmp1', one(T), one(T))
+    # temp += (tstep - 1) * b * b'
+    mul!(temp, b, b', T(tstep - 1), one(T))
+
+    # Solve Q_chol \ temp
+    ldiv!(Q_U, temp)
+    Q_val += T(-0.5) * ((tstep - 1) * log_det_Q + tr(temp))
+
+    return Q_val
+end
+
+"""
     Q_obs!(C, d, E_z, E_zz, y)
 
 Single time-step observation component of the Q-function for
@@ -1033,6 +1128,73 @@ function Q_obs(
 end
 
 """
+    Q_obs!(ws, lds, E_z, E_zz, y)
+
+In-place version of `Q_obs` that uses pre-allocated buffers from `SmoothWorkspace`.
+Uses cached Cholesky factors from `compute_smooth_constants!`.
+"""
+function Q_obs!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    E_z::AbstractMatrix{T},
+    E_zz::AbstractArray{T,3},
+    y::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    obs_dim = lds.obs_dim
+    tsteps = size(y, 2)
+    C = lds.obs_model.C
+    d = lds.obs_model.d
+
+    # Use cached Cholesky factor
+    R_U = UpperTriangular(ws.R_chol_U)
+
+    # Compute log determinant from cached Cholesky
+    log_det_R = zero(T)
+    for j in 1:obs_dim
+        log_det_R += 2 * log(R_U[j, j])
+    end
+    const_term = obs_dim * log(T(2π))
+
+    # Use workspace buffers
+    temp = ws.elbo_obs_temp
+    work_matrix = ws.elbo_obs_work
+    ytil = ws.elbo_ytil
+    sum_yy = ws.elbo_sum_yy
+    sum_yz = ws.elbo_sum_yz
+    work1 = ws.elbo_obs_work1
+    work2 = ws.elbo_obs_work2
+
+    fill!(temp, zero(T))
+
+    @views for t in axes(y, 2)
+        # Residualize: ytil = y[:,t] - d
+        ytil .= y[:, t] .- d
+
+        # sum_yy = ytil * ytil'
+        mul!(sum_yy, ytil, ytil')
+
+        # sum_yz = ytil * E_z[:,t]' (outer product)
+        fill!(sum_yz, zero(T))
+        BLAS.ger!(one(T), ytil, E_z[:, t], sum_yz)
+
+        # Build work_matrix
+        copyto!(work_matrix, sum_yy)
+        mul!(work_matrix, C, sum_yz', -one(T), one(T))   # work_matrix -= C * sum_yz'
+        mul!(work1, sum_yz, C')                           # work1 = sum_yz * C'
+        work_matrix .-= work1                             # work_matrix -= work1
+        mul!(work2, E_zz[:, :, t], C')                    # work2 = E_zz * C'
+        mul!(work_matrix, C, work2, one(T), one(T))       # work_matrix += C * work2
+
+        # Accumulate
+        temp .+= work_matrix
+    end
+
+    # Solve R_chol \ temp (R_U' * R_U \ temp = R_U' \ (R_U \ temp))
+    ldiv!(R_U, temp)
+    return T(-0.5) * (tsteps * (const_term + log_det_R) + tr(temp))
+end
+
+"""
     Q_function(A, b, Q, C, d, R, P0, x0, E_z, E_zz, E_zz_prev, y)
 
 Complete Q-function for Gaussian LDS:
@@ -1108,6 +1270,74 @@ function calculate_elbo(
 end
 
 """
+    calculate_elbo(lds, tfs, y, sws)
+
+Low-allocation version of `calculate_elbo` using `SmoothWorkspace` buffers.
+Uses cached Cholesky factors from `compute_smooth_constants!`.
+
+Note: For single-trial case only. Multi-trial threading would require workspace pool.
+"""
+function calculate_elbo(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractArray{T,3},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    ntrials = size(y, 3)
+
+    # Calculate total entropy from individual FilterSmooth objects
+    total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
+
+    # For single trial, use workspace-aware functions
+    # For multi-trial, fall back to allocation (workspace is per-thread)
+    Q_total = zero(T)
+
+    if ntrials == 1
+        fs = tfs[1]
+        # Use in-place Q_state! and Q_obs! with workspace
+        Q_state_val = Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev)
+        Q_obs_val = Q_obs!(sws, lds, fs.E_z, fs.E_zz, view(y, :, :, 1))
+        Q_total = Q_state_val + Q_obs_val
+    else
+        # Multi-trial: use original allocating version for now
+        # (Threading with workspaces would require sws_pool)
+        Q_vals = zeros(T, ntrials)
+        @threads for trial in 1:ntrials
+            fs = tfs[trial]
+            Q_vals[trial] = Q_function(
+                lds.state_model.A,
+                lds.state_model.b,
+                lds.state_model.Q,
+                lds.obs_model.C,
+                lds.obs_model.d,
+                lds.obs_model.R,
+                lds.state_model.P0,
+                lds.state_model.x0,
+                fs.E_z,
+                fs.E_zz,
+                fs.E_zz_prev,
+                view(y, :, :, trial),
+            )
+        end
+        Q_total = sum(Q_vals)
+    end
+
+    # prior terms (included once)
+    prior_term = zero(T)
+    if lds.state_model.Q_prior !== nothing
+        prior_term += iw_logprior_term(lds.state_model.Q, lds.state_model.Q_prior)
+    end
+    if lds.state_model.P0_prior !== nothing
+        prior_term += iw_logprior_term(lds.state_model.P0, lds.state_model.P0_prior)
+    end
+    if (lds.obs_model isa GaussianObservationModel) && (lds.obs_model.R_prior !== nothing)
+        prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
+    end
+
+    return Q_total + prior_term - total_entropy
+end
+
+"""
     sufficient_statistics(x_smooth, p_smooth, p_smooth_t1)
 
 Compute sufficient statistics for the EM algorithm in a Linear Dynamical System.
@@ -1180,7 +1410,8 @@ function estep!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     smooth!(lds, tfs, y, sws_pool)
     sufficient_statistics!(tfs)
-    elbo = calculate_elbo(lds, tfs, y)
+    # Use workspace-aware calculate_elbo (Cholesky already cached in smooth!)
+    elbo = calculate_elbo(lds, tfs, y, sws_pool[1])
     return elbo
 end
 

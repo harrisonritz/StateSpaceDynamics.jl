@@ -409,6 +409,24 @@ struct SmoothWorkspace{T<:Real}
     # update_C_d! temps
     work_yz::Matrix{T}        # (obs_dim × latent_dim)
     work_outer::Matrix{T}     # (latent_dim × latent_dim)
+
+    # ELBO / Q_state buffers
+    elbo_temp::Matrix{T}           # (latent_dim × latent_dim) - main accumulator
+    elbo_sum_E_zz::Matrix{T}       # (latent_dim × latent_dim)
+    elbo_sum_E_zzm1::Matrix{T}     # (latent_dim × latent_dim)
+    elbo_sum_E_cross::Matrix{T}    # (latent_dim × latent_dim)
+    elbo_sum_mu_t::Vector{T}       # (latent_dim,)
+    elbo_sum_mu_tm1::Vector{T}     # (latent_dim,)
+    elbo_temp2::Matrix{T}          # (latent_dim × latent_dim) - for A * sum_E_zzm1 * A'
+
+    # Q_obs buffers
+    elbo_obs_temp::Matrix{T}       # (obs_dim × obs_dim) - accumulator
+    elbo_obs_work::Matrix{T}       # (obs_dim × obs_dim) - work matrix
+    elbo_ytil::Vector{T}           # (obs_dim,) - residualized y
+    elbo_sum_yy::Matrix{T}         # (obs_dim × obs_dim)
+    elbo_sum_yz::Matrix{T}         # (obs_dim × latent_dim)
+    elbo_obs_work1::Matrix{T}      # (obs_dim × obs_dim)
+    elbo_obs_work2::Matrix{T}      # (latent_dim × obs_dim)
 end
 
 """
@@ -478,6 +496,24 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
     work_yz = zeros(T, obs_dim, latent_dim)
     work_outer = zeros(T, latent_dim, latent_dim)
 
+    # ELBO / Q_state buffers
+    elbo_temp = zeros(T, latent_dim, latent_dim)
+    elbo_sum_E_zz = zeros(T, latent_dim, latent_dim)
+    elbo_sum_E_zzm1 = zeros(T, latent_dim, latent_dim)
+    elbo_sum_E_cross = zeros(T, latent_dim, latent_dim)
+    elbo_sum_mu_t = zeros(T, latent_dim)
+    elbo_sum_mu_tm1 = zeros(T, latent_dim)
+    elbo_temp2 = zeros(T, latent_dim, latent_dim)
+
+    # Q_obs buffers
+    elbo_obs_temp = zeros(T, obs_dim, obs_dim)
+    elbo_obs_work = zeros(T, obs_dim, obs_dim)
+    elbo_ytil = zeros(T, obs_dim)
+    elbo_sum_yy = zeros(T, obs_dim, obs_dim)
+    elbo_sum_yz = zeros(T, obs_dim, latent_dim)
+    elbo_obs_work1 = zeros(T, obs_dim, obs_dim)
+    elbo_obs_work2 = zeros(T, latent_dim, obs_dim)
+
     return SmoothWorkspace{T}(
         btd,
         R_chol_U, Q_chol_U, P0_chol_U,
@@ -493,6 +529,10 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
         temp_Q1, temp_Q2, temp_Q3, temp_Q4, temp_Q5, innovation_cov,
         innovation, Czt, temp_R_matrix, outer_product, state_uncertainty,
         work_yz, work_outer,
+        elbo_temp, elbo_sum_E_zz, elbo_sum_E_zzm1, elbo_sum_E_cross,
+        elbo_sum_mu_t, elbo_sum_mu_tm1, elbo_temp2,
+        elbo_obs_temp, elbo_obs_work, elbo_ytil, elbo_sum_yy, elbo_sum_yz,
+        elbo_obs_work1, elbo_obs_work2,
     )
 end
 
