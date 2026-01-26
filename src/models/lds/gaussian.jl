@@ -538,60 +538,6 @@ function Hessian(
 end
 
 """
-    Hessian!(ws, lds, y, x)
-
-In-place version of `Hessian` that writes blocks into the workspace and
-updates the sparse matrix values. Returns the workspace's sparse matrix.
-"""
-function Hessian!(
-    ws::BlockTridiagonalWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    A_mat, Q, x0, P0 = lds.state_model.A,
-        lds.state_model.Q, lds.state_model.x0,
-        lds.state_model.P0
-    C, R = lds.obs_model.C, lds.obs_model.R
-
-    tsteps = size(y, 2)
-    state_dim = size(A_mat, 1)
-
-    # Pre-compute Cholesky factorizations
-    R_chol = cholesky(Symmetric(R))
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    # Compute reusable terms
-    H_sub_entry = Q_chol \ A_mat
-    H_super_entry = Matrix(H_sub_entry')
-
-    I_mat = Matrix{T}(I, state_dim, state_dim)
-    yt_given_xt = -C' * (R_chol \ C)
-    xt_given_xt_1 = -(Q_chol \ I_mat)
-    xt1_given_xt = -A_mat' * (Q_chol \ A_mat)
-    x_t = -(P0_chol \ I_mat)
-
-    # Fill blocks in-place
-    for i in 1:(tsteps - 1)
-        copyto!(ws.H_sub[i], H_sub_entry)
-        copyto!(ws.H_super[i], H_super_entry)
-    end
-
-    # Main diagonal
-    ws.H_diag[1] .= yt_given_xt .+ xt1_given_xt .+ x_t
-    for i in 2:(tsteps - 1)
-        ws.H_diag[i] .= yt_given_xt .+ xt_given_xt_1 .+ xt1_given_xt
-    end
-    ws.H_diag[tsteps] .= yt_given_xt .+ xt_given_xt_1
-
-    # Update sparse matrix in-place
-    block_tridgm!(ws)
-
-    return ws.H_sparse
-end
-
-"""
     Hessian!(sws, lds, y, x)
 
 In-place Hessian using pre-computed block templates from `SmoothWorkspace`.
@@ -640,13 +586,15 @@ Direct smoothing for a single trial.
 """
 function smooth(lds::LinearDynamicalSystem, y::AbstractMatrix{T}) where {T}
     fs = initialize_FilterSmooth(lds, size(y, 2))
-    smooth!(lds, fs, y)
+    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2))
+    smooth!(lds, fs, y, sws)
     return fs.x_smooth, fs.p_smooth
 end
 
 function smooth(lds::LinearDynamicalSystem, y::AbstractArray{T,3}) where {T}
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
-    smooth!(lds, tfs, y)
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.nthreads()]
+    smooth!(lds, tfs, y, sws_pool)
 
     D = lds.latent_dim
     Tt = size(y, 2)
@@ -661,96 +609,6 @@ function smooth(lds::LinearDynamicalSystem, y::AbstractArray{T,3}) where {T}
         Ps[:, :, :, n] .= fs.p_smooth
     end
     return xs, Ps
-end
-
-function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, fs::FilterSmooth{T}, y::AbstractMatrix{T},
-    ws::Union{Nothing,BlockTridiagonalWorkspace{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
-
-    # use old fs if it exists, by default is zeros if no iteration of EM has occurred
-    X₀ = Vector{T}(vec(fs.E_z))
-
-    function nll(vec_x::AbstractVector{T})
-        x = reshape(vec_x, D, tsteps)
-        return -sum(loglikelihood(x, lds, y))
-    end
-
-    function g!(g::Vector{T}, vec_x::Vector{T})
-        x = reshape(vec_x, D, tsteps)
-        grad = Gradient(lds, y, x)
-        return g .= vec(-grad)
-    end
-
-    # Use workspace-aware Hessian if available
-    function h!(h::SparseMatrixCSC{T}, vec_x::Vector{T}) where {T<:Real}
-        x = reshape(vec_x, D, tsteps)
-        if ws !== nothing
-            Hessian!(ws, lds, y, x)
-            # Same sparsity pattern: directly negate nzval
-            h.nzval .= .-ws.H_sparse.nzval
-        else
-            H, _, _, _ = Hessian(lds, y, x)
-            mul!(h, -1.0, H)
-        end
-        return nothing
-    end
-
-    # Initial values setup
-    initial_f = nll(X₀)
-    inital_g = similar(X₀)
-    g!(inital_g, X₀)
-
-    # Use workspace sparse pattern if available
-    initial_h = if ws !== nothing
-        copy(ws.H_sparse)
-    else
-        spzeros(T, length(X₀), length(X₀))
-    end
-    h!(initial_h, X₀)
-
-    td = TwiceDifferentiable(nll, g!, h!, X₀, initial_f, inital_g, initial_h)
-    opts = Optim.Options(; g_abstol=1e-8, x_abstol=1e-8, f_abstol=1e-8, iterations=100)
-
-    res = optimize(td, X₀, Newton(; linesearch=LineSearches.BackTracking()), opts)
-
-    fs.x_smooth .= reshape(res.minimizer, D, tsteps)
-
-    # Get the second moments of the latent state path
-    if ws !== nothing && lds.latent_dim > 10
-        # In-place path: use workspace for Hessian and inverse
-        Hessian!(ws, lds, y, fs.x_smooth)
-        _negate_blocks!(ws)
-        block_tridiagonal_inverse!(
-            fs.p_smooth, fs.p_smooth_tt1,
-            ws.neg_sub, ws.neg_diag, ws.neg_super, ws,
-        )
-        fs.entropy = gaussian_entropy(Symmetric(ws.H_sparse))
-    elseif lds.latent_dim > 10
-        H, main, super, sub = Hessian(lds, y, fs.x_smooth)
-        p_smooth_result, p_smooth_tt1_result = block_tridiagonal_inverse(
-            -sub, -main, -super
-        )
-        fs.p_smooth .= p_smooth_result
-        fs.p_smooth_tt1[:, :, 2:end] .= p_smooth_tt1_result
-        fs.entropy = gaussian_entropy(Symmetric(H))
-    else
-        H, main, super, sub = Hessian(lds, y, fs.x_smooth)
-        p_smooth_result, p_smooth_tt1_result = block_tridiagonal_inverse_static(
-            -sub, -main, -super, Val(lds.latent_dim)
-        )
-        fs.p_smooth .= p_smooth_result
-        fs.p_smooth_tt1[:, :, 2:end] .= p_smooth_tt1_result
-        fs.entropy = gaussian_entropy(Symmetric(H))
-    end
-
-    # Symmetrize
-    @views for i in 1:tsteps
-        fs.p_smooth[:, :, i] .= 0.5 .* (fs.p_smooth[:, :, i] .+ fs.p_smooth[:, :, i]')
-    end
-
-    return fs
 end
 
 """
@@ -832,40 +690,20 @@ function smooth!(
 end
 
 """
-    smooth!(lds, tfs, y::AbstractArray{T,3})
+    smooth!(lds, tfs, y::AbstractArray{T,3}, sws_pool::Vector{SmoothWorkspace{T}})
 
-Direct smoothing for multiple trials.
+Low-allocation smoothing for multiple trials using `SmoothWorkspace` pool.
+Each thread uses its own workspace to avoid contention.
 
 # Arguments
 - `lds::LinearDynamicalSystem`: The model.
 - `tfs::TrialFilterSmooth`: Preallocated container (one per trial).
 - `y::Array{T,3}`: Observations (obs_dim × tsteps × ntrials).
-
-# Side effects
-- Fills each `FilterSmooth` in `tfs` with `x_smooth`, `p_smooth`, `p_smooth_tt1`, `E_z`, `E_zz`, `E_zz_prev`, `entropy`.
+- `sws_pool::Vector{SmoothWorkspace{T}}`: Pool of workspaces (one per thread).
 
 # Returns
 - `tfs`: The same `TrialFilterSmooth`, populated.
 """
-function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
-    ws_pool::Union{Nothing,Vector{BlockTridiagonalWorkspace{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    ntrials = size(y, 3)
-
-    if ntrials == 1
-        ws = ws_pool !== nothing ? ws_pool[1] : nothing
-        smooth!(lds, tfs[1], y[:, :, 1], ws)
-    else
-        @views @threads for trial in 1:ntrials
-            ws = ws_pool !== nothing ? ws_pool[Threads.threadid()] : nothing
-            smooth!(lds, tfs[trial], y[:, :, trial], ws)
-        end
-    end
-
-    return tfs
-end
-
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
@@ -966,6 +804,7 @@ function Q_state!(
     x0 = lds.state_model.x0
 
     # Use cached Cholesky factors (already computed by compute_smooth_constants!)
+    # For Cholesky P0 = U'U, we need to solve P0 \ temp = inv(U) * inv(U') * temp
     Q_U = UpperTriangular(ws.Q_chol_U)
     P0_U = UpperTriangular(ws.P0_chol_U)
 
@@ -995,8 +834,10 @@ function Q_state!(
         mul!(temp, x0, x0', one(T), one(T))            # temp += x0 * x0'
     end
 
-    # Solve P0_chol \ temp using ldiv! with upper triangular
-    ldiv!(P0_U, temp)  # temp = P0_U \ temp (solves P0_U * result = temp)
+    # Solve P0 \ temp = inv(P0) * temp = inv(U) * inv(U') * temp
+    # First: temp2 = inv(U') * temp (solve U' * temp2 = temp)
+    ldiv!(P0_U', temp)  # temp = inv(U') * temp
+    ldiv!(P0_U, temp)   # temp = inv(U) * temp = P0 \ original_temp
     Q_val = T(-0.5) * (log_det_P0 + tr(temp))
 
     # Transition part: accumulate sums over t=2:tstep
@@ -1034,7 +875,8 @@ function Q_state!(
     # temp += (tstep - 1) * b * b'
     mul!(temp, b, b', T(tstep - 1), one(T))
 
-    # Solve Q_chol \ temp
+    # Solve Q \ temp = inv(Q) * temp
+    ldiv!(Q_U', temp)
     ldiv!(Q_U, temp)
     Q_val += T(-0.5) * ((tstep - 1) * log_det_Q + tr(temp))
 
@@ -1189,7 +1031,8 @@ function Q_obs!(
         temp .+= work_matrix
     end
 
-    # Solve R_chol \ temp (R_U' * R_U \ temp = R_U' \ (R_U \ temp))
+    # Solve R \ temp = inv(R) * temp = inv(U) * inv(U') * temp
+    ldiv!(R_U', temp)
     ldiv!(R_U, temp)
     return T(-0.5) * (tsteps * (const_term + log_det_R) + tr(temp))
 end
@@ -1383,27 +1226,17 @@ function sufficient_statistics!(tfs::TrialFilterSmooth{T}) where {T<:Real}
 end
 
 """
-    estep(lds::LinearDynamicalSystem{T,S,O},tfs::TrialFilterSmooth, y::AbstractArray{T,3})
+    estep!(lds, tfs, y, sws_pool)
 
-Perform the E-step of the EM algorithm for a Linear Dynamical System, treating all input as
-multi-trial.
+Perform the E-step of the EM algorithm for a Linear Dynamical System.
+Uses `SmoothWorkspace` pool for low-allocation smoothing.
 
 # Note
-- This function first smooths the data using the `smooth` function, then computes sufficient
+- This function first smooths the data using `smooth!`, then computes sufficient
     statistics.
 - It treats all input as multi-trial, with single-trial being a special case where
     `ntrials = 1`.
 """
-function estep!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth, y::AbstractArray{T,3},
-    ws_pool::Union{Nothing,Vector{BlockTridiagonalWorkspace{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    smooth!(lds, tfs, y, ws_pool)
-    sufficient_statistics!(tfs)
-    elbo = calculate_elbo(lds, tfs, y)
-    return elbo
-end
-
 function estep!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
@@ -1758,39 +1591,10 @@ function update_R!(
 end
 
 """
-    mstep!(lds, tfs, y, w)
-
-Perform the M-step of the EM algorithm for a Linear Dynamical System with multi-trial data.
-"""
-function mstep!(
-    lds::LinearDynamicalSystem{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
-    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    # Get initial parameters using new approach
-    old_params = _get_all_params_vec(lds)
-
-    # Update parameters
-    update_initial_state_mean!(lds, tfs, w)
-    update_initial_state_covariance!(lds, tfs, w)
-    update_A_b!(lds, tfs, w)
-    update_Q!(lds, tfs, w)
-    update_C_d!(lds, tfs, y, w)
-    update_R!(lds, tfs, y, w)
-
-    # Get new parameters using new approach
-    new_params = _get_all_params_vec(lds)
-
-    # Parameter delta
-    norm_change = norm(new_params - old_params)
-    return norm_change
-end
-
-"""
     mstep!(lds, tfs, y, sws; w=nothing)
 
-Low-allocation M-step using `SmoothWorkspace` buffers.
+Perform the M-step of the EM algorithm for a Linear Dynamical System.
+Uses `SmoothWorkspace` buffers for low-allocation parameter updates.
 """
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -2109,12 +1913,8 @@ function fit!(
     # Create a FilterSmooth object
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
 
-    # Create workspace pool (one per thread)
-    sws_pool = if lds.latent_dim > 10
-        [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.nthreads()]
-    else
-        nothing
-    end
+    # Create workspace pool (one per thread) - always use allocation-free path
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.nthreads()]
 
     # Initialize progress bar only if progress=true
     prog = if progress
@@ -2136,15 +1936,9 @@ function fit!(
 
     # Run EM
     for i in 1:max_iter
-        # E-step
-        if sws_pool !== nothing
-            elbo = estep!(lds, tfs, y, sws_pool)
-            # M-step (use first workspace for M-step buffers)
-            Δparams = mstep!(lds, tfs, y, sws_pool[1])
-        else
-            elbo = estep!(lds, tfs, y)
-            Δparams = mstep!(lds, tfs, y)
-        end
+        # E-step and M-step using workspace pool
+        elbo = estep!(lds, tfs, y, sws_pool)
+        Δparams = mstep!(lds, tfs, y, sws_pool[1])
         # Update the log-likelihood vector and parameter difference
         push!(elbos, elbo)
         push!(param_diff, Δparams)
