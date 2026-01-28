@@ -1045,55 +1045,69 @@ function smooth!(
             sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, grad_vec, btd
         )
 
-        # Backtracking line search with quadratic interpolation (Nocedal & Wright Sec. 3.5)
+        # Backtracking line search with quadratic/cubic interpolation (Nocedal & Wright Sec. 3.5)
         Δx = reshape(sws.X₀, D, tsteps)
         ϕ_0 = sum(loglikelihood(x, lds, y))      # f(0)
         dϕ_0 = dot(grad_vec, sws.X₀)             # f'(0) = g' * Δx > 0 (ascent direction)
-        α = one(T)
         ρ_hi, ρ_lo = T(0.5), T(0.1)              # Safeguard bounds on step reduction
 
-        # First trial
-        x .+= α .* Δx
-        ϕ_α = sum(loglikelihood(x, lds, y))
+        # First trial with α = 1
+        α_1, α_2 = one(T), one(T)
+        x .+= α_2 .* Δx
+        ϕx_0, ϕx_1 = ϕ_0, sum(loglikelihood(x, lds, y))
 
         # Phase 1: Bisect until we get a finite value
-        iterfinitemax = 50
         iterfinite = 0
-        while !isfinite(ϕ_α) && iterfinite < iterfinitemax
+        while !isfinite(ϕx_1) && iterfinite < 50
             iterfinite += 1
-            x .-= α .* Δx  # Revert
-            α *= T(0.5)
-            x .+= α .* Δx
-            ϕ_α = sum(loglikelihood(x, lds, y))
+            x .-= α_2 .* Δx
+            α_1 = α_2
+            α_2 *= T(0.5)
+            x .+= α_2 .* Δx
+            ϕx_1 = sum(loglikelihood(x, lds, y))
         end
 
-        # Phase 2: Quadratic interpolation backtracking until Armijo condition satisfied
-        max_ls_iter = 1000
+        # Phase 2: Quadratic/cubic interpolation until Armijo condition satisfied
+        # Note: For maximization, Armijo requires ϕ ≥ ϕ_0 + c*α*dϕ_0 (sufficient increase)
         ls_iter = 0
-        while ϕ_α < ϕ_0 + c_armijo * α * dϕ_0
+        while ϕx_1 < ϕ_0 + c_armijo * α_2 * dϕ_0
             ls_iter += 1
-            if ls_iter > max_ls_iter
-                # Give up and take whatever step we have
+            if ls_iter > 1000
                 break
             end
 
-            # Quadratic interpolation: fit parabola to ϕ(0), ϕ'(0), ϕ(α)
-            # Minimizer: α_new = -dϕ_0 * α² / (2 * (ϕ_α - ϕ_0 - dϕ_0 * α))
-            α_tmp = -(dϕ_0 * α^2) / (2 * (ϕ_α - ϕ_0 - dϕ_0 * α))
+            # Compute new step size via interpolation
+            if ls_iter == 1
+                # Quadratic interpolation: fit parabola to ϕ(0), ϕ'(0), ϕ(α)
+                α_tmp = -(dϕ_0 * α_2^2) / (2 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2))
+            else
+                # Cubic interpolation using two function values
+                div = one(T) / (α_1^2 * α_2^2 * (α_2 - α_1))
+                a = (α_1^2 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2) - α_2^2 * (ϕx_0 - ϕ_0 - dϕ_0 * α_1)) * div
+                b = (-α_1^3 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2) + α_2^3 * (ϕx_0 - ϕ_0 - dϕ_0 * α_1)) * div
+
+                if abs(a) < eps(T)
+                    α_tmp = -dϕ_0 / (2 * b)
+                else
+                    disc = max(b^2 - 3 * a * dϕ_0, zero(T))
+                    α_tmp = (-b + sqrt(disc)) / (3 * a)
+                end
+            end
 
             # Apply safeguards: don't shrink too much or too little
-            α_tmp = min(α_tmp, α * ρ_hi)  # At most halve
-            α_tmp = max(α_tmp, α * ρ_lo)  # At least reduce by factor of 10
+            α_tmp = min(α_tmp, α_2 * ρ_hi)
+            α_tmp = max(α_tmp, α_2 * ρ_lo)
 
-            # Update
-            x .-= α .* Δx  # Revert to x_old
-            α = α_tmp
-            x .+= α .* Δx  # Try new step
-            ϕ_α = sum(loglikelihood(x, lds, y))
+            # Update: store previous, try new step
+            α_1 = α_2
+            x .-= α_2 .* Δx  # Revert to x_old
+            α_2 = α_tmp
+            x .+= α_2 .* Δx
+            ϕx_0, ϕx_1 = ϕx_1, sum(loglikelihood(x, lds, y))
         end
 
         # Check convergence on effective step size
-        if α * norm(Δx) < tol
+        if α_2 * norm(Δx) < tol
             converged = true
             break
         end
