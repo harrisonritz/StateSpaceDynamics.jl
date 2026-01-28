@@ -73,6 +73,56 @@ function loglikelihood(
 end
 
 """
+    _loglikelihood_ws(x, lds, y, ws)
+
+Efficient log-likelihood computation using cached Cholesky factors from SmoothWorkspace.
+Returns the total log-likelihood (scalar), not per-timestep.
+Used in the Newton line search to avoid repeated Cholesky factorizations.
+"""
+function _loglikelihood_ws(
+    x::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T},
+    ws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(y, 2)
+    C = lds.obs_model.C
+    log_d = lds.obs_model.log_d
+    A = lds.state_model.A
+    b = lds.state_model.b
+    x0 = lds.state_model.x0
+    obs_dim, latent_dim = size(C)
+
+    ll = zero(T)
+
+    # Observation log-likelihood: sum over t of [y'(Cx+d) - sum(exp(Cx+d))]
+    @views for t in 1:tsteps
+        for i in 1:obs_dim
+            η = dot(C[i, :], x[:, t]) + log_d[i]
+            ll += y[i, t] * η - exp(η)
+        end
+    end
+
+    # Prior term: -0.5 * (x_1 - x0)' * P0^{-1} * (x_1 - x0)
+    # Use ws.P0_chol_U (upper triangular) - solve P0_chol_U' * z = (x_1 - x0), then ||z||^2
+    @views begin
+        dx1 = x[:, 1] .- x0
+        # z = P0_chol_U' \ dx1 (forward solve with lower triangular = U')
+        z = ws.P0_chol_U' \ dx1
+        ll -= T(0.5) * dot(z, z)
+    end
+
+    # Transition terms: -0.5 * sum_{t=2}^T (x_t - Ax_{t-1} - b)' * Q^{-1} * (x_t - Ax_{t-1} - b)
+    @views for t in 2:tsteps
+        dx = x[:, t] .- (A * x[:, t - 1] .+ b)
+        z = ws.Q_chol_U' \ dx
+        ll -= T(0.5) * dot(z, z)
+    end
+
+    return ll
+end
+
+"""
     loglikelihood(x::AbstractArray{T,3}, plds::LinearDynamicalSystem{T,S,O}, y::AbstractArray{T,3})
 
 Calculate the complete-data log-likelihood of a Poisson Linear Dynamical System model for multiple trials.
@@ -1023,11 +1073,14 @@ function smooth!(
     converged = false
     c_armijo = T(1e-4)
 
+    # Track function value for f-convergence check
+    ϕ_prev = -T(Inf)
+
     for iter in 1:max_iter
         # Compute gradient
         _compute_gradient_poisson!(sws.grad_buf, sws, lds, y, x)
 
-        # Check gradient-based convergence
+        # Check gradient-based convergence (g_converged)
         grad_norm = norm(sws.grad_buf)
         if grad_norm < tol
             converged = true
@@ -1047,14 +1100,14 @@ function smooth!(
 
         # Backtracking line search with quadratic/cubic interpolation (Nocedal & Wright Sec. 3.5)
         Δx = reshape(sws.X₀, D, tsteps)
-        ϕ_0 = sum(loglikelihood(x, lds, y))      # f(0)
+        ϕ_0 = _loglikelihood_ws(x, lds, y, sws)      # f(0)
         dϕ_0 = dot(grad_vec, sws.X₀)             # f'(0) = g' * Δx > 0 (ascent direction)
         ρ_hi, ρ_lo = T(0.5), T(0.1)              # Safeguard bounds on step reduction
 
         # First trial with α = 1
         α_1, α_2 = one(T), one(T)
         x .+= α_2 .* Δx
-        ϕx_0, ϕx_1 = ϕ_0, sum(loglikelihood(x, lds, y))
+        ϕx_0, ϕx_1 = ϕ_0, _loglikelihood_ws(x, lds, y, sws)
 
         # Phase 1: Bisect until we get a finite value
         iterfinite = 0
@@ -1064,16 +1117,14 @@ function smooth!(
             α_1 = α_2
             α_2 *= T(0.5)
             x .+= α_2 .* Δx
-            ϕx_1 = sum(loglikelihood(x, lds, y))
+            ϕx_1 = _loglikelihood_ws(x, lds, y, sws)
         end
 
         # Phase 2: Quadratic/cubic interpolation until Armijo condition satisfied
         # Note: For maximization, Armijo requires ϕ ≥ ϕ_0 + c*α*dϕ_0 (sufficient increase)
-        ls_iter = 0
-        while ϕx_1 < ϕ_0 + c_armijo * α_2 * dϕ_0
-            ls_iter += 1
-            if ls_iter > 1000
-                break
+        for ls_iter in 1:25
+            if ϕx_1 >= ϕ_0 + c_armijo * α_2 * dϕ_0
+                break  # Armijo satisfied
             end
 
             # Compute new step size via interpolation
@@ -1103,14 +1154,19 @@ function smooth!(
             x .-= α_2 .* Δx  # Revert to x_old
             α_2 = α_tmp
             x .+= α_2 .* Δx
-            ϕx_0, ϕx_1 = ϕx_1, sum(loglikelihood(x, lds, y))
+            ϕx_0, ϕx_1 = ϕx_1, _loglikelihood_ws(x, lds, y, sws)
         end
 
-        # Check convergence on effective step size
-        if α_2 * norm(Δx) < tol
+        # Check convergence: step size (x_converged) or function value (f_converged)
+        step_size = α_2 * norm(Δx)
+        f_change = abs(ϕx_1 - ϕ_prev)
+
+        if step_size < tol || f_change < tol
             converged = true
             break
         end
+
+        ϕ_prev = ϕx_1
     end
 
     # After convergence, compute posterior covariances
