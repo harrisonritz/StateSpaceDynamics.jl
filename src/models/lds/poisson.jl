@@ -622,7 +622,8 @@ function calculate_elbo(
         prior_term += iw_logprior_term(plds.state_model.P0, plds.state_model.P0_prior)
     end
 
-    return sum(Q_vals) + prior_term - total_entropy
+    # ELBO = E_q[log p(y,x|θ)] + H[q] = Q + prior + entropy
+    return sum(Q_vals) + prior_term + total_entropy
 end
 
 """
@@ -1044,24 +1045,51 @@ function smooth!(
             sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, grad_vec, btd
         )
 
-        # Backtracking line search with Armijo condition
+        # Backtracking line search with quadratic interpolation (Nocedal & Wright Sec. 3.5)
         Δx = reshape(sws.X₀, D, tsteps)
-        current_ll = sum(loglikelihood(x, lds, y))
-        directional_deriv = dot(grad_vec, sws.X₀)  # g' * Δx > 0 (ascent direction)
+        ϕ_0 = sum(loglikelihood(x, lds, y))      # f(0)
+        dϕ_0 = dot(grad_vec, sws.X₀)             # f'(0) = g' * Δx > 0 (ascent direction)
         α = one(T)
+        ρ_hi, ρ_lo = T(0.5), T(0.1)              # Safeguard bounds on step reduction
 
-        for ls_iter in 1:25
-            x .+= α .* Δx
-            new_ll = sum(loglikelihood(x, lds, y))
-            if isfinite(new_ll) && new_ll ≥ current_ll + c_armijo * α * directional_deriv
-                break  # Accept step (x already updated)
-            end
+        # First trial
+        x .+= α .* Δx
+        ϕ_α = sum(loglikelihood(x, lds, y))
+
+        # Phase 1: Bisect until we get a finite value
+        iterfinitemax = 50
+        iterfinite = 0
+        while !isfinite(ϕ_α) && iterfinite < iterfinitemax
+            iterfinite += 1
             x .-= α .* Δx  # Revert
             α *= T(0.5)
-            if ls_iter == 25
-                # All line search steps failed; take the smallest step
-                x .+= α .* Δx
+            x .+= α .* Δx
+            ϕ_α = sum(loglikelihood(x, lds, y))
+        end
+
+        # Phase 2: Quadratic interpolation backtracking until Armijo condition satisfied
+        max_ls_iter = 1000
+        ls_iter = 0
+        while ϕ_α < ϕ_0 + c_armijo * α * dϕ_0
+            ls_iter += 1
+            if ls_iter > max_ls_iter
+                # Give up and take whatever step we have
+                break
             end
+
+            # Quadratic interpolation: fit parabola to ϕ(0), ϕ'(0), ϕ(α)
+            # Minimizer: α_new = -dϕ_0 * α² / (2 * (ϕ_α - ϕ_0 - dϕ_0 * α))
+            α_tmp = -(dϕ_0 * α^2) / (2 * (ϕ_α - ϕ_0 - dϕ_0 * α))
+
+            # Apply safeguards: don't shrink too much or too little
+            α_tmp = min(α_tmp, α * ρ_hi)  # At most halve
+            α_tmp = max(α_tmp, α * ρ_lo)  # At least reduce by factor of 10
+
+            # Update
+            x .-= α .* Δx  # Revert to x_old
+            α = α_tmp
+            x .+= α .* Δx  # Try new step
+            ϕ_α = sum(loglikelihood(x, lds, y))
         end
 
         # Check convergence on effective step size

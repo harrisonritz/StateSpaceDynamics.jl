@@ -1124,7 +1124,8 @@ function calculate_elbo(
         prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
     end
 
-    return sum(Q_vals) + prior_term - total_entropy
+    # ELBO = E_q[log p(y,x|θ)] + H[q] = Q + prior + entropy
+    return sum(Q_vals) + prior_term + total_entropy
 end
 
 """
@@ -1192,7 +1193,8 @@ function calculate_elbo(
         prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
     end
 
-    return Q_total + prior_term - total_entropy
+    # ELBO = E_q[log p(y,x|θ)] + H[q] = Q + prior + entropy
+    return Q_total + prior_term + total_entropy
 end
 
 """
