@@ -85,37 +85,46 @@ function _loglikelihood_ws(
     y::AbstractMatrix{T},
     ws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+
     tsteps = size(y, 2)
-    C = lds.obs_model.C
+
+    C     = lds.obs_model.C
     log_d = lds.obs_model.log_d
-    A = lds.state_model.A
-    b = lds.state_model.b
-    x0 = lds.state_model.x0
-    obs_dim, latent_dim = size(C)
+    A     = lds.state_model.A
+    b     = lds.state_model.b
+    x0    = lds.state_model.x0
 
     ll = zero(T)
 
-    # Observation log-likelihood: sum over t of [y'(Cx+d) - sum(exp(Cx+d))]
+    # Reuse an obs-dim buffer to store d = exp(log_d) once per call.
+    d = ws.temp_solve_R                 # length obs_dim
+    @. d = exp(log_d)
+
+    η = ws.temp_dy                      # length obs_dim
+    dx = ws.temp_dx                     # length latent_dim
+    z  = ws.temp_solve_Q                # length latent_dim
+
+    # Observation term: sum_t [ y_t'η_t - sum(exp(η_t)) ], η_t = Cx_t + d
     @views for t in 1:tsteps
-        for i in 1:obs_dim
-            η = dot(C[i, :], x[:, t]) + log_d[i]
-            ll += y[i, t] * η - exp(η)
-        end
+        mul!(η, C, x[:, t])             # η := C * x_t
+        @. η = η + d                    # η := η + d
+        ll += dot(y[:, t], η) - sum(exp, η)
     end
 
-    # Prior term: -0.5 * (x_1 - x0)' * P0^{-1} * (x_1 - x0)
-    # Use ws.P0_chol_U (upper triangular) - solve P0_chol_U' * z = (x_1 - x0), then ||z||^2
+    # Prior: -0.5 * || P0^{-1/2} (x1 - x0) ||^2  with P0 = U'U
     @views begin
-        dx1 = x[:, 1] .- x0
-        # z = P0_chol_U' \ dx1 (forward solve with lower triangular = U')
-        z = ws.P0_chol_U' \ dx1
+        @. dx = x[:, 1] - x0
+        copyto!(z, dx)
+        ldiv!(LowerTriangular(ws.P0_chol_U'), z)  # z := U' \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
-    # Transition terms: -0.5 * sum_{t=2}^T (x_t - Ax_{t-1} - b)' * Q^{-1} * (x_t - Ax_{t-1} - b)
+    # Transitions: -0.5 * sum_{t=2}^T || Q^{-1/2} (x_t - A x_{t-1} - b) ||^2, Q = U'U
     @views for t in 2:tsteps
-        dx = x[:, t] .- (A * x[:, t - 1] .+ b)
-        z = ws.Q_chol_U' \ dx
+        mul!(dx, A, x[:, t-1])          # dx := A * x_{t-1}
+        @. dx = x[:, t] - (dx + b)      # dx := x_t - (A x_{t-1} + b)
+        copyto!(z, dx)
+        ldiv!(LowerTriangular(ws.Q_chol_U'), z)   # z := U' \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
