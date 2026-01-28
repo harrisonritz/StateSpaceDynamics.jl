@@ -593,7 +593,7 @@ end
 
 function smooth(lds::LinearDynamicalSystem, y::AbstractArray{T,3}) where {T}
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.nthreads()]
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.maxthreadid()]
     smooth!(lds, tfs, y, sws_pool)
 
     D = lds.latent_dim
@@ -621,7 +621,7 @@ exploiting the block tridiagonal structure of the Hessian for efficient solving.
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O}, fs::FilterSmooth{T}, y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
     btd = sws.btd
 
@@ -707,7 +707,7 @@ Each thread uses its own workspace to avoid contention.
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = size(y, 3)
 
     if ntrials == 1
@@ -720,6 +720,21 @@ function smooth!(
     end
 
     return tfs
+end
+
+"""
+    smooth!(lds, tfs, y)
+
+Convenience method for multi-trial Gaussian LDS smoothing that creates workspaces internally.
+This is less efficient than passing a pre-allocated workspace pool, but useful for testing.
+"""
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(y, 2)
+    npool = Threads.maxthreadid()
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    return smooth!(lds, tfs, y, sws_pool)
 end
 
 """
@@ -1240,12 +1255,26 @@ Uses `SmoothWorkspace` pool for low-allocation smoothing.
 function estep!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     smooth!(lds, tfs, y, sws_pool)
     sufficient_statistics!(tfs)
     # Use workspace-aware calculate_elbo (Cholesky already cached in smooth!)
     elbo = calculate_elbo(lds, tfs, y, sws_pool[1])
     return elbo
+end
+
+"""
+    estep!(lds, tfs, y)
+
+Convenience method for Gaussian LDS E-step that creates workspaces internally.
+"""
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(y, 2)
+    npool = Threads.maxthreadid()
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    return estep!(lds, tfs, y, sws_pool)
 end
 
 """
@@ -1617,6 +1646,22 @@ function mstep!(
     return norm_change
 end
 
+"""
+    mstep!(lds, tfs, y; w=nothing)
+
+Convenience method for Gaussian LDS M-step that creates a workspace internally.
+"""
+function mstep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractArray{T,3},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(y, 2)
+    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
+    return mstep!(lds, tfs, y, sws, w)
+end
+
 function update_initial_state_covariance!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
@@ -1897,7 +1942,7 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress=true,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     if eltype(y) !== T
         error("Observed data must be of type $(T); Got $(eltype(y)))")
     end
@@ -1914,7 +1959,7 @@ function fit!(
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
 
     # Create workspace pool (one per thread) - always use allocation-free path
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.nthreads()]
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.maxthreadid()]
 
     # Initialize progress bar only if progress=true
     prog = if progress

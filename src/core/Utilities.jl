@@ -542,6 +542,10 @@ end
 Pre-compute and cache all Cholesky factors and derived terms that are constant
 within a single `smooth!` call (i.e., depend only on model parameters, not on x).
 Must be called once at the start of each `smooth!` invocation.
+
+For Gaussian observation models, computes both state and observation model terms.
+For Poisson observation models, only computes state model terms (observation
+terms are x-dependent and computed per-iteration).
 """
 function compute_smooth_constants!(
     ws::SmoothWorkspace{T},
@@ -576,6 +580,55 @@ function compute_smooth_constants!(
     # yt_given_xt = -C' * (R_chol \ C)
     mul!(ws.yt_given_xt, C', tmp_RC)
     ws.yt_given_xt .*= -one(T)
+
+    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
+    copyto!(ws.xt_given_xt_1, ws.I_mat)
+    ldiv!(Q_chol, ws.xt_given_xt_1)
+    ws.xt_given_xt_1 .*= -one(T)
+
+    # xt1_given_xt = -A' * (Q_chol \ A)
+    mul!(ws.xt1_given_xt, A', tmp_QA)
+    ws.xt1_given_xt .*= -one(T)
+
+    # x_t = -(P0_chol \ I) = -P0^{-1}
+    copyto!(ws.x_t, ws.I_mat)
+    ldiv!(P0_chol, ws.x_t)
+    ws.x_t .*= -one(T)
+
+    return nothing
+end
+
+"""
+    compute_smooth_constants_poisson!(ws::SmoothWorkspace{T}, lds)
+
+Pre-compute and cache Cholesky factors and derived terms for Poisson LDS smoothing.
+Only computes state model terms since the observation terms are x-dependent
+and must be computed per-iteration.
+
+Must be called once at the start of each `smooth!` invocation for Poisson LDS.
+"""
+function compute_smooth_constants_poisson!(
+    ws::SmoothWorkspace{T},
+    lds,
+) where {T<:Real}
+    A = lds.state_model.A
+    Q = lds.state_model.Q
+    P0 = lds.state_model.P0
+
+    # Compute Cholesky factors for state model only
+    Q_chol = cholesky(Symmetric(Q))
+    P0_chol = cholesky(Symmetric(P0))
+
+    copyto!(ws.Q_chol_U, Q_chol.U)
+    copyto!(ws.P0_chol_U, P0_chol.U)
+
+    # Gradient terms: A_inv_Q = (Q_chol \ A)'
+    tmp_QA = Q_chol \ A   # latent_dim × latent_dim
+    copyto!(ws.A_inv_Q, tmp_QA')
+
+    # Hessian block templates for state model
+    copyto!(ws.H_sub_entry, tmp_QA)          # Q_chol \ A
+    copyto!(ws.H_super_entry, tmp_QA')       # (Q_chol \ A)'
 
     # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
     copyto!(ws.xt_given_xt_1, ws.I_mat)

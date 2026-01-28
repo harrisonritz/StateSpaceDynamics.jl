@@ -821,3 +821,427 @@ function mstep!(
     new_params = _get_all_params_vec(plds)
     return norm(new_params - old_params)
 end
+
+
+"""
+    _fill_hessian_blocks_poisson!(ws, lds, x)
+
+Fill the Hessian block diagonal and off-diagonal entries for Poisson LDS.
+Uses pre-computed state model terms from `compute_smooth_constants_poisson!`
+and computes the x-dependent Poisson observation term per-timestep.
+"""
+function _fill_hessian_blocks_poisson!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(x, 2)
+    btd = ws.btd
+    C = lds.obs_model.C
+    log_d = lds.obs_model.log_d
+    d = exp.(log_d)
+    obs_dim, latent_dim = size(C)
+
+    # Pre-compute diagonal templates
+    Q_middle = ws.xt1_given_xt .+ ws.xt_given_xt_1
+    Q_first = ws.x_t .+ ws.xt1_given_xt
+    Q_last = ws.xt_given_xt_1
+
+    # Fill sub/super-diagonal blocks (constant for all timesteps)
+    for i in 1:(tsteps - 1)
+        copyto!(btd.H_sub[i], ws.H_sub_entry)
+        copyto!(btd.H_super[i], ws.H_super_entry)
+    end
+
+    # Temporaries for Poisson observation term
+    λ = Vector{T}(undef, obs_dim)
+    z = Vector{T}(undef, obs_dim)
+
+    @views for t in 1:tsteps
+        # Start with state model contribution
+        if t == 1
+            copyto!(btd.H_diag[t], Q_first)
+        elseif t == tsteps
+            copyto!(btd.H_diag[t], Q_last)
+        else
+            copyto!(btd.H_diag[t], Q_middle)
+        end
+
+        # Add Poisson observation term: -C' * diag(λ) * C
+        mul!(z, C, x[:, t])
+        @. λ = exp(z + d)
+
+        # Compute -C' * diag(λ) * C and add to diagonal block
+        for j in 1:latent_dim, i in 1:latent_dim
+            acc = zero(T)
+            for k in 1:obs_dim
+                acc += C[k, i] * λ[k] * C[k, j]
+            end
+            btd.H_diag[t][i, j] -= acc
+        end
+    end
+
+    return nothing
+end
+
+"""
+    _compute_gradient_poisson!(grad, ws, lds, y, x)
+
+Compute the gradient of the log-likelihood for Poisson LDS.
+Fills `grad` (latent_dim × tsteps) matrix with gradient values.
+"""
+function _compute_gradient_poisson!(
+    grad::AbstractMatrix{T},
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T},
+    x::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    A = lds.state_model.A
+    b = lds.state_model.b
+    C = lds.obs_model.C
+    log_d = lds.obs_model.log_d
+    x0 = lds.state_model.x0
+
+    d = exp.(log_d)
+    tsteps = size(y, 2)
+    latent_dim, obs_dim = lds.latent_dim, lds.obs_dim
+
+    # Cholesky factors from workspace (stored as upper triangular)
+    Q_chol_U = UpperTriangular(ws.Q_chol_U)
+    P0_chol_U = UpperTriangular(ws.P0_chol_U)
+
+    # Reuse workspace temp vectors
+    Cx_t = ws.dyt           # obs_dim
+    exp_term = ws.temp_dy   # obs_dim
+    state_diff = ws.dxt     # latent_dim
+    temp_grad = ws.tmp1     # latent_dim
+    common_term = ws.tmp2   # latent_dim
+
+    @views for t in 1:tsteps
+        # Observation term: C' * (y - exp(C*x + d))
+        mul!(Cx_t, C, x[:, t])
+        @. exp_term = exp(Cx_t + d)
+        exp_term .= y[:, t] .- exp_term
+        mul!(common_term, C', exp_term)
+
+        if t == 1
+            # First timestep: common_term + A' * Q⁻¹ * (x₂ - A*x₁ - b) - P0⁻¹ * (x₁ - x0)
+            mul!(state_diff, A, x[:, t])
+            state_diff .= x[:, 2] .- state_diff .- b
+
+            # Q⁻¹ * state_diff via Cholesky: solve Q_chol_U' * Q_chol_U * z = state_diff
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol_U', temp_grad)
+            ldiv!(Q_chol_U, temp_grad)
+
+            mul!(grad[:, t], A', temp_grad)
+            grad[:, t] .+= common_term
+
+            # Subtract P0⁻¹ * (x₁ - x0)
+            state_diff .= x[:, t] .- x0
+            copyto!(temp_grad, state_diff)
+            ldiv!(P0_chol_U', temp_grad)
+            ldiv!(P0_chol_U, temp_grad)
+            grad[:, t] .-= temp_grad
+
+        elseif t == tsteps
+            # Last timestep: common_term - Q⁻¹ * (xₜ - A*xₜ₋₁ - b)
+            mul!(state_diff, A, x[:, t - 1])
+            state_diff .= x[:, t] .- state_diff .- b
+
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol_U', temp_grad)
+            ldiv!(Q_chol_U, temp_grad)
+
+            grad[:, t] .= common_term .- temp_grad
+        else
+            # Middle timesteps
+            # common_term + A' * Q⁻¹ * (xₜ₊₁ - A*xₜ - b) - Q⁻¹ * (xₜ - A*xₜ₋₁ - b)
+
+            # Forward term: A' * Q⁻¹ * (xₜ₊₁ - A*xₜ - b)
+            mul!(state_diff, A, x[:, t])
+            state_diff .= x[:, t + 1] .- state_diff .- b
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol_U', temp_grad)
+            ldiv!(Q_chol_U, temp_grad)
+            mul!(grad[:, t], A', temp_grad)
+            grad[:, t] .+= common_term
+
+            # Backward term: -Q⁻¹ * (xₜ - A*xₜ₋₁ - b)
+            mul!(state_diff, A, x[:, t - 1])
+            state_diff .= x[:, t] .- state_diff .- b
+            copyto!(temp_grad, state_diff)
+            ldiv!(Q_chol_U', temp_grad)
+            ldiv!(Q_chol_U, temp_grad)
+            grad[:, t] .-= temp_grad
+        end
+    end
+
+    return grad
+end
+
+"""
+    smooth!(lds, fs, y, sws; max_iter=20, tol=1e-6)
+
+Poisson LDS smoothing using iterative Newton with block tridiagonal solve.
+Uses `SmoothWorkspace` for pre-allocated buffers.
+
+Since the Poisson log-likelihood is non-quadratic, multiple Newton iterations
+are required (unlike Gaussian LDS which converges in one step).
+"""
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O}, fs::FilterSmooth{T}, y::AbstractMatrix{T},
+    sws::SmoothWorkspace{T};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps, D = size(y, 2), lds.latent_dim
+    btd = sws.btd
+
+    # Pre-compute all constant terms for this smooth! call
+    compute_smooth_constants_poisson!(sws, lds)
+
+    # Use x_smooth as the working buffer (sufficient_statistics! copies x_smooth -> E_z)
+    x = fs.x_smooth
+
+    # Initialize from previous E_z (warm start) or from prior
+    if all(fs.E_z .== 0)
+        # First call: initialize from prior
+        x[:, 1] .= lds.state_model.x0
+        for t in 2:tsteps
+            mul!(view(x, :, t), lds.state_model.A, view(x, :, t - 1))
+            x[:, t] .+= lds.state_model.b
+        end
+    else
+        # Warm start from previous E-step
+        copyto!(x, fs.E_z)
+    end
+
+    # Newton iteration with backtracking line search (Armijo condition)
+    converged = false
+    c_armijo = T(1e-4)
+
+    for iter in 1:max_iter
+        # Compute gradient
+        _compute_gradient_poisson!(sws.grad_buf, sws, lds, y, x)
+
+        # Check gradient-based convergence
+        grad_norm = norm(sws.grad_buf)
+        if grad_norm < tol
+            converged = true
+            break
+        end
+
+        # Build Hessian blocks and negate for Newton step: (-H) * Δx = g
+        _fill_hessian_blocks_poisson!(sws, lds, x)
+        _negate_blocks!(btd)
+
+        # Compute Newton direction via block tridiagonal solve
+        grad_vec = vec(sws.grad_buf)
+        copyto!(sws.X₀, grad_vec)
+        block_tridiagonal_solve!(
+            sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, grad_vec, btd
+        )
+
+        # Backtracking line search with Armijo condition
+        Δx = reshape(sws.X₀, D, tsteps)
+        current_ll = sum(loglikelihood(x, lds, y))
+        directional_deriv = dot(grad_vec, sws.X₀)  # g' * Δx > 0 (ascent direction)
+        α = one(T)
+
+        for ls_iter in 1:25
+            x .+= α .* Δx
+            new_ll = sum(loglikelihood(x, lds, y))
+            if isfinite(new_ll) && new_ll ≥ current_ll + c_armijo * α * directional_deriv
+                break  # Accept step (x already updated)
+            end
+            x .-= α .* Δx  # Revert
+            α *= T(0.5)
+            if ls_iter == 25
+                # All line search steps failed; take the smallest step
+                x .+= α .* Δx
+            end
+        end
+
+        # Check convergence on effective step size
+        if α * norm(Δx) < tol
+            converged = true
+            break
+        end
+    end
+
+    # After convergence, compute posterior covariances
+    # -H at the MAP is the precision matrix of the Laplace approximation
+    _fill_hessian_blocks_poisson!(sws, lds, x)
+    _negate_blocks!(btd)
+
+    # Compute inverse (covariance) and log-determinant
+    logdet_precision = block_tridiagonal_inverse_logdet!(
+        fs.p_smooth, fs.p_smooth_tt1,
+        btd.neg_sub, btd.neg_diag, btd.neg_super, btd
+    )
+
+    # Compute entropy from log-determinant
+    n_total = D * tsteps
+    fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_total)
+
+    return fs
+end
+
+"""
+    smooth!(lds, tfs, y, sws_pool; max_iter=20, tol=1e-6)
+
+Multi-trial Poisson LDS smoothing with workspace pool.
+"""
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    sws_pool::Vector{SmoothWorkspace{T}};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    ntrials = size(y, 3)
+
+    if ntrials == 1
+        @views smooth!(lds, tfs[1], y[:, :, 1], sws_pool[1]; max_iter=max_iter, tol=tol)
+    else
+        @threads for trial in 1:ntrials
+            tid = Threads.threadid()
+            @views smooth!(
+                lds, tfs[trial], y[:, :, trial], sws_pool[tid];
+                max_iter=max_iter, tol=tol
+            )
+        end
+    end
+
+    return tfs
+end
+
+"""
+    smooth!(lds, tfs, y; max_iter=20, tol=1e-6)
+
+Convenience method for multi-trial Poisson LDS smoothing that creates workspaces internally.
+This is less efficient than passing a pre-allocated workspace pool, but useful for testing.
+"""
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(y, 2)
+    npool = Threads.maxthreadid()
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    return smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
+end
+
+"""
+    estep!(lds, tfs, y, sws_pool; max_iter=20, tol=1e-6)
+
+E-step for Poisson LDS: smooth and compute sufficient statistics.
+"""
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    sws_pool::Vector{SmoothWorkspace{T}};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
+    sufficient_statistics!(tfs)
+    elbo = calculate_elbo(lds, tfs, y)
+    return elbo
+end
+
+"""
+    estep!(lds, tfs, y; max_iter=20, tol=1e-6)
+
+Convenience method for Poisson LDS E-step that creates workspaces internally.
+"""
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(y, 2)
+    npool = Threads.maxthreadid()
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    return estep!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
+end
+
+"""
+    fit!(plds, y; max_iter=100, tol=1e-6, progress=true, newton_max_iter=20, newton_tol=1e-6)
+
+Fit a Poisson LDS model using the Laplace-EM algorithm with workspace-based smoothing.
+
+# Arguments
+- `plds`: The Poisson Linear Dynamical System model
+- `y`: Observed data array (obs_dim × tsteps × ntrials)
+- `max_iter`: Maximum EM iterations (default: 100)
+- `tol`: Convergence tolerance for ELBO (default: 1e-6)
+- `progress`: Show progress bar (default: true)
+- `newton_max_iter`: Max Newton iterations per E-step (default: 20)
+- `newton_tol`: Newton convergence tolerance (default: 1e-6)
+"""
+function fit!(
+    plds::LinearDynamicalSystem{T,S,O},
+    y::AbstractArray{T,3};
+    max_iter::Int=100,
+    tol::Float64=1e-6,
+    progress=true,
+    newton_max_iter::Int=20,
+    newton_tol::Float64=1e-6,
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    if eltype(y) !== T
+        error("Observed data must be of type $(T); Got $(eltype(y)))")
+    end
+
+    obs_dim, tsteps, ntrials = size(y)
+    latent_dim = plds.latent_dim
+
+    # Initialize TrialFilterSmooth
+    tfs = initialize_FilterSmooth(plds, tsteps, ntrials)
+
+    # Create workspace pool (one per thread ID)
+    npool = Threads.maxthreadid()
+    sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, tsteps) for _ in 1:npool]
+
+    # Tracking arrays
+    elbos = Vector{T}(undef, max_iter)
+    param_diffs = Vector{T}(undef, max_iter)
+
+    # Progress bar
+    prog = if progress
+        Progress(max_iter; desc="Fitting Poisson LDS via LaPlaceEM...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
+
+    # EM iterations
+    for iter in 1:max_iter
+        # E-step: smooth and compute sufficient statistics
+        elbos[iter] = estep!(
+            plds, tfs, y, sws_pool;
+            max_iter=newton_max_iter, tol=T(newton_tol)
+        )
+
+        # M-step: update parameters
+        param_diffs[iter] = mstep!(plds, tfs, y)
+
+        # Update progress
+        if !isnothing(prog)
+            next!(prog; showvalues=[(:ELBO, elbos[iter]), (:Δparams, param_diffs[iter])])
+        end
+
+        # Check convergence (after at least 2 iterations)
+        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+            resize!(elbos, iter)
+            resize!(param_diffs, iter)
+            break
+        end
+    end
+
+    if !isnothing(prog)
+        finish!(prog)
+    end
+
+    return elbos, param_diffs
+end
