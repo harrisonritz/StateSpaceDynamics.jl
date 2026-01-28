@@ -1270,7 +1270,7 @@ function fit!(
 
         # Update progress
         if !isnothing(prog)
-            next!(prog; showvalues=[(:ELBO, elbos[iter]), (:Δparams, param_diffs[iter])])
+            next!(prog)
         end
 
         # Check convergence (after at least 2 iterations)
