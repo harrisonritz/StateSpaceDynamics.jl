@@ -227,13 +227,13 @@ function test_block_tridiagonal_inverse_randomized_vs_static()
         for block_size in (1, 2, 3)
             for n in (1, 2, 3, 4)
                 for trial in 1:5
-                    # build blocks
-                    A = [randn(rng, T, block_size, block_size) for _ in 1:max(0, n - 1)]
-                    B = [
+                    # build blocks (explicitly typed to avoid Vector{Any} when empty)
+                    A = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
+                    B = Matrix{T}[
                         T(5.0) * Matrix{T}(I, block_size, block_size) +
                         randn(rng, T, block_size, block_size) for _ in 1:n
                     ]
-                    C = [randn(rng, T, block_size, block_size) for _ in 1:max(0, n - 1)]
+                    C = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
 
                     # dynamic
                     λii_reg, λij_reg = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
