@@ -23,6 +23,10 @@ using Base: show
 include("core/GlobalTypes.jl")
 include("core/Utilities.jl")
 
+# Include optimization utilities
+include("optimization/linesearch.jl")
+include("optimization/newton.jl")
+
 # Linear Dynamical Systems
 include("models/lds/types.jl")
 include("models/lds/gaussian.jl")
