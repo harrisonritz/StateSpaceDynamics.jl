@@ -320,7 +320,7 @@ function test_SLDS_hessian_numerical()
     x_trial = x[:, :, 1]
 
     # Analytical Hessian
-    H, H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
+    H = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
 
     # Numerical Hessian - same weighted objective as gradient test
     function weighted_ll(x_flat)
@@ -402,7 +402,7 @@ function test_SLDS_hessian_block_structure()
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
-    H, H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
+    H = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
 
     D = slds.LDSs[1].latent_dim
 
@@ -1117,7 +1117,7 @@ function test_zero_weights_behavior()
     grad = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w)
     @test all(isfinite.(grad))
 
-    H, H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
+    H = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
     @test all(isfinite.(H))
 end
 

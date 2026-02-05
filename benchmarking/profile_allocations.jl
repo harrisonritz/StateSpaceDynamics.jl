@@ -1,3 +1,8 @@
+if pwd() != @__DIR__
+    using Pkg
+    Pkg.activate("benchmarking")
+end
+
 using StateSpaceDynamics
 using LinearAlgebra
 using Random
@@ -86,53 +91,19 @@ display(result_mstep)
 
 # Profile calculate_elbo
 println("\n[calculate_elbo]")
-result_elbo = @benchmark StateSpaceDynamics.calculate_elbo($model, $tfs, $y)
+result_elbo = @benchmark StateSpaceDynamics.calculate_elbo($model, $tfs, $y, $sws_pool)
 display(result_elbo)
 
-# Profile Q_function (called by calculate_elbo)
-println("\n[Q_function - single trial]")
-fs = tfs[1]
-y_trial_3d = y[:, :, 1:1]
-result_qfunc = @benchmark StateSpaceDynamics.Q_function(
-    $model.state_model.A,
-    $model.state_model.b,
-    $model.state_model.Q,
-    $model.obs_model.C,
-    $model.obs_model.d,
-    $model.obs_model.R,
-    $model.state_model.P0,
-    $model.state_model.x0,
-    $(fs.E_z),
-    $(fs.E_zz),
-    $(fs.E_zz_prev),
-    $y_trial
-)
-display(result_qfunc)
-
-# Profile Q_state
-println("\n[Q_state - single trial]")
-result_qstate = @benchmark StateSpaceDynamics.Q_state(
-    $model.state_model.A,
-    $model.state_model.b,
-    $model.state_model.Q,
-    $model.state_model.P0,
-    $model.state_model.x0,
-    $(fs.E_z),
-    $(fs.E_zz),
-    $(fs.E_zz_prev)
-)
+# Profile Q_state!
+println("\n[Q_state]")
+StateSpaceDynamics.Q_state!(sws, model, fs.E_z, fs.E_zz, fs.E_zz_prev)
+result_qstate = @benchmark StateSpaceDynamics.Q_state!(sws, $model, $fs.E_z, $fs.E_zz, $fs.E_zz_prev)
 display(result_qstate)
 
-# Profile Q_obs
-println("\n[Q_obs - single trial]")
-result_qobs = @benchmark StateSpaceDynamics.Q_obs(
-    $model.obs_model.C,
-    $model.obs_model.d,
-    $model.obs_model.R,
-    $(fs.E_z),
-    $(fs.E_zz),
-    $y_trial
-)
+# Profile Q_obs!
+println("\n[Q_obs]")
+StateSpaceDynamics.Q_obs!(sws, model, fs.E_z, fs.E_zz, y_trial)
+result_qobs = @benchmark StateSpaceDynamics.Q_obs!(sws, $model, $fs.E_z, $fs.E_zz, $y_trial)
 display(result_qobs)
 
 # Profile compute_smooth_constants!
@@ -200,7 +171,6 @@ println("\nsmooth!: $(BenchmarkTools.prettymemory(result_smooth.memory))")
 println("estep!: $(BenchmarkTools.prettymemory(result_estep.memory))")
 println("mstep!: $(BenchmarkTools.prettymemory(result_mstep.memory))")
 println("calculate_elbo: $(BenchmarkTools.prettymemory(result_elbo.memory))")
-println("Q_function: $(BenchmarkTools.prettymemory(result_qfunc.memory))")
 println("Q_state: $(BenchmarkTools.prettymemory(result_qstate.memory))")
 println("Q_obs: $(BenchmarkTools.prettymemory(result_qobs.memory))")
 

@@ -1078,105 +1078,44 @@ function smooth!(
         copyto!(x, fs.E_z)
     end
 
-    # Newton iteration with backtracking line search (Armijo condition)
-    converged = false
-    c_armijo = T(1e-4)
+    ls = BackTrackingLS{T}()                 # Armijo backtracking (LineSearches-like defaults)
+    g  = sws.grad_buf                        # D×T gradient buffer
+    p  = reshape(sws.X₀, D, tsteps)          # D×T direction buffer (views sws.X₀)
 
-    # Track function value for f-convergence check
-    ϕ_prev = -T(Inf)
+    # objective evaluator at current x (must be allocation-free)
+    ϕ!() = _loglikelihood_ws(x, lds, y, sws)
 
-    for iter in 1:max_iter
-        # Compute gradient
-        _compute_gradient_poisson!(sws.grad_buf, sws, lds, y, x)
-
-        # Check gradient-based convergence (g_converged)
-        grad_norm = norm(sws.grad_buf)
-        if grad_norm < tol
-            converged = true
-            break
-        end
-
-        # Build Hessian blocks and negate for Newton step: (-H) * Δx = g
-        _fill_hessian_blocks_poisson!(sws, lds, x)
-        _negate_blocks!(btd)
-
-        # Compute Newton direction via block tridiagonal solve
-        grad_vec = vec(sws.grad_buf)
-        copyto!(sws.X₀, grad_vec)
-        block_tridiagonal_solve!(
-            sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, grad_vec, btd
-        )
-
-        # Backtracking line search with quadratic/cubic interpolation (Nocedal & Wright Sec. 3.5)
-        Δx = reshape(sws.X₀, D, tsteps)
-        ϕ_0 = _loglikelihood_ws(x, lds, y, sws)      # f(0)
-        dϕ_0 = dot(grad_vec, sws.X₀)             # f'(0) = g' * Δx > 0 (ascent direction)
-        ρ_hi, ρ_lo = T(0.5), T(0.1)              # Safeguard bounds on step reduction
-
-        # First trial with α = 1
-        α_1, α_2 = one(T), one(T)
-        x .+= α_2 .* Δx
-        ϕx_0, ϕx_1 = ϕ_0, _loglikelihood_ws(x, lds, y, sws)
-
-        # Phase 1: Bisect until we get a finite value
-        iterfinite = 0
-        while !isfinite(ϕx_1) && iterfinite < 50
-            iterfinite += 1
-            x .-= α_2 .* Δx
-            α_1 = α_2
-            α_2 *= T(0.5)
-            x .+= α_2 .* Δx
-            ϕx_1 = _loglikelihood_ws(x, lds, y, sws)
-        end
-
-        # Phase 2: Quadratic/cubic interpolation until Armijo condition satisfied
-        # Note: For maximization, Armijo requires ϕ ≥ ϕ_0 + c*α*dϕ_0 (sufficient increase)
-        for ls_iter in 1:25
-            if ϕx_1 >= ϕ_0 + c_armijo * α_2 * dϕ_0
-                break  # Armijo satisfied
-            end
-
-            # Compute new step size via interpolation
-            if ls_iter == 1
-                # Quadratic interpolation: fit parabola to ϕ(0), ϕ'(0), ϕ(α)
-                α_tmp = -(dϕ_0 * α_2^2) / (2 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2))
-            else
-                # Cubic interpolation using two function values
-                div = one(T) / (α_1^2 * α_2^2 * (α_2 - α_1))
-                a = (α_1^2 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2) - α_2^2 * (ϕx_0 - ϕ_0 - dϕ_0 * α_1)) * div
-                b = (-α_1^3 * (ϕx_1 - ϕ_0 - dϕ_0 * α_2) + α_2^3 * (ϕx_0 - ϕ_0 - dϕ_0 * α_1)) * div
-
-                if abs(a) < eps(T)
-                    α_tmp = -dϕ_0 / (2 * b)
-                else
-                    disc = max(b^2 - 3 * a * dϕ_0, zero(T))
-                    α_tmp = (-b + sqrt(disc)) / (3 * a)
-                end
-            end
-
-            # Apply safeguards: don't shrink too much or too little
-            α_tmp = min(α_tmp, α_2 * ρ_hi)
-            α_tmp = max(α_tmp, α_2 * ρ_lo)
-
-            # Update: store previous, try new step
-            α_1 = α_2
-            x .-= α_2 .* Δx  # Revert to x_old
-            α_2 = α_tmp
-            x .+= α_2 .* Δx
-            ϕx_0, ϕx_1 = ϕx_1, _loglikelihood_ws(x, lds, y, sws)
-        end
-
-        # Check convergence: step size (x_converged) or function value (f_converged)
-        step_size = α_2 * norm(Δx)
-        f_change = abs(ϕx_1 - ϕ_prev)
-
-        if step_size < tol || f_change < tol
-            converged = true
-            break
-        end
-
-        ϕ_prev = ϕx_1
+    # gradient callback
+    compute_grad! = (gcur, xcur) -> begin
+        _compute_gradient_poisson!(gcur, sws, lds, y, xcur)
+        return nothing
     end
+
+    # Hessian-builder callback (fills blocks, then negates to form (-Hℓ) SPD)
+    build_hess! = (xcur) -> begin
+        _fill_hessian_blocks_poisson!(sws, lds, xcur)
+        _negate_blocks!(btd)
+        return nothing
+    end
+
+    # direction solver: solve (-Hℓ) p = g via block-tridiagonal solve, in-place into p
+    solve_dir! = (pcur, gcur) -> begin
+        gvec = vec(gcur)     
+        pvec = vec(pcur)     
+        copyto!(pvec, gvec)
+        block_tridiagonal_solve!(
+            pvec, btd.neg_sub, btd.neg_diag, btd.neg_super, gvec, btd
+        )
+        return nothing
+    end
+
+    converged = newton_smooth!(
+        Val(:max), x, g, p,
+        compute_grad!, build_hess!, solve_dir!, ϕ!,
+        ls;
+        max_iter=max_iter,
+        tol=tol,
+    )
 
     # After convergence, compute posterior covariances
     # -H at the MAP is the precision matrix of the Laplace approximation
@@ -1195,6 +1134,7 @@ function smooth!(
 
     return fs
 end
+
 
 """
     smooth!(lds, tfs, y, sws_pool; max_iter=20, tol=1e-6)

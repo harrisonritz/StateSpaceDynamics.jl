@@ -15,6 +15,28 @@ end
 
 # Matrix utilities
 """
+    Symmetrize!(A::AbstractMatrix{T}) where {T<:Real}
+
+In-place symmetrization of a square matrix `A` via averaging with its transpose:
+A <- 0.5*(A + A').
+"""
+function Symmetrize!(A::AbstractMatrix{T}) where {T<:Real}
+    n, m = size(A)
+    @boundscheck n == m || throw(DimensionMismatch("Matrix must be square for symmetrization, got $(n)×$(m)"))
+    half = T(0.5)
+
+    for j in 1:n
+        for i in 1:(j-1)
+            avg = (A[i, j] + A[j, i]) * half
+            A[i, j] = avg
+            A[j, i] = avg
+        end
+    end
+
+    return A
+end
+
+"""
     block_tridiagonal_inverse(A, B, C)
 
 Compute the inverse of a block tridiagonal matrix.
@@ -343,11 +365,19 @@ struct SmoothWorkspace{T<:Real}
     # Sub-workspace for block tridiagonal operations
     btd::BlockTridiagonalWorkspace{T}
 
-    # Pre-computed constant terms (filled by compute_smooth_constants!)
-    # Cholesky upper triangular factors
+    # cholesky buffers
+    R_buf::Matrix{T}      # (obs_dim × obs_dim)
+    Q_buf::Matrix{T}      # (latent_dim × latent_dim)
+    P0_buf::Matrix{T}     # (latent_dim × latent_dim)
+    
+    # Cached upper-tri Chol factors
     R_chol_U::Matrix{T}       # (obs_dim × obs_dim)
     Q_chol_U::Matrix{T}       # (latent_dim × latent_dim)
     P0_chol_U::Matrix{T}      # (latent_dim × latent_dim)
+
+    # Solve Outputs
+    tmp_RC::Matrix{T}    # obs_dim × latent_dim   (R^{-1} C)
+    tmp_QA::Matrix{T}    # latent_dim × latent_dim (Q^{-1} A)
 
     # Derived terms for Gradient
     C_inv_R::Matrix{T}        # (R_chol \ C)' = C'inv(R), size (latent_dim × obs_dim)
@@ -388,11 +418,13 @@ struct SmoothWorkspace{T<:Real}
     # M-step buffers
     Sxz::Matrix{T}            # (latent_dim × latent_dim+1) for update_A_b!
     Szz_Ab::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_A_b!
+    AB::Matrix{T}             # (latent_dim × latent_dim+1) for update_A_b!
     Syz::Matrix{T}            # (obs_dim × latent_dim+1) for update_C_d!
     Szz_Cd::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_C_d!
     Q_sum::Matrix{T}          # (latent_dim × latent_dim)
     R_sum::Matrix{T}          # (obs_dim × obs_dim)
     S0_sum::Matrix{T}         # (latent_dim × latent_dim)
+
     # update_Q! temps
     temp_Q1::Matrix{T}        # (latent_dim × latent_dim)
     temp_Q2::Matrix{T}        # (latent_dim × latent_dim)
@@ -400,15 +432,18 @@ struct SmoothWorkspace{T<:Real}
     temp_Q4::Matrix{T}        # (latent_dim × latent_dim)
     temp_Q5::Vector{T}        # (latent_dim,)
     innovation_cov::Matrix{T} # (latent_dim × latent_dim)
+
     # update_R! temps
     innovation::Vector{T}     # (obs_dim,)
     Czt::Vector{T}            # (obs_dim,)
     temp_R_matrix::Matrix{T}  # (obs_dim × latent_dim)
     outer_product::Matrix{T}  # (latent_dim × latent_dim)
     state_uncertainty::Matrix{T} # (latent_dim × latent_dim)
+
     # update_C_d! temps
     work_yz::Matrix{T}        # (obs_dim × latent_dim)
     work_outer::Matrix{T}     # (latent_dim × latent_dim)
+    CD::Matrix{T}             # (obs_dim × latent_dim + 1)
 
     # ELBO / Q_state buffers
     elbo_temp::Matrix{T}           # (latent_dim × latent_dim) - main accumulator
@@ -438,9 +473,17 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 
     # Pre-computed constant terms (will be filled by compute_smooth_constants!)
+    R_buf = zeros(T, obs_dim, obs_dim)
+    Q_buf = zeros(T, latent_dim, latent_dim)
+    P0_buf = zeros(T, latent_dim, latent_dim)
+
     R_chol_U = zeros(T, obs_dim, obs_dim)
     Q_chol_U = zeros(T, latent_dim, latent_dim)
     P0_chol_U = zeros(T, latent_dim, latent_dim)
+
+    tmp_RC = zeros(T, obs_dim, latent_dim)
+    tmp_QA = zeros(T, latent_dim, latent_dim)
+
     C_inv_R = zeros(T, latent_dim, obs_dim)
     A_inv_Q = zeros(T, latent_dim, latent_dim)
     H_sub_entry = zeros(T, latent_dim, latent_dim)
@@ -477,6 +520,7 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
     # M-step buffers
     Sxz = zeros(T, latent_dim, latent_dim + 1)
     Szz_Ab = zeros(T, latent_dim + 1, latent_dim + 1)
+    AB = zeros(T, latent_dim, latent_dim + 1)   
     Syz = zeros(T, obs_dim, latent_dim + 1)
     Szz_Cd = zeros(T, latent_dim + 1, latent_dim + 1)
     Q_sum = zeros(T, latent_dim, latent_dim)
@@ -495,6 +539,7 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
     state_uncertainty = zeros(T, latent_dim, latent_dim)
     work_yz = zeros(T, obs_dim, latent_dim)
     work_outer = zeros(T, latent_dim, latent_dim)
+    CD = zeros(T, obs_dim, latent_dim + 1)
 
     # ELBO / Q_state buffers
     elbo_temp = zeros(T, latent_dim, latent_dim)
@@ -516,7 +561,9 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
 
     return SmoothWorkspace{T}(
         btd,
+        R_buf, Q_buf, P0_buf,
         R_chol_U, Q_chol_U, P0_chol_U,
+        tmp_RC, tmp_QA,
         C_inv_R, A_inv_Q,
         H_sub_entry, H_super_entry,
         yt_given_xt, xt_given_xt_1, xt1_given_xt, x_t,
@@ -524,11 +571,11 @@ function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) 
         dxt, dxt_next, dyt, tmp1, tmp2, tmp3,
         ll_vec, temp_dx, temp_dy, temp_solve_Q, temp_solve_R,
         I_mat,
-        Sxz, Szz_Ab, Syz, Szz_Cd,
+        Sxz, Szz_Ab, AB, Syz, Szz_Cd,
         Q_sum, R_sum, S0_sum,
         temp_Q1, temp_Q2, temp_Q3, temp_Q4, temp_Q5, innovation_cov,
         innovation, Czt, temp_R_matrix, outer_product, state_uncertainty,
-        work_yz, work_outer,
+        work_yz, work_outer, CD,
         elbo_temp, elbo_sum_E_zz, elbo_sum_E_zzm1, elbo_sum_E_cross,
         elbo_sum_mu_t, elbo_sum_mu_tm1, elbo_temp2,
         elbo_obs_temp, elbo_obs_work, elbo_ytil, elbo_sum_yy, elbo_sum_yz,
@@ -547,56 +594,61 @@ For Gaussian observation models, computes both state and observation model terms
 For Poisson observation models, only computes state model terms (observation
 terms are x-dependent and computed per-iteration).
 """
-function compute_smooth_constants!(
-    ws::SmoothWorkspace{T},
-    lds,
-) where {T<:Real}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
+function compute_smooth_constants!(ws::SmoothWorkspace{T}, lds) where {T<:Real}
+    A  = lds.state_model.A
+    Q  = lds.state_model.Q
     P0 = lds.state_model.P0
-    C = lds.obs_model.C
-    R = lds.obs_model.R
+    C  = lds.obs_model.C
+    R  = lds.obs_model.R
 
-    # Compute Cholesky factors
-    R_chol = cholesky(Symmetric(R))
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
+    # Cholesky in-place
+    copyto!(ws.R_buf, R)
+    Rchol = cholesky!(Symmetric(ws.R_buf))
 
-    copyto!(ws.R_chol_U, R_chol.U)
-    copyto!(ws.Q_chol_U, Q_chol.U)
-    copyto!(ws.P0_chol_U, P0_chol.U)
+    copyto!(ws.Q_buf, Q)
+    Qchol = cholesky!(Symmetric(ws.Q_buf))
 
-    # Gradient terms: C_inv_R = (R_chol \ C)' and A_inv_Q = (Q_chol \ A)'
-    # R_chol \ C computes inv(R) * C via Cholesky, then transpose
-    tmp_RC = R_chol \ C   # obs_dim × latent_dim → but we want (latent_dim × obs_dim)
-    copyto!(ws.C_inv_R, tmp_RC')
-    tmp_QA = Q_chol \ A   # latent_dim × latent_dim
-    copyto!(ws.A_inv_Q, tmp_QA')
+    copyto!(ws.P0_buf, P0)
+    P0chol = cholesky!(Symmetric(ws.P0_buf))
 
-    # Hessian block templates
-    copyto!(ws.H_sub_entry, tmp_QA)          # Q_chol \ A
-    copyto!(ws.H_super_entry, tmp_QA')       # (Q_chol \ A)'
+    # store U factors
+    copyto!(ws.R_chol_U, Rchol.U)
+    copyto!(ws.Q_chol_U, Qchol.U)
+    copyto!(ws.P0_chol_U, P0chol.U)
 
-    # yt_given_xt = -C' * (R_chol \ C)
-    mul!(ws.yt_given_xt, C', tmp_RC)
+    # tmp_RC = R^{-1} C
+    copyto!(ws.tmp_RC, C)
+    ldiv!(Rchol, ws.tmp_RC)
+    copyto!(ws.C_inv_R, ws.tmp_RC')
+
+    # tmp_QA = Q^{-1} A
+    copyto!(ws.tmp_QA, A)
+    ldiv!(Qchol, ws.tmp_QA)
+    copyto!(ws.A_inv_Q, ws.tmp_QA')
+    copyto!(ws.H_sub_entry,   ws.tmp_QA)
+    copyto!(ws.H_super_entry, ws.tmp_QA')
+
+    # yt_given_xt = -C' * (R^{-1} C)
+    mul!(ws.yt_given_xt, C', ws.tmp_RC)
     ws.yt_given_xt .*= -one(T)
 
-    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
+    # xt_given_xt_1 = -Q^{-1}
     copyto!(ws.xt_given_xt_1, ws.I_mat)
-    ldiv!(Q_chol, ws.xt_given_xt_1)
+    ldiv!(Qchol, ws.xt_given_xt_1)
     ws.xt_given_xt_1 .*= -one(T)
 
-    # xt1_given_xt = -A' * (Q_chol \ A)
-    mul!(ws.xt1_given_xt, A', tmp_QA)
+    # xt1_given_xt = -A' * (Q^{-1} A)
+    mul!(ws.xt1_given_xt, A', ws.tmp_QA)
     ws.xt1_given_xt .*= -one(T)
 
-    # x_t = -(P0_chol \ I) = -P0^{-1}
+    # x_t = -P0^{-1}
     copyto!(ws.x_t, ws.I_mat)
-    ldiv!(P0_chol, ws.x_t)
+    ldiv!(P0chol, ws.x_t)
     ws.x_t .*= -one(T)
 
     return nothing
 end
+
 
 """
     compute_smooth_constants_poisson!(ws::SmoothWorkspace{T}, lds)
