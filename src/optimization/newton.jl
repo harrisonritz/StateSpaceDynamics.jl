@@ -8,8 +8,14 @@
 - `ϕ!()` evaluates objective at current `x`
 """
 function newton_smooth!(
-    sense::Val, x, g, p,
-    compute_grad!, build_hess!, solve_dir!, ϕ!,
+    sense::Val,
+    x,
+    g,
+    p,
+    compute_grad!,
+    build_hess!,
+    solve_dir!,
+    ϕ!,
     ls::Union{Nothing,AbstractLineSearch};
     max_iter::Int=20,
     tol=1e-6,
@@ -30,7 +36,7 @@ function newton_smooth!(
             @. x = x + p
             ϕ_prev = ϕ!()
         else
-            ϕ0  = ϕ!()
+            ϕ0 = ϕ!()
             dϕ0 = dot(vec(g), vec(p))  # should be > 0 for ascent; < 0 for descent
             α, ϕ_new = backtracking!(sense, ls, x, p, ϕ!, ϕ0, dϕ0)
             # optional convergence checks:

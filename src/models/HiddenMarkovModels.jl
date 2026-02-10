@@ -367,7 +367,7 @@ function backward!(model::AbstractHMM, FB::ForwardBackward, logA::AbstractMatrix
     ll = FB.loglikelihoods
     K, T = size(β, 1), size(β, 2)
 
-   @views begin
+    @views begin
         # β_T = 0 in log-space
         for i in 1:K
             β[i, T] = 0.0

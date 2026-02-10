@@ -248,3 +248,62 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "  $(join(prms, ", "))")
     return nothing
 end
+
+"""
+    SLDS{T,S,O,TM,ISV}
+
+A Switching Linear Dynamical System (SLDS). A hierarchical time-series model of the form:
+
+```math
+z_t | z_{t-1} ~ Categorical(A_{z_{t-1}, :})
+x_t | x_{t-1}, z_t ~ N(A^{(z_t)} x_{t-1} + b^{(z_t)}, Q^{(z_t)})
+y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
+```
+
+# Fields
+- `A::TM`: Transition matrix for the discrete states (K x K)
+- `πₖ::ISV`: Initial state distribution for the discrete states (K-dimensional vector)
+- `LDSs::Vector{LinearDynamicalSystem{T,S,O}}`: Vector of K Linear Dynamical Systems, one for each discrete state
+"""
+@kwdef mutable struct SLDS{
+    T<:Real,
+    S<:AbstractStateModel,
+    O<:AbstractObservationModel,
+    TM<:AbstractMatrix{T},
+    ISV<:AbstractVector{T},
+} <: AbstractHMM
+    A::TM
+    πₖ::ISV
+    LDSs::Vector{LinearDynamicalSystem{T,S,O}}
+end
+
+function Base.show(io::IO, slds::SLDS; gap="")
+    K = length(slds.LDSs)
+
+    println(io, gap, "Switching Linear Dynamical System (SLDS):")
+    println(io, gap, "-----------------------------------------")
+    println(io, gap, " Number of discrete states: $K")
+
+    if K > 3
+        println(io, gap, " size(A)  = ($(size(slds.A,1)), $(size(slds.A,2)))")
+        println(io, gap, " size(πₖ) = ($(length(slds.πₖ)),)")
+    else
+        println(io, gap, " A  = $(round.(slds.A, sigdigits=3))")
+        println(io, gap, " πₖ = $(round.(slds.πₖ, sigdigits=3))")
+    end
+
+    println(io, gap, " Linear Dynamical Systems:")
+    println(io, gap, " -------------------------")
+
+    # Show details of first LDS
+    if K > 0
+        println(io, gap, "  State 1:")
+        Base.show(io, slds.LDSs[1]; gap=gap * "   ")
+
+        if K > 1
+            println(io, gap, "  ... and $(K-1) more state(s)")
+        end
+    end
+
+    return nothing
+end

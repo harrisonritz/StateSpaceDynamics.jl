@@ -174,6 +174,7 @@ function loglikelihood!(
     y::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
+
     A = lds.state_model.A
     b = lds.state_model.b
     x0 = lds.state_model.x0
@@ -189,37 +190,108 @@ function loglikelihood!(
     temp_solve_Q = ws.temp_solve_Q
     temp_solve_R = ws.temp_solve_R
 
-    total_ll = zero(T)
+    latent_dim = lds.latent_dim
+    obs_dim = lds.obs_dim
+
+    cP0 = -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(ws.P0_chol_U, latent_dim))
+    cQ = -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(ws.Q_chol_U, latent_dim))
+    cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + _logdet_from_U(ws.R_chol_U, obs_dim))
 
     for t in 1:tsteps
         ll_t = zero(T)
 
-        # Initial state contribution (only at t=1)
+        # Initial state (t=1): log p(x1)
         if t == 1
             @views temp_dx .= x[:, 1] .- x0
             ldiv!(temp_solve_Q, P0_U, temp_dx)
-            ll_t += sum(abs2, temp_solve_Q)
+            ll_t += cP0 - T(0.5) * sum(abs2, temp_solve_Q)
         end
 
-        # Dynamics contribution (t > 1)
+        # Dynamics (t>1): log p(x_t | x_{t-1})
         if t > 1
-            @views mul!(temp_dx, A, x[:, t-1])
+            @views mul!(temp_dx, A, x[:, t - 1])
             @views temp_dx .= x[:, t] .- temp_dx .- b
             ldiv!(temp_solve_Q, Q_U, temp_dx)
-            ll_t += sum(abs2, temp_solve_Q)
+            ll_t += cQ - T(0.5) * sum(abs2, temp_solve_Q)
         end
 
-        # Emission contribution
+        # Emission: log p(y_t | x_t)
         @views mul!(temp_dy, lds.obs_model.C, x[:, t])
         @views temp_dy .= y[:, t] .- temp_dy .- d
         ldiv!(temp_solve_R, R_U, temp_dy)
-        ll_t += sum(abs2, temp_solve_R)
+        ll_t += cR - T(0.5) * sum(abs2, temp_solve_R)
 
-        ll_vec[t] = -T(0.5) * ll_t
-        total_ll += ll_vec[t]
+        ll_vec[t] = ll_t
     end
 
-    return total_ll
+    return ll_vec
+end
+
+"""
+    loglikelihood!(ws, x, lds, y)
+
+Compute per-timestep complete-data log-likelihood contributions for a Gaussian LDS:
+
+- `ll[1]` includes: log p(x₁) + log p(y₁ | x₁)
+- `ll[t]` for t≥2 includes: log p(x_t | x_{t-1}) + log p(y_t | x_t)
+
+Writes into `ws.ll_vec` and returns it.
+
+Notes:
+- Normalization terms (logdet + log(2π)) are included. These are constant w.r.t. `x`,
+  but **not** constant across SLDS discrete states when `Q`/`R` differ by state.
+"""
+function loglikelihood!(
+    ll::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::LDSConstantCache{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(y, 2)
+    @assert length(ll) == tsteps
+
+    A = lds.state_model.A
+    b = lds.state_model.b
+    x0 = lds.state_model.x0
+    C = lds.obs_model.C
+    d = lds.obs_model.d
+
+    Q_U = UpperTriangular(cc.Q_chol_U)
+    P0_U = UpperTriangular(cc.P0_chol_U)
+    R_U = UpperTriangular(cc.R_chol_U)
+
+    dxt = ws.dxt
+    dyt = ws.dyt
+    tmp = ws.tmp1  # latent_dim work vector (used as transition residual)
+
+    for t in 1:tsteps
+        ll_t = zero(T)
+
+        # emission: cR - 0.5*||R^{-1/2}(y_t - Cx_t - d)||^2
+        @views mul!(dyt, C, x[:, t])
+        @views dyt .= y[:, t] .- dyt .- d
+        ldiv!(dyt, R_U, dyt)
+        ll_t += cc.cR - T(0.5) * sum(abs2, dyt)
+
+        if t == 1
+            # prior: cP0 - 0.5*||P0^{-1/2}(x1 - x0)||^2
+            @views dxt .= x[:, 1] .- x0
+            ldiv!(dxt, P0_U, dxt)
+            ll_t += cc.cP0 - T(0.5) * sum(abs2, dxt)
+        else
+            # transition: cQ - 0.5*||Q^{-1/2}(x_t - A x_{t-1} - b)||^2
+            @views mul!(tmp, A, x[:, t - 1])
+            @views tmp .= x[:, t] .- tmp .- b
+            ldiv!(tmp, Q_U, tmp)
+            ll_t += cc.cQ - T(0.5) * sum(abs2, tmp)
+        end
+
+        ll[t] = ll_t
+    end
+
+    return ll
 end
 
 """
@@ -363,7 +435,10 @@ end
 
 function smooth(lds::LinearDynamicalSystem, y::AbstractArray{T,3}) where {T}
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.maxthreadid()]
+    sws_pool = [
+        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for
+        _ in 1:Threads.maxthreadid()
+    ]
     smooth!(lds, tfs, y, sws_pool)
 
     D = lds.latent_dim
@@ -389,7 +464,9 @@ Newton solver (since the Gaussian LDS has a quadratic log-likelihood),
 exploiting the block tridiagonal structure of the Hessian for efficient solving.
 """
 function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, fs::FilterSmooth{T}, y::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    fs::FilterSmooth{T},
+    y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
@@ -429,12 +506,7 @@ function smooth!(
     # Solve for Newton step using block tridiagonal structure
     # sws.X₀ will be overwritten with the step
     block_tridiagonal_solve!(
-        sws.X₀,
-        btd.neg_sub,
-        btd.neg_diag,
-        btd.neg_super,
-        sws.grad_vec,
-        btd
+        sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, sws.grad_vec, btd
     )
 
     # x_new = x_old - step
@@ -444,8 +516,7 @@ function smooth!(
     # Get the second moments using the block structure
     # The Hessian blocks are already in btd.neg_* (as -H_loglik = precision matrix)
     logdet_precision = block_tridiagonal_inverse_logdet!(
-        fs.p_smooth, fs.p_smooth_tt1,
-        btd.neg_sub, btd.neg_diag, btd.neg_super, btd,
+        fs.p_smooth, fs.p_smooth_tt1, btd.neg_sub, btd.neg_diag, btd.neg_super, btd
     )
     # Compute entropy from logdet
     n = D * tsteps
@@ -475,7 +546,9 @@ Each thread uses its own workspace to avoid contention.
 - `tfs`: The same `TrialFilterSmooth`, populated.
 """
 function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = size(y, 3)
@@ -715,7 +788,6 @@ function calculate_elbo(
     y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
     ntrials = size(y, 3)
 
     total_entropy = zero(T)
@@ -743,8 +815,9 @@ function calculate_elbo(
                 fs = tfs[trial]
                 compute_smooth_constants!(sws, lds)
 
-                acc += Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
-                       Q_obs!(sws, lds, fs.E_z, fs.E_zz, view(y, :, :, trial))
+                acc +=
+                    Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
+                    Q_obs!(sws, lds, fs.E_z, fs.E_zz, view(y,:,:,trial))
             end
 
             partial[i] = acc
@@ -766,7 +839,6 @@ function calculate_elbo(
 
     return Q_total + prior_term + total_entropy
 end
-
 
 """
     sufficient_statistics(x_smooth, p_smooth, p_smooth_t1)
@@ -826,7 +898,9 @@ Uses `SmoothWorkspace` pool for low-allocation smoothing.
     `ntrials = 1`.
 """
 function estep!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractArray{T,3},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     smooth!(lds, tfs, y, sws_pool)
@@ -880,18 +954,13 @@ function mstep!(
     sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    old_params = _get_all_params_vec(lds)
-
     update_initial_state_mean!(lds, tfs, w)
     update_initial_state_covariance!(lds, tfs, sws, w)
     update_A_b!(lds, tfs, sws, w)
     update_Q!(lds, tfs, sws, w)
     update_C_d!(lds, tfs, y, sws, w)
     update_R!(lds, tfs, y, sws, w)
-
-    new_params = _get_all_params_vec(lds)
-    norm_change = norm(new_params - old_params)
-    return norm_change
+    return nothing
 end
 
 """
@@ -980,7 +1049,7 @@ function update_A_b!(
         end
     end
 
-    F = factorize(Szz')                     
+    F = factorize(Szz')
     ldiv!(transpose(AB), F, transpose(Sxz)) # AB' = (Szz') \ (Sxz')
 
     copyto!(lds.state_model.A, view(AB, :, 1:D))
@@ -1020,6 +1089,8 @@ function update_Q!(
     temp4 = sws.temp_Q4
     temp5 = sws.temp_Q5
     innovation_cov = sws.innovation_cov
+    bbT = sws.bbT
+    mul!(bbT, b, b')
 
     total_weight = zero(T)
 
@@ -1045,11 +1116,11 @@ function update_Q!(
             @. innovation_cov = Σt - temp1 - temp2 + temp4
 
             mul!(temp5, A, μtm1)
-            mul!(innovation_cov, μt, b', -one(T), one(T))
-            mul!(innovation_cov, b, μt', -one(T), one(T))
-            mul!(innovation_cov, temp5, b', one(T), one(T))
-            mul!(innovation_cov, b, temp5', one(T), one(T))
-            mul!(innovation_cov, b, b', one(T), one(T))
+            BLAS.ger!(-one(T), μt, b, innovation_cov)
+            BLAS.ger!(-one(T), b, μt, innovation_cov)
+            BLAS.ger!(one(T), temp5, b, innovation_cov)
+            BLAS.ger!(one(T), b, temp5, innovation_cov)
+            innovation_cov .+= bbT
 
             Q_sum .+= weight .* innovation_cov
             total_weight += weight
@@ -1230,14 +1301,16 @@ function fit!(
 
     # Create a vector to store the log-likelihood values
     elbos = Vector{T}()
-    param_diff = Vector{T}()
 
     sizehint!(elbos, max_iter)  # Pre-allocate for efficiency
     # Create a FilterSmooth object
     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
 
     # Create workspace pool (one per thread) - always use allocation-free path
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for _ in 1:Threads.maxthreadid()]
+    sws_pool = [
+        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for
+        _ in 1:Threads.maxthreadid()
+    ]
 
     # Initialize progress bar only if progress=true
     prog = if progress
@@ -1261,10 +1334,9 @@ function fit!(
     for i in 1:max_iter
         # E-step and M-step using workspace pool
         elbo = estep!(lds, tfs, y, sws_pool)
-        Δparams = mstep!(lds, tfs, y, sws_pool[1])
+        mstep!(lds, tfs, y, sws_pool[1])
         # Update the log-likelihood vector and parameter difference
         push!(elbos, elbo)
-        push!(param_diff, Δparams)
 
         # Update the progress bar only if it exists
         if progress && prog !== nothing
@@ -1276,7 +1348,7 @@ function fit!(
             if progress && prog !== nothing
                 finish!(prog)
             end
-            return elbos, param_diff
+            return elbos
         end
 
         prev_elbo = elbo
@@ -1287,9 +1359,8 @@ function fit!(
         finish!(prog)
     end
 
-    return elbos, param_diff
+    return elbos
 end
-
 
 #=
 Legacy wrappers for testing purposes only; use workspace-aware versions instead. Eventually remove.
@@ -1342,9 +1413,7 @@ function update_R!(
 end
 
 function Gradient(
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
     ws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
@@ -1363,9 +1432,7 @@ function Gradient(
 end
 
 function Hessian(
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
     ws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
@@ -1395,7 +1462,7 @@ function mstep!(
 end
 
 function estep!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
     npool = Threads.maxthreadid()
@@ -1404,7 +1471,7 @@ function estep!(
 end
 
 function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3},
+    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
     npool = Threads.maxthreadid()
@@ -1413,13 +1480,10 @@ function smooth!(
 end
 
 function loglikelihood(
-    x::AbstractMatrix{XT},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{YT},
-) where {T<:Real, YT<:Real, XT<:Real, S<:GaussianStateModel{T}, O<:GaussianObservationModel{T}}
-
+    x::AbstractMatrix{XT}, lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{YT}
+) where {T<:Real,YT<:Real,XT<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
-    WT = promote_type(T, YT, XT) 
+    WT = promote_type(T, YT, XT)
     ws = SmoothWorkspace(WT, lds.latent_dim, lds.obs_dim, tsteps)
     compute_smooth_constants!(ws, lds)
     return loglikelihood!(ws, x, lds, y)

@@ -22,11 +22,13 @@ A <- 0.5*(A + A').
 """
 function Symmetrize!(A::AbstractMatrix{T}) where {T<:Real}
     n, m = size(A)
-    @boundscheck n == m || throw(DimensionMismatch("Matrix must be square for symmetrization, got $(n)×$(m)"))
+    @boundscheck n == m || throw(
+        DimensionMismatch("Matrix must be square for symmetrization, got $(n)×$(m)")
+    )
     half = T(0.5)
 
     for j in 1:n
-        for i in 1:(j-1)
+        for i in 1:(j - 1)
             avg = (A[i, j] + A[j, i]) * half
             A[i, j] = avg
             A[j, i] = avg
@@ -277,426 +279,6 @@ function block_tridgm(
     end
 
     return sparse(I, J, V, N, N)
-end
-
-# Block Tridiagonal Workspace
-"""
-    BlockTridiagonalWorkspace{T<:Real}
-
-Pre-allocated workspace for block tridiagonal operations in LDS smoothing.
-Holds all temporary buffers needed by `Hessian!`, `block_tridgm!`, and
-`block_tridiagonal_inverse!` to avoid repeated allocations during EM iterations.
-"""
-struct BlockTridiagonalWorkspace{T<:Real}
-    block_size::Int
-    n_blocks::Int
-
-    # Hessian block storage
-    H_diag::Vector{Matrix{T}}
-    H_sub::Vector{Matrix{T}}
-    H_super::Vector{Matrix{T}}
-
-    # Sparse matrix with fixed sparsity pattern
-    H_sparse::SparseMatrixCSC{T,Int}
-    # Precomputed map from block (k, i, j) to nzval index for zero-allocation writes
-    nzval_map::Vector{Int}
-
-    # block_tridiagonal_inverse buffers
-    D::Vector{Matrix{T}}
-    E::Vector{Matrix{T}}
-    M::Matrix{T}
-    term1::Matrix{T}
-    term2::Matrix{T}
-    S::Matrix{T}
-    Ibs::Matrix{T}
-    Z::Matrix{T}
-
-    # Negated blocks
-    neg_diag::Vector{Matrix{T}}
-    neg_sub::Vector{Matrix{T}}
-    neg_super::Vector{Matrix{T}}
-end
-
-"""
-    BlockTridiagonalWorkspace(::Type{T}, block_size::Int, n_blocks::Int)
-
-Construct a preallocated workspace for block tridiagonal operations with the
-given block size (latent dimension) and number of blocks (timesteps).
-"""
-function BlockTridiagonalWorkspace(::Type{T}, block_size::Int, n_blocks::Int) where {T<:Real}
-    H_diag = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
-    H_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
-    H_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
-
-    H_sparse = _build_block_tridiag_pattern(T, block_size, n_blocks)
-    nzval_map = _build_nzval_map(H_sparse, block_size, n_blocks)
-
-    D = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
-    E = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
-    M = zeros(T, block_size, block_size)
-    term1 = zeros(T, block_size, block_size)
-    term2 = zeros(T, block_size, block_size)
-    S = zeros(T, block_size, block_size)
-    Ibs = Matrix{T}(I, block_size, block_size)
-    Z = zeros(T, block_size, block_size)
-
-    neg_diag = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
-    neg_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
-    neg_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
-
-    return BlockTridiagonalWorkspace{T}(
-        block_size, n_blocks,
-        H_diag, H_sub, H_super,
-        H_sparse, nzval_map,
-        D, E, M, term1, term2, S, Ibs, Z,
-        neg_diag, neg_sub, neg_super,
-    )
-end
-
-"""
-    SmoothWorkspace{T<:Real}
-
-Pre-allocated workspace for the full LDS smoothing + EM pipeline.
-Houses a `BlockTridiagonalWorkspace` for block tridiagonal operations, plus all
-buffers needed by `loglikelihood!`, `Gradient!`, `Hessian!`, and M-step updates
-to avoid repeated allocations during EM iterations.
-"""
-struct SmoothWorkspace{T<:Real}
-    # Sub-workspace for block tridiagonal operations
-    btd::BlockTridiagonalWorkspace{T}
-
-    # cholesky buffers
-    R_buf::Matrix{T}      # (obs_dim × obs_dim)
-    Q_buf::Matrix{T}      # (latent_dim × latent_dim)
-    P0_buf::Matrix{T}     # (latent_dim × latent_dim)
-    
-    # Cached upper-tri Chol factors
-    R_chol_U::Matrix{T}       # (obs_dim × obs_dim)
-    Q_chol_U::Matrix{T}       # (latent_dim × latent_dim)
-    P0_chol_U::Matrix{T}      # (latent_dim × latent_dim)
-
-    # Solve Outputs
-    tmp_RC::Matrix{T}    # obs_dim × latent_dim   (R^{-1} C)
-    tmp_QA::Matrix{T}    # latent_dim × latent_dim (Q^{-1} A)
-
-    # Derived terms for Gradient
-    C_inv_R::Matrix{T}        # (R_chol \ C)' = C'inv(R), size (latent_dim × obs_dim)
-    A_inv_Q::Matrix{T}        # (Q_chol \ A)' = A'inv(Q), size (latent_dim × latent_dim)
-
-    # Derived terms for Hessian block templates
-    H_sub_entry::Matrix{T}    # Q_chol \ A, size (latent_dim × latent_dim)
-    H_super_entry::Matrix{T}  # H_sub_entry', size (latent_dim × latent_dim)
-    yt_given_xt::Matrix{T}    # -C'*(R_chol \ C), size (latent_dim × latent_dim)
-    xt_given_xt_1::Matrix{T}  # -(Q_chol \ I), size (latent_dim × latent_dim)
-    xt1_given_xt::Matrix{T}   # -A'*(Q_chol \ A), size (latent_dim × latent_dim)
-    x_t::Matrix{T}            # -(P0_chol \ I), size (latent_dim × latent_dim)
-
-    # Optimizer buffers (reused across EM iterations) 
-    X₀::Vector{T}             # Vectorized latent path (latent_dim * tsteps)
-    grad_buf::Matrix{T}       # Gradient output buffer (latent_dim × tsteps)
-    grad_vec::Vector{T}       # Vectorized gradient for TwiceDifferentiable (latent_dim * tsteps)
-    initial_h::SparseMatrixCSC{T,Int}  # Sparse Hessian (avoid copy each iteration)
-
-    # Gradient temp vectors
-    dxt::Vector{T}            # (latent_dim,)
-    dxt_next::Vector{T}       # (latent_dim,)
-    dyt::Vector{T}            # (obs_dim,)
-    tmp1::Vector{T}           # (latent_dim,)
-    tmp2::Vector{T}           # (latent_dim,)
-    tmp3::Vector{T}           # (latent_dim,)
-
-    # loglikelihood temp vectors
-    ll_vec::Vector{T}         # (tsteps,)
-    temp_dx::Vector{T}        # (latent_dim,)
-    temp_dy::Vector{T}        # (obs_dim,)
-    temp_solve_Q::Vector{T}   # (latent_dim,)
-    temp_solve_R::Vector{T}   # (obs_dim,)
-
-    # Hessian temp matrix
-    I_mat::Matrix{T}          # Identity (latent_dim × latent_dim)
-
-    # M-step buffers
-    Sxz::Matrix{T}            # (latent_dim × latent_dim+1) for update_A_b!
-    Szz_Ab::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_A_b!
-    AB::Matrix{T}             # (latent_dim × latent_dim+1) for update_A_b!
-    Syz::Matrix{T}            # (obs_dim × latent_dim+1) for update_C_d!
-    Szz_Cd::Matrix{T}         # (latent_dim+1 × latent_dim+1) for update_C_d!
-    Q_sum::Matrix{T}          # (latent_dim × latent_dim)
-    R_sum::Matrix{T}          # (obs_dim × obs_dim)
-    S0_sum::Matrix{T}         # (latent_dim × latent_dim)
-
-    # update_Q! temps
-    temp_Q1::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q2::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q3::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q4::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q5::Vector{T}        # (latent_dim,)
-    innovation_cov::Matrix{T} # (latent_dim × latent_dim)
-
-    # update_R! temps
-    innovation::Vector{T}     # (obs_dim,)
-    Czt::Vector{T}            # (obs_dim,)
-    temp_R_matrix::Matrix{T}  # (obs_dim × latent_dim)
-    outer_product::Matrix{T}  # (latent_dim × latent_dim)
-    state_uncertainty::Matrix{T} # (latent_dim × latent_dim)
-
-    # update_C_d! temps
-    work_yz::Matrix{T}        # (obs_dim × latent_dim)
-    work_outer::Matrix{T}     # (latent_dim × latent_dim)
-    CD::Matrix{T}             # (obs_dim × latent_dim + 1)
-
-    # ELBO / Q_state buffers
-    elbo_temp::Matrix{T}           # (latent_dim × latent_dim) - main accumulator
-    elbo_sum_E_zz::Matrix{T}       # (latent_dim × latent_dim)
-    elbo_sum_E_zzm1::Matrix{T}     # (latent_dim × latent_dim)
-    elbo_sum_E_cross::Matrix{T}    # (latent_dim × latent_dim)
-    elbo_sum_mu_t::Vector{T}       # (latent_dim,)
-    elbo_sum_mu_tm1::Vector{T}     # (latent_dim,)
-    elbo_temp2::Matrix{T}          # (latent_dim × latent_dim) - for A * sum_E_zzm1 * A'
-
-    # Q_obs buffers
-    elbo_obs_temp::Matrix{T}       # (obs_dim × obs_dim) - accumulator
-    elbo_obs_work::Matrix{T}       # (obs_dim × obs_dim) - work matrix
-    elbo_ytil::Vector{T}           # (obs_dim,) - residualized y
-    elbo_sum_yy::Matrix{T}         # (obs_dim × obs_dim)
-    elbo_sum_yz::Matrix{T}         # (obs_dim × latent_dim)
-    elbo_obs_work1::Matrix{T}      # (obs_dim × obs_dim)
-    elbo_obs_work2::Matrix{T}      # (latent_dim × obs_dim)
-end
-
-"""
-    SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int)
-
-Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
-"""
-function SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int) where {T<:Real}
-    btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
-
-    # Pre-computed constant terms (will be filled by compute_smooth_constants!)
-    R_buf = zeros(T, obs_dim, obs_dim)
-    Q_buf = zeros(T, latent_dim, latent_dim)
-    P0_buf = zeros(T, latent_dim, latent_dim)
-
-    R_chol_U = zeros(T, obs_dim, obs_dim)
-    Q_chol_U = zeros(T, latent_dim, latent_dim)
-    P0_chol_U = zeros(T, latent_dim, latent_dim)
-
-    tmp_RC = zeros(T, obs_dim, latent_dim)
-    tmp_QA = zeros(T, latent_dim, latent_dim)
-
-    C_inv_R = zeros(T, latent_dim, obs_dim)
-    A_inv_Q = zeros(T, latent_dim, latent_dim)
-    H_sub_entry = zeros(T, latent_dim, latent_dim)
-    H_super_entry = zeros(T, latent_dim, latent_dim)
-    yt_given_xt = zeros(T, latent_dim, latent_dim)
-    xt_given_xt_1 = zeros(T, latent_dim, latent_dim)
-    xt1_given_xt = zeros(T, latent_dim, latent_dim)
-    x_t = zeros(T, latent_dim, latent_dim)
-
-    # Optimizer buffers
-    X₀ = zeros(T, latent_dim * tsteps)
-    grad_buf = zeros(T, latent_dim, tsteps)
-    grad_vec = zeros(T, latent_dim * tsteps)
-    initial_h = copy(btd.H_sparse)
-
-    # Gradient temp vectors
-    dxt = zeros(T, latent_dim)
-    dxt_next = zeros(T, latent_dim)
-    dyt = zeros(T, obs_dim)
-    tmp1 = zeros(T, latent_dim)
-    tmp2 = zeros(T, latent_dim)
-    tmp3 = zeros(T, latent_dim)
-
-    # loglikelihood temp vectors
-    ll_vec = zeros(T, tsteps)
-    temp_dx = zeros(T, latent_dim)
-    temp_dy = zeros(T, obs_dim)
-    temp_solve_Q = zeros(T, latent_dim)
-    temp_solve_R = zeros(T, obs_dim)
-
-    # Hessian temp matrix
-    I_mat = Matrix{T}(I, latent_dim, latent_dim)
-
-    # M-step buffers
-    Sxz = zeros(T, latent_dim, latent_dim + 1)
-    Szz_Ab = zeros(T, latent_dim + 1, latent_dim + 1)
-    AB = zeros(T, latent_dim, latent_dim + 1)   
-    Syz = zeros(T, obs_dim, latent_dim + 1)
-    Szz_Cd = zeros(T, latent_dim + 1, latent_dim + 1)
-    Q_sum = zeros(T, latent_dim, latent_dim)
-    R_sum = zeros(T, obs_dim, obs_dim)
-    S0_sum = zeros(T, latent_dim, latent_dim)
-    temp_Q1 = zeros(T, latent_dim, latent_dim)
-    temp_Q2 = zeros(T, latent_dim, latent_dim)
-    temp_Q3 = zeros(T, latent_dim, latent_dim)
-    temp_Q4 = zeros(T, latent_dim, latent_dim)
-    temp_Q5 = zeros(T, latent_dim)
-    innovation_cov = zeros(T, latent_dim, latent_dim)
-    innovation = zeros(T, obs_dim)
-    Czt = zeros(T, obs_dim)
-    temp_R_matrix = zeros(T, obs_dim, latent_dim)
-    outer_product = zeros(T, latent_dim, latent_dim)
-    state_uncertainty = zeros(T, latent_dim, latent_dim)
-    work_yz = zeros(T, obs_dim, latent_dim)
-    work_outer = zeros(T, latent_dim, latent_dim)
-    CD = zeros(T, obs_dim, latent_dim + 1)
-
-    # ELBO / Q_state buffers
-    elbo_temp = zeros(T, latent_dim, latent_dim)
-    elbo_sum_E_zz = zeros(T, latent_dim, latent_dim)
-    elbo_sum_E_zzm1 = zeros(T, latent_dim, latent_dim)
-    elbo_sum_E_cross = zeros(T, latent_dim, latent_dim)
-    elbo_sum_mu_t = zeros(T, latent_dim)
-    elbo_sum_mu_tm1 = zeros(T, latent_dim)
-    elbo_temp2 = zeros(T, latent_dim, latent_dim)
-
-    # Q_obs buffers
-    elbo_obs_temp = zeros(T, obs_dim, obs_dim)
-    elbo_obs_work = zeros(T, obs_dim, obs_dim)
-    elbo_ytil = zeros(T, obs_dim)
-    elbo_sum_yy = zeros(T, obs_dim, obs_dim)
-    elbo_sum_yz = zeros(T, obs_dim, latent_dim)
-    elbo_obs_work1 = zeros(T, obs_dim, obs_dim)
-    elbo_obs_work2 = zeros(T, latent_dim, obs_dim)
-
-    return SmoothWorkspace{T}(
-        btd,
-        R_buf, Q_buf, P0_buf,
-        R_chol_U, Q_chol_U, P0_chol_U,
-        tmp_RC, tmp_QA,
-        C_inv_R, A_inv_Q,
-        H_sub_entry, H_super_entry,
-        yt_given_xt, xt_given_xt_1, xt1_given_xt, x_t,
-        X₀, grad_buf, grad_vec, initial_h,
-        dxt, dxt_next, dyt, tmp1, tmp2, tmp3,
-        ll_vec, temp_dx, temp_dy, temp_solve_Q, temp_solve_R,
-        I_mat,
-        Sxz, Szz_Ab, AB, Syz, Szz_Cd,
-        Q_sum, R_sum, S0_sum,
-        temp_Q1, temp_Q2, temp_Q3, temp_Q4, temp_Q5, innovation_cov,
-        innovation, Czt, temp_R_matrix, outer_product, state_uncertainty,
-        work_yz, work_outer, CD,
-        elbo_temp, elbo_sum_E_zz, elbo_sum_E_zzm1, elbo_sum_E_cross,
-        elbo_sum_mu_t, elbo_sum_mu_tm1, elbo_temp2,
-        elbo_obs_temp, elbo_obs_work, elbo_ytil, elbo_sum_yy, elbo_sum_yz,
-        elbo_obs_work1, elbo_obs_work2,
-    )
-end
-
-"""
-    compute_smooth_constants!(ws::SmoothWorkspace{T}, lds)
-
-Pre-compute and cache all Cholesky factors and derived terms that are constant
-within a single `smooth!` call (i.e., depend only on model parameters, not on x).
-Must be called once at the start of each `smooth!` invocation.
-
-For Gaussian observation models, computes both state and observation model terms.
-For Poisson observation models, only computes state model terms (observation
-terms are x-dependent and computed per-iteration).
-"""
-function compute_smooth_constants!(ws::SmoothWorkspace{T}, lds) where {T<:Real}
-    A  = lds.state_model.A
-    Q  = lds.state_model.Q
-    P0 = lds.state_model.P0
-    C  = lds.obs_model.C
-    R  = lds.obs_model.R
-
-    # Cholesky in-place
-    copyto!(ws.R_buf, R)
-    Rchol = cholesky!(Symmetric(ws.R_buf))
-
-    copyto!(ws.Q_buf, Q)
-    Qchol = cholesky!(Symmetric(ws.Q_buf))
-
-    copyto!(ws.P0_buf, P0)
-    P0chol = cholesky!(Symmetric(ws.P0_buf))
-
-    # store U factors
-    copyto!(ws.R_chol_U, Rchol.U)
-    copyto!(ws.Q_chol_U, Qchol.U)
-    copyto!(ws.P0_chol_U, P0chol.U)
-
-    # tmp_RC = R^{-1} C
-    copyto!(ws.tmp_RC, C)
-    ldiv!(Rchol, ws.tmp_RC)
-    copyto!(ws.C_inv_R, ws.tmp_RC')
-
-    # tmp_QA = Q^{-1} A
-    copyto!(ws.tmp_QA, A)
-    ldiv!(Qchol, ws.tmp_QA)
-    copyto!(ws.A_inv_Q, ws.tmp_QA')
-    copyto!(ws.H_sub_entry,   ws.tmp_QA)
-    copyto!(ws.H_super_entry, ws.tmp_QA')
-
-    # yt_given_xt = -C' * (R^{-1} C)
-    mul!(ws.yt_given_xt, C', ws.tmp_RC)
-    ws.yt_given_xt .*= -one(T)
-
-    # xt_given_xt_1 = -Q^{-1}
-    copyto!(ws.xt_given_xt_1, ws.I_mat)
-    ldiv!(Qchol, ws.xt_given_xt_1)
-    ws.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q^{-1} A)
-    mul!(ws.xt1_given_xt, A', ws.tmp_QA)
-    ws.xt1_given_xt .*= -one(T)
-
-    # x_t = -P0^{-1}
-    copyto!(ws.x_t, ws.I_mat)
-    ldiv!(P0chol, ws.x_t)
-    ws.x_t .*= -one(T)
-
-    return nothing
-end
-
-
-"""
-    compute_smooth_constants_poisson!(ws::SmoothWorkspace{T}, lds)
-
-Pre-compute and cache Cholesky factors and derived terms for Poisson LDS smoothing.
-Only computes state model terms since the observation terms are x-dependent
-and must be computed per-iteration.
-
-Must be called once at the start of each `smooth!` invocation for Poisson LDS.
-"""
-function compute_smooth_constants_poisson!(
-    ws::SmoothWorkspace{T},
-    lds,
-) where {T<:Real}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
-    P0 = lds.state_model.P0
-
-    # Compute Cholesky factors for state model only
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    copyto!(ws.Q_chol_U, Q_chol.U)
-    copyto!(ws.P0_chol_U, P0_chol.U)
-
-    # Gradient terms: A_inv_Q = (Q_chol \ A)'
-    tmp_QA = Q_chol \ A   # latent_dim × latent_dim
-    copyto!(ws.A_inv_Q, tmp_QA')
-
-    # Hessian block templates for state model
-    copyto!(ws.H_sub_entry, tmp_QA)          # Q_chol \ A
-    copyto!(ws.H_super_entry, tmp_QA')       # (Q_chol \ A)'
-
-    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
-    copyto!(ws.xt_given_xt_1, ws.I_mat)
-    ldiv!(Q_chol, ws.xt_given_xt_1)
-    ws.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q_chol \ A)
-    mul!(ws.xt1_given_xt, A', tmp_QA)
-    ws.xt1_given_xt .*= -one(T)
-
-    # x_t = -(P0_chol \ I) = -P0^{-1}
-    copyto!(ws.x_t, ws.I_mat)
-    ldiv!(P0_chol, ws.x_t)
-    ws.x_t .*= -one(T)
-
-    return nothing
 end
 
 """
@@ -1119,7 +701,9 @@ function block_tridiagonal_solve!(
         mul!(M, A[i - 1], D[i], -one(T), one(T))
 
         # Modify RHS: b̃ᵢ = bᵢ - Aᵢ₋₁ * x[i-1]
-        @views mul!(x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end], -one(T), one(T))
+        @views mul!(
+            x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end], -one(T), one(T)
+        )
 
         # Factor modified diagonal
         F = lu!(M)
@@ -1141,7 +725,9 @@ function block_tridiagonal_solve!(
         idx_next_end = (i + 1) * bs
 
         # x[i] = x[i] - D[i+1] * x[i+1]
-        @views mul!(x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end], -one(T), one(T))
+        @views mul!(
+            x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end], -one(T), one(T)
+        )
     end
 
     return x
@@ -1373,6 +959,15 @@ function stack_tuples(d)
 
     # Return the stacked matrices as a tuple
     return tuple(stacked_matrices...)
+end
+
+# logdet(Σ) from Cholesky Σ = U'U => logdet(Σ) = 2 * sum(log(diag(U)))
+function _logdet_from_U(U::AbstractMatrix{T}, n::Int) where {T}
+    s = zero(T)
+    for i in 1:n
+        s += log(U[i, i])
+    end
+    return 2s
 end
 
 """

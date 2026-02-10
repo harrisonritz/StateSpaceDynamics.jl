@@ -53,6 +53,100 @@ function _rowstochastic(K)
     return A
 end
 
+"""
+Compute y = H * x where H is block-tridiagonal given by (H_diag, H_super, H_sub).
+
+- H_diag[t] is D×D on the diagonal
+- H_super[t] is D×D for block (t, t+1)
+- H_sub[t]   is D×D for block (t+1, t)
+
+x is a vector of length D*T.
+"""
+function _block_tridiag_mul(H_diag, H_super, H_sub, x::AbstractVector)
+    Tsteps = length(H_diag)
+    D = size(H_diag[1], 1)
+    @assert length(x) == D * Tsteps
+
+    y = similar(x)
+    fill!(y, zero(eltype(y)))
+
+    for t in 1:Tsteps
+        xt = @view x[(D*(t-1)+1):(D*t)]
+        yt = @view y[(D*(t-1)+1):(D*t)]
+
+        yt .+= H_diag[t] * xt
+
+        if t < Tsteps
+            xtp1 = @view x[(D*t+1):(D*(t+1))]
+            yt .+= H_super[t] * xtp1
+        end
+        if t > 1
+            xtm1 = @view x[(D*(t-2)+1):(D*(t-1))]
+            yt .+= H_sub[t-1] * xtm1
+        end
+    end
+    return y
+end
+
+"""
+Compute q = x' * H * x for block-tridiagonal H without building H.
+
+Uses q = Σ x_t' H_tt x_t + Σ (x_t' H_{t,t+1} x_{t+1} + x_{t+1}' H_{t+1,t} x_t).
+"""
+function _block_tridiag_quadform(H_diag, H_super, H_sub, x::AbstractVector)
+    Tsteps = length(H_diag)
+    D = size(H_diag[1], 1)
+    @assert length(x) == D * Tsteps
+
+    q = zero(eltype(x))
+    for t in 1:Tsteps
+        xt = @view x[(D*(t-1)+1):(D*t)]
+        q += dot(xt, H_diag[t] * xt)
+    end
+    for t in 1:(Tsteps-1)
+        xt   = @view x[(D*(t-1)+1):(D*t)]
+        xtp1 = @view x[(D*t+1):(D*(t+1))]
+        q += dot(xt,   H_super[t] * xtp1)
+        q += dot(xtp1, H_sub[t]   * xt)
+    end
+    return q
+end
+
+
+function _test_hessian_blocks_basic(slds, y_trial, x_trial, w; atol=1e-10)
+    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
+
+    Tsteps = size(y_trial, 2)
+    D = slds.LDSs[1].latent_dim
+
+    @test length(H_diag) == Tsteps
+    @test length(H_super) == Tsteps - 1
+    @test length(H_sub) == Tsteps - 1
+
+    for t in 1:Tsteps
+        @test size(H_diag[t]) == (D, D)
+        @test all(isfinite, H_diag[t])
+    end
+    for t in 1:(Tsteps - 1)
+        @test size(H_super[t]) == (D, D)
+        @test size(H_sub[t]) == (D, D)
+        @test all(isfinite, H_super[t])
+        @test all(isfinite, H_sub[t])
+
+        # symmetry condition for a symmetric block-tridiagonal matrix
+        @test isapprox(H_sub[t], H_super[t]'; atol=atol)
+    end
+
+    # Check that H acts like a symmetric operator: x'H y == y'H x
+    x = randn(D * Tsteps)
+    v = randn(D * Tsteps)
+    Hx = _block_tridiag_mul(H_diag, H_super, H_sub, x)
+    Hv = _block_tridiag_mul(H_diag, H_super, H_sub, v)
+    @test isapprox(dot(x, Hv), dot(v, Hx); atol=1e-8)
+
+    return H_diag, H_super, H_sub
+end
+
 function test_valid_SLDS_happy_path()
     K = 3
     lds = _make_gaussian_lds(2, 4)
@@ -251,9 +345,6 @@ function test_SLDS_gradient_numerical()
     # Analytical gradient
     grad_analytical = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w)
 
-    # For numerical gradient, we need to compute the weighted objective
-    # The trick: the gradient is LINEAR in the weights, so we can compute
-    # a weighted sum of gradients, which equals the gradient of the weighted objective
     function weighted_ll(x_flat)
         x_mat = reshape(x_flat, size(x_trial))
 
@@ -310,63 +401,52 @@ function test_SLDS_hessian_numerical()
     lds = _make_gaussian_lds(2, 2)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=5, ntrials=1)
-
+    _, x, y = rand(slds; tsteps=5, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps)
-    w ./= sum(w; dims=1)
+    w = rand(K, tsteps); w ./= sum(w; dims=1)
 
     y_trial = y[:, :, 1]
     x_trial = x[:, :, 1]
 
-    # Analytical Hessian
-    H = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
+    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
 
-    # Numerical Hessian - same weighted objective as gradient test
     function weighted_ll(x_flat)
         x_mat = reshape(x_flat, size(x_trial))
         ll = 0.0
-
         for k in 1:K
             lds_k = slds.LDSs[k]
-
-            A_k = lds_k.state_model.A
-            Q_k = lds_k.state_model.Q
-            b_k = lds_k.state_model.b
-            x0_k = lds_k.state_model.x0
-            P0_k = lds_k.state_model.P0
-            C_k = lds_k.obs_model.C
-            R_k = lds_k.obs_model.R
-            d_k = lds_k.obs_model.d
+            A_k, Q_k, b_k = lds_k.state_model.A, lds_k.state_model.Q, lds_k.state_model.b
+            x0_k, P0_k = lds_k.state_model.x0, lds_k.state_model.P0
+            C_k, R_k, d_k = lds_k.obs_model.C, lds_k.obs_model.R, lds_k.obs_model.d
 
             R_chol = cholesky(Symmetric(R_k)).U
             Q_chol = cholesky(Symmetric(Q_k)).U
             P0_chol = cholesky(Symmetric(P0_k)).U
 
-            # Initial state (weighted by w[k, 1])
             dx0 = x_mat[:, 1] - x0_k
             ll += w[k, 1] * (-0.5 * sum(abs2, P0_chol \ dx0))
 
-            # Dynamics and emissions
             for t in 1:tsteps
-                # Emission (weighted by w[k, t])
                 dy = y_trial[:, t] - (C_k * x_mat[:, t] + d_k)
                 ll += w[k, t] * (-0.5 * sum(abs2, R_chol \ dy))
-
-                # Dynamics (weighted by w[k, t])
                 if t > 1
                     dx = x_mat[:, t] - (A_k * x_mat[:, t - 1] + b_k)
                     ll += w[k, t] * (-0.5 * sum(abs2, Q_chol \ dx))
                 end
             end
         end
-
         return ll
     end
 
-    H_numerical = ForwardDiff.hessian(weighted_ll, vec(x_trial))
+    Hnum = ForwardDiff.hessian(weighted_ll, vec(x_trial))
 
-    @test isapprox(H, H_numerical, rtol=1e-5, atol=1e-5)
+    D = slds.LDSs[1].latent_dim
+    v = randn(D * tsteps)
+
+    Hv_blocks = _block_tridiag_mul(H_diag, H_super, H_sub, v)
+    Hv_num = Hnum * v
+
+    @test isapprox(Hv_blocks, Hv_num; rtol=1e-5, atol=1e-5)
 end
 
 function test_SLDS_gradient_reduces_to_single_LDS()
@@ -391,46 +471,16 @@ function test_SLDS_gradient_reduces_to_single_LDS()
     end
 end
 
-function test_SLDS_hessian_block_structure()
+function test_SLDS_hessian_block_structure_gaussian()
     K = 2
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=10, ntrials=1)
-
+    _, x, y = rand(slds; tsteps=10, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps)
-    w ./= sum(w; dims=1)
+    w = rand(K, tsteps); w ./= sum(w; dims=1)
 
-    H = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
-
-    D = slds.LDSs[1].latent_dim
-
-    # Check sizes
-    @test length(H_diag) == tsteps
-    @test length(H_super) == tsteps - 1
-    @test length(H_sub) == tsteps - 1
-    @test size(H) == (D * tsteps, D * tsteps)
-
-    # Check each block is D×D
-    for t in 1:tsteps
-        @test size(H_diag[t]) == (D, D)
-    end
-    for t in 1:(tsteps - 1)
-        @test size(H_super[t]) == (D, D)
-        @test size(H_sub[t]) == (D, D)
-    end
-
-    # Check block-tridiagonal structure (zeros outside bands)
-    for i in 1:(D * tsteps)
-        for j in 1:(D * tsteps)
-            block_i = (i-1) ÷ D + 1
-            block_j = (j-1) ÷ D + 1
-            if abs(block_i - block_j) > 1
-                @test abs(H[i, j]) < 1e-10
-            end
-        end
-    end
+    _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
 end
 
 function test_SLDS_gradient_weight_normalization()
@@ -1208,26 +1258,11 @@ function test_SLDS_hessian_block_structure_poisson()
     lds = _make_poisson_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=15, ntrials=1)
-
+    _, x, y = rand(slds; tsteps=12, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps)
-    w ./= sum(w; dims=1)
+    w = rand(K, tsteps); w ./= sum(w; dims=1)
 
-    y_trial = y[:, :, 1]
-    x_trial = x[:, :, 1]
-
-    hess, H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
-
-    # Check structure
-    @test hess isa AbstractMatrix
-    @test all(isfinite, hess)
-    @test issymmetric(hess) || isapprox(hess, hess', atol=1e-10)
-
-    # Check block diagonal structure
-    @test length(H_diag) == tsteps
-    @test length(H_super) == tsteps - 1
-    @test length(H_sub) == tsteps - 1
+    _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
 end
 
 function test_SLDS_smooth_basic_poisson()

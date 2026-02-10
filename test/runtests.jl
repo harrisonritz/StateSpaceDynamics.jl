@@ -57,7 +57,7 @@ include("helper_functions.jl")
                 test_SLDS_gradient_numerical()
                 test_SLDS_hessian_numerical()
                 test_SLDS_gradient_reduces_to_single_LDS()
-                test_SLDS_hessian_block_structure()
+                test_SLDS_hessian_block_structure_gaussian()
                 test_SLDS_gradient_weight_normalization()
             end
 

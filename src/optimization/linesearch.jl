@@ -1,9 +1,9 @@
 abstract type AbstractLineSearch end
 
 Base.@kwdef struct BackTrackingLS{T} <: AbstractLineSearch
-    c1::T       = 1e-4
-    ρ_hi::T     = 0.5
-    ρ_lo::T     = 0.1
+    c1::T = 1e-4
+    ρ_hi::T = 0.5
+    ρ_lo::T = 0.1
     max_iters::Int = 25
     max_halvings::Int = 50
     order::Int = 3
@@ -27,10 +27,14 @@ In-place backtracking along direction `p` from current `x`.
 Returns (α, ϕ_new).
 """
 function backtracking!(
-    sense::Val, ls::BackTrackingLS{T},
-    x::AbstractArray{T}, p::AbstractArray{T},
-    ϕ!::F, ϕ0::T, dϕ0::T,
-) where {T<:Real, F}
+    sense::Val,
+    ls::BackTrackingLS{T},
+    x::AbstractArray{T},
+    p::AbstractArray{T},
+    ϕ!::F,
+    ϕ0::T,
+    dϕ0::T,
+) where {T<:Real,F}
     @assert ls.order == 2 || ls.order == 3
 
     α1 = one(T)
@@ -62,9 +66,9 @@ function backtracking!(
         αtmp = α2
         if ls.order == 2 || k == 1
             denom = (ϕx1 - ϕ0 - dϕ0*α2)
-            αtmp = -(dϕ0 * α2*α2) / (2*denom)
+            αtmp = -(dϕ0 * α2 * α2) / (2*denom)
         else
-            div = one(T) / (α1*α1 * α2*α2 * (α2 - α1))
+            div = one(T) / (α1 * α1 * α2 * α2 * (α2 - α1))
             a = (α1*α1*(ϕx1 - ϕ0 - dϕ0*α2) - α2*α2*(ϕx0 - ϕ0 - dϕ0*α1)) * div
             b = (-α1^3*(ϕx1 - ϕ0 - dϕ0*α2) + α2^3*(ϕx0 - ϕ0 - dϕ0*α1)) * div
             if abs(a) < eps(T)

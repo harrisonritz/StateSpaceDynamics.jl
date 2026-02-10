@@ -21,6 +21,8 @@ using Base: show
 
 # Core types and utilities
 include("core/GlobalTypes.jl")
+include("models/lds/types.jl")
+include("core/Workspaces.jl")
 include("core/Utilities.jl")
 
 # Include optimization utilities
@@ -28,14 +30,13 @@ include("optimization/linesearch.jl")
 include("optimization/newton.jl")
 
 # Linear Dynamical Systems
-include("models/lds/types.jl")
 include("models/lds/gaussian.jl")
 include("models/lds/poisson.jl")
+include("models/lds/SLDS.jl")
 
 # Other models
 include("models/EmissionModels.jl")
 include("models/HiddenMarkovModels.jl")
-include("models/SLDS.jl")
 include("models/MixtureModels.jl")
 
 # Algorithms
