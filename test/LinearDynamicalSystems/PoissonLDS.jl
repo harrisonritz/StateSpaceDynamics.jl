@@ -229,10 +229,9 @@ function test_poisson_fit_type_preservation()
 
         x, y = rand(lds; tsteps=50, ntrials=3)
 
-        mls, param_diff = fit!(lds, y; max_iter=10, tol=1e-6)
+        mls = fit!(lds, y; max_iter=10, tol=1e-6)
 
         @test eltype(mls) === T
-        @test eltype(param_diff) === T
     end
 end
 
@@ -320,13 +319,15 @@ function test_parameter_gradient()
         C_size = plds.obs_dim * plds.latent_dim
         log_d = params[(end - plds.obs_dim + 1):end]
         C = reshape(params[1:C_size], plds.obs_dim, plds.latent_dim)
-        return -StateSpaceDynamics.Q_observation_model(
-            C,
-            log_d,
-            reshape(E_z, size(E_z)..., 1),
-            reshape(P_smooth, size(P_smooth)..., 1),
-            y,
-        )
+        d = exp.(log_d)
+        tsteps = size(y, 2)
+        val = zero(eltype(params))
+        for t in 1:tsteps
+            h_t = C * E_z[:, t] .+ d
+            rho_t = [eltype(params)(0.5) * dot(C[i, :], P_smooth[:, :, t] * C[i, :]) for i in 1:size(C, 1)]
+            val += dot(y[:, t], h_t) - sum(exp.(h_t .+ rho_t))
+        end
+        return -val
     end
 
     grad = ForwardDiff.gradient(f, params)
@@ -425,12 +426,17 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, Tt, N)
         StateSpaceDynamics.estep!(plds, tfs, Y)
 
-        Q0 = StateSpaceDynamics.Q_observation_model(
-            plds.obs_model.C, plds.obs_model.log_d, tfs, Y
+        ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
+        StateSpaceDynamics.compute_smooth_constants!(ws, plds)
+
+        Q0 = sum(
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[:, :, k])
+            for k in 1:N
         )
-        StateSpaceDynamics.update_observation_model!(plds, tfs, Y)  # LBFGS inside
-        Q1 = StateSpaceDynamics.Q_observation_model(
-            plds.obs_model.C, plds.obs_model.log_d, tfs, Y
+        StateSpaceDynamics.update_observation_model!(plds, tfs, Y, ws)  # LBFGS inside
+        Q1 = sum(
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[:, :, k])
+            for k in 1:N
         )
 
         @test Q1 ≥ Q0 - 1e-7

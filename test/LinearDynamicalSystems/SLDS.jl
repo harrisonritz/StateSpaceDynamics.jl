@@ -71,18 +71,18 @@ function _block_tridiag_mul(H_diag, H_super, H_sub, x::AbstractVector)
     fill!(y, zero(eltype(y)))
 
     for t in 1:Tsteps
-        xt = @view x[(D*(t-1)+1):(D*t)]
-        yt = @view y[(D*(t-1)+1):(D*t)]
+        xt = @view x[(D * (t - 1) + 1):(D * t)]
+        yt = @view y[(D * (t - 1) + 1):(D * t)]
 
         yt .+= H_diag[t] * xt
 
         if t < Tsteps
-            xtp1 = @view x[(D*t+1):(D*(t+1))]
+            xtp1 = @view x[(D * t + 1):(D * (t + 1))]
             yt .+= H_super[t] * xtp1
         end
         if t > 1
-            xtm1 = @view x[(D*(t-2)+1):(D*(t-1))]
-            yt .+= H_sub[t-1] * xtm1
+            xtm1 = @view x[(D * (t - 2) + 1):(D * (t - 1))]
+            yt .+= H_sub[t - 1] * xtm1
         end
     end
     return y
@@ -100,18 +100,17 @@ function _block_tridiag_quadform(H_diag, H_super, H_sub, x::AbstractVector)
 
     q = zero(eltype(x))
     for t in 1:Tsteps
-        xt = @view x[(D*(t-1)+1):(D*t)]
+        xt = @view x[(D * (t - 1) + 1):(D * t)]
         q += dot(xt, H_diag[t] * xt)
     end
-    for t in 1:(Tsteps-1)
-        xt   = @view x[(D*(t-1)+1):(D*t)]
-        xtp1 = @view x[(D*t+1):(D*(t+1))]
-        q += dot(xt,   H_super[t] * xtp1)
-        q += dot(xtp1, H_sub[t]   * xt)
+    for t in 1:(Tsteps - 1)
+        xt = @view x[(D * (t - 1) + 1):(D * t)]
+        xtp1 = @view x[(D * t + 1):(D * (t + 1))]
+        q += dot(xt, H_super[t] * xtp1)
+        q += dot(xtp1, H_sub[t] * xt)
     end
     return q
 end
-
 
 function _test_hessian_blocks_basic(slds, y_trial, x_trial, w; atol=1e-10)
     H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
@@ -403,7 +402,8 @@ function test_SLDS_hessian_numerical()
 
     _, x, y = rand(slds; tsteps=5, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps); w ./= sum(w; dims=1)
+    w = rand(K, tsteps);
+    w ./= sum(w; dims=1)
 
     y_trial = y[:, :, 1]
     x_trial = x[:, :, 1]
@@ -478,9 +478,10 @@ function test_SLDS_hessian_block_structure_gaussian()
 
     _, x, y = rand(slds; tsteps=10, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps); w ./= sum(w; dims=1)
+    w = rand(K, tsteps);
+    w ./= sum(w; dims=1)
 
-    _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
+    return _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
 end
 
 function test_SLDS_gradient_weight_normalization()
@@ -1167,8 +1168,10 @@ function test_zero_weights_behavior()
     grad = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w)
     @test all(isfinite.(grad))
 
-    H = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
-    @test all(isfinite.(H))
+    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
+    @test all(all(isfinite, h) for h in H_diag)
+    @test all(all(isfinite, h) for h in H_super)
+    @test all(all(isfinite, h) for h in H_sub)
 end
 
 # Poisson SLDS Tests
@@ -1260,9 +1263,10 @@ function test_SLDS_hessian_block_structure_poisson()
 
     _, x, y = rand(slds; tsteps=12, ntrials=1)
     tsteps = size(y, 2)
-    w = rand(K, tsteps); w ./= sum(w; dims=1)
+    w = rand(K, tsteps);
+    w ./= sum(w; dims=1)
 
-    _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
+    return _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
 end
 
 function test_SLDS_smooth_basic_poisson()

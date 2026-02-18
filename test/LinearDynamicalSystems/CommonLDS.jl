@@ -49,15 +49,30 @@ function test_hessian_common(lds, x, y)
         return sum(StateSpaceDynamics.loglikelihood(x, lds, y))
     end
 
-    for i in axes(y, 3)
-        hess, main, super, sub = StateSpaceDynamics.Hessian(lds, y[:, 1:3, i], x[:, 1:3, i])
-        @test size(hess) == (3 * lds.latent_dim, 3 * lds.latent_dim)
-        @test size(main) == (3,)
-        @test size(super) == (2,)
-        @test size(sub) == (2,)
+    tsteps_test = 3
+    ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps_test)
 
-        obj = latents -> log_likelihood(latents, lds, y[:, 1:3, i])
-        hess_numerical = ForwardDiff.hessian(obj, x[:, 1:3, i])
+    for i in axes(y, 3)
+        yi = y[:, 1:tsteps_test, i]
+        xi = x[:, 1:tsteps_test, i]
+
+        # Fill Hessian blocks via workspace
+        if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
+            StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+            StateSpaceDynamics.Hessian!(ws, lds, yi, xi)
+        else
+            StateSpaceDynamics.Hessian!(ws.btd, lds, yi, xi)
+        end
+
+        btd = ws.btd
+        @test length(btd.H_diag) == tsteps_test
+        @test length(btd.H_super) == tsteps_test - 1
+        @test length(btd.H_sub) == tsteps_test - 1
+
+        # Assemble for numerical comparison
+        hess = block_tridgm(btd.H_diag, btd.H_super, btd.H_sub)
+        obj = latents -> log_likelihood(latents, lds, yi)
+        hess_numerical = ForwardDiff.hessian(obj, xi)
         @test norm(hess_numerical - hess) < 1e-8
     end
 end
@@ -124,32 +139,43 @@ Works for both GaussianLDS and PoissonLDS.
 """
 function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     lds, x, y = toy_fn(ntrials, [true, true, false, false, false, false])
+    tsteps = size(y, 2)
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
-    ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps, size(y, 3))
+    StateSpaceDynamics.estep!(lds, tfs, y)
 
-    function obj(x0::AbstractVector, P0_sqrt::AbstractMatrix, lds)
-        A, b, Q = lds.state_model.A, lds.state_model.b, lds.state_model.Q
-        P0 = P0_sqrt * P0_sqrt'
+    ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+
+    # Save original parameters
+    x0_orig = copy(lds.state_model.x0)
+    P0_orig = copy(lds.state_model.P0)
+
+    function obj(x0::AbstractVector, P0_sqrt::AbstractMatrix)
+        lds.state_model.x0 .= x0
+        lds.state_model.P0 .= P0_sqrt * P0_sqrt'
+        StateSpaceDynamics.compute_smooth_constants!(ws, lds)
         Q_val = 0.0
         for i in 1:ntrials
-            E_z, E_zz, E_zz_prev = tfs[i].E_z, tfs[i].E_zz, tfs[i].E_zz_prev
-            Q_val += StateSpaceDynamics.Q_state(A, b, Q, P0, x0, E_z, E_zz, E_zz_prev)
+            Q_val += StateSpaceDynamics.Q_state!(ws, lds, tfs[i].E_z, tfs[i].E_zz, tfs[i].E_zz_prev)
         end
         return -Q_val
     end
 
-    P0_sqrt = Matrix(cholesky(lds.state_model.P0).U)
+    P0_sqrt = Matrix(cholesky(P0_orig).U)
 
     x0_opt = optimize(
-        x0 -> obj(x0, P0_sqrt, lds),
-        lds.state_model.x0,
+        x0 -> obj(x0, P0_sqrt),
+        copy(x0_orig),
         LBFGS(),
         Optim.Options(; g_abstol=1e-12),
     ).minimizer
-    P0_opt = optimize(P0_ -> obj(x0_opt, P0_, lds), P0_sqrt, LBFGS()).minimizer
+    P0_opt = optimize(P0_ -> obj(x0_opt, P0_), P0_sqrt, LBFGS()).minimizer
 
-    StateSpaceDynamics.mstep!(lds, tfs, y)
+    # Restore original parameters before M-step
+    lds.state_model.x0 .= x0_orig
+    lds.state_model.P0 .= P0_orig
+
+    StateSpaceDynamics.mstep!(lds, tfs, y, ws)
 
     @test isapprox(lds.state_model.x0, x0_opt, atol=1e-6)
     @test isapprox(lds.state_model.P0, P0_opt * P0_opt', atol=1e-6)
@@ -163,33 +189,44 @@ Works for both GaussianLDS and PoissonLDS.
 """
 function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     lds, x, y = toy_fn(ntrials, [false, false, true, true, false, false])
+    tsteps = size(y, 2)
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
-    ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps, size(y, 3))
+    StateSpaceDynamics.estep!(lds, tfs, y)
 
-    function obj_state(AB::AbstractMatrix, Q_sqrt::AbstractMatrix, lds)
+    ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+
+    # Save original parameters
+    A_orig = copy(lds.state_model.A)
+    b_orig = copy(lds.state_model.b)
+    Q_orig = copy(lds.state_model.Q)
+
+    function obj_state(AB::AbstractMatrix, Q_sqrt::AbstractMatrix)
         D = size(AB, 1)
-        A = AB[:, 1:D]
-        b = AB[:, D + 1]
-        Q = Q_sqrt * Q_sqrt'
-        val = zero(eltype(Q))
+        lds.state_model.A .= AB[:, 1:D]
+        lds.state_model.b .= AB[:, D + 1]
+        lds.state_model.Q .= Q_sqrt * Q_sqrt'
+        StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+        val = 0.0
         @views for k in 1:ntrials
-            E_z, E_zz, E_zz_prev = tfs[k].E_z, tfs[k].E_zz, tfs[k].E_zz_prev
-            val += StateSpaceDynamics.Q_state(
-                A, b, Q, lds.state_model.P0, lds.state_model.x0, E_z, E_zz, E_zz_prev
-            )
+            val += StateSpaceDynamics.Q_state!(ws, lds, tfs[k].E_z, tfs[k].E_zz, tfs[k].E_zz_prev)
         end
         return -val
     end
 
     D = lds.latent_dim
-    AB0 = hcat(lds.state_model.A, lds.state_model.b)
-    Q_sqrt0 = Matrix(cholesky(lds.state_model.Q).U)
+    AB0 = hcat(A_orig, b_orig)
+    Q_sqrt0 = Matrix(cholesky(Q_orig).U)
 
-    AB_opt = optimize(AB -> obj_state(AB, Q_sqrt0, lds), AB0, LBFGS()).minimizer
-    Q_opt_sqrt = optimize(Qs -> obj_state(AB_opt, Qs, lds), Q_sqrt0, LBFGS()).minimizer
+    AB_opt = optimize(AB -> obj_state(AB, Q_sqrt0), AB0, LBFGS()).minimizer
+    Q_opt_sqrt = optimize(Qs -> obj_state(AB_opt, Qs), Q_sqrt0, LBFGS()).minimizer
 
-    StateSpaceDynamics.mstep!(lds, tfs, y)
+    # Restore original parameters before M-step
+    lds.state_model.A .= A_orig
+    lds.state_model.b .= b_orig
+    lds.state_model.Q .= Q_orig
+
+    StateSpaceDynamics.mstep!(lds, tfs, y, ws)
 
     @test isapprox(lds.state_model.A, AB_opt[:, 1:D], atol=1e-6, rtol=1e-6)
     @test isapprox(lds.state_model.b, AB_opt[:, D + 1], atol=1e-6, rtol=1e-6)
@@ -204,7 +241,7 @@ Works for both GaussianLDS and PoissonLDS.
 """
 function test_em_convergence_common(toy_fn, n_trials=1)
     lds, x, y = toy_fn(n_trials)
-    objective, param_diff = fit!(lds, y; max_iter=100)
+    objective = fit!(lds, y; max_iter=100)
     # For GaussianLDS this is marginal likelihood, for PoissonLDS it's ELBO
     # Both should be monotonically increasing
     @test objective[end] > objective[1]

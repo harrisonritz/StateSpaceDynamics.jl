@@ -367,17 +367,26 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     # run the E_Step
     ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
 
+    tsteps = size(y, 2)
+    ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+
+    # Save original parameters
+    C_orig = copy(lds.obs_model.C)
+    d_orig = copy(lds.obs_model.d)
+    R_orig = copy(lds.obs_model.R)
+
     # Objective over (C,d,R)
     function obj_obs(CD::AbstractMatrix, R_sqrt::AbstractMatrix, lds)
         D = size(CD, 2) - 1
-        C = CD[:, 1:D]
-        d = CD[:, D + 1]
-        R = R_sqrt * R_sqrt'
-        val = zero(eltype(R))
+        lds.obs_model.C .= CD[:, 1:D]
+        lds.obs_model.d .= CD[:, D + 1]
+        lds.obs_model.R .= R_sqrt * R_sqrt'
+        StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+        val = zero(eltype(R_sqrt))
 
         @views for k in 1:ntrials
             E_z, E_zz = tfs[k].E_z, tfs[k].E_zz
-            val += StateSpaceDynamics.Q_obs(C, d, R, E_z, E_zz, y[:, :, k])
+            val += StateSpaceDynamics.Q_obs!(ws, lds, E_z, E_zz, y[:, :, k])
         end
         return -val
     end
@@ -388,6 +397,11 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
 
     CD_opt = optimize(CD -> obj_obs(CD, R_sqrt0, lds), CD0, LBFGS()).minimizer
     R_opt_sqrt = optimize(Rs -> obj_obs(CD_opt, Rs, lds), R_sqrt0, LBFGS()).minimizer
+
+    # Restore original parameters before M-step
+    lds.obs_model.C .= C_orig
+    lds.obs_model.d .= d_orig
+    lds.obs_model.R .= R_orig
 
     # M-step updates the model
     StateSpaceDynamics.mstep!(lds, tfs, y)
@@ -401,7 +415,7 @@ function test_EM(n_trials::Int=1)
     test_em_convergence_common(toy_lds, n_trials)
     # Additional check for monotonic increase
     lds, x, y = toy_lds(n_trials)
-    ml_total, norm_diff = fit!(lds, y; max_iter=100)
+    ml_total = fit!(lds, y; max_iter=100)
     @test all(diff(ml_total) .>= 0)
 end
 
@@ -432,7 +446,7 @@ function test_gaussian_iw_priors_shape_map_and_R_sanity(; rng=MersenneTwister(20
 
         X, Y = rand(rng, lds; tsteps=Tt, ntrials=N)
 
-        elbos, Δ = fit!(lds, Y; max_iter=12, tol=0.0, progress=false)
+        elbos = fit!(lds, Y; max_iter=12, tol=0.0, progress=false)
         @test all(diff(elbos) .>= -1e-7)
         @test issymmetric(lds.state_model.Q)
         @test issymmetric(lds.state_model.P0)

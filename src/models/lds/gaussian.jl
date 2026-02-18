@@ -169,10 +169,10 @@ In-place version of `loglikelihood` that uses pre-computed Cholesky factors from
 """
 function loglikelihood!(
     ws::SmoothWorkspace{T},
-    x::AbstractMatrix,
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    x::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T0,S,O},
+    y::AbstractMatrix{T0},
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
     tsteps = size(y, 2)
 
     A = lds.state_model.A
@@ -1116,10 +1116,12 @@ function update_Q!(
             @. innovation_cov = Σt - temp1 - temp2 + temp4
 
             mul!(temp5, A, μtm1)
-            BLAS.ger!(-one(T), μt, b, innovation_cov)
-            BLAS.ger!(-one(T), b, μt, innovation_cov)
-            BLAS.ger!(one(T), temp5, b, innovation_cov)
-            BLAS.ger!(one(T), b, temp5, innovation_cov)
+            # innovation_cov += α * x * y'
+            mul!(innovation_cov, reshape(μt, :, 1),    reshape(b,     1, :), -one(T), one(T))  # -= μt*b'
+            mul!(innovation_cov, reshape(b,  :, 1),    reshape(μt,    1, :), -one(T), one(T))  # -= b*μt'
+            mul!(innovation_cov, reshape(temp5, :, 1), reshape(b,     1, :),  one(T), one(T))  # += temp5*b'
+            mul!(innovation_cov, reshape(b,  :, 1),    reshape(temp5, 1, :),  one(T), one(T))  # += b*temp5'
+
             innovation_cov .+= bbT
 
             Q_sum .+= weight .* innovation_cov
@@ -1335,6 +1337,7 @@ function fit!(
         # E-step and M-step using workspace pool
         elbo = estep!(lds, tfs, y, sws_pool)
         mstep!(lds, tfs, y, sws_pool[1])
+        
         # Update the log-likelihood vector and parameter difference
         push!(elbos, elbo)
 

@@ -189,7 +189,7 @@ struct SmoothWorkspace{T<:Real}
     elbo_sum_mu_tm1::Vector{T}     # (latent_dim,)
     elbo_temp2::Matrix{T}          # (latent_dim × latent_dim) - for A * sum_E_zzm1 * A'
 
-    # Q_obs buffers
+    # Q_obs buffers (Gaussian)
     elbo_obs_temp::Matrix{T}       # (obs_dim × obs_dim) - accumulator
     elbo_obs_work::Matrix{T}       # (obs_dim × obs_dim) - work matrix
     elbo_ytil::Vector{T}           # (obs_dim,) - residualized y
@@ -197,6 +197,12 @@ struct SmoothWorkspace{T<:Real}
     elbo_sum_yz::Matrix{T}         # (obs_dim × latent_dim)
     elbo_obs_work1::Matrix{T}      # (obs_dim × obs_dim)
     elbo_obs_work2::Matrix{T}      # (latent_dim × obs_dim)
+
+    # Q_obs buffers (Poisson)
+    h_obs::Vector{T}               # (obs_dim,) - h_t = C * E[x_t] + d
+    rho_obs::Vector{T}             # (obs_dim,) - variance correction
+    CP_obs::Matrix{T}              # (obs_dim × latent_dim) - C * P_t
+    CEz_obs::Vector{T}             # (obs_dim,) - C * E[x_t]
 end
 
 """
@@ -288,7 +294,7 @@ function SmoothWorkspace(
     elbo_sum_mu_tm1 = zeros(T, latent_dim)
     elbo_temp2 = zeros(T, latent_dim, latent_dim)
 
-    # Q_obs buffers
+    # Q_obs buffers (Gaussian)
     elbo_obs_temp = zeros(T, obs_dim, obs_dim)
     elbo_obs_work = zeros(T, obs_dim, obs_dim)
     elbo_ytil = zeros(T, obs_dim)
@@ -296,6 +302,12 @@ function SmoothWorkspace(
     elbo_sum_yz = zeros(T, obs_dim, latent_dim)
     elbo_obs_work1 = zeros(T, obs_dim, obs_dim)
     elbo_obs_work2 = zeros(T, latent_dim, obs_dim)
+
+    # Q_obs buffers (Poisson)
+    h_obs = zeros(T, obs_dim)
+    rho_obs = zeros(T, obs_dim)
+    CP_obs = zeros(T, obs_dim, latent_dim)
+    CEz_obs = zeros(T, obs_dim)
 
     return SmoothWorkspace{T}(
         btd,
@@ -368,6 +380,10 @@ function SmoothWorkspace(
         elbo_sum_yz,
         elbo_obs_work1,
         elbo_obs_work2,
+        h_obs,
+        rho_obs,
+        CP_obs,
+        CEz_obs,
     )
 end
 
@@ -378,11 +394,14 @@ Pre-compute and cache all Cholesky factors and derived terms that are constant
 within a single `smooth!` call (i.e., depend only on model parameters, not on x).
 Must be called once at the start of each `smooth!` invocation.
 
-For Gaussian observation models, computes both state and observation model terms.
-For Poisson observation models, only computes state model terms (observation
-terms are x-dependent and computed per-iteration).
+Dispatches on the observation model type:
+- Gaussian: computes both state and observation model terms.
+- Poisson: only computes state model terms (observation terms are x-dependent).
 """
-function compute_smooth_constants!(ws::SmoothWorkspace{T}, lds) where {T<:Real}
+function compute_smooth_constants!(
+    ws::SmoothWorkspace{WT},
+    lds::LinearDynamicalSystem{T,S,O},
+) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q
     P0 = lds.state_model.P0
@@ -437,16 +456,10 @@ function compute_smooth_constants!(ws::SmoothWorkspace{T}, lds) where {T<:Real}
     return nothing
 end
 
-"""
-    compute_smooth_constants_poisson!(ws::SmoothWorkspace{T}, lds)
-
-Pre-compute and cache Cholesky factors and derived terms for Poisson LDS smoothing.
-Only computes state model terms since the observation terms are x-dependent
-and must be computed per-iteration.
-
-Must be called once at the start of each `smooth!` invocation for Poisson LDS.
-"""
-function compute_smooth_constants_poisson!(ws::SmoothWorkspace{T}, lds) where {T<:Real}
+function compute_smooth_constants!(
+    ws::SmoothWorkspace{WT},
+    lds::LinearDynamicalSystem{T,S,O},
+) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q
     P0 = lds.state_model.P0

@@ -501,7 +501,7 @@ function Hessian!(
 end
 
 """
-    Q_observation_model!(sws, cc, E_z, p_smooth, y; weights=nothing)
+    Q_obs!(sws, cc, E_z, p_smooth, y; weights=nothing)
 
 Allocation-free Poisson observation-model Q for a *single trial*:
 
@@ -511,15 +511,14 @@ where
   ρ_i,t = 0.5 * c_i' * P_t * c_i
 and d = exp.(log_d) is cached in cc.d.
 """
-function Q_observation_model!(
+function Q_obs!(
     sws::SmoothWorkspace{T},                      # must provide cc.C and cc.d
     lds::LinearDynamicalSystem{T,S,O},            # for obs_model.C and obs_model.log_d
     E_z::AbstractMatrix{T},                       # state_dim × T
     p_smooth::AbstractArray{T,3},                 # state_dim × state_dim × T
     y::AbstractMatrix{T};                         # obs_dim × T
     weights::Union{Nothing,AbstractVector{T}}=nothing,
-) where {T<:Real, S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     d = exp.(lds.obs_model.log_d)
     C = lds.obs_model.C
 
@@ -527,10 +526,10 @@ function Q_observation_model!(
     tsteps = size(y, 2)
 
     # workspace buffers 
-    h   = sws.h_obs       :: Vector{T}            # obs_dim
-    rho = sws.rho_obs     :: Vector{T}            # obs_dim
-    CP  = sws.CP_obs      :: Matrix{T}            # obs_dim × state_dim
-    CEz = sws.CEz_obs     :: Vector{T}            # obs_dim
+    h = sws.h_obs::Vector{T}            # obs_dim
+    rho = sws.rho_obs::Vector{T}            # obs_dim
+    CP = sws.CP_obs::Matrix{T}            # obs_dim × state_dim
+    CEz = sws.CEz_obs::Vector{T}            # obs_dim
 
     Q_val = zero(T)
 
@@ -538,8 +537,8 @@ function Q_observation_model!(
         wt = isnothing(weights) ? one(T) : weights[t]
 
         Ez_t = E_z[:, t]                 # state_dim
-        P_t  = p_smooth[:, :, t]         # state_dim × state_dim
-        y_t  = y[:, t]                   # obs_dim
+        P_t = p_smooth[:, :, t]         # state_dim × state_dim
+        y_t = y[:, t]                   # obs_dim
 
         # CEz = C * Ez_t
         mul!(CEz, C, Ez_t)
@@ -615,8 +614,9 @@ function calculate_elbo(
                 # Caches Q/P0 cholesky etc. (same as Gaussian)
                 compute_smooth_constants!(sws, lds)
 
-                acc += Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
-                       Q_obs!(sws, lds, fs, view(y, :, :, trial))  # dispatches on Poisson
+                acc +=
+                    Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
+                    Q_obs!(sws, lds, fs.E_z, fs.p_smooth, view(y,:,:,trial))  # dispatches on Poisson
             end
 
             partial[i] = acc
@@ -635,7 +635,6 @@ function calculate_elbo(
 
     return Q_total + prior_term + total_entropy
 end
-
 
 """
     gradient_observation_model_single_trial!(grad, C, log_d, E_z, p_smooth, y, weights)
@@ -768,43 +767,63 @@ function update_observation_model!(
     plds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     y::AbstractArray{T,3},
+    sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    if plds.fit_bool[5]
-        params = vcat(vec(plds.obs_model.C), plds.obs_model.log_d)
 
-        function f(params::Vector{T})
-            C_size = plds.obs_dim * plds.latent_dim
-            log_d = params[(end - plds.obs_dim + 1):end]
-            C = reshape(params[1:C_size], plds.obs_dim, plds.latent_dim)
-            return -Q_observation_model(C, log_d, tfs, y, w)
+    plds.fit_bool[5] || return nothing
+
+    obs_dim  = plds.obs_dim
+    latent_dim = plds.latent_dim
+    C_size = obs_dim * latent_dim
+
+    # initial parameter vector
+    params = vcat(vec(plds.obs_model.C), plds.obs_model.log_d)
+
+    function f(params::Vector{T})
+        # views into params
+        C_view     = reshape(view(params, 1:C_size), obs_dim, latent_dim)
+        log_d_view = view(params, C_size+1:C_size+obs_dim)
+
+        # write into model so Q_obs!(sws, plds, ...) sees them
+        copyto!(plds.obs_model.C, C_view)
+        copyto!(plds.obs_model.log_d, log_d_view)
+
+        acc = zero(T)
+        ntrials = length(tfs)
+
+        @views for trial in 1:ntrials
+            fs = tfs[trial]
+            weights = isnothing(w) ? nothing : w[trial]
+            acc += Q_obs!(sws, plds, fs.E_z, fs.p_smooth, view(y, :, :, trial); weights=weights)
         end
 
-        function g!(grad::Vector{T}, params::Vector{T})
-            C_size = plds.obs_dim * plds.latent_dim
-            log_d = params[(end - plds.obs_dim + 1):end]
-            C = reshape(params[1:C_size], plds.obs_dim, plds.latent_dim)
-            return gradient_observation_model!(grad, C, log_d, tfs, y, w)
-        end
+        return -acc
+    end
 
-        opts = Optim.Options(;
-            x_reltol=1e-12, x_abstol=1e-12, g_abstol=1e-12, f_reltol=1e-12, f_abstol=1e-12
-        )
+    function g!(grad::Vector{T}, params::Vector{T})
+        C_view     = reshape(view(params, 1:C_size), obs_dim, latent_dim)
+        log_d_view = view(params, C_size+1:C_size+obs_dim)
+        return gradient_observation_model!(grad, C_view, log_d_view, tfs, y, w)
+    end
 
-        result = optimize(
-            f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts
-        )
+    opts = Optim.Options(;
+        x_reltol=1e-12, x_abstol=1e-12, g_abstol=1e-12, f_reltol=1e-12, f_abstol=1e-12
+    )
 
-        # Update the parameters
-        C_size = plds.obs_dim * plds.latent_dim
-        plds.obs_model.C = reshape(
-            result.minimizer[1:C_size], plds.obs_dim, plds.latent_dim
-        )
-        plds.obs_model.log_d = result.minimizer[(end - plds.obs_dim + 1):end]
+    result = optimize(
+        f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts
+    )
+
+    # write final params back
+    @views begin
+        plds.obs_model.C     .= reshape(result.minimizer[1:C_size], obs_dim, latent_dim)
+        plds.obs_model.log_d .= result.minimizer[C_size+1:C_size+obs_dim]
     end
 
     return nothing
 end
+
 
 """
     mstep!(plds, tfs, y, w)
@@ -815,16 +834,17 @@ function mstep!(
     plds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     y::AbstractArray{T,3},
+    sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     # Update state parameters
     update_initial_state_mean!(plds, tfs, w)
-    update_initial_state_covariance!(plds, tfs, w)
-    update_A_b!(plds, tfs, w)
-    update_Q!(plds, tfs, w)
+    update_initial_state_covariance!(plds, tfs, sws, w)
+    update_A_b!(plds, tfs, sws, w)
+    update_Q!(plds, tfs, sws, w)
 
     # Update observation parameters
-    update_observation_model!(plds, tfs, y, w)
+    update_observation_model!(plds, tfs, y, sws, w)
     return nothing
 end
 
@@ -832,7 +852,7 @@ end
     _fill_hessian_blocks_poisson!(ws, lds, x)
 
 Fill the Hessian block diagonal and off-diagonal entries for Poisson LDS.
-Uses pre-computed state model terms from `compute_smooth_constants_poisson!`
+Uses pre-computed state model terms from `compute_smooth_constants!`
 and computes the x-dependent Poisson observation term per-timestep.
 """
 function _fill_hessian_blocks_poisson!(
@@ -1005,7 +1025,7 @@ function smooth!(
     btd = sws.btd
 
     # Pre-compute all constant terms for this smooth! call
-    compute_smooth_constants_poisson!(sws, lds)
+    compute_smooth_constants!(sws, lds)
 
     # Use x_smooth as the working buffer (sufficient_statistics! copies x_smooth -> E_z)
     x = fs.x_smooth
@@ -1149,7 +1169,7 @@ function estep!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
     sufficient_statistics!(tfs)
-    elbo = calculate_elbo(lds, tfs, y)
+    elbo = calculate_elbo(lds, tfs, y, sws_pool)
     return elbo
 end
 
@@ -1210,7 +1230,6 @@ function fit!(
 
     # Tracking arrays
     elbos = Vector{T}(undef, max_iter)
-    param_diffs = Vector{T}(undef, max_iter)
 
     # Progress bar
     prog = if progress
@@ -1232,7 +1251,7 @@ function fit!(
         )
 
         # M-step: update parameters
-        param_diffs[iter] = mstep!(plds, tfs, y)
+        mstep!(plds, tfs, y, sws_pool[1])
 
         # Update progress
         if !isnothing(prog)
@@ -1242,7 +1261,6 @@ function fit!(
         # Check convergence (after at least 2 iterations)
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             resize!(elbos, iter)
-            resize!(param_diffs, iter)
             break
         end
     end
@@ -1251,5 +1269,5 @@ function fit!(
         finish!(prog)
     end
 
-    return elbos, param_diffs
+    return elbos
 end

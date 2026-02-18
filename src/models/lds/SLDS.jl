@@ -639,10 +639,10 @@ function smooth!(
     fs::FilterSmooth{T},
     y::AbstractMatrix{T},
     w::AbstractMatrix{T};
-    ws::Union{Nothing,SLDSSmoothWorkspace{T}} = nothing,
-    max_iter::Int = 20,
-    tol::T = T(1e-6),
-    linesearch::Union{Nothing,AbstractLineSearch} = BackTrackingLS{T}(),
+    ws::Union{Nothing,SLDSSmoothWorkspace{T}}=nothing,
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+    linesearch::Union{Nothing,AbstractLineSearch}=BackTrackingLS{T}(),
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
     tsteps = size(y, 2)
@@ -687,20 +687,21 @@ function smooth!(
     # Hessian builder: fill blocks for ∇² loglik, then negate to form (-Hℓ) SPD
     build_hess! = (xcur) -> begin
         Hessian_blocks!(ws, slds, y, xcur, w)  # fills btd.H_* for loglik
-        negate_blocks!(btd)                    # fills btd.neg_* = -(Hℓ blocks)
+        _negate_blocks!(btd)                    # fills btd.neg_* = -(Hℓ blocks)
         return nothing
     end
 
     # Solve (-Hℓ) p = g  (Newton ascent direction)
-    solve_dir! = (pcur, gcur) -> begin
-        gvec = vec(gcur)
-        pvec = vec(pcur)
-        copyto!(pvec, gvec)
-        block_tridiagonal_solve!(
-            pvec, btd.neg_sub, btd.neg_diag, btd.neg_super, gvec, btd
-        )
-        return nothing
-    end
+    solve_dir! =
+        (pcur, gcur) -> begin
+            gvec = vec(gcur)
+            pvec = vec(pcur)
+            copyto!(pvec, gvec)
+            block_tridiagonal_solve!(
+                pvec, btd.neg_sub, btd.neg_diag, btd.neg_super, gvec, btd
+            )
+            return nothing
+        end
 
     converged = newton_smooth!(
         Val(:max),
@@ -722,12 +723,7 @@ function smooth!(
     _negate_blocks!(btd)
 
     block_tridiagonal_inverse!(
-        fs.p_smooth,
-        fs.p_smooth_tt1,
-        btd.neg_sub,
-        btd.neg_diag,
-        btd.neg_super,
-        btd,
+        fs.p_smooth, fs.p_smooth_tt1, btd.neg_sub, btd.neg_diag, btd.neg_super, btd
     )
 
     @views for t in 1:tsteps
@@ -935,6 +931,7 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     fbs::AbstractVector{<:ForwardBackward{T}},
     y::AbstractArray{T,3},
+    sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
     ntrials = size(y, 3)
@@ -953,10 +950,28 @@ function mstep!(
         end
 
         # Update LDS k with weighted sufficient statistics
-        mstep!(slds.LDSs[k], tfs, y, weights)
+        mstep!(slds.LDSs[k], tfs, y, sws, weights)
     end
 
     return nothing
+end
+
+"""
+    mstep!(slds, tfs, fbs, y)
+
+Convenience method that creates workspace internally.
+"""
+function mstep!(
+    slds::SLDS{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    fbs::AbstractVector{<:ForwardBackward{T}},
+    y::AbstractArray{T,3},
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    tsteps = size(y, 2)
+    latent_dim = slds.LDSs[1].latent_dim
+    obs_dim = slds.LDSs[1].obs_dim
+    sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
+    return mstep!(slds, tfs, fbs, y, sws)
 end
 
 """
@@ -976,6 +991,11 @@ function fit!(
     # Initialize structures
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
     fbs = [initialize_forward_backward(slds, tsteps, T) for _ in 1:ntrials]
+
+    # Create workspace for M-step (reused across iterations)
+    latent_dim = slds.LDSs[1].latent_dim
+    obs_dim = slds.LDSs[1].obs_dim
+    sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
 
     # Initialize progress bar
     prog = if progress
@@ -1003,7 +1023,7 @@ function fit!(
         elbos[iter] = elbo
 
         # M-step: update parameters
-        mstep!(slds, tfs, fbs, y)
+        mstep!(slds, tfs, fbs, y, sws)
 
         # Update progress
         if progress && prog !== nothing
