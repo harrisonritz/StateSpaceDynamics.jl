@@ -1,5 +1,7 @@
 module StateSpaceDynamics
 
+import HiddenMarkovModels as HMMs
+
 using ArrayLayouts
 using Distributions
 using ForwardDiff

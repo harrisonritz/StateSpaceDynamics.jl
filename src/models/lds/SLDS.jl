@@ -1,17 +1,14 @@
 """
-    initialize_forward_backward(model::AbstractHMM, num_obs::Int)
+    _make_slds_fb_storage(dl, tsteps)
 
-Initialize the forward backward storage struct.
+Pre-allocate a `HMMs.ForwardBackwardStorage` for one trial given discrete layer `dl` and
+sequence length `tsteps`.  The observation sequence is `1:tsteps` (timestep indices).
 """
-function initialize_forward_backward(model::SLDS, num_obs::Int, ::Type{T}) where {T<:Real}
-    num_states = size(model.A, 1)
-
-    return ForwardBackward(
-        zeros(T, num_states, num_obs),
-        zeros(T, num_states, num_obs),
-        zeros(T, num_states, num_obs),
-        zeros(T, num_states, num_obs),
-        zeros(T, num_states, num_states),
+function _make_slds_fb_storage(dl::SLDSDiscreteLayer{T}, tsteps::Int) where {T}
+    obs_seq = 1:tsteps
+    ctrl_seq = fill(nothing, tsteps)
+    return HMMs.initialize_forward_backward(
+        dl, obs_seq, ctrl_seq; seq_ends=(tsteps,), transition_marginals=true
     )
 end
 
@@ -832,86 +829,81 @@ function sample_posterior(tfs::TrialFilterSmooth{T}, nsamples::Int=1) where {T<:
 end
 
 """
-    estep!(slds::SLDS, tfs::TrialFilterSmooth, fbs::Vector{ForwardBackward}, y::AbstractArray, x_samples::AbstractArray)
+    estep!(slds, tfs, fb_storages, dl, y, x_samples)
 
 E-step for SLDS using a single sample from the continuous posterior.
-- Uses sampled continuous states to compute emission likelihoods
-- Runs forward-backward to get discrete state posteriors  
+- Fills `dl.logL` with per-state log-likelihoods from sampled continuous states
+- Runs forward-backward (external HiddenMarkovModels.jl backend) to get discrete posteriors
 - Smooths continuous states given discrete posteriors
-- Computes sufficient statistics
+- Computes sufficient statistics and returns the stochastic ELBO estimate
 """
 function estep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
-    fbs::AbstractVector{<:ForwardBackward},
+    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
+    dl::SLDSDiscreteLayer{T},
     y::AbstractArray{T,3},
     x_samples::AbstractArray{T,4},  # (latent_dim, tsteps, ntrials, nsamples=1)
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     ntrials = size(y, 3)
     K = length(slds.LDSs)
     tsteps = size(y, 2)
+    obs_seq = 1:tsteps
+    ctrl_seq = fill(nothing, tsteps)
 
     total_elbo = zero(T)
 
     for trial in 1:ntrials
-        y_trial = view(y,:,:,trial)
-        x_sample = view(x_samples,:,:,trial,1)  # Use first (and only) sample
-        fb = fbs[trial]  # Use trial-specific ForwardBackward
+        y_trial = view(y, :, :, trial)
+        x_sample = view(x_samples, :, :, trial, 1)
+        fbs = fb_storages[trial]
 
+        # Fill pre-computed log-likelihoods for the discrete layer
         for k in 1:K
-            fb.loglikelihoods[k, :] .= loglikelihood(x_sample, slds.LDSs[k], y_trial)
+            dl.logL[k, :] .= loglikelihood(x_sample, slds.LDSs[k], y_trial)
         end
 
-        # Run forward-backward for discrete states
-        forward!(slds, fb)
-        backward!(slds, fb)
-        calculate_γ!(slds, fb)
-        calculate_ξ!(slds, fb)
+        # Forward-backward via external backend
+        HMMs.forward_backward!(
+            fbs, dl, obs_seq, ctrl_seq; seq_ends=(tsteps,), transition_marginals=true
+        )
 
-        # Get discrete state posteriors (normalize from log space)
-        w = exp.(fb.γ)  # (K, tsteps)
+        # γ[k,t] is already a probability (not log); use directly as weights
+        w = fbs.γ  # K×T
 
         # Smooth continuous states given discrete posteriors
         smooth!(slds, tfs[trial], y_trial, w)
-
-        # Compute sufficient statistics for M-step
         sufficient_statistics!(tfs[trial])
 
-        # Compute trial contribution to ELBO
-        # ELBO = E_q(z)q(x)[log p(y,x,z)] - H[q(x)] - H[q(z)]
         trial_elbo = zero(T)
-
-        # E_q(z)q(x)[log p(y,x,z)] = sum_k q(z_t=k) * log p(y_t,x_t|z_t=k)
-        # Use updated x_smooth for computing complete-data likelihood
         x_smooth_trial = tfs[trial].x_smooth
 
+        # E_q[log p(y,x|z)] weighted by discrete posteriors
         for k in 1:K
-            # Complete-data log-likelihood for LDS k: log p(y,x|z=k)
-            # This already includes state dynamics + observations
-            ll_k = loglikelihood(x_smooth_trial, slds.LDSs[k], y_trial)  # Vector of length tsteps
-
-            # Weight by discrete state posterior at each time
+            ll_k = loglikelihood(x_smooth_trial, slds.LDSs[k], y_trial)
             for t in 1:tsteps
                 trial_elbo += w[k, t] * ll_k[t]
             end
         end
 
-        # Discrete state prior: log p(z)
-        # Initial state
-        trial_elbo += sum(w[k, 1] * log(slds.πₖ[k] + 1e-12) for k in 1:K)
+        # log p(z_1)
+        for k in 1:K
+            trial_elbo += w[k, 1] * log(slds.πₖ[k] + T(1e-12))
+        end
 
-        # Transitions
-        for i in 1:K, j in 1:K
-            trial_elbo += exp(fb.ξ[i, j]) * log(slds.A[i, j] + 1e-12)
+        # log p(z_t | z_{t-1}): sum_t sum_{i,j} ξ[t][i,j] * log A[i,j]
+        for t in 1:(tsteps - 1)
+            for i in 1:K, j in 1:K
+                trial_elbo += fbs.ξ[t][i, j] * log(slds.A[i, j] + T(1e-12))
+            end
         end
 
         # Subtract entropies
         trial_elbo -= tfs[trial].entropy  # H[q(x)]
-
-        # H[q(z)] = -sum_t sum_k q(z_t=k) log q(z_t=k)
-        discrete_entropy =
-            -sum(w[k, t] * log(w[k, t] + 1e-12) for k in 1:K, t in 1:tsteps if w[k, t] > 0)
-        trial_elbo -= discrete_entropy
+        for k in 1:K, t in 1:tsteps
+            wkt = w[k, t]
+            wkt > 0 && (trial_elbo += wkt * log(wkt + T(1e-12)))  # -H[q(z)] = +E[log q(z)]
+        end
 
         total_elbo += trial_elbo
     end
@@ -920,16 +912,16 @@ function estep!(
 end
 
 """
-    mstep!(slds::SLDS, tfs::TrialFilterSmooth, fbs::Vector{ForwardBackward}, y::AbstractArray)
+    mstep!(slds, tfs, fb_storages, y, sws)
 
 M-step for SLDS.
-- Updates discrete HMM parameters (A, Z₀) using aggregated statistics across trials
+- Updates discrete parameters (A, πₖ) from aggregated ForwardBackwardStorage statistics
 - Updates each LDS using weighted sufficient statistics
 """
 function mstep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
-    fbs::AbstractVector{<:ForwardBackward{T}},
+    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
     y::AbstractArray{T,3},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
@@ -937,49 +929,52 @@ function mstep!(
     ntrials = size(y, 3)
     tsteps = size(y, 2)
 
-    # Update HMM parameters using aggregated statistics from all trials
-    update_initial_state_distribution!(slds, fbs)
-    update_transition_matrix!(slds, fbs)
+    fill!(slds.πₖ, zero(T))
+    for trial in 1:ntrials
+        slds.πₖ .+= view(fb_storages[trial].γ, :, 1)
+    end
+    slds.πₖ ./= ntrials
 
-    # Update each LDS using weighted data across all trials
+    # A[i,j] = sum_trial sum_{t<T} ξ[t][i,j] / sum_trial sum_{t<T} γ[i,t]
+    num = zeros(T, K, K)
+    denom = zeros(T, K)
+    for trial in 1:ntrials
+        fbs = fb_storages[trial]
+        for t in 1:(tsteps - 1)
+            num .+= fbs.ξ[t]
+            denom .+= view(fbs.γ, :, t)
+        end
+    end
+    for i in 1:K
+        slds.A[i, :] .= num[i, :] ./ max(denom[i], T(1e-12))
+    end
+
     for k in 1:K
-        # Collect weights for state k from all trials as a vector of vectors
         weights = Vector{Vector{T}}(undef, ntrials)
         for trial in 1:ntrials
-            weights[trial] = exp.(fbs[trial].γ[k, :])
+            weights[trial] = fb_storages[trial].γ[k, :]
         end
-
-        # Update LDS k with weighted sufficient statistics
         mstep!(slds.LDSs[k], tfs, y, sws, weights)
     end
 
     return nothing
 end
 
-"""
-    mstep!(slds, tfs, fbs, y)
-
-Convenience method that creates workspace internally.
-"""
 function mstep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
-    fbs::AbstractVector{<:ForwardBackward{T}},
+    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
     y::AbstractArray{T,3},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    tsteps = size(y, 2)
-    latent_dim = slds.LDSs[1].latent_dim
-    obs_dim = slds.LDSs[1].obs_dim
-    sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
-    return mstep!(slds, tfs, fbs, y, sws)
+    sws = SmoothWorkspace(T, slds.LDSs[1].latent_dim, slds.LDSs[1].obs_dim, size(y, 2))
+    return mstep!(slds, tfs, fb_storages, y, sws)
 end
 
 """
-    fit!(slds::SLDS{T,S,O}, y::AbstractArray{T,3}; max_iter::Int=50, progress::Bool=true
-        ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    fit!(slds::SLDS{T,S,O}, y::AbstractArray{T,3}; max_iter::Int=50, progress::Bool=true)
 
-Fit SLDS using variational Laplace EM algorithm with stochastic ELBO estimates.
-Runs for exactly max_iter iterations (no early stopping due to stochastic estimates).
+Fit SLDS using variational Laplace EM with stochastic ELBO estimates.
+Runs for exactly `max_iter` iterations.
 """
 function fit!(
     slds::SLDS{T,S,O}, y::AbstractArray{T,3}; max_iter::Int=50, progress::Bool=true
@@ -987,55 +982,46 @@ function fit!(
     ntrials = size(y, 3)
     tsteps = size(y, 2)
     K = length(slds.LDSs)
-
-    # Initialize structures
-    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
-    fbs = [initialize_forward_backward(slds, tsteps, T) for _ in 1:ntrials]
-
-    # Create workspace for M-step (reused across iterations)
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
+
+    # Continuous-state smoother storage
+    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+
+    # Discrete-layer wrapper (holds references to slds.A and slds.πₖ)
+    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, tsteps))
+
+    # Pre-allocate ForwardBackwardStorage for each trial (reused each iteration)
+    fb_storages = [_make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+
+    # M-step workspace
     sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
 
-    # Initialize progress bar
-    prog = if progress
-        Progress(max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true)
-    else
-        nothing
-    end
-
-    # Storage for ELBO values
+    prog = progress ? Progress(max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true) : nothing
     elbos = Vector{T}(undef, max_iter)
 
-    # Initialize with uniform weights and smooth once
-    w_uniform = ones(T, K, tsteps) ./ K
+    # Warm-start: smooth once with uniform discrete weights
+    w_uniform = fill(one(T) / K, K, tsteps)
     for trial in 1:ntrials
         smooth!(slds, tfs[trial], y[:, :, trial], w_uniform)
     end
 
-    # Main EM loop - runs for exactly max_iter iterations
     for iter in 1:max_iter
-        # Sample from current continuous posteriors
-        x_samples, entropies = sample_posterior(Random.default_rng(), tfs, 1)
+        x_samples, _ = sample_posterior(Random.default_rng(), tfs, 1)
 
-        # E-step: infer discrete states and update continuous states
-        elbo = estep!(slds, tfs, fbs, y, x_samples)
+        elbo = estep!(slds, tfs, fb_storages, dl, y, x_samples)
         elbos[iter] = elbo
 
-        # M-step: update parameters
-        mstep!(slds, tfs, fbs, y, sws)
+        mstep!(slds, tfs, fb_storages, y, sws)
 
-        # Update progress
-        if progress && prog !== nothing
+        if prog !== nothing
             next!(prog; showvalues=[(:iteration, iter), (:ELBO, elbo)])
         end
     end
 
-    # Finish progress bar
-    if progress && prog !== nothing
+    if prog !== nothing
         finish!(prog)
     end
-
     return elbos
 end
 

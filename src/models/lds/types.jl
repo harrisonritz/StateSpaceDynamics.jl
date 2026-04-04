@@ -271,11 +271,44 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
     O<:AbstractObservationModel,
     TM<:AbstractMatrix{T},
     ISV<:AbstractVector{T},
-} <: AbstractHMM
+}
     A::TM
     πₖ::ISV
     LDSs::Vector{LinearDynamicalSystem{T,S,O}}
 end
+
+"""
+    SLDSDiscreteLayer{T,TM,TV}
+
+Thin wrapper satisfying the `HiddenMarkovModels.AbstractHMM` interface for the discrete
+switching layer of an SLDS.  The `logL` matrix (K×T) is pre-filled with per-state
+log-likelihoods before each forward-backward call; `obs_seq` is then just `1:T` (timestep
+indices) so that `obs_logdensities!` can look up the correct column.
+
+Fields `A` and `πₖ` are kept as references to the parent SLDS matrices so that in-place
+M-step updates are automatically reflected.
+"""
+mutable struct SLDSDiscreteLayer{T<:Real,TM<:AbstractMatrix{T},TV<:AbstractVector{T}} <:
+               HMMs.AbstractHMM
+    A::TM            # K×K row-stochastic transition matrix
+    πₖ::TV           # K initial-state distribution
+    logL::Matrix{T}  # K×T pre-computed log-likelihoods; mutated before each FB pass
+end
+
+HMMs.initialization(dl::SLDSDiscreteLayer) = dl.πₖ
+HMMs.transition_matrix(dl::SLDSDiscreteLayer) = dl.A
+
+# Override the log-density chokepoint so obs_distributions is never needed.
+# obs is the timestep index t (an Int), supplied as obs_seq = 1:T.
+function HMMs.obs_logdensities!(
+    logb::AbstractVector, dl::SLDSDiscreteLayer, obs::Int, control; kwargs...
+)
+    logb .= view(dl.logL, :, obs)
+    return nothing
+end
+
+# Provide eltype without going through obs_distributions
+Base.eltype(::SLDSDiscreteLayer{T}, obs, control) where {T} = T
 
 function Base.show(io::IO, slds::SLDS; gap="")
     K = length(slds.LDSs)
