@@ -757,3 +757,15 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
 
     return ws
 end
+
+#=
+Refresh the per-regime constant caches after an M-step has updated the LDS parameters.
+Must be called before the next E-step so that Cholesky factors, Hessian templates, etc.
+reflect the current Q, R, A, P0.
+=#
+function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
+    for k in eachindex(slds.LDSs)
+        compute_slds_constants!(ws.consts[k], slds.LDSs[k], ws.I_mat)
+    end
+    return nothing
+end

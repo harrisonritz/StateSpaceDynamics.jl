@@ -761,15 +761,19 @@ function test_SLDS_estep_basic()
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
+    slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+
     # Initialize with uniform weights
     for trial in 1:ntrials
         w_uniform = ones(Float64, K, tsteps) ./ K
-        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform)
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
     end
 
     # Sample and run E-step
-    x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1)
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples)
+    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{Float64}(undef, latent_dim)
+    StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
+    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
 
     # Check ELBO is finite
     @test isfinite(elbo)
@@ -812,13 +816,17 @@ function test_SLDS_mstep_updates_parameters()
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
+    slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+
     # Run one E-step
     for trial in 1:ntrials
         w_uniform = ones(Float64, K, tsteps) ./ K
-        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform)
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
     end
-    x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1)
-    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples)
+    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{Float64}(undef, latent_dim)
+    StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
+    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
 
     # Store old parameters
     A_old = copy(slds.A)
@@ -923,13 +931,17 @@ function test_SLDS_estep_elbo_components()
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
+    slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+
     # Initialize
     w_uniform = ones(Float64, K, tsteps) ./ K
-    StateSpaceDynamics.smooth!(slds, tfs[1], y[:, :, 1], w_uniform)
+    StateSpaceDynamics.smooth!(slds, tfs[1], y[:, :, 1], w_uniform; ws=slds_ws)
 
     # Sample and run E-step
-    x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1)
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples)
+    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{Float64}(undef, latent_dim)
+    StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
+    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
 
     # ELBO should be finite and typically negative (log probability)
     @test isfinite(elbo)
@@ -1299,16 +1311,21 @@ function test_SLDS_estep_basic_poisson()
     tsteps, ntrials = 20, 3
     z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
 
+    latent_dim = slds.LDSs[1].latent_dim
+
     # Initialize structures
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
 
     # Sample posterior
-    x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1)
+    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{Float64}(undef, latent_dim)
+    StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
     # Run E-step
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples)
+    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
 
     @test isfinite(elbo)
 
@@ -1337,12 +1354,17 @@ function test_SLDS_mstep_updates_parameters_poisson()
     tsteps, ntrials = 20, 3
     z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
 
+    latent_dim = slds.LDSs[1].latent_dim
+
     # Initialize and run E-step
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
-    x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1)
-    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples)
+    slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{Float64}(undef, latent_dim)
+    StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
+    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
 
     # Store old parameters
     C_old = [copy(lds.obs_model.C) for lds in slds.LDSs]

@@ -156,7 +156,7 @@ function loglikelihood!(
     tmp = ws.tmp1
 
     C = cc.C
-    d = ws.d
+    d = cc.d
 
     for t in 1:tsteps
         ll_t = zero(T)
@@ -166,9 +166,9 @@ function loglikelihood!(
         z .+= d
         @. λ = exp(z)
 
-        # compute y⋅z - λ - log(y!)
+        # compute y⋅z - λ - log(y!)  (loggamma(n+1) = log(n!) for real n≥0)
         @views begin
-            ll_t += sum(y[:, t] .* z) - sum(λ) - sum(logfactorial.(y[:, t]))
+            ll_t += sum(y[:, t] .* z) - sum(λ) - sum(yi -> loggamma(yi + one(T)), y[:, t])
         end
 
         if t == 1

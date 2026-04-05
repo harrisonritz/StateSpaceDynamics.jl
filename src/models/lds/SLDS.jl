@@ -738,12 +738,55 @@ function smooth(slds::SLDS, y::AbstractMatrix{T}, w::AbstractMatrix{T}) where {T
 end
 
 """
+    sample_posterior!(x_out, rng, tfs, randn_buf)
+
+In-place version of `sample_posterior` for multi-trial use inside EM loops.
+Fills the pre-allocated `x_out` (latent_dim × tsteps × ntrials) with one posterior
+sample per trial. `randn_buf` (latent_dim) is a scratch vector reused across timesteps.
+"""
+function sample_posterior!(
+    x_out::AbstractArray{T,3},
+    rng::AbstractRNG,
+    tfs::TrialFilterSmooth{T},
+    randn_buf::Vector{T},
+) where {T<:Real}
+    min_jitter = T(1e-8)
+    tsteps = size(tfs[1].x_smooth, 2)
+    ntrials = length(tfs.FilterSmooths)
+
+    for trial in 1:ntrials
+        fs = tfs[trial]
+        x_trial = view(x_out, :, :, trial)
+        for t in 1:tsteps
+            chol = nothing
+            jitter = zero(T)
+            for attempt in 1:5
+                try
+                    chol = cholesky(Symmetric(fs.p_smooth[:, :, t]) + jitter * I)
+                    break
+                catch
+                    jitter = min_jitter * T(10)^(attempt - 1)
+                    if attempt == 5
+                        @warn "Covariance not positive definite at t=$t trial=$trial, jitter=$jitter"
+                        chol = cholesky(Symmetric(fs.p_smooth[:, :, t]) + jitter * I)
+                    end
+                end
+            end
+            randn!(rng, randn_buf)
+            lmul!(chol.L, randn_buf)
+            x_trial[:, t] .= fs.x_smooth[:, t] .+ randn_buf
+        end
+    end
+    return x_out
+end
+
+"""
     sample_posterior(rng::AbstractRNG, fs::FilterSmooth{T}) where {T<:Real}
 
 Sample a trajectory from the posterior over continuous states and compute its entropy.
 
 Returns:
-- x_sample: matrix of size (latent_dim, tsteps) representing one sample from 
+- x_sample: matrix of size (latent_dim, tsteps) representing one sample from
   q(x) = ∏ₜ N(x_t | x_smooth_t, p_smooth_t)
 - entropy: H[q(x)] = ∑ₜ H[N(x_t | x_smooth_t, p_smooth_t)]
 """
@@ -766,7 +809,7 @@ function sample_posterior(rng::AbstractRNG, fs::FilterSmooth{T}) where {T<:Real}
             try
                 chol = cholesky(Σ + jitter * I)
                 break
-            catch e
+            catch
                 if attempt == max_attempts
                     # Last resort: use larger jitter
                     jitter = min_jitter * T(10)^(attempt-1)
@@ -843,7 +886,8 @@ function estep!(
     fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
     dl::SLDSDiscreteLayer{T},
     y::AbstractArray{T,3},
-    x_samples::AbstractArray{T,4},  # (latent_dim, tsteps, ntrials, nsamples=1)
+    x_samples::AbstractArray{T,3},  # (latent_dim, tsteps, ntrials)
+    slds_ws::SLDSSmoothWorkspace{T},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     ntrials = size(y, 3)
     K = length(slds.LDSs)
@@ -855,12 +899,13 @@ function estep!(
 
     for trial in 1:ntrials
         y_trial = view(y, :, :, trial)
-        x_sample = view(x_samples, :, :, trial, 1)
+        x_sample = view(x_samples, :, :, trial)
         fbs = fb_storages[trial]
 
         # Fill pre-computed log-likelihoods for the discrete layer
         for k in 1:K
-            dl.logL[k, :] .= loglikelihood(x_sample, slds.LDSs[k], y_trial)
+            loglikelihood!(slds_ws.ll_tmp, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_sample, y_trial)
+            dl.logL[k, :] .= slds_ws.ll_tmp
         end
 
         # Forward-backward via external backend
@@ -872,7 +917,7 @@ function estep!(
         w = fbs.γ  # K×T
 
         # Smooth continuous states given discrete posteriors
-        smooth!(slds, tfs[trial], y_trial, w)
+        smooth!(slds, tfs[trial], y_trial, w; ws=slds_ws)
         sufficient_statistics!(tfs[trial])
 
         trial_elbo = zero(T)
@@ -880,9 +925,9 @@ function estep!(
 
         # E_q[log p(y,x|z)] weighted by discrete posteriors
         for k in 1:K
-            ll_k = loglikelihood(x_smooth_trial, slds.LDSs[k], y_trial)
+            loglikelihood!(slds_ws.ll_tmp, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_smooth_trial, y_trial)
             for t in 1:tsteps
-                trial_elbo += w[k, t] * ll_k[t]
+                trial_elbo += w[k, t] * slds_ws.ll_tmp[t]
             end
         end
 
@@ -949,10 +994,10 @@ function mstep!(
         slds.A[i, :] .= num[i, :] ./ max(denom[i], T(1e-12))
     end
 
+    weights = Vector{AbstractVector{T}}(undef, ntrials)
     for k in 1:K
-        weights = Vector{Vector{T}}(undef, ntrials)
         for trial in 1:ntrials
-            weights[trial] = fb_storages[trial].γ[k, :]
+            weights[trial] = view(fb_storages[trial].γ, k, :)
         end
         mstep!(slds.LDSs[k], tfs, y, sws, weights)
     end
@@ -994,8 +1039,11 @@ function fit!(
     # Pre-allocate ForwardBackwardStorage for each trial (reused each iteration)
     fb_storages = [_make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
-    # M-step workspace
+    # Workspaces — allocated once, reused every iteration
     sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
+    slds_ws = SLDSSmoothWorkspace(T, slds, tsteps)
+    x_samples = Array{T,3}(undef, latent_dim, tsteps, ntrials)
+    randn_buf = Vector{T}(undef, latent_dim)
 
     prog = progress ? Progress(max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true) : nothing
     elbos = Vector{T}(undef, max_iter)
@@ -1003,16 +1051,17 @@ function fit!(
     # Warm-start: smooth once with uniform discrete weights
     w_uniform = fill(one(T) / K, K, tsteps)
     for trial in 1:ntrials
-        smooth!(slds, tfs[trial], y[:, :, trial], w_uniform)
+        smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
     end
 
     for iter in 1:max_iter
-        x_samples, _ = sample_posterior(Random.default_rng(), tfs, 1)
+        sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
-        elbo = estep!(slds, tfs, fb_storages, dl, y, x_samples)
+        elbo = estep!(slds, tfs, fb_storages, dl, y, x_samples, slds_ws)
         elbos[iter] = elbo
 
         mstep!(slds, tfs, fb_storages, y, sws)
+        refresh_slds_constants!(slds_ws, slds)
 
         if prog !== nothing
             next!(prog; showvalues=[(:iteration, iter), (:ELBO, elbo)])
