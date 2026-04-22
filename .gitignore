@@ -32,4 +32,4 @@ benchmarking/testfile.jl
 # benchmarking files
 benchmarking/.CondaPkg
 benchmarking/.DEAD_CondaPkg
-benchmarking/benchmark.jl
+benchmarking/benchmark.jl.claude/worktrees/
