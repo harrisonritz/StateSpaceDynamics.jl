@@ -1500,3 +1500,101 @@ function loglikelihood(
     compute_smooth_constants!(ws, lds)
     return loglikelihood!(ws, x, lds, y)
 end
+
+"""
+    filter_loglikelihood(lds, y)
+
+One-step-ahead predictive log-likelihood ∑_{t,n} log p(y_t^n | y_{1:t-1}^n) via
+the Kalman filter.  Valid for any fitted `LinearDynamicalSystem` with a
+`GaussianObservationModel`, regardless of which E-step backend was used to train it.
+
+Returns the **total** log-likelihood.  Divide by `obs_dim * tsteps * ntrials` for a
+per-observation score that is comparable across configurations.
+"""
+function filter_loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractArray{T,3},
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+    A  = lds.state_model.A
+    Q  = lds.state_model.Q
+    b  = lds.state_model.b
+    x0 = lds.state_model.x0
+    P0 = lds.state_model.P0
+    C  = lds.obs_model.C
+    R  = lds.obs_model.R
+    d  = lds.obs_model.d
+
+    obs_dim, tsteps, ntrials = size(y)
+    D = lds.latent_dim
+
+    total_ll = zero(T)
+    log2πp = T(obs_dim) * log(T(2π))
+
+    # Pre-allocate buffers (reused across trials and time steps)
+    x_p    = Vector{T}(undef, D)
+    x_f    = Vector{T}(undef, D)
+    P_p    = Matrix{T}(undef, D, D)
+    P_f    = Matrix{T}(undef, D, D)
+    tmp_DD = Matrix{T}(undef, D, D)
+    innov  = Vector{T}(undef, obs_dim)
+    Si_e   = Vector{T}(undef, obs_dim)
+    Smat   = Matrix{T}(undef, obs_dim, obs_dim)
+    PCt    = Matrix{T}(undef, D, obs_dim)
+    SiPCt  = Matrix{T}(undef, obs_dim, D)
+
+    for n in 1:ntrials
+        x_f .= x0
+        P_f .= P0
+
+        for t in 1:tsteps
+            # Prediction (t=1: prediction == prior)
+            if t == 1
+                x_p .= x0
+                P_p .= P0
+            else
+                mul!(x_p, A, x_f)
+                x_p .+= b
+                mul!(tmp_DD, A, P_f)
+                mul!(P_p, tmp_DD, A')
+                P_p .+= Q
+                P_p .= (P_p .+ P_p') .* T(0.5)
+            end
+
+            # Innovation: e = y_t - C x_p - d
+            mul!(innov, C, x_p)
+            @views innov .= y[:, t, n] .- innov .- d
+
+            # Innovation covariance: S = C P_p C' + R
+            mul!(PCt, P_p, C')
+            mul!(Smat, C, PCt)
+            Smat .+= R
+            Smat .= (Smat .+ Smat') .* T(0.5)
+
+            # One-step predictive log-likelihood: log N(e; 0, S)
+            S_ch = cholesky(Hermitian(Smat))
+            Si_e .= innov
+            ldiv!(S_ch, Si_e)           # Si_e ← S⁻¹ e
+            total_ll -= T(0.5) * (log2πp + logdet(S_ch) + dot(innov, Si_e))
+
+            # Update: x_f = x_p + K e  where K = PCt S⁻¹
+            mul!(x_f, PCt, Si_e)        # x_f = PCt (S⁻¹ e)
+            x_f .+= x_p
+
+            # P_f = P_p - PCt S⁻¹ PCt'
+            SiPCt .= PCt'
+            ldiv!(S_ch, SiPCt)          # SiPCt ← S⁻¹ PCt'
+            mul!(P_f, PCt, SiPCt)
+            P_f .= P_p .- P_f
+            P_f .= (P_f .+ P_f') .* T(0.5)
+        end
+    end
+
+    return total_ll
+end
+
+function filter_loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractMatrix{T},
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+    return filter_loglikelihood(lds, reshape(y, size(y, 1), size(y, 2), 1))
+end
