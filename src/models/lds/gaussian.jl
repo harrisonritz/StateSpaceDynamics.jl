@@ -1293,9 +1293,18 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress=true,
+    u=nothing,
+    u0=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     if eltype(y) !== T
         error("Observed data must be of type $(T); Got $(eltype(y)))")
+    end
+
+    if lds.kalman_filter
+        return _fit_kalman!(
+            lds, y;
+            u=u, u0=u0, max_iter=max_iter, tol=tol, progress=progress,
+        )
     end
 
     # Initialize log-likelihood

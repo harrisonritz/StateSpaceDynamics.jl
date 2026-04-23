@@ -940,6 +940,32 @@ function valid_Σ(Σ::AbstractMatrix{T}) where {T<:Real}
     return ishermitian(Σ) && isposdef(Σ)
 end
 
+"""
+    tol_PD(A; tol=1e-6) -> PDMat
+
+Eigen-floor stabilization for covariance matrices used along the Kalman path. All
+eigenvalues below `tol * λ_max` are raised to `tol * λ_max`, preserving the overall
+scale/conditioning of the matrix; the result is rewrapped as a `PDMat` so downstream
+code can reuse the cached Cholesky. The matrix is symmetrized (via `hermitianpart`) if
+passed as a plain `Matrix`.
+
+Used by the Kalman filter/smoother to keep predicted and filtered covariances strictly
+positive definite in the presence of floating-point noise. Ported from
+StateSpaceAnalysis. Prefer this over `make_posdef!`/`stabilize_covariance_matrix` for
+Kalman covariances — the scale-aware floor behaves better than an absolute floor when
+the covariance has a large dynamic range.
+"""
+function tol_PD(A_sym::Union{Symmetric,Hermitian}; tol::Real=1e-6)::PDMat
+    λ, Q = eigen!(A_sym)
+    λ_max = λ[end]
+    λ_r = max.(λ ./ λ_max, zero(eltype(λ)))
+    λ_new = (λ_max - λ_max * tol) .* λ_r .+ λ_max * tol
+    return PDMat(X_A_Xt(PDiagMat(λ_new), Q))
+end
+
+tol_PD(A::AbstractMatrix; tol::Real=1e-6)::PDMat = tol_PD(hermitianpart(A); tol=tol)
+tol_PD(A::PDMat; tol::Real=1e-6)::PDMat = tol_PD(Hermitian(Matrix(A)); tol=tol)
+
 # Function for stacking data... in prep for the trialized M_step!()
 function stack_tuples(d)
     # Determine the number of tuples and number of elements in each tuple

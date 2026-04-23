@@ -8,6 +8,7 @@ using ForwardDiff
 using LinearAlgebra
 using LineSearches
 using Optim
+using PDMats
 using ProgressMeter
 using Random
 using SparseArrays
@@ -34,6 +35,7 @@ include("optimization/newton.jl")
 # Linear Dynamical Systems
 include("models/lds/gaussian.jl")
 include("models/lds/poisson.jl")
+include("models/lds/kalman.jl")
 include("models/lds/SLDS.jl")
 
 # Other models
