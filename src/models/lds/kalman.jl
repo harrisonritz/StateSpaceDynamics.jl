@@ -39,6 +39,7 @@ function precompute_kalman_constants!(
     lds::LinearDynamicalSystem{T,S,O};
     tol::Real=T(1e-6),
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
     C = lds.obs_model.C
 
     kws.Q_PD[]  = tol_PD(lds.state_model.Q;  tol=tol)
@@ -50,8 +51,9 @@ function precompute_kalman_constants!(
     copyto!(kws.CiR, RinvC')             # D × p
 
     # CiRC = CiR * C  (D × D, symmetric)
-    mul!(kws.CiRC, kws.CiR, C)
-    Symmetrize!(kws.CiRC)
+    # mul!(kws.CiRC, kws.CiR, C)
+    # Symmetrize!(kws.CiRC)
+    kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
     return nothing
 end
@@ -95,34 +97,42 @@ function covariance_forward_backward!(
     kws.pred_cov[1] = kws.P0_PD[]
 
     # pred_icov_mat[:,:,1] = P0^{-1} via Cholesky (no allocation)
-    pi1 = @view kws.pred_icov_mat[:, :, 1]
-    fill!(pi1, zero(T))
-    @inbounds for i in 1:D; pi1[i, i] = one(T); end
-    ldiv!(kws.P0_PD[].chol, pi1)
+    # pi1 = @view kws.pred_icov_mat[:, :, 1]
+    # fill!(pi1, zero(T))
+    # @inbounds for i in 1:D; pi1[i, i] = one(T); end
+    # ldiv!(kws.P0_PD[].chol, pi1)
 
-    # filt_prec[1] = pred_icov[1] + CiRC  →  filt_cov[1] = inv(filt_prec[1])
-    tmp1 .= pi1 .+ CiRC                              # no allocation
-    Symmetrize!(tmp1)
-    kws.filt_cov[1] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted by eigen!
+    # # filt_prec[1] = pred_icov[1] + CiRC  →  filt_cov[1] = inv(filt_prec[1])
+    # tmp1 .= pi1 .+ CiRC                              # no allocation
+    # Symmetrize!(tmp1)
+    # kws.filt_cov[1] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted by eigen!
+
+    kws.pred_cov[1] = kws.P0_PD[]
+    kws.filt_cov[1] = inv(inv(kws.P0_PD[]) + CiRC)
 
     @inbounds for t in 2:Tsteps
-        # pred_cov[t] = A · filt_cov[t-1] · A' + Q
+        # pred_cov[t] = A · filt_cov[t-1] · A' + Q ---------
         # X_A_Xt(filt_cov[t-1], A) = A * filt_cov * A' via trmm + syrk
         copyto!(tmp1, X_A_Xt(kws.filt_cov[t - 1], A))
         tmp1 .+= Q_mat
-        Symmetrize!(tmp1)
-        kws.pred_cov[t] = tol_PD(Symmetric(tmp1); tol=tol)   # tmp1 corrupted by eigen!
+        # Symmetrize!(tmp1)
+        # kws.pred_cov[t] = tol_PD(Symmetric(tmp1); tol=tol)   # tmp1 corrupted by eigen!
+        kws.pred_cov[t] = PDMat(tmp1)
 
-        # pred_icov_mat[:,:,t] = pred_cov[t]^{-1}  (Cholesky back-substitution)
-        pit = @view kws.pred_icov_mat[:, :, t]
-        fill!(pit, zero(T))
-        @inbounds for i in 1:D; pit[i, i] = one(T); end
-        ldiv!(kws.pred_cov[t].chol, pit)
+        # pred_icov_mat[:,:,t] = pred_cov[t]^{-1}  (Cholesky back-substitution) ---------
+        # pit = @view kws.pred_icov_mat[:, :, t]
+        # fill!(pit, zero(T))
+        # @inbounds for i in 1:D; pit[i, i] = one(T); end
+        # ldiv!(kws.pred_cov[t].chol, pit)
+        pit = inv(kws.pred_cov[t])
 
-        # filt_cov[t] = inv(pred_icov[t] + CiRC)
-        tmp1 .= pit .+ CiRC
-        Symmetrize!(tmp1)
-        kws.filt_cov[t] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted
+        # filt_cov[t] = inv(pred_icov[t] + CiRC) ---------
+        # S.est.filt_cov[tt] = inv(S.mdl.CiRC + S.est.pred_icov[tt]);
+        tmp1 .= pit + CiRC
+        kws.filt_cov[t] = inv(tmp1)  # tmp1 corrupted
+
+        # Symmetrize!(tmp1)
+        # kws.filt_cov[t] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted
     end
 
     # -------- Backward (RTS) pass --------

@@ -9,22 +9,55 @@ The Kalman path is enabled with `kalman_filter=true`. It should:
 - reject invalid configurations (Poisson obs, missing `u` when `B` is set).
 """
 
+function init_params(rng::AbstractRNG, latent_dim::Int, obs_dim::Int)
+    A = SSD.random_rotation_matrix(latent_dim, rng)
+
+    Q = randn(rng, latent_dim, latent_dim)
+    Q = Q * Q' .+ 1e-3
+
+    x0 = randn(rng, latent_dim)
+    P0 = randn(rng, latent_dim, latent_dim)
+    P0 = P0 * P0' .+ 1e-3
+
+    C = randn(rng, obs_dim, latent_dim)
+    R = randn(rng, obs_dim, obs_dim)
+    R = R * R' .+ 1e-3
+
+    b = randn(rng, latent_dim)
+    d = randn(rng, obs_dim)
+
+    return LDSParams(A, Q, x0, P0, C, R, b, d)
+end
+
+# function _make_toy_lds(; kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7,
+#                       B=nothing, B0=nothing)
+#     Random.seed!(seed)
+#     sm = GaussianStateModel(;
+#         A=0.8*Matrix{Float64}(I, D, D),
+#         Q=0.2*Matrix{Float64}(I, D, D),
+#         x0=zeros(D),
+#         P0=Matrix{Float64}(I, D, D),
+#         b=zeros(D),
+#         B=B,
+#         B0=B0,
+#     )
+#     om = GaussianObservationModel(;
+#         C=randn(p, D),
+#         R=0.5*Matrix{Float64}(I, p, p),
+#         d=zeros(p),
+#     )
+#     return LinearDynamicalSystem(sm, om; kalman_filter=kalman_filter)
+# end
+
 function _make_toy_lds(; kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7,
                       B=nothing, B0=nothing)
-    Random.seed!(seed)
+    params = init_params(MersenneTwister(seed), D, p)
     sm = GaussianStateModel(;
-        A=0.8*Matrix{Float64}(I, D, D),
-        Q=0.2*Matrix{Float64}(I, D, D),
-        x0=zeros(D),
-        P0=Matrix{Float64}(I, D, D),
-        b=zeros(D),
-        B=B,
-        B0=B0,
+        A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b,
+        B=B, B0=B0,
     )
     om = GaussianObservationModel(;
-        C=randn(p, D),
-        R=0.5*Matrix{Float64}(I, p, p),
-        d=zeros(p),
+        C=params.C, R=params.R, d=params.d,
     )
     return LinearDynamicalSystem(sm, om; kalman_filter=kalman_filter)
 end
@@ -63,16 +96,19 @@ function _simulate_lds(lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42,
 end
 
 function test_kalman_smooth_agrees_with_newton()
-    D, p, T, N = 3, 5, 40, 4
-    lds_kf = _make_toy_lds(; kalman_filter=true)
-    lds_bt = _make_toy_lds(; kalman_filter=false)
+    D, p, T, N = 8, 16, 64, 64
+    lds_kf = _make_toy_lds(; D=D, p=p, kalman_filter=true)
+    lds_bt = _make_toy_lds(; D=D, p=p, kalman_filter=false)
     y = _simulate_lds(lds_kf, T, N)
 
-    elbos_kf = fit!(lds_kf, y; max_iter=1, progress=false)
-    elbos_bt = fit!(lds_bt, y; max_iter=1, progress=false)
+    n_obs = p * T * N
+
+    elbos_kf = fit!(lds_kf, y; max_iter=1, progress=false)[1] / n_obs
+    elbos_bt = fit!(lds_bt, y; max_iter=1, progress=false)[1] / n_obs
 
     # Single-iteration ELBO should match across backends modulo tol_PD floor.
-    @test abs(elbos_kf[1] - elbos_bt[1]) < 1e-3
+    @printf("ELBOs: KF = %.8f  BT = %.8f\n (diff = %.8f)\n", elbos_kf[1], elbos_bt[1], abs(elbos_kf[1] - elbos_bt[1]))
+    @test abs(elbos_kf[1] - elbos_bt[1]) < 1e-4
 end
 
 function test_kalman_fit_matches_newton()

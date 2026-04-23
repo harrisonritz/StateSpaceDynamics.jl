@@ -812,8 +812,8 @@ struct KalmanWorkspace{T<:Real}
     Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
-    CiR::Matrix{T}    # C' * R^{-1}   (D × p)
-    CiRC::Matrix{T}   # C' * R^{-1} * C  (D × D), symmetric
+    CiR::Matrix{T}                              # C' * R^{-1}   (D × p)
+    CiRC::Base.RefValue{PDMat{T,Matrix{T}}}     # C' * R^{-1} * C  (D × D), symmetric
     shared_entropy::Base.RefValue{T}
 
     # Per-trial mean-pass buffers (thread-safe via trial-slice access)
@@ -878,7 +878,7 @@ function KalmanWorkspace(
         Ref(placeholder_D),
         Ref(placeholder_p),
         zeros(T, D, p),
-        zeros(T, D, D),
+        Ref(placeholder_D),
         Ref(zero(T)),
         zeros(T, D, tsteps, ntrials),
         zeros(T, D, tsteps, ntrials),
