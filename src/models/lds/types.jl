@@ -39,12 +39,25 @@ end
 
 Represents the state model of a Linear Dynamical System with Gaussian noise.
 
+State evolution:
+```math
+x_1   ~ N(x_0 + B_0 u_0, P_0)
+x_{t+1} | x_t ~ N(A x_t + b + B u_t, Q)
+```
+where `B·u_t` and `B_0·u_0` are present only when the corresponding `B`, `B0` fields
+are supplied (i.e., not `nothing`). Input matrices are only consumed by the Kalman
+filter path (see `LinearDynamicalSystem.kalman_filter`).
+
 # Fields
 - `A::M`: Transition matrix (size `latent_dim × latent_dim`).
 - `Q::M`: Process noise covariance matrix.
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
+- `B::Union{Nothing,M} = nothing`: Optional dynamics input matrix (`latent_dim × u_dim`).
+    When supplied, inputs `u` must be passed to `fit!`/`smooth!` via a keyword argument.
+- `B0::Union{Nothing,M} = nothing`: Optional initial-state input matrix
+    (`latent_dim × u0_dim`). When supplied, `u0` must be passed to `fit!`/`smooth!`.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
 """
@@ -56,6 +69,8 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
+    B::Union{Nothing,M} = nothing
+    B0::Union{Nothing,M} = nothing
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
 end
@@ -80,6 +95,15 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
         println(io, gap, "  b  = $(round.(gsm.b, digits=2))")
         println(io, gap, "  x0 = $(round.(gsm.x0, digits=2))")
         println(io, gap, "  P0 = $(round.(gsm.P0, sigdigits=3))")
+    end
+
+    if gsm.B !== nothing
+        println(io, gap, " Dynamics input:")
+        println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
+    end
+    if gsm.B0 !== nothing
+        println(io, gap, " Initial input:")
+        println(io, gap, "  size(B0) = ($(size(gsm.B0,1)), $(size(gsm.B0,2)))")
     end
 
     return nothing
@@ -128,7 +152,15 @@ function GaussianStateModel(
     A::M, Q::M, b::V, x0::V, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianStateModel{T,M,V}(;
-        A=A, Q=Q, b=b, x0=x0, P0=P0, Q_prior=nothing, P0_prior=nothing
+        A=A,
+        Q=Q,
+        b=b,
+        x0=x0,
+        P0=P0,
+        B=nothing,
+        B0=nothing,
+        Q_prior=nothing,
+        P0_prior=nothing,
     )
 end
 
@@ -188,7 +220,13 @@ Represents a unified Linear Dynamical System with customizable state and observa
     PoissonObservationModel)
 - `latent_dim::Int`: Dimension of the latent state
 - `obs_dim::Int`: Dimension of the observations
-- `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization
+- `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
+    Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
+    Poisson path (`[x0, P0, A&b, Q, C&log_d]`), and length 8 when `kalman_filter=true`
+    with inputs supplied (`[x0, P0, A&b, Q, C&d, R, B, B0]`).
+- `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
+    E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
+    the existing block-tridiagonal MAP path.
 """
 Base.@kwdef struct LinearDynamicalSystem{
     T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}
@@ -198,21 +236,28 @@ Base.@kwdef struct LinearDynamicalSystem{
     latent_dim::Int
     obs_dim::Int
     fit_bool::Vector{Bool}
+    kalman_filter::Bool = false
 end
 
 function LinearDynamicalSystem(
-    state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},Nothing}=nothing
+    state_model::S,
+    obs_model::O;
+    fit_bool::Union{Vector{Bool},Nothing}=nothing,
+    kalman_filter::Bool=false,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
     # Infer dimensions from matrices
     latent_dim = size(state_model.A, 1)
     obs_dim = size(obs_model.C, 1)
 
-    # Set default fit_bool based on observation model type
+    # Set default fit_bool based on observation model type / Kalman flag
     if fit_bool === nothing
         if obs_model isa PoissonObservationModel
             # For Poisson: [x0, P0, A&b, Q, C&log_d] (5 parameters)
             fit_bool = [true, true, true, true, true]
+        elseif kalman_filter
+            # Kalman-path Gaussian: [x0, P0, A&b, Q, C&d, R, B, B0] (length 8)
+            fit_bool = [true, true, true, true, true, true, true, true]
         else
             # For Gaussian: [x0, P0, A&b, Q, C&d, R] (6 parameters)
             fit_bool = [true, true, true, true, true, true]
@@ -221,7 +266,7 @@ function LinearDynamicalSystem(
 
     # Create the LDS
     lds = LinearDynamicalSystem{T,S,O}(
-        state_model, obs_model, latent_dim, obs_dim, fit_bool
+        state_model, obs_model, latent_dim, obs_dim, fit_bool, kalman_filter
     )
 
     # Validate the constructed LDS (throws on error)
@@ -233,6 +278,9 @@ end
 function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "Linear Dynamical System:")
     println(io, gap, "------------------------")
+    if lds.kalman_filter
+        println(io, gap, " E-step backend: Kalman filter + RTS smoother")
+    end
     Base.show(io, lds.state_model; gap=gap * " ")
     Base.show(io, lds.obs_model; gap=gap * " ")
     println(io, gap, " Parameters to update:")
@@ -241,6 +289,9 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     if lds.obs_model isa PoissonObservationModel
         # C and log_d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, log_d"][lds.fit_bool[1:5]]
+    elseif lds.kalman_filter && length(lds.fit_bool) == 8
+        labels = ["x0", "P0", "A (and b)", "Q", "C", "R", "B", "B0"]
+        prms = labels[lds.fit_bool]
     else
         prms = ["x0", "P0", "A (and b)", "Q", "C", "R"][lds.fit_bool[1:6]]
     end
