@@ -138,6 +138,16 @@ include("helper_functions.jl")
             end
         end
 
+        include("LinearDynamicalSystems/KalmanLDS.jl")
+        @testset "Kalman LDS" begin
+            test_kalman_smooth_agrees_with_newton()
+            test_kalman_fit_matches_newton()
+            test_kalman_covariance_shared_across_trials()
+            test_kalman_with_B_input_equivalent_to_bias()
+            test_kalman_rejects_poisson_obs()
+            test_kalman_missing_u_errors()
+        end
+
         include("LinearDynamicalSystems/PoissonLDS.jl")
         @testset "Poisson LDS" begin
             @testset "Constructors" begin
