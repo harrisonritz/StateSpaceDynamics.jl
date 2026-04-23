@@ -5,7 +5,7 @@ Base.string(::SSD_LDSImplem) = "StateSpaceDynamics.jl"
 
 function build_model(::SSD_LDSImplem, instance::LDSInstance, params::LDSParams)
     (; latent_dim, obs_dim, num_trials, seq_length) = instance
-    (; A, Q, x0, P0, C, R)  = params
+    (; A, Q, x0, P0, C, R, b, d)  = params
 
     # Create the model
     state_model = GaussianStateModel(
@@ -13,11 +13,13 @@ function build_model(::SSD_LDSImplem, instance::LDSInstance, params::LDSParams)
         Q = Q,
         x0 = x0,
         P0 = P0,
+        b = b,
         )
 
     obs_model = GaussianObservationModel(
         C = C,
         R = R,
+        d = d,
         )
 
     glds = LinearDynamicalSystem(;
@@ -25,7 +27,9 @@ function build_model(::SSD_LDSImplem, instance::LDSInstance, params::LDSParams)
             obs_model=obs_model,
             latent_dim=latent_dim,
             obs_dim=obs_dim,
-            fit_bool=fill(true, 6))
+            fit_bool=fill(true, 6),
+            kalman_filter=true,
+            )
 
     return glds
 end
