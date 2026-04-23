@@ -31,7 +31,7 @@ struct BenchConfig
 end
 
 kf_config = BenchConfig(
-    [2, 4, 8],   # latent_dims
+    [4, 8],   # latent_dims
     [4, 8],      # obs_dims
     100,         # seq_length
     10,          # n_iters (EM iterations per fit)
@@ -108,7 +108,7 @@ results = DataFrame(
 
 for latent_dim in kf_config.latent_dims
     for obs_dim in kf_config.obs_dims
-        obs_dim < latent_dim && continue
+        # obs_dim < latent_dim && continue
 
         println("\n→ latent_dim=$latent_dim, obs_dim=$obs_dim, seq_len=$(kf_config.seq_length), num_trials=$NUM_TRIALS")
 
@@ -151,7 +151,7 @@ for latent_dim in kf_config.latent_dims
                 med_sec, bench.memory, bench.allocs,
                 ll_per_obs,
             ))
-            @printf("median = %.4f sec  test_ll/obs = %.4f\n", med_sec, ll_per_obs)
+            @printf("median = %.6f sec  test_ll/obs = %.6f  alloc = %d  mem = %.2f MB\n", med_sec, ll_per_obs, bench.allocs, bench.memory/1e6)
         end
     end
 end
@@ -163,7 +163,7 @@ end
 results_dir = joinpath(@__DIR__, "results")
 isdir(results_dir) || mkpath(results_dir)
 
-csv_path = joinpath(results_dir, "kf_benchmark_results.csv")
+csv_path = joinpath(results_dir, "kf_benchmark_results_ntrials$(NUM_TRIALS)_seqlen$(kf_config.seq_length).csv")
 CSV.write(csv_path, results)
 println("\nWrote results → $csv_path")
 
@@ -263,6 +263,6 @@ final_plt = plot(grid_plot, legend_plot;
                  plot_title  = "Tridiagonal vs Kalman/RTS  (seq_len=$(kf_config.seq_length), trials=$NUM_TRIALS, iters=$(kf_config.n_iters))")
 plot!(final_plt; tickfontsize=10, guidefontsize=12, legendfontsize=11)
 
-png_path = joinpath(results_dir, "kf_benchmark.png")
+png_path = joinpath(results_dir, "kf_benchmark_ntrials$(NUM_TRIALS)_seqlen$(kf_config.seq_length).png")
 savefig(final_plt, png_path)
 println("Wrote plot → $png_path")

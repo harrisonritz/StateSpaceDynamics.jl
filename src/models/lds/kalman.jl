@@ -87,60 +87,84 @@ function covariance_forward_backward!(
     A      = lds.state_model.A
     Q_mat  = kws.Q_PD[].mat
     CiRC   = kws.CiRC
+    tmp1   = kws.cov_tmp1   # D×D scratch — written freely, may be corrupted by tol_PD
+    tmp2   = kws.cov_tmp2   # D×D scratch — ditto
 
     # -------- Forward pass --------
-    kws.pred_cov[1]  = kws.P0_PD[]
-    kws.pred_icov[1] = inv(kws.P0_PD[])
+    # t = 1: seed from prior P0.
+    kws.pred_cov[1] = kws.P0_PD[]
 
-    # filt_prec[1] = pred_icov[1] + CiRC   →   filt_cov[1] = inv(filt_prec[1])
-    filt_prec_1     = Matrix(kws.pred_icov[1]) .+ CiRC
-    kws.filt_cov[1] = inv(tol_PD(hermitianpart(filt_prec_1); tol=tol))
+    # pred_icov_mat[:,:,1] = P0^{-1} via Cholesky (no allocation)
+    pi1 = @view kws.pred_icov_mat[:, :, 1]
+    fill!(pi1, zero(T))
+    @inbounds for i in 1:D; pi1[i, i] = one(T); end
+    ldiv!(kws.P0_PD[].chol, pi1)
+
+    # filt_prec[1] = pred_icov[1] + CiRC  →  filt_cov[1] = inv(filt_prec[1])
+    tmp1 .= pi1 .+ CiRC                              # no allocation
+    Symmetrize!(tmp1)
+    kws.filt_cov[1] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted by eigen!
 
     @inbounds for t in 2:Tsteps
         # pred_cov[t] = A · filt_cov[t-1] · A' + Q
-        pred_mat = Matrix(X_A_Xt(kws.filt_cov[t - 1], A))  # plain matrix
-        pred_mat .+= Q_mat
-        kws.pred_cov[t]  = tol_PD(hermitianpart(pred_mat); tol=tol)
-        kws.pred_icov[t] = inv(kws.pred_cov[t])
+        # X_A_Xt(filt_cov[t-1], A) = A * filt_cov * A' via trmm + syrk
+        copyto!(tmp1, X_A_Xt(kws.filt_cov[t - 1], A))
+        tmp1 .+= Q_mat
+        Symmetrize!(tmp1)
+        kws.pred_cov[t] = tol_PD(Symmetric(tmp1); tol=tol)   # tmp1 corrupted by eigen!
 
-        filt_prec_t = Matrix(kws.pred_icov[t]) .+ CiRC
-        kws.filt_cov[t] = inv(tol_PD(hermitianpart(filt_prec_t); tol=tol))
+        # pred_icov_mat[:,:,t] = pred_cov[t]^{-1}  (Cholesky back-substitution)
+        pit = @view kws.pred_icov_mat[:, :, t]
+        fill!(pit, zero(T))
+        @inbounds for i in 1:D; pit[i, i] = one(T); end
+        ldiv!(kws.pred_cov[t].chol, pit)
+
+        # filt_cov[t] = inv(pred_icov[t] + CiRC)
+        tmp1 .= pit .+ CiRC
+        Symmetrize!(tmp1)
+        kws.filt_cov[t] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted
     end
 
     # -------- Backward (RTS) pass --------
     kws.smooth_cov[Tsteps] = kws.filt_cov[Tsteps]
 
-    # Seed shared 3-D aliases for FilterSmooth reference-sharing.
     fill!(kws.p_smooth_shared, zero(T))
     fill!(kws.p_smooth_tt1_shared, zero(T))
     @views kws.p_smooth_shared[:, :, Tsteps] .= kws.smooth_cov[Tsteps].mat
 
-    # Entropy log-determinant accumulator.
     ent_logdet = logdet(kws.smooth_cov[Tsteps])
 
     @inbounds for t in (Tsteps - 1):-1:1
         filt_t_mat = kws.filt_cov[t].mat
+        pi_t1      = @view kws.pred_icov_mat[:, :, t + 1]   # P_pred[t+1]^{-1}
 
         # G_t = filt_cov[t] · A' · pred_icov[t+1]
-        Gt = (filt_t_mat * A') * Matrix(kws.pred_icov[t + 1])
-        @views copyto!(kws.G[:, :, t], Gt)
+        # Write into tmp2 (concrete Matrix{T}) for type-stable X_A_Xt calls below.
+        mul!(tmp1, filt_t_mat, A')    # tmp1 = P_filt · A'
+        mul!(tmp2, tmp1, pi_t1)       # tmp2 = G_t
+        @views kws.G[:, :, t] .= tmp2 # store for smooth_mean backward pass
 
-        # smooth_cov[t] = filt_cov[t] + G_t · (smooth_cov[t+1] − pred_cov[t+1]) · G_t'
-        diff_mat   = kws.smooth_cov[t + 1].mat .- kws.pred_cov[t + 1].mat
-        smooth_raw = filt_t_mat .+ Gt * diff_mat * Gt'
-        kws.smooth_cov[t] = tol_PD(hermitianpart(smooth_raw); tol=tol)
-        @views copyto!(kws.p_smooth_shared[:, :, t], kws.smooth_cov[t].mat)
+        # Both triple products use X_A_Xt (trmm + syrk, ~2x faster than gemm×2 at large D).
+        # tmp2 holds G_t as a concrete Matrix{T} — avoids SubArray JET inference issues.
+        # GpGt is shared by smooth_cov and back_condP — compute once, use twice.
+        GpGt = X_A_Xt(kws.pred_cov[t + 1], tmp2)    # G_t · P_pred[t+1] · G_t'
+        GsGt = X_A_Xt(kws.smooth_cov[t + 1], tmp2)  # G_t · P_smooth[t+1] · G_t'
 
-        # Backward-conditional cov for joint entropy chain-rule:
-        # Σ_{t|x_{t+1},y} = filt_cov[t] − G_t · pred_cov[t+1] · G_t'
-        back_cond  = filt_t_mat .- Gt * kws.pred_cov[t + 1].mat * Gt'
-        back_condP = tol_PD(hermitianpart(back_cond); tol=tol)
+        # smooth_cov[t] = filt_cov[t] + G_t · (smooth_t+1 − pred_t+1) · G_t'
+        tmp1 .= filt_t_mat .+ GsGt .- GpGt
+        Symmetrize!(tmp1)
+        kws.smooth_cov[t] = tol_PD(Symmetric(tmp1); tol=tol)  # tmp1 corrupted
+        @views kws.p_smooth_shared[:, :, t] .= kws.smooth_cov[t].mat
+
+        # Backward-conditional cov for entropy chain-rule:
+        # Sigma_{t|x_{t+1},y} = filt_cov[t] - G_t · pred_cov[t+1] · G_t'
+        tmp2 .= filt_t_mat .- GpGt   # reuse GpGt; overwrites tmp2 (G_t no longer needed)
+        Symmetrize!(tmp2)
+        back_condP = tol_PD(Symmetric(tmp2); tol=tol)  # tmp2 corrupted
         ent_logdet += logdet(back_condP)
     end
 
     # Lag-1 cross-covariance: Cov(x_t, x_{t-1} | y) = smooth_cov[t] · G_{t-1}'
-    # Stored at index t for t = 2:T to match SSD's `p_smooth_tt1` convention
-    # (entry at t=1 stays zero because there is no x_0).
     @inbounds @views for t in 2:Tsteps
         mul!(kws.p_smooth_tt1_shared[:, :, t], kws.smooth_cov[t].mat, kws.G[:, :, t - 1]')
     end
@@ -241,15 +265,15 @@ function _filter_mean_trial!(
     b      = lds.state_model.b
 
     @views begin
-        pred = kws.pred_mean[:, :, n]
-        filt = kws.filt_mean[:, :, n]
+        pred     = kws.pred_mean[:, :, n]
+        filt     = kws.filt_mean[:, :, n]
+        info_buf = kws.mean_tmp[:, n]   # pre-allocated D-vector for this trial
 
         # t = 1
         pred[:, 1] .= x0_eff
-        # filt[:, 1] = filt_cov[1] * (pred_icov[1] * pred[:, 1] + CiRY[:, 1, n])
-        info_rhs = kws.pred_icov[1] * pred[:, 1]
-        info_rhs .+= kws.CiRY[:, 1, n]
-        mul!(filt[:, 1], kws.filt_cov[1].mat, info_rhs)
+        mul!(info_buf, kws.pred_icov_mat[:, :, 1], pred[:, 1])
+        info_buf .+= kws.CiRY[:, 1, n]
+        mul!(filt[:, 1], kws.filt_cov[1].mat, info_buf)
 
         @inbounds for t in 2:Tsteps
             # pred[:, t] = A · filt[:, t-1] + b + Bu[:, t-1, n]
@@ -257,10 +281,9 @@ function _filter_mean_trial!(
             pred[:, t] .+= b
             pred[:, t] .+= kws.Bu[:, t - 1, n]
 
-            # filt[:, t] = filt_cov[t] * (pred_icov[t] * pred[:, t] + CiRY[:, t, n])
-            info_rhs = kws.pred_icov[t] * pred[:, t]
-            info_rhs .+= kws.CiRY[:, t, n]
-            mul!(filt[:, t], kws.filt_cov[t].mat, info_rhs)
+            mul!(info_buf, kws.pred_icov_mat[:, :, t], pred[:, t])
+            info_buf .+= kws.CiRY[:, t, n]
+            mul!(filt[:, t], kws.filt_cov[t].mat, info_buf)
         end
     end
 
