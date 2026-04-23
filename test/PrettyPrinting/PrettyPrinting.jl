@@ -115,8 +115,8 @@ function test_pretty_printing()
 
     # Linear Dynamical System 
 
-    lds1 = LinearDynamicalSystem(gsm1, gom1, 5, 5, [true, true, true, true, true, true])
-    lds2 = LinearDynamicalSystem(gsm2, pom2, 2, 2, [true, true, true, true, true])
+    lds1 = LinearDynamicalSystem(gsm1, gom1, 5, 5, [true, true, true, true, true, true], false)
+    lds2 = LinearDynamicalSystem(gsm2, pom2, 2, 2, [true, true, true, true, true], false)
     push!(objs, lds1, lds2)
 
     @test println(io1, lds1) === nothing
