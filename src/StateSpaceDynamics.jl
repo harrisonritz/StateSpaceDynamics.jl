@@ -78,6 +78,6 @@ export random_rotation_matrix
 export print_full
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, kmeans_init!, viterbi, class_probabilities
+export rand, smooth, fit!, loglikelihood, filter_loglikelihood, kmeans_init!, viterbi, class_probabilities
 
 end
