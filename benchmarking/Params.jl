@@ -15,6 +15,8 @@ end
     P0::M
     C::M
     R::M
+    b::V
+    d::V
 end
 
 function init_params(rng::AbstractRNG, instance::HMMInstance)
@@ -56,7 +58,10 @@ function init_params(rng::AbstractRNG, instance::LDSInstance)
     R = randn(rng, obs_dim, obs_dim)
     R = R * R'  .+ 1e-3
 
-    return LDSParams(;A=A, Q=Q, x0=x0, P0=P0, C=C, R=R)
+    b = randn(rng, latent_dim)
+    d = randn(rng, obs_dim)
+
+    return LDSParams(;A=A, Q=Q, x0=x0, P0=P0, C=C, R=R, b=b, d=d)
 end
 
 function build_data(rng::AbstractRNG, model::LinearDynamicalSystem, instance::LDSInstance)

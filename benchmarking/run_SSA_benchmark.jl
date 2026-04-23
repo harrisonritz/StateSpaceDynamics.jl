@@ -29,7 +29,7 @@ BenchmarkTools.DEFAULT_PARAMETERS.seconds = 1.0
 # ----------------------
 
 
-save_name = "benchmarking/results/lds_benchmark_recoverx.csv"
+save_name = "benchmarking/results/SSA_benchmark_recoverx.csv"
 
 # lds_config = BenchConfig(
 #     [2, 4, 6, 8],  # latent_dims
@@ -61,24 +61,27 @@ lds_implementations = [
 
 lds_results = []
 
-# latent_dim = 5
-# obs_dim = 10
-# seq_len = 100
-# impl = SSA_LDSImplem()
+
+
+latent_dim = 5
+obs_dim = 10
+seq_len = 100
+impl = SSA_LDSImplem()
 
 
 
 # Run 1 EM iteration to compile
-# instance = LDSInstance(; latent_dim=2, obs_dim=2, num_trials=10, seq_length=100)
-# rng = StableRNG(1234)
-# params = init_params(rng, instance)
+instance = LDSInstance(; latent_dim=2, obs_dim=2, num_trials=10, seq_length=100)
+rng = StableRNG(1234)
+params = init_params(rng, instance)
 
-# ssd_model = build_model(SSD_LDSImplem(), instance, params)
-# x, y = build_data(rng, ssd_model, instance)
+ssd_model = build_model(SSD_LDSImplem(), instance, params)
+x, y = build_data(rng, ssd_model, instance)
 
-# fit_model = deepcopy(model)
-# ssd_fit = StateSpaceDynamics.fit!(fit_model, y, max_iter=100, tol=1e-50)
-# xhat, phat = smooth(fit_model, y)
+ssa_model = build_model(SSA_LDSImplem(), instance, params)
+fit_model = deepcopy(model)
+ssd_fit = StateSpaceDynamics.fit!(fit_model, y, max_iter=100, tol=1e-50)
+xhat, phat = smooth(fit_model, y)
 
 
 
