@@ -793,9 +793,16 @@ struct KalmanWorkspace{T<:Real}
     # Shared covariance storage (populated once per E-step)
     pred_cov::Vector{PDMat{T,Matrix{T}}}
     filt_cov::Vector{PDMat{T,Matrix{T}}}
-    pred_icov::Vector{PDMat{T,Matrix{T}}}
+    pred_icov_mat::Array{T,3}   # (D, D, T) — P_pred^{-1} as plain matrices (replaces Vector{PDMat})
     smooth_cov::Vector{PDMat{T,Matrix{T}}}
     G::Array{T,3}  # (D, D, T-1)
+
+    # Pre-allocated scratch buffers for covariance_forward_backward! (no per-step allocs)
+    cov_tmp1::Matrix{T}   # (D, D)
+    cov_tmp2::Matrix{T}   # (D, D)
+
+    # Per-trial D-vector scratch for _filter_mean_trial! (column n used by trial n)
+    mean_tmp::Matrix{T}   # (D, ntrials)
 
     # Shared 3D aliases for FilterSmooth reference-sharing
     p_smooth_shared::Array{T,3}      # (D, D, T)
@@ -838,9 +845,14 @@ function KalmanWorkspace(
 
     pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     filt_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
-    pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     smooth_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     G = zeros(T, D, D, max(tsteps - 1, 0))
+
+    # pred_icov_mat[:,:,t] holds P_pred[t]^{-1} as a plain matrix (identity-initialised)
+    pred_icov_mat = zeros(T, D, D, tsteps)
+    for t in 1:tsteps
+        for i in 1:D; pred_icov_mat[i, i, t] = one(T); end
+    end
 
     p_smooth_shared = zeros(T, D, D, tsteps)
     p_smooth_tt1_shared = zeros(T, D, D, tsteps)
@@ -854,9 +866,12 @@ function KalmanWorkspace(
         ntrials,
         pred_cov,
         filt_cov,
-        pred_icov,
+        pred_icov_mat,
         smooth_cov,
         G,
+        zeros(T, D, D),       # cov_tmp1
+        zeros(T, D, D),       # cov_tmp2
+        zeros(T, D, ntrials), # mean_tmp
         p_smooth_shared,
         p_smooth_tt1_shared,
         Ref(placeholder_D),
