@@ -34,3 +34,4 @@ benchmarking/.CondaPkg
 benchmarking/.DEAD_CondaPkg
 benchmarking/benchmark.jl.claude/worktrees/
 /.claude
+/benchmarking/results
