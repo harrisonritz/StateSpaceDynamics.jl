@@ -108,7 +108,7 @@ function covariance_forward_backward!(
     # kws.filt_cov[1] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted by eigen!
 
     kws.pred_cov[1] = kws.P0_PD[]
-    kws.filt_cov[1] = inv(inv(kws.P0_PD[]) + CiRC)
+    kws.filt_cov[1] = inv(inv(kws.P0_PD[]) + CiRC[])
 
     @inbounds for t in 2:Tsteps
         # pred_cov[t] = A · filt_cov[t-1] · A' + Q ---------
@@ -128,7 +128,7 @@ function covariance_forward_backward!(
 
         # filt_cov[t] = inv(pred_icov[t] + CiRC) ---------
         # S.est.filt_cov[tt] = inv(S.mdl.CiRC + S.est.pred_icov[tt]);
-        tmp1 .= pit + CiRC
+        tmp1 .= pit + CiRC[]
         kws.filt_cov[t] = inv(tmp1)  # tmp1 corrupted
 
         # Symmetrize!(tmp1)
