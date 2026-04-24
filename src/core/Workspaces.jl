@@ -794,6 +794,7 @@ struct KalmanWorkspace{T<:Real}
     pred_cov::Vector{PDMat{T,Matrix{T}}}
     filt_cov::Vector{PDMat{T,Matrix{T}}}
     pred_icov_mat::Array{T,3}   # (D, D, T) — P_pred^{-1} as plain matrices (replaces Vector{PDMat})
+    pred_icov::Vector{PDMat{T,Matrix{T}}}
     smooth_cov::Vector{PDMat{T,Matrix{T}}}
     G::Array{T,3}  # (D, D, T-1)
 
@@ -845,6 +846,7 @@ function KalmanWorkspace(
     placeholder_p = PDMat(Matrix{T}(I, p, p))
 
     pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     filt_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     smooth_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     G = zeros(T, D, D, max(tsteps - 1, 0))
@@ -859,34 +861,35 @@ function KalmanWorkspace(
     p_smooth_tt1_shared = zeros(T, D, D, tsteps)
 
     return KalmanWorkspace{T}(
-        D,
-        p,
-        u_dim,
-        u0_dim,
-        tsteps,
-        ntrials,
-        pred_cov,
-        filt_cov,
-        pred_icov_mat,
-        smooth_cov,
-        G,
-        zeros(T, D, D),       # cov_tmp1
-        zeros(T, D, D),       # cov_tmp2
-        Ref(placeholder_D),   # pd_tmp
-        zeros(T, D, ntrials), # mean_tmp
-        p_smooth_shared,
-        p_smooth_tt1_shared,
-        Ref(placeholder_D),
-        Ref(placeholder_D),
-        Ref(placeholder_p),
-        zeros(T, D, p),
-        Ref(placeholder_D),
-        Ref(zero(T)),
-        zeros(T, D, tsteps, ntrials),
-        zeros(T, D, tsteps, ntrials),
-        zeros(T, D, tsteps, ntrials),
-        zeros(T, D, tsteps, ntrials),
-        zeros(T, D, tsteps, ntrials),
-        zeros(T, p, tsteps, ntrials),
+        D,                              # latent_dim
+        p,                              # obs_dim
+        u_dim,                          # control_dim
+        u0_dim,                         # initial_control_dim
+        tsteps,                         # time_steps
+        ntrials,                        # number_of_trials
+        pred_cov,                       # Vector{PDMat} for P_pred[t]
+        filt_cov,                       # Vector{PDMat} for P_filt[t]
+        pred_icov_mat,                  # Array{T,3} for P_pred[t]^{-1} as plain matrices
+        pred_icov,                      # Vector{PDMat} for P_pred[t]^{-1} as PDMats (cached Cholesky factors)
+        smooth_cov,                     # Vector{PDMat} for P_smooth[t]
+        G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
+        zeros(T, D, D),                 # cov_tmp1
+        zeros(T, D, D),                 # cov_tmp2
+        Ref(placeholder_D),             # pd_tmp
+        zeros(T, D, ntrials),           # mean_tmp
+        p_smooth_shared,                # (D, D, T)
+        p_smooth_tt1_shared,            # (D, D, T)
+        Ref(placeholder_D),             # Q_PD
+        Ref(placeholder_D),             # P0_PD
+        Ref(placeholder_p),             # R_PD
+        zeros(T, D, p),                 # CiR
+        Ref(placeholder_D),             # CiRC
+        Ref(zero(T)),                   # shared_entropy
+        zeros(T, D, tsteps, ntrials),   # pred_mean
+        zeros(T, D, tsteps, ntrials),   # filt_mean
+        zeros(T, D, tsteps, ntrials),   # smooth_mean
+        zeros(T, D, tsteps, ntrials),   # Bu
+        zeros(T, D, tsteps, ntrials),   # CiRY
+        zeros(T, p, tsteps, ntrials),   # y_minus_d
     )
 end
