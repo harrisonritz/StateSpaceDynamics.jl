@@ -169,3 +169,28 @@ function Base.setindex!(
     return (f.FilterSmooths[i] = value)
 end
 Base.length(f::TrialFilterSmooth) = length(f.FilterSmooths)
+
+
+mutable struct SufficientStatistics{T<:Real}
+    
+    # initial conditions
+    init_xx::Base.RefValue{PDMat{T,Matrix{T}}}
+    init_xy::Matrix{T}
+    init_yy::Base.RefValue{PDMat{T,Matrix{T}}}
+
+    # transitions model
+    dyn_xx::Base.RefValue{PDMat{T,Matrix{T}}}
+    dyn_xy::Matrix{T}
+    dyn_yy::Base.RefValue{PDMat{T,Matrix{T}}}
+    dyn_uu::Base.RefValue{PDMat{T,Matrix{T}}}
+
+    # observation model
+    obs_xx::Base.RefValue{PDMat{T,Matrix{T}}}
+    obs_xy::Matrix{T}
+    obs_yy::Base.RefValue{PDMat{T,Matrix{T}}}
+    obs_dd::Base.RefValue{PDMat{T,Matrix{T}}}
+    obs_dy::Matrix{T}
+
+end
+
+
