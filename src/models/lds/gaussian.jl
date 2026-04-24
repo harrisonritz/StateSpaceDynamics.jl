@@ -1292,19 +1292,60 @@ function fit!(
     y::AbstractArray{T,3};
     max_iter::Int=100,
     tol::Float64=1e-6,
-    progress=true,
+    progress::Bool=true,
     u=nothing,
     u0=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+    return _fit!(lds, y, max_iter, tol, progress, u, u0, Val(lds.kalman_filter))
+
+end
+
+function _fit!(lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractArray{T,3},
+    max_iter::Int,
+    tol::Float64,
+    progress::Bool,
+    u,
+    u0,
+    ::Val{true},
+    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
+
+    return _fit_kalman!(
+        lds, y;
+        u=u, u0=u0, max_iter=max_iter, tol=tol, progress=progress,
+    )
+
+end
+
+function _fit!(lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractArray{T,3},
+    max_iter::Int,
+    tol::Float64,
+    progress::Bool,
+    u,
+    u0,
+    ::Val{false},
+    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
+    
+    
+    return _fit_tridiag!(
+        lds,y;
+        max_iter=max_iter, tol=tol, progress=progress,
+    )
+
+end
+
+
+function _fit_tridiag!(
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractArray{T,3};
+    max_iter::Int=100,
+    tol::Float64=1e-6,
+    progress::Bool=true
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     if eltype(y) !== T
         error("Observed data must be of type $(T); Got $(eltype(y)))")
-    end
-
-    if lds.kalman_filter
-        return _fit_kalman!(
-            lds, y;
-            u=u, u0=u0, max_iter=max_iter, tol=tol, progress=progress,
-        )
     end
 
     # Initialize log-likelihood
@@ -1373,6 +1414,94 @@ function fit!(
 
     return elbos
 end
+
+
+# function fit!(
+#     lds::LinearDynamicalSystem{T,S,O},
+#     y::AbstractArray{T,3};
+#     max_iter::Int=100,
+#     tol::Float64=1e-6,
+#     progress=true,
+#     u=nothing,
+#     u0=nothing,
+# ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+#     if eltype(y) !== T
+#         error("Observed data must be of type $(T); Got $(eltype(y)))")
+#     end
+
+#     if lds.kalman_filter
+#         return _fit_kalman!(
+#             lds, y;
+#             u=u, u0=u0, max_iter=max_iter, tol=tol, progress=progress,
+#         )
+#     end
+
+#     # Initialize log-likelihood
+#     prev_elbo = -T(Inf)
+
+#     # Create a vector to store the log-likelihood values
+#     elbos = Vector{T}()
+
+#     sizehint!(elbos, max_iter)  # Pre-allocate for efficiency
+#     # Create a FilterSmooth object
+#     tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+
+#     # Create workspace pool (one per thread) - always use allocation-free path
+#     sws_pool = [
+#         SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for
+#         _ in 1:Threads.maxthreadid()
+#     ]
+
+#     # Initialize progress bar only if progress=true
+#     prog = if progress
+#         if O <: GaussianObservationModel
+#             Progress(max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true)
+#         elseif O <: PoissonObservationModel
+#             Progress(
+#                 max_iter;
+#                 desc="Fitting Poisson LDS via LaPlaceEM...",
+#                 barlen=50,
+#                 showspeed=true,
+#             )
+#         else
+#             error("Unknown LDS model type")
+#         end
+#     else
+#         nothing
+#     end
+
+#     # Run EM
+#     for i in 1:max_iter
+#         # E-step and M-step using workspace pool
+#         elbo = estep!(lds, tfs, y, sws_pool)
+#         mstep!(lds, tfs, y, sws_pool[1])
+        
+#         # Update the log-likelihood vector and parameter difference
+#         push!(elbos, elbo)
+
+#         # Update the progress bar only if it exists
+#         if progress && prog !== nothing
+#             next!(prog)
+#         end
+
+#         # Check convergence
+#         if abs(elbo - prev_elbo) < tol
+#             if progress && prog !== nothing
+#                 finish!(prog)
+#             end
+#             return elbos
+#         end
+
+#         prev_elbo = elbo
+#     end
+
+#     # Finish the progress bar if max_iter is reached
+#     if progress && prog !== nothing
+#         finish!(prog)
+#     end
+
+#     return elbos
+# end
 
 #=
 Legacy wrappers for testing purposes only; use workspace-aware versions instead. Eventually remove.
