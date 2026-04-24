@@ -46,17 +46,19 @@ function precompute_kalman_constants!(
     kws.R_PD[]  = tol_PD(lds.obs_model.R;    tol=tol)
     kws.P0_PD[] = tol_PD(lds.state_model.P0; tol=tol)
 
-    # CiR = C' * R^{-1}  (D × p).  R_PD \ C solves R * X = C via cached Cholesky.
-    RinvC = kws.R_PD[] \ C               # p × D
-    copyto!(kws.CiR, RinvC')             # D × p
-
-    # CiRC = CiR * C  (D × D, symmetric)
-    # mul!(kws.CiRC, kws.CiR, C)
-    # Symmetrize!(kws.CiRC)
+    kws.CiR = C'/kws.R_PD[]
     kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
     return nothing
 end
+
+
+
+
+
+
+
+
 
 """
     covariance_forward_backward!(kws::KalmanWorkspace, lds; tol=1e-6)
@@ -129,7 +131,7 @@ function covariance_forward_backward!(
         # filt_cov[t] = inv(pred_icov[t] + CiRC) ---------
         # S.est.filt_cov[tt] = inv(S.mdl.CiRC + S.est.pred_icov[tt]);
         tmp1 .= pit + CiRC[]
-        kws.filt_cov[t] = inv(tmp1)  # tmp1 corrupted
+        kws.filt_cov[t] = inv(PDMat(tmp1))  # tmp1 corrupted
 
         # Symmetrize!(tmp1)
         # kws.filt_cov[t] = inv(tol_PD(Symmetric(tmp1); tol=tol))  # tmp1 corrupted
@@ -735,6 +737,14 @@ function mstep!(
 
     return nothing
 end
+
+
+
+
+
+
+
+
 
 """
     _fit_kalman!(lds, y; u, u0, max_iter, tol, progress)

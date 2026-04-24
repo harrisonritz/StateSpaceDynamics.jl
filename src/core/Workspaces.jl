@@ -800,6 +800,7 @@ struct KalmanWorkspace{T<:Real}
     # Pre-allocated scratch buffers for covariance_forward_backward! (no per-step allocs)
     cov_tmp1::Matrix{T}   # (D, D)
     cov_tmp2::Matrix{T}   # (D, D)
+    pd_tmp::Base.RefValue{PDMat{T,Matrix{T}}} #(D, D)
 
     # Per-trial D-vector scratch for _filter_mean_trial! (column n used by trial n)
     mean_tmp::Matrix{T}   # (D, ntrials)
@@ -871,6 +872,7 @@ function KalmanWorkspace(
         G,
         zeros(T, D, D),       # cov_tmp1
         zeros(T, D, D),       # cov_tmp2
+        Ref(placeholder_D),   # pd_tmp
         zeros(T, D, ntrials), # mean_tmp
         p_smooth_shared,
         p_smooth_tt1_shared,
