@@ -85,40 +85,21 @@ function Base.show(io::IO, fb::ForwardBackward; gap="")
     return nothing
 end
 
-""""
+"""
     FilterSmooth{T<:Real}
 
-A mutable structure for storing smoothed estimates and associated covariance matrices in a
-filtering or smoothing algorithm.
-
-# Type Parameters
-- `T<:Real`: The numerical type used for all fields (e.g., `Float64`, `Float32`).
+Per-trial container for smoothed estimates and associated covariance matrices.
+A multi-trial fit holds one of these per trial (see `TrialFilterSmooth`); trial lengths
+may differ.
 
 # Fields
-- `x_smooth::Matrix{T}` The matrix containing smoothed state estimates over time. Each
-    column typically represents the state vector at a given time step.
-
-- `p_smooth::Array{T, 3}` The posterior covariance matrices with dimensions
-    (latent_dim, latent_dim, time_steps)
-
-- `E_z::Array{T, 3}` The expected latent states, size (state_dim, T, n_trials).
-
-- `E_zz::Array{T, 4}` The expected value of z_t * z_t', size
-    (state_dim, state_dim, T, n_trials).
-
-- `E_zz_prev::Array{T, 4}` The expected value of z_t * z_{t-1}', size
-    (state_dim, state_dim, T, n_trials).
-
-# Example
-```julia
-# Initialize a FilterSmooth object with Float64 type
-filter = FilterSmooth{Float64}(
-    x_smooth = zeros(10, 100),
-    p_smooth = zeros(10, 10, 100),
-    E_z = zeros(10, 100, 5),
-    E_zz = zeros(10, 10, 100, 5),
-    E_zz_prev = zeros(10, 10, 100, 5)
-)
+- `x_smooth::Matrix{T}`: smoothed state estimates `(latent_dim × T_trial)`
+- `p_smooth::Array{T,3}`: smoothed covariances `(latent_dim × latent_dim × T_trial)`
+- `p_smooth_tt1::Array{T,3}`: lag-1 cross covariances `(latent_dim × latent_dim × T_trial)`
+- `E_z::Matrix{T}`: posterior mean `(latent_dim × T_trial)`
+- `E_zz::Array{T,3}`: second moment `E[zₜzₜ']` `(latent_dim × latent_dim × T_trial)`
+- `E_zz_prev::Array{T,3}`: second moment `E[zₜzₜ₋₁']` `(latent_dim × latent_dim × T_trial)`
+- `entropy::T`: posterior entropy `H[q(x)]` for this trial
 """
 mutable struct FilterSmooth{T<:Real}
     x_smooth::Matrix{T}

@@ -381,9 +381,11 @@ end
 """
     Hessian!(sws, lds, y, x)
 
-Construct the Hessian matrix of the log-likelihood of the LDS model given a set of
-observations. In-place Hessian using pre-computed block templates from `SmoothWorkspace`.
-Avoids all Cholesky and matrix solve allocations by using cached terms.
+Fill `sws.btd.H_diag`, `H_sub`, `H_super` with the log-likelihood Hessian blocks for
+the active trial (length derived from `size(y, 2)`). Returns nothing — the sparse form
+is **not** built here because the Newton solver consumes blocks directly.
+Workspace buffers may be sized for a longer trial; only the first `tsteps` blocks are
+written, which keeps this hot path safe for ragged-length fitting.
 """
 function Hessian!(
     sws::SmoothWorkspace{T},
@@ -394,23 +396,18 @@ function Hessian!(
     tsteps = size(y, 2)
     btd = sws.btd
 
-    # Fill blocks from pre-computed templates (no computation needed)
     for i in 1:(tsteps - 1)
         copyto!(btd.H_sub[i], sws.H_sub_entry)
         copyto!(btd.H_super[i], sws.H_super_entry)
     end
 
-    # Main diagonal from cached templates
     btd.H_diag[1] .= sws.yt_given_xt .+ sws.xt1_given_xt .+ sws.x_t
     for i in 2:(tsteps - 1)
         btd.H_diag[i] .= sws.yt_given_xt .+ sws.xt_given_xt_1 .+ sws.xt1_given_xt
     end
     btd.H_diag[tsteps] .= sws.yt_given_xt .+ sws.xt_given_xt_1
 
-    # Update sparse matrix in-place
-    block_tridgm!(btd)
-
-    return btd.H_sparse
+    return nothing
 end
 
 """
@@ -1440,7 +1437,9 @@ function Hessian(
     tsteps = size(y, 2)
     ws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
     compute_smooth_constants!(ws, lds)
-    return copy(Hessian!(ws, lds, y, x))
+    Hessian!(ws, lds, y, x)
+    block_tridgm!(ws.btd)
+    return copy(ws.btd.H_sparse)
 end
 
 function Hessian(
@@ -1450,7 +1449,9 @@ function Hessian(
     x::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     compute_smooth_constants!(ws, lds)
-    return copy(Hessian!(ws, lds, y, x))
+    Hessian!(ws, lds, y, x)
+    block_tridgm!(ws.btd)
+    return copy(ws.btd.H_sparse)
 end
 
 function mstep!(
