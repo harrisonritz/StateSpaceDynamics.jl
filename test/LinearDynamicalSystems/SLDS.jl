@@ -757,7 +757,7 @@ function test_SLDS_estep_basic()
     z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
 
     # Initialize structures
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
@@ -812,7 +812,7 @@ function test_SLDS_mstep_updates_parameters()
     z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
 
     # Initialize structures
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
@@ -927,7 +927,7 @@ function test_SLDS_estep_elbo_components()
 
     z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
 
@@ -1314,7 +1314,7 @@ function test_SLDS_estep_basic_poisson()
     latent_dim = slds.LDSs[1].latent_dim
 
     # Initialize structures
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
@@ -1357,7 +1357,7 @@ function test_SLDS_mstep_updates_parameters_poisson()
     latent_dim = slds.LDSs[1].latent_dim
 
     # Initialize and run E-step
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
     fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)

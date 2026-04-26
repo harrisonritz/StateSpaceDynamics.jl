@@ -9,29 +9,36 @@ function _extract_state_params(state_model::GaussianStateModel{T}) where {T}
 end
 
 """
-    initialize_FilterSmooth(model, num_obs) 
-   
-Initialize a `FilterSmooth` object for a given linear dynamical system model and number of observations.
+    initialize_FilterSmooth(model, tsteps::Int)
+
+Initialize a per-trial `FilterSmooth` buffer sized for `tsteps` timesteps.
 """
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O}, num_obs::Int
+    model::LinearDynamicalSystem{T,S,O}, tsteps::Int
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    num_states = model.latent_dim
+    D = model.latent_dim
     return FilterSmooth{T}(
-        zeros(T, num_states, num_obs),                    # x_smooth
-        zeros(T, num_states, num_states, num_obs),        # p_smooth  
-        zeros(T, num_states, num_states, num_obs),        # p_smooth_tt1
-        zeros(T, num_states, num_obs),                    # E_z
-        zeros(T, num_states, num_states, num_obs),        # E_zz
-        zeros(T, num_states, num_states, num_obs),        # E_zz_prev
-        zero(T),                                           # entropy
+        zeros(T, D, tsteps),                              # x_smooth
+        zeros(T, D, D, tsteps),                           # p_smooth
+        zeros(T, D, D, tsteps),                           # p_smooth_tt1
+        zeros(T, D, tsteps),                              # E_z
+        zeros(T, D, D, tsteps),                           # E_zz
+        zeros(T, D, D, tsteps),                           # E_zz_prev
+        zero(T),                                          # entropy
     )
 end
 
+"""
+    initialize_FilterSmooth(model, tsteps_per_trial::AbstractVector{<:Integer})
+
+Initialize a `TrialFilterSmooth` with one `FilterSmooth` per trial. Trial lengths may
+differ.
+"""
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O}, tsteps::Int, ntrials::Int
+    model::LinearDynamicalSystem{T,S,O},
+    tsteps_per_trial::AbstractVector{<:Integer},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    filter_smooths = [initialize_FilterSmooth(model, tsteps) for _ in 1:ntrials]
+    filter_smooths = [initialize_FilterSmooth(model, Int(t)) for t in tsteps_per_trial]
     return TrialFilterSmooth(filter_smooths)
 end
 
@@ -111,39 +118,56 @@ function _sample_trial!(
     end
 end
 
-function Random.rand(
-    rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}; tsteps::Int, ntrials::Int=1
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+"""
+    Random.rand([rng,] lds, tsteps::Integer)
+    Random.rand([rng,] lds, tsteps_per_trial::AbstractVector{<:Integer})
 
-    # Extract parameters once using a more systematic approach
+Sample from a Linear Dynamical System.
+
+- With a scalar `tsteps`, returns one trial as `(x::Matrix, y::Matrix)` of sizes
+  `(latent_dim, tsteps)` and `(obs_dim, tsteps)` respectively.
+- With a vector of per-trial lengths, returns
+  `(x::Vector{Matrix}, y::Vector{Matrix})`. Lengths may differ across trials.
+"""
+function Random.rand(
+    rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     state_params = _extract_state_params(lds.state_model)
     obs_params = _extract_obs_params(lds.obs_model)
 
-    # Pre-allocate based on observation model type
-    x = Array{T,3}(undef, lds.latent_dim, tsteps, ntrials)
-    y = Array{T,3}(undef, lds.obs_dim, tsteps, ntrials)
+    x = Matrix{T}(undef, lds.latent_dim, Int(tsteps))
+    y = Matrix{T}(undef, lds.obs_dim, Int(tsteps))
+    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model)
+    return x, y
+end
 
-    # Sample trials (potentially in parallel for large ntrials)
-    if ntrials > 10  # Threshold for parallelization
+function Random.rand(
+    rng::AbstractRNG,
+    lds::LinearDynamicalSystem{T,S,O},
+    tsteps_per_trial::AbstractVector{<:Integer},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    state_params = _extract_state_params(lds.state_model)
+    obs_params = _extract_obs_params(lds.obs_model)
+
+    ntrials = length(tsteps_per_trial)
+    x = Vector{Matrix{T}}(undef, ntrials)
+    y = Vector{Matrix{T}}(undef, ntrials)
+    for i in 1:ntrials
+        Ti = Int(tsteps_per_trial[i])
+        x[i] = Matrix{T}(undef, lds.latent_dim, Ti)
+        y[i] = Matrix{T}(undef, lds.obs_dim, Ti)
+    end
+
+    if ntrials > 10
         Threads.@threads for trial in 1:ntrials
             _sample_trial!(
-                rng,
-                view(x,:,:,trial),
-                view(y,:,:,trial),
-                state_params,
-                obs_params,
-                lds.obs_model,
+                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model
             )
         end
     else
         for trial in 1:ntrials
             _sample_trial!(
-                rng,
-                view(x,:,:,trial),
-                view(y,:,:,trial),
-                state_params,
-                obs_params,
-                lds.obs_model,
+                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model
             )
         end
     end
@@ -151,14 +175,14 @@ function Random.rand(
     return x, y
 end
 
-"""
-    Random.rand(lds::LinearDynamicalSystem; tsteps::Int, ntrials::Int)
-    Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem; tsteps::Int, ntrials::Int)
+function Random.rand(lds::LinearDynamicalSystem, tsteps::Integer)
+    return rand(Random.default_rng(), lds, tsteps)
+end
 
-Sample from a Linear Dynamical System.
-"""
-function Random.rand(lds::LinearDynamicalSystem; kwargs...)
-    return rand(Random.default_rng(), lds; kwargs...)
+function Random.rand(
+    lds::LinearDynamicalSystem, tsteps_per_trial::AbstractVector{<:Integer}
+)
+    return rand(Random.default_rng(), lds, tsteps_per_trial)
 end
 
 """
@@ -430,25 +454,25 @@ function smooth(lds::LinearDynamicalSystem, y::AbstractMatrix{T}) where {T}
     return fs.x_smooth, fs.p_smooth
 end
 
-function smooth(lds::LinearDynamicalSystem, y::AbstractArray{T,3}) where {T}
-    tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+function smooth(
+    lds::LinearDynamicalSystem, y::AbstractVector{<:AbstractMatrix{T}}
+) where {T}
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    T_max = maximum(tsteps_per_trial)
+    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)
     sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for
+        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for
         _ in 1:Threads.maxthreadid()
     ]
     smooth!(lds, tfs, y, sws_pool)
 
-    D = lds.latent_dim
-    Tt = size(y, 2)
-    N = size(y, 3)
-
-    xs = Array{T,3}(undef, D, Tt, N)
-    Ps = Array{T,4}(undef, D, D, Tt, N)
-
+    N = length(y)
+    xs = Vector{Matrix{T}}(undef, N)
+    Ps = Vector{Array{T,3}}(undef, N)
     for n in 1:N
         fs = tfs.FilterSmooths[n]
-        xs[:, :, n] .= fs.x_smooth
-        Ps[:, :, :, n] .= fs.p_smooth
+        xs[n] = copy(fs.x_smooth)
+        Ps[n] = copy(fs.p_smooth)
     end
     return xs, Ps
 end
@@ -467,59 +491,45 @@ function smooth!(
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
+    n_active = D * tsteps
     btd = sws.btd
 
-    # Pre-compute all constant terms once for this smooth! call
     compute_smooth_constants!(sws, lds)
 
-    # Initialize X₀ from previous E[z] (warm start)
-    copyto!(sws.X₀, 1, fs.E_z, 1, length(sws.X₀))
+    # Workspace buffers may be sized for a longer trial; take active-length views.
+    X0 = view(sws.X₀, 1:n_active)
+    grad_vec = view(sws.grad_vec, 1:n_active)
+    neg_diag_v = view(btd.neg_diag, 1:tsteps)
+    neg_sub_v = view(btd.neg_sub, 1:(tsteps - 1))
+    neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
-    # Compute gradient at X₀ (negated for minimization: we minimize -loglik)
-    x_mat = reshape(sws.X₀, D, tsteps)
+    # Warm-start from previous E[z].
+    copyto!(X0, fs.E_z)
+
+    x_mat = reshape(X0, D, tsteps)
     Gradient!(sws, lds, y, x_mat)
-    # grad_vec = -gradient (for minimization of negative log-likelihood)
-    copyto!(sws.grad_vec, 1, sws.grad_buf, 1, length(sws.grad_vec))
-    sws.grad_vec .*= -one(T)
+    # grad_vec = -gradient (minimize negative log-likelihood)
+    for t in 1:tsteps, i in 1:D
+        sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
+    end
 
-    # Compute Hessian (constant for Gaussian LDS, only depends on parameters)
     Hessian!(sws, lds, y, x_mat)
-    _negate_blocks!(btd)
+    _negate_blocks!(btd, tsteps)
 
-    # Direct Newton step for minimizing f(x) = -loglik(x)
-    # Newton update: x_new = x_old - H_f⁻¹ * ∇f
-    # where H_f = -H_loglik (Hessian of negative loglik), ∇f = -∇loglik
-    #
-    # We have: neg_diag etc = -H_loglik (which is SPD since H_loglik is negative definite)
-    # grad_vec = -Gradient!(sws, ...) = -∇loglik = ∇f
-    #
-    # So we solve: (-H_loglik) * step = ∇f = -∇loglik
-    # => step = (-H_loglik)⁻¹ * (-∇loglik)
-    # => x_new = x_old - step
-
-    # Save x_old in fs.x_smooth before overwriting sws.X₀
+    # Save x_old in fs.x_smooth before we overwrite sws.X₀ with the Newton step.
     fs.x_smooth .= x_mat
 
-    # Solve for Newton step using block tridiagonal structure
-    # sws.X₀ will be overwritten with the step
-    block_tridiagonal_solve!(
-        sws.X₀, btd.neg_sub, btd.neg_diag, btd.neg_super, sws.grad_vec, btd
-    )
+    block_tridiagonal_solve!(X0, neg_sub_v, neg_diag_v, neg_super_v, grad_vec, btd)
 
-    # x_new = x_old - step
-    step_mat = reshape(sws.X₀, D, tsteps)
+    step_mat = reshape(X0, D, tsteps)
     fs.x_smooth .-= step_mat
 
-    # Get the second moments using the block structure
-    # The Hessian blocks are already in btd.neg_* (as -H_loglik = precision matrix)
     logdet_precision = block_tridiagonal_inverse_logdet!(
-        fs.p_smooth, fs.p_smooth_tt1, btd.neg_sub, btd.neg_diag, btd.neg_super, btd
+        fs.p_smooth, fs.p_smooth_tt1, neg_sub_v, neg_diag_v, neg_super_v, btd
     )
-    # Compute entropy from logdet
-    n = D * tsteps
-    fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n)
 
-    # Symmetrize covariances
+    fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
+
     @views for i in 1:tsteps
         Symmetrize!(fs.p_smooth[:, :, i])
     end
@@ -528,34 +538,44 @@ function smooth!(
 end
 
 """
-    smooth!(lds, tfs, y::AbstractArray{T,3}, sws_pool::Vector{SmoothWorkspace{T}})
+    smooth!(lds, tfs, y::AbstractVector{<:AbstractMatrix}, sws_pool)
 
-Low-allocation smoothing for multiple trials using `SmoothWorkspace` pool.
-Each thread uses its own workspace to avoid contention.
+Low-allocation multi-trial smoothing. Each task in `sws_pool` owns one workspace;
+trials are partitioned across tasks via `@spawn` / `fetch` (see
+https://julialang.org/blog/2023/07/PSA-dont-use-threadid/).
 
 # Arguments
-- `lds::LinearDynamicalSystem`: The model.
-- `tfs::TrialFilterSmooth`: Preallocated container (one per trial).
-- `y::Array{T,3}`: Observations (obs_dim × tsteps × ntrials).
-- `sws_pool::Vector{SmoothWorkspace{T}}`: Pool of workspaces (one per thread).
-
-# Returns
-- `tfs`: The same `TrialFilterSmooth`, populated.
+- `lds::LinearDynamicalSystem`
+- `tfs::TrialFilterSmooth`: one `FilterSmooth` per trial, sized at each trial's length
+- `y::AbstractVector{<:AbstractMatrix}`: one `obs_dim × T_i` matrix per trial
+- `sws_pool::Vector{SmoothWorkspace{T}}`: task-local workspaces, each sized at
+  `max(T_i)`
 """
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    ntrials = size(y, 3)
+    ntrials = length(y)
 
     if ntrials == 1
-        @views smooth!(lds, tfs[1], y[:, :, 1], sws_pool[1])
-    else
-        @views @threads for trial in 1:ntrials
-            sws = sws_pool[Threads.threadid()]
-            smooth!(lds, tfs[trial], y[:, :, trial], sws)
+        smooth!(lds, tfs[1], y[1], sws_pool[1])
+        return tfs
+    end
+
+    ntasks = min(ntrials, length(sws_pool))
+    chunksize = cld(ntrials, ntasks)
+
+    @sync for i in 1:ntasks
+        lo = (i - 1) * chunksize + 1
+        hi = min(i * chunksize, ntrials)
+        lo > hi && continue
+        @spawn begin
+            sws = sws_pool[i]
+            for trial in lo:hi
+                smooth!(lds, tfs[trial], y[trial], sws)
+            end
         end
     end
 
@@ -782,41 +802,35 @@ Note: For single-trial case only. Multi-trial threading would require workspace 
 function calculate_elbo(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    ntrials = size(y, 3)
+    ntrials = length(y)
 
     total_entropy = zero(T)
     for fs in tfs.FilterSmooths
         total_entropy += fs.entropy
     end
 
-    # number of concurrent tasks we will spawn
     ntasks = min(ntrials, length(sws_pool))
     partial = zeros(T, ntasks)
-
-    # simple contiguous partitioning (stable “task id” = i)
     chunksize = cld(ntrials, ntasks)
 
     @sync for i in 1:ntasks
-        lo = (i-1)*chunksize + 1
-        hi = min(i*chunksize, ntrials)
+        lo = (i - 1) * chunksize + 1
+        hi = min(i * chunksize, ntrials)
         lo > hi && continue
 
         @spawn begin
             sws = sws_pool[i]
             acc = zero(T)
-
             for trial in lo:hi
                 fs = tfs[trial]
                 compute_smooth_constants!(sws, lds)
-
                 acc +=
                     Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
-                    Q_obs!(sws, lds, fs.E_z, fs.E_zz, view(y,:,:,trial))
+                    Q_obs!(sws, lds, fs.E_z, fs.E_zz, y[trial])
             end
-
             partial[i] = acc
         end
     end
@@ -897,7 +911,7 @@ Uses `SmoothWorkspace` pool for low-allocation smoothing.
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     smooth!(lds, tfs, y, sws_pool)
@@ -947,7 +961,7 @@ Uses `SmoothWorkspace` buffers for low-allocation parameter updates.
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
@@ -1138,29 +1152,22 @@ function update_Q!(
 end
 
 """
-    update_C_d!(
-        lds::LinearDynamicalSystem{T,S,O},
-        tfs::TrialFilterSmooth{T},
-        y::AbstractArray{T,3},
-        sws::SmoothWorkspace{T},
-        w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing
-    )
+    update_C_d!(lds, tfs, y, sws, w=nothing)
 
-Update the observation matrix C and bias d of the Linear Dynamical System.
+Update the observation matrix `C` and bias `d`. Expects `y` as a vector of per-trial
+observation matrices (each `obs_dim × T_i`); trial lengths may differ.
 """
 function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
 
     ntrials = length(tfs)
-    tsteps = size(y, 2)
     D = lds.latent_dim
-    p = lds.obs_dim
 
     Syz = sws.Syz
     Szz = sws.Szz_Cd
@@ -1174,13 +1181,15 @@ function update_C_d!(
 
     for trial in 1:ntrials
         fs = tfs[trial]
+        y_trial = y[trial]
+        tsteps = size(y_trial, 2)
         weights = isnothing(w) ? nothing : w[trial]
         @views for t in 1:tsteps
             wt = isnothing(weights) ? one(T) : weights[t]
 
             μ = fs.E_z[:, t]
             Σ = fs.E_zz[:, :, t]
-            yt = y[:, t, trial]
+            yt = y_trial[:, t]
 
             fill!(work_yz, zero(T))
             BLAS.ger!(wt, yt, μ, work_yz)
@@ -1197,10 +1206,10 @@ function update_C_d!(
     end
 
     F = factorize(Szz)
-    ldiv!(transpose(CD), F, transpose(Syz)) # CD' = Szz \ Syz'
+    ldiv!(transpose(CD), F, transpose(Syz))
 
     copyto!(lds.obs_model.C, view(CD, :, 1:D))
-    copyto!(lds.obs_model.d, view(CD, :, D+1))
+    copyto!(lds.obs_model.d, view(CD, :, D + 1))
 
     return nothing
 end
@@ -1208,14 +1217,13 @@ end
 function update_R!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[6] || return nothing
 
     obs_dim = lds.obs_dim
-    tsteps = size(y, 2)
     ntrials = length(tfs)
 
     R_new = sws.R_sum
@@ -1233,13 +1241,15 @@ function update_R!(
 
     for trial in 1:ntrials
         fs = tfs[trial]
+        y_trial = y[trial]
+        tsteps = size(y_trial, 2)
         weights = isnothing(w) ? nothing : w[trial]
 
         @views for t in 1:tsteps
             wt = isnothing(weights) ? one(T) : weights[t]
 
             mul!(Czt, C, fs.E_z[:, t])
-            @. innovation = y[:, t, trial] - (Czt + d)
+            @. innovation = y_trial[:, t] - (Czt + d)
 
             BLAS.ger!(wt, innovation, innovation, R_new)
 
@@ -1266,100 +1276,73 @@ function update_R!(
 end
 
 """
-    fit!(lds, y; max_iter::Int=100, tol::Real=1e-6)
-    where {T<:Real, S<:GaussianStateModel{T}, O<:GaussianObservationModel{T}}
+    fit!(lds, y; max_iter=100, tol=1e-6, progress=true)
 
-Fit a Linear Dynamical System using the Expectation-Maximization (EM) algorithm with Kalman
-smoothing over multiple trials
+Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
 # Arguments
-- `lds::LinearDynamicalSystem{T,S,O}`: The Linear Dynamical System to be fitted.
-- `y::AbstractArray{T,3}`: Observed data, size(obs_dim, T_steps, n_trials)
+- `lds::LinearDynamicalSystem{T,S,O}`: model to fit in place
+- `y`: observations. Two shapes accepted:
+    * `AbstractMatrix{T}` of size `(obs_dim, T)` — single trial
+    * `AbstractVector{<:AbstractMatrix{T}}` — multi-trial, each `(obs_dim, T_i)`,
+      trial lengths may differ
 
-# Keyword Arguments
-- `max_iter::Int=100`: Maximum number of EM iterations.
-- `tol::T=1e-6`: Convergence tolerance for log-likelihood change.
+# Keywords
+- `max_iter::Int=100`: maximum EM iterations
+- `tol::Float64=1e-6`: convergence tolerance on ELBO change
+- `progress::Bool=true`: show progress bar
 
-# Returns
-- `mls::Vector{T}`: Vector of log-likelihood values for each iteration.
-- `param_diff::Vector{T}`: Vector of parameter deltas for each EM iteration.
+Returns a `Vector{T}` of ELBO values, one per iteration.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractArray{T,3};
+    y::AbstractVector{<:AbstractMatrix{T}};
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress=true,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    if eltype(y) !== T
-        error("Observed data must be of type $(T); Got $(eltype(y)))")
-    end
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    T_max = maximum(tsteps_per_trial)
 
-    # Initialize log-likelihood
     prev_elbo = -T(Inf)
-
-    # Create a vector to store the log-likelihood values
     elbos = Vector{T}()
+    sizehint!(elbos, max_iter)
 
-    sizehint!(elbos, max_iter)  # Pre-allocate for efficiency
-    # Create a FilterSmooth object
-    tfs = initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)
 
-    # Create workspace pool (one per thread) - always use allocation-free path
     sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2)) for
+        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for
         _ in 1:Threads.maxthreadid()
     ]
 
-    # Initialize progress bar only if progress=true
-    prog = if progress
-        if O <: GaussianObservationModel
-            Progress(max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true)
-        elseif O <: PoissonObservationModel
-            Progress(
-                max_iter;
-                desc="Fitting Poisson LDS via LaPlaceEM...",
-                barlen=50,
-                showspeed=true,
-            )
-        else
-            error("Unknown LDS model type")
-        end
-    else
-        nothing
-    end
+    prog = progress ? Progress(
+        max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true
+    ) : nothing
 
-    # Run EM
-    for i in 1:max_iter
-        # E-step and M-step using workspace pool
+    for _ in 1:max_iter
         elbo = estep!(lds, tfs, y, sws_pool)
         mstep!(lds, tfs, y, sws_pool[1])
-        
-        # Update the log-likelihood vector and parameter difference
         push!(elbos, elbo)
 
-        # Update the progress bar only if it exists
-        if progress && prog !== nothing
-            next!(prog)
-        end
+        prog !== nothing && next!(prog)
 
-        # Check convergence
         if abs(elbo - prev_elbo) < tol
-            if progress && prog !== nothing
-                finish!(prog)
-            end
+            prog !== nothing && finish!(prog)
             return elbos
         end
-
         prev_elbo = elbo
     end
 
-    # Finish the progress bar if max_iter is reached
-    if progress && prog !== nothing
-        finish!(prog)
-    end
-
+    prog !== nothing && finish!(prog)
     return elbos
+end
+
+function fit!(
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T};
+    kwargs...,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    return fit!(lds, [y]; kwargs...)
 end
 
 #=
@@ -1395,20 +1378,22 @@ end
 function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2))
+    T_max = maximum(size(yt, 2) for yt in y)
+    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max)
     return update_C_d!(lds, tfs, y, sws, w)
 end
 
 function update_R!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2))
+    T_max = maximum(size(yt, 2) for yt in y)
+    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max)
     return update_R!(lds, tfs, y, sws, w)
 end
 
@@ -1457,29 +1442,33 @@ end
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractArray{T,3},
+    y::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
-    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
+    T_max = maximum(size(yt, 2) for yt in y)
+    sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max)
     return mstep!(lds, tfs, y, sws, w)
 end
 
 function estep!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3}
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
+    T_max = maximum(size(yt, 2) for yt in y)
     npool = Threads.maxthreadid()
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for _ in 1:npool]
     return estep!(lds, tfs, y, sws_pool)
 end
 
 function smooth!(
-    lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, y::AbstractArray{T,3}
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
+    T_max = maximum(size(yt, 2) for yt in y)
     npool = Threads.maxthreadid()
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps) for _ in 1:npool]
+    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for _ in 1:npool]
     return smooth!(lds, tfs, y, sws_pool)
 end
 

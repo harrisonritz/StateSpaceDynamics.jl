@@ -27,13 +27,13 @@ end
     test_gradient_common(lds, x, y)
 
 Test that analytical gradient matches numerical gradient for any LDS type.
-Works for both GaussianLDS and PoissonLDS.
+`x`, `y` are vectors of per-trial matrices.
 """
 function test_gradient_common(lds, x, y)
-    for i in axes(y, 3)
-        f = latents -> sum(StateSpaceDynamics.loglikelihood(latents, lds, y[:, :, i]))
-        grad_numerical = ForwardDiff.gradient(f, x[:, :, i])
-        grad_analytical = StateSpaceDynamics.Gradient(lds, y[:, :, i], x[:, :, i])
+    for i in eachindex(y)
+        f = latents -> sum(StateSpaceDynamics.loglikelihood(latents, lds, y[i]))
+        grad_numerical = ForwardDiff.gradient(f, x[i])
+        grad_analytical = StateSpaceDynamics.Gradient(lds, y[i], x[i])
         @test norm(grad_numerical - grad_analytical) < 1e-8
     end
 end
@@ -42,7 +42,6 @@ end
     test_hessian_common(lds, x, y)
 
 Test that analytical Hessian matches numerical Hessian for any LDS type.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_hessian_common(lds, x, y)
     function log_likelihood(x::AbstractArray, lds, y::AbstractArray)
@@ -52,11 +51,10 @@ function test_hessian_common(lds, x, y)
     tsteps_test = 3
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps_test)
 
-    for i in axes(y, 3)
-        yi = y[:, 1:tsteps_test, i]
-        xi = x[:, 1:tsteps_test, i]
+    for i in eachindex(y)
+        yi = y[i][:, 1:tsteps_test]
+        xi = x[i][:, 1:tsteps_test]
 
-        # Fill Hessian blocks via workspace
         if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
             StateSpaceDynamics.compute_smooth_constants!(ws, lds)
             StateSpaceDynamics.Hessian!(ws, lds, yi, xi)
@@ -69,7 +67,6 @@ function test_hessian_common(lds, x, y)
         @test length(btd.H_super) == tsteps_test - 1
         @test length(btd.H_sub) == tsteps_test - 1
 
-        # Assemble for numerical comparison
         hess = block_tridgm(btd.H_diag, btd.H_super, btd.H_sub)
         obj = latents -> log_likelihood(latents, lds, yi)
         hess_numerical = ForwardDiff.hessian(obj, xi)
@@ -81,15 +78,13 @@ end
     test_smooth_common(lds, x, y)
 
 Test smoothing produces correct dimensions and gradients are near zero at the mode.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_smooth_common(lds, x, y)
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     StateSpaceDynamics.smooth!(lds, tfs, y)
 
-    n_trials = size(y, 3)
-    n_tsteps = size(y, 2)
-
+    n_tsteps = size(y[1], 2)
     x_smooth = tfs[1].x_smooth
     p_smooth = tfs[1].p_smooth
     p_smooth_tt1 = tfs[1].p_smooth_tt1
@@ -98,11 +93,10 @@ function test_smooth_common(lds, x, y)
     @test size(p_smooth) == (lds.latent_dim, lds.latent_dim, n_tsteps)
     @test size(p_smooth_tt1) == (lds.latent_dim, lds.latent_dim, n_tsteps)
 
-    # Test that gradient is near zero at the smoothed estimate
-    for i in axes(y, 3)
-        f = latents -> sum(StateSpaceDynamics.loglikelihood(latents, lds, y[:, :, i]))
-        grad_numerical = ForwardDiff.gradient(f, x_smooth[:, :, i])
-        grad_analytical = StateSpaceDynamics.Gradient(lds, y[:, :, i], x_smooth[:, :, i])
+    for i in eachindex(y)
+        f = latents -> sum(StateSpaceDynamics.loglikelihood(latents, lds, y[i]))
+        grad_numerical = ForwardDiff.gradient(f, tfs[i].x_smooth)
+        grad_analytical = StateSpaceDynamics.Gradient(lds, y[i], tfs[i].x_smooth)
         @test norm(grad_numerical - grad_analytical) < 1e-7
     end
 end
@@ -111,14 +105,13 @@ end
     test_estep_common(lds, x, y)
 
 Test E-step produces correct dimensions and valid marginal likelihood.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_estep_common(lds, x, y)
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
 
-    n_trials = size(y, 3)
-    n_tsteps = size(y, 2)
+    n_tsteps = size(y[1], 2)
 
     E_z, E_zz, E_zz_prev = tfs[1].E_z, tfs[1].E_zz, tfs[1].E_zz_prev
     x_smooth, p_smooth = tfs[1].x_smooth, tfs[1].p_smooth
@@ -135,18 +128,17 @@ end
     test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
 
 Test that initial state parameters (x0, P0) are updated correctly via M-step.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     lds, x, y = toy_fn(ntrials, [true, true, false, false, false, false])
-    tsteps = size(y, 2)
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tsteps = tsteps_per_trial[1]
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps, size(y, 3))
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     StateSpaceDynamics.estep!(lds, tfs, y)
 
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
 
-    # Save original parameters
     x0_orig = copy(lds.state_model.x0)
     P0_orig = copy(lds.state_model.P0)
 
@@ -171,7 +163,6 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     ).minimizer
     P0_opt = optimize(P0_ -> obj(x0_opt, P0_), P0_sqrt, LBFGS()).minimizer
 
-    # Restore original parameters before M-step
     lds.state_model.x0 .= x0_orig
     lds.state_model.P0 .= P0_orig
 
@@ -185,18 +176,17 @@ end
     test_state_model_parameter_updates_common(toy_fn, ntrials=1)
 
 Test that state model parameters (A, b, Q) are updated correctly via M-step.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     lds, x, y = toy_fn(ntrials, [false, false, true, true, false, false])
-    tsteps = size(y, 2)
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tsteps = tsteps_per_trial[1]
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps, size(y, 3))
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     StateSpaceDynamics.estep!(lds, tfs, y)
 
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
 
-    # Save original parameters
     A_orig = copy(lds.state_model.A)
     b_orig = copy(lds.state_model.b)
     Q_orig = copy(lds.state_model.Q)
@@ -221,7 +211,6 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     AB_opt = optimize(AB -> obj_state(AB, Q_sqrt0), AB0, LBFGS()).minimizer
     Q_opt_sqrt = optimize(Qs -> obj_state(AB_opt, Qs), Q_sqrt0, LBFGS()).minimizer
 
-    # Restore original parameters before M-step
     lds.state_model.A .= A_orig
     lds.state_model.b .= b_orig
     lds.state_model.Q .= Q_orig
@@ -237,12 +226,9 @@ end
     test_em_convergence_common(toy_fn, n_trials=1)
 
 Test that EM algorithm produces monotonically increasing likelihood/ELBO.
-Works for both GaussianLDS and PoissonLDS.
 """
 function test_em_convergence_common(toy_fn, n_trials=1)
     lds, x, y = toy_fn(n_trials)
     objective = fit!(lds, y; max_iter=100)
-    # For GaussianLDS this is marginal likelihood, for PoissonLDS it's ELBO
-    # Both should be monotonically increasing
     @test objective[end] > objective[1]
 end

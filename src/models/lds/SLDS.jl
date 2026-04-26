@@ -994,12 +994,16 @@ function mstep!(
         slds.A[i, :] .= num[i, :] ./ max(denom[i], T(1e-12))
     end
 
+    # Wrap 3D `y` as a vector of per-trial views for the new LDS mstep! API.
+    # (Commit 3 will flip the SLDS public API itself to Vector{Matrix}.)
+    y_per_trial = [view(y, :, :, trial) for trial in 1:ntrials]
+
     weights = Vector{AbstractVector{T}}(undef, ntrials)
     for k in 1:K
         for trial in 1:ntrials
             weights[trial] = view(fb_storages[trial].γ, k, :)
         end
-        mstep!(slds.LDSs[k], tfs, y, sws, weights)
+        mstep!(slds.LDSs[k], tfs, y_per_trial, sws, weights)
     end
 
     return nothing
@@ -1031,7 +1035,7 @@ function fit!(
     obs_dim = slds.LDSs[1].obs_dim
 
     # Continuous-state smoother storage
-    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps, ntrials)
+    tfs = initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
 
     # Discrete-layer wrapper (holds references to slds.A and slds.πₖ)
     dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, tsteps))
