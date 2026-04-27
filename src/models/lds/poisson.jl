@@ -1210,7 +1210,7 @@ function fit!(
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
 
-    tfs = initialize_FilterSmooth(plds, tsteps_per_trial)
+    tfs = initialize_FilterSmooth(plds, tsteps_per_trial)::TrialFilterSmooth{T}
 
     npool = Threads.maxthreadid()
     sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, T_max) for _ in 1:npool]

@@ -443,7 +443,9 @@ Direct smoothing for a single trial.
 - `p_smooth::Array{T,3}`: Smoothed latent covariances (latent_dim × latent_dim × tsteps).
 """
 function smooth(lds::LinearDynamicalSystem, y::AbstractMatrix{T}) where {T}
-    fs = initialize_FilterSmooth(lds, size(y, 2))
+    # Type assertion narrows the union for JET; runtime no-op since dispatch on
+    # `size(y, 2)::Int` already lands in the FilterSmooth-returning method.
+    fs = initialize_FilterSmooth(lds, size(y, 2))::FilterSmooth{T}
     sws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, size(y, 2))
     smooth!(lds, fs, y, sws)
     return fs.x_smooth, fs.p_smooth
@@ -454,7 +456,7 @@ function smooth(
 ) where {T}
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
-    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)
+    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)::TrialFilterSmooth{T}
     sws_pool = [
         SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for
         _ in 1:Threads.maxthreadid()
@@ -1303,7 +1305,7 @@ function fit!(
     elbos = Vector{T}()
     sizehint!(elbos, max_iter)
 
-    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)
+    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)::TrialFilterSmooth{T}
 
     sws_pool = [
         SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for

@@ -808,7 +808,7 @@ end
 
 # Public API wrapper
 function smooth(slds::SLDS, y::AbstractMatrix{T}, w::AbstractMatrix{T}) where {T<:Real}
-    fs = initialize_FilterSmooth(slds.LDSs[1], size(y, 2))
+    fs = initialize_FilterSmooth(slds.LDSs[1], size(y, 2))::FilterSmooth{T}
     smooth!(slds, fs, y, w)
     return fs.x_smooth, fs.p_smooth
 end
@@ -1110,7 +1110,7 @@ function fit!(
     T_max = maximum(tsteps_per_trial)
 
     # Continuous-state smoother storage (per-trial sized).
-    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)
+    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
 
     # Discrete-layer wrapper (logL sized for batched obs_seq).
     dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
