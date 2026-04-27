@@ -1293,11 +1293,12 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    u=nothing,
     u0=nothing,
+    u=nothing,
+    d=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
-    return _fit!(lds, y, max_iter, tol, progress, u, u0, Val(lds.kalman_filter))
+    return _fit!(lds, y, max_iter, tol, progress, u0, u, d, Val(lds.kalman_filter))
 
 end
 
@@ -1306,14 +1307,15 @@ function _fit!(lds::LinearDynamicalSystem{T,S,O},
     max_iter::Int,
     tol::Float64,
     progress::Bool,
-    u,
     u0,
+    u,
+    d,
     ::Val{true},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
 
     return _fit_kalman!(
         lds, y;
-        u=u, u0=u0, max_iter=max_iter, tol=tol, progress=progress,
+        u0=u0, u=u, d=d, max_iter=max_iter, tol=tol, progress=progress,
     )
 
 end
@@ -1323,8 +1325,9 @@ function _fit!(lds::LinearDynamicalSystem{T,S,O},
     max_iter::Int,
     tol::Float64,
     progress::Bool,
-    u,
     u0,
+    u,
+    d,
     ::Val{false},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
     

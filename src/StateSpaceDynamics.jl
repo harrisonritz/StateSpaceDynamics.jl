@@ -59,7 +59,8 @@ export ProbabilisticPCA,
     LinearDynamicalSystem,
     GaussianMixtureModel,
     PoissonMixtureModel,
-    HiddenMarkovModel
+    HiddenMarkovModel,
+    Data
 export RegressionEmission,
     PoissonRegressionEmission,
     AutoRegressionEmission,
