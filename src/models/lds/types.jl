@@ -23,6 +23,7 @@ end
     return (Ψ .+ S) ./ (ν + n + d + one(T))
 end
 
+# TODO: this should use PD Mats
 @inline function iw_logprior_term(Σ::AbstractMatrix{T}, prior::IWPrior{T}) where {T}
     D = size(Σ, 1)
     Ψ, ν = prior.Ψ, prior.ν
@@ -73,6 +74,8 @@ Base.@kwdef mutable struct GaussianStateModel{
     B0::M = zeros(size(A, 1), 1) # default to zero matrix if not supplied
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
+    B0_lambda::Union{Nothing,M} = nothing # optional prior on B0
+    AB_lambda::Union{Nothing,M} = nothing # optional joint prior on A and B
 end
 
 function Base.show(io::IO, gsm::GaussianStateModel; gap="")
@@ -125,6 +128,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     d::Union{Nothing,V}
     D::M = zeros(size(C, 1), 1) # default to zero matrix if not supplied
     R_prior::Union{Nothing,IWPrior{T}} = nothing
+    CD_lambda::Union{Nothing,M} = nothing # optional joint prior on C and D (stacked vertically)
 end
 
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
@@ -146,7 +150,10 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     return nothing
 end
 
-# Convenience constructors
+
+
+
+# Convenience constructors (State)
 function GaussianStateModel(
     A::M, Q::M, b::V, x0::V, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
@@ -160,11 +167,14 @@ function GaussianStateModel(
         B0=zeros(size(A, 1), 1),
         Q_prior=nothing,
         P0_prior=nothing,
+        AB_lambda=nothing,
+        B0_lambda=nothing,
     )
 end
 
+
 function GaussianStateModel(
-    A::M, Q::M, B::M, B0::M, P0::M
+    A::M, Q::M, B::M, B0::M, P0::M,
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianStateModel{T,M,V}(;
         A=A,
@@ -176,22 +186,41 @@ function GaussianStateModel(
         B0=B0,
         Q_prior=nothing,
         P0_prior=nothing,
+        AB_lambda=nothing,
+        B0_lambda=nothing,
     )
 end
 
 
 
+
+# Convenience constructors (Observation)
+
 function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianObservationModel{T,M,V}(; C=C, R=R, d=d, D=zeros(size(C, 1), 1), R_prior=nothing)
+    return GaussianObservationModel{T,M,V}(; 
+    C=C, 
+    R=R, 
+    d=d, 
+    D=zeros(size(C, 1), 1), 
+    R_prior=nothing,
+    CD_lambda=nothing,
+    )
 end
 
 
 function GaussianObservationModel(
     C::M, R::M, D::M,
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianObservationModel{T,M,V}(; C=C, R=R, d=d, D=D, R_prior=nothing)
+    return GaussianObservationModel{T,M,V}(; 
+    C=C, 
+    R=R, 
+    d=d, 
+    D=D, 
+    R_prior=nothing,
+    CD_lambda=nothing,
+    )
 end
 
 

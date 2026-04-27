@@ -27,7 +27,7 @@
 #   trial's view would corrupt all trials.
 # =============================================================================
 
-using BenchmarkTools
+# using BenchmarkTools
 
 
 
@@ -67,7 +67,7 @@ function _fit_kalman!(
     for _ in 1:max_iter
 
         estep!(lds, suf, kws, data)
-        mstep!(lds, suf, kws, data)
+        mstep!(lds, suf, kws)
         elbo = elbo(lds, suf, kws; data)
 
         push!(elbos, elbo)
@@ -139,6 +139,8 @@ function initialize_SufficientStatistics(
 
     latent_dim = model.latent_dim
     obs_dim = model.obs_dim
+    tsteps = size(data.y, 2);
+    ntrials = size(data.y, 3);
     u0_dim = model.init_input_dim
     u_dim = model.state_input_dim
     d_dim = model.obs_input_dim
@@ -150,6 +152,7 @@ function initialize_SufficientStatistics(
     PD_init(T, dim) = PDMat(diagm(ones(T,dim)))
 
     # precompute initial conditions
+    init_n = size(data.u0, 2)
     init_xx = zeros(T, u0_dim, u0_dim);
     mul!(init_xx, data.u0, data.u0', 1.0, 0.0);
     
@@ -171,23 +174,33 @@ function initialize_SufficientStatistics(
 
     
     return SufficientStatistics{T}(
-
         # initial conditions
+        ntrials,                                        # init_n
         Ref(tol_PD(init_xx)),                           # init_xx
         zeros(T, u0_dim, latent_dim),                   # init_xy
         Ref(PD_init(T, latent_dim)),                    # init_yy
 
-        # transitions model
+        # dynamics model
+        (tsteps - 1.0)*ntrials,                         # dyn_n
         Ref(tol_PD(dyn_xx)),                            # dyn_xx
         zeros(T, latent_dim+u_dim, latent_dim),         # dyn_xy
         Ref(PD_init(T, latent_dim)),                    # dyn_yy
         
         # observation model
+        tsteps*ntrials,                                 # obs_n
         Ref(tol_PD(obs_xx)),                            # obs_xx
         obs_xy,                                         # obs_xy
         Ref(tol_PD(obs_yy)),                            # obs_yy
     )
 end
+
+
+
+
+
+# ==== E-STEP =============================================================================
+
+
 
 
 """
@@ -216,6 +229,8 @@ function estep!(
 end
 
 
+
+
 """
     precompute_kalman_constants!(kws::KalmanWorkspace, lds; tol=1e-6)
 
@@ -230,13 +245,50 @@ function precompute_kalman_constants!(
     tol::Real=T(1e-6),
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
-    C = lds.obs_model.C
 
+    kws.P0_PD[] = tol_PD(lds.state_model.P0; tol=tol)
     kws.Q_PD[]  = tol_PD(lds.state_model.Q;  tol=tol)
     kws.R_PD[]  = tol_PD(lds.obs_model.R;    tol=tol)
-    kws.P0_PD[] = tol_PD(lds.state_model.P0; tol=tol)
+
+    if isnothing(lds.state_model.B0_lambda)
+        kws.B0_lambda = nothing
+    else
+        kws.B0_lambda[] = PDMat(lds.state_model.B0_lambda)
+    end
+
+    if isnothing(lds.state_model.AB_lambda)
+        kws.AB_lambda = nothing
+    else
+        kws.AB_lambda[] = PDMat(lds.state_model.AB_lambda)
+    end
+
+    if isnothing(lds.obs_model.CD_lambda)
+        kws.CD_lambda = nothing
+    else
+        kws.CD_lambda[] = PDMat(lds.obs_model.CD_lambda)
+    end
+
+    if isnothing(lds.state_model.P0_prior)
+        kws.P0_mu = nothing
+    else
+        kws.P0_mu[] = PDMat(lds.state_model.P0_prior.Ψ)
+    end
+
+    if isnothing(lds.state_model.Q_prior)
+        kws.Q_mu = nothing
+    else
+        kws.Q_mu[] = PDMat(lds.state_model.Q_prior.Ψ)
+    end
+
+    if isnothing(lds.obs_model.R_prior)
+        kws.R_mu = nothing
+    else
+        kws.R_mu[] = PDMat(lds.obs_model.R_prior.Ψ)
+    end
 
 
+
+    C = lds.obs_model.C
     copyto!(kws.CiR, C'/kws.R_PD[])
     kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
@@ -395,6 +447,7 @@ function backwards_cov!(
     # At = lds.state_model.A'
 
     # smooth covariance ================================
+    kws.smooth_xcov = zeros(T, kws.latent_dim, kws.latent_dim)
     @inbounds @views for tt in eachindex(kws.filt_cov)[end-1:-1:1]
 
         # reverse kalman gain
@@ -407,7 +460,7 @@ function backwards_cov!(
                                      X_A_Xt(kws.filt_cov[tt], I - kws.cov_tmp1));
 
         # smoothed cross-cov
-        # mul!(kws.cov_tmp2, kws.G[:,:,tt], kws.smooth_cov[tt+1], 1.0, 1.0);
+        mul!(kws.smooth_xcov, kws.G[:,:,tt], kws.smooth_cov[tt+1], 1.0, 1.0);
 
     end
 
@@ -516,34 +569,38 @@ end
     ) where {T<:Real}
 
     # initial conditions -------
+    suf.init_n = kws.ntrials
     # init_xx (preset)
     # init_xy
     mul!(suf.init_xy, data.u0, kws.pred_mean[:,1,:]', 1.0, 0.0);
     # init_yy
-    suf.init_yy[] = aggregate_xx(kws.smooth_mean[:,1,:], kws.smooth_cov[1], kws.ntrials);
+    suf.init_yy[] = aggregate_xx(kws.smooth_mean[:,1,:], kws.smooth_cov[1], suf.init_n);
 
 
     # transitions -------
-    x_prev = reshape(kws.smooth_mean[:,1:end-1,:], kws.latent_dim, (kws.tsteps-1) * kws.ntrials)
-    x_next = reshape(kws.smooth_mean[:,2:end,:], kws.latent_dim, (kws.tsteps-1) * kws.ntrials)
-    u_prev = reshape(data.u[:,1:end-1,:], size(data.u, 1), (size(data.u, 2)-1)*size(data.u, 3))
-    #     dyn_xx
+    suf.dyn_n = (kws.tsteps - 1) * kws.ntrials
+    x_prev = reshape(kws.smooth_mean[:,1:end-1,:], kws.latent_dim, suf.dyn_n)
+    x_next = reshape(kws.smooth_mean[:,2:end,:], kws.latent_dim, suf.dyn_n)
+    u_prev = reshape(data.u[:,1:end-1,:], size(data.u, 1), suf.dyn_n)
+    # dyn_xx
     dyn_xx = deepcopy(suf.dyn_xx[].mat);
     dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
     mul!(dyn_xx[1:kws.latent_dim, 1:kws.latent_dim], x_prev, x_prev', 1.0, 1.0)
     mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim+1):end], x_prev, u_prev', 1.0, 0.0)
     mul!(dyn_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], u_prev, x_prev', 1.0, 0.0)
     suf.dyn_xx[] = tol_PD(dyn_xx);
-    #     dyn_xy
+    # dyn_xy
+    suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov[1:end-1] .* kws.ntrials;
     mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 0.0)
-    #     dyn_yy
+    # dyn_yy
     suf.dyn_yy[] = aggregate_xx(x_next, kws.smooth_cov[2:end], kws.ntrials);
 
 
     # observations -------
-    x_cur = reshape(kws.smooth_mean, kws.latent_dim, kws.tsteps * kws.ntrials)
-    y_cur = reshape(data.y, kws.obs_dim, kws.tsteps * kws.ntrials)
-    d_cur = reshape(data.d, kws.obs_input_dim, kws.tsteps * kws.ntrials)
+    suf.obs_n = kws.tsteps * kws.ntrials
+    x_cur = reshape(kws.smooth_mean, kws.latent_dim, suf.obs_n)
+    y_cur = reshape(data.y, kws.obs_dim, suf.obs_n)
+    d_cur = reshape(data.d, kws.obs_input_dim, suf.obs_n)
     # obs_xx
     obs_xx = deepcopy(suf.obs_xx[].mat);
     obs_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov).mat * kws.ntrials;
@@ -553,27 +610,33 @@ end
     suf.obs_xx[] = tol_PD(obs_xx);
     # obs_xy
     mul!(suf.obs_xy[1:kws.latent_dim,:], x_cur, y_cur', 1.0, 0.0)
-    #     obs_yy (preset)
+    # obs_yy (preset)
 
 end
 
 
 
 # ==== M-STEP =============================================================================
-regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, lam::T) where {T<:Real} = PDMat(XX + lam) \ XY
-regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}) where {T<:Real} = XX \ XY
+regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}) where {T<:Real} = (XX + prior_lambda) \ XY
+# regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}) where {T<:Real} = XX \ XY
 
-est_cov(
+function est_cov(
+    W::AbstractMatrix{T},
     XX::PDMat{T,Matrix{T}},
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
-    lam::T,
-    df::T,
-    mu::T,
-) where {T<:Real} 
+    N::T,
+    prior_lambda::PDMat{T,Matrix{T}},
+    prior_df::T,
+    prior_mu::T,
+    )::Matrix{T} where {T<:Real} 
 
+    Wxy = W*XY;
 
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) + (prior_df * prior_mu)) / 
+                ((N + prior_df) - size(XX,1));
 
+    return tol_PD(Cov).mat # make PD, but don't save as PDMat
 end
 
 
@@ -581,56 +644,76 @@ function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     kws::KalmanWorkspace{T},
-    data::Data{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
-    # update initial conditions
     # initials ===============================================
-    # Mean
-    W = (PDMat(suf.init_xx + lds.prior_init) \ suf.init_xy)';
-    B0 = W
+    B0 = regress(
+        suf.init_xx, 
+        suf.init_xy, 
+        kws.B0_lambda[])
 
-    # Covariance
-    Wxy = W*S.est.xy_init;
-    P0e = (S.est.yy_init .- Wxy .- Wxy' .+ X_A_Xt(S.est.xx_init, W) .+ W*S.prm.lam_B0*W' + (S.prm.df_P0 * S.prm.mu_P0)) / 
-            ((S.est.n_init[1] + S.prm.df_P0) - size(S.est.xx_init,1));
+    P0 = est_cov(
+        B0,
+        suf.init_xx,
+        suf.init_xy,
+        suf.init_yy,
+        suf.init_n,
+        kws.B0_lambda[],
+        kws.P0_df,
+        kws.P0_mu[],
+    )
+
+    lds.state_model.B0 = B0
+    lds.state_model.P0 = P0
 
 
-    P0 = format_noise(P0e, S.prm.P0_type);
+    # dynamics ===============================================
+    AB = regress(
+        suf.dyn_xx, 
+        suf.dyn_xy, 
+        kws.AB_lambda[])
 
+    A = AB[:, 1:kws.latent_dim];
+    B = AB[:, (kws.latent_dim+1):end];
+
+    Q = est_cov(
+        AB,
+        suf.dyn_xx,
+        suf.dyn_xy,
+        suf.dyn_yy,
+        suf.dyn_n,
+        kws.AB_lambda[],
+        kws.Q_df,
+        kws.Q_mu[],
+    )
+
+    lds.state_model.A = A
+    lds.state_model.B = B
+    lds.state_model.Q = Q
+
+
+    # observations ===============================================
+    CD = regress(
+        suf.obs_xx, 
+        suf.obs_xy, 
+        kws.CD_lambda[])
     
+    C = CD[:, 1:kws.latent_dim];
+    D = CD[:, (kws.latent_dim+1):end];
 
+    R = est_cov(
+        CD,
+        suf.obs_xx,
+        suf.obs_xy,
+        suf.obs_yy,
+        suf.obs_n,
+        kws.CD_lambda[],
+        kws.R_df,
+        kws.R_mu[],
+    )
 
-    # latents ===============================================
-    # Mean
-    W = ((S.est.xx_dyn_PD[1] + S.prm.lam_AB) \ S.est.xy_dyn)';
-    A = W[:, 1:S.dat.x_dim];
-    B = W[:, (S.dat.x_dim+1):end];
-
-    # Covariance
-    Wxy = W*S.est.xy_dyn;
-    Qe = (S.est.yy_dyn .- Wxy .- Wxy' .+ X_A_Xt(S.est.xx_dyn_PD[1], W) .+ W*S.prm.lam_AB*W' + (S.prm.df_Q * S.prm.mu_Q)) / 
-        ((S.est.n_dyn[1] + S.prm.df_Q) - size(S.est.xx_dyn,1));
-
-    Q = format_noise(Qe, S.prm.Q_type);
-
-
-
-
-    # emissions ===============================================
-    # Mean
-    W = ((S.est.xx_obs_PD[1] + S.prm.lam_C) \ S.est.xy_obs)';
-    C = deepcopy(W);
-
-    # Covariance
-    Wxy = W*S.est.xy_obs;
-    Re = (S.est.yy_obs .- Wxy .- Wxy' .+ X_A_Xt(S.est.xx_obs_PD[1], W) .+ W*S.prm.lam_C*W' + (S.prm.df_R * S.prm.mu_R)) / 
-            ((S.est.n_obs[1] + S.prm.df_R) - size(S.est.xx_obs,1));
-
-    R = format_noise(Re, S.prm.R_type);
-
-
-
-
+    lds.obs_model.C = C
+    lds.obs_model.D = D
+    lds.obs_model.R = R
 
 end

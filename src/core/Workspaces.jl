@@ -797,6 +797,7 @@ struct KalmanWorkspace{T<:Real}
     pred_icov_mat::Array{T,3}   # (D, D, T) — P_pred^{-1} as plain matrices (replaces Vector{PDMat})
     pred_icov::Vector{PDMat{T,Matrix{T}}}
     smooth_cov::Vector{PDMat{T,Matrix{T}}}
+    smooth_xcov::Matrix{T}  # (D, D) - cross-covariance P_smooth[t, t-1]
     G::Array{T,3}  # (D, D, T-1)
 
     # Pre-allocated scratch buffers for covariance_forward_backward! (no per-step allocs)
@@ -815,6 +816,12 @@ struct KalmanWorkspace{T<:Real}
     Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    B0_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
+    P0_mu::Base.RefValue{PDMat{T,Matrix{T}}}
+    AB_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
+    Q_mu::Base.RefValue{PDMat{T,Matrix{T}}}
+    CD_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
+    CD_mu::Base.RefValue{PDMat{T,Matrix{T}}}
     CiR::Matrix{T}                              # C' * R^{-1}   (D × p)
     CiRC::Base.RefValue{PDMat{T,Matrix{T}}}     # C' * R^{-1} * C  (D × D), symmetric
     shared_entropy::Base.RefValue{T}
@@ -848,10 +855,15 @@ function KalmanWorkspace(
     placeholder_D = PDMat(Matrix{T}(I, D, D))
     placeholder_p = PDMat(Matrix{T}(I, p, p))
 
+    placeholder_B0 = PDMat(Matrix{T}(I, init_input_dim, init_input_dim))
+    placeholder_AB = PDMat(Matrix{T}(I, D+state_input_dim, D+state_input_dim))
+    placeholder_CD = PDMat(Matrix{T}(I, D+obs_input_dim, D+obs_input_dim))
+
     pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     filt_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     smooth_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    smooth_xcov = zeros(T, D, D)
     G = zeros(T, D, D, max(tsteps - 1, 0))
 
     # pred_icov_mat[:,:,t] holds P_pred[t]^{-1} as a plain matrix (identity-initialised)
@@ -876,6 +888,7 @@ function KalmanWorkspace(
         pred_icov_mat,                  # Array{T,3} for P_pred[t]^{-1} as plain matrices
         pred_icov,                      # Vector{PDMat} for P_pred[t]^{-1} as PDMats (cached Cholesky factors)
         smooth_cov,                     # Vector{PDMat} for P_smooth[t]
+        smooth_xcov,                    # Matrix{T} for P_smooth[t, t-1]
         G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
         zeros(T, D, D),                 # cov_tmp1
         zeros(T, D, D),                 # cov_tmp2
@@ -886,6 +899,12 @@ function KalmanWorkspace(
         Ref(placeholder_D),             # Q_PD
         Ref(placeholder_D),             # P0_PD
         Ref(placeholder_p),             # R_PD
+        Ref(placeholder_B0),            # B0_lambda
+        Ref(placeholder_D),             # P0_mu 
+        Ref(placeholder_AB),            # AB_lambda
+        Ref(placeholder_D),             # Q_mu
+        Ref(placeholder_CD),            # CD_lambda 
+        Ref(placeholder_p),             # R_mu
         zeros(T, D, p),                 # CiR
         Ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
