@@ -112,7 +112,7 @@ end
 
 function run_benchmark(::pykalman_LDSImplem, model::Any, Y::AbstractArray)
     # No need to run an initial iteration, no JIT
-    Y = Y[:, :, 1]
+    Y = Y[1]
 
     # run benchmark
     np = pyimport("numpy")
@@ -129,7 +129,7 @@ function run_benchmark(::Dynamax_LDSImplem, model::Tuple, Y::AbstractArray)
     np = pyimport("numpy")
     jax = pyimport("jax")
 
-    Y = Y[:, :, 1]
+    Y = Y[1]
     Y_np = np.array(Y).transpose()
 
     (params, props, lds) = model

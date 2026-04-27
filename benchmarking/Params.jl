@@ -62,6 +62,6 @@ end
 function build_data(rng::AbstractRNG, model::LinearDynamicalSystem, instance::LDSInstance)
     (; latent_dim, obs_dim, num_trials, seq_length) = instance
 
-    latents, observations = rand(rng, model; ntrials=num_trials, tsteps=seq_length)
+    latents, observations = rand(rng, model, fill(seq_length, num_trials))
     return latents, observations
 end

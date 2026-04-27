@@ -56,13 +56,13 @@ true_lds = LinearDynamicalSystem(
 );
 
 # Generate data from the reference model
-x_true, y_true = rand(rng, true_lds; tsteps=T, ntrials=1)
+x_true, y_true = rand(rng, true_lds, T)
 
 print("Generated data from reference LDS model
 ")
 print("True latent dynamics eigenvalues: ", round.(eigvals(A_true), digits=3), "
 ")
-print("Data variance explained by each latent dim: ", round.(var(x_true[:,:,1], dims=2)[:], digits=3), "
+print("Data variance explained by each latent dim: ", round.(var(x_true, dims=2)[:], digits=3), "
 ")
 
 # ## Non-Identifiability: Similarity (Rotation) Invariance
@@ -120,9 +120,8 @@ end
 rotated_models = [rotate_lds(true_lds, R) for R in rotations]
 
 # Compute likelihoods: should match (up to numerical tolerance)
-y_data = reshape(y_true, D, T, 1)
-x_smooth_orig, _ = smooth(true_lds, y_data)
-ll_orig = loglikelihood(x_smooth_orig[:,:,1], true_lds, y_true[:,:,1])
+x_smooth_orig, _ = smooth(true_lds, y_true)
+ll_orig = loglikelihood(x_smooth_orig, true_lds, y_true)
 
 print("
 " * "="^60 * "
@@ -135,8 +134,8 @@ print("="^60 * "
 ", sum(ll_orig))
 
 for (name, R, model) in zip(rot_names, rotations, rotated_models)
-    x_s_rot, _ = smooth(model, y_data)
-    ll_rot = loglikelihood(x_s_rot[:,:,1], model, y_true[:,:,1])
+    x_s_rot, _ = smooth(model, y_true)
+    ll_rot = loglikelihood(x_s_rot, model, y_true)
     @printf("%-24s  LL: %.6f  ΔLL: %.3e  cond(R): %-8.2f  orth? %s
 ",
             name, sum(ll_rot), sum(abs.(ll_rot - ll_orig)), cond(R), isorthogonal(R) ? "yes" : "no")
@@ -169,10 +168,10 @@ end
 # Choose R3 for demonstration (random orthogonal)
 R_idx = 3
 m_rot = rotated_models[R_idx]
-x_rot, _ = smooth(m_rot, y_data)
+x_rot, _ = smooth(m_rot, y_true)
 
-Rhat = procrustes_R(x_rot[:,:,1], x_smooth_orig[:,:,1])  # map rotated -> original
-state_align_relerr = norm(Rhat * x_rot[:,:,1] - x_smooth_orig[:,:,1]) / norm(x_smooth_orig[:,:,1])
+Rhat = procrustes_R(x_rot, x_smooth_orig)  # map rotated -> original
+state_align_relerr = norm(Rhat * x_rot - x_smooth_orig) / norm(x_smooth_orig)
 @printf("
 Procrustes state alignment (R%d): rel. error = %.3e
 ", R_idx, state_align_relerr)
@@ -233,18 +232,16 @@ end
 
 # New data from a rotated model and prediction with both models should have identical error.
 
-x_rot_new, y_rot_new = rand(rng, rotated_models[1]; tsteps=100, ntrials=1)
+x_rot_new, y_rot_new = rand(rng, rotated_models[1], 100)
 
-test_data = reshape(y_rot_new, D, 100, 1)
+x_pred_orig, _ = smooth(true_lds, y_rot_new)
+y_pred_orig = true_lds.obs_model.C * x_pred_orig
 
-x_pred_orig, _ = smooth(true_lds, test_data)
-y_pred_orig = true_lds.obs_model.C * x_pred_orig[:, :, 1]
+x_pred_rot, _ = smooth(rotated_models[1], y_rot_new)
+y_pred_rot = rotated_models[1].obs_model.C * x_pred_rot
 
-x_pred_rot, _ = smooth(rotated_models[1], test_data)
-y_pred_rot = rotated_models[1].obs_model.C * x_pred_rot[:, :, 1]
-
-mse_orig = mean((y_rot_new[:, :, 1] - y_pred_orig).^2)
-mse_rot  = mean((y_rot_new[:, :, 1] - y_pred_rot).^2)
+mse_orig = mean((y_rot_new - y_pred_orig).^2)
+mse_rot  = mean((y_rot_new - y_pred_rot).^2)
 @printf("
 Prediction MSE (same test seq): original=%.6f  rotated=%.6f
 ", mse_orig, mse_rot)
@@ -266,11 +263,11 @@ end
 diagnostics = RotDiag[]
 
 for (name, R, model) in zip(rot_names, rotations, rotated_models)
-    x_s, _ = smooth(model, y_data)
-    ll = loglikelihood(x_s[:,:,1], model, y_true[:,:,1])
+    x_s, _ = smooth(model, y_true)
+    ll = loglikelihood(x_s, model, y_true)
     dLL = sum(abs.(ll - ll_orig))
-    Rhat_i = procrustes_R(x_s[:,:,1], x_smooth_orig[:,:,1])
-    relerr = norm(Rhat_i * x_s[:,:,1] - x_smooth_orig[:,:,1]) / max(norm(x_smooth_orig[:,:,1]), eps())
+    Rhat_i = procrustes_R(x_s, x_smooth_orig)
+    relerr = norm(Rhat_i * x_s - x_smooth_orig) / max(norm(x_smooth_orig), eps())
     θ = subspace_angles_deg(C_true, model.obs_model.C)
     push!(diagnostics, RotDiag(name, dLL, cond(R), isorthogonal(R), maximum(θ), relerr))
 end

@@ -24,9 +24,9 @@ function create_test_lds(latent_dim::Int, obs_dim::Int, seq_length::Int)
 
     lds = LinearDynamicalSystem(state_model, obs_model)
 
-    # Generate a random sequence
+    # Generate a random sequence (single trial)
     rng = MersenneTwister(42)
-    x, y = rand(lds; tsteps=seq_length)
+    x, y = rand(lds, seq_length)
 
     return lds, x, y
 end
@@ -56,42 +56,42 @@ println("="^60)
 T = Float64
 latent_dim = 64
 obs_dim = 10
-tsteps = 100
-ntrials = size(y, 3)
+tsteps = size(y, 2)
+
+# Wrap the single-trial Matrix as a 1-element Vector{Matrix} for the multi-trial API.
+y_multi = [y]
 
 # Create the workspace and FilterSmooth objects
-tfs = StateSpaceDynamics.initialize_FilterSmooth(model, tsteps, ntrials)
+tfs = StateSpaceDynamics.initialize_FilterSmooth(model, [tsteps])
 sws_pool = [StateSpaceDynamics.SmoothWorkspace(T, latent_dim, obs_dim, tsteps) for _ in 1:Threads.nthreads()]
 sws = sws_pool[1]
 
 # Profile smooth!
 println("\n[smooth! - single trial]")
 fs = tfs[1]
-y_trial = view(y, :, :, 1)
-result_smooth = @benchmark StateSpaceDynamics.smooth!($model, $fs, $y_trial, $sws)
+result_smooth = @benchmark StateSpaceDynamics.smooth!($model, $fs, $y, $sws)
 display(result_smooth)
 
 # Profile sufficient_statistics!
 println("\n[sufficient_statistics! - single trial]")
-# First run smooth to populate fs
-StateSpaceDynamics.smooth!(model, fs, y_trial, sws)
+StateSpaceDynamics.smooth!(model, fs, y, sws)
 result_ss = @benchmark StateSpaceDynamics.sufficient_statistics!($fs)
 display(result_ss)
 
 # Profile estep!
 println("\n[estep! - full]")
-result_estep = @benchmark StateSpaceDynamics.estep!($model, $tfs, $y, $sws_pool)
+result_estep = @benchmark StateSpaceDynamics.estep!($model, $tfs, $y_multi, $sws_pool)
 display(result_estep)
 
 # Profile mstep!
 println("\n[mstep! - full]")
-StateSpaceDynamics.estep!(model, tfs, y, sws_pool)
-result_mstep = @benchmark StateSpaceDynamics.mstep!($model, $tfs, $y, $sws)
+StateSpaceDynamics.estep!(model, tfs, y_multi, sws_pool)
+result_mstep = @benchmark StateSpaceDynamics.mstep!($model, $tfs, $y_multi, $sws)
 display(result_mstep)
 
 # Profile calculate_elbo
 println("\n[calculate_elbo]")
-result_elbo = @benchmark StateSpaceDynamics.calculate_elbo($model, $tfs, $y, $sws_pool)
+result_elbo = @benchmark StateSpaceDynamics.calculate_elbo($model, $tfs, $y_multi, $sws_pool)
 display(result_elbo)
 
 # Profile Q_state!
