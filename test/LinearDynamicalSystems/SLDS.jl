@@ -212,14 +212,17 @@ function test_SLDS_sampling_gaussian()
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 50, 5
-    z, x, y = rand(s; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(s, fill(tsteps, ntrials))
 
-    @test size(z) == (tsteps, ntrials)
-    @test size(x) == (2, tsteps, ntrials)
-    @test size(y) == (4, tsteps, ntrials)
-    @test all(1 ≤ z[t, n] ≤ K for t in 1:tsteps, n in 1:ntrials)
-    @test all(isfinite, x)
-    @test all(isfinite, y)
+    @test length(z) == ntrials
+    @test length(x) == ntrials
+    @test length(y) == ntrials
+    @test all(length(z[n]) == tsteps for n in 1:ntrials)
+    @test all(size(x[n]) == (2, tsteps) for n in 1:ntrials)
+    @test all(size(y[n]) == (4, tsteps) for n in 1:ntrials)
+    @test all(1 ≤ z[n][t] ≤ K for t in 1:tsteps, n in 1:ntrials)
+    @test all(all(isfinite, xn) for xn in x)
+    @test all(all(isfinite, yn) for yn in y)
 end
 
 function test_SLDS_sampling_poisson()
@@ -228,33 +231,31 @@ function test_SLDS_sampling_poisson()
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 30, 3
-    z, x, y = rand(s; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(s, fill(tsteps, ntrials))
 
-    @test size(z) == (tsteps, ntrials)
-    @test size(x) == (2, tsteps, ntrials)
-    @test size(y) == (3, tsteps, ntrials)
-    @test all(1 ≤ z[t, n] ≤ K for t in 1:tsteps, n in 1:ntrials)
-    @test all(y[i, t, n] ≥ 0 for i in 1:3, t in 1:tsteps, n in 1:ntrials)
-    @test all(y[i, t, n] == round(y[i, t, n]) for i in 1:3, t in 1:tsteps, n in 1:ntrials)
+    @test length(z) == ntrials
+    @test all(length(z[n]) == tsteps for n in 1:ntrials)
+    @test all(size(x[n]) == (2, tsteps) for n in 1:ntrials)
+    @test all(size(y[n]) == (3, tsteps) for n in 1:ntrials)
+    @test all(1 ≤ z[n][t] ≤ K for t in 1:tsteps, n in 1:ntrials)
+    @test all(y[n][i, t] ≥ 0 for i in 1:3, t in 1:tsteps, n in 1:ntrials)
+    @test all(y[n][i, t] == round(y[n][i, t]) for i in 1:3, t in 1:tsteps, n in 1:ntrials)
 end
 
 function test_SLDS_deterministic_transitions()
     K = 2
     lds = _make_gaussian_lds(2, 2)
 
-    # Always transition 1 → 2 → 2 → 2...
     A_det = [0.0 1.0; 0.0 1.0]
-    Z0_det = [1.0, 0.0]  # Always start in state 1
+    Z0_det = [1.0, 0.0]
 
     s = SLDS(; A=A_det, πₖ=Z0_det, LDSs=fill(lds, K))
 
     tsteps = 10
-    z, x, y = rand(s; tsteps=tsteps, ntrials=3)
+    z, x, y = rand(s, fill(tsteps, 3))
 
-    # Should always start in state 1
-    @test all(z[1, n] == 1 for n in 1:3)
-    # Should always be in state 2 after first step
-    @test all(z[t, n] == 2 for t in 2:tsteps, n in 1:3)
+    @test all(z[n][1] == 1 for n in 1:3)
+    @test all(z[n][t] == 2 for t in 2:tsteps, n in 1:3)
 end
 
 function test_SLDS_single_trial()
@@ -263,11 +264,12 @@ function test_SLDS_single_trial()
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps = 100
-    z, x, y = rand(s; tsteps=tsteps, ntrials=1)
+    z, x, y = rand(s, fill(tsteps, 1))
 
-    @test size(z) == (tsteps, 1)
-    @test size(x) == (2, tsteps, 1)
-    @test size(y) == (4, tsteps, 1)
+    @test length(z) == 1
+    @test length(z[1]) == tsteps
+    @test size(x[1]) == (2, tsteps)
+    @test size(y[1]) == (4, tsteps)
 end
 
 function test_SLDS_reproducibility()
@@ -275,16 +277,15 @@ function test_SLDS_reproducibility()
     lds = _make_gaussian_lds(2, 3)
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    # Same seed should give same results
     Random.seed!(42)
-    z1, x1, y1 = rand(s; tsteps=20, ntrials=2)
+    z1, x1, y1 = rand(s, fill(20, 2))
 
     Random.seed!(42)
-    z2, x2, y2 = rand(s; tsteps=20, ntrials=2)
+    z2, x2, y2 = rand(s, fill(20, 2))
 
     @test z1 == z2
-    @test x1 ≈ x2
-    @test y1 ≈ y2
+    @test all(x1[n] ≈ x2[n] for n in eachindex(x1))
+    @test all(y1[n] ≈ y2[n] for n in eachindex(y1))
 end
 
 function test_SLDS_single_state_edge_case()
@@ -294,21 +295,21 @@ function test_SLDS_single_state_edge_case()
 
     @test validate_SLDS(s) === nothing
 
-    z, x, y = rand(s; tsteps=10, ntrials=2)
-    @test all(z .== 1)  # Should always be in state 1
+    z, x, y = rand(s, fill(10, 2))
+    @test all(all(zn .== 1) for zn in z)
 end
 
 function test_SLDS_minimal_dimensions()
     K = 2
-    lds = _make_gaussian_lds(1, 1)  # Minimal dimensions
+    lds = _make_gaussian_lds(1, 1)
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(s; tsteps=10, ntrials=3)
+    z, x, y = rand(s, fill(10, 3))
 
-    @test size(x) == (1, 10, 3)
-    @test size(y) == (1, 10, 3)
-    @test all(isfinite, x)
-    @test all(isfinite, y)
+    @test all(size(x[n]) == (1, 10) for n in 1:3)
+    @test all(size(y[n]) == (1, 10) for n in 1:3)
+    @test all(all(isfinite, xn) for xn in x)
+    @test all(all(isfinite, yn) for yn in y)
 end
 
 function test_valid_SLDS_probability_helper_functions()
@@ -332,14 +333,14 @@ function test_SLDS_gradient_numerical()
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=20, ntrials=1)
+    z, x, y = rand(slds, fill(20, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
-    y_trial = y[:, :, 1]
-    x_trial = x[:, :, 1]
+    y_trial = y[1]
+    x_trial = x[1]
 
     # Analytical gradient
     grad_analytical = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w)
@@ -400,13 +401,13 @@ function test_SLDS_hessian_numerical()
     lds = _make_gaussian_lds(2, 2)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    _, x, y = rand(slds; tsteps=5, ntrials=1)
-    tsteps = size(y, 2)
+    _, x, y = rand(slds, fill(5, 1))
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps);
     w ./= sum(w; dims=1)
 
-    y_trial = y[:, :, 1]
-    x_trial = x[:, :, 1]
+    y_trial = y[1]
+    x_trial = x[1]
 
     H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
 
@@ -454,9 +455,9 @@ function test_SLDS_gradient_reduces_to_single_LDS()
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=20, ntrials=1)
+    z, x, y = rand(slds, fill(20, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
 
     # Test each discrete state in isolation
     for active_k in 1:K
@@ -464,8 +465,8 @@ function test_SLDS_gradient_reduces_to_single_LDS()
         w = zeros(K, tsteps)
         w[active_k, :] .= 1.0
 
-        grad_slds = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w)
-        grad_lds = StateSpaceDynamics.Gradient(slds.LDSs[active_k], y[:, :, 1], x[:, :, 1])
+        grad_slds = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
+        grad_lds = StateSpaceDynamics.Gradient(slds.LDSs[active_k], y[1], x[1])
 
         @test isapprox(grad_slds, grad_lds, rtol=1e-10)
     end
@@ -476,12 +477,12 @@ function test_SLDS_hessian_block_structure_gaussian()
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    _, x, y = rand(slds; tsteps=10, ntrials=1)
-    tsteps = size(y, 2)
+    _, x, y = rand(slds, fill(10, 1))
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps);
     w ./= sum(w; dims=1)
 
-    return _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
+    return _test_hessian_blocks_basic(slds, y[1], x[1], w)
 end
 
 function test_SLDS_gradient_weight_normalization()
@@ -489,9 +490,9 @@ function test_SLDS_gradient_weight_normalization()
     lds = _make_gaussian_lds(2, 2)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=15, ntrials=1)
+    z, x, y = rand(slds, fill(15, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
 
     # Create two different weight matrices that sum to same values
     w1 = rand(K, tsteps)
@@ -501,8 +502,8 @@ function test_SLDS_gradient_weight_normalization()
     w2 ./= sum(w2; dims=1)  # Renormalize
 
     # Gradients should be the same (weights are normalized)
-    grad1 = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w1)
-    grad2 = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w2)
+    grad1 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w1)
+    grad2 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w2)
 
     @test isapprox(grad1, grad2, rtol=1e-10)
 end
@@ -521,13 +522,13 @@ function test_SLDS_smooth_basic()
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
     # Generate data
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
+    z, x, y = rand(slds, fill(tsteps, 1))
 
     # Create uniform weights (should behave like averaging both LDS)
     w = ones(Float64, K, tsteps) ./ K
 
     # Call smooth
-    x_smooth, p_smooth = smooth(slds, y[:, :, 1], w)
+    x_smooth, p_smooth = smooth(slds, y[1], w)
 
     # Basic checks
     @test size(x_smooth) == (latent_dim, tsteps)
@@ -553,8 +554,8 @@ function test_SLDS_smooth_reduces_to_single_LDS()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
-    y_trial = y[:, :, 1]
+    z, x, y = rand(slds, fill(tsteps, 1))
+    y_trial = y[1]
 
     # All weight on first LDS
     w = zeros(Float64, K, tsteps)
@@ -583,8 +584,8 @@ function test_SLDS_smooth_with_realistic_weights()
 
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
-    y_trial = y[:, :, 1]
+    z, x, y = rand(slds, fill(tsteps, 1))
+    y_trial = y[1]
 
     # Create time-varying weights (simulate discrete state posterior)
     w = zeros(Float64, K, tsteps)
@@ -617,8 +618,8 @@ function test_SLDS_smooth_consistency_with_gradients()
 
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
-    y_trial = y[:, :, 1]
+    z, x, y = rand(slds, fill(tsteps, 1))
+    y_trial = y[1]
 
     w = rand(Float64, K, tsteps)
     w ./= sum(w; dims=1)  # Normalize
@@ -643,13 +644,13 @@ function test_SLDS_smooth_entropy_calculation()
 
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
+    z, x, y = rand(slds, fill(tsteps, 1))
 
     w = ones(Float64, K, tsteps) ./ K
 
     # Call smooth! directly to access StateSpaceDynamics.FilterSmooth
     fs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps)
-    return StateSpaceDynamics.smooth!(slds, fs, y[:, :, 1], w)
+    return StateSpaceDynamics.smooth!(slds, fs, y[1], w)
 
     # Entropy should be positive (for Gaussian)
     # @test fs.entropy > 0
@@ -668,12 +669,12 @@ function test_SLDS_smooth_covariance_symmetry()
 
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
+    z, x, y = rand(slds, fill(tsteps, 1))
 
     w = rand(Float64, K, tsteps)
     w ./= sum(w; dims=1)
 
-    _, p_smooth = smooth(slds, y[:, :, 1], w)
+    _, p_smooth = smooth(slds, y[1], w)
 
     # Check symmetry at each timestep
     for t in 1:tsteps
@@ -693,8 +694,8 @@ function test_SLDS_smooth_different_weight_patterns()
 
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
-    y_trial = y[:, :, 1]
+    z, x, y = rand(slds, fill(tsteps, 1))
+    y_trial = y[1]
 
     # Test 1: Uniform weights
     w_uniform = ones(Float64, K, tsteps) ./ K
@@ -728,12 +729,12 @@ function test_SLDS_sample_posterior_basic()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=1)
+    z, x, y = rand(slds, fill(tsteps, 1))
     w = ones(Float64, K, tsteps) ./ K
 
     # Get smoothed posterior
     fs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps)
-    StateSpaceDynamics.smooth!(slds, fs, y[:, :, 1], w)
+    StateSpaceDynamics.smooth!(slds, fs, y[1], w)
 
     # Sample from posterior
     x_sample, entropy = StateSpaceDynamics.sample_posterior(fs)
@@ -754,31 +755,35 @@ function test_SLDS_estep_basic()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
-    # Initialize structures
+    # Batched fb_storage with seq_ends
+    seq_ends = cumsum(fill(tsteps, ntrials))
+    total_T = last(seq_ends)
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
+
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
-    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
-    fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
+    fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
 
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
 
-    # Initialize with uniform weights
     for trial in 1:ntrials
         w_uniform = ones(Float64, K, tsteps) ./ K
-        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[trial], w_uniform; ws=slds_ws)
     end
 
-    # Sample and run E-step
-    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
+    elbo = StateSpaceDynamics.estep!(
+        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    )
 
-    # Check ELBO is finite
     @test isfinite(elbo)
 
-    # Check sufficient statistics were computed
     for trial in 1:ntrials
         @test size(tfs[trial].E_z) == (latent_dim, tsteps)
         @test size(tfs[trial].E_zz) == (latent_dim, latent_dim, tsteps)
@@ -788,15 +793,11 @@ function test_SLDS_estep_basic()
         @test all(isfinite, tfs[trial].E_zz_prev)
     end
 
-    # Check discrete posteriors (γ is now in probability space)
-    for trial in 1:ntrials
-        w = fbs[trial].γ
-        @test size(w) == (K, tsteps)
-        @test all(isfinite, w)
-        @test all(w .>= 0)
-        # Each column should approximately sum to 1
-        @test all(isapprox.(sum(w; dims=1), 1.0, atol=1e-10))
-    end
+    # Check batched γ has reasonable shape and probabilities sum to 1 per timestep.
+    @test size(fb_storage.γ) == (K, total_T)
+    @test all(isfinite, fb_storage.γ)
+    @test all(fb_storage.γ .>= 0)
+    @test all(isapprox.(sum(fb_storage.γ; dims=1), 1.0, atol=1e-10))
 end
 
 function test_SLDS_mstep_updates_parameters()
@@ -809,32 +810,38 @@ function test_SLDS_mstep_updates_parameters()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
-    # Initialize structures
+    seq_ends = cumsum(fill(tsteps, ntrials))
+    total_T = last(seq_ends)
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
+
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
-    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
-    fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
+    fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
 
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
 
-    # Run one E-step
     for trial in 1:ntrials
         w_uniform = ones(Float64, K, tsteps) ./ K
-        StateSpaceDynamics.smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[trial], w_uniform; ws=slds_ws)
     end
-    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
+    StateSpaceDynamics.estep!(
+        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    )
 
-    # Store old parameters
     A_old = copy(slds.A)
-    πₖ_old = copy(slds.πₖ)
-    A_lds_old = [copy(lds.state_model.A) for lds in slds.LDSs]
 
-    # Run M-step
-    StateSpaceDynamics.mstep!(slds, tfs, fbs, y)
+    StateSpaceDynamics.mstep!(
+        slds, tfs, fb_storage, dl, y, sws;
+        obs_seq=obs_seq, seq_ends=seq_ends,
+    )
 
     # Check parameters changed (with high probability)
     @test !isapprox(slds.A, A_old, rtol=1e-6) || true  # May not change if data is degenerate
@@ -859,7 +866,7 @@ function test_SLDS_fit_runs_to_completion()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # Fit without progress bar
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
@@ -883,7 +890,7 @@ function test_SLDS_fit_elbo_generally_increases()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
 
@@ -906,7 +913,7 @@ function test_SLDS_fit_multitrial()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
 
@@ -925,25 +932,30 @@ function test_SLDS_estep_elbo_components()
     lds = _make_gaussian_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
+
+    seq_ends = cumsum(fill(tsteps, ntrials))
+    total_T = last(seq_ends)
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
-    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
-    fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
+    fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
 
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
 
-    # Initialize
     w_uniform = ones(Float64, K, tsteps) ./ K
-    StateSpaceDynamics.smooth!(slds, tfs[1], y[:, :, 1], w_uniform; ws=slds_ws)
+    StateSpaceDynamics.smooth!(slds, tfs[1], y[1], w_uniform; ws=slds_ws)
 
-    # Sample and run E-step
-    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
+    elbo = StateSpaceDynamics.estep!(
+        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    )
 
-    # ELBO should be finite and typically negative (log probability)
     @test isfinite(elbo)
 
     # Entropy should be positive
@@ -960,7 +972,7 @@ function test_weighted_update_initial_state_mean()
 
     ntrials = 4
     tsteps = 10
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # Create per-trial, per-timestep weights
     w = [rand(K, tsteps) for _ in 1:ntrials]
@@ -971,10 +983,10 @@ function test_weighted_update_initial_state_mean()
     # Mock FilterSmooth objects with ALL required fields
     tfs_array = Vector{StateSpaceDynamics.FilterSmooth{Float64}}(undef, ntrials)
     for k in 1:ntrials
-        x_smooth = x[:, :, k]
+        x_smooth = x[k]
         p_smooth = zeros(Float64, latent_dim, latent_dim, tsteps)
         p_smooth_tt1 = zeros(Float64, latent_dim, latent_dim, tsteps)
-        E_z = x[:, :, k]
+        E_z = x[k]
         E_zz = zeros(Float64, latent_dim, latent_dim, tsteps)
         E_zz_prev = zeros(Float64, latent_dim, latent_dim, tsteps)
 
@@ -1018,7 +1030,7 @@ function test_weighted_update_A_b()
 
     ntrials = 3
     tsteps = 15
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # Create weights
     w = [rand(K, tsteps) for _ in 1:ntrials]
@@ -1029,10 +1041,10 @@ function test_weighted_update_A_b()
     # Create FilterSmooth objects with ALL required fields
     tfs_array = Vector{StateSpaceDynamics.FilterSmooth{Float64}}(undef, ntrials)
     for k in 1:ntrials
-        x_smooth = x[:, :, k]
+        x_smooth = x[k]
         p_smooth = zeros(Float64, latent_dim, latent_dim, tsteps)
         p_smooth_tt1 = zeros(Float64, latent_dim, latent_dim, tsteps)
-        E_z = x[:, :, k]
+        E_z = x[k]
         E_zz = zeros(Float64, latent_dim, latent_dim, tsteps)
         E_zz_prev = zeros(Float64, latent_dim, latent_dim, tsteps)
 
@@ -1079,7 +1091,7 @@ function test_weighted_update_Q()
 
     ntrials = 3
     tsteps = 15
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # Create weights
     w = [rand(K, tsteps) for _ in 1:ntrials]
@@ -1090,10 +1102,10 @@ function test_weighted_update_Q()
     # Create FilterSmooth objects with ALL required fields
     tfs_array = Vector{StateSpaceDynamics.FilterSmooth{Float64}}(undef, ntrials)
     for k in 1:ntrials
-        x_smooth = x[:, :, k]
+        x_smooth = x[k]
         p_smooth = zeros(Float64, latent_dim, latent_dim, tsteps)
         p_smooth_tt1 = zeros(Float64, latent_dim, latent_dim, tsteps)
-        E_z = x[:, :, k]
+        E_z = x[k]
         E_zz = zeros(Float64, latent_dim, latent_dim, tsteps)
         E_zz_prev = zeros(Float64, latent_dim, latent_dim, tsteps)
 
@@ -1138,20 +1150,20 @@ function test_weighted_gradient_linearity()
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=10, ntrials=1)
-    tsteps = size(y, 2)
+    z, x, y = rand(slds, fill(10, 1))
+    tsteps = size(y[1], 2)
 
     # Create base weights
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
     # Compute gradient with base weights
-    grad1 = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w)
+    grad1 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
 
     # Compute gradient with scaled weights (should produce same result after normalization)
     w_scaled = 2.5 * w
     w_scaled ./= sum(w_scaled; dims=1)
-    grad2 = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w_scaled)
+    grad2 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w_scaled)
 
     # After normalization, gradients should be equal
     @test isapprox(grad1, grad2, rtol=1e-10)
@@ -1163,18 +1175,18 @@ function test_zero_weights_behavior()
     lds = _make_gaussian_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=10, ntrials=1)
-    tsteps = size(y, 2)
+    z, x, y = rand(slds, fill(10, 1))
+    tsteps = size(y[1], 2)
 
     # Create weights where one state has zero weight everywhere
     w = zeros(K, tsteps)
     w[1, :] .= 1.0  # Only state 1 is active
 
     # This should work without errors
-    grad = StateSpaceDynamics.Gradient(slds, y[:, :, 1], x[:, :, 1], w)
+    grad = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
     @test all(isfinite.(grad))
 
-    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[:, :, 1], x[:, :, 1], w)
+    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[1], x[1], w)
     @test all(all(isfinite, h) for h in H_diag)
     @test all(all(isfinite, h) for h in H_super)
     @test all(all(isfinite, h) for h in H_sub)
@@ -1189,11 +1201,11 @@ function test_SLDS_sampling_poisson_extended()
     s = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 50, 10
-    z, x, y = rand(s; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(s, fill(tsteps, ntrials))
 
-    @test all(y[i, t, n] ≥ 0 for i in 1:5, t in 1:tsteps, n in 1:ntrials)
-    @test all(y[i, t, n] == round(y[i, t, n]) for i in 1:5, t in 1:tsteps, n in 1:ntrials)
-    @test all(isfinite, y)
+    @test all(y[n][i, t] ≥ 0 for i in 1:5, t in 1:tsteps, n in 1:ntrials)
+    @test all(y[n][i, t] == round(y[n][i, t]) for i in 1:5, t in 1:tsteps, n in 1:ntrials)
+    @test all(all(isfinite, yn) for yn in y)
 end
 
 function test_SLDS_gradient_numerical_poisson()
@@ -1201,14 +1213,14 @@ function test_SLDS_gradient_numerical_poisson()
     lds = _make_poisson_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=20, ntrials=1)
+    z, x, y = rand(slds, fill(20, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
-    y_trial = y[:, :, 1]
-    x_trial = x[:, :, 1]
+    y_trial = y[1]
+    x_trial = x[1]
 
     # Analytical gradient
     grad_analytical = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w)
@@ -1267,12 +1279,12 @@ function test_SLDS_hessian_block_structure_poisson()
     lds = _make_poisson_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    _, x, y = rand(slds; tsteps=12, ntrials=1)
-    tsteps = size(y, 2)
+    _, x, y = rand(slds, fill(12, 1))
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps);
     w ./= sum(w; dims=1)
 
-    return _test_hessian_blocks_basic(slds, y[:, :, 1], x[:, :, 1], w)
+    return _test_hessian_blocks_basic(slds, y[1], x[1], w)
 end
 
 function test_SLDS_smooth_basic_poisson()
@@ -1280,14 +1292,14 @@ function test_SLDS_smooth_basic_poisson()
     lds = _make_poisson_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=20, ntrials=1)
+    z, x, y = rand(slds, fill(20, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
     # Run smooth
-    x_smooth, p_smooth = StateSpaceDynamics.smooth(slds, y[:, :, 1], w)
+    x_smooth, p_smooth = StateSpaceDynamics.smooth(slds, y[1], w)
 
     # Check outputs
     @test size(x_smooth) == (slds.LDSs[1].latent_dim, tsteps)
@@ -1309,41 +1321,37 @@ function test_SLDS_estep_basic_poisson()
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 20, 3
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     latent_dim = slds.LDSs[1].latent_dim
 
-    # Initialize structures
+    seq_ends = cumsum(fill(tsteps, ntrials))
+    total_T = last(seq_ends)
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
+
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
-    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
-    fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
+    fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
 
-    # Sample posterior
-    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
-    # Run E-step
-    elbo = StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
+    elbo = StateSpaceDynamics.estep!(
+        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    )
 
     @test isfinite(elbo)
 
-    # Check forward-backward results (γ is now in probability space)
-    for trial in 1:ntrials
-        @test all(isfinite, fbs[trial].α)
-        @test all(isfinite, fbs[trial].β)
-        @test all(isfinite, fbs[trial].γ)
-        @test all(t -> all(isfinite, t), fbs[trial].ξ)
-
-        # Check that γ sums to 1 at each time
-        for t in 1:tsteps
-            @test isapprox(sum(fbs[trial].γ[:, t]), 1.0, atol=1e-10)
-        end
-
-        # Check that γ values are valid probabilities
-        @test all(0 .<= fbs[trial].γ .<= 1)
-    end
+    @test all(isfinite, fb_storage.α)
+    @test all(isfinite, fb_storage.β)
+    @test all(isfinite, fb_storage.γ)
+    @test all(ξt -> all(isfinite, ξt), fb_storage.ξ)
+    @test all(isapprox.(sum(fb_storage.γ; dims=1), 1.0, atol=1e-10))
+    @test all(0 .<= fb_storage.γ .<= 1)
 end
 
 function test_SLDS_mstep_updates_parameters_poisson()
@@ -1352,28 +1360,35 @@ function test_SLDS_mstep_updates_parameters_poisson()
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 20, 3
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     latent_dim = slds.LDSs[1].latent_dim
+    obs_dim = slds.LDSs[1].obs_dim
 
-    # Initialize and run E-step
+    seq_ends = cumsum(fill(tsteps, ntrials))
+    total_T = last(seq_ends)
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
+
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
-    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, tsteps))
-    fbs = [StateSpaceDynamics._make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
+    fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
-    x_samples = Array{Float64,3}(undef, latent_dim, tsteps, ntrials)
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+
+    x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    StateSpaceDynamics.estep!(slds, tfs, fbs, dl, y, x_samples, slds_ws)
+    StateSpaceDynamics.estep!(
+        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    )
 
-    # Store old parameters
-    C_old = [copy(lds.obs_model.C) for lds in slds.LDSs]
-    log_d_old = [copy(lds.obs_model.log_d) for lds in slds.LDSs]
+    StateSpaceDynamics.mstep!(
+        slds, tfs, fb_storage, dl, y, sws;
+        obs_seq=obs_seq, seq_ends=seq_ends,
+    )
 
-    # Run M-step
-    StateSpaceDynamics.mstep!(slds, tfs, fbs, y)
-
-    # Check Poisson observation parameters are finite
     for k in 1:K
         @test all(isfinite, slds.LDSs[k].obs_model.C)
         @test all(isfinite, slds.LDSs[k].obs_model.log_d)
@@ -1391,7 +1406,7 @@ function test_SLDS_fit_runs_to_completion_poisson()
     lds = _make_poisson_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # Fit without progress bar
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
@@ -1411,7 +1426,7 @@ function test_SLDS_fit_elbo_generally_increases_poisson()
     lds = _make_poisson_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
 
@@ -1433,7 +1448,7 @@ function test_SLDS_fit_multitrial_poisson()
     lds = _make_poisson_lds(latent_dim, obs_dim)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     elbos = fit!(slds, y; max_iter=max_iter, progress=false)
 
@@ -1448,13 +1463,10 @@ function test_SLDS_poisson_count_validation()
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
     tsteps, ntrials = 30, 5
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
-    # All observations should be non-negative
-    @test all(y .>= 0)
-
-    # All observations should be integers (within floating point precision)
-    @test all(abs.(y .- round.(y)) .< 1e-10)
+    @test all(all(yn .>= 0) for yn in y)
+    @test all(all(abs.(yn .- round.(yn)) .< 1e-10) for yn in y)
 end
 
 function test_SLDS_poisson_log_d_interpretation()
@@ -1471,14 +1483,13 @@ function test_SLDS_poisson_log_d_interpretation()
     slds = SLDS(; A=reshape([1.0], 1, 1), πₖ=[1.0], LDSs=[lds])
 
     tsteps, ntrials = 1000, 1
-    z, x, y = rand(slds; tsteps=tsteps, ntrials=ntrials)
+    z, x, y = rand(slds, fill(tsteps, ntrials))
 
     # The rate λ = exp(C*x + d) = exp(0 + d) = exp(d) when C=0
-    # So expected rates are exp(d) where d = exp(log_d)
     d_values = exp.(lds.obs_model.log_d)  # [1, 2, 3]
-    expected_rates = exp.(d_values)        # [e^1, e^2, e^3] ≈ [2.7, 7.4, 20.1]
+    expected_rates = exp.(d_values)        # [e^1, e^2, e^3]
 
-    mean_rates = mean(y; dims=2)[:, 1, 1]
+    mean_rates = vec(mean(y[1]; dims=2))
 
     for i in 1:obs_dim
         @test isapprox(mean_rates[i], expected_rates[i], rtol=0.3)
@@ -1491,14 +1502,14 @@ function test_SLDS_gradient_weight_normalization_poisson()
     lds = _make_poisson_lds(2, 3)
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
 
-    z, x, y = rand(slds; tsteps=20, ntrials=1)
+    z, x, y = rand(slds, fill(20, 1))
 
-    tsteps = size(y, 2)
+    tsteps = size(y[1], 2)
     w = rand(K, tsteps)
     w ./= sum(w; dims=1)
 
-    y_trial = y[:, :, 1]
-    x_trial = x[:, :, 1]
+    y_trial = y[1]
+    x_trial = x[1]
 
     # Gradient with uniform weights should equal unweighted gradient
     w_uniform = ones(K, tsteps) ./ K

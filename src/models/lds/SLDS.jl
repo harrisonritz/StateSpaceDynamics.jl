@@ -1,57 +1,94 @@
 """
-    _make_slds_fb_storage(dl, tsteps)
+    _make_slds_fb_storage(dl, seq_ends)
 
-Pre-allocate a `HMMs.ForwardBackwardStorage` for one trial given discrete layer `dl` and
-sequence length `tsteps`.  The observation sequence is `1:tsteps` (timestep indices).
+Allocate a single `HMMs.ForwardBackwardStorage` covering all trials. `seq_ends` is the
+cumulative timestep index at which each trial ends (HMMs.jl convention). The fb_storage
+buffers are sized at `K × sum(T_i)` and `dl.logL` is sized to match.
 """
-function _make_slds_fb_storage(dl::SLDSDiscreteLayer{T}, tsteps::Int) where {T}
-    obs_seq = 1:tsteps
-    ctrl_seq = fill(nothing, tsteps)
+function _make_slds_fb_storage(
+    dl::SLDSDiscreteLayer{T}, seq_ends::AbstractVector{Int}
+) where {T}
+    total_T = last(seq_ends)
+    obs_seq = 1:total_T
+    ctrl_seq = fill(nothing, total_T)
     return HMMs.initialize_forward_backward(
-        dl, obs_seq, ctrl_seq; seq_ends=(tsteps,), transition_marginals=true
+        dl, obs_seq, ctrl_seq; seq_ends=seq_ends, transition_marginals=true
     )
 end
 
 """
-    rand(rng::AbstractRNG, slds::SLDS{T,S,O}; tsteps::Int, ntrials::Int=1) where {T<:Real, S<:AbstractStateModel, O<:AbstractObservationModel}
+    rand([rng,] slds, tsteps::Integer)
+    rand([rng,] slds, tsteps_per_trial::AbstractVector{<:Integer})
 
-Sample from a Switching Linear Dynamical System (SLDS). Returns a tuple `(z, x, y)` where:
-- `z` is a matrix of discrete states of size `(tsteps, ntrials)`
-- `x` is a 3D array of continuous latent states of size `(latent_dim, tsteps, ntrials)`
-- `y` is a 3D array of observations of size `(obs_dim, tsteps, ntrials)`
+Sample from a Switching Linear Dynamical System.
+
+- Scalar `tsteps`: returns one trial as `(z::Vector{Int}, x::Matrix, y::Matrix)`.
+- Vector of per-trial lengths: returns `(z::Vector{Vector{Int}}, x::Vector{Matrix},
+  y::Vector{Matrix})`. Trial lengths may differ.
 """
 function Random.rand(
-    rng::AbstractRNG, slds::SLDS{T,S,O}; tsteps::Int, ntrials::Int=1
+    rng::AbstractRNG, slds::SLDS{T,S,O}, tsteps::Integer
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    K = length(slds.LDSs)  # Number of discrete states
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
 
-    # Pre-allocate outputs
-    z = Array{Int,2}(undef, tsteps, ntrials)        # Discrete states
-    x = Array{T,3}(undef, latent_dim, tsteps, ntrials)  # Continuous states  
-    y = Array{T,3}(undef, obs_dim, tsteps, ntrials)     # Observations
+    z = Vector{Int}(undef, Int(tsteps))
+    x = Matrix{T}(undef, latent_dim, Int(tsteps))
+    y = Matrix{T}(undef, obs_dim, Int(tsteps))
 
-    # Pre-extract parameters for all LDS models
     state_params = [_extract_state_params(lds.state_model) for lds in slds.LDSs]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in slds.LDSs]
 
-    # Sample each trial
+    _sample_slds_trial!(
+        rng, z, x, y, slds.A, slds.πₖ, state_params, obs_params, slds.LDSs[1].obs_model
+    )
+
+    return z, x, y
+end
+
+function Random.rand(
+    rng::AbstractRNG,
+    slds::SLDS{T,S,O},
+    tsteps_per_trial::AbstractVector{<:Integer},
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    latent_dim = slds.LDSs[1].latent_dim
+    obs_dim = slds.LDSs[1].obs_dim
+    ntrials = length(tsteps_per_trial)
+
+    z = Vector{Vector{Int}}(undef, ntrials)
+    x = Vector{Matrix{T}}(undef, ntrials)
+    y = Vector{Matrix{T}}(undef, ntrials)
+
+    state_params = [_extract_state_params(lds.state_model) for lds in slds.LDSs]
+    obs_params = [_extract_obs_params(lds.obs_model) for lds in slds.LDSs]
+
     for trial in 1:ntrials
+        Ti = Int(tsteps_per_trial[trial])
+        z[trial] = Vector{Int}(undef, Ti)
+        x[trial] = Matrix{T}(undef, latent_dim, Ti)
+        y[trial] = Matrix{T}(undef, obs_dim, Ti)
         _sample_slds_trial!(
             rng,
-            view(z, :, trial),
-            view(x,:,:,trial),
-            view(y,:,:,trial),
+            z[trial],
+            x[trial],
+            y[trial],
             slds.A,
             slds.πₖ,
             state_params,
             obs_params,
             slds.LDSs[1].obs_model,
-        )  # Use first for type dispatch
+        )
     end
 
     return z, x, y
+end
+
+function Random.rand(slds::SLDS, tsteps::Integer)
+    return rand(Random.default_rng(), slds, tsteps)
+end
+
+function Random.rand(slds::SLDS, tsteps_per_trial::AbstractVector{<:Integer})
+    return rand(Random.default_rng(), slds, tsteps_per_trial)
 end
 
 # Core SLDS trial sampling logic
@@ -152,12 +189,59 @@ function _sample_continuous_given_discrete!(
     end
 end
 
-# Convenience method without explicit RNG
-Random.rand(slds::SLDS; kwargs...) = rand(Random.default_rng(), slds; kwargs...)
+"""
+    StatsAPI.fit!(dl::SLDSDiscreteLayer, fb_storage, obs_seq; seq_ends)
+
+Update the discrete transition matrix `dl.A` and initial-state distribution `dl.πₖ`
+in place from forward-backward statistics. Mirrors HiddenMarkovModels.jl's
+`fit!(::HMM, ...)` pattern using the `ξ[t2]` scratch trick: for each sequence,
+`ξ[t2]` is zero by FB convention so it doubles as an accumulator for `sum(ξ[t1:t2-1])`.
+
+Skips fitting observation distributions because the SLDS discrete layer doesn't have
+parametric obs distributions; per-state log-likelihoods are filled into `dl.logL`
+upstream by the SLDS E-step.
+"""
+function StatsAPI.fit!(
+    dl::SLDSDiscreteLayer{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    obs_seq::AbstractVector;
+    seq_ends::AbstractVector{Int},
+) where {T<:Real}
+    γ = fb_storage.γ
+    ξ = fb_storage.ξ
+
+    # Accumulate ξ[t1:t2-1] into ξ[t2] (zero by FB convention) for each trial.
+    @threads for k in eachindex(seq_ends)
+        t1, t2 = HMMs.seq_limits(seq_ends, k)
+        scratch = ξ[t2]
+        fill!(scratch, zero(eltype(scratch)))
+        for t in t1:(t2 - 1)
+            scratch .+= ξ[t]
+        end
+    end
+
+    fill!(dl.πₖ, zero(eltype(dl.πₖ)))
+    fill!(dl.A, zero(eltype(dl.A)))
+    for k in eachindex(seq_ends)
+        t1, t2 = HMMs.seq_limits(seq_ends, k)
+        dl.πₖ .+= view(γ, :, t1)
+        dl.A .+= ξ[t2]
+    end
+
+    dl.πₖ ./= sum(dl.πₖ)
+    for i in axes(dl.A, 1)
+        s = sum(view(dl.A, i, :))
+        if s > zero(T)
+            dl.A[i, :] ./= s
+        end
+    end
+
+    return nothing
+end
 
 """
     loglikelihood(slds::SLDS, x, y, w)
-    
+
 Compute weighted complete-data log-likelihood for SLDS.
 Returns vector of per-timestep log-likelihoods.
 """
@@ -168,19 +252,20 @@ function loglikelihood!(
     y::AbstractMatrix{T},
     w::AbstractMatrix{T},   # K × T responsibilities/weights
 ) where {T<:Real}
-    fill!(ws.ll_vec, zero(T))
+    Tsteps = size(y, 2)
+
+    # Workspace ll_vec may be sized for a longer trial; only touch the active prefix.
+    @views fill!(ws.ll_vec[1:Tsteps], zero(T))
 
     K = length(slds.LDSs)
     for k in 1:K
-        loglikelihood!(ws.ll_tmp, ws, ws.consts[k], slds.LDSs[k], x, y)
-
-        # accumulate: ll_vec[t] += w[k,t] * ll_tmp[t]
-        for t in 1:length(ws.ll_vec)
+        loglikelihood!(view(ws.ll_tmp, 1:Tsteps), ws, ws.consts[k], slds.LDSs[k], x, y)
+        for t in 1:Tsteps
             ws.ll_vec[t] += w[k, t] * ws.ll_tmp[t]
         end
     end
 
-    return ws.ll_vec
+    return view(ws.ll_vec, 1:Tsteps)
 end
 
 """
@@ -643,16 +728,14 @@ function smooth!(
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
     tsteps = size(y, 2)
+    n_active = latent_dim * tsteps
 
     ws === nothing && (ws = SLDSSmoothWorkspace(T, slds, tsteps))
     btd = ws.btd
 
-    # working buffer
     x = fs.x_smooth
 
-    # init (warm start if available)
     if all(fs.E_z .== 0)
-        # crude prior init using first mode's dynamics
         lds1 = slds.LDSs[1]
         x[:, 1] .= lds1.state_model.x0
         for t in 2:tsteps
@@ -663,44 +746,39 @@ function smooth!(
         copyto!(x, fs.E_z)
     end
 
-    # gradient buffer and direction buffer
-    g = ws.grad_buf                       # D×T
-    p = reshape(ws.X₀, latent_dim, tsteps)  # D×T (view)
+    # Active-length views into (possibly) oversized workspace buffers.
+    g = view(ws.grad_buf, :, 1:tsteps)
+    p = reshape(view(ws.X₀, 1:n_active), latent_dim, tsteps)
+    neg_diag_v = view(btd.neg_diag, 1:tsteps)
+    neg_sub_v = view(btd.neg_sub, 1:(tsteps - 1))
+    neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
-    # objective at current x (allocation-free)
     ϕ!() = begin
-        loglikelihood!(ws, slds, x, y, w)  # fills ws.ll_vec
-        return sum(ws.ll_vec)
+        ll = loglikelihood!(ws, slds, x, y, w)
+        return sum(ll)
     end
 
-    # gradient callback: g <- ∇ loglik
     compute_grad! = (gcur, xcur) -> begin
-        # xcur is x (we mutate x in-place); Gradient! writes into ws.grad_buf
         Gradient!(ws, slds, y, xcur, w)
-        copyto!(gcur, ws.grad_buf)
+        copyto!(gcur, view(ws.grad_buf, :, 1:tsteps))
         return nothing
     end
 
-    # Hessian builder: fill blocks for ∇² loglik, then negate to form (-Hℓ) SPD
     build_hess! = (xcur) -> begin
-        Hessian_blocks!(ws, slds, y, xcur, w)  # fills btd.H_* for loglik
-        _negate_blocks!(btd)                    # fills btd.neg_* = -(Hℓ blocks)
+        Hessian_blocks!(ws, slds, y, xcur, w)
+        _negate_blocks!(btd, tsteps)
         return nothing
     end
 
-    # Solve (-Hℓ) p = g  (Newton ascent direction)
-    solve_dir! =
-        (pcur, gcur) -> begin
-            gvec = vec(gcur)
-            pvec = vec(pcur)
-            copyto!(pvec, gvec)
-            block_tridiagonal_solve!(
-                pvec, btd.neg_sub, btd.neg_diag, btd.neg_super, gvec, btd
-            )
-            return nothing
-        end
+    solve_dir! = (pcur, gcur) -> begin
+        gvec = vec(gcur)
+        pvec = vec(pcur)
+        copyto!(pvec, gvec)
+        block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
+        return nothing
+    end
 
-    converged = newton_smooth!(
+    newton_smooth!(
         Val(:max),
         x,
         g,
@@ -714,13 +792,12 @@ function smooth!(
         tol=tol,
     )
 
-    # Posterior covariances from Laplace approx:
-    # precision = -∇² loglik at MAP
+    # Posterior covariances at the MAP via Laplace approx.
     Hessian_blocks!(ws, slds, y, x, w)
-    _negate_blocks!(btd)
+    _negate_blocks!(btd, tsteps)
 
     block_tridiagonal_inverse!(
-        fs.p_smooth, fs.p_smooth_tt1, btd.neg_sub, btd.neg_diag, btd.neg_super, btd
+        fs.p_smooth, fs.p_smooth_tt1, neg_sub_v, neg_diag_v, neg_super_v, btd
     )
 
     @views for t in 1:tsteps
@@ -740,23 +817,23 @@ end
 """
     sample_posterior!(x_out, rng, tfs, randn_buf)
 
-In-place version of `sample_posterior` for multi-trial use inside EM loops.
-Fills the pre-allocated `x_out` (latent_dim × tsteps × ntrials) with one posterior
-sample per trial. `randn_buf` (latent_dim) is a scratch vector reused across timesteps.
+Sample one continuous-state trajectory per trial from the posterior, in place.
+`x_out` is a `Vector{Matrix{T}}` with one matrix per trial sized at that trial's
+length; trial lengths may differ. `randn_buf` (length `latent_dim`) is reused.
 """
 function sample_posterior!(
-    x_out::AbstractArray{T,3},
+    x_out::AbstractVector{<:AbstractMatrix{T}},
     rng::AbstractRNG,
     tfs::TrialFilterSmooth{T},
     randn_buf::Vector{T},
 ) where {T<:Real}
     min_jitter = T(1e-8)
-    tsteps = size(tfs[1].x_smooth, 2)
     ntrials = length(tfs.FilterSmooths)
 
     for trial in 1:ntrials
         fs = tfs[trial]
-        x_trial = view(x_out, :, :, trial)
+        x_trial = x_out[trial]
+        tsteps = size(x_trial, 2)
         for t in 1:tsteps
             chol = nothing
             jitter = zero(T)
@@ -872,82 +949,95 @@ function sample_posterior(tfs::TrialFilterSmooth{T}, nsamples::Int=1) where {T<:
 end
 
 """
-    estep!(slds, tfs, fb_storages, dl, y, x_samples)
+    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; obs_seq, ctrl_seq, seq_ends)
 
 E-step for SLDS using a single sample from the continuous posterior.
-- Fills `dl.logL` with per-state log-likelihoods from sampled continuous states
-- Runs forward-backward (external HiddenMarkovModels.jl backend) to get discrete posteriors
-- Smooths continuous states given discrete posteriors
+
+- Fills `dl.logL` (`K × sum(T_i)`) with per-state log-likelihoods from sampled continuous states
+- Runs forward-backward via HiddenMarkovModels.jl with `seq_ends` (one storage covers all
+  trials; HMMs.jl `@threads` across trials internally)
+- Smooths continuous states given discrete posteriors per trial
 - Computes sufficient statistics and returns the stochastic ELBO estimate
 """
 function estep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
-    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
+    fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractArray{T,3},
-    x_samples::AbstractArray{T,3},  # (latent_dim, tsteps, ntrials)
-    slds_ws::SLDSSmoothWorkspace{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::AbstractVector{<:AbstractMatrix{T}},
+    slds_ws::SLDSSmoothWorkspace{T};
+    obs_seq::AbstractVector,
+    ctrl_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    ntrials = size(y, 3)
+    ntrials = length(y)
     K = length(slds.LDSs)
-    tsteps = size(y, 2)
-    obs_seq = 1:tsteps
-    ctrl_seq = fill(nothing, tsteps)
+
+    # Fill per-trial slices of dl.logL from the sampled continuous trajectory.
+    for trial in 1:ntrials
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        y_trial = y[trial]
+        x_sample = x_samples[trial]
+        for k in 1:K
+            ll_view = view(dl.logL, k, t1:t2)
+            loglikelihood!(
+                ll_view, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_sample, y_trial
+            )
+        end
+    end
+
+    # Single batched forward-backward (HMMs.jl threads across trials internally).
+    HMMs.forward_backward!(
+        fb_storage, dl, obs_seq, ctrl_seq;
+        seq_ends=seq_ends, transition_marginals=true,
+    )
 
     total_elbo = zero(T)
 
     for trial in 1:ntrials
-        y_trial = view(y, :, :, trial)
-        x_sample = view(x_samples, :, :, trial)
-        fbs = fb_storages[trial]
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        Tsteps = t2 - t1 + 1
+        y_trial = y[trial]
+        w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
 
-        # Fill pre-computed log-likelihoods for the discrete layer
-        for k in 1:K
-            loglikelihood!(slds_ws.ll_tmp, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_sample, y_trial)
-            dl.logL[k, :] .= slds_ws.ll_tmp
-        end
-
-        # Forward-backward via external backend
-        HMMs.forward_backward!(
-            fbs, dl, obs_seq, ctrl_seq; seq_ends=(tsteps,), transition_marginals=true
-        )
-
-        # γ[k,t] is already a probability (not log); use directly as weights
-        w = fbs.γ  # K×T
-
-        # Smooth continuous states given discrete posteriors
         smooth!(slds, tfs[trial], y_trial, w; ws=slds_ws)
         sufficient_statistics!(tfs[trial])
 
         trial_elbo = zero(T)
         x_smooth_trial = tfs[trial].x_smooth
 
-        # E_q[log p(y,x|z)] weighted by discrete posteriors
+        # E_q[log p(y, x | z)] weighted by discrete posteriors.
         for k in 1:K
-            loglikelihood!(slds_ws.ll_tmp, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_smooth_trial, y_trial)
-            for t in 1:tsteps
-                trial_elbo += w[k, t] * slds_ws.ll_tmp[t]
+            ll = view(slds_ws.ll_tmp, 1:Tsteps)
+            loglikelihood!(
+                ll, slds_ws, slds_ws.consts[k], slds.LDSs[k], x_smooth_trial, y_trial
+            )
+            for t in 1:Tsteps
+                trial_elbo += w[k, t] * ll[t]
             end
         end
 
-        # log p(z_1)
+        # log p(z_1).
         for k in 1:K
             trial_elbo += w[k, 1] * log(slds.πₖ[k] + T(1e-12))
         end
 
-        # log p(z_t | z_{t-1}): sum_t sum_{i,j} ξ[t][i,j] * log A[i,j]
-        for t in 1:(tsteps - 1)
+        # log p(z_t | z_{t-1}) = sum_t sum_{i,j} ξ[t][i,j] * log A[i,j].
+        # ξ is indexed by global timestep; the last entry of each trial (ξ[t2]) is zero
+        # by FB convention so we iterate t1..t2-1.
+        for t in t1:(t2 - 1)
+            ξt = fb_storage.ξ[t]
             for i in 1:K, j in 1:K
-                trial_elbo += fbs.ξ[t][i, j] * log(slds.A[i, j] + T(1e-12))
+                trial_elbo += ξt[i, j] * log(slds.A[i, j] + T(1e-12))
             end
         end
 
-        # Subtract entropies
-        trial_elbo -= tfs[trial].entropy  # H[q(x)]
-        for k in 1:K, t in 1:tsteps
+        # Subtract entropies: -H[q(x)] - H[q(z)].
+        trial_elbo -= tfs[trial].entropy
+        for k in 1:K, t in 1:Tsteps
             wkt = w[k, t]
-            wkt > 0 && (trial_elbo += wkt * log(wkt + T(1e-12)))  # -H[q(z)] = +E[log q(z)]
+            wkt > 0 && (trial_elbo += wkt * log(wkt + T(1e-12)))
         end
 
         total_elbo += trial_elbo
@@ -957,114 +1047,114 @@ function estep!(
 end
 
 """
-    mstep!(slds, tfs, fb_storages, y, sws)
+    mstep!(slds, tfs, fb_storage, y, sws; obs_seq, seq_ends)
 
 M-step for SLDS.
-- Updates discrete parameters (A, πₖ) from aggregated ForwardBackwardStorage statistics
-- Updates each LDS using weighted sufficient statistics
+
+- Updates discrete parameters (`slds.A`, `slds.πₖ`) via `StatsAPI.fit!` on the discrete
+  layer (uses HMMs.jl's `ξ[t2]` scratch trick).
+- Updates each LDS component using γ-weighted sufficient statistics.
 """
 function mstep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
-    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
-    y::AbstractArray{T,3},
-    sws::SmoothWorkspace{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    dl::SLDSDiscreteLayer{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T};
+    obs_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
-    ntrials = size(y, 3)
-    tsteps = size(y, 2)
+    ntrials = length(y)
 
-    fill!(slds.πₖ, zero(T))
-    for trial in 1:ntrials
-        slds.πₖ .+= view(fb_storages[trial].γ, :, 1)
-    end
-    slds.πₖ ./= ntrials
+    # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
+    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
 
-    # A[i,j] = sum_trial sum_{t<T} ξ[t][i,j] / sum_trial sum_{t<T} γ[i,t]
-    num = zeros(T, K, K)
-    denom = zeros(T, K)
-    for trial in 1:ntrials
-        fbs = fb_storages[trial]
-        for t in 1:(tsteps - 1)
-            num .+= fbs.ξ[t]
-            denom .+= view(fbs.γ, :, t)
-        end
-    end
-    for i in 1:K
-        slds.A[i, :] .= num[i, :] ./ max(denom[i], T(1e-12))
-    end
-
-    # Wrap 3D `y` as a vector of per-trial views for the new LDS mstep! API.
-    # (Commit 3 will flip the SLDS public API itself to Vector{Matrix}.)
-    y_per_trial = [view(y, :, :, trial) for trial in 1:ntrials]
-
+    # LDS-component M-step: per-trial weights are slices of fb_storage.γ.
     weights = Vector{AbstractVector{T}}(undef, ntrials)
     for k in 1:K
         for trial in 1:ntrials
-            weights[trial] = view(fb_storages[trial].γ, k, :)
+            t1, t2 = HMMs.seq_limits(seq_ends, trial)
+            weights[trial] = view(fb_storage.γ, k, t1:t2)
         end
-        mstep!(slds.LDSs[k], tfs, y_per_trial, sws, weights)
+        mstep!(slds.LDSs[k], tfs, y, sws, weights)
     end
 
     return nothing
 end
 
-function mstep!(
-    slds::SLDS{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    fb_storages::AbstractVector{<:HMMs.ForwardBackwardStorage},
-    y::AbstractArray{T,3},
-) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    sws = SmoothWorkspace(T, slds.LDSs[1].latent_dim, slds.LDSs[1].obs_dim, size(y, 2))
-    return mstep!(slds, tfs, fb_storages, y, sws)
-end
-
 """
-    fit!(slds::SLDS{T,S,O}, y::AbstractArray{T,3}; max_iter::Int=50, progress::Bool=true)
+    fit!(slds::SLDS, y::AbstractVector{<:AbstractMatrix}; max_iter=50, progress=true)
+    fit!(slds::SLDS, y::AbstractMatrix; max_iter=50, progress=true)
 
-Fit SLDS using variational Laplace EM with stochastic ELBO estimates.
-Runs for exactly `max_iter` iterations.
+Fit SLDS using variational Laplace EM with stochastic ELBO estimates. Runs for exactly
+`max_iter` iterations.
+
+`y` is either a single trial `(obs_dim × T)` matrix or a vector of per-trial matrices
+(ragged `T_i` allowed). Internally a single batched `HMMs.ForwardBackwardStorage` of
+length `sum(T_i)` is allocated, with `seq_ends = cumsum(T_i)` to demarcate trials.
 """
 function fit!(
-    slds::SLDS{T,S,O}, y::AbstractArray{T,3}; max_iter::Int=50, progress::Bool=true
+    slds::SLDS{T,S,O},
+    y::AbstractVector{<:AbstractMatrix{T}};
+    max_iter::Int=50,
+    progress::Bool=true,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    ntrials = size(y, 3)
-    tsteps = size(y, 2)
     K = length(slds.LDSs)
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
 
-    # Continuous-state smoother storage
-    tfs = initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    ntrials = length(y)
+    seq_ends = cumsum(tsteps_per_trial)
+    total_T = last(seq_ends)
+    T_max = maximum(tsteps_per_trial)
 
-    # Discrete-layer wrapper (holds references to slds.A and slds.πₖ)
-    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, tsteps))
+    # Continuous-state smoother storage (per-trial sized).
+    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)
 
-    # Pre-allocate ForwardBackwardStorage for each trial (reused each iteration)
-    fb_storages = [_make_slds_fb_storage(dl, tsteps) for _ in 1:ntrials]
+    # Discrete-layer wrapper (logL sized for batched obs_seq).
+    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
 
-    # Workspaces — allocated once, reused every iteration
-    sws = SmoothWorkspace(T, latent_dim, obs_dim, tsteps)
-    slds_ws = SLDSSmoothWorkspace(T, slds, tsteps)
-    x_samples = Array{T,3}(undef, latent_dim, tsteps, ntrials)
+    # Single batched fb_storage covering all trials.
+    fb_storage = _make_slds_fb_storage(dl, seq_ends)
+
+    # Cached batched obs_seq / ctrl_seq for HMMs.jl.
+    obs_seq = collect(1:total_T)
+    ctrl_seq = fill(nothing, total_T)
+
+    # Workspaces — allocated once at max trial length, reused each iteration.
+    sws = SmoothWorkspace(T, latent_dim, obs_dim, T_max)
+    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
+    x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
     randn_buf = Vector{T}(undef, latent_dim)
 
-    prog = progress ? Progress(max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true) : nothing
+    prog = progress ? Progress(
+        max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true
+    ) : nothing
     elbos = Vector{T}(undef, max_iter)
 
-    # Warm-start: smooth once with uniform discrete weights
-    w_uniform = fill(one(T) / K, K, tsteps)
+    # Warm-start: smooth once per trial with uniform discrete weights.
     for trial in 1:ntrials
-        smooth!(slds, tfs[trial], y[:, :, trial], w_uniform; ws=slds_ws)
+        Ti = tsteps_per_trial[trial]
+        w_uniform = fill(one(T) / K, K, Ti)
+        smooth!(slds, tfs[trial], y[trial], w_uniform; ws=slds_ws)
     end
 
     for iter in 1:max_iter
         sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
-        elbo = estep!(slds, tfs, fb_storages, dl, y, x_samples, slds_ws)
+        elbo = estep!(
+            slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
+            obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        )
         elbos[iter] = elbo
 
-        mstep!(slds, tfs, fb_storages, y, sws)
+        mstep!(
+            slds, tfs, fb_storage, dl, y, sws;
+            obs_seq=obs_seq, seq_ends=seq_ends,
+        )
         refresh_slds_constants!(slds_ws, slds)
 
         if prog !== nothing
@@ -1076,6 +1166,12 @@ function fit!(
         finish!(prog)
     end
     return elbos
+end
+
+function fit!(
+    slds::SLDS{T,S,O}, y::AbstractMatrix{T}; kwargs...
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    return fit!(slds, [y]; kwargs...)
 end
 
 # Deprecation wrappers for old API
