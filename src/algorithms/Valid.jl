@@ -335,7 +335,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     expected_fit_length = if lds.obs_model isa PoissonObservationModel
         5
     elseif lds.kalman_filter
-        8
+        9
     else
         6
     end

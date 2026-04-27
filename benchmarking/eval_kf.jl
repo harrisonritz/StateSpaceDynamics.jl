@@ -119,6 +119,8 @@ params = init_params(rng, latent_dim, obs_dim)
 # Both methods fit the same training data and are evaluated on the same
 # held-out test set drawn from the true generative model.
 ref = build_lds(params, false)
+
+
 _, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
 _, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
 

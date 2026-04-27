@@ -785,8 +785,9 @@ The workspace is split into three layers:
 struct KalmanWorkspace{T<:Real}
     latent_dim::Int
     obs_dim::Int
-    u_dim::Int
-    u0_dim::Int
+    init_input_dim::Int
+    state_input_dim::Int
+    obs_input_dim::Int
     tsteps::Int
     ntrials::Int
 
@@ -822,9 +823,10 @@ struct KalmanWorkspace{T<:Real}
     pred_mean::Array{T,3}    # (D, T, ntrials)
     filt_mean::Array{T,3}    # (D, T, ntrials)
     smooth_mean::Array{T,3}  # (D, T, ntrials)
-    Bu::Array{T,3}           # (D, T, ntrials)  — zeros if B === nothing
+    Bu::Array{T,3}           # (D, T, ntrials)
     CiRY::Array{T,3}         # (D, T, ntrials)
     y_minus_d::Array{T,3}    # (p, T, ntrials)
+    Dd::Array{T,3}           # (p, T, ntrials)
 end
 
 """
@@ -838,8 +840,9 @@ function KalmanWorkspace(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    u_dim = lds.state_model.B === nothing ? 0 : size(lds.state_model.B, 2)
-    u0_dim = lds.state_model.B0 === nothing ? 0 : size(lds.state_model.B0, 2)
+    init_input_dim = size(lds.state_model.B0, 2)
+    state_input_dim = size(lds.state_model.B, 2)
+    obs_input_dim = size(lds.obs_model.D, 2)
 
     # Placeholder PDMats; re-wrapped at the start of every E-step
     placeholder_D = PDMat(Matrix{T}(I, D, D))
@@ -863,8 +866,9 @@ function KalmanWorkspace(
     return KalmanWorkspace{T}(
         D,                              # latent_dim
         p,                              # obs_dim
-        u_dim,                          # control_dim
-        u0_dim,                         # initial_control_dim
+        init_input_dim,                 # initial_control_dim
+        state_input_dim,                # control_dim
+        obs_input_dim,                  # observation_control_dim
         tsteps,                         # time_steps
         ntrials,                        # number_of_trials
         pred_cov,                       # Vector{PDMat} for P_pred[t]
@@ -891,5 +895,6 @@ function KalmanWorkspace(
         zeros(T, D, tsteps, ntrials),   # Bu
         zeros(T, D, tsteps, ntrials),   # CiRY
         zeros(T, p, tsteps, ntrials),   # y_minus_d
+        zeros(T, p, tsteps, ntrials),   # Dd
     )
 end

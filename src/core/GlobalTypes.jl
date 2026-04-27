@@ -182,15 +182,22 @@ mutable struct SufficientStatistics{T<:Real}
     dyn_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     dyn_xy::Matrix{T}
     dyn_yy::Base.RefValue{PDMat{T,Matrix{T}}}
-    dyn_uu::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # observation model
     obs_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     obs_xy::Matrix{T}
     obs_yy::Base.RefValue{PDMat{T,Matrix{T}}}
-    obs_dd::Base.RefValue{PDMat{T,Matrix{T}}}
-    obs_dy::Matrix{T}
 
+end
+
+
+
+
+Base.@kwdef struct Data{T<:Real}
+    y::Array{T,3}
+    u0::Matrix{T}
+    u::Array{T,3}
+    d::Array{T,3}
 end
 
 
