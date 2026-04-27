@@ -174,16 +174,19 @@ Base.length(f::TrialFilterSmooth) = length(f.FilterSmooths)
 mutable struct SufficientStatistics{T<:Real}
     
     # initial conditions
+    init_n::Int
     init_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     init_xy::Matrix{T}
     init_yy::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # transitions model
+    dyn_n::Int
     dyn_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     dyn_xy::Matrix{T}
     dyn_yy::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # observation model
+    obs_n::Int
     obs_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     obs_xy::Matrix{T}
     obs_yy::Base.RefValue{PDMat{T,Matrix{T}}}
