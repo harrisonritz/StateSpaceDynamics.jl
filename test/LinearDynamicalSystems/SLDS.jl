@@ -778,8 +778,16 @@ function test_SLDS_estep_basic()
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
     elbo = StateSpaceDynamics.estep!(
-        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        slds_ws;
+        obs_seq=obs_seq,
+        ctrl_seq=ctrl_seq,
+        seq_ends=seq_ends,
     )
 
     @test isfinite(elbo)
@@ -832,15 +840,22 @@ function test_SLDS_mstep_updates_parameters()
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
     StateSpaceDynamics.estep!(
-        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        slds_ws;
+        obs_seq=obs_seq,
+        ctrl_seq=ctrl_seq,
+        seq_ends=seq_ends,
     )
 
     A_old = copy(slds.A)
 
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, y, sws;
-        obs_seq=obs_seq, seq_ends=seq_ends,
+        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
     )
 
     # Check parameters changed (with high probability)
@@ -952,8 +967,16 @@ function test_SLDS_estep_elbo_components()
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
     elbo = StateSpaceDynamics.estep!(
-        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        slds_ws;
+        obs_seq=obs_seq,
+        ctrl_seq=ctrl_seq,
+        seq_ends=seq_ends,
     )
 
     @test isfinite(elbo)
@@ -1340,8 +1363,16 @@ function test_SLDS_estep_basic_poisson()
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
     elbo = StateSpaceDynamics.estep!(
-        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        slds_ws;
+        obs_seq=obs_seq,
+        ctrl_seq=ctrl_seq,
+        seq_ends=seq_ends,
     )
 
     @test isfinite(elbo)
@@ -1380,13 +1411,20 @@ function test_SLDS_mstep_updates_parameters_poisson()
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
     StateSpaceDynamics.estep!(
-        slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-        obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        slds_ws;
+        obs_seq=obs_seq,
+        ctrl_seq=ctrl_seq,
+        seq_ends=seq_ends,
     )
 
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, y, sws;
-        obs_seq=obs_seq, seq_ends=seq_ends,
+        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
     )
 
     for k in 1:K

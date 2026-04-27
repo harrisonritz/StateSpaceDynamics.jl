@@ -35,8 +35,7 @@ Initialize a `TrialFilterSmooth` with one `FilterSmooth` per trial. Trial length
 differ.
 """
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O},
-    tsteps_per_trial::AbstractVector{<:Integer},
+    model::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{<:Integer}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     filter_smooths = [initialize_FilterSmooth(model, Int(t)) for t in tsteps_per_trial]
     return TrialFilterSmooth(filter_smooths)
@@ -160,15 +159,11 @@ function Random.rand(
 
     if ntrials > 10
         Threads.@threads for trial in 1:ntrials
-            _sample_trial!(
-                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model
-            )
+            _sample_trial!(rng, x[trial], y[trial], state_params, obs_params, lds.obs_model)
         end
     else
         for trial in 1:ntrials
-            _sample_trial!(
-                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model
-            )
+            _sample_trial!(rng, x[trial], y[trial], state_params, obs_params, lds.obs_model)
         end
     end
 
@@ -1128,10 +1123,10 @@ function update_Q!(
 
             mul!(temp5, A, μtm1)
             # innovation_cov += α * x * y'
-            mul!(innovation_cov, reshape(μt, :, 1),    reshape(b,     1, :), -one(T), one(T))  # -= μt*b'
-            mul!(innovation_cov, reshape(b,  :, 1),    reshape(μt,    1, :), -one(T), one(T))  # -= b*μt'
-            mul!(innovation_cov, reshape(temp5, :, 1), reshape(b,     1, :),  one(T), one(T))  # += temp5*b'
-            mul!(innovation_cov, reshape(b,  :, 1),    reshape(temp5, 1, :),  one(T), one(T))  # += b*temp5'
+            mul!(innovation_cov, reshape(μt, :, 1), reshape(b, 1, :), -one(T), one(T))  # -= μt*b'
+            mul!(innovation_cov, reshape(b, :, 1), reshape(μt, 1, :), -one(T), one(T))  # -= b*μt'
+            mul!(innovation_cov, reshape(temp5, :, 1), reshape(b, 1, :), one(T), one(T))  # += temp5*b'
+            mul!(innovation_cov, reshape(b, :, 1), reshape(temp5, 1, :), one(T), one(T))  # += b*temp5'
 
             innovation_cov .+= bbT
 
@@ -1315,9 +1310,11 @@ function fit!(
         _ in 1:Threads.maxthreadid()
     ]
 
-    prog = progress ? Progress(
-        max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true
-    ) : nothing
+    prog = if progress
+        Progress(max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
 
     for _ in 1:max_iter
         elbo = estep!(lds, tfs, y, sws_pool)
@@ -1338,9 +1335,7 @@ function fit!(
 end
 
 function fit!(
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T};
-    kwargs...,
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}; kwargs...
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     return fit!(lds, [y]; kwargs...)
 end

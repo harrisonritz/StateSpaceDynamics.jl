@@ -330,7 +330,10 @@ function test_parameter_gradient()
         val = zero(eltype(params))
         for t in 1:tsteps
             h_t = C * E_z[:, t] .+ d
-            rho_t = [eltype(params)(0.5) * dot(C[i, :], P_smooth[:, :, t] * C[i, :]) for i in 1:size(C, 1)]
+            rho_t = [
+                eltype(params)(0.5) * dot(C[i, :], P_smooth[:, :, t] * C[i, :]) for
+                i in 1:size(C, 1)
+            ]
             val += dot(y1[:, t], h_t) - sum(exp.(h_t .+ rho_t))
         end
         return -val
@@ -435,13 +438,13 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         StateSpaceDynamics.compute_smooth_constants!(ws, plds)
 
         Q0 = sum(
-            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k])
-            for k in 1:N
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
+            k in 1:N
         )
         StateSpaceDynamics.update_observation_model!(plds, tfs, Y, ws)  # LBFGS inside
         Q1 = sum(
-            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k])
-            for k in 1:N
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
+            k in 1:N
         )
 
         @test Q1 ≥ Q0 - 1e-7

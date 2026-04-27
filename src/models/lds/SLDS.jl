@@ -47,9 +47,7 @@ function Random.rand(
 end
 
 function Random.rand(
-    rng::AbstractRNG,
-    slds::SLDS{T,S,O},
-    tsteps_per_trial::AbstractVector{<:Integer},
+    rng::AbstractRNG, slds::SLDS{T,S,O}, tsteps_per_trial::AbstractVector{<:Integer}
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
@@ -770,13 +768,14 @@ function smooth!(
         return nothing
     end
 
-    solve_dir! = (pcur, gcur) -> begin
-        gvec = vec(gcur)
-        pvec = vec(pcur)
-        copyto!(pvec, gvec)
-        block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
-        return nothing
-    end
+    solve_dir! =
+        (pcur, gcur) -> begin
+            gvec = vec(gcur)
+            pvec = vec(pcur)
+            copyto!(pvec, gvec)
+            block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
+            return nothing
+        end
 
     newton_smooth!(
         Val(:max),
@@ -989,8 +988,7 @@ function estep!(
 
     # Single batched forward-backward (HMMs.jl threads across trials internally).
     HMMs.forward_backward!(
-        fb_storage, dl, obs_seq, ctrl_seq;
-        seq_ends=seq_ends, transition_marginals=true,
+        fb_storage, dl, obs_seq, ctrl_seq; seq_ends=seq_ends, transition_marginals=true
     )
 
     total_elbo = zero(T)
@@ -1130,9 +1128,11 @@ function fit!(
     x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
     randn_buf = Vector{T}(undef, latent_dim)
 
-    prog = progress ? Progress(
-        max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true
-    ) : nothing
+    prog = if progress
+        Progress(max_iter; desc="Fitting SLDS via EM...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
     elbos = Vector{T}(undef, max_iter)
 
     # Warm-start: smooth once per trial with uniform discrete weights.
@@ -1146,15 +1146,20 @@ function fit!(
         sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
         elbo = estep!(
-            slds, tfs, fb_storage, dl, y, x_samples, slds_ws;
-            obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+            slds,
+            tfs,
+            fb_storage,
+            dl,
+            y,
+            x_samples,
+            slds_ws;
+            obs_seq=obs_seq,
+            ctrl_seq=ctrl_seq,
+            seq_ends=seq_ends,
         )
         elbos[iter] = elbo
 
-        mstep!(
-            slds, tfs, fb_storage, dl, y, sws;
-            obs_seq=obs_seq, seq_ends=seq_ends,
-        )
+        mstep!(slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends)
         refresh_slds_constants!(slds_ws, slds)
 
         if prog !== nothing

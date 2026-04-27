@@ -399,8 +399,7 @@ Dispatches on the observation model type:
 - Poisson: only computes state model terms (observation terms are x-dependent).
 """
 function compute_smooth_constants!(
-    ws::SmoothWorkspace{WT},
-    lds::LinearDynamicalSystem{T,S,O},
+    ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q
@@ -457,8 +456,7 @@ function compute_smooth_constants!(
 end
 
 function compute_smooth_constants!(
-    ws::SmoothWorkspace{WT},
-    lds::LinearDynamicalSystem{T,S,O},
+    ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q

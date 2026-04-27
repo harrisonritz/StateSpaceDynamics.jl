@@ -770,7 +770,6 @@ function update_observation_model!(
     sws::SmoothWorkspace{T},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-
     plds.fit_bool[5] || return nothing
 
     obs_dim = plds.obs_dim
@@ -799,8 +798,8 @@ function update_observation_model!(
     end
 
     function g!(grad::Vector{T}, params::Vector{T})
-        C_view     = reshape(view(params, 1:C_size), obs_dim, latent_dim)
-        log_d_view = view(params, C_size+1:C_size+obs_dim)
+        C_view = reshape(view(params, 1:C_size), obs_dim, latent_dim)
+        log_d_view = view(params, (C_size + 1):(C_size + obs_dim))
         return gradient_observation_model!(grad, C_view, log_d_view, tfs, y, w)
     end
 
@@ -808,19 +807,16 @@ function update_observation_model!(
         x_reltol=1e-12, x_abstol=1e-12, g_abstol=1e-12, f_reltol=1e-12, f_abstol=1e-12
     )
 
-    result = optimize(
-        f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts
-    )
+    result = optimize(f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts)
 
     # write final params back
     @views begin
-        plds.obs_model.C     .= reshape(result.minimizer[1:C_size], obs_dim, latent_dim)
-        plds.obs_model.log_d .= result.minimizer[C_size+1:C_size+obs_dim]
+        plds.obs_model.C .= reshape(result.minimizer[1:C_size], obs_dim, latent_dim)
+        plds.obs_model.log_d .= result.minimizer[(C_size + 1):(C_size + obs_dim)]
     end
 
     return nothing
 end
-
 
 """
     mstep!(plds, tfs, y, w)
@@ -1057,13 +1053,14 @@ function smooth!(
         return nothing
     end
 
-    solve_dir! = (pcur, gcur) -> begin
-        gvec = vec(gcur)
-        pvec = vec(pcur)
-        copyto!(pvec, gvec)
-        block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
-        return nothing
-    end
+    solve_dir! =
+        (pcur, gcur) -> begin
+            gvec = vec(gcur)
+            pvec = vec(pcur)
+            copyto!(pvec, gvec)
+            block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
+            return nothing
+        end
 
     newton_smooth!(
         Val(:max),
@@ -1220,9 +1217,16 @@ function fit!(
 
     elbos = Vector{T}(undef, max_iter)
 
-    prog = progress ? Progress(
-        max_iter; desc="Fitting Poisson LDS via LaPlaceEM...", barlen=50, showspeed=true
-    ) : nothing
+    prog = if progress
+        Progress(
+            max_iter;
+            desc="Fitting Poisson LDS via LaPlaceEM...",
+            barlen=50,
+            showspeed=true,
+        )
+    else
+        nothing
+    end
 
     for iter in 1:max_iter
         elbos[iter] = estep!(
@@ -1243,9 +1247,7 @@ function fit!(
 end
 
 function fit!(
-    plds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T};
-    kwargs...,
+    plds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}; kwargs...
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     return fit!(plds, [y]; kwargs...)
 end

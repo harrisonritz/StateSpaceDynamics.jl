@@ -49,7 +49,9 @@ function test_hessian_common(lds, x, y)
     end
 
     tsteps_test = 3
-    ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps_test)
+    ws = StateSpaceDynamics.SmoothWorkspace(
+        Float64, lds.latent_dim, lds.obs_dim, tsteps_test
+    )
 
     for i in eachindex(y)
         yi = y[i][:, 1:tsteps_test]
@@ -148,7 +150,9 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.compute_smooth_constants!(ws, lds)
         Q_val = 0.0
         for i in 1:ntrials
-            Q_val += StateSpaceDynamics.Q_state!(ws, lds, tfs[i].E_z, tfs[i].E_zz, tfs[i].E_zz_prev)
+            Q_val += StateSpaceDynamics.Q_state!(
+                ws, lds, tfs[i].E_z, tfs[i].E_zz, tfs[i].E_zz_prev
+            )
         end
         return -Q_val
     end
@@ -156,10 +160,7 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     P0_sqrt = Matrix(cholesky(P0_orig).U)
 
     x0_opt = optimize(
-        x0 -> obj(x0, P0_sqrt),
-        copy(x0_orig),
-        LBFGS(),
-        Optim.Options(; g_abstol=1e-12),
+        x0 -> obj(x0, P0_sqrt), copy(x0_orig), LBFGS(), Optim.Options(; g_abstol=1e-12)
     ).minimizer
     P0_opt = optimize(P0_ -> obj(x0_opt, P0_), P0_sqrt, LBFGS()).minimizer
 
@@ -199,7 +200,9 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.compute_smooth_constants!(ws, lds)
         val = 0.0
         @views for k in 1:ntrials
-            val += StateSpaceDynamics.Q_state!(ws, lds, tfs[k].E_z, tfs[k].E_zz, tfs[k].E_zz_prev)
+            val += StateSpaceDynamics.Q_state!(
+                ws, lds, tfs[k].E_z, tfs[k].E_zz, tfs[k].E_zz_prev
+            )
         end
         return -val
     end
