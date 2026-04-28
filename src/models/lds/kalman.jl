@@ -67,9 +67,21 @@ function _fit_kalman!(
     for iter in 1:max_iter
 
         estep!(lds, suf, kws, data)
-        mstep!(lds, suf, kws)
         elbo = compute_elbo(kws, suf)
-
+        mstep!(lds, suf, kws)
+        
+        # update vestigial parameters for backward compatibility (to be removed in future)
+        if all(data.u0[:,1] .== 1)
+            lds.state_model.x0 = vec(lds.state_model.B0)
+        end
+        if all(data.d[:,1,:] .== 1)
+            lds.obs_model.d  = vec(lds.obs_model.D)
+        end
+        if all(data.u[:,1,:] .== 1)
+            lds.state_model.b  = vec(lds.state_model.B)
+        end
+        
+        # report progress
         push!(elbos, elbo)
         progress && prog !== nothing && next!(prog)
 
@@ -255,11 +267,6 @@ function precompute_kalman_constants!(
     kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
     
-    @inbounds @views for n in axes(data.y, 3)
-        mul!(kws.CiRY[:,:,n], kws.CiR, data.y[:, :, n] .- kws.Dd[:,:,n]);
-    end
-
-
     # Initial inputs
     B0 = lds.state_model.B0
 
@@ -360,6 +367,13 @@ function precompute_kalman_constants!(
             mul!(kws.Dd[:, :, n], D, data.d[:, :, n])
         end
     end
+
+
+    # update CIRY    
+    @inbounds @views for n in axes(data.y, 3)
+        mul!(kws.CiRY[:,:,n], kws.CiR, data.y[:, :, n] .- kws.Dd[:,:,n]);
+    end
+
 end
 
 
@@ -385,7 +399,8 @@ function forwards_cov!(
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     kws.pred_cov[1] = kws.P0_PD[];
-    kws.filt_cov[1] = PDMat(inv(inv(kws.P0_PD[]) + kws.CiRC[]));
+    kws.pred_icov[1] = inv(kws.pred_cov[1]);
+    kws.filt_cov[1] = inv(kws.CiRC[] + kws.pred_icov[1]);
 
     @inbounds @views for tt in eachindex(kws.filt_cov)[2:end]
 
@@ -456,6 +471,10 @@ function forwards_mean!(
     kws::KalmanWorkspace{T}
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     
+    mul!(kws.mean_tmp, kws.pred_icov[1], kws.pred_mean[:,1,:], 1.0, 0.0)
+    kws.mean_tmp .+= kws.CiRY[:,1,:]
+    mul!(kws.filt_mean[:,1,:], kws.filt_cov[1], kws.mean_tmp, 1.0, 0.0)
+
     @inbounds @views for tt in axes(kws.pred_mean,2)[2:end]
 
         mul!(kws.pred_mean[:,tt,:], lds.state_model.A, kws.filt_mean[:,tt-1,:], 1.0, 0.0);
@@ -828,7 +847,7 @@ function compute_elbo(kws,suf)
     v0 = kws.R_df;
     vN = v0 + (n - kws.obs_input_dim);
     lam0 = kws.CD_lambda;
-    lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
+    lamN = lam0 === nothing ? suf.obs_xx[] : lam0 + suf.obs_xx[];
     Sig0 = kws.R_mu * kws.R_df
     SigN = kws.R_PD[]  * vN;
     XX = suf.obs_xx[]
