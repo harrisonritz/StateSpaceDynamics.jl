@@ -816,12 +816,21 @@ struct KalmanWorkspace{T<:Real}
     Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
-    B0_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
-    P0_mu::Base.RefValue{PDMat{T,Matrix{T}}}
-    AB_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
-    Q_mu::Base.RefValue{PDMat{T,Matrix{T}}}
-    CD_lambda::Base.RefValue{PDMat{T,Matrix{T}}}
-    CD_mu::Base.RefValue{PDMat{T,Matrix{T}}}
+
+    #  Priors
+    B0_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    P0_mu::Matrix{T}
+    P0_df::Int
+
+    AB_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    Q_mu::Matrix{T}
+    Q_df::Int
+
+    CD_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    R_mu::Matrix{T}
+    R_df::Int
+
+    # Derived terms for Kalman gain and LL computation (refreshed each E-step)
     CiR::Matrix{T}                              # C' * R^{-1}   (D × p)
     CiRC::Base.RefValue{PDMat{T,Matrix{T}}}     # C' * R^{-1} * C  (D × D), symmetric
     shared_entropy::Base.RefValue{T}
@@ -834,6 +843,8 @@ struct KalmanWorkspace{T<:Real}
     CiRY::Array{T,3}         # (D, T, ntrials)
     y_minus_d::Array{T,3}    # (p, T, ntrials)
     Dd::Array{T,3}           # (p, T, ntrials)
+
+
 end
 
 """
@@ -855,9 +866,48 @@ function KalmanWorkspace(
     placeholder_D = PDMat(Matrix{T}(I, D, D))
     placeholder_p = PDMat(Matrix{T}(I, p, p))
 
-    placeholder_B0 = PDMat(Matrix{T}(I, init_input_dim, init_input_dim))
-    placeholder_AB = PDMat(Matrix{T}(I, D+state_input_dim, D+state_input_dim))
-    placeholder_CD = PDMat(Matrix{T}(I, D+obs_input_dim, D+obs_input_dim))
+    if isnothing(lds.state_model.B0_lambda)
+        placeholder_B0 = nothing
+    else
+        placeholder_B0 = PDMat(lds.state_model.B0_lambda)
+    end
+
+    if isnothing(lds.state_model.AB_lambda)
+        placeholder_AB = nothing
+    else
+        placeholder_AB = PDMat(lds.state_model.AB_lambda)
+    end
+
+    if isnothing(lds.obs_model.CD_lambda)
+        placeholder_CD = nothing
+    else
+        placeholder_CD = PDMat(lds.state_model.CD_lambda)
+    end
+
+    if isnothing(lds.state_model.P0_prior)
+        placeholder_P0_mu = zeros(T, D, D)
+        placeholder_P0_df = 0
+    else
+        placeholder_P0_mu = PDMat(lds.state_model.P0_prior.Ψ)
+        placeholder_P0_df = lds.state_model.P0_prior.ν
+    end
+
+    if isnothing(lds.state_model.Q_prior)
+        placeholder_Q_mu = zeros(T, D, D)
+        placeholder_Q_df = 0
+    else
+        placeholder_Q_mu = PDMat(lds.state_model.Q_prior.Ψ)
+        placeholder_Q_df = lds.state_model.Q_prior.ν
+    end
+
+    if isnothing(lds.obs_model.R_prior)
+        placeholder_R_mu = zeros(T, p, p)
+        placeholder_R_df = 0
+    else
+        placeholder_R_mu = PDMat(lds.obs_model.R_prior.Ψ)
+        placeholder_R_df = lds.obs_model.R_prior.ν
+    end
+    
 
     pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
@@ -899,12 +949,16 @@ function KalmanWorkspace(
         Ref(placeholder_D),             # Q_PD
         Ref(placeholder_D),             # P0_PD
         Ref(placeholder_p),             # R_PD
-        Ref(placeholder_B0),            # B0_lambda
-        Ref(placeholder_D),             # P0_mu 
-        Ref(placeholder_AB),            # AB_lambda
-        Ref(placeholder_D),             # Q_mu
-        Ref(placeholder_CD),            # CD_lambda 
-        Ref(placeholder_p),             # R_mu
+        
+        placeholder_B0,                 # B0_lambda
+        placeholder_P0_mu,              # P0_mu
+        placeholder_P0_df,              # P0_df 
+        placeholder_AB,                 # AB_lambda
+        placeholder_Q_mu,               # Q_mu
+        placeholder_Q_df,               # Q_df
+        placeholder_CD,                 # CD_lambda 
+        placeholder_R_mu,               # R_mu
+        placeholder_Q_df,               # R_df
         zeros(T, D, p),                 # CiR
         Ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
