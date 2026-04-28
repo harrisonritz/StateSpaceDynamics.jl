@@ -743,8 +743,8 @@ log_post(
                                 -0.5*v*logdet(lamN) .+
                                 0.5*v0*logdet(0.5 .* Sig0) .+
                                 -0.5*vN*logdet(0.5 .* SigN) .+
-                                SpecialFunctions.loggamma(0.5 .* v0) .+ 
-                                -SpecialFunctions.loggamma(0.5 .* vN);
+                                -SpecialFunctions.loggamma(0.5 .* v0) .+ 
+                                SpecialFunctions.loggamma(0.5 .* vN);
 
 
 # no beta prior
@@ -761,8 +761,8 @@ log_post(
                                 -0.5*v*logdet(lamN) .+
                                 0.5*v0*logdet(0.5 .* Sig0) .+
                                 -0.5*vN*logdet(0.5 .* SigN) .+
-                                SpecialFunctions.loggamma(0.5 .* v0) .+ 
-                                -SpecialFunctions.loggamma(0.5 .* vN);
+                                -SpecialFunctions.loggamma(0.5 .* v0) .+ 
+                                SpecialFunctions.loggamma(0.5 .* vN);
     
                                 
 # no cov prior
@@ -777,7 +777,7 @@ log_post(
                                 0.5*v*logdet(lam0) .+ 
                                 -0.5*v*logdet(lamN) .+
                                 -0.5*vN*logdet(0.5 .* SigN) .+
-                                -SpecialFunctions.loggamma(0.5 .* vN);
+                                SpecialFunctions.loggamma(0.5 .* vN);
 
 
 # no prior
@@ -791,7 +791,7 @@ log_post(
     ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
                                 -0.5*v*logdet(lamN) .+
                                 -0.5*vN*logdet(0.5 .* SigN) .+
-                                -SpecialFunctions.loggamma(0.5 .* vN);
+                                SpecialFunctions.loggamma(0.5 .* vN);
 
 
 function compute_elbo(kws,suf)
@@ -807,37 +807,35 @@ function compute_elbo(kws,suf)
     lamN = lam0 === nothing ? suf.init_xx[] : lam0 + suf.init_xx[];
     Sig0 = kws.P0_mu * kws.P0_df
     SigN = kws.P0_PD[]  * vN;
-    XX = suf.init_xx[]
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
     else
         elbo += log_post(n,v,vN,lam0,lamN,SigN)
     end
 
     if abs(elbo) == Inf
-        @show n v v0 vN lam0 XX Sig0 SigN
+        @show n v v0 vN lam0 lamN Sig0 SigN
     end
 
     # Dynamics --------------------------------------
     n = suf.dyn_n
     v = kws.latent_dim;
     v0 = kws.Q_df;
-    vN = v0 + (n - kws.state_input_dim);
+    vN = v0 + (n - (kws.latent_dim + kws.state_input_dim));
     lam0 = kws.AB_lambda;
     lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
     Sig0 = kws.Q_mu * kws.Q_df
     SigN = kws.Q_PD[]  * vN;
-    XX = suf.dyn_xx[]
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
     else
         elbo += log_post(n,v,vN,lam0,lamN,SigN)
     end
 
     if abs(elbo) == Inf
-        @show n v v0 vN lam0 XX Sig0 SigN
+        @show n v v0 vN lam0 lamN Sig0 SigN
     end
 
 
@@ -845,20 +843,19 @@ function compute_elbo(kws,suf)
     n = suf.obs_n
     v = kws.obs_dim;
     v0 = kws.R_df;
-    vN = v0 + (n - kws.obs_input_dim);
+    vN = v0 + (n - (kws.obs_dim + kws.obs_input_dim));
     lam0 = kws.CD_lambda;
     lamN = lam0 === nothing ? suf.obs_xx[] : lam0 + suf.obs_xx[];
     Sig0 = kws.R_mu * kws.R_df
     SigN = kws.R_PD[]  * vN;
-    XX = suf.obs_xx[]
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
     else
         elbo += log_post(n,v,vN,lam0,lamN,SigN)
     end
     if abs(elbo) == Inf
-        @show n v v0 vN lam0 XX Sig0 SigN
+        @show n v v0 vN lam0 lamN Sig0 SigN
     end
 
 
