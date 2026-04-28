@@ -68,7 +68,7 @@ function _fit_kalman!(
 
         estep!(lds, suf, kws, data)
         mstep!(lds, suf, kws)
-        elbo = elbo(lds, suf, kws; data)
+        elbo = compute_elbo(kws, suf)
 
         push!(elbos, elbo)
         progress && prog !== nothing && next!(prog)
@@ -100,24 +100,18 @@ function format_kf_data!(
         u0_formatted = ones(T, 1, ntrials)
         lds.state_model.B0 = reshape(lds.state_model.x0, :, 1)
 
-        println("\nu0 shape = ($(size(u0_formatted)))")
-        println("state_model.B0 shape = ($(size(lds.state_model.B0)))")
     end
 
     if u === nothing
         u_formatted = ones(T, 1, tsteps, ntrials)
         lds.state_model.B = reshape(lds.state_model.b, :, 1)
 
-        println("\nu shape = ($(size(u_formatted)))")
-        println("state_model.B shape = ($(size(lds.state_model.B)))")
     end
 
     if d === nothing
         d_formatted = ones(T, 1, tsteps, ntrials)
         lds.obs_model.D = reshape(lds.obs_model.d, :, 1)
 
-        println("\nd shape = ($(size(d_formatted)))")
-        println("obs_model.D shape = ($(size(lds.obs_model.D)))")
     end
 
     data = Data(
@@ -152,7 +146,6 @@ function initialize_SufficientStatistics(
     PD_init(T, dim) = PDMat(diagm(ones(T,dim)))
 
     # precompute initial conditions
-    init_n = size(data.u0, 2)
     init_xx = zeros(T, u0_dim, u0_dim);
     mul!(init_xx, data.u0, data.u0', 1.0, 0.0);
     
@@ -249,44 +242,6 @@ function precompute_kalman_constants!(
     kws.P0_PD[] = tol_PD(lds.state_model.P0; tol=tol)
     kws.Q_PD[]  = tol_PD(lds.state_model.Q;  tol=tol)
     kws.R_PD[]  = tol_PD(lds.obs_model.R;    tol=tol)
-
-    if isnothing(lds.state_model.B0_lambda)
-        kws.B0_lambda = nothing
-    else
-        kws.B0_lambda[] = PDMat(lds.state_model.B0_lambda)
-    end
-
-    if isnothing(lds.state_model.AB_lambda)
-        kws.AB_lambda = nothing
-    else
-        kws.AB_lambda[] = PDMat(lds.state_model.AB_lambda)
-    end
-
-    if isnothing(lds.obs_model.CD_lambda)
-        kws.CD_lambda = nothing
-    else
-        kws.CD_lambda[] = PDMat(lds.obs_model.CD_lambda)
-    end
-
-    if isnothing(lds.state_model.P0_prior)
-        kws.P0_mu = nothing
-    else
-        kws.P0_mu[] = PDMat(lds.state_model.P0_prior.Ψ)
-    end
-
-    if isnothing(lds.state_model.Q_prior)
-        kws.Q_mu = nothing
-    else
-        kws.Q_mu[] = PDMat(lds.state_model.Q_prior.Ψ)
-    end
-
-    if isnothing(lds.obs_model.R_prior)
-        kws.R_mu = nothing
-    else
-        kws.R_mu[] = PDMat(lds.obs_model.R_prior.Ψ)
-    end
-
-
 
     C = lds.obs_model.C
     copyto!(kws.CiR, C'/kws.R_PD[])
@@ -447,7 +402,7 @@ function backwards_cov!(
     # At = lds.state_model.A'
 
     # smooth covariance ================================
-    kws.smooth_xcov = zeros(T, kws.latent_dim, kws.latent_dim)
+    kws.smooth_xcov .= zeros(T, kws.latent_dim, kws.latent_dim)
     @inbounds @views for tt in eachindex(kws.filt_cov)[end-1:-1:1]
 
         # reverse kalman gain
@@ -590,7 +545,7 @@ end
     mul!(dyn_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], u_prev, x_prev', 1.0, 0.0)
     suf.dyn_xx[] = tol_PD(dyn_xx);
     # dyn_xy
-    suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov[1:end-1] .* kws.ntrials;
+    suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov .* kws.ntrials;
     mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 0.0)
     # dyn_yy
     suf.dyn_yy[] = aggregate_xx(x_next, kws.smooth_cov[2:end], kws.ntrials);
@@ -617,27 +572,48 @@ end
 
 
 # ==== M-STEP =============================================================================
-regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}) where {T<:Real} = (XX + prior_lambda) \ XY
-# regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}) where {T<:Real} = XX \ XY
+regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}) where {T<:Real} = transpose((XX + prior_lambda) \ XY)
+regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::Nothing) where {T<:Real} = transpose(XX \ XY)
 
 function est_cov(
     W::AbstractMatrix{T},
     XX::PDMat{T,Matrix{T}},
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
-    N::T,
+    N::Int,
     prior_lambda::PDMat{T,Matrix{T}},
-    prior_df::T,
-    prior_mu::T,
+    prior_df::Int,
+    prior_mu::AbstractMatrix{T},
     )::Matrix{T} where {T<:Real} 
 
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) + (prior_df * prior_mu)) / 
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+ (prior_df * prior_mu)) / 
                 ((N + prior_df) - size(XX,1));
 
     return tol_PD(Cov).mat # make PD, but don't save as PDMat
 end
+
+
+function est_cov(
+    W::AbstractMatrix{T},
+    XX::PDMat{T,Matrix{T}},
+    XY::AbstractMatrix{T},
+    YY::PDMat{T,Matrix{T}},
+    N::Int,
+    prior_lambda::Nothing,
+    prior_df::Int,
+    prior_mu::AbstractMatrix{T},
+    )::Matrix{T} where {T<:Real} 
+
+    Wxy = W*XY;
+
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / 
+                ((N + prior_df) - size(XX,1));
+
+    return tol_PD(Cov).mat # make PD, but don't save as PDMat
+end
+
 
 
 function mstep!(
@@ -648,19 +624,19 @@ function mstep!(
 
     # initials ===============================================
     B0 = regress(
-        suf.init_xx, 
+        suf.init_xx[], 
         suf.init_xy, 
-        kws.B0_lambda[])
+        kws.B0_lambda)
 
     P0 = est_cov(
         B0,
-        suf.init_xx,
+        suf.init_xx[],
         suf.init_xy,
-        suf.init_yy,
+        suf.init_yy[],
         suf.init_n,
-        kws.B0_lambda[],
+        kws.B0_lambda,
         kws.P0_df,
-        kws.P0_mu[],
+        kws.P0_mu,
     )
 
     lds.state_model.B0 = B0
@@ -669,22 +645,22 @@ function mstep!(
 
     # dynamics ===============================================
     AB = regress(
-        suf.dyn_xx, 
+        suf.dyn_xx[], 
         suf.dyn_xy, 
-        kws.AB_lambda[])
+        kws.AB_lambda)
 
     A = AB[:, 1:kws.latent_dim];
     B = AB[:, (kws.latent_dim+1):end];
 
     Q = est_cov(
         AB,
-        suf.dyn_xx,
+        suf.dyn_xx[],
         suf.dyn_xy,
-        suf.dyn_yy,
+        suf.dyn_yy[],
         suf.dyn_n,
-        kws.AB_lambda[],
+        kws.AB_lambda,
         kws.Q_df,
-        kws.Q_mu[],
+        kws.Q_mu,
     )
 
     lds.state_model.A = A
@@ -694,26 +670,171 @@ function mstep!(
 
     # observations ===============================================
     CD = regress(
-        suf.obs_xx, 
+        suf.obs_xx[], 
         suf.obs_xy, 
-        kws.CD_lambda[])
+        kws.CD_lambda)
     
     C = CD[:, 1:kws.latent_dim];
     D = CD[:, (kws.latent_dim+1):end];
 
     R = est_cov(
         CD,
-        suf.obs_xx,
+        suf.obs_xx[],
         suf.obs_xy,
-        suf.obs_yy,
+        suf.obs_yy[],
         suf.obs_n,
-        kws.CD_lambda[],
+        kws.CD_lambda,
         kws.R_df,
-        kws.R_mu[],
+        kws.R_mu,
     )
 
     lds.obs_model.C = C
     lds.obs_model.D = D
     lds.obs_model.R = R
+
+end
+
+
+
+
+# ==== COMPUTE ELBO =============================================================================
+
+
+# full priors
+log_post(
+    n::Int,
+    v::Int,
+    v0::Int,
+    vN::Int,
+    lam0::PDMat{T,Matrix{T}},
+    lamN::PDMat{T,Matrix{T}},
+    Sig0::Matrix{T},
+    SigN::PDMat{T,Matrix{T}},
+    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
+                                0.5*v*logdet(lam0) .+ 
+                                -0.5*v*logdet(lamN) .+
+                                0.5*v0*logdet(0.5 .* Sig0) .+
+                                -0.5*vN*logdet(0.5 .* SigN) .+
+                                SpecialFunctions.loggamma(0.5 .* v0) .+ 
+                                -SpecialFunctions.loggamma(0.5 .* vN);
+
+
+# no beta prior
+log_post(
+    n::Int,
+    v::Int,
+    v0::Int,
+    vN::Int,
+    lam0::Nothing,
+    lamN::PDMat{T,Matrix{T}},
+    Sig0::Matrix{T},
+    SigN::PDMat{T,Matrix{T}},
+    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
+                                -0.5*v*logdet(lamN) .+
+                                0.5*v0*logdet(0.5 .* Sig0) .+
+                                -0.5*vN*logdet(0.5 .* SigN) .+
+                                SpecialFunctions.loggamma(0.5 .* v0) .+ 
+                                -SpecialFunctions.loggamma(0.5 .* vN);
+    
+                                
+# no cov prior
+log_post(
+    n::Int,
+    v::Int,
+    vN::Int,
+    lam0::PDMat{T,Matrix{T}},
+    lamN::PDMat{T,Matrix{T}},
+    SigN::PDMat{T,Matrix{T}},
+    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
+                                0.5*v*logdet(lam0) .+ 
+                                -0.5*v*logdet(lamN) .+
+                                -0.5*vN*logdet(0.5 .* SigN) .+
+                                -SpecialFunctions.loggamma(0.5 .* vN);
+
+
+# no prior
+log_post(
+    n::Int,
+    v::Int,
+    vN::Int,
+    lam0::Nothing,
+    lamN::PDMat{T,Matrix{T}},
+    SigN::PDMat{T,Matrix{T}},
+    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
+                                -0.5*v*logdet(lamN) .+
+                                -0.5*vN*logdet(0.5 .* SigN) .+
+                                -SpecialFunctions.loggamma(0.5 .* vN);
+
+
+function compute_elbo(kws,suf)
+
+    elbo = 0.0;
+
+    # Initial Conditions --------------------------------------
+    n = suf.init_n
+    v = kws.latent_dim;
+    v0 = kws.P0_df;
+    vN = v0 + (n - kws.init_input_dim);
+    lam0 = kws.B0_lambda;
+    lamN = lam0 === nothing ? suf.init_xx[] : lam0 + suf.init_xx[];
+    Sig0 = kws.P0_mu * kws.P0_df
+    SigN = kws.P0_PD[]  * vN;
+    XX = suf.init_xx[]
+
+    if v0 > 0
+        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+    else
+        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+    end
+
+    if abs(elbo) == Inf
+        @show n v v0 vN lam0 XX Sig0 SigN
+    end
+
+    # Dynamics --------------------------------------
+    n = suf.dyn_n
+    v = kws.latent_dim;
+    v0 = kws.Q_df;
+    vN = v0 + (n - kws.state_input_dim);
+    lam0 = kws.AB_lambda;
+    lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
+    Sig0 = kws.Q_mu * kws.Q_df
+    SigN = kws.Q_PD[]  * vN;
+    XX = suf.dyn_xx[]
+
+    if v0 > 0
+        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+    else
+        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+    end
+
+    if abs(elbo) == Inf
+        @show n v v0 vN lam0 XX Sig0 SigN
+    end
+
+
+    # Observations --------------------------------------
+    n = suf.obs_n
+    v = kws.obs_dim;
+    v0 = kws.R_df;
+    vN = v0 + (n - kws.obs_input_dim);
+    lam0 = kws.CD_lambda;
+    lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
+    Sig0 = kws.R_mu * kws.R_df
+    SigN = kws.R_PD[]  * vN;
+    XX = suf.obs_xx[]
+
+    if v0 > 0
+        elbo += log_post(n,v,v0,vN,lam0,XX,Sig0,SigN)
+    else
+        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+    end
+    if abs(elbo) == Inf
+        @show n v v0 vN lam0 XX Sig0 SigN
+    end
+
+
+
+    return elbo
 
 end
