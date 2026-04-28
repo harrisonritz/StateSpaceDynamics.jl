@@ -34,8 +34,8 @@ kf_config = BenchConfig(
     4,   # latent_dims
     8,      # obs_dims
     100,         # seq_length
-    1,          # n_iters (EM iterations per fit)
-    512,         # n_repeats (benchmark samples)
+    50,          # n_iters (EM iterations per fit)
+    1,         # n_repeats (benchmark samples)
 )
 
 const NUM_TRIALS = 100
@@ -120,6 +120,12 @@ params = init_params(rng, latent_dim, obs_dim)
 # held-out test set drawn from the true generative model.
 ref = build_lds(params, false)
 
+println("\n\nTrue generative model ---------------------\n")
+show(ref)
+eigenvals = eigvals(ref.state_model.A)
+println("\nEigenvalues of A: ", eigenvals)
+println("Spectral radius of A: ", maximum(abs.(eigenvals)))
+
 
 _, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
 _, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
@@ -131,22 +137,33 @@ n_obs = obs_dim * kf_config.seq_length * NUM_TRIALS
 
 # %% fit model
 print("  $(rpad(string(name), 8)) ")
-model = build_lds(params, kf)
+params0 = init_params(rng, latent_dim, obs_dim)
+model = build_lds(params0, kf)
+
+println("\n\nInitial model ---------------------\n")
+show(model)
 
 # Warm up / precompile
-SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-50, progress=false)
+SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-8, progress=false)
 
 max_iter = kf_config.n_iters
 bench = @benchmark SSD.fit!(m, $y;
                             max_iter=$max_iter,
-                            tol=1e-50,
+                            tol=1e-8,
                             progress=true) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
 
 
 # Fit once outside the benchmark to get final parameters for evaluation.
 fitted = deepcopy(model)
-SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-50, progress=false)
+SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-8, progress=false)
 test_loglik = SSD.filter_loglikelihood(fitted, y_test)
+
+println("\n\nFitted model ---------------------\n")
+show(fitted)
+eigenvals = eigvals(fitted.state_model.A)
+println("\nEigenvalues of A: ", eigenvals)
+println("Spectral radius of A: ", maximum(abs.(eigenvals)))
+
 
 display(bench)
 @printf("test_ll = %.6f\n", test_loglik)

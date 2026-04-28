@@ -64,7 +64,7 @@ function _fit_kalman!(
 
     prog = progress ? Progress(max_iter; desc="Fitting LDS (Kalman) via EM...", barlen=50, showspeed=true) : nothing
 
-    for _ in 1:max_iter
+    for iter in 1:max_iter
 
         estep!(lds, suf, kws, data)
         mstep!(lds, suf, kws)
@@ -73,7 +73,10 @@ function _fit_kalman!(
         push!(elbos, elbo)
         progress && prog !== nothing && next!(prog)
 
-        if abs(elbo - prev_elbo) < tol
+
+        if (elbo - prev_elbo) < 0
+            # @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
+        elseif (elbo - prev_elbo) < tol
             progress && prog !== nothing && finish!(prog)
             return elbos
         end
@@ -99,19 +102,22 @@ function format_kf_data!(
     if u0 === nothing
         u0_formatted = ones(T, 1, ntrials)
         lds.state_model.B0 = reshape(lds.state_model.x0, :, 1)
-
+    else
+        u0_formatted = u0
     end
 
     if u === nothing
         u_formatted = ones(T, 1, tsteps, ntrials)
         lds.state_model.B = reshape(lds.state_model.b, :, 1)
-
+    else
+        u_formatted = u
     end
 
     if d === nothing
         d_formatted = ones(T, 1, tsteps, ntrials)
         lds.obs_model.D = reshape(lds.obs_model.d, :, 1)
-
+    else
+        d_formatted = d
     end
 
     data = Data(
@@ -124,6 +130,7 @@ function format_kf_data!(
     return data
 
 end
+
 
 
 function initialize_SufficientStatistics(
@@ -546,7 +553,7 @@ end
     suf.dyn_xx[] = tol_PD(dyn_xx);
     # dyn_xy
     suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov .* kws.ntrials;
-    mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 0.0)
+    mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 1.0)
     # dyn_yy
     suf.dyn_yy[] = aggregate_xx(x_next, kws.smooth_cov[2:end], kws.ntrials);
 
@@ -588,7 +595,7 @@ function est_cov(
 
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+ (prior_df * prior_mu)) / 
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) + (prior_df * prior_mu)) / 
                 ((N + prior_df) - size(XX,1));
 
     return tol_PD(Cov).mat # make PD, but don't save as PDMat
@@ -608,7 +615,7 @@ function est_cov(
 
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / 
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) + (prior_df * prior_mu)) / 
                 ((N + prior_df) - size(XX,1));
 
     return tol_PD(Cov).mat # make PD, but don't save as PDMat
