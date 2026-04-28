@@ -75,7 +75,7 @@ function _fit_kalman!(
 
 
         if (elbo - prev_elbo) < 0
-            # @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
+            @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
         elseif (elbo - prev_elbo) < tol
             progress && prog !== nothing && finish!(prog)
             return elbos
@@ -288,7 +288,7 @@ function precompute_kalman_constants!(
     end
 
     if data.u0 !== nothing
-        mul!(kws.pred_mean[:,1,:], B0, data.u0, 1.0, 1.0);
+        mul!(kws.pred_mean[:,1,:], B0, data.u0);
     end
 
 
@@ -534,7 +534,7 @@ end
     suf.init_n = kws.ntrials
     # init_xx (preset)
     # init_xy
-    mul!(suf.init_xy, data.u0, kws.pred_mean[:,1,:]', 1.0, 0.0);
+    mul!(suf.init_xy, data.u0, kws.smooth_mean[:,1,:]', 1.0, 0.0);
     # init_yy
     suf.init_yy[] = aggregate_xx(kws.smooth_mean[:,1,:], kws.smooth_cov[1], suf.init_n);
 
@@ -554,6 +554,8 @@ end
     # dyn_xy
     suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov .* kws.ntrials;
     mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 1.0)
+    mul!(suf.dyn_xy[(kws.latent_dim+1):end,:], u_prev, x_next', 1.0, 0.0)
+
     # dyn_yy
     suf.dyn_yy[] = aggregate_xx(x_next, kws.smooth_cov[2:end], kws.ntrials);
 
