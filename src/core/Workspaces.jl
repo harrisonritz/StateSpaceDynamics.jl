@@ -958,7 +958,7 @@ function KalmanWorkspace(
         placeholder_Q_df,               # Q_df
         placeholder_CD,                 # CD_lambda 
         placeholder_R_mu,               # R_mu
-        placeholder_Q_df,               # R_df
+        placeholder_R_df,               # R_df
         zeros(T, D, p),                 # CiR
         Ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
