@@ -118,14 +118,7 @@ params = init_params(rng, latent_dim, obs_dim)
 
 # Both methods fit the same training data and are evaluated on the same
 # held-out test set drawn from the true generative model.
-ref = build_lds(params, false)
-
-println("\n\nTrue generative model ---------------------\n")
-show(ref)
-gen_eigenvals = eigvals(ref.state_model.A)
-println("\nEigenvalues of A: ", gen_eigenvals)
-println("Spectral radius of A: ", maximum(abs.(gen_eigenvals)))
-
+ref = build_lds(params, kf)
 
 _, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
 _, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
@@ -140,11 +133,11 @@ print("  $(rpad(string(name), 8)) ")
 params0 = init_params(rng, latent_dim, obs_dim)
 model = build_lds(params0, kf)
 
-println("\n\nInitial model ---------------------\n")
-show(model)
-
 # Warm up / precompile
 SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-8, progress=false)
+
+VSCodeServer.@profview SSD.fit!(deepcopy(model), y; max_iter=100, tol=1e-8, progress=false)
+
 
 max_iter = kf_config.n_iters
 bench = @benchmark SSD.fit!(m, $y;
@@ -158,8 +151,16 @@ fitted = deepcopy(model)
 SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-8, progress=false)
 test_loglik = SSD.filter_loglikelihood(fitted, y_test)
 
+
+
+println("\n\n------------------------------------------Original model ------------------------------------------\n")
+show(ref)
+
 println("\n\n------------------------------------------Fitted model ------------------------------------------")
 show(fitted)
+
+elbos = SSD.fit!(fitted, y; max_iter=10, tol=1e-6, progress=false)
+println("\n ELBO: $(round.(elbos .- elbos[1], digits=6)) \n")
 
 
 println("\n\n------------------------------------------ Recovery ------------------------------------------")
@@ -179,3 +180,4 @@ println("---------------------\n\n")
 
 display(bench)
 @printf("test_ll = %.6f\n", test_loglik)
+

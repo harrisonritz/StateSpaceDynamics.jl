@@ -175,8 +175,8 @@ end
 
 function GaussianStateModel(
     A::M, Q::M, B::M, B0::M, P0::M,
-) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianStateModel{T,M,V}(;
+) where {T<:Real,M<:AbstractMatrix{T}}
+    return GaussianStateModel{T,M}(;
         A=A,
         Q=Q,
         b=nothing,
@@ -212,8 +212,8 @@ end
 
 function GaussianObservationModel(
     C::M, R::M, D::M,
-) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianObservationModel{T,M,V}(; 
+) where {T<:Real,M<:AbstractMatrix{T}}
+    return GaussianObservationModel{T,M}(; 
     C=C, 
     R=R, 
     d=d, 
