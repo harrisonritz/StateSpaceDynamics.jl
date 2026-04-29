@@ -31,7 +31,7 @@ struct BenchConfig
 end
 
 kf_config = BenchConfig(
-    4,   # latent_dims
+    5,   # latent_dims
     8,      # obs_dims
     100,         # seq_length
     50,          # n_iters (EM iterations per fit)
@@ -134,15 +134,15 @@ params0 = init_params(rng, latent_dim, obs_dim)
 model = build_lds(params0, kf)
 
 # Warm up / precompile
-SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-8, progress=false)
+SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-6, progress=false)
 
-VSCodeServer.@profview SSD.fit!(deepcopy(model), y; max_iter=100, tol=1e-8, progress=false)
+VSCodeServer.@profview SSD.fit!(deepcopy(model), y; max_iter=100, tol=1e-6, progress=false)
 
 
 max_iter = kf_config.n_iters
 bench = @benchmark SSD.fit!(m, $y;
                             max_iter=$max_iter,
-                            tol=1e-8,
+                            tol=1e-6,
                             progress=true) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
 
 

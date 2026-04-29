@@ -18,6 +18,9 @@ using CSV
 using Plots
 using Measures
 
+BLAS.set_num_threads(1)
+set_zero_subnormals(true);
+
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
