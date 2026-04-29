@@ -46,7 +46,7 @@ function _fit_kalman!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    mono_warn::Bool=false,
+    mono_warn::Bool=true,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     eltype(y) === T || error("Observed data must be of type $(T); got $(eltype(y))")
 
@@ -213,7 +213,7 @@ end
 
 # ==== E-STEP =============================================================================
 
-
+# using BenchmarkTools
 
 
 """
@@ -238,6 +238,7 @@ function estep!(
     smooth_mean!(lds, kws)
 
     sufficient_statistics!(suf, kws, data)
+    
 
 end
 
@@ -371,9 +372,9 @@ function precompute_kalman_constants!(
 
 
     # update CIRY
-    @inbounds YMinusD = data.y .- kws.Dd
+    @inbounds kws.y_minus_d .= data.y .- kws.Dd
     @inbounds @views for n in axes(data.y, 3)
-        mul!(kws.CiRY[:,:,n], kws.CiR, YMinusD[:,:,n]);
+        mul!(kws.CiRY[:,:,n], kws.CiR, kws.y_minus_d[:,:,n]);
     end
 
 end
@@ -564,7 +565,6 @@ end
 
     xx = sum(smooth_cov).mat*ntrials;
     sym_syrk!(xx, smooth_mean)
-    # mul!(xx, smooth_mean, smooth_mean', 1.0, 1.0)
    
     return tol_PD(xx)
 
@@ -578,62 +578,66 @@ end
     ) where {T<:Real}
 
     # initial conditions -------
-    x_init = collect(kws.smooth_mean[:,1,:])
+    kws.x_init .= kws.smooth_mean[:,1,:]
     suf.init_n = kws.ntrials
     # init_xx (preset)
     # init_xy
-    mul!(suf.init_xy, data.u0, x_init', 1.0, 0.0);
+    mul!(suf.init_xy, data.u0, kws.x_init', 1.0, 0.0);
     # init_yy
-    suf.init_yy[] = aggregate_xx(x_init, kws.smooth_cov[1], suf.init_n);
+    suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1], suf.init_n);
 
 
     # transitions -------
     suf.dyn_n = (kws.tsteps - 1) * kws.ntrials
-    x_prev = collect(reshape(kws.smooth_mean[:,1:end-1,:], kws.latent_dim, suf.dyn_n))
-    x_next = collect(reshape(kws.smooth_mean[:,2:end,:], kws.latent_dim, suf.dyn_n))
+    kws.x_prev .= reshape(kws.smooth_mean[:,1:end-1,:], kws.latent_dim, suf.dyn_n)
+    kws.x_next .= reshape(kws.smooth_mean[:,2:end,:], kws.latent_dim, suf.dyn_n)
     u_prev = reshape(data.u[:,1:end-1,:], size(data.u, 1), suf.dyn_n)
-    # dyn_xx
-    dyn_xx = deepcopy(suf.dyn_xx[].mat);
-    dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
     
-    # ------
-    # mul!(dyn_xx[1:kws.latent_dim, 1:kws.latent_dim], x_prev, x_prev', 1.0, 1.0)
-    sym_syrk!(dyn_xx[1:kws.latent_dim, 1:kws.latent_dim], x_prev)
-    # ------
+    # dyn_xx = deepcopy(suf.dyn_xx[].mat);
+    # dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
+    # sym_syrk!(dyn_xx[1:kws.latent_dim, 1:kws.latent_dim], x_prev)
+    # mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim+1):end], x_prev, u_prev', 1.0, 0.0)
+    # mul!(dyn_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], u_prev, x_prev', 1.0, 0.0)
+    # suf.dyn_xx[] = tol_PD(dyn_xx);
 
+    dyn_xx = deepcopy(suf.dyn_xx[].mat);
+    dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
+    BLAS.syrk!('U', 'N', 1.0, kws.x_prev, 1.0, dyn_xx[1:kws.latent_dim, 1:kws.latent_dim])
+    mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim+1):end], kws.x_prev, u_prev', 1.0, 0.0)
+    LinearAlgebra.copytri!(dyn_xx, 'U')
+    suf.dyn_xx[] = tol_PD(dyn_xx)
 
-    mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim+1):end], x_prev, u_prev', 1.0, 0.0)
-    mul!(dyn_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], u_prev, x_prev', 1.0, 0.0)
-    suf.dyn_xx[] = tol_PD(dyn_xx);
+  
     # dyn_xy
     suf.dyn_xy[1:kws.latent_dim,:] = kws.smooth_xcov .* kws.ntrials;
-    mul!(suf.dyn_xy[1:kws.latent_dim,:], x_prev, x_next', 1.0, 1.0)
-    mul!(suf.dyn_xy[(kws.latent_dim+1):end,:], u_prev, x_next', 1.0, 0.0)
-
+    mul!(suf.dyn_xy[1:kws.latent_dim,:], kws.x_prev, kws.x_next', 1.0, 1.0)
+    mul!(suf.dyn_xy[(kws.latent_dim+1):end,:], u_prev, kws.x_next', 1.0, 0.0)
     # dyn_yy
-    suf.dyn_yy[] = aggregate_xx(x_next, kws.smooth_cov[2:end], kws.ntrials);
+    suf.dyn_yy[] = aggregate_xx(kws.x_next, kws.smooth_cov[2:end], kws.ntrials);
 
 
     # observations -------
     suf.obs_n = kws.tsteps * kws.ntrials
-    x_cur = collect(reshape(kws.smooth_mean, kws.latent_dim, suf.obs_n))
+    kws.x_cur .= reshape(kws.smooth_mean, kws.latent_dim, suf.obs_n)
     y_cur = reshape(data.y, kws.obs_dim, suf.obs_n)
     d_cur = reshape(data.d, kws.obs_input_dim, suf.obs_n)
-    # obs_xx
-    obs_xx = deepcopy(suf.obs_xx[].mat);
-    obs_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov).mat * kws.ntrials;
     
-    # ------
-    # mul!(obs_xx[1:kws.latent_dim, 1:kws.latent_dim], x_cur, x_cur', 1.0, 1.0)
-    sym_syrk!(obs_xx[1:kws.latent_dim, 1:kws.latent_dim], x_cur)
-    # ------
+    # obs_xx
+    # obs_xx = deepcopy(suf.obs_xx[].mat);
+    # obs_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov).mat * kws.ntrials;
+    # sym_syrk!(obs_xx[1:kws.latent_dim, 1:kws.latent_dim], x_cur)
+    # mul!(obs_xx[1:kws.latent_dim, (kws.latent_dim+1):end], x_cur, d_cur', 1.0, 0.0)
+    # mul!(obs_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], d_cur, x_cur', 1.0, 0.0)
+    # suf.obs_xx[] = tol_PD(obs_xx);
 
-
-    mul!(obs_xx[1:kws.latent_dim, (kws.latent_dim+1):end], x_cur, d_cur', 1.0, 0.0)
-    mul!(obs_xx[(kws.latent_dim+1):end, 1:kws.latent_dim], d_cur, x_cur', 1.0, 0.0)
+    obs_xx = deepcopy(suf.obs_xx[].mat);
+    obs_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov).mat .* kws.ntrials;
+    BLAS.syrk!('U', 'N', 1.0, kws.x_cur, 1.0, obs_xx[1:kws.latent_dim, 1:kws.latent_dim])
+    mul!(obs_xx[1:kws.latent_dim, (kws.latent_dim+1):end], kws.x_cur, d_cur', 1.0, 0.0)
+    LinearAlgebra.copytri!(obs_xx, 'U')
     suf.obs_xx[] = tol_PD(obs_xx);
     # obs_xy
-    mul!(suf.obs_xy[1:kws.latent_dim,:], x_cur, y_cur', 1.0, 0.0)
+    mul!(suf.obs_xy[1:kws.latent_dim,:], kws.x_cur, y_cur', 1.0, 0.0)
     # obs_yy (preset)
 
 end

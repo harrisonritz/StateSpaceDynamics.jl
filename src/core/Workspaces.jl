@@ -843,6 +843,10 @@ struct KalmanWorkspace{T<:Real}
     y_minus_d::Array{T,3}    # (p, T, ntrials)
     Dd::Array{T,3}           # (p, T, ntrials)
 
+    x_prev::Matrix{T}
+    x_next::Matrix{T}
+    x_init::Matrix{T}
+    x_cur::Matrix{T}
 
 end
 
@@ -918,6 +922,9 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     p_smooth_shared = zeros(T, D, D, tsteps)
     p_smooth_tt1_shared = zeros(T, D, D, tsteps)
 
+    
+
+
     return KalmanWorkspace{T}(
         D,                              # latent_dim
         p,                              # obs_dim
@@ -961,5 +968,9 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, tsteps, ntrials),   # CiRY
         zeros(T, p, tsteps, ntrials),   # y_minus_d
         zeros(T, p, tsteps, ntrials),   # Dd
+        zeros(T, D, (tsteps-1)*ntrials),   # x_prev
+        zeros(T, D, (tsteps-1)*ntrials),   # x_next
+        zeros(T, D, ntrials),           # x_init
+        zeros(T, D, tsteps*ntrials)    # x_cur
     )
 end
