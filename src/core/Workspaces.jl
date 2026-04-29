@@ -794,7 +794,6 @@ struct KalmanWorkspace{T<:Real}
     # Shared covariance storage (populated once per E-step)
     pred_cov::Vector{PDMat{T,Matrix{T}}}
     filt_cov::Vector{PDMat{T,Matrix{T}}}
-    pred_icov_mat::Array{T,3}   # (D, D, T) — P_pred^{-1} as plain matrices (replaces Vector{PDMat})
     pred_icov::Vector{PDMat{T,Matrix{T}}}
     smooth_cov::Vector{PDMat{T,Matrix{T}}}
     smooth_xcov::Matrix{T}  # (D, D) - cross-covariance P_smooth[t, t-1]
@@ -853,7 +852,7 @@ end
 Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
 `lds.obs_model isa GaussianObservationModel`.
 """
-function KalmanWorkspace(
+@views function KalmanWorkspace(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::Int, ntrials::Int
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
@@ -916,12 +915,6 @@ function KalmanWorkspace(
     smooth_xcov = zeros(T, D, D)
     G = zeros(T, D, D, max(tsteps - 1, 0))
 
-    # pred_icov_mat[:,:,t] holds P_pred[t]^{-1} as a plain matrix (identity-initialised)
-    pred_icov_mat = zeros(T, D, D, tsteps)
-    for t in 1:tsteps
-        for i in 1:D; pred_icov_mat[i, i, t] = one(T); end
-    end
-
     p_smooth_shared = zeros(T, D, D, tsteps)
     p_smooth_tt1_shared = zeros(T, D, D, tsteps)
 
@@ -935,7 +928,6 @@ function KalmanWorkspace(
         ntrials,                        # number_of_trials
         pred_cov,                       # Vector{PDMat} for P_pred[t]
         filt_cov,                       # Vector{PDMat} for P_filt[t]
-        pred_icov_mat,                  # Array{T,3} for P_pred[t]^{-1} as plain matrices
         pred_icov,                      # Vector{PDMat} for P_pred[t]^{-1} as PDMats (cached Cholesky factors)
         smooth_cov,                     # Vector{PDMat} for P_smooth[t]
         smooth_xcov,                    # Matrix{T} for P_smooth[t, t-1]

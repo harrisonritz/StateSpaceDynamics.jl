@@ -122,9 +122,9 @@ ref = build_lds(params, false)
 
 println("\n\nTrue generative model ---------------------\n")
 show(ref)
-eigenvals = eigvals(ref.state_model.A)
-println("\nEigenvalues of A: ", eigenvals)
-println("Spectral radius of A: ", maximum(abs.(eigenvals)))
+gen_eigenvals = eigvals(ref.state_model.A)
+println("\nEigenvalues of A: ", gen_eigenvals)
+println("Spectral radius of A: ", maximum(abs.(gen_eigenvals)))
 
 
 _, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
@@ -158,11 +158,23 @@ fitted = deepcopy(model)
 SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-8, progress=false)
 test_loglik = SSD.filter_loglikelihood(fitted, y_test)
 
-println("\n\nFitted model ---------------------\n")
+println("\n\n------------------------------------------Fitted model ------------------------------------------")
 show(fitted)
-eigenvals = eigvals(fitted.state_model.A)
-println("\nEigenvalues of A: ", eigenvals)
-println("Spectral radius of A: ", maximum(abs.(eigenvals)))
+
+
+println("\n\n------------------------------------------ Recovery ------------------------------------------")
+
+println("\nGenerative model ---------------------")
+gen_eigenvals = eigvals(ref.state_model.A)
+println("Eigenvalues of A: ", round.(gen_eigenvals, digits=6))
+println("Spectral radius of A: ", round.(maximum(abs.(gen_eigenvals)),digits=6))
+
+println("\nFitted model ---------------------")
+fitted_eigenvals = eigvals(fitted.state_model.A)
+println("Eigenvalues of A: ", round.(fitted_eigenvals, digits=6))
+println("Spectral radius of A: ", round.(maximum(abs.(fitted_eigenvals)),digits=6))
+println("---------------------\n\n")
+
 
 
 display(bench)

@@ -46,6 +46,7 @@ function _fit_kalman!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
+    mono_warn::Bool=true,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     eltype(y) === T || error("Observed data must be of type $(T); got $(eltype(y))")
 
@@ -86,7 +87,7 @@ function _fit_kalman!(
         progress && prog !== nothing && next!(prog)
 
 
-        if (elbo - prev_elbo) < 0
+        if mono_warn && (elbo - prev_elbo) < 0
             @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
         elseif (elbo - prev_elbo) < tol
             progress && prog !== nothing && finish!(prog)
@@ -145,7 +146,7 @@ end
 
 
 
-function initialize_SufficientStatistics(
+@views function initialize_SufficientStatistics(
     model::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
@@ -295,7 +296,7 @@ function precompute_kalman_constants!(
     end
 
     if data.u0 !== nothing
-        mul!(kws.pred_mean[:,1,:], B0, data.u0);
+        @views mul!(kws.pred_mean[:,1,:], B0, data.u0);
     end
 
 
@@ -393,7 +394,7 @@ function smooth_cov!(
 end
 
 
-function forwards_cov!(
+@views function forwards_cov!(
     lds::LinearDynamicalSystem{T,S,O},
     kws::KalmanWorkspace{T}
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
@@ -471,9 +472,11 @@ function forwards_mean!(
     kws::KalmanWorkspace{T}
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     
-    mul!(kws.mean_tmp, kws.pred_icov[1], kws.pred_mean[:,1,:], 1.0, 0.0)
-    kws.mean_tmp .+= kws.CiRY[:,1,:]
-    mul!(kws.filt_mean[:,1,:], kws.filt_cov[1], kws.mean_tmp, 1.0, 0.0)
+    @views begin
+        mul!(kws.mean_tmp, kws.pred_icov[1], kws.pred_mean[:,1,:], 1.0, 0.0)
+        kws.mean_tmp .+= kws.CiRY[:,1,:]
+        mul!(kws.filt_mean[:,1,:], kws.filt_cov[1], kws.mean_tmp, 1.0, 0.0)
+    end
 
     @inbounds @views for tt in axes(kws.pred_mean,2)[2:end]
 
