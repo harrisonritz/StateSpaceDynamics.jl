@@ -124,25 +124,28 @@ for latent_dim in kf_config.latent_dims
         # Normalization constant for per-observation log-likelihood
         n_obs = obs_dim * kf_config.seq_length * NUM_TRIALS
 
+        # random initial parameters for fitting (same for both methods)
+        params0 = init_params(rng, latent_dim, obs_dim)
+
         for (name, kf) in methods
             print("  $(rpad(string(name), 8)) ")
 
-            model = build_lds(params, kf)
+            model = build_lds(params0, kf)
 
             # Warm up / precompile
-            SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-50, progress=false)
+            SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-6, progress=false)
 
             max_iter = kf_config.n_iters
             bench = @benchmark SSD.fit!(m, $y;
                                         max_iter=$max_iter,
-                                        tol=1e-50,
+                                        tol=1e-6,
                                         progress=false) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
 
             med_sec = median(bench).time / 1e9
 
             # Fit once outside the benchmark to get final parameters for evaluation.
             fitted = deepcopy(model)
-            SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-50, progress=false)
+            SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-6, progress=false)
             ll_per_obs = SSD.filter_loglikelihood(fitted, y_test) / n_obs
 
             push!(results, (
