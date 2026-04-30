@@ -62,18 +62,18 @@ struct LDSParams{T<:Real}
 end
 
 function init_params(rng::AbstractRNG, latent_dim::Int, obs_dim::Int)
-    A = SSD.random_rotation_matrix(latent_dim, rng)
+    A = 0.99 * SSD.random_rotation_matrix(latent_dim, rng)
 
     Q = randn(rng, latent_dim, latent_dim)
-    Q = Q * Q' .+ 1e-3
+    Q = Q * Q' + I
 
     x0 = randn(rng, latent_dim)
     P0 = randn(rng, latent_dim, latent_dim)
-    P0 = P0 * P0' .+ 1e-3
+    P0 = P0 * P0' + I
 
     C = randn(rng, obs_dim, latent_dim)
     R = randn(rng, obs_dim, obs_dim)
-    R = R * R' .+ 1e-3
+    R = R * R' + I
 
     b = randn(rng, latent_dim)
     d = randn(rng, obs_dim)
@@ -107,6 +107,7 @@ results = DataFrame(
     memory          = Int[],
     allocs          = Int[],
     test_ll_per_obs = Float64[],
+    elbo            = Float64[],    
 )
 
 for latent_dim in kf_config.latent_dims
@@ -125,7 +126,7 @@ for latent_dim in kf_config.latent_dims
         _, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
 
         # Normalization constant for per-observation log-likelihood
-        n_obs = obs_dim * kf_config.seq_length * NUM_TRIALS
+        n_obs = kf_config.seq_length * NUM_TRIALS
 
         # random initial parameters for fitting (same for both methods)
         params0 = init_params(rng, latent_dim, obs_dim)
@@ -148,16 +149,16 @@ for latent_dim in kf_config.latent_dims
 
             # Fit once outside the benchmark to get final parameters for evaluation.
             fitted = deepcopy(model)
-            SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-6, progress=false)
+            elbo = SSD.fit!(fitted, y; max_iter=max_iter, tol=1e-6, progress=false)
             ll_per_obs = SSD.filter_loglikelihood(fitted, y_test) / n_obs
 
             push!(results, (
                 name, latent_dim, obs_dim,
                 kf_config.seq_length, NUM_TRIALS, max_iter,
                 med_sec, bench.memory, bench.allocs,
-                ll_per_obs,
+                ll_per_obs, elbo[end],
             ))
-            @printf("median = %.6f sec  test_ll/obs = %.6f  alloc = %d  mem = %.2f MB\n", med_sec, ll_per_obs, bench.allocs, bench.memory/1e6)
+            @printf("median = %.6f sec || elbo = %.6f | test_ll/obs = %.6f || alloc = %d | mem = %.2f MB\n", med_sec, elbo[end], ll_per_obs, bench.allocs, bench.memory/1e6)
         end
     end
 end

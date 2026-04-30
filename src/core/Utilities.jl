@@ -955,16 +955,28 @@ StateSpaceAnalysis. Prefer this over `make_posdef!`/`stabilize_covariance_matrix
 Kalman covariances — the scale-aware floor behaves better than an absolute floor when
 the covariance has a large dynamic range.
 """
-function tol_PD(A_sym::Union{Symmetric,Hermitian}; tol::Real=1e-6)::PDMat
-    λ, Q = eigen!(A_sym)
-    λ_max = λ[end]
-    λ_r = max.(λ ./ λ_max, zero(eltype(λ)))
-    λ_new = (λ_max - λ_max * tol) .* λ_r .+ λ_max * tol
-    return PDMat(X_A_Xt(PDiagMat(λ_new), Q))
+function tol_PD(A_sym::Union{Symmetric{T},Hermitian{T}}; tol::T=1e-6)::PDMat{T, Matrix{T}} where {T<:Real}
+    # F = eigen!(A_sym)
+    # λ_max = F.values[end]
+    # λ_r = max.(F.values ./ λ_max, zero(T))
+    # λ_new = (λ_max - λ_max * tol) .* λ_r .+ λ_max * tol
+    # return PDMat(X_A_Xt(PDiagMat(λ_new), F.vectors))
+
+    F = eigen!(A_sym)
+    λ_max = F.values[end]
+    scale = λ_max * tol
+    slope = λ_max - scale        # = λ_max * (1 - tol)
+    for i in eachindex(F.values)
+        r = max(F.values[i] / λ_max, zero(T))
+        F.values[i] = slope * r + scale
+    end
+    return PDMat(X_A_Xt(PDiagMat(F.values), F.vectors))
+
 end
 
-tol_PD(A::AbstractMatrix; tol::Real=1e-6)::PDMat = tol_PD(hermitianpart(A); tol=tol)
+tol_PD(A::Matrix; tol::Real=1e-6)::PDMat = tol_PD(hermitianpart(A); tol=tol)
 tol_PD(A::PDMat; tol::Real=1e-6)::PDMat = tol_PD(Hermitian(Matrix(A)); tol=tol)
+id_PD(A::Matrix; tol::Real=1e-6)::PDMat = PDMat(hermitianpart(A + (tol * tr(A) / size(A, 1)) * I))
 
 # Function for stacking data... in prep for the trialized M_step!()
 function stack_tuples(d)

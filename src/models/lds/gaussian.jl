@@ -1689,7 +1689,8 @@ function filter_loglikelihood(
                 mul!(tmp_DD, A, P_f)
                 mul!(P_p, tmp_DD, A')
                 P_p .+= Q
-                P_p .= (P_p .+ P_p') .* T(0.5)
+                Symmetrize!(P_p)
+                # P_p .= (P_p .+ P_p') .* T(0.5)
             end
 
             # Innovation: e = y_t - C x_p - d
@@ -1700,7 +1701,8 @@ function filter_loglikelihood(
             mul!(PCt, P_p, C')
             mul!(Smat, C, PCt)
             Smat .+= R
-            Smat .= (Smat .+ Smat') .* T(0.5)
+            Symmetrize!(Smat)
+            # Smat .= (Smat .+ Smat') .* T(0.5)
 
             # One-step predictive log-likelihood: log N(e; 0, S)
             S_ch = cholesky(Hermitian(Smat))
@@ -1717,7 +1719,8 @@ function filter_loglikelihood(
             ldiv!(S_ch, SiPCt)          # SiPCt ← S⁻¹ PCt'
             mul!(P_f, PCt, SiPCt)
             P_f .= P_p .- P_f
-            P_f .= (P_f .+ P_f') .* T(0.5)
+            Symmetrize!(P_f)
+            # P_f .= (P_f .+ P_f') .* T(0.5)
         end
     end
 
