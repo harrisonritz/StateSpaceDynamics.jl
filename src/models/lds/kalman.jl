@@ -701,7 +701,7 @@ function est_cov(
     Wxy = W*XY;
 
     Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) + (prior_df * prior_mu)) / 
-                ((N + prior_df) - size(XX,1));
+                (N + prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
@@ -721,7 +721,7 @@ function est_cov(
     Wxy = W*XY;
 
     Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) + (prior_df * prior_mu)) / 
-                ((N + prior_df) - size(XX,1));
+                (N + prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
