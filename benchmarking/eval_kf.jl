@@ -18,6 +18,9 @@ using CSV
 using Plots
 using Measures
 
+BLAS.set_num_threads(1)
+set_zero_subnormals(true);
+
 # ----------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------
@@ -31,7 +34,7 @@ struct BenchConfig
 end
 
 kf_config = BenchConfig(
-    5,   # latent_dims
+    4,   # latent_dims
     8,      # obs_dims
     100,         # seq_length
     50,          # n_iters (EM iterations per fit)
@@ -59,18 +62,19 @@ struct LDSParams{T<:Real}
 end
 
 function init_params(rng::AbstractRNG, latent_dim::Int, obs_dim::Int)
-    A = SSD.random_rotation_matrix(latent_dim, rng)
+    A = 0.99 * SSD.random_rotation_matrix(latent_dim, rng)
 
     Q = randn(rng, latent_dim, latent_dim)
-    Q = Q * Q' .+ 1e-3
+    Q = Q * Q' + 1e-2I
+    
 
     x0 = randn(rng, latent_dim)
     P0 = randn(rng, latent_dim, latent_dim)
-    P0 = P0 * P0' .+ 1e-3
+    P0 = P0 * P0' + 1e-2I
 
     C = randn(rng, obs_dim, latent_dim)
     R = randn(rng, obs_dim, obs_dim)
-    R = R * R' .+ 1e-3
+    R = R * R' + 1e-2I
 
     b = randn(rng, latent_dim)
     d = randn(rng, obs_dim)
@@ -136,7 +140,7 @@ model = build_lds(params0, kf)
 # Warm up / precompile
 SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-6, progress=false)
 
-VSCodeServer.@profview SSD.fit!(deepcopy(model), y; max_iter=100, tol=1e-6, progress=false)
+VSCodeServer.@profview SSD.fit!(deepcopy(model), y; max_iter=500, tol=1e-6, progress=false)
 
 
 max_iter = kf_config.n_iters

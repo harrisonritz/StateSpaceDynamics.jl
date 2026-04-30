@@ -783,6 +783,8 @@ The workspace is split into three layers:
 `u_dim` / `u0_dim` are 0 when the corresponding `B` / `B0` inputs are absent.
 """
 struct KalmanWorkspace{T<:Real}
+
+    # constants
     latent_dim::Int
     obs_dim::Int
     init_input_dim::Int
@@ -796,7 +798,10 @@ struct KalmanWorkspace{T<:Real}
     filt_cov::Vector{PDMat{T,Matrix{T}}}
     pred_icov::Vector{PDMat{T,Matrix{T}}}
     smooth_cov::Vector{PDMat{T,Matrix{T}}}
-    smooth_xcov::Matrix{T}  # (D, D) - cross-covariance P_smooth[t, t-1]
+    sum_smooth_cov_all::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_cov_prev::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_cov_next::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_xcov::Matrix{T}  # (D, D) - cross-covariance P_smooth[t, t-1]
     G::Array{T,3}  # (D, D, T-1)
 
     # Pre-allocated scratch buffers for covariance_forward_backward! (no per-step allocs)
@@ -841,7 +846,7 @@ struct KalmanWorkspace{T<:Real}
     Bu::Array{T,3}           # (D, T, ntrials)
     CiRY::Array{T,3}         # (D, T, ntrials)
     y_minus_d::Array{T,3}    # (p, T, ntrials)
-    Dd::Array{T,3}           # (p, T, ntrials)
+    # Dd::Array{T,3}           # (p, T, ntrials)
 
     x_prev::Matrix{T}
     x_next::Matrix{T}
@@ -916,7 +921,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     filt_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     smooth_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
-    smooth_xcov = zeros(T, D, D)
     G = zeros(T, D, D, max(tsteps - 1, 0))
 
     p_smooth_shared = zeros(T, D, D, tsteps)
@@ -937,7 +941,10 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         filt_cov,                       # Vector{PDMat} for P_filt[t]
         pred_icov,                      # Vector{PDMat} for P_pred[t]^{-1} as PDMats (cached Cholesky factors)
         smooth_cov,                     # Vector{PDMat} for P_smooth[t]
-        smooth_xcov,                    # Matrix{T} for P_smooth[t, t-1]
+        zeros(T, D, D),                 # sum_smooth_cov_all, Matrix{T}  for sum P_smooth[1:T]
+        zeros(T, D, D),                 # sum_smooth_cov_prev, Matrix{T}  for sum P_smooth[1:(T-1)]
+        zeros(T, D, D),                 # sum_smooth_cov_next, Matrix{T}  for sum P_smooth[2:T]
+        zeros(T, D, D),                 # sum_smooth_xcov, Matrix{T} for sum P_smooth[t, t-1]
         G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
         zeros(T, D, D),                 # cov_tmp1
         zeros(T, D, D),                 # cov_tmp2
@@ -958,6 +965,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_CD,                 # CD_lambda 
         placeholder_R_mu,               # R_mu
         placeholder_R_df,               # R_df
+
         zeros(T, D, p),                 # CiR
         Ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
@@ -967,10 +975,10 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, tsteps, ntrials),   # Bu
         zeros(T, D, tsteps, ntrials),   # CiRY
         zeros(T, p, tsteps, ntrials),   # y_minus_d
-        zeros(T, p, tsteps, ntrials),   # Dd
-        zeros(T, D, (tsteps-1)*ntrials),   # x_prev
-        zeros(T, D, (tsteps-1)*ntrials),   # x_next
+        # zeros(T, p, tsteps, ntrials),   # Dd
+        zeros(T, D, (tsteps-1)*ntrials),# x_prev
+        zeros(T, D, (tsteps-1)*ntrials),# x_next
         zeros(T, D, ntrials),           # x_init
-        zeros(T, D, tsteps*ntrials)    # x_cur
+        zeros(T, D, tsteps*ntrials)     # x_cur
     )
 end
