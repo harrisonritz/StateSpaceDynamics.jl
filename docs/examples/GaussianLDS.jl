@@ -87,7 +87,7 @@ true_lds = LinearDynamicalSystem(;
 tSteps = 500;  # Number of time points to simulate
 
 # The rand function generates both latent trajectories and corresponding observations
-latents, observations = rand(rng, true_lds; tsteps=tSteps, ntrials=1);
+latents, observations = rand(rng, true_lds, tSteps);
 
 # ## Plot Vector Field of Latent Dynamics
 
@@ -116,7 +116,7 @@ V_norm = V ./ magnitude;
 # Create the vector field plot with the actual trajectory overlaid
 p1 = quiver(X, Y, quiver=(U_norm, V_norm), color=:blue, alpha=0.3,
            linewidth=1, arrow=arrow(:closed, :head, 0.1, 0.1))
-plot!(latents[1, :, 1], latents[2, :, 1], xlabel=L"x_1", ylabel=L"x_2",
+plot!(latents[1, :], latents[2, :], xlabel=L"x_1", ylabel=L"x_2",
       color=:black, linewidth=1.5, title="Latent Dynamics", legend=false)
 
 p1
@@ -126,8 +126,8 @@ p1
 # Let's visualize both the latent states (which evolve smoothly according to our
 # dynamics) and the observations (which are noisy linear combinations of the latents).
 
-states = latents[:, :, 1]      # Extract the latent trajectory
-emissions = observations[:, :, 1];  # Extract the observed data
+states = latents
+emissions = observations;
 
 # Create a two-panel plot: latent states on top, observations below
 lim_states = maximum(abs.(states))
@@ -201,7 +201,7 @@ p3 = plot()
 for d in 1:latent_dim
     plot!(1:tSteps, states[d, :] .+ lim_states * (d-1), color=:black,
           linewidth=2, label=(d==1 ? "True" : ""), alpha=0.8)
-    plot!(1:tSteps, x_smooth[d, :, 1] .+ lim_states * (d-1), color=:firebrick,
+    plot!(1:tSteps, x_smooth[d, :] .+ lim_states * (d-1), color=:firebrick,
           linewidth=2, label=(d==1 ? "Predicted" : ""), alpha=0.8)
 end
 plot!(yticks=(lim_states .* (0:latent_dim-1), [L"x_%$d" for d in 1:latent_dim]),
@@ -230,7 +230,7 @@ p3
 println("Starting EM algorithm to learn parameters...")
 
 # Suppress output and capture ELBO values
-elbo, _ = fit!(naive_ssm, observations; max_iter=100, tol=1e-6);
+elbo = fit!(naive_ssm, observations; max_iter=100, tol=1e-6);
 
 println("EM converged after $(length(elbo)) iterations")
 
@@ -242,7 +242,7 @@ p4 = plot()
 for d in 1:latent_dim
     plot!(1:tSteps, states[d, :] .+ lim_states * (d-1), color=:black,
           linewidth=2, label=(d==1 ? "True" : ""), alpha=0.8)
-    plot!(1:tSteps, x_smooth_post[d, :, 1] .+ lim_states * (d-1), color=:firebrick,
+    plot!(1:tSteps, x_smooth_post[d, :] .+ lim_states * (d-1), color=:firebrick,
           linewidth=2, label=(d==1 ? "Predicted" : ""), alpha=0.8)
 end
 plot!(yticks=(lim_states .* (0:latent_dim-1), [L"x_%$d" for d in 1:latent_dim]),

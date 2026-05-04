@@ -20,9 +20,9 @@ end
 
 BenchmarkTools.DEFAULT_PARAMETERS.seconds = 1.0
 
-# ----------------------
-# LDS Benchmarks
-# ----------------------
+#=
+LDS Benchmarks
+=#
 
 lds_config = BenchConfig(
     [2, 4, 6, 8],  # latent_dims
@@ -101,9 +101,9 @@ end
 CSV.write("benchmarking/results/lds_benchmark_results.csv", df_lds)
 
 
-# ----------------------
-# HMM Benchmarks
-# ----------------------
+#=
+HMM Benchmarks
+=#
 
 hmm_config = BenchConfig(
     [2, 4, 6, 8],          # num_states

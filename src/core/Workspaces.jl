@@ -399,8 +399,7 @@ Dispatches on the observation model type:
 - Poisson: only computes state model terms (observation terms are x-dependent).
 """
 function compute_smooth_constants!(
-    ws::SmoothWorkspace{WT},
-    lds::LinearDynamicalSystem{T,S,O},
+    ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q
@@ -457,8 +456,7 @@ function compute_smooth_constants!(
 end
 
 function compute_smooth_constants!(
-    ws::SmoothWorkspace{WT},
-    lds::LinearDynamicalSystem{T,S,O},
+    ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     A = lds.state_model.A
     Q = lds.state_model.Q
@@ -758,6 +756,21 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
     return ws
 end
 
+
+"""
+Refresh the per-regime constant caches after an M-step has updated the LDS parameters.
+Must be called before the next E-step so that Cholesky factors, Hessian templates, etc.
+reflect the current Q, R, A, P0.
+"""
+function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
+    for k in eachindex(slds.LDSs)
+        compute_slds_constants!(ws.consts[k], slds.LDSs[k], ws.I_mat)
+    end
+    return nothing
+end
+
+
+
 """
     KalmanWorkspace{T<:Real}
 
@@ -985,4 +998,4 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, ntrials),           # x_init
         zeros(T, D, tsteps*ntrials)     # x_cur
     )
-end
+

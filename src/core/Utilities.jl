@@ -48,9 +48,9 @@ Compute the inverse of a block tridiagonal matrix.
 and Hummer, D.G., Astronomy and Astrophysics, 245, 171–181 (1991), Appendix B.
 """
 function block_tridiagonal_inverse(
-    A::Vector{<:AbstractMatrix{T}},
-    B::Vector{<:AbstractMatrix{T}},
-    C::Vector{<:AbstractMatrix{T}},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real}
     n = length(B)
     bs = size(B[1], 1)
@@ -128,9 +128,9 @@ Compute the inverse of a block tridiagonal matrix using static matrices. See
 `block_tridiagonal_inverse` for details.
 """
 function block_tridiagonal_inverse_static(
-    A::Vector{<:AbstractMatrix{T}},
-    B::Vector{<:AbstractMatrix{T}},
-    C::Vector{<:AbstractMatrix{T}},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
     ::Val{N},
 ) where {T<:Real,N}
     n = length(B)
@@ -233,9 +233,9 @@ Construct a block tridiagonal matrix from three vectors of matrices.
     length of `main_diag`.
 """
 function block_tridgm(
-    main_diag::Vector{<:AbstractMatrix{T}},
-    upper_diag::Vector{<:AbstractMatrix{T}},
-    lower_diag::Vector{<:AbstractMatrix{T}},
+    main_diag::AbstractVector{<:AbstractMatrix{T}},
+    upper_diag::AbstractVector{<:AbstractMatrix{T}},
+    lower_diag::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real}
     n = length(main_diag)
     m = size(main_diag[1], 1)
@@ -465,9 +465,9 @@ Uses preallocated buffers from `ws`.
 function block_tridiagonal_inverse!(
     p_smooth::AbstractArray{T,3},
     p_smooth_tt1::AbstractArray{T,3},
-    A::Vector{<:AbstractMatrix{T}},
-    B::Vector{<:AbstractMatrix{T}},
-    C::Vector{<:AbstractMatrix{T}},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
     n = length(B)
@@ -543,9 +543,9 @@ matrix factorizations.
 function block_tridiagonal_inverse_logdet!(
     p_smooth::AbstractArray{T,3},
     p_smooth_tt1::AbstractArray{T,3},
-    A::Vector{<:AbstractMatrix{T}},
-    B::Vector{<:AbstractMatrix{T}},
-    C::Vector{<:AbstractMatrix{T}},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
     n = length(B)
@@ -658,9 +658,9 @@ potentially large sparse LU.
 """
 function block_tridiagonal_solve!(
     x::AbstractVector{T},
-    A::Vector{<:AbstractMatrix{T}},
-    B::Vector{<:AbstractMatrix{T}},
-    C::Vector{<:AbstractMatrix{T}},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
     b::AbstractVector{T},
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
@@ -734,15 +734,18 @@ function block_tridiagonal_solve!(
 end
 
 """
-    _negate_blocks!(ws::BlockTridiagonalWorkspace{T})
+    _negate_blocks!(ws::BlockTridiagonalWorkspace{T}, n_active::Int=ws.n_blocks)
 
-Copy negated H_diag/H_sub/H_super into neg_diag/neg_sub/neg_super in-place.
+Copy negated H_diag/H_sub/H_super into neg_diag/neg_sub/neg_super in-place
+for the first `n_active` diagonal blocks (and `n_active - 1` off-diagonal blocks).
 """
-function _negate_blocks!(ws::BlockTridiagonalWorkspace{T}) where {T<:Real}
-    for i in eachindex(ws.H_diag)
+function _negate_blocks!(
+    ws::BlockTridiagonalWorkspace{T}, n_active::Int=ws.n_blocks
+) where {T<:Real}
+    for i in 1:n_active
         ws.neg_diag[i] .= .-ws.H_diag[i]
     end
-    for i in eachindex(ws.H_sub)
+    for i in 1:(n_active - 1)
         ws.neg_sub[i] .= .-ws.H_sub[i]
         ws.neg_super[i] .= .-ws.H_super[i]
     end

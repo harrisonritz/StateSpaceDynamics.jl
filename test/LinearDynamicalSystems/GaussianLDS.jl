@@ -35,7 +35,7 @@ function toy_lds(
     )
     # sample data
     T = 100
-    x, y = StateSpaceDynamics.rand(lds; tsteps=T, ntrials=ntrials)
+    x, y = StateSpaceDynamics.rand(lds, fill(T, ntrials))
     return lds, x, y
 end
 
@@ -212,12 +212,14 @@ function test_gaussian_sample_type_preservation()
         fit_bool=fill(true, 6),
     )
 
-    x_f32, y_f32 = StateSpaceDynamics.rand(gls_f32; tsteps=50, ntrials=3)
+    x_f32, y_f32 = StateSpaceDynamics.rand(gls_f32, fill(50, 3))
 
-    @test eltype(x_f32) === Float32
-    @test eltype(y_f32) === Float32
-    @test size(x_f32) == (2, 50, 3)
-    @test size(y_f32) == (2, 50, 3)
+    @test eltype(x_f32[1]) === Float32
+    @test eltype(y_f32[1]) === Float32
+    @test length(x_f32) == 3
+    @test length(y_f32) == 3
+    @test size(x_f32[1]) == (2, 50)
+    @test size(y_f32[1]) == (2, 50)
 
     # BigFloat
     A_bf = Matrix{BigFloat}(I, 2, 2)
@@ -239,12 +241,14 @@ function test_gaussian_sample_type_preservation()
         fit_bool=fill(true, 6),
     )
 
-    x_bf, y_bf = StateSpaceDynamics.rand(gls_bf; tsteps=50, ntrials=3)
+    x_bf, y_bf = StateSpaceDynamics.rand(gls_bf, fill(50, 3))
 
-    @test eltype(x_bf) === BigFloat
-    @test eltype(y_bf) === BigFloat
-    @test size(x_bf) == (2, 50, 3)
-    @test size(y_bf) == (2, 50, 3)
+    @test eltype(x_bf[1]) === BigFloat
+    @test eltype(y_bf[1]) === BigFloat
+    @test length(x_bf) == 3
+    @test length(y_bf) == 3
+    @test size(x_bf[1]) == (2, 50)
+    @test size(y_bf[1]) == (2, 50)
 end
 
 function test_gaussian_fit_type_preservation()
@@ -264,12 +268,11 @@ function test_gaussian_fit_type_preservation()
             state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
 
-        x, y = rand(lds; tsteps=50, ntrials=3)
+        x, y = rand(lds, fill(50, 3))
 
-        mls, param_diff = fit!(lds, y; max_iter=10, tol=1e-6)
+        elbos = fit!(lds, y; max_iter=10, tol=1e-6)
 
-        @test eltype(sum(mls)) === T
-        @test eltype(param_diff) === T
+        @test eltype(elbos) === T
     end
 end
 
@@ -290,9 +293,9 @@ function test_gaussian_loglikelihood_type_preservation()
             state_model=gsm, obs_model=gom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
 
-        x, y = rand(lds; tsteps=50, ntrials=3)
-        x_mat = x[:, :, 1]
-        y_mat = y[:, :, 1]
+        x, y = rand(lds, fill(50, 3))
+        x_mat = x[1]
+        y_mat = y[1]
 
         # compute log‐likelihood and check types 
         ll = sum(StateSpaceDynamics.loglikelihood(x_mat, lds, y_mat))
@@ -334,11 +337,11 @@ function test_smooth()
     lds, x, y = toy_lds()
     test_smooth_common(lds, x, y)
     # Additional Gaussian-specific checks
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     StateSpaceDynamics.smooth!(lds, tfs, y)
-    x_smooth = tfs[1].x_smooth
-    for i in axes(y, 3)
-        grad_analytical = StateSpaceDynamics.Gradient(lds, y[:, :, i], x_smooth[:, :, i])
+    for i in eachindex(y)
+        grad_analytical = StateSpaceDynamics.Gradient(lds, y[i], tfs[i].x_smooth)
         @test maximum(abs.(grad_analytical)) < 1e-8
         @test norm(grad_analytical) < 1e-8
     end
@@ -362,12 +365,13 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     lds, x, y = toy_lds(ntrials, [false, false, false, false, true, true])
 
     # tfs
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, size(y, 2), size(y, 3))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
 
     # run the E_Step
     ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
 
-    tsteps = size(y, 2)
+    tsteps = tsteps_per_trial[1]
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
 
     # Save original parameters
@@ -384,9 +388,9 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
         StateSpaceDynamics.compute_smooth_constants!(ws, lds)
         val = zero(eltype(R_sqrt))
 
-        @views for k in 1:ntrials
+        for k in 1:ntrials
             E_z, E_zz = tfs[k].E_z, tfs[k].E_zz
-            val += StateSpaceDynamics.Q_obs!(ws, lds, E_z, E_zz, y[:, :, k])
+            val += StateSpaceDynamics.Q_obs!(ws, lds, E_z, E_zz, y[k])
         end
         return -val
     end
@@ -444,7 +448,7 @@ function test_gaussian_iw_priors_shape_map_and_R_sanity(; rng=MersenneTwister(20
         gom = GaussianObservationModel(C=C, R=R, d=d, R_prior=Rprior)
         lds = LinearDynamicalSystem(gsm, gom)
 
-        X, Y = rand(rng, lds; tsteps=Tt, ntrials=N)
+        X, Y = rand(rng, lds, fill(Tt, N))
 
         elbos = fit!(lds, Y; max_iter=12, tol=0.0, progress=false)
         @test all(diff(elbos) .>= -1e-7)
@@ -482,9 +486,9 @@ function test_gaussian_update_R_matches_residual_cov(; rng=MersenneTwister(7))
         gom = GaussianObservationModel(C=C, R=copy(Rtrue), d=d)
         lds = LinearDynamicalSystem(gsm, gom)
 
-        X, Y = rand(rng, lds; tsteps=Tt, ntrials=N)
+        X, Y = rand(rng, lds, fill(Tt, N))
 
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, Tt, N)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, fill(Tt, N))
         StateSpaceDynamics.estep!(lds, tfs, Y)
 
         # only update R
@@ -520,10 +524,10 @@ function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
             GaussianObservationModel(C=C, R=R, d=d),
         )
 
-        _, Y = rand(rng, lds1; tsteps=Tt, ntrials=N)
+        _, Y = rand(rng, lds1, fill(Tt, N))
 
         # manual weighted EM
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds1, Tt, N)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds1, fill(Tt, N))
         w = [ones(Float64, Tt), 2.0 .* ones(Float64, Tt)]
         for _ in 1:6
             StateSpaceDynamics.estep!(lds1, tfs, Y)
@@ -532,7 +536,7 @@ function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
         θw = vec([lds1.state_model.A; lds1.obs_model.C])
 
         # duplicate trial 2 once ~ same effect
-        Ydup = cat(Y, Y[:, :, 2:2]; dims=3)
+        Ydup = vcat(Y, [copy(Y[2])])
         fit!(lds2, Ydup; max_iter=6, tol=0.0, progress=false)
         θd = vec([lds2.state_model.A; lds2.obs_model.C])
 
