@@ -90,9 +90,13 @@ function build_lds(p::LDSParams, kalman::Bool)
     )
 end
 
+
 # ----------------------------------------------------------------------
 # Benchmark loop
 # ----------------------------------------------------------------------
+
+eig_dims = minimum(kf_config.latent_dims)
+
 
 methods = [(:tridiag, false), (:kalman, true)]
 
@@ -111,6 +115,7 @@ results = DataFrame(
 )
 
 for latent_dim in kf_config.latent_dims
+
     for obs_dim in kf_config.obs_dims
         # obs_dim < latent_dim && continue
 
@@ -131,13 +136,17 @@ for latent_dim in kf_config.latent_dims
         # random initial parameters for fitting (same for both methods)
         params0 = init_params(rng, latent_dim, obs_dim)
 
+        # print the first few eigenvalues of the true A matrix for reference
+        true_A_eig = eigen(params.A).values[1:eig_dims]
+        @printf("  True A eigenvalues (first %d): %s\n", eig_dims, string(round.(true_A_eig, sigdigits=4)))
+
         for (name, kf) in methods
             print("  $(rpad(string(name), 8)) ")
 
             model = build_lds(params0, kf)
 
             # Warm up / precompile
-            SSD.fit!(deepcopy(model), y; max_iter=1, tol=1e-6, progress=false)
+            SSD.fit!(deepcopy(model), y; max_iter=10, tol=1e-6, progress=false)
 
             max_iter = kf_config.n_iters
             bench = @benchmark SSD.fit!(m, $y;
@@ -146,6 +155,8 @@ for latent_dim in kf_config.latent_dims
                                         progress=false) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
 
             med_sec = median(bench).time / 1e9
+
+          
 
             # Fit once outside the benchmark to get final parameters for evaluation.
             fitted = deepcopy(model)
@@ -159,6 +170,11 @@ for latent_dim in kf_config.latent_dims
                 ll_per_obs, elbo[end],
             ))
             @printf("median = %.6f sec || elbo = %.6f | test_ll/obs = %.6f || alloc = %d | mem = %.2f MB\n", med_sec, elbo[end], ll_per_obs, bench.allocs, bench.memory/1e6)
+
+            # print the first min(latent_dim) eigenvalues of the fitted A matrix
+            A_eig = eigen(fitted.state_model.A).values[1:eig_dims]
+            @printf("  A eigenvalues (first %d): %s\n", eig_dims, string(round.(A_eig, sigdigits=4)))
+
         end
     end
 end

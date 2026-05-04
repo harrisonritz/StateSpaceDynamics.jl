@@ -67,8 +67,8 @@ Base.@kwdef mutable struct GaussianStateModel{
 } <: AbstractStateModel{T}
     A::M
     Q::M
-    b::Union{Nothing,V}
-    x0::Union{Nothing,V}
+    b::V
+    x0::V
     P0::M
     B::M = zeros(size(A, 1), 1)  # default to zero matrix if not supplied
     B0::M = zeros(size(A, 1), 1) # default to zero matrix if not supplied
@@ -179,8 +179,8 @@ function GaussianStateModel(
     return GaussianStateModel{T,M}(;
         A=A,
         Q=Q,
-        b=nothing,
-        x0=nothing,
+        b=zeros(size(A, 1), 1),
+        x0=zeros(size(A, 1), 1),
         P0=P0,
         B=B,
         B0=B0,
@@ -216,7 +216,7 @@ function GaussianObservationModel(
     return GaussianObservationModel{T,M}(; 
     C=C, 
     R=R, 
-    d=d, 
+    d=zeros(size(C, 1), 1), 
     D=D, 
     R_prior=nothing,
     CD_lambda=nothing,
@@ -278,8 +278,8 @@ Represents a unified Linear Dynamical System with customizable state and observa
 - `obs_dim::Int`: Dimension of the observations
 - `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
     Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
-    Poisson path (`[x0, P0, A&b, Q, C&log_d]`), and length 8 when `kalman_filter=true`
-    with inputs supplied (`[x0, P0, A&b, Q, C&d, R, B, B0]`).
+    Poisson path (`[x0, P0, A&b, Q, C&log_d]`), and length 9 when `kalman_filter=true`
+    with inputs supplied (`[x0, P0, A, Q, C, R, B, B0, D]`).
 - `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
     E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
     the existing block-tridiagonal MAP path.
