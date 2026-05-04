@@ -124,8 +124,10 @@ params = init_params(rng, latent_dim, obs_dim)
 # held-out test set drawn from the true generative model.
 ref = build_lds(params, kf)
 
-_, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
-_, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
+
+tsteps=[kf_config.seq_length for _ in 1:NUM_TRIALS]
+_, y      = rand(rng, ref, tsteps)
+_, y_test = rand(StableRNG(5678), ref, tsteps)
 
 # Normalization constant for per-observation log-likelihood
 n_obs = obs_dim * kf_config.seq_length * NUM_TRIALS

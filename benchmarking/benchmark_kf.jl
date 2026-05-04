@@ -127,8 +127,10 @@ for latent_dim in kf_config.latent_dims
         # Both methods fit the same training data and are evaluated on the same
         # held-out test set drawn from the true generative model.
         ref = build_lds(params, false)
-        _, y      = rand(rng, ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
-        _, y_test = rand(StableRNG(5678), ref; ntrials=NUM_TRIALS, tsteps=kf_config.seq_length)
+
+        tsteps=[kf_config.seq_length for _ in 1:NUM_TRIALS]
+        _, y      = rand(rng, ref, tsteps)
+        _, y_test = rand(StableRNG(5678), ref, tsteps)
 
         # Normalization constant for per-observation log-likelihood
         n_obs = kf_config.seq_length * NUM_TRIALS

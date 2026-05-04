@@ -998,4 +998,4 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, ntrials),           # x_init
         zeros(T, D, tsteps*ntrials)     # x_cur
     )
-
+end

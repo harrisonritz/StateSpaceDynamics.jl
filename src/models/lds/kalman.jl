@@ -70,18 +70,7 @@ function _fit_kalman!(
         estep!(lds, suf, kws, data)
         elbo = marginal_loglikelihood(lds, kws)
         mstep!(lds, suf, kws)
-        # elbo = compute_elbo(lds, suf, kws)
-
-        # update vestigial parameters for backward compatibility (to be removed in future)
-        # if all(data.u0[:,1] .== 1)
-        #     lds.state_model.x0 = vec(lds.state_model.B0)
-        # end
-        # if all(data.d[:,1,:] .== 1)
-        #     lds.obs_model.d  = vec(lds.obs_model.D)
-        # end
-        # if all(data.u[:,1,:] .== 1)
-        #     lds.state_model.b  = vec(lds.state_model.B)
-        # end
+        # elbo = compute_elbo(lds, suf, kws)        
         
         # report progress
         push!(elbos, elbo)
@@ -92,13 +81,33 @@ function _fit_kalman!(
             @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
         elseif (elbo - prev_elbo) < tol
             progress && prog !== nothing && finish!(prog)
+            update_vestigials!(lds, data) 
             return elbos
         end
         prev_elbo = elbo
     end
-
     progress && prog !== nothing && finish!(prog)
+    update_vestigials!(lds, data) 
     return elbos
+end
+
+
+function update_vestigials!(
+    lds::LinearDynamicalSystem{T,S,O}, 
+    data::Data{T}
+    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+    # update vestigial parameters for backward compatibility (to be removed in future)
+    if all(data.u0[:,1] .== 1)
+        lds.state_model.x0 = vec(lds.state_model.B0)
+    end
+    if all(data.d[:,1,:] .== 1)
+        lds.obs_model.d  = vec(lds.obs_model.D)
+    end
+    if all(data.u[:,1,:] .== 1)
+        lds.state_model.b  = vec(lds.state_model.B)
+    end
+    lds
 end
 
 
@@ -734,6 +743,8 @@ function mstep!(
     kws::KalmanWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
+    # TODO: include filt_bool
+
     # initials ===============================================
     B0 = regress(
         suf.init_xx[], 
@@ -1006,6 +1017,7 @@ function marginal_loglikelihood(
     total_ll = zero(T)
     # kws.obs_pd_tmp[] = PDMat(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
     MV = MvNormal(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
+
     @inbounds kws.innovation .= kws.y_minus_d .- reshape(lds.obs_model.C * reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials), kws.obs_dim, kws.tsteps, kws.ntrials)
 
     @inbounds @views for t in eachindex(kws.pred_cov)
