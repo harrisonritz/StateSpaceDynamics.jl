@@ -808,6 +808,7 @@ struct KalmanWorkspace{T<:Real}
     cov_tmp1::Matrix{T}   # (D, D)
     cov_tmp2::Matrix{T}   # (D, D)
     pd_tmp::Base.RefValue{PDMat{T,Matrix{T}}} #(D, D)
+    obs_pd_tmp::Base.RefValue{PDMat{T,Matrix{T}}} #(p, p)
 
     # Per-trial D-vector scratch for _filter_mean_trial! (column n used by trial n)
     mean_tmp::Matrix{T}   # (D, ntrials)
@@ -846,6 +847,7 @@ struct KalmanWorkspace{T<:Real}
     Bu::Array{T,3}           # (D, T, ntrials)
     CiRY::Array{T,3}         # (D, T, ntrials)
     y_minus_d::Array{T,3}    # (p, T, ntrials)
+    innovation::Array{T,3}   # (p, T, ntrials)
     # Dd::Array{T,3}           # (p, T, ntrials)
 
     x_prev::Matrix{T}
@@ -889,14 +891,14 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     if isnothing(lds.obs_model.CD_lambda)
         placeholder_CD = nothing
     else
-        placeholder_CD = PDMat(lds.state_model.CD_lambda)
+        placeholder_CD = PDMat(lds.obs_model.CD_lambda)
     end
 
     if isnothing(lds.state_model.P0_prior)
         placeholder_P0_mu = zeros(T, D, D)
         placeholder_P0_df = 0
     else
-        placeholder_P0_mu = PDMat(lds.state_model.P0_prior.Ψ)
+        placeholder_P0_mu = Matrix{T}(lds.state_model.P0_prior.Ψ)
         placeholder_P0_df = lds.state_model.P0_prior.ν
     end
 
@@ -904,7 +906,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_Q_mu = zeros(T, D, D)
         placeholder_Q_df = 0
     else
-        placeholder_Q_mu = PDMat(lds.state_model.Q_prior.Ψ)
+        placeholder_Q_mu = Matrix{T}(lds.state_model.Q_prior.Ψ)
         placeholder_Q_df = lds.state_model.Q_prior.ν
     end
 
@@ -912,7 +914,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_R_mu = zeros(T, p, p)
         placeholder_R_df = 0
     else
-        placeholder_R_mu = PDMat(lds.obs_model.R_prior.Ψ)
+        placeholder_R_mu = Matrix{T}(lds.obs_model.R_prior.Ψ)
         placeholder_R_df = lds.obs_model.R_prior.ν
     end
     
@@ -949,6 +951,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, D),                 # cov_tmp1
         zeros(T, D, D),                 # cov_tmp2
         Ref(placeholder_D),             # pd_tmp
+        Ref(placeholder_p),             # obs_pd_tmp
         zeros(T, D, ntrials),           # mean_tmp
         p_smooth_shared,                # (D, D, T)
         p_smooth_tt1_shared,            # (D, D, T)
@@ -975,6 +978,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, tsteps, ntrials),   # Bu
         zeros(T, D, tsteps, ntrials),   # CiRY
         zeros(T, p, tsteps, ntrials),   # y_minus_d
+        zeros(T, p, tsteps, ntrials),   # innovations
         # zeros(T, p, tsteps, ntrials),   # Dd
         zeros(T, D, (tsteps-1)*ntrials),# x_prev
         zeros(T, D, (tsteps-1)*ntrials),# x_next

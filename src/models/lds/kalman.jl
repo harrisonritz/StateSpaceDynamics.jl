@@ -46,7 +46,7 @@ function _fit_kalman!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    monotonicity_check::Bool=true,
+    monotonicity_check::Bool=false,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     eltype(y) === T || error("Observed data must be of type $(T); got $(eltype(y))")
 
@@ -73,15 +73,15 @@ function _fit_kalman!(
         # elbo = compute_elbo(lds, suf, kws)
 
         # update vestigial parameters for backward compatibility (to be removed in future)
-        if all(data.u0[:,1] .== 1)
-            lds.state_model.x0 = vec(lds.state_model.B0)
-        end
-        if all(data.d[:,1,:] .== 1)
-            lds.obs_model.d  = vec(lds.obs_model.D)
-        end
-        if all(data.u[:,1,:] .== 1)
-            lds.state_model.b  = vec(lds.state_model.B)
-        end
+        # if all(data.u0[:,1] .== 1)
+        #     lds.state_model.x0 = vec(lds.state_model.B0)
+        # end
+        # if all(data.d[:,1,:] .== 1)
+        #     lds.obs_model.d  = vec(lds.obs_model.D)
+        # end
+        # if all(data.u[:,1,:] .== 1)
+        #     lds.state_model.b  = vec(lds.state_model.B)
+        # end
         
         # report progress
         push!(elbos, elbo)
@@ -394,7 +394,7 @@ end
 
 function smooth_cov!(
     lds::LinearDynamicalSystem{T,S,O}, 
-    kws::KalmanWorkspace{T}
+    kws::KalmanWorkspace{T},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
         
     @inline forwards_cov!(lds, kws)
@@ -406,7 +406,7 @@ end
 
 @views function forwards_cov!(
     lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T}
+    kws::KalmanWorkspace{T},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     kws.pred_cov[1] = kws.P0_PD[];
@@ -434,7 +434,7 @@ end
 
 function backwards_cov!(
     lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T}
+    kws::KalmanWorkspace{T},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # init smoothed cov & accumulators
@@ -514,7 +514,7 @@ end
 
 function forwards_mean!(
     lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T}
+    kws::KalmanWorkspace{T},
     ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     
     @inbounds @views begin
@@ -545,7 +545,7 @@ end
 
 
 function backwards_mean!(
-    kws::KalmanWorkspace{T}
+    kws::KalmanWorkspace{T},
     ) where {T<:Real}
     
     kws.smooth_mean[:,end,:] .= kws.filt_mean[:, end,:];
@@ -700,8 +700,8 @@ function est_cov(
 
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) + (prior_df * prior_mu)) / 
-                (N + prior_df);
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+ (prior_df * prior_mu)) / 
+                (N .+ prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
@@ -720,8 +720,8 @@ function est_cov(
 
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) + (prior_df * prior_mu)) / 
-                (N + prior_df);
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / 
+                (N .+ prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
@@ -961,27 +961,62 @@ end
 
 
 
+# function marginal_loglikelihood(
+#     lds::LinearDynamicalSystem{T,S,O},
+#     kws::KalmanWorkspace{T},
+# ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+#     total_ll = zero(T)
+#     CVCR = PDMat(Matrix(I(lds.obs_dim))) # placeholder, will be updated in loop
+#     Cmu = zeros(T, lds.obs_dim)
+#     MV = MvNormal(Cmu, CVCR)
+
+#     @inline @views for t in eachindex(kws.pred_cov)
+
+#         CVCR = tol_PD(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
+        
+#         @inline @views for n in 1:kws.ntrials
+
+#             mul!(Cmu, lds.obs_model.C, kws.pred_mean[:,t,n])
+#             MV = MvNormal(Cmu, CVCR)
+#             total_ll += logpdf(MV, kws.y_minus_d[:,t,n]);
+            
+#         end
+#     end
+
+#     return total_ll
+
+# end
+
+
+# function logpdf_sum!(
+#     MV::MvNormal{T,PDMat{T,Matrix{T}}},
+#     x::AbstractVector{T},
+#     out::T,
+# ) where {T<:Real} 
+# out += Distributions.logpdf(MV, x)
+# out
+# end
+
 function marginal_loglikelihood(
     lds::LinearDynamicalSystem{T,S,O},
     kws::KalmanWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     total_ll = zero(T)
-    CVCR = PDMat(Matrix(I(lds.obs_dim))) # placeholder, will be updated in loop
-    Cmu = zeros(T, lds.obs_dim)
-    MV = MvNormal(Cmu, CVCR)
+    # kws.obs_pd_tmp[] = PDMat(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
+    MV = MvNormal(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
+    @inbounds kws.innovation .= kws.y_minus_d .- reshape(lds.obs_model.C * reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials), kws.obs_dim, kws.tsteps, kws.ntrials)
 
-    @inline @views for t in eachindex(kws.pred_cov)
+    @inbounds @views for t in eachindex(kws.pred_cov)
 
-        CVCR = PDMat(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
-
-        @inline @views for n in 1:kws.ntrials
-
-            mul!(Cmu, lds.obs_model.C, kws.pred_mean[:,t,n])
-            MV = MvNormal(Cmu, CVCR)
-            total_ll += logpdf(MV, kws.y_minus_d[:,t,n]);
-            
+        kws.obs_pd_tmp[] = tol_PD(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
+        MV = MvNormal(kws.obs_pd_tmp[])
+    
+        for n in axes(kws.innovation, 3)
+            total_ll += Distributions.logpdf(MV, kws.innovation[:,t,n]);
         end
+
     end
 
     return total_ll

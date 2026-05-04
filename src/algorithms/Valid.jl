@@ -134,7 +134,7 @@ function _validate_state_model(
     end
 
     # Check optional B matrix (dynamics input)
-    if state_model.B !== nothing && size(state_model.B, 1) != latent_dim
+    if size(state_model.B, 1) != latent_dim
         throw(
             DimensionMismatchError(
                 "B matrix rows", latent_dim, size(state_model.B, 1)
@@ -143,7 +143,7 @@ function _validate_state_model(
     end
 
     # Check optional B0 matrix (initial-state input)
-    if state_model.B0 !== nothing && size(state_model.B0, 1) != latent_dim
+    if size(state_model.B0, 1) != latent_dim
         throw(
             DimensionMismatchError(
                 "B0 matrix rows", latent_dim, size(state_model.B0, 1)

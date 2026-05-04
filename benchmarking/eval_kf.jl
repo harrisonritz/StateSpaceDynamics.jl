@@ -38,7 +38,7 @@ kf_config = BenchConfig(
     8,      # obs_dims
     100,         # seq_length
     50,          # n_iters (EM iterations per fit)
-    1,         # n_repeats (benchmark samples)
+    128,         # n_repeats (benchmark samples)
 )
 
 const NUM_TRIALS = 100
@@ -147,7 +147,7 @@ max_iter = kf_config.n_iters
 bench = @benchmark SSD.fit!(m, $y;
                             max_iter=$max_iter,
                             tol=1e-6,
-                            progress=true) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
+                            progress=false) setup=(m = deepcopy($model)) samples=kf_config.n_repeats evals=1
 
 
 # Fit once outside the benchmark to get final parameters for evaluation.

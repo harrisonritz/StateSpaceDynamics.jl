@@ -137,8 +137,9 @@ function test_kalman_covariance_shared_across_trials()
 
     tsteps, ntrials = size(y, 2), size(y, 3)
     kws = StateSpaceDynamics.KalmanWorkspace(lds, tsteps, ntrials)
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps, ntrials)
-    StateSpaceDynamics.smooth!(lds, tfs, y, kws)
+    data = format_kf_data!(lds, y, nothing, nothing, nothing, T, N)
+    precompute_kalman_constants!(kws, lds, data)
+    smooth_cov!(lds, kws)
 
     # All trials alias the same underlying covariance storage.
     @test tfs[1].p_smooth === tfs[2].p_smooth
