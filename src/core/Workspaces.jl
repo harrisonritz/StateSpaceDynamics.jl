@@ -756,14 +756,246 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
     return ws
 end
 
-#=
+
+"""
 Refresh the per-regime constant caches after an M-step has updated the LDS parameters.
 Must be called before the next E-step so that Cholesky factors, Hessian templates, etc.
 reflect the current Q, R, A, P0.
-=#
+"""
 function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
     for k in eachindex(slds.LDSs)
         compute_slds_constants!(ws.consts[k], slds.LDSs[k], ws.I_mat)
     end
     return nothing
+end
+
+
+
+"""
+    KalmanWorkspace{T<:Real}
+
+Pre-allocated workspace for the information-form Kalman filter + RTS smoother path
+(ported from StateSpaceAnalysis). Used when `LinearDynamicalSystem.kalman_filter == true`.
+
+The workspace is split into three layers:
+
+1. **Shared covariance storage** (`pred_cov`, `filt_cov`, `pred_icov`, `smooth_cov`,
+   `G`). Populated once per E-step by the covariance forward-backward pass — these
+   quantities depend only on `A, Q, C, R, P0`, not on the observations, so they are
+   reused across all trials. Stored as `Vector{PDMat}` to keep Cholesky factors cached.
+
+2. **Shared 3D aliases** (`p_smooth_shared`, `p_smooth_tt1_shared`). Dense arrays that
+   each trial's `FilterSmooth.p_smooth` / `FilterSmooth.p_smooth_tt1` is set to point
+   at (same Julia object, not a copy). `sufficient_statistics!` only reads these
+   fields, so reference-sharing is safe.
+
+3. **Per-trial mean-pass buffers** (`pred_mean`, `filt_mean`, `smooth_mean`, `Bu`,
+   `CiRY`, `y_minus_d`). Shape `(D, T, ntrials)` — threads write into disjoint trial
+   slices, so no locking is required.
+
+`u_dim` / `u0_dim` are 0 when the corresponding `B` / `B0` inputs are absent.
+"""
+struct KalmanWorkspace{T<:Real}
+
+    # constants
+    latent_dim::Int
+    obs_dim::Int
+    init_input_dim::Int
+    state_input_dim::Int
+    obs_input_dim::Int
+    tsteps::Int
+    ntrials::Int
+
+    # Shared covariance storage (populated once per E-step)
+    pred_cov::Vector{PDMat{T,Matrix{T}}}
+    filt_cov::Vector{PDMat{T,Matrix{T}}}
+    pred_icov::Vector{PDMat{T,Matrix{T}}}
+    smooth_cov::Vector{PDMat{T,Matrix{T}}}
+    sum_smooth_cov_all::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_cov_prev::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_cov_next::Matrix{T}   # (D, D) - covariance P_smooth[t]
+    sum_smooth_xcov::Matrix{T}  # (D, D) - cross-covariance P_smooth[t, t-1]
+    G::Array{T,3}  # (D, D, T-1)
+
+    # Pre-allocated scratch buffers for covariance_forward_backward! (no per-step allocs)
+    cov_tmp1::Matrix{T}   # (D, D)
+    cov_tmp2::Matrix{T}   # (D, D)
+    pd_tmp::Base.RefValue{PDMat{T,Matrix{T}}} #(D, D)
+    obs_pd_tmp::Base.RefValue{PDMat{T,Matrix{T}}} #(p, p)
+
+    # Per-trial D-vector scratch for _filter_mean_trial! (column n used by trial n)
+    mean_tmp::Matrix{T}   # (D, ntrials)
+
+    # Shared 3D aliases for FilterSmooth reference-sharing
+    p_smooth_shared::Array{T,3}      # (D, D, T)
+    p_smooth_tt1_shared::Array{T,3}  # (D, D, T)
+
+    # Derived constants (refreshed each E-step; M-step mutates Q, R, P0)
+    Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+
+    #  Priors
+    B0_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    P0_mu::Matrix{T}
+    P0_df::Int
+
+    AB_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    Q_mu::Matrix{T}
+    Q_df::Int
+
+    CD_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    R_mu::Matrix{T}
+    R_df::Int
+
+    # Derived terms for Kalman gain and LL computation (refreshed each E-step)
+    CiR::Matrix{T}                              # C' * R^{-1}   (D × p)
+    CiRC::Base.RefValue{PDMat{T,Matrix{T}}}     # C' * R^{-1} * C  (D × D), symmetric
+    shared_entropy::Base.RefValue{T}
+
+    # Per-trial mean-pass buffers (thread-safe via trial-slice access)
+    pred_mean::Array{T,3}    # (D, T, ntrials)
+    filt_mean::Array{T,3}    # (D, T, ntrials)
+    smooth_mean::Array{T,3}  # (D, T, ntrials)
+    Bu::Array{T,3}           # (D, T, ntrials)
+    CiRY::Array{T,3}         # (D, T, ntrials)
+    y_minus_d::Array{T,3}    # (p, T, ntrials)
+    innovation::Array{T,3}   # (p, T, ntrials)
+    # Dd::Array{T,3}           # (p, T, ntrials)
+
+    x_prev::Matrix{T}
+    x_next::Matrix{T}
+    x_init::Matrix{T}
+    x_cur::Matrix{T}
+
+end
+
+"""
+    KalmanWorkspace(lds::LinearDynamicalSystem, tsteps::Int, ntrials::Int)
+
+Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
+`lds.obs_model isa GaussianObservationModel`.
+"""
+@views function KalmanWorkspace(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps::Int, ntrials::Int
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    D = lds.latent_dim
+    p = lds.obs_dim
+    init_input_dim = size(lds.state_model.B0, 2)
+    state_input_dim = size(lds.state_model.B, 2)
+    obs_input_dim = size(lds.obs_model.D, 2)
+
+    # Placeholder PDMats; re-wrapped at the start of every E-step
+    placeholder_D = PDMat(Matrix{T}(I, D, D))
+    placeholder_p = PDMat(Matrix{T}(I, p, p))
+
+    if isnothing(lds.state_model.B0_lambda)
+        placeholder_B0 = nothing
+    else
+        placeholder_B0 = PDMat(lds.state_model.B0_lambda)
+    end
+
+    if isnothing(lds.state_model.AB_lambda)
+        placeholder_AB = nothing
+    else
+        placeholder_AB = PDMat(lds.state_model.AB_lambda)
+    end
+
+    if isnothing(lds.obs_model.CD_lambda)
+        placeholder_CD = nothing
+    else
+        placeholder_CD = PDMat(lds.obs_model.CD_lambda)
+    end
+
+    if isnothing(lds.state_model.P0_prior)
+        placeholder_P0_mu = zeros(T, D, D)
+        placeholder_P0_df = 0
+    else
+        placeholder_P0_mu = Matrix{T}(lds.state_model.P0_prior.Ψ)
+        placeholder_P0_df = lds.state_model.P0_prior.ν
+    end
+
+    if isnothing(lds.state_model.Q_prior)
+        placeholder_Q_mu = zeros(T, D, D)
+        placeholder_Q_df = 0
+    else
+        placeholder_Q_mu = Matrix{T}(lds.state_model.Q_prior.Ψ)
+        placeholder_Q_df = lds.state_model.Q_prior.ν
+    end
+
+    if isnothing(lds.obs_model.R_prior)
+        placeholder_R_mu = zeros(T, p, p)
+        placeholder_R_df = 0
+    else
+        placeholder_R_mu = Matrix{T}(lds.obs_model.R_prior.Ψ)
+        placeholder_R_df = lds.obs_model.R_prior.ν
+    end
+    
+
+    pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    filt_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    smooth_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
+    G = zeros(T, D, D, max(tsteps - 1, 0))
+
+    p_smooth_shared = zeros(T, D, D, tsteps)
+    p_smooth_tt1_shared = zeros(T, D, D, tsteps)
+
+    
+
+
+    return KalmanWorkspace{T}(
+        D,                              # latent_dim
+        p,                              # obs_dim
+        init_input_dim,                 # initial_control_dim
+        state_input_dim,                # control_dim
+        obs_input_dim,                  # observation_control_dim
+        tsteps,                         # time_steps
+        ntrials,                        # number_of_trials
+        pred_cov,                       # Vector{PDMat} for P_pred[t]
+        filt_cov,                       # Vector{PDMat} for P_filt[t]
+        pred_icov,                      # Vector{PDMat} for P_pred[t]^{-1} as PDMats (cached Cholesky factors)
+        smooth_cov,                     # Vector{PDMat} for P_smooth[t]
+        zeros(T, D, D),                 # sum_smooth_cov_all, Matrix{T}  for sum P_smooth[1:T]
+        zeros(T, D, D),                 # sum_smooth_cov_prev, Matrix{T}  for sum P_smooth[1:(T-1)]
+        zeros(T, D, D),                 # sum_smooth_cov_next, Matrix{T}  for sum P_smooth[2:T]
+        zeros(T, D, D),                 # sum_smooth_xcov, Matrix{T} for sum P_smooth[t, t-1]
+        G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
+        zeros(T, D, D),                 # cov_tmp1
+        zeros(T, D, D),                 # cov_tmp2
+        Ref(placeholder_D),             # pd_tmp
+        Ref(placeholder_p),             # obs_pd_tmp
+        zeros(T, D, ntrials),           # mean_tmp
+        p_smooth_shared,                # (D, D, T)
+        p_smooth_tt1_shared,            # (D, D, T)
+        Ref(placeholder_D),             # Q_PD
+        Ref(placeholder_D),             # P0_PD
+        Ref(placeholder_p),             # R_PD
+        
+        placeholder_B0,                 # B0_lambda
+        placeholder_P0_mu,              # P0_mu
+        placeholder_P0_df,              # P0_df 
+        placeholder_AB,                 # AB_lambda
+        placeholder_Q_mu,               # Q_mu
+        placeholder_Q_df,               # Q_df
+        placeholder_CD,                 # CD_lambda 
+        placeholder_R_mu,               # R_mu
+        placeholder_R_df,               # R_df
+
+        zeros(T, D, p),                 # CiR
+        Ref(placeholder_D),             # CiRC
+        Ref(zero(T)),                   # shared_entropy
+        zeros(T, D, tsteps, ntrials),   # pred_mean
+        zeros(T, D, tsteps, ntrials),   # filt_mean
+        zeros(T, D, tsteps, ntrials),   # smooth_mean
+        zeros(T, D, tsteps, ntrials),   # Bu
+        zeros(T, D, tsteps, ntrials),   # CiRY
+        zeros(T, p, tsteps, ntrials),   # y_minus_d
+        zeros(T, p, tsteps, ntrials),   # innovations
+        # zeros(T, p, tsteps, ntrials),   # Dd
+        zeros(T, D, (tsteps-1)*ntrials),# x_prev
+        zeros(T, D, (tsteps-1)*ntrials),# x_next
+        zeros(T, D, ntrials),           # x_init
+        zeros(T, D, tsteps*ntrials)     # x_cur
+    )
 end

@@ -23,6 +23,7 @@ end
     return (Ψ .+ S) ./ (ν + n + d + one(T))
 end
 
+# TODO: this should use PD Mats
 @inline function iw_logprior_term(Σ::AbstractMatrix{T}, prior::IWPrior{T}) where {T}
     D = size(Σ, 1)
     Ψ, ν = prior.Ψ, prior.ν
@@ -39,12 +40,25 @@ end
 
 Represents the state model of a Linear Dynamical System with Gaussian noise.
 
+State evolution:
+```math
+x_1   ~ N(x_0 + B_0 u_0, P_0)
+x_{t+1} | x_t ~ N(A x_t + b + B u_t, Q)
+```
+where `B·u_t` and `B_0·u_0` are present only when the corresponding `B`, `B0` fields
+are supplied (i.e., not `nothing`). Input matrices are only consumed by the Kalman
+filter path (see `LinearDynamicalSystem.kalman_filter`).
+
 # Fields
 - `A::M`: Transition matrix (size `latent_dim × latent_dim`).
 - `Q::M`: Process noise covariance matrix.
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
+- `B::M: Optional dynamics input matrix (`latent_dim × u_dim`).
+    When supplied, inputs `u` must be passed to `fit!`/`smooth!` via a keyword argument.
+- `B0::M: Optional initial-state input matrix
+    (`latent_dim × u0_dim`). When supplied, `u0` must be passed to `fit!`/`smooth!`.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
 """
@@ -56,8 +70,12 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
+    B::M = zeros(size(A, 1), 1)  # default to zero matrix if not supplied
+    B0::M = zeros(size(A, 1), 1) # default to zero matrix if not supplied
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
+    B0_lambda::Union{Nothing,M} = nothing # optional prior on B0
+    AB_lambda::Union{Nothing,M} = nothing # optional joint prior on A and B
 end
 
 function Base.show(io::IO, gsm::GaussianStateModel; gap="")
@@ -82,6 +100,11 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
         println(io, gap, "  P0 = $(round.(gsm.P0, sigdigits=3))")
     end
 
+        println(io, gap, " Dynamics input:")
+        println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
+        println(io, gap, " Initial input:")
+        println(io, gap, "  size(B0) = ($(size(gsm.B0,1)), $(size(gsm.B0,2)))")
+
     return nothing
 end
 
@@ -102,8 +125,10 @@ Base.@kwdef mutable struct GaussianObservationModel{
 } <: AbstractObservationModel{T}
     C::M
     R::M
-    d::V
+    d::Union{Nothing,V}
+    D::M = zeros(size(C, 1), 1) # default to zero matrix if not supplied
     R_prior::Union{Nothing,IWPrior{T}} = nothing
+    CD_lambda::Union{Nothing,M} = nothing # optional joint prior on C and D (stacked vertically)
 end
 
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
@@ -114,29 +139,92 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
         println(io, gap, " size(C) = ($(size(gom.C,1)), $(size(gom.C,2)))")
         println(io, gap, " size(R) = ($(size(gom.R,1)), $(size(gom.R,2)))")
         println(io, gap, " size(d) = ($(length(gom.d)),)")
+        println(io, gap, " size(D) = ($(size(gom.D,1)), $(size(gom.D,2)))")
     else
         println(io, gap, " C = $(round.(gom.C, digits=2))")
         println(io, gap, " R = $(round.(gom.R, digits=2))")
         println(io, gap, " d = $(round.(gom.d, digits=2))")
+        println(io, gap, " D = $(round.(gom.D, digits=2))")
     end
 
     return nothing
 end
 
-# Convenience constructors
+
+
+
+# Convenience constructors (State)
 function GaussianStateModel(
     A::M, Q::M, b::V, x0::V, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianStateModel{T,M,V}(;
-        A=A, Q=Q, b=b, x0=x0, P0=P0, Q_prior=nothing, P0_prior=nothing
+        A=A,
+        Q=Q,
+        b=b,
+        x0=x0,
+        P0=P0,
+        B=zeros(T, size(A, 1), 1),
+        B0=zeros(T, size(A, 1), 1),
+        Q_prior=nothing,
+        P0_prior=nothing,
+        AB_lambda=nothing,
+        B0_lambda=nothing,
     )
 end
+
+
+function GaussianStateModel(
+    A::M, Q::M, B::M, B0::M, P0::M,
+) where {T<:Real,M<:AbstractMatrix{T}}
+    return GaussianStateModel{T,M}(;
+        A=A,
+        Q=Q,
+        b=zeros(T, size(A, 1)),
+        x0=zeros(T, size(A, 1)),
+        P0=P0,
+        B=B,
+        B0=B0,
+        Q_prior=nothing,
+        P0_prior=nothing,
+        AB_lambda=nothing,
+        B0_lambda=nothing,
+    )
+end
+
+
+
+
+# Convenience constructors (Observation)
 
 function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianObservationModel{T,M,V}(; C=C, R=R, d=d, R_prior=nothing)
+    return GaussianObservationModel{T,M,V}(; 
+    C=C, 
+    R=R, 
+    d=d, 
+    D=zeros(size(C, 1), 1), 
+    R_prior=nothing,
+    CD_lambda=nothing,
+    )
 end
+
+
+function GaussianObservationModel(
+    C::M, R::M, D::M,
+) where {T<:Real,M<:AbstractMatrix{T}}
+    return GaussianObservationModel{T,M}(; 
+    C=C, 
+    R=R, 
+    d=zeros(T, size(C, 1)), 
+    D=D, 
+    R_prior=nothing,
+    CD_lambda=nothing,
+    )
+end
+
+
+
 
 """
     PoissonObservationModel{
@@ -188,7 +276,13 @@ Represents a unified Linear Dynamical System with customizable state and observa
     PoissonObservationModel)
 - `latent_dim::Int`: Dimension of the latent state
 - `obs_dim::Int`: Dimension of the observations
-- `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization
+- `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
+    Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
+    Poisson path (`[x0, P0, A&b, Q, C&log_d]`), and length 9 when `kalman_filter=true`
+    with inputs supplied (`[x0, P0, A, Q, C, R, B, B0, D]`).
+- `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
+    E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
+    the existing block-tridiagonal MAP path.
 """
 Base.@kwdef struct LinearDynamicalSystem{
     T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}
@@ -197,32 +291,51 @@ Base.@kwdef struct LinearDynamicalSystem{
     obs_model::O
     latent_dim::Int
     obs_dim::Int
+    state_input_dim::Int = 1
+    init_input_dim::Int = 1
+    obs_input_dim::Int = 1
     fit_bool::Vector{Bool}
+    kalman_filter::Bool = false
 end
 
 function LinearDynamicalSystem(
-    state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},Nothing}=nothing
+    state_model::S,
+    obs_model::O;
+    fit_bool::Union{Vector{Bool},Nothing}=nothing,
+    kalman_filter::Bool=false,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
     # Infer dimensions from matrices
     latent_dim = size(state_model.A, 1)
     obs_dim = size(obs_model.C, 1)
+    state_input_dim = hasproperty(state_model, :B) && !isnothing(state_model.B) ? size(state_model.B, 2) : 1
+    init_input_dim = hasproperty(state_model, :B0) && !isnothing(state_model.B0) ? size(state_model.B0, 2) : 1
+    obs_input_dim = hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 1
 
-    # Set default fit_bool based on observation model type
+
+    # Set default fit_bool based on observation model type / Kalman flag
     if fit_bool === nothing
         if obs_model isa PoissonObservationModel
             # For Poisson: [x0, P0, A&b, Q, C&log_d] (5 parameters)
             fit_bool = [true, true, true, true, true]
+        elseif kalman_filter
+            # Kalman-path Gaussian: [x0, P0, A, Q, C, R, B, B0, D] (length 9)
+            fit_bool = [true, true, true, true, true, true, true, true, true]
         else
-            # For Gaussian: [x0, P0, A&b, Q, C&d, R] (6 parameters)
+            # For Tridiagonal Gaussian: [x0, P0, A&b, Q, C&d, R] (6 parameters)
             fit_bool = [true, true, true, true, true, true]
         end
     end
 
+
     # Create the LDS
     lds = LinearDynamicalSystem{T,S,O}(
-        state_model, obs_model, latent_dim, obs_dim, fit_bool
+        state_model, obs_model, 
+        latent_dim, obs_dim, 
+        state_input_dim, init_input_dim, obs_input_dim, 
+        fit_bool, kalman_filter
     )
+
 
     # Validate the constructed LDS (throws on error)
     validate_LDS(lds)
@@ -233,6 +346,9 @@ end
 function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "Linear Dynamical System:")
     println(io, gap, "------------------------")
+    if lds.kalman_filter
+        println(io, gap, " E-step backend: Kalman filter + RTS smoother")
+    end
     Base.show(io, lds.state_model; gap=gap * " ")
     Base.show(io, lds.obs_model; gap=gap * " ")
     println(io, gap, " Parameters to update:")
@@ -241,8 +357,11 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     if lds.obs_model isa PoissonObservationModel
         # C and log_d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, log_d"][lds.fit_bool[1:5]]
+    elseif lds.kalman_filter && length(lds.fit_bool) == 9
+        labels = ["x0", "P0", "A", "Q", "C", "R", "B", "B0", "D"]
+        prms = labels[lds.fit_bool]
     else
-        prms = ["x0", "P0", "A (and b)", "Q", "C", "R"][lds.fit_bool[1:6]]
+        prms = ["x0", "P0", "A (and b)", "Q", "C (and d)", "R"][lds.fit_bool[1:6]]
     end
 
     println(io, gap, "  $(join(prms, ", "))")

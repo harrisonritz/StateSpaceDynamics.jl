@@ -35,7 +35,7 @@ lds_config = BenchConfig(
 lds_implementations = [
     SSD_LDSImplem(),
     pykalman_LDSImplem(),
-    Dynamax_LDSImplem()
+    # Dynamax_LDSImplem()
 ]
 
 lds_results = []
