@@ -133,6 +133,24 @@ function _validate_state_model(
         )
     end
 
+    # Check optional B matrix (dynamics input)
+    if size(state_model.B, 1) != latent_dim
+        throw(
+            DimensionMismatchError(
+                "B matrix rows", latent_dim, size(state_model.B, 1)
+            ),
+        )
+    end
+
+    # Check optional B0 matrix (initial-state input)
+    if size(state_model.B0, 1) != latent_dim
+        throw(
+            DimensionMismatchError(
+                "B0 matrix rows", latent_dim, size(state_model.B0, 1)
+            ),
+        )
+    end
+
     # Check Q matrix (process noise covariance)
     if size(state_model.Q) != (latent_dim, latent_dim)
         throw(
@@ -208,6 +226,8 @@ function _validate_obs_model(
     if size(obs_model.R) != (obs_dim, obs_dim)
         throw(DimensionMismatchError("R matrix", (obs_dim, obs_dim), size(obs_model.R)))
     end
+
+    # TODO: check D matrix
 
     if !issymmetric(obs_model.R)
         max_asym = maximum(abs.(obs_model.R - obs_model.R'))
@@ -298,6 +318,15 @@ end
 ```
 """
 function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
+    # The Kalman-path backend only supports Gaussian observations
+    if lds.kalman_filter && lds.obs_model isa PoissonObservationModel
+        throw(
+            ArgumentError(
+                "kalman_filter=true requires a GaussianObservationModel; got $(typeof(lds.obs_model))",
+            ),
+        )
+    end
+
     # Check state model dimensions and properties
     _validate_state_model(lds.state_model, lds.latent_dim)
 
@@ -305,7 +334,13 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     _validate_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
 
     # Check fit_bool length
-    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    expected_fit_length = if lds.obs_model isa PoissonObservationModel
+        5
+    elseif lds.kalman_filter
+        9
+    else
+        6
+    end
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end

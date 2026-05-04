@@ -1296,7 +1296,73 @@ function fit!(
     y::AbstractVector{<:AbstractMatrix{T}};
     max_iter::Int=100,
     tol::Float64=1e-6,
-    progress=true,
+    progress::Bool=true,
+    u0=nothing,
+    u=nothing,
+    d=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+    return _fit!(lds, y, max_iter, tol, progress, u0, u, d, Val(lds.kalman_filter))
+
+end
+
+function _fit!(lds::LinearDynamicalSystem{T,S,O},
+    y_vec::AbstractVector{<:AbstractMatrix{T}},
+    max_iter::Int,
+    tol::Float64,
+    progress::Bool,
+    u0,
+    u,
+    d,
+    ::Val{true},
+    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    
+    y_combined = zeros(T, size(y_vec[1], 1), size(y_vec[1], 2), length(y_vec))
+    try
+        # combine y vector into matrix
+        y_combined = cat(y_vec..., dims=3)
+    catch
+        throw(ArgumentError(
+            """
+            Failed to combine input vector of matrices into a single matrix. 
+            Ensure all matrices have the same number of rows (obs_dim) and that 
+            the total number of columns does not exceed memory limits.
+            """
+            ))
+    end
+
+    return _fit_kalman!(
+        lds, y_combined;
+        u0=u0, u=u, d=d, max_iter=max_iter, tol=tol, progress=progress,
+    )
+
+end
+
+function _fit!(lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    max_iter::Int,
+    tol::Float64,
+    progress::Bool,
+    u0,
+    u,
+    d,
+    ::Val{false},
+    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
+    
+    return _fit_tridiag!(
+        lds, y;
+        max_iter=max_iter, tol=tol, progress=progress,
+    )
+
+end
+
+
+function _fit_tridiag!(
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractVector{<:AbstractMatrix{T}};
+    max_iter::Int=100,
+    tol::Float64=1e-6,
+    progress::Bool=true
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
@@ -1336,10 +1402,21 @@ function fit!(
     return elbos
 end
 
+
 function fit!(
-    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}; kwargs...
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractArray{T}; kwargs...
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    return fit!(lds, [y]; kwargs...)
+    # reshape y from [obs_dim, tsteps, trials] to vector of matrices if needed
+    if ndims(y) == 3
+        obs_dim, tsteps, ntrials = size(y)
+        y_vec = [view(y, :, :, i) for i in 1:ntrials]
+        return fit!(lds, y_vec; kwargs...)
+    elseif ndims(y) == 2
+        # single trial case, wrap in vector
+        return fit!(lds, [y]; kwargs...)
+    else
+        throw(ArgumentError("Input array y must be 2D or 3D."))
+    end
 end
 
 #=
@@ -1477,4 +1554,107 @@ function loglikelihood(
     ws = SmoothWorkspace(WT, lds.latent_dim, lds.obs_dim, tsteps)
     compute_smooth_constants!(ws, lds)
     return loglikelihood!(ws, x, lds, y)
+end
+
+"""
+    filter_loglikelihood(lds, y)
+
+One-step-ahead predictive log-likelihood ∑_{t,n} log p(y_t^n | y_{1:t-1}^n) via
+the Kalman filter.  Valid for any fitted `LinearDynamicalSystem` with a
+`GaussianObservationModel`, regardless of which E-step backend was used to train it.
+
+Returns the **total** log-likelihood.  Divide by `obs_dim * tsteps * ntrials` for a
+per-observation score that is comparable across configurations.
+"""
+function filter_loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractArray{T,3},
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+    A  = lds.state_model.A
+    Q  = lds.state_model.Q
+    b  = lds.state_model.b
+    x0 = lds.state_model.x0
+    P0 = lds.state_model.P0
+    C  = lds.obs_model.C
+    R  = lds.obs_model.R
+    d  = lds.obs_model.d
+
+    obs_dim, tsteps, ntrials = size(y)
+    D = lds.latent_dim
+
+    total_ll = zero(T)
+    log2πp = T(obs_dim) * log(T(2π))
+
+    # Pre-allocate buffers (reused across trials and time steps)
+    x_p    = Vector{T}(undef, D)
+    x_f    = Vector{T}(undef, D)
+    P_p    = Matrix{T}(undef, D, D)
+    P_f    = Matrix{T}(undef, D, D)
+    tmp_DD = Matrix{T}(undef, D, D)
+    innov  = Vector{T}(undef, obs_dim)
+    Si_e   = Vector{T}(undef, obs_dim)
+    Smat   = Matrix{T}(undef, obs_dim, obs_dim)
+    PCt    = Matrix{T}(undef, D, obs_dim)
+    SiPCt  = Matrix{T}(undef, obs_dim, D)
+
+    for n in 1:ntrials
+        x_f .= x0
+        P_f .= P0
+
+        for t in 1:tsteps
+            # Prediction (t=1: prediction == prior)
+            if t == 1
+                x_p .= x0
+                P_p .= P0
+            else
+                mul!(x_p, A, x_f)
+                x_p .+= b
+                mul!(tmp_DD, A, P_f)
+                mul!(P_p, tmp_DD, A')
+                P_p .+= Q
+                Symmetrize!(P_p)
+                # P_p .= (P_p .+ P_p') .* T(0.5)
+            end
+
+            # Innovation: e = y_t - C x_p - d
+            mul!(innov, C, x_p)
+            @views innov .= y[:, t, n] .- innov .- d
+
+            # Innovation covariance: S = C P_p C' + R
+            mul!(PCt, P_p, C')
+            mul!(Smat, C, PCt)
+            Smat .+= R
+            Symmetrize!(Smat)
+            # Smat .= (Smat .+ Smat') .* T(0.5)
+
+            # One-step predictive log-likelihood: log N(e; 0, S)
+            S_ch = cholesky(Hermitian(Smat))
+            Si_e .= innov
+            ldiv!(S_ch, Si_e)           # Si_e ← S⁻¹ e
+            total_ll -= T(0.5) * (log2πp + logdet(S_ch) + dot(innov, Si_e))
+
+            # Update: x_f = x_p + K e  where K = PCt S⁻¹
+            mul!(x_f, PCt, Si_e)        # x_f = PCt (S⁻¹ e)
+            x_f .+= x_p
+
+            # P_f = P_p - PCt S⁻¹ PCt'
+            SiPCt .= PCt'
+            ldiv!(S_ch, SiPCt)          # SiPCt ← S⁻¹ PCt'
+            mul!(P_f, PCt, SiPCt)
+            P_f .= P_p .- P_f
+            Symmetrize!(P_f)
+            # P_f .= (P_f .+ P_f') .* T(0.5)
+        end
+    end
+
+    return total_ll
+end
+
+function filter_loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractVector{<:AbstractMatrix{T}},
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+
+    y_comb = cat(y..., dims=3)
+    return filter_loglikelihood(lds, y_comb)
 end
