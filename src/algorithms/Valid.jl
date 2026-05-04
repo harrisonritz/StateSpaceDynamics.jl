@@ -227,6 +227,8 @@ function _validate_obs_model(
         throw(DimensionMismatchError("R matrix", (obs_dim, obs_dim), size(obs_model.R)))
     end
 
+    # TODO: check D matrix
+
     if !issymmetric(obs_model.R)
         max_asym = maximum(abs.(obs_model.R - obs_model.R'))
         throw(NotSymmetricError("R matrix", max_asym))

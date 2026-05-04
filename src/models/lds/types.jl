@@ -55,9 +55,9 @@ filter path (see `LinearDynamicalSystem.kalman_filter`).
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
-- `B::Union{Nothing,M} = nothing`: Optional dynamics input matrix (`latent_dim × u_dim`).
+- `B::M: Optional dynamics input matrix (`latent_dim × u_dim`).
     When supplied, inputs `u` must be passed to `fit!`/`smooth!` via a keyword argument.
-- `B0::Union{Nothing,M} = nothing`: Optional initial-state input matrix
+- `B0::M: Optional initial-state input matrix
     (`latent_dim × u0_dim`). When supplied, `u0` must be passed to `fit!`/`smooth!`.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
@@ -163,8 +163,8 @@ function GaussianStateModel(
         b=b,
         x0=x0,
         P0=P0,
-        B=zeros(size(A, 1), 1),
-        B0=zeros(size(A, 1), 1),
+        B=zeros(T, size(A, 1), 1),
+        B0=zeros(T, size(A, 1), 1),
         Q_prior=nothing,
         P0_prior=nothing,
         AB_lambda=nothing,
@@ -179,8 +179,8 @@ function GaussianStateModel(
     return GaussianStateModel{T,M}(;
         A=A,
         Q=Q,
-        b=zeros(size(A, 1), 1),
-        x0=zeros(size(A, 1), 1),
+        b=zeros(T, size(A, 1)),
+        x0=zeros(T, size(A, 1)),
         P0=P0,
         B=B,
         B0=B0,
@@ -216,7 +216,7 @@ function GaussianObservationModel(
     return GaussianObservationModel{T,M}(; 
     C=C, 
     R=R, 
-    d=zeros(size(C, 1), 1), 
+    d=zeros(T, size(C, 1)), 
     D=D, 
     R_prior=nothing,
     CD_lambda=nothing,

@@ -103,8 +103,8 @@ function test_kalman_smooth_agrees_with_newton()
 
     n_obs = p * T * N
 
-    elbos_kf = fit!(lds_kf, y; max_iter=1, progress=false)[1] / n_obs
-    elbos_bt = fit!(lds_bt, y; max_iter=1, progress=false)[1] / n_obs
+    elbos_kf = fit!(lds_kf, y; max_iter=1, progress=false)[1] ./ n_obs
+    elbos_bt = fit!(lds_bt, y; max_iter=1, progress=false)[1] ./ n_obs
 
     # Single-iteration ELBO should match across backends modulo tol_PD floor.
     @printf("ELBOs: KF = %.8f  BT = %.8f\n (diff = %.8f)\n", elbos_kf[1], elbos_bt[1], abs(elbos_kf[1] - elbos_bt[1]))
@@ -142,10 +142,9 @@ function test_kalman_covariance_shared_across_trials()
     smooth_cov!(lds, kws)
 
     # All trials alias the same underlying covariance storage.
-    @test tfs[1].p_smooth === tfs[2].p_smooth
-    @test tfs[1].p_smooth === tfs[3].p_smooth
-    @test tfs[1].p_smooth_tt1 === tfs[2].p_smooth_tt1
-    @test tfs[1].entropy == tfs[2].entropy
+    @test kws[1].smooth_cov === kws[2].smooth_cov
+    @test kws[1].filt_cov === kws[2].filt_cov
+    @test kws[1].pred_cov === kws[3].pred_cov
 end
 
 function test_kalman_with_B_input_equivalent_to_bias()
