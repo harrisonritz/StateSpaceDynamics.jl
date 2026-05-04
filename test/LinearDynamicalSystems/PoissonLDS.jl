@@ -25,7 +25,7 @@ function toy_PoissonLDS(
 
     # sample data
     T = 100
-    x, y = rand(poisson_lds; tsteps=T, ntrials=ntrials) # 100 timepoints, ntrials
+    x, y = rand(poisson_lds, fill(T, ntrials))
 
     return poisson_lds, x, y
 end
@@ -177,12 +177,14 @@ function test_poisson_sample_type_preservation()
         fit_bool=fill(true, 6),
     )
 
-    x_f32, y_f32 = rand(plds_f32; tsteps=50, ntrials=3)
+    x_f32, y_f32 = rand(plds_f32, fill(50, 3))
 
-    @test eltype(x_f32) === Float32
-    @test eltype(y_f32) === Float32
-    @test size(x_f32) == (2, 50, 3)
-    @test size(y_f32) == (2, 50, 3)
+    @test eltype(x_f32[1]) === Float32
+    @test eltype(y_f32[1]) === Float32
+    @test length(x_f32) == 3
+    @test length(y_f32) == 3
+    @test size(x_f32[1]) == (2, 50)
+    @test size(y_f32[1]) == (2, 50)
 
     # BigFloat
     A_bf = Matrix{BigFloat}(I, 2, 2)
@@ -203,12 +205,14 @@ function test_poisson_sample_type_preservation()
         fit_bool=fill(true, 6),
     )
 
-    x_bf, y_bf = rand(plds_bf; tsteps=50, ntrials=3)
+    x_bf, y_bf = rand(plds_bf, fill(50, 3))
 
-    @test eltype(x_bf) === BigFloat
-    @test eltype(y_bf) === BigFloat
-    @test size(x_bf) == (2, 50, 3)
-    @test size(y_bf) == (2, 50, 3)
+    @test eltype(x_bf[1]) === BigFloat
+    @test eltype(y_bf[1]) === BigFloat
+    @test length(x_bf) == 3
+    @test length(y_bf) == 3
+    @test size(x_bf[1]) == (2, 50)
+    @test size(y_bf[1]) == (2, 50)
 end
 
 function test_poisson_fit_type_preservation()
@@ -227,7 +231,7 @@ function test_poisson_fit_type_preservation()
             state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
 
-        x, y = rand(lds; tsteps=50, ntrials=3)
+        x, y = rand(lds, fill(50, 3))
 
         mls = fit!(lds, y; max_iter=10, tol=1e-6)
 
@@ -251,10 +255,10 @@ function test_poisson_loglikelihood_type_preservation()
             state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
 
-        x, y = rand(lds; tsteps=50, ntrials=3)
+        x, y = rand(lds, fill(50, 3))
 
-        x_mat = x[:, :, 1]
-        y_mat = y[:, :, 1]
+        x_mat = x[1]
+        y_mat = y[1]
 
         ll = sum(StateSpaceDynamics.loglikelihood(x_mat, lds, y_mat))
 
@@ -298,7 +302,8 @@ end
 function test_parameter_gradient()
     plds, x, y = toy_PoissonLDS()
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, size(y, 2), size(y, 3))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, tsteps_per_trial)
 
     # run estep
     ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
@@ -312,20 +317,24 @@ function test_parameter_gradient()
         zeros(length(params)), C, log_d, tfs, y
     )
 
-    # get numerical gradient
+    # numerical gradient against trial 1 only
     E_z = tfs[1].E_z
     P_smooth = tfs[1].p_smooth
+    y1 = y[1]
     function f(params::AbstractVector{<:Real})
         C_size = plds.obs_dim * plds.latent_dim
         log_d = params[(end - plds.obs_dim + 1):end]
         C = reshape(params[1:C_size], plds.obs_dim, plds.latent_dim)
         d = exp.(log_d)
-        tsteps = size(y, 2)
+        tsteps = size(y1, 2)
         val = zero(eltype(params))
         for t in 1:tsteps
             h_t = C * E_z[:, t] .+ d
-            rho_t = [eltype(params)(0.5) * dot(C[i, :], P_smooth[:, :, t] * C[i, :]) for i in 1:size(C, 1)]
-            val += dot(y[:, t], h_t) - sum(exp.(h_t .+ rho_t))
+            rho_t = [
+                eltype(params)(0.5) * dot(C[i, :], P_smooth[:, :, t] * C[i, :]) for
+                i in 1:size(C, 1)
+            ]
+            val += dot(y1[:, t], h_t) - sum(exp.(h_t .+ rho_t))
         end
         return -val
     end
@@ -352,8 +361,7 @@ function test_EM_matlab()
     data_1 = Matrix(CSV.read("test_data/trial1.csv", DataFrame))
     data_2 = Matrix(CSV.read("test_data/trial2.csv", DataFrame))
     data_3 = Matrix(CSV.read("test_data/trial3.csv", DataFrame))
-    y = cat(data_1, data_2, data_3; dims=3)
-    y = permutedims(y, [2, 1, 3])
+    y = [permutedims(d, [2, 1]) for d in (data_1, data_2, data_3)]
     # read the matlab objects to compare results
     seq = matread("test_data/seq_matlab_3_trials_plds.mat")
     params = matread("test_data/params_matlab_3_trials_plds.mat")
@@ -375,7 +383,7 @@ function test_EM_matlab()
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 6)
     )
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, size(y, 2), size(y, 3))
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, [size(yt, 2) for yt in y])
 
     # first smooth results
     ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
@@ -421,22 +429,22 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         pom = PoissonObservationModel(C=C, log_d=log_d)
         plds = LinearDynamicalSystem(gsm, pom)
 
-        _, Y = rand(rng, plds; tsteps=Tt, ntrials=N)
+        _, Y = rand(rng, plds, fill(Tt, N))
 
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, Tt, N)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
         StateSpaceDynamics.estep!(plds, tfs, Y)
 
         ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
         StateSpaceDynamics.compute_smooth_constants!(ws, plds)
 
         Q0 = sum(
-            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[:, :, k])
-            for k in 1:N
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
+            k in 1:N
         )
         StateSpaceDynamics.update_observation_model!(plds, tfs, Y, ws)  # LBFGS inside
         Q1 = sum(
-            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[:, :, k])
-            for k in 1:N
+            StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
+            k in 1:N
         )
 
         @test Q1 ≥ Q0 - 1e-7
@@ -464,8 +472,8 @@ function test_poisson_gradient_shape_and_finiteness()
             PoissonObservationModel(C=C, log_d=log_d),
         )
 
-        _, Y = rand(plds; tsteps=Tt, ntrials=N)
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, Tt, N)
+        _, Y = rand(plds, fill(Tt, N))
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
         StateSpaceDynamics.estep!(plds, tfs, Y)
 
         g = zeros(Float64, length(vec(C)) + length(log_d))

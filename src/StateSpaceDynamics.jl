@@ -15,6 +15,7 @@ using SparseArrays
 using SpecialFunctions
 using StaticArrays
 using Statistics
+using StatsAPI: StatsAPI
 using StatsBase
 using StatsFuns
 
