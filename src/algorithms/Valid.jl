@@ -135,20 +135,12 @@ function _validate_state_model(
 
     # Check optional B matrix (dynamics input)
     if size(state_model.B, 1) != latent_dim
-        throw(
-            DimensionMismatchError(
-                "B matrix rows", latent_dim, size(state_model.B, 1)
-            ),
-        )
+        throw(DimensionMismatchError("B matrix rows", latent_dim, size(state_model.B, 1)))
     end
 
     # Check optional B0 matrix (initial-state input)
     if size(state_model.B0, 1) != latent_dim
-        throw(
-            DimensionMismatchError(
-                "B0 matrix rows", latent_dim, size(state_model.B0, 1)
-            ),
-        )
+        throw(DimensionMismatchError("B0 matrix rows", latent_dim, size(state_model.B0, 1)))
     end
 
     # Check Q matrix (process noise covariance)

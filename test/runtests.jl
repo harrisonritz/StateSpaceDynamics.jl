@@ -10,7 +10,6 @@ using Optim
 using Random
 using StateSpaceDynamics
 using SparseArrays
-using StaticArrays
 using StatsFuns
 using SpecialFunctions
 using Test
@@ -188,18 +187,13 @@ include("helper_functions.jl")
     # Utilities Tests
     @testset verbose=true "Utilities" begin
         include("Utilities/Utilities.jl")
-        test_euclidean_distance()
-        test_kmeanspp_initialization()
-        test_kmeans_clustering()
         test_block_tridgm()
         test_gaussian_entropy()
 
         @testset "Block Tridiagonal Inverse" begin
-            test_block_tridiagonal_inverse()
-            test_block_tridiagonal_inverse_type_preservation()
-            test_block_tridiagonal_inverse_single_block()
-            test_block_tridiagonal_inverse_randomized_vs_static()
-            test_block_tridiagonal_inverse_vs_static()
+            test_block_tridiagonal_inverse_mutating()
+            test_block_tridiagonal_inverse_logdet()
+            test_block_tridiagonal_solve()
         end
     end
 

@@ -49,21 +49,20 @@ end
 #     return LinearDynamicalSystem(sm, om; kalman_filter=kalman_filter)
 # end
 
-function _make_toy_lds(; kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7,
-                      B=nothing, B0=nothing)
+function _make_toy_lds(;
+    kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7, B=nothing, B0=nothing
+)
     params = init_params(MersenneTwister(seed), D, p)
     sm = GaussianStateModel(;
-        A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b,
-        B=B, B0=B0,
+        A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b, B=B, B0=B0
     )
-    om = GaussianObservationModel(;
-        C=params.C, R=params.R, d=params.d,
-    )
+    om = GaussianObservationModel(; C=params.C, R=params.R, d=params.d)
     return LinearDynamicalSystem(sm, om; kalman_filter=kalman_filter)
 end
 
-function _simulate_lds(lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42,
-                      u=nothing, u0=nothing)
+function _simulate_lds(
+    lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42, u=nothing, u0=nothing
+)
     Random.seed!(seed)
     D = lds.latent_dim
     p = lds.obs_dim
@@ -87,7 +86,7 @@ function _simulate_lds(lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42,
         x = x0_eff .+ Lp0 * randn(D)
         y[:, 1, n] = C * x + d + Lr * randn(p)
         for t in 2:T
-            bu = B === nothing ? zero(b) : B * u[:, t-1, n]
+            bu = B === nothing ? zero(b) : B * u[:, t - 1, n]
             x = A * x + b + bu + Lq * randn(D)
             y[:, t, n] = C * x + d + Lr * randn(p)
         end
@@ -107,7 +106,12 @@ function test_kalman_smooth_agrees_with_newton()
     elbos_bt = fit!(lds_bt, y; max_iter=1, progress=false)[1] ./ n_obs
 
     # Single-iteration ELBO should match across backends modulo tol_PD floor.
-    @printf("ELBOs: KF = %.8f  BT = %.8f\n (diff = %.8f)\n", elbos_kf[1], elbos_bt[1], abs(elbos_kf[1] - elbos_bt[1]))
+    @printf(
+        "ELBOs: KF = %.8f  BT = %.8f\n (diff = %.8f)\n",
+        elbos_kf[1],
+        elbos_bt[1],
+        abs(elbos_kf[1] - elbos_bt[1])
+    )
     @test abs(elbos_kf[1] - elbos_bt[1]) < 1e-4
 end
 
@@ -162,9 +166,7 @@ function test_kalman_with_B_input_equivalent_to_bias()
         B=B,
     )
     om = GaussianObservationModel(;
-        C=randn(p, D),
-        R=0.4*Matrix{Float64}(I, p, p),
-        d=zeros(p),
+        C=randn(p, D), R=0.4*Matrix{Float64}(I, p, p), d=zeros(p)
     )
     lds_B = LinearDynamicalSystem(sm, om; kalman_filter=true)
 
@@ -174,12 +176,14 @@ function test_kalman_with_B_input_equivalent_to_bias()
     # Equivalent LDS where bias b=1 replaces B·u=1.
     Random.seed!(11)
     sm_b = GaussianStateModel(;
-        A=lds_B.state_model.A, Q=lds_B.state_model.Q,
-        x0=lds_B.state_model.x0, P0=lds_B.state_model.P0,
+        A=lds_B.state_model.A,
+        Q=lds_B.state_model.Q,
+        x0=lds_B.state_model.x0,
+        P0=lds_B.state_model.P0,
         b=ones(D),
     )
     om_b = GaussianObservationModel(;
-        C=lds_B.obs_model.C, R=lds_B.obs_model.R, d=lds_B.obs_model.d,
+        C=lds_B.obs_model.C, R=lds_B.obs_model.R, d=lds_B.obs_model.d
     )
     lds_b = LinearDynamicalSystem(sm_b, om_b; kalman_filter=true)
 
@@ -201,7 +205,9 @@ function test_kalman_rejects_poisson_obs()
     sm = GaussianStateModel(;
         A=0.7*Matrix{Float64}(I, D, D),
         Q=0.2*Matrix{Float64}(I, D, D),
-        x0=zeros(D), P0=Matrix{Float64}(I, D, D), b=zeros(D),
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=zeros(D),
     )
     om = PoissonObservationModel(; C=randn(p, D), log_d=zeros(p))
     @test_throws Exception LinearDynamicalSystem(sm, om; kalman_filter=true)
@@ -214,10 +220,13 @@ function test_kalman_missing_u_errors()
     sm = GaussianStateModel(;
         A=0.6*Matrix{Float64}(I, D, D),
         Q=0.2*Matrix{Float64}(I, D, D),
-        x0=zeros(D), P0=Matrix{Float64}(I, D, D), b=zeros(D), B=B,
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=zeros(D),
+        B=B,
     )
     om = GaussianObservationModel(;
-        C=randn(p, D), R=0.3*Matrix{Float64}(I, p, p), d=zeros(p),
+        C=randn(p, D), R=0.3*Matrix{Float64}(I, p, p), d=zeros(p)
     )
     lds = LinearDynamicalSystem(sm, om; kalman_filter=true)
     y = randn(p, T, N)

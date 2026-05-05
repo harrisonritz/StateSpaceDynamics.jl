@@ -13,7 +13,6 @@ using ProgressMeter
 using Random
 using SparseArrays
 using SpecialFunctions
-using StaticArrays
 using Statistics
 using StatsAPI: StatsAPI
 using StatsBase
@@ -58,9 +57,8 @@ export IWPrior
 export CovUpdateCache
 
 # Utilities
-export kmeanspp_initialization, kmeans_clustering, fit!, block_tridgm
-export block_tridiagonal_inverse, block_tridiagonal_inverse_static
-export stabilize_covariance_matrix, valid_Σ, make_posdef!, gaussian_entropy
+export fit!, block_tridgm
+export valid_Σ, gaussian_entropy
 export random_rotation_matrix
 export print_full
 export info_update!

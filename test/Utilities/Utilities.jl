@@ -1,36 +1,3 @@
-function test_euclidean_distance()
-    x = [1.0, 2.0, 3.0]
-    y = [4.0, 5.0, 6.0]
-    @test StateSpaceDynamics.euclidean_distance(x, y) == sqrt(27.0)
-end
-
-function test_kmeanspp_initialization()
-    # Generate random data
-    data = randn(2, 100)
-    # Initialize centroids
-    k_means = 3
-    centroids = kmeanspp_initialization(data, k_means)
-    # Check dimensions
-    @test size(centroids) == (2, k_means)
-end
-
-function test_kmeans_clustering()
-    # Generate random data
-    data = randn(2, 100)
-    # Initialize centroids
-    k_means = 3
-    centroids, labels = kmeans_clustering(data, k_means)
-    # Check dimensions
-    @test size(centroids) == (2, k_means)
-    @test length(labels) == 100
-    # Now test kmeans on a vector.
-    data = randn(100)
-    centroids, labels = kmeans_clustering(data, k_means)
-    # Check dimensions
-    @test size(centroids) == (1, k_means)
-    @test length(labels) == 100
-end
-
 function test_block_tridgm()
     # Test with minimal block sizes
     super = [rand(1, 1) for i in 1:1]
@@ -87,144 +54,86 @@ function test_gaussian_entropy()
     @test isapprox(gaus_entropy_dist, gauss_entropy_ssd; atol=1e-6)
 end
 
-function test_block_tridiagonal_inverse()
-    # Test basic functionality with simple matrices
-    n = 3
-    block_size = 2
-
-    # Create simple block tridiagonal matrix
-    A = [Matrix{Float64}(I, block_size, block_size) for _ in 1:(n - 1)]
-    B = [2.0 * Matrix{Float64}(I, block_size, block_size) for _ in 1:n]
-    C = [0.5 * Matrix{Float64}(I, block_size, block_size) for _ in 1:(n - 1)]
-
-    λii, λij = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
-
-    # Check output dimensions
-    @test size(λii) == (block_size, block_size, n)
-    @test size(λij) == (block_size, block_size, n - 1)
-
-    # Check that diagonal blocks are well-defined (not NaN or Inf)
-    @test all(isfinite.(λii))
-    @test all(isfinite.(λij))
-
-    # For this specific case with identity matrices, check rough magnitude
-    # The diagonal blocks should be inverses of the diagonal elements
-    for i in 1:n
-        @test all(abs.(λii[:, :, i]) .< 10.0)  # Reasonable magnitude
-    end
-end
-
-function test_block_tridiagonal_inverse_type_preservation()
-    # Test that Float32 is preserved
-    n = 3
-    block_size = 2
-
-    A = [Matrix{Float32}(I, block_size, block_size) for _ in 1:(n - 1)]
-    B = [2.0f0 * Matrix{Float32}(I, block_size, block_size) for _ in 1:n]
-    C = [0.5f0 * Matrix{Float32}(I, block_size, block_size) for _ in 1:(n - 1)]
-
-    λii, λij = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
-
-    @test eltype(λii) == Float32
-    @test eltype(λij) == Float32
-end
-
-function test_block_tridiagonal_inverse_single_block()
-    # Test with a single block (n=1)
-    block_size = 3
-    A = Vector{Matrix{Float64}}()
-    B = [randn(block_size, block_size)]
-    B[1] = B[1] + 5.0 * I  # Make it well-conditioned
-    C = Vector{Matrix{Float64}}()
-
-    λii, λij = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
-
-    # Should just be the inverse of the single block
-    @test isapprox(λii[:, :, 1], inv(B[1]); atol=1e-10)
-    @test size(λij, 3) == 0  # No off-diagonal blocks
-end
-
-function test_block_tridiagonal_inverse_vs_static()
-    # Compare non-static vs static implementation
-    n = 4
-    block_size = 2
-
-    A = [randn(block_size, block_size) for _ in 1:(n - 1)]
-    B = [
-        5.0 * Matrix{Float64}(I, block_size, block_size) + randn(block_size, block_size) for
-        _ in 1:n
+# Build a random, well-conditioned block tridiagonal matrix and return both
+# (A, B, C) blocks plus the dense reconstruction H so tests can compare against inv(H).
+function _random_block_tridiag(::Type{T}, block_size::Int, n::Int, rng) where {T<:Real}
+    A = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
+    B = Matrix{T}[
+        T(5.0) * Matrix{T}(I, block_size, block_size) +
+        randn(rng, T, block_size, block_size) for _ in 1:n
     ]
-    C = [randn(block_size, block_size) for _ in 1:(n - 1)]
-
-    # Non-static version
-    λii_reg, λij_reg = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
-
-    # Static version
-    A_static = [SMatrix{block_size,block_size}(a) for a in A]
-    B_static = [SMatrix{block_size,block_size}(b) for b in B]
-    C_static = [SMatrix{block_size,block_size}(c) for c in C]
-    λii_static, λij_static = StateSpaceDynamics.block_tridiagonal_inverse_static(
-        A_static, B_static, C_static, Val(block_size)
-    )
-
-    # Results should be reasonably close (allowing for numerical differences in the algorithms)
-    @test isapprox(λii_reg, λii_static; atol=1e-6)
-    @test isapprox(λij_reg, λij_static; atol=1e-6)
-
-    # Verify both implementations produce finite values
-    @test all(isfinite.(λii_reg))
-    @test all(isfinite.(λij_reg))
-    @test all(isfinite.(λii_static))
-    @test all(isfinite.(λij_static))
+    C = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
+    H = Matrix(block_tridgm(B, C, A))
+    return A, B, C, H
 end
 
-function test_block_tridiagonal_inverse_randomized_vs_static()
-    # Randomized stress-test comparing dynamic and static implementations
+function test_block_tridiagonal_inverse_mutating()
     rng = MersenneTwister(42)
 
     for T in (Float64, Float32)
-        # looser tolerance for Float32
-        atol = T === Float32 ? 1e-5 : 1e-6
+        atol = T === Float32 ? 1e-4 : 1e-8
+        for block_size in (1, 2, 3), n in (1, 2, 3, 4)
+            A, B, C, H = _random_block_tridiag(T, block_size, n, rng)
+            Hinv = inv(H)
 
-        for block_size in (1, 2, 3)
-            for n in (1, 2, 3, 4)
-                for trial in 1:5
-                    # build blocks (explicitly typed to avoid Vector{Any} when empty)
-                    A = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
-                    B = Matrix{T}[
-                        T(5.0) * Matrix{T}(I, block_size, block_size) +
-                        randn(rng, T, block_size, block_size) for _ in 1:n
-                    ]
-                    C = Matrix{T}[randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
+            ws = StateSpaceDynamics.BlockTridiagonalWorkspace(T, block_size, n)
+            p_smooth = zeros(T, block_size, block_size, n)
+            p_smooth_tt1 = zeros(T, block_size, block_size, n)
 
-                    # dynamic
-                    λii_reg, λij_reg = StateSpaceDynamics.block_tridiagonal_inverse(A, B, C)
+            StateSpaceDynamics.block_tridiagonal_inverse!(p_smooth, p_smooth_tt1, A, B, C, ws)
 
-                    # static (only when sizes are small enough to construct SMatrix)
-                    if isempty(A)
-                        A_static = SMatrix{block_size,block_size,T}[]
-                    else
-                        A_static = [SMatrix{block_size,block_size,T}(a) for a in A]
-                    end
-                    B_static = [SMatrix{block_size,block_size,T}(b) for b in B]
-                    if isempty(C)
-                        C_static = SMatrix{block_size,block_size,T}[]
-                    else
-                        C_static = [SMatrix{block_size,block_size,T}(c) for c in C]
-                    end
-                    λii_static, λij_static = StateSpaceDynamics.block_tridiagonal_inverse_static(
-                        A_static, B_static, C_static, Val(block_size)
-                    )
-
-                    @test isapprox(λii_reg, λii_static; atol=atol, rtol=0)
-                    @test isapprox(λij_reg, λij_static; atol=atol, rtol=0)
-
-                    @test all(isfinite.(λii_reg))
-                    @test all(isfinite.(λij_reg))
-                    @test all(isfinite.(λii_static))
-                    @test all(isfinite.(λij_static))
-                end
+            for i in 1:n
+                rows = ((i - 1) * block_size + 1):(i * block_size)
+                @test isapprox(p_smooth[:, :, i], Hinv[rows, rows]; atol=atol, rtol=0)
+            end
+            for i in 2:n
+                rows_i = ((i - 1) * block_size + 1):(i * block_size)
+                rows_im1 = ((i - 2) * block_size + 1):((i - 1) * block_size)
+                @test isapprox(p_smooth_tt1[:, :, i], Hinv[rows_i, rows_im1]; atol=atol, rtol=0)
             end
         end
     end
+end
+
+function test_block_tridiagonal_inverse_logdet()
+    rng = MersenneTwister(7)
+    T = Float64
+    block_size = 3
+    n = 5
+
+    A, B, C, H = _random_block_tridiag(T, block_size, n, rng)
+    expected_logdet = logdet(H)
+
+    ws = StateSpaceDynamics.BlockTridiagonalWorkspace(T, block_size, n)
+    p_smooth = zeros(T, block_size, block_size, n)
+    p_smooth_tt1 = zeros(T, block_size, block_size, n)
+
+    logdet_val = StateSpaceDynamics.block_tridiagonal_inverse_logdet!(
+        p_smooth, p_smooth_tt1, A, B, C, ws
+    )
+
+    @test isapprox(logdet_val, expected_logdet; atol=1e-8, rtol=0)
+
+    Hinv = inv(H)
+    for i in 1:n
+        rows = ((i - 1) * block_size + 1):(i * block_size)
+        @test isapprox(p_smooth[:, :, i], Hinv[rows, rows]; atol=1e-8, rtol=0)
+    end
+end
+
+function test_block_tridiagonal_solve()
+    rng = MersenneTwister(11)
+    T = Float64
+    block_size = 2
+    n = 4
+
+    A, B, C, H = _random_block_tridiag(T, block_size, n, rng)
+    b = randn(rng, T, n * block_size)
+    expected = H \ b
+
+    ws = StateSpaceDynamics.BlockTridiagonalWorkspace(T, block_size, n)
+    x = zeros(T, n * block_size)
+    StateSpaceDynamics.block_tridiagonal_solve!(x, A, B, C, b, ws)
+
+    @test isapprox(x, expected; atol=1e-8, rtol=0)
 end

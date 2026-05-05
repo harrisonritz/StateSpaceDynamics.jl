@@ -39,187 +39,6 @@ function Symmetrize!(A::AbstractMatrix{T}) where {T<:Real}
 end
 
 """
-    block_tridiagonal_inverse(A, B, C)
-
-Compute the inverse of a block tridiagonal matrix.
-
-# Notes: This implementation is from the paper:
-"An Accelerated Lambda Iteration Method for Multilevel Radiative Transfer” Rybicki, G.B.,
-and Hummer, D.G., Astronomy and Astrophysics, 245, 171–181 (1991), Appendix B.
-"""
-function block_tridiagonal_inverse(
-    A::AbstractVector{<:AbstractMatrix{T}},
-    B::AbstractVector{<:AbstractMatrix{T}},
-    C::AbstractVector{<:AbstractMatrix{T}},
-) where {T<:Real}
-    n = length(B)
-    bs = size(B[1], 1)
-
-    # Preallocate D and E blocks (all blocks exist and will be overwritten in-place)
-    D = [zeros(T, bs, bs) for _ in 1:(n + 1)]
-    E = [zeros(T, bs, bs) for _ in 1:(n + 1)]
-
-    # Outputs
-    λii = Array{T}(undef, bs, bs, n)
-    λij = Array{T}(undef, bs, bs, n-1)
-
-    Ibs = Matrix{T}(I, bs, bs)
-    Z = zeros(T, bs, bs)  # reusable "edge" block
-
-    # Work buffers (reused; LU overwrites its input)
-    M = zeros(T, bs, bs)
-    term1 = zeros(T, bs, bs)
-    term2 = zeros(T, bs, bs)
-    S = zeros(T, bs, bs)
-
-    for i in 1:n
-        Ai = (i == 1) ? Z : A[i - 1]
-        Ci = (i <= length(C)) ? C[i] : Z
-
-        copyto!(M, B[i])                         # M = B[i]
-        mul!(M, Ai, D[i], -one(T), one(T))       # M = B[i] - Ai*D[i]
-        F = lu!(M)                               # in-place LU on M
-        ldiv!(D[i + 1], F, Ci)                     # D[i+1] = F \ Ci (no alloc)
-    end
-
-    for i in n:-1:1
-        Ci = (i <= length(C)) ? C[i] : Z
-        Ai = (i == 1) ? Z : A[i - 1]
-
-        copyto!(M, B[i])                         # M = B[i]
-        mul!(M, Ci, E[i + 1], -one(T), one(T))     # M = B[i] - Ci*E[i+1]
-        F = lu!(M)
-        ldiv!(E[i], F, Ai)                       # E[i] = F \ Ai (no alloc)
-    end
-
-    for i in 1:n
-        # term1 = I - D[i+1]*E[i+1]
-        copyto!(term1, Ibs)
-        mul!(term1, D[i + 1], E[i + 1], -one(T), one(T))
-
-        # term2 = B[i] - A[i-1]*D[i]
-        Ai = (i == 1) ? Z : A[i - 1]
-        copyto!(term2, B[i])
-        mul!(term2, Ai, D[i], -one(T), one(T))
-
-        # S = term2 * term1
-        mul!(S, term2, term1)
-        F = lu!(S)
-
-        @views ldiv!(λii[:, :, i], F, Ibs)        # λii[:,:,i] = F \ I
-    end
-
-    for i in 2:n
-        @views mul!(λij[:, :, i - 1], E[i], λii[:, :, i - 1])
-    end
-
-    # avoid allocating -λij
-    for k in eachindex(λij)
-        λij[k] = -λij[k]
-    end
-
-    return λii, λij
-end
-
-"""
-    block_tridiagonal_inverse_static(A, B, C)
-
-Compute the inverse of a block tridiagonal matrix using static matrices. See
-`block_tridiagonal_inverse` for details.
-"""
-function block_tridiagonal_inverse_static(
-    A::AbstractVector{<:AbstractMatrix{T}},
-    B::AbstractVector{<:AbstractMatrix{T}},
-    C::AbstractVector{<:AbstractMatrix{T}},
-    ::Val{N},
-) where {T<:Real,N}
-    n = length(B)
-
-    # Pre-allocate working matrices (reuse these)
-    M = MMatrix{N,N,T}(undef)  # Mutable static matrix for intermediate calculations
-    temp = MMatrix{N,N,T}(undef)
-    identity_static = MMatrix{N,N,T}(I)
-    zero_static = @SMatrix zeros(N, N)
-
-    # Initialize D and E arrays - use mutable static matrices
-    D = Vector{SMatrix{N,N,T}}(undef, n + 1)
-    E = Vector{SMatrix{N,N,T}}(undef, n + 1)
-    D[1] = zero_static
-    E[n + 1] = zero_static
-
-    # Pre-allocate output arrays
-    λii = Array{T}(undef, N, N, n)
-    λij = Array{T}(undef, N, N, n - 1)
-
-    # Forward sweep for D
-    for i in 1:n
-        # M = B[i] - A_extended[i] * D[i]
-        if i == 1
-            M .= B[1]  # A_extended[1] is zeros
-        else
-            mul!(temp, SMatrix{N,N,T}(A[i - 1]), D[i])  # Convert only when needed
-            M .= B[i] .- temp
-        end
-
-        # D[i + 1] = inv(M) * C_extended[i]
-        if i == n
-            D[i + 1] = zero_static  # C_extended[n] is zeros
-        else
-            M_static = SMatrix{N,N,T}(M)
-            C_static = SMatrix{N,N,T}(C[i])
-            D[i + 1] = M_static \ C_static
-        end
-    end
-
-    # Backward sweep for E
-    for i in n:-1:1
-        # M = B[i] - C_extended[i] * E[i + 1]
-        if i == n
-            M .= B[n]  # C_extended[n] is zeros
-        else
-            mul!(temp, SMatrix{N,N,T}(C[i]), E[i + 1])
-            M .= B[i] .- temp
-        end
-
-        # E[i] = inv(M) * A_extended[i]
-        if i == 1
-            E[i] = zero_static  # A_extended[1] is zeros
-        else
-            M_static = SMatrix{N,N,T}(M)
-            A_static = SMatrix{N,N,T}(A[i - 1])
-            E[i] = M_static \ A_static
-        end
-    end
-
-    # Compute λii
-    for i in 1:n
-        # term1 = identity - D[i + 1] * E[i + 1]
-        mul!(temp, D[i + 1], E[i + 1])
-        term1 = identity_static - SMatrix{N,N,T}(temp)
-
-        # term2 = B[i] - A_extended[i] * D[i]
-        if i == 1
-            term2 = SMatrix{N,N,T}(B[1])
-        else
-            mul!(temp, SMatrix{N,N,T}(A[i - 1]), D[i])
-            term2 = SMatrix{N,N,T}(B[i]) - SMatrix{N,N,T}(temp)
-        end
-
-        # S = term2 * term1
-        S = term2 * term1
-        λii[:, :, i] = Matrix(S \ identity_static)
-    end
-
-    # Compute λij
-    for i in 2:n
-        result = E[i] * SMatrix{N,N,T}(view(λii,:,:,(i - 1)))
-        λij[:, :, i - 1] = Matrix(result)
-    end
-
-    return λii, -λij
-end
-
-"""
     block_tridgm(
         main_diag::Vector{Matrix{T}},
         upper_diag::Vector{Matrix{T}},
@@ -752,193 +571,6 @@ function _negate_blocks!(
     return nothing
 end
 
-# Initialization utilities
-"""
-    euclidean_distance(a::AbstractVector{Float64}, b::AbstractVector{Float64})
-
-Calculate the Euclidean distance between two points.
-"""
-function euclidean_distance(a::AbstractVector, b::AbstractVector)
-    return sqrt(sum((a .- b) .^ 2))
-end
-
-"""
-    kmeanspp_initialization(data::AbstractMatrix{T}, k_means::Int) where {T<:Real}
-
-Perform K-means++ initialization for cluster centroids (column-major input).
-"""
-function kmeanspp_initialization(data::AbstractMatrix{T}, k_means::Int) where {T<:Real}
-    D, N = size(data)  # (D, N) data layout
-    centroids = zeros(T, D, k_means)
-    rand_idx = rand(1:N)
-    centroids[:, 1] = data[:, rand_idx]
-
-    for k in 2:k_means
-        dists = zeros(N)
-        for i in 1:N
-            dists[i] = minimum([
-                euclidean_distance(@view(data[:, i]), @view(centroids[:, j])) for
-                j in 1:(k - 1)
-            ])
-        end
-
-        probs = dists .^ 2
-        probs ./= sum(probs)
-        next_idx = StatsBase.sample(1:N, Weights(probs))
-        centroids[:, k] = data[:, next_idx]
-    end
-
-    return centroids
-end
-
-"""
-    kmeanspp_initialization(data::AbstractVector{T}, k_means::Int)
-
-K-means++ initialization for vector data.
-"""
-function kmeanspp_initialization(data::AbstractVector{T}, k_means::Int) where {T<:Real}
-    data = reshape(data, 1, :)  # shape (1, N)
-    return kmeanspp_initialization(data, k_means)
-end
-
-"""
-    kmeans_clustering(
-        data::AbstractMatrix{T}, k_means::Int, max_iters::Int=100, tol::Float64=1e-6
-    ) where {T<:Real}
-
-Perform K-means clustering on column-major data.
-"""
-function kmeans_clustering(
-    data::AbstractMatrix{T}, k_means::Int, max_iters::Int=100, tol::Float64=1e-6
-) where {T<:Real}
-    D, N = size(data)
-    centroids = kmeanspp_initialization(data, k_means)
-    labels = zeros(Int, N)
-
-    for iter in 1:max_iters
-        for i in 1:N
-            x_i = @view data[:, i]
-            min_k, min_dist = 1, euclidean_distance(x_i, @view centroids[:, 1])
-
-            for k in 2:k_means
-                dist = euclidean_distance(x_i, @view centroids[:, k])
-                if dist < min_dist
-                    min_dist = dist
-                    min_k = k
-                end
-            end
-
-            labels[i] = min_k
-        end
-
-        old_centroids = copy(centroids)
-        new_centroids = zeros(T, D, k_means)
-
-        for k in 1:k_means
-            inds = findall(labels .== k)
-
-            if isempty(inds)
-                new_centroids[:, k] .= data[:, rand(1:N)]
-            else
-                cluster_points = data[:, inds]
-                new_centroids[:, k] .= mean(cluster_points; dims=2)
-            end
-        end
-
-        centroids .= new_centroids
-
-        if all(
-            euclidean_distance(centroids[:, k], old_centroids[:, k]) <= tol for
-            k in 1:k_means
-        )
-            break
-        end
-    end
-
-    return centroids, labels
-end
-
-"""
-    kmeans_clustering(
-        data::AbstractVector{T}, k_means::Int, max_iters::Int=100, tol::Float64=1e-6
-    )
-
-Perform K-means clustering on vector data.
-"""
-function kmeans_clustering(
-    data::AbstractVector{T}, k_means::Int, max_iters::Int=100, tol::Float64=1e-6
-) where {T<:Real}
-    data = reshape(data, 1, :)  # shape (1, N)
-    return kmeans_clustering(data, k_means, max_iters, tol)
-end
-
-"""
-    logistic(x::Real)
-
-Calculate the logistic function in a numerically stable way.
-"""
-function logistic(x::Real)
-    if x > 0
-        return 1 / (1 + exp(-x))
-    else
-        exp_x = exp(x)
-
-        return exp_x / (1 + exp_x)
-    end
-end
-
-"""
-    make_posdef!(A::AbstractMatrix{T}) where {T<:Real}
-
-Ensure that a matrix is positive definite by adjusting its eigenvalues.
-"""
-function make_posdef!(A::AbstractMatrix{T}; min_eigval::T=convert(T, 1e-6)) where {T<:Real}
-    # Work with the symmetric part
-    B = Symmetric((A + A') / 2)
-
-    # Get eigendecomposition
-    F = eigen(B)
-
-    # Find negative or small eigenvalues
-    neg_eigs = F.values .< min_eigval
-
-    # If already positive definite, return early
-    if !any(neg_eigs)
-        return A
-    end
-
-    # Fix negative eigenvalues
-    F.values[neg_eigs] .= min_eigval
-
-    # Reconstruct
-    A .= F.vectors * Diagonal(F.values) * F.vectors'
-
-    # Ensure symmetry due to numerical errors
-    A .= (A + A') / 2
-
-    return A
-end
-
-"""
-    stabilize_covariance_matrix(Σ::Matrix{<:Real})
-
-Stabilize a covariance matrix by ensuring it is symmetric and positive definite.
-"""
-function stabilize_covariance_matrix(Σ::AbstractMatrix{T}) where {T<:Real}
-    # check if the covariance is symmetric. If not, make it symmetric
-    if !ishermitian(Σ)
-        Σ = (Σ + Σ') * 0.5
-    end
-
-    # check if matrix is posdef. If not, add a small value to the diagonal (sometimes an
-    # emission only models one observation and the covariance matrix is singular)
-    if !isposdef(Σ)
-        Σ = Σ + 1e-12 * I
-    end
-
-    return Σ
-end
-
 function valid_Σ(Σ::AbstractMatrix{T}) where {T<:Real}
     return ishermitian(Σ) && isposdef(Σ)
 end
@@ -954,11 +586,11 @@ passed as a plain `Matrix`.
 
 Used by the Kalman filter/smoother to keep predicted and filtered covariances strictly
 positive definite in the presence of floating-point noise. Ported from
-StateSpaceAnalysis. Prefer this over `make_posdef!`/`stabilize_covariance_matrix` for
-Kalman covariances — the scale-aware floor behaves better than an absolute floor when
-the covariance has a large dynamic range.
+StateSpaceAnalysis.
 """
-function tol_PD(A_sym::Union{Symmetric{T},Hermitian{T}}; tol::T=1e-6)::PDMat{T, Matrix{T}} where {T<:Real}
+function tol_PD(
+    A_sym::Union{Symmetric{T},Hermitian{T}}; tol::T=1e-6
+)::PDMat{T,Matrix{T}} where {T<:Real}
     # F = eigen!(A_sym)
     # λ_max = F.values[end]
     # λ_r = max.(F.values ./ λ_max, zero(T))
@@ -974,33 +606,13 @@ function tol_PD(A_sym::Union{Symmetric{T},Hermitian{T}}; tol::T=1e-6)::PDMat{T, 
         F.values[i] = slope * r + scale
     end
     return PDMat(X_A_Xt(PDiagMat(F.values), F.vectors))
-
 end
 
 tol_PD(A::Matrix; tol::Real=1e-6)::PDMat = tol_PD(hermitianpart(A); tol=tol)
 tol_PD(A::PDMat; tol::Real=1e-6)::PDMat = tol_PD(Hermitian(Matrix(A)); tol=tol)
-id_PD(A::Matrix; tol::Real=1e-6)::PDMat = PDMat(hermitianpart(A + (tol * tr(A) / size(A, 1)) * I))
-
-# Function for stacking data... in prep for the trialized M_step!()
-function stack_tuples(d)
-    # Determine the number of tuples and number of elements in each tuple
-    num_tuples = length(d)
-    num_elements = length(d[1])
-
-    # Initialize an array to store the stacked matrices
-    stacked_matrices = Vector{Matrix{Float64}}(undef, num_elements)
-
-    # Stack matrices for each position in the tuple
-    for i in 1:num_elements
-        # Extract all matrices at the i-th position from each tuple
-        matrices_to_stack = [d[j][i] for j in 1:num_tuples]
-        # Vertically concatenate the collected matrices
-        stacked_matrices[i] = vcat(matrices_to_stack...)
-    end
-
-    # Return the stacked matrices as a tuple
-    return tuple(stacked_matrices...)
-end
+id_PD(A::Matrix; tol::Real=1e-6)::PDMat = PDMat(
+    hermitianpart(A + (tol * tr(A) / size(A, 1)) * I)
+)
 
 # logdet(Σ) from Cholesky Σ = U'U => logdet(Σ) = 2 * sum(log(diag(U)))
 function _logdet_from_U(U::AbstractMatrix{T}, n::Int) where {T}
@@ -1022,18 +634,6 @@ function gaussian_entropy(H::Symmetric{T}) where {T<:Real}
     F = cholesky(-H)                    # factorize Λ = -H (SPD)
     logdetΛ = 2 * sum(log, diag(F))     # logdet precision
     return 0.5 * (n * (1 + log(2π)) - logdetΛ)
-end
-
-"""
-    gaussian_entropy(H::Symmetric{BigFloat, <:SparseMatrix})
-
-Specialized method for BigFloat sparse matrices using logdet.
-"""
-function gaussian_entropy(H::Symmetric{BigFloat,<:AbstractSparseMatrix})
-    n = size(H, 1)
-    logdet_H = logdet(-H)
-
-    return 0.5 * (n * (BigFloat(1 + log(BigFloat(2π))) - logdet_H))
 end
 
 """

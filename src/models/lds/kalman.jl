@@ -29,8 +29,6 @@
 
 # using BenchmarkTools
 
-
-
 """
     _fit_kalman!(lds, y; u, u0, max_iter, tol, progress)
 
@@ -63,53 +61,52 @@ function _fit_kalman!(
     elbos = Vector{T}()
     sizehint!(elbos, max_iter)
 
-    prog = progress ? Progress(max_iter; desc="Fitting LDS (Kalman) via EM...", barlen=50, showspeed=true) : nothing
+    prog = if progress
+        Progress(max_iter; desc="Fitting LDS (Kalman) via EM...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
 
     for iter in 1:max_iter
-
         estep!(lds, suf, kws, data)
         elbo = marginal_loglikelihood(lds, kws)
         mstep!(lds, suf, kws)
         # elbo = compute_elbo(lds, suf, kws)        
-        
+
         # report progress
         push!(elbos, elbo)
         progress && prog !== nothing && next!(prog)
-
 
         if monotonicity_check && (elbo - prev_elbo) < 0
             @warn "ELBO decreased from $(prev_elbo) to $(elbo) at iteration $(iter); this should not happen with a correct implementation. Consider reducing `tol` or checking for numerical issues."
         elseif (elbo - prev_elbo) < tol
             progress && prog !== nothing && finish!(prog)
-            update_vestigials!(lds, data) 
+            update_vestigials!(lds, data)
             return elbos
         end
         prev_elbo = elbo
     end
     progress && prog !== nothing && finish!(prog)
-    update_vestigials!(lds, data) 
+    update_vestigials!(lds, data)
     return elbos
 end
 
-
 function update_vestigials!(
-    lds::LinearDynamicalSystem{T,S,O}, 
-    data::Data{T}
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # update vestigial parameters for backward compatibility (to be removed in future)
-    if all(data.u0[:,1] .== 1)
+    if all(data.u0[:, 1] .== 1)
         lds.state_model.x0 = vec(lds.state_model.B0)
     end
-    if all(data.d[:,1,:] .== 1)
-        lds.obs_model.d  = vec(lds.obs_model.D)
+    if all(data.d[:, 1, :] .== 1)
+        lds.obs_model.d = vec(lds.obs_model.D)
     end
-    if all(data.u[:,1,:] .== 1)
-        lds.state_model.b  = vec(lds.state_model.B)
+    if all(data.u[:, 1, :] .== 1)
+        lds.state_model.b = vec(lds.state_model.B)
     end
-    lds
+    return lds
 end
-
 
 function format_kf_data!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -143,24 +140,14 @@ function format_kf_data!(
         d_formatted = d
     end
 
-    data = Data(
-        y = y,
-        u0 = u0_formatted,
-        u = u_formatted,
-        d = d_formatted,
-    )
+    data = Data(; y=y, u0=u0_formatted, u=u_formatted, d=d_formatted)
 
     return data
-
 end
 
-
-
 @views function initialize_SufficientStatistics(
-    model::LinearDynamicalSystem{T,S,O},
-    data::Data{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-
+    model::LinearDynamicalSystem{T,S,O}, data::Data{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     latent_dim = model.latent_dim
     obs_dim = model.obs_dim
     tsteps = size(data.y, 2);
@@ -170,32 +157,33 @@ end
     d_dim = model.obs_input_dim
 
     y_wide = reshape(data.y, size(data.y, 1), size(data.y, 2)*size(data.y, 3));
-    u_wide = reshape(data.u[:,1:end-1,:], size(data.u, 1), (size(data.u, 2)-1)*size(data.u, 3));
+    u_wide = reshape(
+        data.u[:, 1:(end - 1), :], size(data.u, 1), (size(data.u, 2)-1)*size(data.u, 3)
+    );
     d_wide = reshape(data.d, size(data.d, 1), size(data.d, 2)*size(data.d, 3));
 
-    PD_init(T, dim) = PDMat(diagm(ones(T,dim)))
+    PD_init(T, dim) = PDMat(diagm(ones(T, dim)))
 
     # precompute initial conditions
     init_xx = zeros(T, u0_dim, u0_dim);
     mul!(init_xx, data.u0, data.u0', 1.0, 0.0);
-    
+
     # precompute dynamics
     dyn_xx = zeros(T, latent_dim+u_dim, latent_dim+u_dim)
     dyn_xx[1:latent_dim, 1:latent_dim] = I(latent_dim)
-    mul!(dyn_xx[(latent_dim+1):end, (latent_dim+1):end], u_wide, u_wide', 1.0, 0.0);
+    mul!(dyn_xx[(latent_dim + 1):end, (latent_dim + 1):end], u_wide, u_wide', 1.0, 0.0);
 
     # precompute observations
     obs_xx = zeros(T, latent_dim+d_dim, latent_dim+d_dim)
     obs_xx[1:latent_dim, 1:latent_dim] = I(latent_dim)
-    mul!(obs_xx[(latent_dim+1):end, (latent_dim+1):end], d_wide, d_wide', 1.0, 0.0);
+    mul!(obs_xx[(latent_dim + 1):end, (latent_dim + 1):end], d_wide, d_wide', 1.0, 0.0);
 
     obs_xy = zeros(T, latent_dim+d_dim, obs_dim)
-    mul!(obs_xy[(latent_dim+1):end, :], d_wide, y_wide', 1.0, 0.0);
+    mul!(obs_xy[(latent_dim + 1):end, :], d_wide, y_wide', 1.0, 0.0);
 
     obs_yy = zeros(T, obs_dim, obs_dim)
     mul!(obs_yy, y_wide, y_wide', 1.0, 0.0);
 
-    
     return SufficientStatistics{T}(
         # initial conditions
         ntrials,                                        # init_n
@@ -204,27 +192,22 @@ end
         Ref(PD_init(T, latent_dim)),                    # init_yy
 
         # dynamics model
-        (tsteps - 1.0)*ntrials,                         # dyn_n
+        (tsteps - 1.0) * ntrials,                         # dyn_n
         Ref(tol_PD(dyn_xx)),                            # dyn_xx
         zeros(T, latent_dim+u_dim, latent_dim),         # dyn_xy
         Ref(PD_init(T, latent_dim)),                    # dyn_yy
-        
+
         # observation model
-        tsteps*ntrials,                                 # obs_n
+        tsteps * ntrials,                                 # obs_n
         Ref(tol_PD(obs_xx)),                            # obs_xx
         obs_xy,                                         # obs_xy
         Ref(tol_PD(obs_yy)),                            # obs_yy
     )
 end
 
-
-
-
-
 # ==== E-STEP =============================================================================
 
 # using BenchmarkTools
-
 
 """
     estep!(lds, suf, y, kws::KalmanWorkspace; u=nothing, u0=nothing)
@@ -240,20 +223,14 @@ function estep!(
     kws::KalmanWorkspace{T},
     data::Data{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    
     precompute_kalman_constants!(kws, lds, data)
 
     smooth_cov!(lds, kws)
 
     smooth_mean!(lds, kws)
 
-    sufficient_statistics!(suf, kws, data)
-    
-
+    return sufficient_statistics!(suf, kws, data)
 end
-
-
-
 
 """
     precompute_kalman_constants!(kws::KalmanWorkspace, lds; tol=1e-6)
@@ -268,56 +245,50 @@ function precompute_kalman_constants!(
     data::Data{T};
     tol::Real=T(1e-6),
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
-
     kws.P0_PD[] = tol_PD(lds.state_model.P0; tol=tol)
-    kws.Q_PD[]  = tol_PD(lds.state_model.Q;  tol=tol)
-    kws.R_PD[]  = tol_PD(lds.obs_model.R;    tol=tol)
+    kws.Q_PD[] = tol_PD(lds.state_model.Q; tol=tol)
+    kws.R_PD[] = tol_PD(lds.obs_model.R; tol=tol)
 
     C = lds.obs_model.C
     copyto!(kws.CiR, C'/kws.R_PD[])
     kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
-    
     # Initial inputs
     B0 = lds.state_model.B0
 
     if B0 !== nothing     # Validate u / B consistency
-        data.u0 === nothing && throw(
-            DimensionMismatchError("u0 (required because B0 !== nothing)", 1, 0),
-        )
+        data.u0 === nothing &&
+            throw(DimensionMismatchError("u0 (required because B0 !== nothing)", 1, 0))
         if size(data.u0, 1) != size(B0, 2)
-            throw(DimensionMismatchError("u0 rows vs B0 cols", size(B0, 2), size(data.u0, 1)))
+            throw(
+                DimensionMismatchError("u0 rows vs B0 cols", size(B0, 2), size(data.u0, 1))
+            )
         end
         if size(data.u0, 2) != kws.ntrials
             throw(
                 DimensionMismatchError(
-                    "u0 shape (u0_dim, ntrials)",
-                        (size(B0, 2), kws.ntrials),
-                        size(data.u0),
+                    "u0 shape (u0_dim, ntrials)", (size(B0, 2), kws.ntrials), size(data.u0)
                 ),
             )
         end
     elseif data.u0 !== nothing
         throw(
             ArgumentError(
-                "u0 was supplied but state_model.B0 is nothing; set B0 before passing u0",
+                "u0 was supplied but state_model.B0 is nothing; set B0 before passing u0"
             ),
         )
     end
 
     if data.u0 !== nothing
-        @views mul!(kws.pred_mean[:,1,:], B0, data.u0);
+        @views mul!(kws.pred_mean[:, 1, :], B0, data.u0);
     end
-
 
     # state inputs
     B = lds.state_model.B
 
     if B !== nothing     # Validate u / B consistency
-        data.u === nothing && throw(
-            DimensionMismatchError("u (required because B !== nothing)", 1, 0),
-        )
+        data.u === nothing &&
+            throw(DimensionMismatchError("u (required because B !== nothing)", 1, 0))
         if size(data.u, 1) != size(B, 2)
             throw(DimensionMismatchError("u rows vs B cols", size(B, 2), size(data.u, 1)))
         end
@@ -333,27 +304,23 @@ function precompute_kalman_constants!(
     elseif data.u !== nothing
         throw(
             ArgumentError(
-                "u was supplied but state_model.B is nothing; set B before passing u",
+                "u was supplied but state_model.B is nothing; set B before passing u"
             ),
         )
     end
 
-    
     if data.u !== nothing
         @inbounds @views for n in axes(data.u, 3)
             mul!(kws.Bu[:, :, n], B, data.u[:, :, n])
         end
     end
 
-
-
     # observation inputs
     D = lds.obs_model.D
 
     if D !== nothing     # Validate d / D consistency
-        data.d === nothing && throw(
-            DimensionMismatchError("d (required because D !== nothing)", 1, 0),
-        )
+        data.d === nothing &&
+            throw(DimensionMismatchError("d (required because D !== nothing)", 1, 0))
         if size(data.d, 1) != size(D, 2)
             throw(DimensionMismatchError("d rows vs D cols", size(D, 2), size(data.d, 1)))
         end
@@ -369,7 +336,7 @@ function precompute_kalman_constants!(
     elseif data.d !== nothing
         throw(
             ArgumentError(
-                "d was supplied but obs_model.D is nothing; set D before passing d",
+                "d was supplied but obs_model.D is nothing; set D before passing d"
             ),
         )
     end
@@ -388,36 +355,25 @@ function precompute_kalman_constants!(
         end
     end
 
-
     # update CIRY
     @inbounds @views for n in axes(data.y, 3)
-        mul!(kws.CiRY[:,:,n], kws.CiR, kws.y_minus_d[:,:,n]);
+        mul!(kws.CiRY[:, :, n], kws.CiR, kws.y_minus_d[:, :, n]);
     end
-
 end
-
-
-
 
 # ==== SMOOTH COVARIANCE =============================================================================
 
 function smooth_cov!(
-    lds::LinearDynamicalSystem{T,S,O}, 
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-        
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     @inline forwards_cov!(lds, kws)
-    
-    @inline backwards_cov!(lds, kws)
 
+    @inline backwards_cov!(lds, kws)
 end
 
-
 @views function forwards_cov!(
-    lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     kws.pred_cov[1] = kws.P0_PD[];
     kws.pred_icov[1] = inv(kws.pred_cov[1]);
     kws.filt_cov[1] = inv(kws.CiRC[] + kws.pred_icov[1]);
@@ -425,7 +381,7 @@ end
     @inbounds @views for tt in eachindex(kws.filt_cov)[2:end]
 
         # kws.pred_cov[tt] = PDMat(X_A_Xt(kws.filt_cov[tt-1], lds.state_model.A) .+ kws.Q_PD[].mat);
-        kws.cov_tmp1 .= X_A_Xt(kws.filt_cov[tt-1], lds.state_model.A);
+        kws.cov_tmp1 .= X_A_Xt(kws.filt_cov[tt - 1], lds.state_model.A);
         kws.cov_tmp1 .+= kws.Q_PD[].mat;
         Symmetrize!(kws.cov_tmp1);
         kws.pred_cov[tt] = PDMat(kws.cov_tmp1);
@@ -433,18 +389,14 @@ end
         # kws.filt_cov[tt] = inv(kws.CiRC[] + kws.pred_icov[tt]);
         kws.pd_tmp[] = kws.CiRC[] + kws.pred_icov[tt]
         kws.filt_cov[tt] = inv(kws.pd_tmp[])
-
     end
 
     return kws
-
 end
 
-
 function backwards_cov!(
-    lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # init smoothed cov & accumulators
     kws.smooth_cov[end] = kws.filt_cov[end];
@@ -460,14 +412,14 @@ function backwards_cov!(
     ent_logdet = logdet(kws.smooth_cov[end].mat)
     logdet_Q = logdet(kws.Q_PD[])
 
-    @inbounds @views for tt in eachindex(kws.filt_cov)[end-1:-1:1]
+    @inbounds @views for tt in eachindex(kws.filt_cov)[(end - 1):-1:1]
 
         # reverse kalman gain
-        mul!(kws.G[:,:,tt], kws.filt_cov[tt], lds.state_model.A', 1.0, 0.0);
-        kws.G[:,:,tt] /= kws.pred_cov[tt+1];
+        mul!(kws.G[:, :, tt], kws.filt_cov[tt], lds.state_model.A', 1.0, 0.0);
+        kws.G[:, :, tt] /= kws.pred_cov[tt + 1];
 
         # smoothed covariances
-        mul!(kws.cov_tmp1, kws.G[:,:,tt], lds.state_model.A, 1.0, 0.0);
+        mul!(kws.cov_tmp1, kws.G[:, :, tt], lds.state_model.A, 1.0, 0.0);
 
         # mystery: this throws PD error
         # kws.pd_tmp[] = kws.smooth_cov[tt+1] + kws.Q_PD[]
@@ -475,8 +427,10 @@ function backwards_cov!(
         # kws.cov_tmp2 .+= X_A_Xt(kws.filt_cov[tt], I - kws.cov_tmp1);
         # kws.smooth_cov[tt] = PDMat(kws.cov_tmp2);
 
-        kws.smooth_cov[tt] = PDMat(X_A_Xt(kws.smooth_cov[tt+1] + kws.Q_PD[], kws.G[:,:,tt]) .+ 
-                                     X_A_Xt(kws.filt_cov[tt], I - kws.cov_tmp1));
+        kws.smooth_cov[tt] = PDMat(
+            X_A_Xt(kws.smooth_cov[tt + 1] + kws.Q_PD[], kws.G[:, :, tt]) .+
+            X_A_Xt(kws.filt_cov[tt], I - kws.cov_tmp1),
+        );
 
         # accumulate smoothed covs
         kws.sum_smooth_cov_all .+= kws.smooth_cov[tt].mat;
@@ -485,121 +439,97 @@ function backwards_cov!(
             kws.sum_smooth_cov_next .+= kws.smooth_cov[tt].mat;
         end
 
-        mul!(kws.sum_smooth_xcov, kws.G[:,:,tt], kws.smooth_cov[tt+1].mat, 1.0, 1.0);
+        mul!(kws.sum_smooth_xcov, kws.G[:, :, tt], kws.smooth_cov[tt + 1].mat, 1.0, 1.0);
 
         # backward-conditional covariance for entropy chain-rule:
         # back_condP = filt_cov[tt] - G[tt]*pred_cov[tt+1]*G[tt]'
         #            = filt_cov[tt] - filt_cov[tt]*(G[tt]*A)'   (cov_tmp1 = G*A already computed)
-        ent_logdet += logdet(kws.filt_cov[tt]) .+ logdet_Q .- logdet(kws.pred_cov[tt+1])
-
+        ent_logdet += logdet(kws.filt_cov[tt]) .+ logdet_Q .- logdet(kws.pred_cov[tt + 1])
     end
 
-    kws.shared_entropy[] = T(0.5) * (kws.tsteps * kws.latent_dim * (one(T) + log(T(2π))) + ent_logdet)
+    kws.shared_entropy[] =
+        T(0.5) * (kws.tsteps * kws.latent_dim * (one(T) + log(T(2π))) + ent_logdet)
 
     return kws
-
 end
-
-
-
-
-
 
 # ==== SMOOTH MEAN =============================================================================
 
 function smooth_mean!(
-    lds::LinearDynamicalSystem{T,S,O}, 
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-        
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     forwards_mean!(lds, kws)
     # bench = @benchmark forwards_mean!($lds, $kws) samples=100
     # display(bench)
-    
-    backwards_mean!(kws)
 
+    return backwards_mean!(kws)
 end
-
 
 function forwards_mean!(
-    lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     @inbounds @views begin
         # filter initial mean
-        mul!(kws.mean_tmp, kws.pred_icov[1], kws.pred_mean[:,1,:], 1.0, 0.0)
-        kws.mean_tmp .+= kws.CiRY[:,1,:]
-        mul!(kws.filt_mean[:,1,:], kws.filt_cov[1], kws.mean_tmp, 1.0, 0.0)
+        mul!(kws.mean_tmp, kws.pred_icov[1], kws.pred_mean[:, 1, :], 1.0, 0.0)
+        kws.mean_tmp .+= kws.CiRY[:, 1, :]
+        mul!(kws.filt_mean[:, 1, :], kws.filt_cov[1], kws.mean_tmp, 1.0, 0.0)
 
         # pre-fill predicted means
-        kws.pred_mean[:,2:end,:] .= kws.Bu[:,1:end-1,:]
+        kws.pred_mean[:, 2:end, :] .= kws.Bu[:, 1:(end - 1), :]
     end
 
-    @inbounds @views for tt in axes(kws.pred_mean,2)[2:end]
-
-        mul!(kws.pred_mean[:,tt,:], lds.state_model.A, kws.filt_mean[:,tt-1,:], 1.0, 1.0);
+    @inbounds @views for tt in axes(kws.pred_mean, 2)[2:end]
+        mul!(
+            kws.pred_mean[:, tt, :],
+            lds.state_model.A,
+            kws.filt_mean[:, tt - 1, :],
+            1.0,
+            1.0,
+        );
         # kws.pred_mean[:,tt,:] .+= kws.Bu[:,tt-1,:];
 
-        mul!(kws.mean_tmp, kws.pred_icov[tt].mat, kws.pred_mean[:,tt,:], 1.0, 0.0);
-        kws.mean_tmp .+= kws.CiRY[:,tt,:];
+        mul!(kws.mean_tmp, kws.pred_icov[tt].mat, kws.pred_mean[:, tt, :], 1.0, 0.0);
+        kws.mean_tmp .+= kws.CiRY[:, tt, :];
 
-        mul!(kws.filt_mean[:,tt,:], kws.filt_cov[tt].mat, kws.mean_tmp, 1.0, 0.0);
-
+        mul!(kws.filt_mean[:, tt, :], kws.filt_cov[tt].mat, kws.mean_tmp, 1.0, 0.0);
     end
 
     return kws
-
 end
 
+function backwards_mean!(kws::KalmanWorkspace{T}) where {T<:Real}
+    kws.smooth_mean[:, end, :] .= kws.filt_mean[:, end, :];
 
-function backwards_mean!(
-    kws::KalmanWorkspace{T},
-    ) where {T<:Real}
-    
-    kws.smooth_mean[:,end,:] .= kws.filt_mean[:, end,:];
-
-    @inbounds @views for tt in eachindex(kws.pred_icov)[end-1:-1:1]
-
-        kws.mean_tmp .= kws.smooth_mean[:,tt+1,:] .- kws.pred_mean[:,tt+1,:];
-        mul!(kws.smooth_mean[:,tt,:], kws.G[:,:,tt], kws.mean_tmp, 1.0, 0.0);
-        kws.smooth_mean[:,tt,:] .+= kws.filt_mean[:,tt,:];
-
+    @inbounds @views for tt in eachindex(kws.pred_icov)[(end - 1):-1:1]
+        kws.mean_tmp .= kws.smooth_mean[:, tt + 1, :] .- kws.pred_mean[:, tt + 1, :];
+        mul!(kws.smooth_mean[:, tt, :], kws.G[:, :, tt], kws.mean_tmp, 1.0, 0.0);
+        kws.smooth_mean[:, tt, :] .+= kws.filt_mean[:, tt, :];
     end
 
     return kws
-
 end
-
-
-
 
 # ==== SUFFICIENT STATISTICS =============================================================================
 # using BenchmarkTools
 
 function sym_syrk!(out, x::Matrix{T}) where {T<:Real}
-
-        BLAS.syrk!('U', 'N', 1.0, x, 1.0, out)
-        LinearAlgebra.copytri!(out, 'U')
-        return out
-
+    BLAS.syrk!('U', 'N', 1.0, x, 1.0, out)
+    LinearAlgebra.copytri!(out, 'U')
+    return out
 end
 
 @inline function aggregate_xx(
-    smooth_mean::Matrix{T}, 
+    smooth_mean::Matrix{T},
     # smooth_cov::PDMat{T,Matrix{T}}, 
-    smooth_cov::Matrix{T}, 
-    ntrials::Int
-    )::PDMat{T,Matrix{T}} where {T<:Real}
-
+    smooth_cov::Matrix{T},
+    ntrials::Int,
+)::PDMat{T,Matrix{T}} where {T<:Real}
     xx = smooth_cov*ntrials;
     sym_syrk!(xx, smooth_mean)
     # mul!(xx, smooth_mean, smooth_mean', 1.0, 1.0)
 
     return tol_PD(xx)
-
 end
-
 
 # @inline function aggregate_xx(
 #     smooth_mean::Matrix{T}, 
@@ -609,20 +539,17 @@ end
 
 #     xx = sum(smooth_cov).mat*ntrials;
 #     sym_syrk!(xx, smooth_mean)
-   
+
 #     return tol_PD(xx)
 
 # end
 
-
 @views @inline function sufficient_statistics!(
-    suf::SufficientStatistics{T},
-    kws::KalmanWorkspace{T},
-    data::Data{T},
-    ) where {T<:Real}
+    suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}, data::Data{T}
+) where {T<:Real}
 
     # initial conditions -------
-    kws.x_init .= kws.smooth_mean[:,1,:]
+    kws.x_init .= kws.smooth_mean[:, 1, :]
     suf.init_n = kws.ntrials
     # init_xx (preset)
     # init_xy
@@ -630,13 +557,12 @@ end
     # init_yy
     suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1].mat, suf.init_n);
 
-
     # transitions -------
     suf.dyn_n = (kws.tsteps - 1) * kws.ntrials
-    kws.x_prev .= reshape(kws.smooth_mean[:,1:end-1,:], kws.latent_dim, suf.dyn_n)
-    kws.x_next .= reshape(kws.smooth_mean[:,2:end,:], kws.latent_dim, suf.dyn_n)
-    u_prev = reshape(data.u[:,1:end-1,:], size(data.u, 1), suf.dyn_n)
-    
+    kws.x_prev .= reshape(kws.smooth_mean[:, 1:(end - 1), :], kws.latent_dim, suf.dyn_n)
+    kws.x_next .= reshape(kws.smooth_mean[:, 2:end, :], kws.latent_dim, suf.dyn_n)
+    u_prev = reshape(data.u[:, 1:(end - 1), :], size(data.u, 1), suf.dyn_n)
+
     # dyn_xx = deepcopy(suf.dyn_xx[].mat);
     # dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
     # sym_syrk!(dyn_xx[1:kws.latent_dim, 1:kws.latent_dim], x_prev)
@@ -648,26 +574,24 @@ end
     # dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov[1:end-1]).mat .* kws.ntrials;
     dyn_xx[1:kws.latent_dim, 1:kws.latent_dim] .= kws.sum_smooth_cov_prev .* kws.ntrials;
     BLAS.syrk!('U', 'N', 1.0, kws.x_prev, 1.0, dyn_xx[1:kws.latent_dim, 1:kws.latent_dim])
-    mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim+1):end], kws.x_prev, u_prev', 1.0, 0.0)
+    mul!(dyn_xx[1:kws.latent_dim, (kws.latent_dim + 1):end], kws.x_prev, u_prev', 1.0, 0.0)
     LinearAlgebra.copytri!(dyn_xx, 'U')
     suf.dyn_xx[] = tol_PD(dyn_xx)
 
-  
     # dyn_xy
-    suf.dyn_xy[1:kws.latent_dim,:] = kws.sum_smooth_xcov .* kws.ntrials;
-    mul!(suf.dyn_xy[1:kws.latent_dim,:], kws.x_prev, kws.x_next', 1.0, 1.0)
-    mul!(suf.dyn_xy[(kws.latent_dim+1):end,:], u_prev, kws.x_next', 1.0, 0.0)
+    suf.dyn_xy[1:kws.latent_dim, :] = kws.sum_smooth_xcov .* kws.ntrials;
+    mul!(suf.dyn_xy[1:kws.latent_dim, :], kws.x_prev, kws.x_next', 1.0, 1.0)
+    mul!(suf.dyn_xy[(kws.latent_dim + 1):end, :], u_prev, kws.x_next', 1.0, 0.0)
     # dyn_yy
     # suf.dyn_yy[] = aggregate_xx(kws.x_next, kws.smooth_cov[2:end], kws.ntrials);
     suf.dyn_yy[] = aggregate_xx(kws.x_next, kws.sum_smooth_cov_next, kws.ntrials);
-
 
     # observations -------
     suf.obs_n = kws.tsteps * kws.ntrials
     kws.x_cur .= reshape(kws.smooth_mean, kws.latent_dim, suf.obs_n)
     y_cur = reshape(data.y, kws.obs_dim, suf.obs_n)
     d_cur = reshape(data.d, kws.obs_input_dim, suf.obs_n)
-    
+
     # obs_xx
     # obs_xx = deepcopy(suf.obs_xx[].mat);
     # obs_xx[1:kws.latent_dim, 1:kws.latent_dim] = sum(kws.smooth_cov).mat * kws.ntrials;
@@ -680,21 +604,27 @@ end
     # obs_xx[1:kws.latent_dim, 1:kws.latent_dim] .= sum(kws.smooth_cov).mat .* kws.ntrials;
     obs_xx[1:kws.latent_dim, 1:kws.latent_dim] .= kws.sum_smooth_cov_all .* kws.ntrials;
     BLAS.syrk!('U', 'N', 1.0, kws.x_cur, 1.0, obs_xx[1:kws.latent_dim, 1:kws.latent_dim])
-    mul!(obs_xx[1:kws.latent_dim, (kws.latent_dim+1):end], kws.x_cur, d_cur', 1.0, 0.0)
+    mul!(obs_xx[1:kws.latent_dim, (kws.latent_dim + 1):end], kws.x_cur, d_cur', 1.0, 0.0)
     LinearAlgebra.copytri!(obs_xx, 'U')
     suf.obs_xx[] = tol_PD(obs_xx);
 
     # obs_xy
-    mul!(suf.obs_xy[1:kws.latent_dim,:], kws.x_cur, y_cur', 1.0, 0.0)
+    return mul!(suf.obs_xy[1:kws.latent_dim, :], kws.x_cur, y_cur', 1.0, 0.0)
     # obs_yy (preset)
 
 end
 
-
-
 # ==== M-STEP =============================================================================
-regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}) where {T<:Real} = transpose((XX + prior_lambda) \ XY)
-regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::Nothing) where {T<:Real} = transpose(XX \ XY)
+function regress(
+    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}
+) where {T<:Real}
+    return transpose((XX + prior_lambda) \ XY)
+end
+function regress(
+    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::Nothing
+) where {T<:Real}
+    return transpose(XX \ XY)
+end
 
 function est_cov(
     W::AbstractMatrix{T},
@@ -705,16 +635,17 @@ function est_cov(
     prior_lambda::PDMat{T,Matrix{T}},
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
-    )::Matrix{T} where {T<:Real} 
-
+)::Matrix{T} where {T<:Real}
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+ (prior_df * prior_mu)) / 
-                (N .+ prior_df);
+    Cov =
+        (
+            YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+
+            (prior_df * prior_mu)
+        ) / (N .+ prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
-
 
 function est_cov(
     W::AbstractMatrix{T},
@@ -725,31 +656,22 @@ function est_cov(
     prior_lambda::Nothing,
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
-    )::Matrix{T} where {T<:Real} 
-
+)::Matrix{T} where {T<:Real}
     Wxy = W*XY;
 
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / 
-                (N .+ prior_df);
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / (N .+ prior_df);
 
     return Cov # make PD, but don't save as PDMat
 end
 
-
-
 function mstep!(
-    lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
-    kws::KalmanWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # TODO: include filt_bool
 
     # initials ===============================================
-    B0 = regress(
-        suf.init_xx[], 
-        suf.init_xy, 
-        kws.B0_lambda)
+    B0 = regress(suf.init_xx[], suf.init_xy, kws.B0_lambda)
 
     P0 = est_cov(
         B0,
@@ -765,15 +687,11 @@ function mstep!(
     lds.state_model.B0 .= B0
     lds.state_model.P0 .= P0
 
-
     # dynamics ===============================================
-    AB = regress(
-        suf.dyn_xx[], 
-        suf.dyn_xy, 
-        kws.AB_lambda)
+    AB = regress(suf.dyn_xx[], suf.dyn_xy, kws.AB_lambda)
 
     A = AB[:, 1:kws.latent_dim];
-    B = AB[:, (kws.latent_dim+1):end];
+    B = AB[:, (kws.latent_dim + 1):end];
 
     Q = est_cov(
         AB,
@@ -790,15 +708,11 @@ function mstep!(
     lds.state_model.B .= B
     lds.state_model.Q .= Q
 
-
     # observations ===============================================
-    CD = regress(
-        suf.obs_xx[], 
-        suf.obs_xy, 
-        kws.CD_lambda)
-    
+    CD = regress(suf.obs_xx[], suf.obs_xy, kws.CD_lambda)
+
     C = CD[:, 1:kws.latent_dim];
-    D = CD[:, (kws.latent_dim+1):end];
+    D = CD[:, (kws.latent_dim + 1):end];
 
     R = est_cov(
         CD,
@@ -813,18 +727,13 @@ function mstep!(
 
     lds.obs_model.C .= C
     lds.obs_model.D .= D
-    lds.obs_model.R .= R
-
+    return lds.obs_model.R .= R
 end
-
-
-
 
 # ==== COMPUTE ELBO =============================================================================
 
-
 # full priors
-log_post(
+function log_post(
     n::Int,
     v::Int,
     v0::Int,
@@ -833,17 +742,14 @@ log_post(
     lamN::PDMat{T,Matrix{T}},
     Sig0::Matrix{T},
     SigN::PDMat{T,Matrix{T}},
-    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
-                                0.5*v*logdet(lam0) .+ 
-                                -0.5*v*logdet(lamN) .+
-                                0.5*v0*logdet(0.5 .* Sig0) .+
-                                -0.5*vN*logdet(0.5 .* SigN) .+
-                                -SpecialFunctions.loggamma(0.5 .* v0) .+ 
-                                SpecialFunctions.loggamma(0.5 .* vN);
-
+) where {T<:Real}
+    return -0.5*n*v*log(2pi) .+ 0.5*v*logdet(lam0) .+ -0.5*v*logdet(lamN) .+
+           0.5*v0*logdet(0.5 .* Sig0) .+ -0.5*vN*logdet(0.5 .* SigN) .+
+           -SpecialFunctions.loggamma(0.5 .* v0) .+ SpecialFunctions.loggamma(0.5 .* vN)
+end;
 
 # no beta prior
-log_post(
+function log_post(
     n::Int,
     v::Int,
     v0::Int,
@@ -852,54 +758,46 @@ log_post(
     lamN::PDMat{T,Matrix{T}},
     Sig0::Matrix{T},
     SigN::PDMat{T,Matrix{T}},
-    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
-                                -0.5*v*logdet(lamN) .+
-                                0.5*v0*logdet(0.5 .* Sig0) .+
-                                -0.5*vN*logdet(0.5 .* SigN) .+
-                                -SpecialFunctions.loggamma(0.5 .* v0) .+ 
-                                SpecialFunctions.loggamma(0.5 .* vN);
-    
-                                
+) where {T<:Real}
+    return -0.5*n*v*log(2pi) .+ -0.5*v*logdet(lamN) .+ 0.5*v0*logdet(0.5 .* Sig0) .+
+           -0.5*vN*logdet(0.5 .* SigN) .+ -SpecialFunctions.loggamma(0.5 .* v0) .+
+           SpecialFunctions.loggamma(0.5 .* vN)
+end;
+
 # no cov prior
-log_post(
+function log_post(
     n::Int,
     v::Int,
     vN::Int,
     lam0::PDMat{T,Matrix{T}},
     lamN::PDMat{T,Matrix{T}},
     SigN::PDMat{T,Matrix{T}},
-    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
-                                0.5*v*logdet(lam0) .+ 
-                                -0.5*v*logdet(lamN) .+
-                                -0.5*vN*logdet(0.5 .* SigN) .+
-                                SpecialFunctions.loggamma(0.5 .* vN);
-
+) where {T<:Real}
+    return -0.5*n*v*log(2pi) .+ 0.5*v*logdet(lam0) .+ -0.5*v*logdet(lamN) .+
+           -0.5*vN*logdet(0.5 .* SigN) .+ SpecialFunctions.loggamma(0.5 .* vN)
+end;
 
 # no prior
-log_post(
+function log_post(
     n::Int,
     v::Int,
     vN::Int,
     lam0::Nothing,
     lamN::PDMat{T,Matrix{T}},
     SigN::PDMat{T,Matrix{T}},
-    ) where {T<:Real} =         -0.5*n*v*log(2pi) .+
-                                -0.5*v*logdet(lamN) .+
-                                -0.5*vN*logdet(0.5 .* SigN) .+
-                                SpecialFunctions.loggamma(0.5 .* vN);
-
+) where {T<:Real}
+    return -0.5*n*v*log(2pi) .+ -0.5*v*logdet(lamN) .+ -0.5*vN*logdet(0.5 .* SigN) .+
+           SpecialFunctions.loggamma(0.5 .* vN)
+end;
 
 function compute_elbo(
-    lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
-    kws::KalmanWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
     elbo = 0.0;
 
     P0_PD = tol_PD(lds.state_model.P0)
-    Q_PD  = tol_PD(lds.state_model.Q)
-    R_PD  = tol_PD(lds.obs_model.R)
+    Q_PD = tol_PD(lds.state_model.Q)
+    R_PD = tol_PD(lds.obs_model.R)
 
     # Initial Conditions --------------------------------------
     n = suf.init_n
@@ -909,12 +807,12 @@ function compute_elbo(
     lam0 = kws.B0_lambda;
     lamN = lam0 === nothing ? suf.init_xx[] : lam0 + suf.init_xx[];
     Sig0 = kws.P0_mu * kws.P0_df
-    SigN = P0_PD  * vN;
+    SigN = P0_PD * vN;
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
+        elbo += log_post(n, v, v0, vN, lam0, lamN, Sig0, SigN)
     else
-        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+        elbo += log_post(n, v, vN, lam0, lamN, SigN)
     end
 
     if abs(elbo) == Inf
@@ -929,18 +827,17 @@ function compute_elbo(
     lam0 = kws.AB_lambda;
     lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
     Sig0 = kws.Q_mu * kws.Q_df
-    SigN = Q_PD  * vN;
+    SigN = Q_PD * vN;
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
+        elbo += log_post(n, v, v0, vN, lam0, lamN, Sig0, SigN)
     else
-        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+        elbo += log_post(n, v, vN, lam0, lamN, SigN)
     end
 
     if abs(elbo) == Inf
         @show n v v0 vN lam0 lamN Sig0 SigN
     end
-
 
     # Observations --------------------------------------
     n = suf.obs_n
@@ -950,12 +847,12 @@ function compute_elbo(
     lam0 = kws.CD_lambda;
     lamN = lam0 === nothing ? suf.obs_xx[] : lam0 + suf.obs_xx[];
     Sig0 = kws.R_mu * kws.R_df
-    SigN = R_PD  * vN;
+    SigN = R_PD * vN;
 
     if v0 > 0
-        elbo += log_post(n,v,v0,vN,lam0,lamN,Sig0,SigN)
+        elbo += log_post(n, v, v0, vN, lam0, lamN, Sig0, SigN)
     else
-        elbo += log_post(n,v,vN,lam0,lamN,SigN)
+        elbo += log_post(n, v, vN, lam0, lamN, SigN)
     end
     if abs(elbo) == Inf
         @show n v v0 vN lam0 lamN Sig0 SigN
@@ -966,11 +863,7 @@ function compute_elbo(
     elbo += kws.ntrials * kws.shared_entropy[]
 
     return elbo
-
 end
-
-
-
 
 # function marginal_loglikelihood(
 #     lds::LinearDynamicalSystem{T,S,O},
@@ -985,20 +878,19 @@ end
 #     @inline @views for t in eachindex(kws.pred_cov)
 
 #         CVCR = tol_PD(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
-        
+
 #         @inline @views for n in 1:kws.ntrials
 
 #             mul!(Cmu, lds.obs_model.C, kws.pred_mean[:,t,n])
 #             MV = MvNormal(Cmu, CVCR)
 #             total_ll += logpdf(MV, kws.y_minus_d[:,t,n]);
-            
+
 #         end
 #     end
 
 #     return total_ll
 
 # end
-
 
 # function logpdf_sum!(
 #     MV::MvNormal{T,PDMat{T,Matrix{T}}},
@@ -1010,27 +902,31 @@ end
 # end
 
 function marginal_loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O},
-    kws::KalmanWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
     total_ll = zero(T)
     # kws.obs_pd_tmp[] = PDMat(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
     MV = MvNormal(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
 
-    @inbounds kws.innovation .= kws.y_minus_d .- reshape(lds.obs_model.C * reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials), kws.obs_dim, kws.tsteps, kws.ntrials)
+    @inbounds kws.innovation .=
+        kws.y_minus_d .- reshape(
+            lds.obs_model.C *
+            reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials),
+            kws.obs_dim,
+            kws.tsteps,
+            kws.ntrials,
+        )
 
     @inbounds @views for t in eachindex(kws.pred_cov)
-
-        kws.obs_pd_tmp[] = tol_PD(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
+        kws.obs_pd_tmp[] = tol_PD(
+            X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R
+        )
         MV = MvNormal(kws.obs_pd_tmp[])
-    
-        for n in axes(kws.innovation, 3)
-            total_ll += Distributions.logpdf(MV, kws.innovation[:,t,n]);
-        end
 
+        for n in axes(kws.innovation, 3)
+            total_ll += Distributions.logpdf(MV, kws.innovation[:, t, n]);
+        end
     end
 
     return total_ll
-
 end
