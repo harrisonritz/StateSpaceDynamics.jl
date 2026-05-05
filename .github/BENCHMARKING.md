@@ -34,11 +34,6 @@ Tests the Laplace approximation-based smoothing for Poisson observations:
 - Observation dimensions: 5, 10
 - Sequence lengths: 100, 500 timesteps
 
-### HMM Forward-Backward
-Tests the forward-backward algorithm:
-- Number of states: 2, 4, 8
-- Sequence lengths: 100, 500 timesteps
-
 ## Metrics Tracked
 
 For each benchmark:
@@ -91,7 +86,6 @@ julia --project run_benchmark.jl
 
 This requires:
 - Python with `pykalman` and `dynamax` installed
-- HiddenMarkovModels.jl for HMM comparisons
 
 ## Interpreting Performance Changes
 

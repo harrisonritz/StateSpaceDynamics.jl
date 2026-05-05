@@ -1048,44 +1048,6 @@ function random_rotation_matrix(n::Int, rng::AbstractRNG=Random.default_rng())
     return Matrix(Q)
 end
 
-"""
-    getproperty(model::AutoRegressiveEmission, sym::Symbol)
-
-Get various properties of 'innerGaussianRegression`.
-"""
-function Base.getproperty(model::AutoRegressiveEmission, sym::Symbol)
-    if sym === :β
-        return model.innerGaussianRegression.β
-    elseif sym === :Σ
-        return model.innerGaussianRegression.Σ
-    elseif sym === :include_intercept
-        return model.innerGaussianRegression.include_intercept
-    elseif sym === :λ
-        return model.innerGaussianRegression.λ
-    else # fallback to getfield
-        return getfield(model, sym)
-    end
-end
-
-"""
-    setproperty!(model::AutoRegressiveEmission, sym::Symbol, value)
-
-Assign to properties of an `AutoRegressiveEmission` by forwarding certain symbols
-to its `innerGaussianRegression` field:
-"""
-# define setters for innerGaussianRegression fields
-function Base.setproperty!(model::AutoRegressiveEmission, sym::Symbol, value)
-    if sym === :β
-        model.innerGaussianRegression.β = value
-    elseif sym === :Σ
-        model.innerGaussianRegression.Σ = value
-    elseif sym === :λ
-        model.innerGaussianRegression.λ = value
-    else # fallback to setfield!
-        setfield!(model, sym, value)
-    end
-end
-
 # Pretty print function that doesn't truncate arrays of model objects
 
 """

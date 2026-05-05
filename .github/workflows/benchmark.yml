@@ -128,25 +128,6 @@ jobs:
                 end
             end
 
-            # Benchmark: HMM forward-backward
-            SUITE["HMM"] = BenchmarkGroup(["HMM"])
-            for num_states in [2, 4, 8], T in [100, 500]
-                rng = StableRNG(1234)
-
-                A = rand(rng, num_states, num_states)
-                A ./= sum(A, dims=2)
-                π = rand(rng, num_states)
-                π ./= sum(π)
-
-                emissions = [GaussianEmission(μ=randn(rng), σ²=1.0) for _ in 1:num_states]
-                hmm = HiddenMarkovModel(A=A, π=π, emissions=emissions)
-
-                _, y = rand(rng, hmm; seq_length=T, num_trials=1)
-
-                SUITE["HMM"]["loglikelihood", "states=$num_states", "T=$T"] =
-                    @benchmarkable loglikelihood($hmm, $y) samples=10 seconds=5
-            end
-
             # Run benchmarks
             println("\n" * "="^70)
             println("Running benchmark suite...")

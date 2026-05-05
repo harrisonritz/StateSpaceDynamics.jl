@@ -97,39 +97,16 @@ Help us maintain a welcoming environment for researchers and developers.
 
 ## Available Models
 
-- [x] Mixture Models
-  - [x] Gaussian Mixture Models
-  - [x] Poisson Mixture Models
-  - [ ] Binomial Mixture Models
-  - [ ] Negative Binomial Mixture Models
-  - [ ] Student's t Mixture Models
-- [x] Hidden Markov Models
-  - [x] Gaussian HMMs
-  - [x] Poisson HMMs
-  - [ ] Binomial HMMs
-  - [ ] Negative Binomial HMMs
-  - [x] Autoregressive HMMs (ARHMM)
 - [x] Linear Dynamical Systems
   - [x] Gaussian Linear Dynamical Systems (Kalman Filter)
   - [x] Poisson Linear Dynamical Systems (PLDS)
   - [ ] PFLDS
   - [x] Switching Linear Dynamical Systems (SLDS)
   - [ ] Recurrent Switching Linear Dynamical Systems (rSLDS)
-- [x] Generalized Linear Models (Not state space models but needed for HMM-GLMs)
-  - [x] Gaussian GLMs
-  - [x] Poisson GLMs
-  - [x] Binomial GLMs
-  - [ ] Negative Binomial GLMs
-- [x] HMM-GLM's
-  - [x] Gaussian HMM-GLMs
-  - [x] Poisson HMM-GLMs
-  - [x] Bernoulli HMM-GLMs
-  - [ ] Negative Binomial HMM-GLMs
-  - [ ] Multinomial HMM-GLMs
 
 ## Related Packages
 
-- [HiddenMarkovModels.jl](https://github.com/maxmouchet/HiddenMarkovModels.jl): A Julia package for Hidden Markov Models. We recommend this package if you are exclusively interested in HMMs. We plan to integrate with this package in the future.
+- [HiddenMarkovModels.jl](https://github.com/maxmouchet/HiddenMarkovModels.jl): A Julia package for Hidden Markov Models. We recommend this package if you need HMMs; StateSpaceDynamics.jl uses it internally for SLDS forward-backward.
 
 - [StateSpaceLearning.jl](https://github.com/LAMPSPUC/StateSpaceLearning.jl) : A Julia package for time series analysis using state space models.
 

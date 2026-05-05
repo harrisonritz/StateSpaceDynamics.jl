@@ -1,19 +1,3 @@
-# Create abstract types here
-"""
-Abstract type for Mixture Models. I.e. GMM's, etc.
-"""
-abstract type MixtureModel end
-
-"""
-Abstract type for Regression Models. I.e. GaussianRegression, BernoulliRegression, etc.
-"""
-abstract type RegressionModel end
-
-"""
-Abstract type for HMMs
-"""
-abstract type AbstractHMM end
-
 """
 Abstract type for Dynamical Systems. I.e. LDS, etc.
 """
@@ -21,69 +5,6 @@ Abstract type for Dynamical Systems. I.e. LDS, etc.
 abstract type DynamicalSystem end
 abstract type AbstractStateModel{T<:Real} end
 abstract type AbstractObservationModel{T<:Real} end
-
-"""
-Base type hierarchy for emission models.
-Each emission model must implement:
-- sample()
-- loglikelihood()
-- fit!()
-"""
-abstract type EmissionModel end
-
-"""
-Base type hierarchy for regression emission models.
-"""
-abstract type RegressionEmission <: EmissionModel end
-
-"""
-Special case of regression emission models that are autoregressive.
-"""
-abstract type AutoRegressiveEmission <: RegressionEmission end
-
-"""
-    ForwardBackward{T<:Real}
-
-A mutable struct that encapsulates the forward–backward algorithm outputs for a hidden
-Markov model (HMM).
-
-# Fields
-- `loglikelihoods::Matrix{T}`: Matrix of log-likelihoods for each observation and state.
-- `α::Matrix{T}`: The forward probabilities (α) for each time step and state.
-- `β::Matrix{T}`: The backward probabilities (β) for each time step and state.
-- `γ::Matrix{T}`: The state occupancy probabilities (γ) for each time step and state.
-- `ξ::Array{T,3}`: The pairwise state occupancy probabilities (ξ) for consecutive time steps
-    and state pairs.
-
-Typically, `α` and `β` are computed by the forward–backward algorithm to find the likelihood
-of an observation sequence. `γ` and `ξ` are derived from these calculations to estimate how
-states transition over time.
-"""
-mutable struct ForwardBackward{
-    T<:Real,V<:AbstractVector{T},M<:AbstractMatrix{T},MM<:AbstractMatrix{T}
-}
-    loglikelihoods::M
-    α::M
-    β::M
-    γ::M
-    ξ::MM
-end
-
-function Base.show(io::IO, fb::ForwardBackward; gap="")
-    println(io, gap, "Forward Backward Object:")
-    println(io, gap, "------------------------")
-    println(
-        io,
-        gap,
-        " size(logL) = ($(size(fb.loglikelihoods,1)), $(size(fb.loglikelihoods,2)))",
-    )
-    println(io, gap, " size(α)    = ($(size(fb.α,1)), $(size(fb.α,2)))")
-    println(io, gap, " size(β)    = ($(size(fb.β,1)), $(size(fb.β,2)))")
-    println(io, gap, " size(γ)    = ($(size(fb.γ,1)), $(size(fb.γ,2)))")
-    println(io, gap, " size(ξ)    = ($(size(fb.ξ,1)), $(size(fb.ξ,2)), $(size(fb.ξ,3)))")
-
-    return nothing
-end
 
 """
     FilterSmooth{T<:Real}
