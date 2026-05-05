@@ -1301,12 +1301,11 @@ function fit!(
     u=nothing,
     d=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
     return _fit!(lds, y, max_iter, tol, progress, u0, u, d, Val(lds.kalman_filter))
-
 end
 
-function _fit!(lds::LinearDynamicalSystem{T,S,O},
+function _fit!(
+    lds::LinearDynamicalSystem{T,S,O},
     y_vec::AbstractVector{<:AbstractMatrix{T}},
     max_iter::Int,
     tol::Float64,
@@ -1315,30 +1314,30 @@ function _fit!(lds::LinearDynamicalSystem{T,S,O},
     u,
     d,
     ::Val{true},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     y_combined = zeros(T, size(y_vec[1], 1), size(y_vec[1], 2), length(y_vec))
     try
         # combine y vector into matrix
-        y_combined = cat(y_vec..., dims=3)
+        y_combined = cat(y_vec...; dims=3)
     catch
-        throw(ArgumentError(
-            """
-            Failed to combine input vector of matrices into a single matrix. 
-            Ensure all matrices have the same number of rows (obs_dim) and that 
-            the total number of columns does not exceed memory limits.
-            """
-            ))
+        throw(
+            ArgumentError(
+                """
+                Failed to combine input vector of matrices into a single matrix. 
+                Ensure all matrices have the same number of rows (obs_dim) and that 
+                the total number of columns does not exceed memory limits.
+                """
+            ),
+        )
     end
 
     return _fit_kalman!(
-        lds, y_combined;
-        u0=u0, u=u, d=d, max_iter=max_iter, tol=tol, progress=progress,
+        lds, y_combined; u0=u0, u=u, d=d, max_iter=max_iter, tol=tol, progress=progress
     )
-
 end
 
-function _fit!(lds::LinearDynamicalSystem{T,S,O},
+function _fit!(
+    lds::LinearDynamicalSystem{T,S,O},
     y::AbstractVector{<:AbstractMatrix{T}},
     max_iter::Int,
     tol::Float64,
@@ -1347,22 +1346,16 @@ function _fit!(lds::LinearDynamicalSystem{T,S,O},
     u,
     d,
     ::Val{false},
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}} 
-    
-    return _fit_tridiag!(
-        lds, y;
-        max_iter=max_iter, tol=tol, progress=progress,
-    )
-
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    return _fit_tridiag!(lds, y; max_iter=max_iter, tol=tol, progress=progress)
 end
-
 
 function _fit_tridiag!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractVector{<:AbstractMatrix{T}};
     max_iter::Int=100,
     tol::Float64=1e-6,
-    progress::Bool=true
+    progress::Bool=true,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
@@ -1402,14 +1395,13 @@ function _fit_tridiag!(
     return elbos
 end
 
-
 function fit!(
     lds::LinearDynamicalSystem{T,S,O}, y::AbstractArray{T}; kwargs...
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     # reshape y from [obs_dim, tsteps, trials] to vector of matrices if needed
     if ndims(y) == 3
         obs_dim, tsteps, ntrials = size(y)
-        y_vec = [view(y, :, :, i) for i in 1:ntrials]
+        y_vec = [view(y,:,:,i) for i in 1:ntrials]
         return fit!(lds, y_vec; kwargs...)
     elseif ndims(y) == 2
         # single trial case, wrap in vector
@@ -1567,17 +1559,16 @@ Returns the **total** log-likelihood.  Divide by `obs_dim * tsteps * ntrials` fo
 per-observation score that is comparable across configurations.
 """
 function filter_loglikelihood(
-    lds::LinearDynamicalSystem{T,SM,OM},
-    y::AbstractArray{T,3},
+    lds::LinearDynamicalSystem{T,SM,OM}, y::AbstractArray{T,3}
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
-    A  = lds.state_model.A
-    Q  = lds.state_model.Q
-    b  = lds.state_model.b
+    A = lds.state_model.A
+    Q = lds.state_model.Q
+    b = lds.state_model.b
     x0 = lds.state_model.x0
     P0 = lds.state_model.P0
-    C  = lds.obs_model.C
-    R  = lds.obs_model.R
-    d  = lds.obs_model.d
+    C = lds.obs_model.C
+    R = lds.obs_model.R
+    d = lds.obs_model.d
 
     obs_dim, tsteps, ntrials = size(y)
     D = lds.latent_dim
@@ -1586,16 +1577,16 @@ function filter_loglikelihood(
     log2πp = T(obs_dim) * log(T(2π))
 
     # Pre-allocate buffers (reused across trials and time steps)
-    x_p    = Vector{T}(undef, D)
-    x_f    = Vector{T}(undef, D)
-    P_p    = Matrix{T}(undef, D, D)
-    P_f    = Matrix{T}(undef, D, D)
+    x_p = Vector{T}(undef, D)
+    x_f = Vector{T}(undef, D)
+    P_p = Matrix{T}(undef, D, D)
+    P_f = Matrix{T}(undef, D, D)
     tmp_DD = Matrix{T}(undef, D, D)
-    innov  = Vector{T}(undef, obs_dim)
-    Si_e   = Vector{T}(undef, obs_dim)
-    Smat   = Matrix{T}(undef, obs_dim, obs_dim)
-    PCt    = Matrix{T}(undef, D, obs_dim)
-    SiPCt  = Matrix{T}(undef, obs_dim, D)
+    innov = Vector{T}(undef, obs_dim)
+    Si_e = Vector{T}(undef, obs_dim)
+    Smat = Matrix{T}(undef, obs_dim, obs_dim)
+    PCt = Matrix{T}(undef, D, obs_dim)
+    SiPCt = Matrix{T}(undef, obs_dim, D)
 
     for n in 1:ntrials
         x_f .= x0
@@ -1651,10 +1642,8 @@ function filter_loglikelihood(
 end
 
 function filter_loglikelihood(
-    lds::LinearDynamicalSystem{T,SM,OM},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    lds::LinearDynamicalSystem{T,SM,OM}, y::AbstractVector{<:AbstractMatrix{T}}
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
-
-    y_comb = cat(y..., dims=3)
+    y_comb = cat(y...; dims=3)
     return filter_loglikelihood(lds, y_comb)
 end

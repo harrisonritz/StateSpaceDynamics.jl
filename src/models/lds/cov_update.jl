@@ -16,12 +16,11 @@ struct CovUpdateCache{T<:BlasFloat}
 end
 
 function CovUpdateCache{T}(n::Integer) where {T<:BlasFloat}
-    CovUpdateCache{T}(Matrix{T}(undef, n, n),
-                      Matrix{T}(undef, n, n),
-                      Matrix{T}(undef, n, n))
+    return CovUpdateCache{T}(
+        Matrix{T}(undef, n, n), Matrix{T}(undef, n, n), Matrix{T}(undef, n, n)
+    )
 end
 CovUpdateCache(n::Integer) = CovUpdateCache{Float64}(n)
-
 
 """
     info_update!(cache, P0, CiRC) -> PDMat
@@ -40,9 +39,9 @@ Cost: one `potri` + one `cholesky!` + one `potri` + one `cholesky!` on
 the naive `inv(inv(P0) + CiRC)` which goes ≈ 8n³/3 via PDMat → Matrix →
 LU-based `inv` → PDMat, losing PD structure in the middle.
 """
-function info_update!(cache::CovUpdateCache{T},
-                      P0::PDMat{T,Matrix{T}},
-                      CiRC::PDMat{T,Matrix{T}}) where {T<:BlasFloat}
+function info_update!(
+    cache::CovUpdateCache{T}, P0::PDMat{T,Matrix{T}}, CiRC::PDMat{T,Matrix{T}}
+) where {T<:BlasFloat}
     n = size(P0, 1)
     @boundscheck begin
         size(CiRC, 1) == n || throw(DimensionMismatch("P0 and CiRC differ"))
@@ -50,7 +49,7 @@ function info_update!(cache::CovUpdateCache{T},
             throw(DimensionMismatch("cache sized for n=$(size(cache.M, 1))"))
     end
 
-    M    = cache.M
+    M = cache.M
     Pmat = cache.Pmat
     Pfac = cache.Pchol_factors
 
@@ -69,7 +68,7 @@ function info_update!(cache::CovUpdateCache{T},
     axpy!(one(T), CiRC.mat, M)
 
     # (3) Cholesky of M, in place, upper triangle: M_upper ← U with M = UᵀU.
-    cholesky!(Symmetric(M, :U); check = true)
+    cholesky!(Symmetric(M, :U); check=true)
 
     # (4) potri! on the fresh factor: M's upper triangle now holds
     #     inv(P0⁻¹ + CiRC), i.e. the new covariance P.
@@ -84,7 +83,7 @@ function info_update!(cache::CovUpdateCache{T},
     #     Unavoidable: there is no closed-form shortcut from chol(M) to
     #     chol(inv(M)) that preserves standard Cholesky triangularity.
     copyto!(Pfac, Pmat)
-    Cout = cholesky!(Symmetric(Pfac, :U); check = true)
+    Cout = cholesky!(Symmetric(Pfac, :U); check=true)
 
     return PDMat(Pmat, Cout)
 end

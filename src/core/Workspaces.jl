@@ -756,7 +756,6 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
     return ws
 end
 
-
 """
 Refresh the per-regime constant caches after an M-step has updated the LDS parameters.
 Must be called before the next E-step so that Cholesky factors, Hessian templates, etc.
@@ -768,8 +767,6 @@ function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
     end
     return nothing
 end
-
-
 
 """
     KalmanWorkspace{T<:Real}
@@ -836,15 +833,15 @@ struct KalmanWorkspace{T<:Real}
     R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
 
     #  Priors
-    B0_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    B0_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
     P0_mu::Matrix{T}
     P0_df::Int
 
-    AB_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    AB_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
     Q_mu::Matrix{T}
     Q_df::Int
 
-    CD_lambda::Union{Nothing, PDMat{T,Matrix{T}}}
+    CD_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
     R_mu::Matrix{T}
     R_df::Int
 
@@ -867,7 +864,6 @@ struct KalmanWorkspace{T<:Real}
     x_next::Matrix{T}
     x_init::Matrix{T}
     x_cur::Matrix{T}
-
 end
 
 """
@@ -930,7 +926,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_R_mu = Matrix{T}(lds.obs_model.R_prior.Ψ)
         placeholder_R_df = lds.obs_model.R_prior.ν
     end
-    
 
     pred_cov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
     pred_icov = [PDMat(Matrix{T}(I, D, D)) for _ in 1:tsteps]
@@ -940,9 +935,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
 
     p_smooth_shared = zeros(T, D, D, tsteps)
     p_smooth_tt1_shared = zeros(T, D, D, tsteps)
-
-    
-
 
     return KalmanWorkspace{T}(
         D,                              # latent_dim
@@ -971,7 +963,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         Ref(placeholder_D),             # Q_PD
         Ref(placeholder_D),             # P0_PD
         Ref(placeholder_p),             # R_PD
-        
         placeholder_B0,                 # B0_lambda
         placeholder_P0_mu,              # P0_mu
         placeholder_P0_df,              # P0_df 
@@ -981,7 +972,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_CD,                 # CD_lambda 
         placeholder_R_mu,               # R_mu
         placeholder_R_df,               # R_df
-
         zeros(T, D, p),                 # CiR
         Ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
@@ -996,6 +986,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, (tsteps-1)*ntrials),# x_prev
         zeros(T, D, (tsteps-1)*ntrials),# x_next
         zeros(T, D, ntrials),           # x_init
-        zeros(T, D, tsteps*ntrials)     # x_cur
+        zeros(T, D, tsteps*ntrials),     # x_cur
     )
 end

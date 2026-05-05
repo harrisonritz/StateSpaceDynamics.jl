@@ -72,9 +72,8 @@ function Base.setindex!(
 end
 Base.length(f::TrialFilterSmooth) = length(f.FilterSmooths)
 
-
 mutable struct SufficientStatistics{T<:Real}
-    
+
     # initial conditions
     init_n::Int
     init_xx::Base.RefValue{PDMat{T,Matrix{T}}}
@@ -92,11 +91,7 @@ mutable struct SufficientStatistics{T<:Real}
     obs_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     obs_xy::Matrix{T}
     obs_yy::Base.RefValue{PDMat{T,Matrix{T}}}
-
 end
-
-
-
 
 Base.@kwdef struct Data{T<:Real}
     y::Array{T,3}
@@ -104,5 +99,4 @@ Base.@kwdef struct Data{T<:Real}
     u::Array{T,3}
     d::Array{T,3}
 end
-
 

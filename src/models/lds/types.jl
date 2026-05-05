@@ -100,10 +100,10 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
         println(io, gap, "  P0 = $(round.(gsm.P0, sigdigits=3))")
     end
 
-        println(io, gap, " Dynamics input:")
-        println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
-        println(io, gap, " Initial input:")
-        println(io, gap, "  size(B0) = ($(size(gsm.B0,1)), $(size(gsm.B0,2)))")
+    println(io, gap, " Dynamics input:")
+    println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
+    println(io, gap, " Initial input:")
+    println(io, gap, "  size(B0) = ($(size(gsm.B0,1)), $(size(gsm.B0,2)))")
 
     return nothing
 end
@@ -150,9 +150,6 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     return nothing
 end
 
-
-
-
 # Convenience constructors (State)
 function GaussianStateModel(
     A::M, Q::M, b::V, x0::V, P0::M
@@ -172,9 +169,8 @@ function GaussianStateModel(
     )
 end
 
-
 function GaussianStateModel(
-    A::M, Q::M, B::M, B0::M, P0::M,
+    A::M, Q::M, B::M, B0::M, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T}}
     return GaussianStateModel{T,M}(;
         A=A,
@@ -191,40 +187,21 @@ function GaussianStateModel(
     )
 end
 
-
-
-
 # Convenience constructors (Observation)
 
 function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return GaussianObservationModel{T,M,V}(; 
-    C=C, 
-    R=R, 
-    d=d, 
-    D=zeros(size(C, 1), 1), 
-    R_prior=nothing,
-    CD_lambda=nothing,
+    return GaussianObservationModel{T,M,V}(;
+        C=C, R=R, d=d, D=zeros(size(C, 1), 1), R_prior=nothing, CD_lambda=nothing
     )
 end
 
-
-function GaussianObservationModel(
-    C::M, R::M, D::M,
-) where {T<:Real,M<:AbstractMatrix{T}}
-    return GaussianObservationModel{T,M}(; 
-    C=C, 
-    R=R, 
-    d=zeros(T, size(C, 1)), 
-    D=D, 
-    R_prior=nothing,
-    CD_lambda=nothing,
+function GaussianObservationModel(C::M, R::M, D::M) where {T<:Real,M<:AbstractMatrix{T}}
+    return GaussianObservationModel{T,M}(;
+        C=C, R=R, d=zeros(T, size(C, 1)), D=D, R_prior=nothing, CD_lambda=nothing
     )
 end
-
-
-
 
 """
     PoissonObservationModel{
@@ -308,10 +285,18 @@ function LinearDynamicalSystem(
     # Infer dimensions from matrices
     latent_dim = size(state_model.A, 1)
     obs_dim = size(obs_model.C, 1)
-    state_input_dim = hasproperty(state_model, :B) && !isnothing(state_model.B) ? size(state_model.B, 2) : 1
-    init_input_dim = hasproperty(state_model, :B0) && !isnothing(state_model.B0) ? size(state_model.B0, 2) : 1
-    obs_input_dim = hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 1
-
+    state_input_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
+        size(state_model.B, 2)
+    else
+        1
+    end
+    init_input_dim = if hasproperty(state_model, :B0) && !isnothing(state_model.B0)
+        size(state_model.B0, 2)
+    else
+        1
+    end
+    obs_input_dim =
+        hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 1
 
     # Set default fit_bool based on observation model type / Kalman flag
     if fit_bool === nothing
@@ -327,15 +312,18 @@ function LinearDynamicalSystem(
         end
     end
 
-
     # Create the LDS
     lds = LinearDynamicalSystem{T,S,O}(
-        state_model, obs_model, 
-        latent_dim, obs_dim, 
-        state_input_dim, init_input_dim, obs_input_dim, 
-        fit_bool, kalman_filter
+        state_model,
+        obs_model,
+        latent_dim,
+        obs_dim,
+        state_input_dim,
+        init_input_dim,
+        obs_input_dim,
+        fit_bool,
+        kalman_filter,
     )
-
 
     # Validate the constructed LDS (throws on error)
     validate_LDS(lds)
