@@ -40,11 +40,6 @@ include("models/lds/poisson.jl")
 include("models/lds/cov_update.jl")
 include("models/lds/SLDS.jl")
 
-# Other models
-include("models/EmissionModels.jl")
-include("models/HiddenMarkovModels.jl")
-include("models/MixtureModels.jl")
-
 # Algorithms
 include("algorithms/Preprocessing.jl")
 include("algorithms/Valid.jl")
@@ -55,21 +50,9 @@ export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
 export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
-export ProbabilisticPCA,
-    SLDS,
-    LinearDynamicalSystem,
-    GaussianMixtureModel,
-    PoissonMixtureModel,
-    HiddenMarkovModel,
-    Data
-export RegressionEmission,
-    PoissonRegressionEmission,
-    AutoRegressionEmission,
-    GaussianEmission,
-    GaussianRegressionEmission,
-    BernoulliRegressionEmission
-export MixtureModel, EmissionModel, DynamicalSystem
-export AbstractHMM, AbstractStateModel, AbstractObservationModel
+export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
+export DynamicalSystem
+export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export IWPrior
 export CovUpdateCache
@@ -83,6 +66,6 @@ export print_full
 export info_update!
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, filter_loglikelihood, kmeans_init!, viterbi, class_probabilities
+export rand, smooth, fit!, loglikelihood, filter_loglikelihood
 
 end

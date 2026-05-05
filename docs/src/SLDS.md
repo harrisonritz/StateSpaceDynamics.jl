@@ -55,7 +55,7 @@ mutable struct SLDS{
     O<:AbstractObservationModel,
     TM<:AbstractMatrix{T},
     ISV<:AbstractVector{T},
-} <: AbstractHMM
+}
     A::TM # Transition matrix
     πₖ::ISV # Initial state distribution
     LDSs::Vector{LinearDynamicalSystem{T,S,O}} # Vector of LDS models
