@@ -34,7 +34,7 @@ struct BenchConfig
 end
 
 kf_config = BenchConfig(
-    [4, 8],   # latent_dims
+    [4, 8, 16],   # latent_dims
     [4, 8],      # obs_dims
     100,         # seq_length
     10,          # n_iters (EM iterations per fit)
