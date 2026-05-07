@@ -1,8 +1,6 @@
 """
 Abstract type for Dynamical Systems. I.e. LDS, etc.
 """
-
-abstract type DynamicalSystem end
 abstract type AbstractStateModel{T<:Real} end
 abstract type AbstractObservationModel{T<:Real} end
 
