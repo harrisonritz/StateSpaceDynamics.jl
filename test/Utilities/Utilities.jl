@@ -80,7 +80,9 @@ function test_block_tridiagonal_inverse_mutating()
             p_smooth = zeros(T, block_size, block_size, n)
             p_smooth_tt1 = zeros(T, block_size, block_size, n)
 
-            StateSpaceDynamics.block_tridiagonal_inverse!(p_smooth, p_smooth_tt1, A, B, C, ws)
+            StateSpaceDynamics.block_tridiagonal_inverse!(
+                p_smooth, p_smooth_tt1, A, B, C, ws
+            )
 
             for i in 1:n
                 rows = ((i - 1) * block_size + 1):(i * block_size)
@@ -89,7 +91,9 @@ function test_block_tridiagonal_inverse_mutating()
             for i in 2:n
                 rows_i = ((i - 1) * block_size + 1):(i * block_size)
                 rows_im1 = ((i - 2) * block_size + 1):((i - 1) * block_size)
-                @test isapprox(p_smooth_tt1[:, :, i], Hinv[rows_i, rows_im1]; atol=atol, rtol=0)
+                @test isapprox(
+                    p_smooth_tt1[:, :, i], Hinv[rows_i, rows_im1]; atol=atol, rtol=0
+                )
             end
         end
     end
