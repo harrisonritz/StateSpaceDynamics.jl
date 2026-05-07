@@ -34,7 +34,7 @@ struct BenchConfig
 end
 
 kf_config = BenchConfig(
-    4,   # latent_dims
+    16,   # latent_dims
     8,      # obs_dims
     100,         # seq_length
     50,          # n_iters (EM iterations per fit)
@@ -165,7 +165,7 @@ show(ref)
 println("\n\n------------------------------------------Fitted model ------------------------------------------")
 show(fitted)
 
-elbos = SSD.fit!(fitted, y; max_iter=10, tol=1e-6, progress=false)
+elbos = SSD.fit!(fitted, y; max_iter=100, tol=1e-6, progress=false)
 println("\n ELBO: $(round.(elbos .- elbos[1], digits=6)) \n")
 
 
@@ -186,4 +186,63 @@ println("---------------------\n\n")
 
 display(bench)
 @printf("test_ll = %.6f\n", test_loglik)
+
+
+
+
+
+# function test_obs_model_parameter_updates(ntrials::Int=1)
+#     # Fit flags: update C and R here (d is bundled with C via CD)
+#     lds, x, y = toy_lds(ntrials, [false, false, false, false, true, true])
+
+#     # tfs
+#     tsteps_per_trial = [size(yt, 2) for yt in y]
+#     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
+
+#     # run the E_Step
+#     ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
+
+#     tsteps = tsteps_per_trial[1]
+#     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+
+#     # Save original parameters
+#     C_orig = copy(lds.obs_model.C)
+#     d_orig = copy(lds.obs_model.d)
+#     R_orig = copy(lds.obs_model.R)
+
+#     # Objective over (C,d,R)
+#     function obj_obs(CD::AbstractMatrix, R_sqrt::AbstractMatrix, lds)
+#         D = size(CD, 2) - 1
+#         lds.obs_model.C .= CD[:, 1:D]
+#         lds.obs_model.d .= CD[:, D + 1]
+#         lds.obs_model.R .= R_sqrt * R_sqrt'
+#         StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+#         val = zero(eltype(R_sqrt))
+
+#         for k in 1:ntrials
+#             E_z, E_zz = tfs[k].E_z, tfs[k].E_zz
+#             val += StateSpaceDynamics.Q_obs!(ws, lds, E_z, E_zz, y[k])
+#         end
+#         return -val
+#     end
+
+#     D = lds.latent_dim
+#     CD0 = hcat(lds.obs_model.C, lds.obs_model.d)
+#     R_sqrt0 = Matrix(cholesky(lds.obs_model.R).U)
+
+#     CD_opt = optimize(CD -> obj_obs(CD, R_sqrt0, lds), CD0, LBFGS()).minimizer
+#     R_opt_sqrt = optimize(Rs -> obj_obs(CD_opt, Rs, lds), R_sqrt0, LBFGS()).minimizer
+
+#     # Restore original parameters before M-step
+#     lds.obs_model.C .= C_orig
+#     lds.obs_model.d .= d_orig
+#     lds.obs_model.R .= R_orig
+
+#     # M-step updates the model
+#     StateSpaceDynamics.mstep!(lds, tfs, y)
+
+#     @test isapprox(lds.obs_model.C, CD_opt[:, 1:D], atol=1e-6, rtol=1e-6)
+#     @test isapprox(lds.obs_model.d, CD_opt[:, D + 1], atol=1e-6, rtol=1e-6)
+#     @test isapprox(lds.obs_model.R, R_opt_sqrt * R_opt_sqrt', atol=1e-6, rtol=1e-6)
+# end
 
