@@ -1057,6 +1057,15 @@ function update_A_b!(
         end
     end
 
+    # MN-prior shrinkage on [A b]: posterior MAP is
+    #   [A b] = (Sxz + M₀ Λ) (Szz + Λ)⁻¹
+    # `Λ` is (D+1) × (D+1), `M₀` is D × (D+1). Reduces to OLS when prior is nothing.
+    prior = lds.state_model.AB_prior
+    if prior !== nothing
+        Szz .+= prior.Λ
+        mul!(Sxz, prior.M₀, prior.Λ, one(T), one(T))
+    end
+
     F = factorize(Szz')
     ldiv!(transpose(AB), F, transpose(Sxz)) # AB' = (Szz') \ (Sxz')
 
@@ -1137,6 +1146,15 @@ function update_Q!(
         end
     end
 
+    # MN-prior contribution to the IW posterior scale matrix:
+    # add (W - M₀) Λ (W - M₀)' where W = [A b] is the freshly-fit regression
+    # MAP. Mathematically the matrix-normal half of an MNIW posterior on (W, Q).
+    AB_prior = lds.state_model.AB_prior
+    if AB_prior !== nothing
+        Wm_state = hcat(A, b) .- AB_prior.M₀          # (D × (D+1))
+        Q_sum .+= Wm_state * AB_prior.Λ * Wm_state'   # (D × D), symmetric
+    end
+
     if lds.state_model.Q_prior === nothing
         copyto!(Q_sum, Q_sum ./ total_weight)
     else
@@ -1202,6 +1220,15 @@ function update_C_d!(
         end
     end
 
+    # MN-prior shrinkage on [C d]: posterior MAP is
+    #   [C d] = (Syz + M₀ Λ) (Szz + Λ)⁻¹
+    # `Λ` is (D+1) × (D+1), `M₀` is obs_dim × (D+1). Reduces to OLS when prior is nothing.
+    CD_prior = lds.obs_model.CD_prior
+    if CD_prior !== nothing
+        Szz .+= CD_prior.Λ
+        mul!(Syz, CD_prior.M₀, CD_prior.Λ, one(T), one(T))
+    end
+
     F = factorize(Szz)
     ldiv!(transpose(CD), F, transpose(Syz))
 
@@ -1259,6 +1286,14 @@ function update_R!(
 
             total_weight += wt
         end
+    end
+
+    # MN-prior contribution to the IW posterior scale matrix for R:
+    # add (W - M₀) Λ (W - M₀)' where W = [C d] is the freshly-fit regression MAP.
+    CD_prior = lds.obs_model.CD_prior
+    if CD_prior !== nothing
+        Wm_obs = hcat(C, d) .- CD_prior.M₀            # (obs_dim × (D+1))
+        R_new .+= Wm_obs * CD_prior.Λ * Wm_obs'       # (obs_dim × obs_dim)
     end
 
     if lds.obs_model.R_prior === nothing
