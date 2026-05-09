@@ -630,49 +630,40 @@ end
 end
 
 # ==== M-STEP =============================================================================
-# Legacy overloads — Λ supplied as a raw PDMat (or `nothing`) with implicit
-# zero prior mean. Retained while the workspace still stores `*_lambda`
-# fields directly. New callers should prefer `mn_map(XX, XY, ::MNPrior)`,
-# which is the same math but lets the caller specify a non-zero `M₀`.
+# Two regression overloads, dispatched on the prior:
+#   * `nothing`  — OLS (no shrinkage, no shift).
+#   * `MNPrior`  — matrix-normal MAP via `mn_map`.
+# Sharing `mn_map` with `core/priors.jl` means the same math will eventually
+# back the tridiag and Poisson M-steps after their Phase 2 migration.
+
 function regress(
-    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}
-) where {T<:Real}
-    return transpose((XX + prior_lambda) \ XY)
-end
-function regress(
-    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::Nothing
+    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, ::Nothing
 ) where {T<:Real}
     return transpose(XX \ XY)
 end
 
-# MNPrior overload — full matrix-normal prior with arbitrary `M₀`. Delegates
-# to the type-level `mn_map` helper so the same math is shared with the
-# tridiag/Poisson M-steps once they migrate.
 function regress(
     XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior::MNPrior{T}
 ) where {T<:Real}
     return mn_map(XX, XY, prior)
 end
 
+# Posterior IW scale matrix for Σ given the regression MAP W. The MN-prior
+# contribution is `(W - M₀) Λ (W - M₀)'` (reduces to `W Λ W'` when `M₀ = 0`).
+
 function est_cov(
     W::AbstractMatrix{T},
     XX::PDMat{T,Matrix{T}},
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
     N::Int,
-    prior_lambda::PDMat{T,Matrix{T}},
+    ::Nothing,
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
 )::Matrix{T} where {T<:Real}
-    Wxy = W*XY;
-
-    Cov =
-        (
-            YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ X_A_Xt(prior_lambda, W) .+
-            (prior_df * prior_mu)
-        ) / (N .+ prior_df);
-
-    return Cov # make PD, but don't save as PDMat
+    Wxy = W * XY
+    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / (N + prior_df)
+    return Cov
 end
 
 function est_cov(
@@ -681,15 +672,21 @@ function est_cov(
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
     N::Int,
-    prior_lambda::Nothing,
+    prior::MNPrior{T},
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
 )::Matrix{T} where {T<:Real}
-    Wxy = W*XY;
-
-    Cov = (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ (prior_df * prior_mu)) / (N .+ prior_df);
-
-    return Cov # make PD, but don't save as PDMat
+    Wxy = W * XY
+    Wm = W .- prior.M₀
+    # MN-prior contribution: (W - M₀) Λ (W - M₀)'. Expanded explicitly because
+    # PDMats only exports `X_A_Xt(::AbstractPDMat, ::AbstractMatrix)` and
+    # `prior.Λ` is a plain `Matrix`. Matrix-of-matrix triple product is a
+    # one-liner here and avoids a cholesky-of-Λ wrap per E-step.
+    WmΛWmT = Wm * prior.Λ * Wm'
+    Cov = (
+        YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ WmΛWmT .+ (prior_df * prior_mu)
+    ) / (N + prior_df)
+    return Cov
 end
 
 function mstep!(
@@ -699,7 +696,7 @@ function mstep!(
     # TODO: include filt_bool
 
     # initials ===============================================
-    B0 = regress(suf.init_xx[], suf.init_xy, kws.B0_lambda)
+    B0 = regress(suf.init_xx[], suf.init_xy, kws.B0_prior)
 
     P0 = est_cov(
         B0,
@@ -707,7 +704,7 @@ function mstep!(
         suf.init_xy,
         suf.init_yy[],
         suf.init_n,
-        kws.B0_lambda,
+        kws.B0_prior,
         kws.P0_df,
         kws.P0_mu,
     )
@@ -716,7 +713,7 @@ function mstep!(
     lds.state_model.P0 .= P0
 
     # dynamics ===============================================
-    AB = regress(suf.dyn_xx[], suf.dyn_xy, kws.AB_lambda)
+    AB = regress(suf.dyn_xx[], suf.dyn_xy, kws.AB_prior)
 
     A = AB[:, 1:kws.latent_dim];
     B = AB[:, (kws.latent_dim + 1):end];
@@ -727,7 +724,7 @@ function mstep!(
         suf.dyn_xy,
         suf.dyn_yy[],
         suf.dyn_n,
-        kws.AB_lambda,
+        kws.AB_prior,
         kws.Q_df,
         kws.Q_mu,
     )
@@ -737,7 +734,7 @@ function mstep!(
     lds.state_model.Q .= Q
 
     # observations ===============================================
-    CD = regress(suf.obs_xx[], suf.obs_xy, kws.CD_lambda)
+    CD = regress(suf.obs_xx[], suf.obs_xy, kws.CD_prior)
 
     C = CD[:, 1:kws.latent_dim];
     D = CD[:, (kws.latent_dim + 1):end];
@@ -748,7 +745,7 @@ function mstep!(
         suf.obs_xy,
         suf.obs_yy[],
         suf.obs_n,
-        kws.CD_lambda,
+        kws.CD_prior,
         kws.R_df,
         kws.R_mu,
     )
@@ -818,6 +815,16 @@ function log_post(
            SpecialFunctions.loggamma(0.5 .* vN)
 end;
 
+"""
+    _prior_Λ_PD(prior) -> Union{Nothing, PDMat}
+
+Extract the matrix-normal precision Λ from an `MNPrior` and wrap it as a
+`PDMat` (so the `log_post` overloads' cached-Cholesky path works unchanged).
+Returns `nothing` when the prior is absent.
+"""
+@inline _prior_Λ_PD(::Nothing) = nothing
+@inline _prior_Λ_PD(prior::MNPrior{T}) where {T} = PDMat(prior.Λ)
+
 function compute_elbo(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
@@ -832,7 +839,7 @@ function compute_elbo(
     v = kws.latent_dim;
     v0 = kws.P0_df;
     vN = v0 + (n - kws.init_input_dim);
-    lam0 = kws.B0_lambda;
+    lam0 = _prior_Λ_PD(kws.B0_prior)
     lamN = lam0 === nothing ? suf.init_xx[] : lam0 + suf.init_xx[];
     Sig0 = kws.P0_mu * kws.P0_df
     SigN = P0_PD * vN;
@@ -852,7 +859,7 @@ function compute_elbo(
     v = kws.latent_dim;
     v0 = kws.Q_df;
     vN = v0 + (n - (kws.latent_dim + kws.state_input_dim));
-    lam0 = kws.AB_lambda;
+    lam0 = _prior_Λ_PD(kws.AB_prior)
     lamN = lam0 === nothing ? suf.dyn_xx[] : lam0 + suf.dyn_xx[];
     Sig0 = kws.Q_mu * kws.Q_df
     SigN = Q_PD * vN;
@@ -871,7 +878,7 @@ function compute_elbo(
     v = kws.obs_dim;
     v0 = kws.R_df;
     vN = v0 + (n - (kws.latent_dim + kws.obs_input_dim));
-    lam0 = kws.CD_lambda;
+    lam0 = _prior_Λ_PD(kws.CD_prior)
     lamN = lam0 === nothing ? suf.obs_xx[] : lam0 + suf.obs_xx[];
     Sig0 = kws.R_mu * kws.R_df
     SigN = R_PD * vN;

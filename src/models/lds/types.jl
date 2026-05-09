@@ -24,6 +24,10 @@ filter path (see `LinearDynamicalSystem.kalman_filter`).
     (`latent_dim × u0_dim`). When supplied, `u0` must be passed to `fit!`/`smooth!`.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
+- `AB_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
+    stacked dynamics matrix `[A B]`. Pair with `Q_prior` for a full MNIW prior on `(AB, Q)`.
+- `B0_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
+    initial-state input matrix `B0`. Pair with `P0_prior` for a full MNIW prior on `(B0, P0)`.
 """
 Base.@kwdef mutable struct GaussianStateModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -37,8 +41,8 @@ Base.@kwdef mutable struct GaussianStateModel{
     B0::M = zeros(size(A, 1), 1) # default to zero matrix if not supplied
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
-    B0_lambda::Union{Nothing,M} = nothing # optional prior on B0
-    AB_lambda::Union{Nothing,M} = nothing # optional joint prior on A and B
+    AB_prior::Union{Nothing,MNPrior{T,M}} = nothing
+    B0_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
 
 function Base.show(io::IO, gsm::GaussianStateModel; gap="")
@@ -82,6 +86,8 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
 - `R::M`: Observation noise covariance of size `(obs_dim × obs_dim)`.
 - `d::V`: Bias vector of length `(obs_dim)`.
 - `R_prior::Union{Nothing, IWPrior{T}} = nothing`: Optional Inverse-Wishart prior for `R`.
+- `CD_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
+    stacked emission matrix `[C D]`. Pair with `R_prior` for a full MNIW prior on `(CD, R)`.
 """
 Base.@kwdef mutable struct GaussianObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -91,7 +97,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     d::Union{Nothing,V}
     D::M = zeros(size(C, 1), 1) # default to zero matrix if not supplied
     R_prior::Union{Nothing,IWPrior{T}} = nothing
-    CD_lambda::Union{Nothing,M} = nothing # optional joint prior on C and D (stacked vertically)
+    CD_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
 
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
@@ -127,8 +133,8 @@ function GaussianStateModel(
         B0=zeros(T, size(A, 1), 1),
         Q_prior=nothing,
         P0_prior=nothing,
-        AB_lambda=nothing,
-        B0_lambda=nothing,
+        AB_prior=nothing,
+        B0_prior=nothing,
     )
 end
 
@@ -145,8 +151,8 @@ function GaussianStateModel(
         B0=B0,
         Q_prior=nothing,
         P0_prior=nothing,
-        AB_lambda=nothing,
-        B0_lambda=nothing,
+        AB_prior=nothing,
+        B0_prior=nothing,
     )
 end
 
@@ -156,13 +162,13 @@ function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianObservationModel{T,M,V}(;
-        C=C, R=R, d=d, D=zeros(size(C, 1), 1), R_prior=nothing, CD_lambda=nothing
+        C=C, R=R, d=d, D=zeros(size(C, 1), 1), R_prior=nothing, CD_prior=nothing
     )
 end
 
 function GaussianObservationModel(C::M, R::M, D::M) where {T<:Real,M<:AbstractMatrix{T}}
     return GaussianObservationModel{T,M}(;
-        C=C, R=R, d=zeros(T, size(C, 1)), D=D, R_prior=nothing, CD_lambda=nothing
+        C=C, R=R, d=zeros(T, size(C, 1)), D=D, R_prior=nothing, CD_prior=nothing
     )
 end
 

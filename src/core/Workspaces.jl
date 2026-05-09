@@ -832,16 +832,18 @@ struct KalmanWorkspace{T<:Real}
     P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
     R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
 
-    #  Priors
-    B0_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
+    #  Priors — matrix-normal halves stored as `MNPrior`s (M₀ + Λ);
+    #  inverse-Wishart halves are split into (μ, df) pairs to keep the
+    #  hot-path arithmetic indirection-free.
+    B0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     P0_mu::Matrix{T}
     P0_df::Int
 
-    AB_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
+    AB_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     Q_mu::Matrix{T}
     Q_df::Int
 
-    CD_lambda::Union{Nothing,PDMat{T,Matrix{T}}}
+    CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     R_mu::Matrix{T}
     R_df::Int
 
@@ -891,23 +893,12 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     placeholder_D = PDMat(Matrix{T}(I, D, D))
     placeholder_p = PDMat(Matrix{T}(I, p, p))
 
-    if isnothing(lds.state_model.B0_lambda)
-        placeholder_B0 = nothing
-    else
-        placeholder_B0 = PDMat(lds.state_model.B0_lambda)
-    end
-
-    if isnothing(lds.state_model.AB_lambda)
-        placeholder_AB = nothing
-    else
-        placeholder_AB = PDMat(lds.state_model.AB_lambda)
-    end
-
-    if isnothing(lds.obs_model.CD_lambda)
-        placeholder_CD = nothing
-    else
-        placeholder_CD = PDMat(lds.obs_model.CD_lambda)
-    end
+    # MN priors stored verbatim; no PDMat wrapping (the M-step needs (XX + Λ)
+    # solves where XX changes every iteration, so a cached chol of Λ-alone
+    # would not be reused).
+    placeholder_B0 = lds.state_model.B0_prior
+    placeholder_AB = lds.state_model.AB_prior
+    placeholder_CD = lds.obs_model.CD_prior
 
     if isnothing(lds.state_model.P0_prior)
         placeholder_P0_mu = zeros(T, D, D)
@@ -969,13 +960,13 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         Ref(placeholder_D),             # Q_PD
         Ref(placeholder_D),             # P0_PD
         Ref(placeholder_p),             # R_PD
-        placeholder_B0,                 # B0_lambda
+        placeholder_B0,                 # B0_prior
         placeholder_P0_mu,              # P0_mu
-        placeholder_P0_df,              # P0_df 
-        placeholder_AB,                 # AB_lambda
+        placeholder_P0_df,              # P0_df
+        placeholder_AB,                 # AB_prior
         placeholder_Q_mu,               # Q_mu
         placeholder_Q_df,               # Q_df
-        placeholder_CD,                 # CD_lambda 
+        placeholder_CD,                 # CD_prior
         placeholder_R_mu,               # R_mu
         placeholder_R_df,               # R_df
         zeros(T, D, p),                 # CiR
