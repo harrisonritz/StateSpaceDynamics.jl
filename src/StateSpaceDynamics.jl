@@ -33,10 +33,10 @@ include("optimization/linesearch.jl")
 include("optimization/newton.jl")
 
 # Linear Dynamical Systems
+include("models/lds/cov_update.jl")
 include("models/lds/kalman.jl")
 include("models/lds/gaussian.jl")
 include("models/lds/poisson.jl")
-include("models/lds/cov_update.jl")
 include("models/lds/SLDS.jl")
 
 # Algorithms

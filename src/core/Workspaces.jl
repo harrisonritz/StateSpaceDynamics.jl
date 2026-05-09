@@ -864,6 +864,12 @@ struct KalmanWorkspace{T<:Real}
     x_next::Matrix{T}
     x_init::Matrix{T}
     x_cur::Matrix{T}
+
+    # Sufficient-statistics scratch (reused each E-step; bottom-right uu/dd
+    # block is initialized once from `initialize_SufficientStatistics` and not
+    # mutated thereafter).
+    dyn_xx_buf::Matrix{T}    # ((D + u_dim) × (D + u_dim))
+    obs_xx_buf::Matrix{T}    # ((D + d_dim) × (D + d_dim))
 end
 
 """
@@ -986,6 +992,8 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, (tsteps-1)*ntrials),# x_prev
         zeros(T, D, (tsteps-1)*ntrials),# x_next
         zeros(T, D, ntrials),           # x_init
-        zeros(T, D, tsteps*ntrials),     # x_cur
+        zeros(T, D, tsteps*ntrials),    # x_cur
+        zeros(T, D + state_input_dim, D + state_input_dim),  # dyn_xx_buf
+        zeros(T, D + obs_input_dim, D + obs_input_dim),      # obs_xx_buf
     )
 end

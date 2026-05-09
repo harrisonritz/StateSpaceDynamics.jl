@@ -87,3 +87,57 @@ function info_update!(
 
     return PDMat(Pmat, Cout)
 end
+
+"""
+    info_update!(P_dest, scratch_M, P0, CiRC) -> PDMat
+
+In-place variant of `info_update!` that writes the result of
+`inv(inv(P0) + CiRC)` into the existing PDMat `P_dest` (overwriting both its
+`mat` and `chol.factors` fields). This is the form required when the result
+must persist across many calls — e.g. inside a loop where every step's output
+is read again later (Kalman forward pass → backward pass).
+
+`scratch_M` is a single n × n workspace (re-used across calls). All inputs and
+the destination must be n × n.
+
+The returned `PDMat` is `P_dest` itself — for caller convenience.
+"""
+function info_update!(
+    P_dest::PDMat{T,Matrix{T}},
+    scratch_M::Matrix{T},
+    P0::PDMat{T,Matrix{T}},
+    CiRC::PDMat{T,Matrix{T}},
+) where {T<:BlasFloat}
+    n = size(P0, 1)
+    @boundscheck begin
+        size(CiRC, 1) == n || throw(DimensionMismatch("P0 and CiRC differ"))
+        size(scratch_M) == (n, n) ||
+            throw(DimensionMismatch("scratch_M sized for n=$(size(scratch_M, 1))"))
+        size(P_dest, 1) == n || throw(DimensionMismatch("P_dest size mismatch"))
+    end
+
+    M = scratch_M
+
+    # (1) M ← inv(P0) via cached Cholesky.
+    uplo0 = P0.chol.uplo
+    copyto!(M, P0.chol.factors)
+    LAPACK.potri!(uplo0, M)
+    copytri!(M, uplo0)
+
+    # (2) M ← inv(P0) + CiRC.
+    axpy!(one(T), CiRC.mat, M)
+
+    # (3) Cholesky-then-potri: M's upper triangle now holds inv(inv(P0) + CiRC).
+    cholesky!(Symmetric(M, :U); check=true)
+    LAPACK.potri!('U', M)
+
+    # (4) Write final mat into P_dest.mat, symmetrized.
+    copyto!(P_dest.mat, M)
+    copytri!(P_dest.mat, 'U')
+
+    # (5) Refresh P_dest.chol.factors with a fresh Cholesky of the new mat.
+    copyto!(P_dest.chol.factors, P_dest.mat)
+    cholesky!(Symmetric(P_dest.chol.factors, :U); check=true)
+
+    return P_dest
+end
