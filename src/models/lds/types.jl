@@ -1,41 +1,4 @@
 """
-    IWPrior{T<:Real, M<:AbstractMatrix}
-
-Inverse-Wishart prior for a covariance matrix Σ ~ IW(Ψ, ν), with density
-p(Σ) ∝ |Σ|^{-(ν + d + 1)/2} exp(-½ tr(Ψ Σ^{-1})) for d = size(Σ,1).
-
-# Fields
-- `Ψ::M`: Scale matrix (d×d, SPD).
-- `ν::T`: Degrees of freedom (must satisfy `ν > d + 1` for a proper mode).
-
-# Notes
-- The MAP update for a posterior IW(Ψ + S, ν + n) is `(Ψ + S) / (ν + n + d + 1)`.
-"""
-Base.@kwdef struct IWPrior{T<:Real,M<:AbstractMatrix}
-    Ψ::M
-    ν::T
-end
-
-# helpers for new priors on cov matrices
-@inline function iw_map(
-    Ψ::AbstractMatrix{T}, ν::T, S::AbstractMatrix{T}, n::T, d::Int
-) where {T}
-    return (Ψ .+ S) ./ (ν + n + d + one(T))
-end
-
-# TODO: this should use PD Mats
-@inline function iw_logprior_term(Σ::AbstractMatrix{T}, prior::IWPrior{T}) where {T}
-    D = size(Σ, 1)
-    Ψ, ν = prior.Ψ, prior.ν
-    # log|Σ| via Cholesky
-    F = cholesky(Symmetric(Σ))
-    logdetΣ = 2sum(log, diag(F.U))
-    # tr(Ψ Σ^{-1}) via triangular solves
-    X = F \ Ψ                 # solves Σ * X = Ψ
-    return -T(0.5) * ((ν + D + one(T)) * logdetΣ + tr(X))
-end
-
-"""
     GaussianStateModel{T<:Real, M<:AbstractMatrix{T}, V<:AbstractVector{T}}
 
 Represents the state model of a Linear Dynamical System with Gaussian noise.

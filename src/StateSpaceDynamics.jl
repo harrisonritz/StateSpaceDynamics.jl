@@ -24,6 +24,7 @@ using Base: show
 
 # Core types and utilities
 include("core/GlobalTypes.jl")
+include("core/priors.jl")
 include("models/lds/types.jl")
 include("core/Workspaces.jl")
 include("core/Utilities.jl")
@@ -52,7 +53,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
-export IWPrior
+export IWPrior, MNPrior
 export CovUpdateCache
 
 # Utilities

@@ -630,6 +630,10 @@ end
 end
 
 # ==== M-STEP =============================================================================
+# Legacy overloads — Λ supplied as a raw PDMat (or `nothing`) with implicit
+# zero prior mean. Retained while the workspace still stores `*_lambda`
+# fields directly. New callers should prefer `mn_map(XX, XY, ::MNPrior)`,
+# which is the same math but lets the caller specify a non-zero `M₀`.
 function regress(
     XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::PDMat{T,Matrix{T}}
 ) where {T<:Real}
@@ -639,6 +643,15 @@ function regress(
     XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior_lambda::Nothing
 ) where {T<:Real}
     return transpose(XX \ XY)
+end
+
+# MNPrior overload — full matrix-normal prior with arbitrary `M₀`. Delegates
+# to the type-level `mn_map` helper so the same math is shared with the
+# tridiag/Poisson M-steps once they migrate.
+function regress(
+    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, prior::MNPrior{T}
+) where {T<:Real}
+    return mn_map(XX, XY, prior)
 end
 
 function est_cov(
