@@ -194,16 +194,19 @@ caused a double-exp bug (`exp(C x + exp(log_d))`); see git log for the fix.
 - `C::AbstractMatrix{T}`: Observation matrix of size `(obs_dim × latent_dim)`. Maps latent
     states into observation space.
 - `d::AbstractVector{T}`: Per-neuron baseline log-rate (length `obs_dim`). Free in ℝ.
-- `C_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on `C`.
-    Unlike the Gaussian path, there is no IW counterpart (no observation noise covariance);
-    this is an MN-only prior contributing `½ tr((C - M₀)' Λ (C - M₀))` to the LBFGS objective.
+- `CD_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
+    stacked emission matrix `[C d]` (treated as a single regression of `log λ` on
+    `[x; 1]`). `M₀` and `Λ` have shapes `(obs_dim, latent_dim+1)` and
+    `(latent_dim+1, latent_dim+1)` respectively. Unlike the Gaussian path there is no IW
+    counterpart since Poisson has no observation-noise covariance — this is an MN-only
+    prior contributing `½ tr(([C d] - M₀) Λ ([C d] - M₀)')` to the LBFGS objective.
 """
 Base.@kwdef mutable struct PoissonObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
 } <: AbstractObservationModel{T}
     C::M
     d::V
-    C_prior::Union{Nothing,MNPrior{T,M}} = nothing
+    CD_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
 
 function Base.show(io::IO, pom::PoissonObservationModel; gap="")
@@ -225,11 +228,11 @@ function Base.show(io::IO, pom::PoissonObservationModel; gap="")
 end
 
 # 2-arg convenience constructor; matches the Gaussian path's positional form
-# so callers don't have to spell out `C_prior=nothing`.
+# so callers don't have to spell out `CD_prior=nothing`.
 function PoissonObservationModel(
     C::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return PoissonObservationModel{T,M,V}(; C=C, d=d, C_prior=nothing)
+    return PoissonObservationModel{T,M,V}(; C=C, d=d, CD_prior=nothing)
 end
 
 """

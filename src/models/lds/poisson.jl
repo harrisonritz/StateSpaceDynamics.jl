@@ -631,6 +631,13 @@ end
     gradient_observation_model_single_trial!(grad, C, d, E_z, p_smooth, y, weights)
 
 Compute the gradient for a single trial and add it to the accumulated gradient.
+
+Treats `[C d]` as a single regression matrix `W` of size `obs_dim × (latent_dim + 1)`
+on the augmented latent `z_aug = [x; 1]`. The parameter layout is unchanged from the
+unstacked version — `vcat(vec(C), d) == vec([C d])` in column-major order — so callers
+of this function don't need to know about the stacked view; only the gradient
+computation has been unified across the two blocks. The MN-prior penalty (added by
+`update_observation_model!`) lives over the same stacked `W`.
 """
 function gradient_observation_model_single_trial!(
     grad::AbstractVector{T},
@@ -642,6 +649,7 @@ function gradient_observation_model_single_trial!(
     weights::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real}
     obs_dim, latent_dim = size(C)
+    Dp1 = latent_dim + 1
     tsteps = size(y, 2)
 
     # Pre-allocate temporary arrays
@@ -650,6 +658,9 @@ function gradient_observation_model_single_trial!(
     λ = Vector{T}(undef, obs_dim)
     CP = Matrix{T}(undef, obs_dim, latent_dim)
 
+    # 2-D view of the gradient buffer as `[C d]`-shaped W (obs_dim × Dp1).
+    grad_W = reshape(view(grad, 1:(obs_dim * Dp1)), obs_dim, Dp1)
+
     @views for t in 1:tsteps
         weight = isnothing(weights) ? one(T) : weights[t]
 
@@ -657,30 +668,26 @@ function gradient_observation_model_single_trial!(
         P_smooth_t = p_smooth[:, :, t]
         y_t = y[:, t]
 
-        # Compute h = C * z_t + d
         mul!(h, C, E_z_t)
         h .+= d
-
-        # Pre-compute CP = C * P_smooth_t
         mul!(CP, C, P_smooth_t)
 
-        # Compute ρ and λ = exp(h + ρ)
         @views for i in 1:obs_dim
             ρ[i] = T(0.5) * dot(C[i, :], CP[i, :])
             λ[i] = exp(h[i] + ρ[i])
         end
 
-        # Gradient computation with weight
+        # Stacked gradient ∂Q/∂W[i, j] = w · (y_t[i] − λ[i]) · z_aug[j]  −  w · λ[i] · CP_aug[i, j]
+        # where z_aug = [E_z_t; 1] and CP_aug[:, 1:D] = CP, CP_aug[:, D+1] = 0
+        # (since ρ has no dependence on the d-column of W). Split into the two
+        # blocks to skip the always-zero CP_aug column.
         for j in 1:latent_dim
             for i in 1:obs_dim
-                idx = (j - 1) * obs_dim + i
-                grad[idx] += weight * (y_t[i] * E_z_t[j] - λ[i] * (E_z_t[j] + CP[i, j]))
+                grad_W[i, j] += weight * (y_t[i] * E_z_t[j] - λ[i] * (E_z_t[j] + CP[i, j]))
             end
         end
-
-        # Gradient w.r.t. d: ∂/∂d_i [y_i (Cx + d)_i - exp((Cx+d)_i + ρ_i)] = y_i - λ_i
-        # (No chain-rule factor — `d` enters the linear predictor directly.)
-        @views grad[(end - obs_dim + 1):end] .+= weight .* (y_t .- λ)
+        # j = latent_dim + 1: z_aug[j] = 1, CP_aug[:, j] = 0 → grad ← grad + w · (y − λ)
+        @views grad_W[:, Dp1] .+= weight .* (y_t .- λ)
     end
 end
 
@@ -763,19 +770,25 @@ function update_observation_model!(
 
     obs_dim = plds.obs_dim
     latent_dim = plds.latent_dim
-    C_size = obs_dim * latent_dim
+    Dp1 = latent_dim + 1
+    n_W = obs_dim * Dp1     # total params; identical to vec([C d]) length
 
+    # Param vector layout: vcat(vec(C), d) == vec([C d]) in column-major order,
+    # so existing callers and tests don't see a layout change — only the inner
+    # math is now expressed uniformly over the stacked W = [C d].
     params = vcat(vec(plds.obs_model.C), plds.obs_model.d)
 
-    # MN-only prior on C (no IW half — Poisson has no observation covariance):
-    #   log p(C) ∝ -½ tr((C - M₀) Λ (C - M₀)')
-    # Adds `+½ tr(...)` to the LBFGS objective and `+(C - M₀) Λ` to the C
-    # block of the gradient.
-    C_prior = plds.obs_model.C_prior
+    # MN-only prior on the stacked emission matrix W = [C d] (Poisson has no IW
+    # counterpart since there is no observation-noise covariance):
+    #   log p(W) ∝ -½ tr((W - M₀) Λ (W - M₀)')
+    # Adds `+½ tr(...)` to the LBFGS objective and `+(W - M₀) Λ` to the gradient.
+    # `M₀` is (obs_dim × Dp1), `Λ` is (Dp1 × Dp1).
+    CD_prior = plds.obs_model.CD_prior
 
     function f(params::Vector{T})
-        C_view = reshape(view(params, 1:C_size), obs_dim, latent_dim)
-        d_view = view(params, (C_size + 1):(C_size + obs_dim))
+        Cd_view = reshape(view(params, 1:n_W), obs_dim, Dp1)
+        @views C_view = Cd_view[:, 1:latent_dim]
+        @views d_view = Cd_view[:, Dp1]
 
         copyto!(plds.obs_model.C, C_view)
         copyto!(plds.obs_model.d, d_view)
@@ -790,21 +803,22 @@ function update_observation_model!(
         end
 
         f_prior = zero(T)
-        if C_prior !== nothing
-            Cm = C_view .- C_prior.M₀
-            f_prior = T(0.5) * sum(Cm .* (Cm * C_prior.Λ))
+        if CD_prior !== nothing
+            Wm = Cd_view .- CD_prior.M₀
+            f_prior = T(0.5) * sum(Wm .* (Wm * CD_prior.Λ))
         end
 
         return -acc + f_prior
     end
 
     function g!(grad::Vector{T}, params::Vector{T})
-        C_view = reshape(view(params, 1:C_size), obs_dim, latent_dim)
-        d_view = view(params, (C_size + 1):(C_size + obs_dim))
+        Cd_view = reshape(view(params, 1:n_W), obs_dim, Dp1)
+        @views C_view = Cd_view[:, 1:latent_dim]
+        @views d_view = Cd_view[:, Dp1]
         gradient_observation_model!(grad, C_view, d_view, tfs, y, w)
-        if C_prior !== nothing
-            grad_C_view = reshape(view(grad, 1:C_size), obs_dim, latent_dim)
-            grad_C_view .+= (C_view .- C_prior.M₀) * C_prior.Λ
+        if CD_prior !== nothing
+            grad_W_view = reshape(view(grad, 1:n_W), obs_dim, Dp1)
+            grad_W_view .+= (Cd_view .- CD_prior.M₀) * CD_prior.Λ
         end
         return grad
     end
@@ -816,10 +830,9 @@ function update_observation_model!(
     result = optimize(f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts)
 
     # write final params back
-    @views begin
-        plds.obs_model.C .= reshape(result.minimizer[1:C_size], obs_dim, latent_dim)
-        plds.obs_model.d .= result.minimizer[(C_size + 1):(C_size + obs_dim)]
-    end
+    result_W = reshape(result.minimizer[1:n_W], obs_dim, Dp1)
+    @views plds.obs_model.C .= result_W[:, 1:latent_dim]
+    @views plds.obs_model.d .= result_W[:, Dp1]
 
     return nothing
 end
