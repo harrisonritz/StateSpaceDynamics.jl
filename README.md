@@ -50,14 +50,14 @@ Q = Matrix(Diagonal([0.01, 0.01])) # process noise
 
 # observation model parameters
 C = [1.2 1.2; 1.2 1.2; 1.2 1.2] # observation matrix
-log_d = log.([0.1, 0.1, 0.1]) # log of the natural parameters of the Poisson distribution
+d = log.([0.1, 0.1, 0.1])       # baseline log-rates: λ_i = exp(C_i' x + d_i)
 
 # generate data
 tsteps = 100
 trials = 10
 
 gaussian_state_model = GaussianStateModel(;A=A, Q=Q, P0=P0, x0=x0)
-poisson_obs_model = PoissonObservationModel(;C=C, log_d=log_d)
+poisson_obs_model = PoissonObservationModel(;C=C, d=d)
 
 plds_true = LinearDynamicalSystem(;state_model=gaussian_state_model, 
                                    obs_model=poisson_obs_model, 
@@ -72,9 +72,9 @@ P0_init = Matrix(0.1 * I(2))
 x0_init = zeros(2)
 
 C_init = rand(3, 2)
-log_d_init = zeros(3)
+d_init = zeros(3)
 
-plds_true = LinearDynamicalSystem(;state_model=GaussianStateModel(;A=A_init, Q=Q_init, P0=P0_init, x0=x0_init), obs_model=PoissonObservationModel(;C=C_init, log_d=log_d_init), latent_dim=2, obs_dim=3, fit_bool=fill(true, 6))
+plds_true = LinearDynamicalSystem(;state_model=GaussianStateModel(;A=A_init, Q=Q_init, P0=P0_init, x0=x0_init), obs_model=PoissonObservationModel(;C=C_init, d=d_init), latent_dim=2, obs_dim=3, fit_bool=fill(true, 6))
 fit!(plds_true, observations; max_iter=15, tol=1e-3)
 ```
 

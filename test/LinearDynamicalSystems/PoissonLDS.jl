@@ -7,14 +7,14 @@ P0 = Matrix(Diagonal([0.1, 0.1]))  # Fixed: was p0, now P0
 A = [cos(0.1) -sin(0.1); sin(0.1) cos(0.1)]
 Q = Matrix(Diagonal([0.1, 0.1]))
 C = [0.6 0.6; 0.6 0.6; 0.6 0.6] .* 2
-log_d = log.([0.1, 0.1, 0.1])
+d = log.([0.1, 0.1, 0.1])
 b = zeros(2)
 
 function toy_PoissonLDS(
     ntrials::Int=1, fit_bool::Vector{Bool}=[true, true, true, true, true, true]
 )
     gaussian_sm = GaussianStateModel(; A=A, b=b, Q=Q, x0=x0, P0=P0)
-    poisson_om = PoissonObservationModel(; C=C, log_d=log_d)  # Fixed: was poisson_sm
+    poisson_om = PoissonObservationModel(; C=C, d=d)  # Fixed: was poisson_sm
     poisson_lds = LinearDynamicalSystem(;
         state_model=gaussian_sm,
         obs_model=poisson_om,
@@ -43,42 +43,42 @@ function test_plds_properties(poisson_lds)
     @test size(poisson_lds.state_model.x0) == (poisson_lds.latent_dim,)
     @test size(poisson_lds.state_model.P0) ==
         (poisson_lds.latent_dim, poisson_lds.latent_dim)
-    @test size(poisson_lds.obs_model.log_d) == (poisson_lds.obs_dim,)
+    @test size(poisson_lds.obs_model.d) == (poisson_lds.obs_dim,)
 end
 
 function test_pobs_constructor_type_preservation()
     # Int
     C_int = [1 2; 3 4]
-    log_d_int = [5, 6]
+    d_int = [5, 6]
 
-    pom_int = PoissonObservationModel(; C=C_int, log_d=log_d_int)
+    pom_int = PoissonObservationModel(; C=C_int, d=d_int)
 
     @test eltype(pom_int.C) === Int
-    @test eltype(pom_int.log_d) === Int
+    @test eltype(pom_int.d) === Int
     @test size(pom_int.C) == (2, 2)
-    @test length(pom_int.log_d) == 2
+    @test length(pom_int.d) == 2
 
     # Float32
     C_f32 = Float32[1 2; 3 4]
-    log_d_f32 = Float32[0.5, 0.6]
+    d_f32 = Float32[0.5, 0.6]
 
-    pom_f32 = PoissonObservationModel(; C=C_f32, log_d=log_d_f32)
+    pom_f32 = PoissonObservationModel(; C=C_f32, d=d_f32)
 
     @test eltype(pom_f32.C) === Float32
-    @test eltype(pom_f32.log_d) === Float32
+    @test eltype(pom_f32.d) === Float32
     @test size(pom_f32.C) == (2, 2)
-    @test length(pom_f32.log_d) == 2
+    @test length(pom_f32.d) == 2
 
     # BigFloat
     C_bf = BigFloat[1 2; 3 4]
-    log_d_bf = BigFloat[0.1, 0.2]
+    d_bf = BigFloat[0.1, 0.2]
 
-    pom_bf = PoissonObservationModel(; C=C_bf, log_d=log_d_bf)
+    pom_bf = PoissonObservationModel(; C=C_bf, d=d_bf)
 
     @test eltype(pom_bf.C) === BigFloat
-    @test eltype(pom_bf.log_d) === BigFloat
+    @test eltype(pom_bf.d) === BigFloat
     @test size(pom_bf.C) == (2, 2)
-    @test length(pom_bf.log_d) == 2
+    @test length(pom_bf.d) == 2
 end
 
 function test_plds_constructor_type_preservation()
@@ -86,13 +86,13 @@ function test_plds_constructor_type_preservation()
     A_int = [1 2; 3 4]
     C_int = [1 0; 0 1]
     Q_int = [2 0; 0 2]
-    log_d_int = [7, 8]
+    d_int = [7, 8]
     x0_int = [5, 6]
     P0_int = [4 0; 0 4]
     b_int = [0, 0]
 
     gsm_int = GaussianStateModel(; A=A_int, Q=Q_int, x0=x0_int, P0=P0_int, b=b_int)
-    pom_int = PoissonObservationModel(; C=C_int, log_d=log_d_int)
+    pom_int = PoissonObservationModel(; C=C_int, d=d_int)
     plds_int = LinearDynamicalSystem(;
         state_model=gsm_int,
         obs_model=pom_int,
@@ -106,7 +106,7 @@ function test_plds_constructor_type_preservation()
     @test eltype(plds_int.state_model.x0) === Int
     @test eltype(plds_int.state_model.P0) === Int
     @test eltype(plds_int.obs_model.C) === Int
-    @test eltype(plds_int.obs_model.log_d) === Int
+    @test eltype(plds_int.obs_model.d) === Int
     @test plds_int.latent_dim == 2
     @test plds_int.obs_dim == 2
 
@@ -114,13 +114,13 @@ function test_plds_constructor_type_preservation()
     A_f32 = Float32[1 2; 3 4]
     C_f32 = Float32[1 0; 0 1]
     Q_f32 = Float32[2 0; 0 2]
-    log_d_f32 = Float32[0.5, 1.5]
+    d_f32 = Float32[0.5, 1.5]
     x0_f32 = Float32[0.7, 0.8]
     P0_f32 = Float32[4 0; 0 4]
     b_f32 = Float32[0, 0]
 
     gsm_f32 = GaussianStateModel(; A=A_f32, Q=Q_f32, x0=x0_f32, P0=P0_f32, b=b_f32)
-    pom_f32 = PoissonObservationModel(; C=C_f32, log_d=log_d_f32)
+    pom_f32 = PoissonObservationModel(; C=C_f32, d=d_f32)
     plds_f32 = LinearDynamicalSystem(;
         state_model=gsm_f32,
         obs_model=pom_f32,
@@ -131,19 +131,19 @@ function test_plds_constructor_type_preservation()
 
     @test eltype(plds_f32.state_model.A) === Float32
     @test eltype(plds_f32.obs_model.C) === Float32
-    @test eltype(plds_f32.obs_model.log_d) === Float32
+    @test eltype(plds_f32.obs_model.d) === Float32
 
     # BigFloat
     A_bf = BigFloat[1 2; 3 4]
     C_bf = BigFloat[1 0; 0 1]
     Q_bf = BigFloat[2 0; 0 2]
-    log_d_bf = BigFloat[0.1, 0.2]
+    d_bf = BigFloat[0.1, 0.2]
     x0_bf = BigFloat[0.3, 0.4]
     P0_bf = BigFloat[4 0; 0 4]
     b_bf = BigFloat[0, 0]
 
     gsm_bf = GaussianStateModel(; A=A_bf, Q=Q_bf, x0=x0_bf, P0=P0_bf, b=b_bf)
-    pom_bf = PoissonObservationModel(; C=C_bf, log_d=log_d_bf)
+    pom_bf = PoissonObservationModel(; C=C_bf, d=d_bf)
     plds_bf = LinearDynamicalSystem(;
         state_model=gsm_bf,
         obs_model=pom_bf,
@@ -154,7 +154,7 @@ function test_plds_constructor_type_preservation()
 
     @test eltype(plds_bf.state_model.A) === BigFloat
     @test eltype(plds_bf.obs_model.C) === BigFloat
-    @test eltype(plds_bf.obs_model.log_d) === BigFloat
+    @test eltype(plds_bf.obs_model.d) === BigFloat
 end
 
 function test_poisson_sample_type_preservation()
@@ -162,13 +162,13 @@ function test_poisson_sample_type_preservation()
     A_f32 = Matrix{Float32}(I, 2, 2)
     C_f32 = Matrix{Float32}(I, 2, 2)
     Q_f32 = Matrix{Float32}(I, 2, 2)
-    log_d32 = zeros(Float32, 2)
+    d32 = zeros(Float32, 2)
     x0_f32 = fill(one(Float32), 2)
     P0_f32 = Matrix{Float32}(I, 2, 2)
     b_f32 = zeros(Float32, 2)
 
     gsm_f32 = GaussianStateModel(; A=A_f32, Q=Q_f32, x0=x0_f32, P0=P0_f32, b=b_f32)
-    pom_f32 = PoissonObservationModel(; C=C_f32, log_d=log_d32)
+    pom_f32 = PoissonObservationModel(; C=C_f32, d=d32)
     plds_f32 = LinearDynamicalSystem(;
         state_model=gsm_f32,
         obs_model=pom_f32,
@@ -196,7 +196,7 @@ function test_poisson_sample_type_preservation()
     b_bf = zeros(BigFloat, 2)
 
     gsm_bf = GaussianStateModel(; A=A_bf, Q=Q_bf, x0=x0_bf, P0=P0_bf, b=b_bf)
-    pom_bf = PoissonObservationModel(; C=C_bf, log_d=log_bf)
+    pom_bf = PoissonObservationModel(; C=C_bf, d=log_bf)
     plds_bf = LinearDynamicalSystem(;
         state_model=gsm_bf,
         obs_model=pom_bf,
@@ -220,13 +220,13 @@ function test_poisson_fit_type_preservation()
         A = Matrix{T}(I, 2, 2)
         C = Matrix{T}(I, 2, 2)
         Q = Matrix{T}(I, 2, 2)
-        log_d = zeros(T, 2)
+        d = zeros(T, 2)
         x0 = fill(one(T), 2)
         P0 = Matrix{T}(I, 2, 2)
         b = zeros(T, 2)
 
         gsm = GaussianStateModel(; A=A, Q=Q, x0=x0, P0=P0, b=b)
-        pom = PoissonObservationModel(; C=C, log_d=log_d)
+        pom = PoissonObservationModel(; C=C, d=d)
         lds = LinearDynamicalSystem(;
             state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
@@ -244,13 +244,13 @@ function test_poisson_loglikelihood_type_preservation()
         A = Matrix{T}(I, 2, 2)
         C = Matrix{T}(I, 2, 2)
         Q = Matrix{T}(I, 2, 2)
-        log_d = zeros(T, 2)
+        d = zeros(T, 2)
         x0 = fill(one(T), 2)
         P0 = Matrix{T}(I, 2, 2)
         b = zeros(T, 2)
 
         gsm = GaussianStateModel(; A=A, Q=Q, x0=x0, P0=P0, b=b)
-        pom = PoissonObservationModel(; C=C, log_d=log_d)
+        pom = PoissonObservationModel(; C=C, d=d)
         lds = LinearDynamicalSystem(;
             state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=2, fit_bool=fill(true, 6)
         )
@@ -309,12 +309,12 @@ function test_parameter_gradient()
     ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
 
     # params
-    C, log_d = plds.obs_model.C, plds.obs_model.log_d
-    params = vcat(vec(C), log_d)
+    C, d = plds.obs_model.C, plds.obs_model.d
+    params = vcat(vec(C), d)
 
     # get analytical gradient
     grad_analytical = StateSpaceDynamics.gradient_observation_model!(
-        zeros(length(params)), C, log_d, tfs, y
+        zeros(length(params)), C, d, tfs, y
     )
 
     # numerical gradient against trial 1 only
@@ -323,9 +323,12 @@ function test_parameter_gradient()
     y1 = y[1]
     function f(params::AbstractVector{<:Real})
         C_size = plds.obs_dim * plds.latent_dim
-        log_d = params[(end - plds.obs_dim + 1):end]
+        d = params[(end - plds.obs_dim + 1):end]
         C = reshape(params[1:C_size], plds.obs_dim, plds.latent_dim)
-        d = exp.(log_d)
+        # Canonical Poisson GLM: λ_t = exp(C x_t + d). The previous version of
+        # this numerical-gradient closure had `d = exp.(d)` here, which mirrored
+        # the (now-fixed) double-exp bug in poisson.jl — the analytical and
+        # numerical gradients agreed only because *both* were wrong.
         tsteps = size(y1, 2)
         val = zero(eltype(params))
         for t in 1:tsteps
@@ -376,7 +379,7 @@ function test_EM_matlab()
     )
 
     pom = PoissonObservationModel(;
-        C=[1.2 1.2; 1.2 1.2; 1.2 1.2], log_d=log.([0.1, 0.1, 0.1])
+        C=[1.2 1.2; 1.2 1.2; 1.2 1.2], d=log.([0.1, 0.1, 0.1])
     )
 
     plds = LinearDynamicalSystem(;
@@ -408,7 +411,7 @@ function test_EM_matlab()
     @test isapprox(plds.obs_model.C, params_obj["C"], atol=1e-5)
     @test isapprox(plds.state_model.x0, params_obj["x0"], atol=1e-5)
     @test isapprox(plds.state_model.P0, params_obj["Q0"], atol=1e-5)
-    @test isapprox(exp.(plds.obs_model.log_d), params_obj["d"], atol=1e-5)
+    @test isapprox(exp.(plds.obs_model.d), params_obj["d"], atol=1e-5)
 end
 
 function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
@@ -423,10 +426,10 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         P0 = 0.15 .* Matrix(I, D, D)
 
         C = 0.3 .* randn(rng, P, D)
-        log_d = log.(0.7 .+ rand(rng, P))
+        d = log.(0.7 .+ rand(rng, P))
 
         gsm = GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0)
-        pom = PoissonObservationModel(C=C, log_d=log_d)
+        pom = PoissonObservationModel(C=C, d=d)
         plds = LinearDynamicalSystem(gsm, pom)
 
         _, Y = rand(rng, plds, fill(Tt, N))
@@ -449,7 +452,7 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
 
         @test Q1 ≥ Q0 - 1e-7
         @test all(isfinite, plds.obs_model.C)
-        @test all(isfinite, plds.obs_model.log_d)
+        @test all(isfinite, plds.obs_model.d)
     end
     return nothing
 end
@@ -465,24 +468,92 @@ function test_poisson_gradient_shape_and_finiteness()
         P0 = 0.6 .* Matrix(I, D, D)
 
         C = 0.2 .* randn(P, D)
-        log_d = zeros(P)
+        d = zeros(P)
 
         plds = LinearDynamicalSystem(
             GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0),
-            PoissonObservationModel(C=C, log_d=log_d),
+            PoissonObservationModel(C=C, d=d),
         )
 
         _, Y = rand(plds, fill(Tt, N))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
         StateSpaceDynamics.estep!(plds, tfs, Y)
 
-        g = zeros(Float64, length(vec(C)) + length(log_d))
+        g = zeros(Float64, length(vec(C)) + length(d))
         StateSpaceDynamics.gradient_observation_model!(
-            g, plds.obs_model.C, plds.obs_model.log_d, tfs, Y
+            g, plds.obs_model.C, plds.obs_model.d, tfs, Y
         )
 
         @test all(isfinite, g)
         @test length(g) == P * D + P
+    end
+    return nothing
+end
+
+"""
+    test_poisson_low_rate_recovery()
+
+Regression test for the canonical Poisson GLM `λ = exp(C x + d)`. Constructs
+data from low-firing-rate neurons (true rates 0.02, 0.05, 0.10, 0.20 per bin)
+with `C ≡ 0` so the rate is determined entirely by `d` and verifies that the
+fit recovers `exp(d_hat) ≈ true_rate`.
+
+This test would have failed under the prior `λ = exp(C x + exp(log_d))`
+double-exp: with C = 0, the achievable rate floor was `exp(0⁺) = 1`, so
+target rates well below 1 spike/bin were unrepresentable.
+"""
+function test_poisson_low_rate_recovery()
+    @testset "PoissonLDS: low-rate recovery (would fail under double-exp)" begin
+        rng = MersenneTwister(20260509)
+
+        D, P, Tt, N = 2, 4, 4000, 4
+        true_rates = [0.02, 0.05, 0.10, 0.20]   # all < 1 spike/bin
+
+        # Simulation truth: latent dynamics decoupled from emissions (C = 0)
+        # so observed mean rate is exactly exp(d).
+        A_true  = 0.9 .* Matrix{Float64}(I, D, D)
+        Q_true  = 0.05 .* Matrix{Float64}(I, D, D)
+        b_true  = zeros(D)
+        x0_true = zeros(D)
+        P0_true = 0.05 .* Matrix{Float64}(I, D, D)
+        C_true  = zeros(P, D)
+        d_true  = log.(true_rates)               # d = log(rate) since C ≡ 0
+
+        sm_true = GaussianStateModel(A=A_true, Q=Q_true, b=b_true, x0=x0_true, P0=P0_true)
+        om_true = PoissonObservationModel(C=C_true, d=d_true)
+        plds_true = LinearDynamicalSystem(sm_true, om_true)
+
+        _, Y = rand(rng, plds_true, fill(Tt, N))
+
+        # Sanity: empirical mean rates land near the true rates.
+        emp = mean(reduce(hcat, Y); dims=2) ./ 1.0
+        for i in 1:P
+            @test isapprox(emp[i], true_rates[i]; rtol=0.25)
+        end
+
+        # Fit from a different starting point (rate ≈ 1 spikes/bin baseline).
+        sm_fit = GaussianStateModel(
+            A=copy(A_true), Q=copy(Q_true), b=copy(b_true),
+            x0=copy(x0_true), P0=copy(P0_true),
+        )
+        om_fit = PoissonObservationModel(C=zeros(P, D), d=zeros(P))
+        plds_fit = LinearDynamicalSystem(sm_fit, om_fit)
+
+        fit!(plds_fit, Y; max_iter=20, progress=false)
+
+        recovered_rates = exp.(plds_fit.obs_model.d)
+        for i in 1:P
+            # Tolerance: 30% relative — generous, since with C=0 fits the
+            # latent/dynamics parameters are unidentifiable and only `d`
+            # carries the rate signal.
+            @test isapprox(recovered_rates[i], true_rates[i]; rtol=0.30)
+        end
+
+        # Strong regression assertion: if the bug were back, `d_hat` would be
+        # driven to large negative values (or NaN) trying to compensate for
+        # the spurious `exp(d)` floor. Guard against that explicitly.
+        @test all(plds_fit.obs_model.d .> -10.0)
+        @test all(isfinite, plds_fit.obs_model.d)
     end
     return nothing
 end

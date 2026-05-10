@@ -46,7 +46,7 @@ function _extract_obs_params(obs_model::GaussianObservationModel{T}) where {T}
 end
 
 function _extract_obs_params(obs_model::PoissonObservationModel{T}) where {T}
-    return (C=obs_model.C, log_d=obs_model.log_d, d=exp.(obs_model.log_d))
+    return (C=obs_model.C, d=obs_model.d)
 end
 
 function _get_all_params_vec(
@@ -67,7 +67,7 @@ function _get_all_params_vec(
     if lds.obs_model isa GaussianObservationModel
         obs_vec = vcat(vec(obs_params.C), vec(obs_params.R), vec(obs_params.d))
     else # PoissonObservationModel
-        obs_vec = vcat(vec(obs_params.C), vec(obs_params.log_d))
+        obs_vec = vcat(vec(obs_params.C), vec(obs_params.d))
     end
 
     return vcat(state_vec, obs_vec)
@@ -945,6 +945,17 @@ function update_initial_state_mean!(
             total_weight += weight
         end
 
+        # In the no-input tridiag path, B0_prior degenerates to a Gaussian
+        # prior on x0 with mean M₀ (D-vector) and scalar precision Λ:
+        #   x0 ~ N(M₀, P0 / Λ)
+        # Posterior MAP: x0 = (Σwᵢ E[z₁]ᵢ + M₀ Λ) / (Σwᵢ + Λ).
+        prior = lds.state_model.B0_prior
+        if prior !== nothing
+            λ_scalar = prior.Λ[1, 1]                 # B0_prior.Λ is 1×1 here
+            @views x0_new .+= λ_scalar .* prior.M₀[:, 1]
+            total_weight += λ_scalar
+        end
+
         lds.state_model.x0 .= x0_new ./ total_weight
     end
 end
@@ -1000,6 +1011,17 @@ function update_initial_state_covariance!(
         wt = isnothing(w) ? one(T) : w[trial][1]
         S0_sum .+= wt .* (fs.E_zz[:, :, 1] - (lds.state_model.x0 * lds.state_model.x0'))
         total_weight += wt
+    end
+
+    # MN-prior contribution to P0 IW posterior scale:
+    #   add (x0 - M₀)(x0 - M₀)' · Λ
+    # This is the matrix-normal half of the joint MNIW prior on (x0, P0)
+    # — the IW half is `lds.state_model.P0_prior` and is applied below.
+    B0_prior = lds.state_model.B0_prior
+    if B0_prior !== nothing
+        λ_scalar = B0_prior.Λ[1, 1]
+        @views Δ = lds.state_model.x0 .- B0_prior.M₀[:, 1]
+        S0_sum .+= λ_scalar .* (Δ * Δ')
     end
 
     if lds.state_model.P0_prior === nothing

@@ -387,7 +387,7 @@ function Gradient!(
 
         elseif lds_k.obs_model isa PoissonObservationModel{T}
             C = cc.C
-            d = cc.d  # cached exp.(log_d)
+            d = cc.d  # cached Poisson log-link intercept
 
             if Tsteps == 1
                 # emission: C'*(y - λ)
@@ -525,7 +525,7 @@ function Hessian_blocks!(
                 @. H_diag[1] += α * cc.yt_given_xt
             elseif lds_k.obs_model isa PoissonObservationModel{T}
                 C = cc.C
-                d = cc.d  # cached exp.(log_d)
+                d = cc.d  # cached Poisson log-link intercept
 
                 mul!(z, C, x[:, 1])
                 @. λ = exp(z + d)
@@ -579,7 +579,7 @@ function Hessian_blocks!(
 
         elseif lds_k.obs_model isa PoissonObservationModel{T}
             C = cc.C
-            d = cc.d  # cached exp.(log_d)
+            d = cc.d  # cached Poisson log-link intercept
 
             # Add -w[k,t] * C' diag(λ_t) C where λ_t = exp(C x_t + d)
             # This implementation is allocation-free but O(latent^2 * obs) per time. Fix later.
@@ -659,8 +659,7 @@ function _compute_hessian_blocks(
 
     A = lds.state_model.A
     C = lds.obs_model.C
-    log_d = lds.obs_model.log_d
-    d = exp.(log_d)
+    d = lds.obs_model.d
 
     # Pre-compute Cholesky factorizations
     Q_chol = cholesky(Symmetric(lds.state_model.Q))

@@ -36,8 +36,9 @@ function loglikelihood(
     tsteps = size(y, 2)
     ll = zeros(R, tsteps)
 
-    # Convert the log firing rate to firing rate
-    d = exp.(plds.obs_model.log_d)
+    # Canonical Poisson GLM: λ_t = exp(C x_t + d), where `d` is the
+    # log-link intercept (free in ℝ; positivity is provided by exp).
+    d = plds.obs_model.d
 
     # Pre-compute Cholesky factorizations
     P0_chol = cholesky(Symmetric(plds.state_model.P0))
@@ -88,16 +89,12 @@ function _loglikelihood_ws(
     tsteps = size(y, 2)
 
     C = lds.obs_model.C
-    log_d = lds.obs_model.log_d
+    d = lds.obs_model.d
     A = lds.state_model.A
     b = lds.state_model.b
     x0 = lds.state_model.x0
 
     ll = zero(T)
-
-    # Reuse an obs-dim buffer to store d = exp(log_d) once per call.
-    d = ws.temp_solve_R                 # length obs_dim
-    @. d = exp(log_d)
 
     η = ws.temp_dy                      # length obs_dim
     dx = ws.temp_dx                     # length latent_dim
@@ -145,7 +142,7 @@ function loglikelihood!(
     b = lds.state_model.b
     x0 = lds.state_model.x0
 
-    # Poisson obs: λ = exp(Cx + log_d); log p(y|x) = sum(y .* logλ - λ - log(y!))
+    # Poisson obs: λ = exp(Cx + d); log p(y|x) = sum(y .* logλ - λ - log(y!))
     z = ws.z
     λ = ws.λ
 
@@ -161,7 +158,7 @@ function loglikelihood!(
     for t in 1:tsteps
         ll_t = zero(T)
 
-        # obs: z = Cx + log_d ; λ = exp(z)
+        # obs: z = Cx + d ; λ = exp(z)
         @views mul!(z, C, x[:, t])
         z .+= d
         @. λ = exp(z)
@@ -230,11 +227,8 @@ function Gradient(
 
     # Extract model parameters
     A, Q, b = lds.state_model.A, lds.state_model.Q, lds.state_model.b
-    C, log_d = lds.obs_model.C, lds.obs_model.log_d
+    C, d = lds.obs_model.C, lds.obs_model.d
     x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    # Convert log_d to d (non-log space)
-    d = exp.(log_d)
 
     # Get dimensions
     tsteps = size(y, 2)
@@ -357,11 +351,8 @@ function Hessian(
 
     # Extract model components
     A, Q = lds.state_model.A, lds.state_model.Q
-    C, log_d = lds.obs_model.C, lds.obs_model.log_d
+    C, d = lds.obs_model.C, lds.obs_model.d
     x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    # Convert log_d to d i.e. non-log space
-    d = exp.(log_d)
 
     # Pre-compute a few things
     tsteps = size(y, 2)
@@ -443,10 +434,8 @@ function Hessian!(
     end
 
     A, Q = lds.state_model.A, lds.state_model.Q
-    C, log_d = lds.obs_model.C, lds.obs_model.log_d
+    C, d = lds.obs_model.C, lds.obs_model.d
     x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    d = exp.(log_d)
 
     tsteps = size(y, 2)
     Q_chol = cholesky(Symmetric(Q))
@@ -516,17 +505,17 @@ Q = Σ_t w_t [ y_t' h_t - 1' exp(h_t + ρ_t) ]
 where
   h_t   = C * E[x_t] + d
   ρ_i,t = 0.5 * c_i' * P_t * c_i
-and d = exp.(log_d) is cached in cc.d.
+and `d` is the canonical log-link Poisson intercept (free in ℝ).
 """
 function Q_obs!(
     sws::SmoothWorkspace{T},                      # must provide cc.C and cc.d
-    lds::LinearDynamicalSystem{T,S,O},            # for obs_model.C and obs_model.log_d
+    lds::LinearDynamicalSystem{T,S,O},            # for obs_model.C and obs_model.d
     E_z::AbstractMatrix{T},                       # state_dim × T
     p_smooth::AbstractArray{T,3},                 # state_dim × state_dim × T
     y::AbstractMatrix{T};                         # obs_dim × T
     weights::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    d = exp.(lds.obs_model.log_d)
+    d = lds.obs_model.d
     C = lds.obs_model.C
 
     obs_dim, _ = size(C)
@@ -639,20 +628,19 @@ function calculate_elbo(
 end
 
 """
-    gradient_observation_model_single_trial!(grad, C, log_d, E_z, p_smooth, y, weights)
+    gradient_observation_model_single_trial!(grad, C, d, E_z, p_smooth, y, weights)
 
 Compute the gradient for a single trial and add it to the accumulated gradient.
 """
 function gradient_observation_model_single_trial!(
     grad::AbstractVector{T},
     C::AbstractMatrix{T},
-    log_d::AbstractVector{T},
+    d::AbstractVector{T},
     E_z::AbstractMatrix{T},
     p_smooth::AbstractArray{T,3},
     y::AbstractMatrix{T},
     weights::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real}
-    d = exp.(log_d)
     obs_dim, latent_dim = size(C)
     tsteps = size(y, 2)
 
@@ -690,20 +678,21 @@ function gradient_observation_model_single_trial!(
             end
         end
 
-        # Update log_d gradient
-        @views grad[(end - obs_dim + 1):end] .+= weight .* (y_t .- λ) .* d
+        # Gradient w.r.t. d: ∂/∂d_i [y_i (Cx + d)_i - exp((Cx+d)_i + ρ_i)] = y_i - λ_i
+        # (No chain-rule factor — `d` enters the linear predictor directly.)
+        @views grad[(end - obs_dim + 1):end] .+= weight .* (y_t .- λ)
     end
 end
 
 """
-    gradient_observation_model!(grad, C, log_d, tfs, y, w)
+    gradient_observation_model!(grad, C, d, tfs, y, w)
 
 Compute the gradient of the Q-function with respect to the observation model parameters using TrialFilterSmooth.
 """
 function gradient_observation_model!(
     grad::AbstractVector{T},
     C::AbstractMatrix{T},
-    log_d::AbstractVector{T},
+    d::AbstractVector{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
@@ -731,7 +720,7 @@ function gradient_observation_model!(
                         weights = isnothing(w) ? nothing : w[k]
 
                         gradient_observation_model_single_trial!(
-                            tmp, C, log_d, fs.E_z, fs.p_smooth, y[k], weights
+                            tmp, C, d, fs.E_z, fs.p_smooth, y[k], weights
                         )
 
                         @simd for i in 1:npar
@@ -776,14 +765,20 @@ function update_observation_model!(
     latent_dim = plds.latent_dim
     C_size = obs_dim * latent_dim
 
-    params = vcat(vec(plds.obs_model.C), plds.obs_model.log_d)
+    params = vcat(vec(plds.obs_model.C), plds.obs_model.d)
+
+    # MN-only prior on C (no IW half — Poisson has no observation covariance):
+    #   log p(C) ∝ -½ tr((C - M₀) Λ (C - M₀)')
+    # Adds `+½ tr(...)` to the LBFGS objective and `+(C - M₀) Λ` to the C
+    # block of the gradient.
+    C_prior = plds.obs_model.C_prior
 
     function f(params::Vector{T})
         C_view = reshape(view(params, 1:C_size), obs_dim, latent_dim)
-        log_d_view = view(params, (C_size + 1):(C_size + obs_dim))
+        d_view = view(params, (C_size + 1):(C_size + obs_dim))
 
         copyto!(plds.obs_model.C, C_view)
-        copyto!(plds.obs_model.log_d, log_d_view)
+        copyto!(plds.obs_model.d, d_view)
 
         acc = zero(T)
         ntrials = length(tfs)
@@ -794,13 +789,24 @@ function update_observation_model!(
             acc += Q_obs!(sws, plds, fs.E_z, fs.p_smooth, y[trial]; weights=weights)
         end
 
-        return -acc
+        f_prior = zero(T)
+        if C_prior !== nothing
+            Cm = C_view .- C_prior.M₀
+            f_prior = T(0.5) * sum(Cm .* (Cm * C_prior.Λ))
+        end
+
+        return -acc + f_prior
     end
 
     function g!(grad::Vector{T}, params::Vector{T})
         C_view = reshape(view(params, 1:C_size), obs_dim, latent_dim)
-        log_d_view = view(params, (C_size + 1):(C_size + obs_dim))
-        return gradient_observation_model!(grad, C_view, log_d_view, tfs, y, w)
+        d_view = view(params, (C_size + 1):(C_size + obs_dim))
+        gradient_observation_model!(grad, C_view, d_view, tfs, y, w)
+        if C_prior !== nothing
+            grad_C_view = reshape(view(grad, 1:C_size), obs_dim, latent_dim)
+            grad_C_view .+= (C_view .- C_prior.M₀) * C_prior.Λ
+        end
+        return grad
     end
 
     opts = Optim.Options(;
@@ -812,7 +818,7 @@ function update_observation_model!(
     # write final params back
     @views begin
         plds.obs_model.C .= reshape(result.minimizer[1:C_size], obs_dim, latent_dim)
-        plds.obs_model.log_d .= result.minimizer[(C_size + 1):(C_size + obs_dim)]
+        plds.obs_model.d .= result.minimizer[(C_size + 1):(C_size + obs_dim)]
     end
 
     return nothing
@@ -851,8 +857,7 @@ function _fill_hessian_blocks_poisson!(
     tsteps = size(x, 2)
     btd = ws.btd
     C = lds.obs_model.C
-    log_d = lds.obs_model.log_d
-    d = exp.(log_d)
+    d = lds.obs_model.d
     obs_dim, latent_dim = size(C)
 
     # Pre-compute diagonal templates
@@ -913,10 +918,9 @@ function _compute_gradient_poisson!(
     A = lds.state_model.A
     b = lds.state_model.b
     C = lds.obs_model.C
-    log_d = lds.obs_model.log_d
+    d = lds.obs_model.d
     x0 = lds.state_model.x0
 
-    d = exp.(log_d)
     tsteps = size(y, 2)
     latent_dim, obs_dim = lds.latent_dim, lds.obs_dim
 

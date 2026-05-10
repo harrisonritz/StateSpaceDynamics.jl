@@ -30,10 +30,10 @@ function _make_poisson_lds(latent_dim::Int, obs_dim::Int)
     P0 = Matrix(1.0 * I(latent_dim))
 
     C = zeros(obs_dim, latent_dim)
-    log_d = zeros(obs_dim)
+    d = zeros(obs_dim)
 
     gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
-    pom = PoissonObservationModel(; C=C, log_d=log_d)
+    pom = PoissonObservationModel(; C=C, d=d)
     return LinearDynamicalSystem(;
         state_model=gsm,
         obs_model=pom,
@@ -1263,8 +1263,9 @@ function test_SLDS_gradient_numerical_poisson()
             x0_k = lds_k.state_model.x0
             P0_k = lds_k.state_model.P0
             C_k = lds_k.obs_model.C
-            log_d_k = lds_k.obs_model.log_d
-            d_k = exp.(log_d_k)
+            d_k = lds_k.obs_model.d
+            # Canonical Poisson: λ = exp(C x + d). Previous version had
+            # `d_k = exp.(d_k)` mirroring the (now-fixed) double-exp.
 
             # Precompute inverses
             inv_P0 = inv(P0_k)
@@ -1429,7 +1430,7 @@ function test_SLDS_mstep_updates_parameters_poisson()
 
     for k in 1:K
         @test all(isfinite, slds.LDSs[k].obs_model.C)
-        @test all(isfinite, slds.LDSs[k].obs_model.log_d)
+        @test all(isfinite, slds.LDSs[k].obs_model.d)
     end
 end
 
@@ -1507,26 +1508,23 @@ function test_SLDS_poisson_count_validation()
     @test all(all(abs.(yn .- round.(yn)) .< 1e-10) for yn in y)
 end
 
-function test_SLDS_poisson_log_d_interpretation()
-    # Test that d correctly controls firing rates via the log link function
+function test_SLDS_poisson_d_interpretation()
+    # Verify the canonical Poisson GLM: λ = exp(C x + d). With C ≡ 0, the
+    # observed rates should equal exp(d) directly.
     K = 1
     latent_dim = 2
     obs_dim = 3
 
-    # Create LDS with specific log_d values
     lds = _make_poisson_lds(latent_dim, obs_dim)
-    lds.obs_model.log_d .= log.([1.0, 2.0, 3.0])  # This gives d = [1, 2, 3]
-    lds.obs_model.C .= 0.0  # No latent influence
+    lds.obs_model.d .= log.([1.0, 2.0, 3.0])  # log-rates: rate = exp(d) = [1, 2, 3]
+    lds.obs_model.C .= 0.0                    # no latent influence
 
     slds = SLDS(; A=reshape([1.0], 1, 1), πₖ=[1.0], LDSs=[lds])
 
     tsteps, ntrials = 1000, 1
     z, x, y = rand(slds, fill(tsteps, ntrials))
 
-    # The rate λ = exp(C*x + d) = exp(0 + d) = exp(d) when C=0
-    d_values = exp.(lds.obs_model.log_d)  # [1, 2, 3]
-    expected_rates = exp.(d_values)        # [e^1, e^2, e^3]
-
+    expected_rates = exp.(lds.obs_model.d)    # [1, 2, 3]
     mean_rates = vec(mean(y[1]; dims=2))
 
     for i in 1:obs_dim

@@ -179,18 +179,31 @@ end
         V<:AbstractVector{T}
     } <: AbstractObservationModel{T}
 
-Represents the observation model of a Linear Dynamical System with Poisson observations.
+Represents the observation model of a Linear Dynamical System with Poisson observations,
+with canonical log-link:
+
+```math
+λ_t = exp(C x_t + d)
+```
+
+`d` is the standard Poisson-GLM intercept — unconstrained in ℝ; positivity of the rate
+`λ` is provided by the `exp`. The previously-named `log_d` field was a misnomer that
+caused a double-exp bug (`exp(C x + exp(log_d))`); see git log for the fix.
 
 # Fields
 - `C::AbstractMatrix{T}`: Observation matrix of size `(obs_dim × latent_dim)`. Maps latent
     states into observation space.
-- `log_d::AbstractVector{T}`: Mean firing rate vector (log space) of length `(obs_dim)`.
+- `d::AbstractVector{T}`: Per-neuron baseline log-rate (length `obs_dim`). Free in ℝ.
+- `C_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on `C`.
+    Unlike the Gaussian path, there is no IW counterpart (no observation noise covariance);
+    this is an MN-only prior contributing `½ tr((C - M₀)' Λ (C - M₀))` to the LBFGS objective.
 """
 Base.@kwdef mutable struct PoissonObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
 } <: AbstractObservationModel{T}
     C::M
-    log_d::V
+    d::V
+    C_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
 
 function Base.show(io::IO, pom::PoissonObservationModel; gap="")
@@ -200,15 +213,23 @@ function Base.show(io::IO, pom::PoissonObservationModel; gap="")
     println(io, gap, "--------------------------")
 
     if nobs > 4 || nstate > 4
-        println(io, gap, " size(C)     = ($nobs, $nstate)")
-        println(io, gap, " size(log_d) = ($(length(pom.log_d)),)")
+        println(io, gap, " size(C) = ($nobs, $nstate)")
+        println(io, gap, " size(d) = ($(length(pom.d)),)")
     else
-        println(io, gap, " C       = $(round.(pom.C, digits=2))")
-        println(io, gap, " log_d   = $(round.(pom.log_d, sigdigits = 3))")
-        println(io, gap, " d       = $(round.(exp.(pom.log_d), digits = 2))")
+        println(io, gap, " C    = $(round.(pom.C, digits=2))")
+        println(io, gap, " d    = $(round.(pom.d, sigdigits = 3))")
+        println(io, gap, " rate = $(round.(exp.(pom.d), digits = 2))   # exp(d) for inspection only")
     end
 
     return nothing
+end
+
+# 2-arg convenience constructor; matches the Gaussian path's positional form
+# so callers don't have to spell out `C_prior=nothing`.
+function PoissonObservationModel(
+    C::M, d::V
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    return PoissonObservationModel{T,M,V}(; C=C, d=d, C_prior=nothing)
 end
 
 """
@@ -224,7 +245,7 @@ Represents a unified Linear Dynamical System with customizable state and observa
 - `obs_dim::Int`: Dimension of the observations
 - `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
     Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
-    Poisson path (`[x0, P0, A&b, Q, C&log_d]`), and length 9 when `kalman_filter=true`
+    Poisson path (`[x0, P0, A&b, Q, C&d]`), and length 9 when `kalman_filter=true`
     with inputs supplied (`[x0, P0, A, Q, C, R, B, B0, D]`).
 - `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
     E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
@@ -270,7 +291,7 @@ function LinearDynamicalSystem(
     # Set default fit_bool based on observation model type / Kalman flag
     if fit_bool === nothing
         if obs_model isa PoissonObservationModel
-            # For Poisson: [x0, P0, A&b, Q, C&log_d] (5 parameters)
+            # For Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
             fit_bool = [true, true, true, true, true]
         elseif kalman_filter
             # Kalman-path Gaussian: [x0, P0, A, Q, C, R, B, B0, D] (length 9)
@@ -312,8 +333,8 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, " ---------------------")
 
     if lds.obs_model isa PoissonObservationModel
-        # C and log_d are either both updated or neither
-        prms = ["x0", "P0", "A (and b)", "Q", "C, log_d"][lds.fit_bool[1:5]]
+        # C and d are either both updated or neither
+        prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
     elseif lds.kalman_filter && length(lds.fit_bool) == 9
         labels = ["x0", "P0", "A", "Q", "C", "R", "B", "B0", "D"]
         prms = labels[lds.fit_bool]

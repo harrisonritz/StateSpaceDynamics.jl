@@ -534,8 +534,7 @@ mutable struct LDSConstantCache{T<:Real}
 
     # Model matrices needed for Poisson fast path
     C::Matrix{T}                 # obs_dim × latent_dim
-    log_d::Vector{T}             # obs_dim
-    d::Vector{T}                 # exp.(log_d) cached once
+    d::Vector{T}                 # obs_dim — Poisson log-link intercept (free in ℝ)
 end
 
 function LDSConstantCache(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
@@ -560,8 +559,7 @@ function LDSConstantCache(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Re
         zeros(T, latent_dim, latent_dim),       # xt1_given_xt
         zeros(T, latent_dim, latent_dim),       # x_t
         zeros(T, obs_dim, latent_dim),          # C
-        zeros(T, obs_dim),                      # log_d
-        zeros(T, obs_dim),                      # d = exp.(log_d)
+        zeros(T, obs_dim),                      # d
     )
 end
 
@@ -583,12 +581,11 @@ function compute_slds_constants!(
 
     obs_dim, latent_dim = size(C)
 
-    # Store log_d if it exists (Poisson); otherwise leave zeros
-    if hasproperty(lds.obs_model, :log_d)
-        cc.log_d .= getproperty(lds.obs_model, :log_d)
-        @. cc.d = exp(cc.log_d)
+    # Cache the Poisson log-link intercept directly (no exp — `d` is free in ℝ).
+    # Gaussian observation models leave it zero (unused).
+    if lds.obs_model isa PoissonObservationModel
+        cc.d .= lds.obs_model.d
     else
-        fill!(cc.log_d, zero(T))
         fill!(cc.d, zero(T))
     end
 

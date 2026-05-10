@@ -57,7 +57,7 @@ P0 = Matrix(0.1 * I(latent_dim));   # Initial state covariance
 # $$\log(\lambda_i) = \mathbf{C}_i^T \mathbf{x}_t + d_i$$
 # where $\mathbf{C}$ maps latent states to log-rates and $d_i$ provides baseline log-rates
 
-log_d = log.(fill(0.1, obs_dim));    # Log baseline rates (small positive rates)
+d = log.(fill(0.1, obs_dim));    # Log baseline rates (small positive rates)
 
 # Observation matrix $\mathbf{C}$: maps 2D latent states to log-rates for each observed dimension
 # Use positive values so latent activity increases firing rates
@@ -92,7 +92,7 @@ C = permutedims([abs.(randn(rng, obs_dim))'; abs.(randn(rng, obs_dim))']);
 
 # Construct the model components
 state_model = GaussianStateModel(; A, Q, b, x0, P0)          # Gaussian latent dynamics
-obs_model = PoissonObservationModel(; C, log_d);           # Poisson observations
+obs_model = PoissonObservationModel(; C, d);           # Poisson observations
 
 # Create the complete Poisson Linear Dynamical System
 true_plds = LinearDynamicalSystem(;
@@ -100,7 +100,7 @@ true_plds = LinearDynamicalSystem(;
     obs_model=obs_model,
     latent_dim=latent_dim,
     obs_dim=obs_dim,
-    fit_bool=fill(true, 6)  # Learn all parameters: A, Q, C, log_d, x0, P0
+    fit_bool=fill(true, 6)  # Learn all parameters: A, Q, C, d, x0, P0
 );
 
 # ## Simulate Latent States and Count Observations
@@ -205,13 +205,13 @@ p2
 A_init = random_rotation_matrix(latent_dim, rng)  # Random rotation matrix
 Q_init = Matrix(0.1 * I(latent_dim))              # Process noise guess
 C_init = randn(rng, obs_dim, latent_dim)          # Random observation mapping
-log_d_init = log.(fill(0.1, obs_dim))             # Baseline log-rate guess
+d_init = log.(fill(0.1, obs_dim))             # Baseline log-rate guess
 x0_init = zeros(latent_dim)                       # Start from origin
 P0_init = Matrix(0.1 * I(latent_dim));             # Initial uncertainty
 
 # Construct naive model
 sm_init = GaussianStateModel(; A=A_init, Q=Q_init, b=b, x0=x0_init, P0=P0_init)
-om_init = PoissonObservationModel(; C=C_init, log_d=log_d_init)
+om_init = PoissonObservationModel(; C=C_init, d=d_init)
 
 naive_plds = LinearDynamicalSystem(;
     state_model=sm_init,

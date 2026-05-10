@@ -209,7 +209,7 @@ function test_kalman_rejects_poisson_obs()
         P0=Matrix{Float64}(I, D, D),
         b=zeros(D),
     )
-    om = PoissonObservationModel(; C=randn(p, D), log_d=zeros(p))
+    om = PoissonObservationModel(; C=randn(p, D), d=zeros(p))
     @test_throws Exception LinearDynamicalSystem(sm, om; kalman_filter=true)
 end
 

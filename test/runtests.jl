@@ -99,7 +99,7 @@ include("helper_functions.jl")
                 test_SLDS_fit_elbo_generally_increases_poisson()
                 test_SLDS_fit_multitrial_poisson()
                 test_SLDS_poisson_count_validation()
-                test_SLDS_poisson_log_d_interpretation()
+                test_SLDS_poisson_d_interpretation()
                 test_SLDS_gradient_weight_normalization_poisson()
             end
         end
@@ -211,7 +211,7 @@ include("helper_functions.jl")
             test_validate_LDS_dimension_mismatch()
             test_validate_LDS_non_positive_definite()
             test_validate_LDS_wrong_fit_bool_length()
-            test_validate_LDS_poisson_extreme_log_d()
+            test_validate_LDS_poisson_extreme_d()
             test_validate_LDS_asymmetric_covariance()
         end
     end

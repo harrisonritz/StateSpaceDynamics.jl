@@ -246,7 +246,7 @@ Validate PoissonObservationModel parameters. Throws exceptions on validation fai
 
 # Throws
 - `DimensionMismatchError`: If dimensions don't match expected values
-- `NumericalStabilityError`: If log_d values are extremely large/small
+- `NumericalStabilityError`: If `d` values are extremely large/small
 """
 function _validate_obs_model(
     obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int
@@ -256,18 +256,20 @@ function _validate_obs_model(
         throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(obs_model.C)))
     end
 
-    # Check log_d vector
-    if length(obs_model.log_d) != obs_dim
-        throw(DimensionMismatchError("log_d vector", obs_dim, length(obs_model.log_d)))
+    # Check d vector
+    if length(obs_model.d) != obs_dim
+        throw(DimensionMismatchError("d vector", obs_dim, length(obs_model.d)))
     end
 
-    # Check that log_d values are reasonable (not extremely large/small)
-    if any(x -> abs(x) > 50, obs_model.log_d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
-        max_val = maximum(abs.(obs_model.log_d))
+    # Check that d values are reasonable. `d` enters the linear predictor as
+    # `λ = exp(C x + d)`; |d| above ~50 risks exp overflow/underflow once Cx
+    # is added on top.
+    if any(x -> abs(x) > 50, obs_model.d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
+        max_val = maximum(abs.(obs_model.d))
         throw(
             NumericalStabilityError(
-                "log_d vector",
-                "contains extremely large/small values (max |log_d| = $max_val), may cause numerical overflow/underflow",
+                "d vector",
+                "contains extremely large/small values (max |d| = $max_val), may cause numerical overflow/underflow",
             ),
         )
     end

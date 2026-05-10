@@ -40,13 +40,13 @@ function test_validate_LDS_poisson()
     A = Matrix{Float64}(I, 2, 2)
     C = randn(3, 2)
     Q = Matrix{Float64}(I, 2, 2)
-    log_d = zeros(Float64, 3)
+    d = zeros(Float64, 3)
     x0 = zeros(Float64, 2)
     P0 = Matrix{Float64}(I, 2, 2)
     b = zeros(Float64, 2)
 
     gsm = GaussianStateModel(; A=A, Q=Q, x0=x0, P0=P0, b=b)
-    pom = PoissonObservationModel(; C=C, log_d=log_d)
+    pom = PoissonObservationModel(; C=C, d=d)
     lds = LinearDynamicalSystem(;
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
     )
@@ -118,18 +118,18 @@ function test_validate_LDS_wrong_fit_bool_length()
     @test_throws DimensionMismatchError validate_LDS(lds)
 end
 
-function test_validate_LDS_poisson_extreme_log_d()
-    # Test Poisson with extreme log_d values
+function test_validate_LDS_poisson_extreme_d()
+    # Test Poisson with extreme d values
     A = Matrix{Float64}(I, 2, 2)
     C = randn(3, 2)
     Q = Matrix{Float64}(I, 2, 2)
-    log_d = [100.0, 0.0, 0.0]  # Extremely large value
+    d = [100.0, 0.0, 0.0]  # Extremely large value
     x0 = zeros(Float64, 2)
     P0 = Matrix{Float64}(I, 2, 2)
     b = zeros(Float64, 2)
 
     gsm = GaussianStateModel(; A=A, Q=Q, x0=x0, P0=P0, b=b)
-    pom = PoissonObservationModel(; C=C, log_d=log_d)
+    pom = PoissonObservationModel(; C=C, d=d)
     lds = LinearDynamicalSystem(;
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
     )

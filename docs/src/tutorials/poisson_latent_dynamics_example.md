@@ -75,7 +75,7 @@ $$\log(\lambda_i) = \mathbf{C}_i^T \mathbf{x}_t + d_i$$
 where $\mathbf{C}$ maps latent states to log-rates and $d_i$ provides baseline log-rates
 
 ````@example poisson_latent_dynamics_example
-log_d = log.(fill(0.1, obs_dim));    # Log baseline rates (small positive rates)
+d = log.(fill(0.1, obs_dim));    # Log baseline rates (small positive rates)
 nothing #hide
 ````
 
@@ -118,7 +118,7 @@ Construct the model components
 
 ````@example poisson_latent_dynamics_example
 state_model = GaussianStateModel(; A, Q, b, x0, P0)          # Gaussian latent dynamics
-obs_model = PoissonObservationModel(; C, log_d);           # Poisson observations
+obs_model = PoissonObservationModel(; C, d);           # Poisson observations
 nothing #hide
 ````
 
@@ -130,7 +130,7 @@ true_plds = LinearDynamicalSystem(;
     obs_model=obs_model,
     latent_dim=latent_dim,
     obs_dim=obs_dim,
-    fit_bool=fill(true, 6)  # Learn all parameters: A, Q, C, log_d, x0, P0
+    fit_bool=fill(true, 6)  # Learn all parameters: A, Q, C, d, x0, P0
 );
 nothing #hide
 ````
@@ -254,7 +254,7 @@ Random initialization (simulating lack of prior knowledge)
 A_init = random_rotation_matrix(latent_dim, rng)  # Random rotation matrix
 Q_init = Matrix(0.1 * I(latent_dim))              # Process noise guess
 C_init = randn(rng, obs_dim, latent_dim)          # Random observation mapping
-log_d_init = log.(fill(0.1, obs_dim))             # Baseline log-rate guess
+d_init = log.(fill(0.1, obs_dim))             # Baseline log-rate guess
 x0_init = zeros(latent_dim)                       # Start from origin
 P0_init = Matrix(0.1 * I(latent_dim));             # Initial uncertainty
 nothing #hide
@@ -264,7 +264,7 @@ Construct naive model
 
 ````@example poisson_latent_dynamics_example
 sm_init = GaussianStateModel(; A=A_init, Q=Q_init, b=b, x0=x0_init, P0=P0_init)
-om_init = PoissonObservationModel(; C=C_init, log_d=log_d_init)
+om_init = PoissonObservationModel(; C=C_init, d=d_init)
 
 naive_plds = LinearDynamicalSystem(;
     state_model=sm_init,
