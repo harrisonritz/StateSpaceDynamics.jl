@@ -13,8 +13,16 @@ b = zeros(2)
 function toy_PoissonLDS(
     ntrials::Int=1, fit_bool::Vector{Bool}=[true, true, true, true, true, true]
 )
-    gaussian_sm = GaussianStateModel(; A=A, b=b, Q=Q, x0=x0, P0=P0)
-    poisson_om = PoissonObservationModel(; C=C, d=d)  # Fixed: was poisson_sm
+    # IMPORTANT: copy the module-level matrices. `GaussianStateModel`/
+    # `PoissonObservationModel` keep references to whatever arrays are
+    # passed in, so without these copies the first `fit!` call mutates the
+    # module-level `A, Q, ...` arrays in place, and every subsequent
+    # `toy_PoissonLDS()` call returns a model seeded with the previous
+    # fit's parameters. Test-ordering-dependent flakiness ensues.
+    gaussian_sm = GaussianStateModel(;
+        A=copy(A), b=copy(b), Q=copy(Q), x0=copy(x0), P0=copy(P0)
+    )
+    poisson_om = PoissonObservationModel(; C=copy(C), d=copy(d))
     poisson_lds = LinearDynamicalSystem(;
         state_model=gaussian_sm,
         obs_model=poisson_om,
@@ -369,7 +377,13 @@ function test_EM_matlab()
     seq = matread("test_data/seq_matlab_3_trials_plds.mat")
     params = matread("test_data/params_matlab_3_trials_plds.mat")
 
-    # create a new plds model using the new constructor pattern
+    # The MATLAB reference was generated against the *buggy* Poisson model
+    # `λ = exp(C x + exp(log_d))` with `log_d = log([0.1, 0.1, 0.1])`. The
+    # *effective* additive offset MATLAB used was `exp(log_d) = [0.1, 0.1, 0.1]`.
+    # Under the canonical post-fix model `λ = exp(C x + d)`, setting
+    # `d = [0.1, 0.1, 0.1]` directly reproduces MATLAB's likelihood — same E-step
+    # posteriors, same M-step optimum (the MAP is reachable from either
+    # parameterization). Hence the comparison still holds as a regression check.
     gsm = GaussianStateModel(;
         A=[cos(0.1) -sin(0.1); sin(0.1) cos(0.1)],
         Q=0.00001 * Matrix{Float64}(I(2)),
@@ -379,7 +393,7 @@ function test_EM_matlab()
     )
 
     pom = PoissonObservationModel(;
-        C=[1.2 1.2; 1.2 1.2; 1.2 1.2], d=log.([0.1, 0.1, 0.1])
+        C=[1.2 1.2; 1.2 1.2; 1.2 1.2], d=[0.1, 0.1, 0.1]
     )
 
     plds = LinearDynamicalSystem(;
@@ -391,19 +405,28 @@ function test_EM_matlab()
     # first smooth results
     ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
 
-    # check each E_z, E_zz, E_zz_prev are the sample
+    # Check each posterior moment against MATLAB's reference.
+    # MATLAB stores Vsm as `(T·D, D)` — vertically-stacked (D × D) covariance
+    # blocks across timesteps — and VVsm as `((T-1)·D, D)` lagged covariance
+    # blocks for t = 2..T. Reshape both to Julia's `(D, D, T)` / `(D, D, T-1)`
+    # layout for direct comparison with `tfs[i].p_smooth` /
+    # `tfs[i].p_smooth_tt1[:, :, 2:end]` (slice 1 of `p_smooth_tt1` is the
+    # unused lag-into-prehistory entry).
+    D = plds.latent_dim
     for i in 1:3
+        T_i = size(y[i], 2)
         posterior_x = seq["seq"]["posterior"][i]["xsm"]
-        posterior_cov = seq["seq"]["posterior"][i]["Vsm"]
-        posterior_lagged_cov = seq["seq"]["posterior"][i]["VVsm"]
-
+        Vsm_3d = permutedims(
+            reshape(seq["seq"]["posterior"][i]["Vsm"], D, T_i, D), (1, 3, 2)
+        )
+        VVsm_3d = permutedims(
+            reshape(seq["seq"]["posterior"][i]["VVsm"], D, T_i - 1, D), (1, 3, 2)
+        )
         @test isapprox(tfs[i].E_z, posterior_x, atol=1e-6)
-
-        # TODO: Restructure matlab objects s.t. we can compare as below
-        # @test isapprox(E_zz[:, :, :, i], posterior_cov, atol=1e-6)
-        # @test isapprox(E_zz_prev[:, :, :, i], posterior_lagged_cov, atol=1e-6)
+        @test isapprox(tfs[i].p_smooth, Vsm_3d, atol=1e-10)
+        @test isapprox(tfs[i].p_smooth_tt1[:, :, 2:end], VVsm_3d, atol=1e-10)
     end
-    # now test the params
+    # now test the params after one EM step
     fit!(plds, y; max_iter=1)
     params_obj = params["params"]["model"]
     @test isapprox(plds.state_model.A, params_obj["A"], atol=1e-5)
@@ -411,7 +434,10 @@ function test_EM_matlab()
     @test isapprox(plds.obs_model.C, params_obj["C"], atol=1e-5)
     @test isapprox(plds.state_model.x0, params_obj["x0"], atol=1e-5)
     @test isapprox(plds.state_model.P0, params_obj["Q0"], atol=1e-5)
-    @test isapprox(exp.(plds.obs_model.d), params_obj["d"], atol=1e-5)
+    # MATLAB stored `d` as the effective offset (= natural firing rate, since
+    # the buggy model's exp(log_d) IS the offset). Under the canonical model
+    # that's just `d` directly — no exp wrapping.
+    @test isapprox(plds.obs_model.d, params_obj["d"], atol=1e-5)
 end
 
 function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))

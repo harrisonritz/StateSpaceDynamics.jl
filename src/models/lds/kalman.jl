@@ -164,7 +164,9 @@ end
     );
     d_wide = reshape(data.d, size(data.d, 1), size(data.d, 2)*size(data.d, 3));
 
-    PD_init(T, dim) = PDMat(diagm(ones(T, dim)))
+    # Matrix{T}(I, dim, dim) is fully type-stable; `diagm(ones(T, dim))`
+    # leaves JET seeing a `Union{Array{T,3}, Matrix}` from `diagm`'s signature.
+    PD_init(T, dim) = PDMat(Matrix{T}(I, dim, dim))
 
     # precompute initial conditions
     init_xx = zeros(T, u0_dim, u0_dim);

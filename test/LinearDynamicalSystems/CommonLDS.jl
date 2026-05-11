@@ -231,6 +231,10 @@ end
 Test that EM algorithm produces monotonically increasing likelihood/ELBO.
 """
 function test_em_convergence_common(toy_fn, n_trials=1)
+    # Seed via StableRNGs so the sampled dataset is reproducible regardless
+    # of test ordering and Julia version (the default RNG implementation can
+    # change across Julia majors; StableRNG is contractually stable).
+    Random.seed!(Random.default_rng(), rand(StableRNG(20260510), UInt))
     lds, x, y = toy_fn(n_trials)
     objective = fit!(lds, y; max_iter=100)
     @test objective[end] > objective[1]

@@ -37,8 +37,8 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
-    B::M = zeros(size(A, 1), 1)  # default to zero matrix if not supplied
-    B0::M = zeros(size(A, 1), 1) # default to zero matrix if not supplied
+    B::M = zeros(eltype(A), size(A, 1), 1)
+    B0::M = zeros(eltype(A), size(A, 1), 1)
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
     AB_prior::Union{Nothing,MNPrior{T,M}} = nothing
@@ -95,7 +95,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     C::M
     R::M
     d::Union{Nothing,V}
-    D::M = zeros(size(C, 1), 1) # default to zero matrix if not supplied
+    D::M = zeros(eltype(C), size(C, 1), 1)  # eltype-preserving default
     R_prior::Union{Nothing,IWPrior{T}} = nothing
     CD_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
@@ -141,7 +141,7 @@ end
 function GaussianStateModel(
     A::M, Q::M, B::M, B0::M, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T}}
-    return GaussianStateModel{T,M}(;
+    return GaussianStateModel{T,M,Vector{T}}(;
         A=A,
         Q=Q,
         b=zeros(T, size(A, 1)),
@@ -162,12 +162,17 @@ function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianObservationModel{T,M,V}(;
-        C=C, R=R, d=d, D=zeros(size(C, 1), 1), R_prior=nothing, CD_prior=nothing
+        C=C,
+        R=R,
+        d=d,
+        D=zeros(eltype(C), size(C, 1), 1),
+        R_prior=nothing,
+        CD_prior=nothing,
     )
 end
 
 function GaussianObservationModel(C::M, R::M, D::M) where {T<:Real,M<:AbstractMatrix{T}}
-    return GaussianObservationModel{T,M}(;
+    return GaussianObservationModel{T,M,Vector{T}}(;
         C=C, R=R, d=zeros(T, size(C, 1)), D=D, R_prior=nothing, CD_prior=nothing
     )
 end

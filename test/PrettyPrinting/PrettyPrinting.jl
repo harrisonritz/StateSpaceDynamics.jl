@@ -4,6 +4,10 @@ function test_pretty_printing()
     io1 = IOBuffer()
     objs = []
 
+    # SPD helper — `validate_LDS` rejects non-symmetric Q/P0/R, so any matrix
+    # destined for those slots must be built symmetrically.
+    spd(n) = (X = rand(n, n); X * X' + I)
+
     # Filter Smooth object
     fs = StateSpaceDynamics.FilterSmooth(
         rand(2, 2),      # x_smooth (2D)
@@ -18,28 +22,29 @@ function test_pretty_printing()
 
     @test println(io1, fs) === nothing
 
-    # Gaussian State Model
+    # Gaussian State Model — Q and P0 must be symmetric (validator enforces).
 
-    gsm1 = GaussianStateModel(rand(5, 5), rand(5, 5), rand(5), rand(5), rand(5, 5))
-    gsm2 = GaussianStateModel(rand(2, 2), rand(2, 2), rand(2), rand(2), rand(2, 2))
+    gsm1 = GaussianStateModel(rand(5, 5), spd(5), rand(5), rand(5), spd(5))
+    gsm2 = GaussianStateModel(rand(2, 2), spd(2), rand(2), rand(2), spd(2))
     push!(objs, gsm1, gsm2)
 
     @test println(io1, gsm1) === nothing
     @test println(io1, gsm2) === nothing
 
-    # Gaussian Observation Model
+    # Gaussian Observation Model — R must be symmetric. Note `gom2` is paired
+    # with `gsm2` (latent_dim = 2) below, so its C is (obs_dim × 2).
 
-    gom1 = GaussianObservationModel(rand(5, 5), rand(5, 5), rand(5))
-    gom2 = GaussianObservationModel(rand(3, 3), rand(3, 3), rand(3))
+    gom1 = GaussianObservationModel(rand(5, 5), spd(5), rand(5))
+    gom2 = GaussianObservationModel(rand(3, 2), spd(3), rand(3))
     push!(objs, gom1, gom2)
 
     @test println(io1, gom1) === nothing
     @test println(io1, gom2) === nothing
 
-    # Poisson Observation Model
+    # Poisson Observation Model — same latent-dim pairing.
 
     pom1 = PoissonObservationModel(rand(5, 5), rand(5))
-    pom2 = PoissonObservationModel(rand(2, 2), rand(2))
+    pom2 = PoissonObservationModel(rand(3, 2), rand(3))
     push!(objs, pom1, pom2)
 
     @test println(io1, pom1) === nothing
