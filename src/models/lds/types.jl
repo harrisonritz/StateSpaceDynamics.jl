@@ -5,12 +5,12 @@ Represents the state model of a Linear Dynamical System with Gaussian noise.
 
 State evolution:
 ```math
-x_1   ~ N(x_0 + B_0 u_0, P_0)
+x_1           ~ N(x_0, P_0)
 x_{t+1} | x_t ~ N(A x_t + b + B u_t, Q)
 ```
-where `B·u_t` and `B_0·u_0` are present only when the corresponding `B`, `B0` fields
-are supplied (i.e., not `nothing`). Input matrices are only consumed by the Kalman
-filter path (see `LinearDynamicalSystem.kalman_filter`).
+where `B·u_t` is present only when `B` is supplied (i.e., not `nothing`). Input
+matrices are only consumed by the Kalman filter path (see
+`LinearDynamicalSystem.kalman_filter`).
 
 # Fields
 - `A::M`: Transition matrix (size `latent_dim × latent_dim`).
@@ -20,14 +20,10 @@ filter path (see `LinearDynamicalSystem.kalman_filter`).
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
 - `B::M: Optional dynamics input matrix (`latent_dim × u_dim`).
     When supplied, inputs `u` must be passed to `fit!`/`smooth!` via a keyword argument.
-- `B0::M: Optional initial-state input matrix
-    (`latent_dim × u0_dim`). When supplied, `u0` must be passed to `fit!`/`smooth!`.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
 - `AB_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
     stacked dynamics matrix `[A B]`. Pair with `Q_prior` for a full MNIW prior on `(AB, Q)`.
-- `B0_prior::Union{Nothing,MNPrior{T,M}} = nothing`: Optional matrix-normal prior on the
-    initial-state input matrix `B0`. Pair with `P0_prior` for a full MNIW prior on `(B0, P0)`.
 """
 Base.@kwdef mutable struct GaussianStateModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -38,11 +34,9 @@ Base.@kwdef mutable struct GaussianStateModel{
     x0::V
     P0::M
     B::M = zeros(eltype(A), size(A, 1), 1)
-    B0::M = zeros(eltype(A), size(A, 1), 1)
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
     AB_prior::Union{Nothing,MNPrior{T,M}} = nothing
-    B0_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
 
 function Base.show(io::IO, gsm::GaussianStateModel; gap="")
@@ -69,8 +63,6 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
 
     println(io, gap, " Dynamics input:")
     println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
-    println(io, gap, " Initial input:")
-    println(io, gap, "  size(B0) = ($(size(gsm.B0,1)), $(size(gsm.B0,2)))")
 
     return nothing
 end
@@ -130,16 +122,14 @@ function GaussianStateModel(
         x0=x0,
         P0=P0,
         B=zeros(T, size(A, 1), 1),
-        B0=zeros(T, size(A, 1), 1),
         Q_prior=nothing,
         P0_prior=nothing,
         AB_prior=nothing,
-        B0_prior=nothing,
     )
 end
 
 function GaussianStateModel(
-    A::M, Q::M, B::M, B0::M, P0::M
+    A::M, Q::M, B::M, P0::M
 ) where {T<:Real,M<:AbstractMatrix{T}}
     return GaussianStateModel{T,M,Vector{T}}(;
         A=A,
@@ -148,11 +138,9 @@ function GaussianStateModel(
         x0=zeros(T, size(A, 1)),
         P0=P0,
         B=B,
-        B0=B0,
         Q_prior=nothing,
         P0_prior=nothing,
         AB_prior=nothing,
-        B0_prior=nothing,
     )
 end
 
@@ -253,8 +241,8 @@ Represents a unified Linear Dynamical System with customizable state and observa
 - `obs_dim::Int`: Dimension of the observations
 - `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
     Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
-    Poisson path (`[x0, P0, A&b, Q, C&d]`), and length 9 when `kalman_filter=true`
-    with inputs supplied (`[x0, P0, A, Q, C, R, B, B0, D]`).
+    Poisson path (`[x0, P0, A&b, Q, C&d]`), and length 8 when `kalman_filter=true`
+    (`[x0, P0, A, Q, C, R, B, D]`).
 - `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
     E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
     the existing block-tridiagonal MAP path.
@@ -267,7 +255,6 @@ Base.@kwdef struct LinearDynamicalSystem{
     latent_dim::Int
     obs_dim::Int
     state_input_dim::Int = 1
-    init_input_dim::Int = 1
     obs_input_dim::Int = 1
     fit_bool::Vector{Bool}
     kalman_filter::Bool = false
@@ -288,11 +275,6 @@ function LinearDynamicalSystem(
     else
         1
     end
-    init_input_dim = if hasproperty(state_model, :B0) && !isnothing(state_model.B0)
-        size(state_model.B0, 2)
-    else
-        1
-    end
     obs_input_dim =
         hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 1
 
@@ -302,8 +284,8 @@ function LinearDynamicalSystem(
             # For Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
             fit_bool = [true, true, true, true, true]
         elseif kalman_filter
-            # Kalman-path Gaussian: [x0, P0, A, Q, C, R, B, B0, D] (length 9)
-            fit_bool = [true, true, true, true, true, true, true, true, true]
+            # Kalman-path Gaussian: [x0, P0, A, Q, C, R, B, D] (length 8)
+            fit_bool = [true, true, true, true, true, true, true, true]
         else
             # For Tridiagonal Gaussian: [x0, P0, A&b, Q, C&d, R] (6 parameters)
             fit_bool = [true, true, true, true, true, true]
@@ -317,7 +299,6 @@ function LinearDynamicalSystem(
         latent_dim,
         obs_dim,
         state_input_dim,
-        init_input_dim,
         obs_input_dim,
         fit_bool,
         kalman_filter,
@@ -343,8 +324,8 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     if lds.obs_model isa PoissonObservationModel
         # C and d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
-    elseif lds.kalman_filter && length(lds.fit_bool) == 9
-        labels = ["x0", "P0", "A", "Q", "C", "R", "B", "B0", "D"]
+    elseif lds.kalman_filter && length(lds.fit_bool) == 8
+        labels = ["x0", "P0", "A", "Q", "C", "R", "B", "D"]
         prms = labels[lds.fit_bool]
     else
         prms = ["x0", "P0", "A (and b)", "Q", "C (and d)", "R"][lds.fit_bool[1:6]]

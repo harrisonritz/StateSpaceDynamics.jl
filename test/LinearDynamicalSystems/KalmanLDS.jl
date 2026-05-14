@@ -5,7 +5,7 @@ The Kalman path is enabled with `kalman_filter=true`. It should:
 - match the block-tridiagonal (Newton) smoother to numerical tolerance
   when no inputs are present,
 - share covariance storage across trials (reference identity),
-- accept and learn `B`, `B0` input matrices via the extended M-step,
+- accept and learn a `B` input matrix via the extended M-step,
 - reject invalid configurations (Poisson obs, missing `u` when `B` is set).
 """
 
@@ -44,48 +44,20 @@ function init_params(rng::AbstractRNG, latent_dim::Int, obs_dim::Int)
     return LDSParams(A, Q, x0, P0, C, R, b, d)
 end
 
-# function _make_toy_lds(; kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7,
-#                       B=nothing, B0=nothing)
-#     Random.seed!(seed)
-#     sm = GaussianStateModel(;
-#         A=0.8*Matrix{Float64}(I, D, D),
-#         Q=0.2*Matrix{Float64}(I, D, D),
-#         x0=zeros(D),
-#         P0=Matrix{Float64}(I, D, D),
-#         b=zeros(D),
-#         B=B,
-#         B0=B0,
-#     )
-#     om = GaussianObservationModel(;
-#         C=randn(p, D),
-#         R=0.5*Matrix{Float64}(I, p, p),
-#         d=zeros(p),
-#     )
-#     return LinearDynamicalSystem(sm, om; kalman_filter=kalman_filter)
-# end
-
 function _make_toy_lds(;
-    kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7, B=nothing, B0=nothing
+    kalman_filter::Bool, D::Int=3, p::Int=5, seed::Int=7, B=nothing
 )
     params = init_params(MersenneTwister(seed), D, p)
-    # `GaussianStateModel.B / .B0` are non-nullable matrix fields with
-    # type-preserving defaults; only override them when the caller supplies
+    # `GaussianStateModel.B` is a non-nullable matrix field with a
+    # type-preserving default; only override it when the caller supplies
     # an explicit input matrix. (`B=nothing` would conflict with `B::M`.)
-    sm = if B === nothing && B0 === nothing
+    sm = if B === nothing
         GaussianStateModel(;
             A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b
         )
-    elseif B0 === nothing
-        GaussianStateModel(;
-            A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b, B=B
-        )
-    elseif B === nothing
-        GaussianStateModel(;
-            A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b, B0=B0
-        )
     else
         GaussianStateModel(;
-            A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b, B=B, B0=B0,
+            A=params.A, Q=params.Q, x0=params.x0, P0=params.P0, b=params.b, B=B
         )
     end
     om = GaussianObservationModel(; C=params.C, R=params.R, d=params.d)
@@ -93,7 +65,7 @@ function _make_toy_lds(;
 end
 
 function _simulate_lds(
-    lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42, u=nothing, u0=nothing
+    lds::LinearDynamicalSystem, T::Int, N::Int; seed::Int=42, u=nothing
 )
     Random.seed!(seed)
     D = lds.latent_dim
@@ -107,18 +79,15 @@ function _simulate_lds(
     P0 = lds.state_model.P0
     x0 = lds.state_model.x0
     B = lds.state_model.B
-    B0 = lds.state_model.B0
 
     Lq = cholesky(Q).L
     Lr = cholesky(R).L
     Lp0 = cholesky(P0).L
     y = zeros(p, T, N)
-    # `B`/`B0` are non-nullable matrix fields with zero defaults; the model
-    # only consumes inputs when matching `u`/`u0` arrays are passed. Gate on
-    # the input arrays here rather than the field nullability.
+    # `B` is a non-nullable matrix field with a zero default; the model only
+    # consumes inputs when a matching `u` array is passed.
     for n in 1:N
-        x0_eff = u0 === nothing ? copy(x0) : x0 .+ B0 * u0[:, n]
-        x = x0_eff .+ Lp0 * randn(D)
+        x = x0 .+ Lp0 * randn(D)
         y[:, 1, n] = C * x + d + Lr * randn(p)
         for t in 2:T
             bu = u === nothing ? zero(b) : B * u[:, t - 1, n]

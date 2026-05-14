@@ -787,14 +787,13 @@ The workspace is split into three layers:
    `CiRY`, `y_minus_d`). Shape `(D, T, ntrials)` — threads write into disjoint trial
    slices, so no locking is required.
 
-`u_dim` / `u0_dim` are 0 when the corresponding `B` / `B0` inputs are absent.
+`u_dim` is 0 when the `B` input is absent.
 """
 struct KalmanWorkspace{T<:Real}
 
     # constants
     latent_dim::Int
     obs_dim::Int
-    init_input_dim::Int
     state_input_dim::Int
     obs_input_dim::Int
     tsteps::Int
@@ -832,7 +831,6 @@ struct KalmanWorkspace{T<:Real}
     #  Priors — matrix-normal halves stored as `MNPrior`s (M₀ + Λ);
     #  inverse-Wishart halves are split into (μ, df) pairs to keep the
     #  hot-path arithmetic indirection-free.
-    B0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     P0_mu::Matrix{T}
     P0_df::Int
 
@@ -882,7 +880,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    init_input_dim = size(lds.state_model.B0, 2)
     state_input_dim = size(lds.state_model.B, 2)
     obs_input_dim = size(lds.obs_model.D, 2)
 
@@ -893,7 +890,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     # MN priors stored verbatim; no PDMat wrapping (the M-step needs (XX + Λ)
     # solves where XX changes every iteration, so a cached chol of Λ-alone
     # would not be reused).
-    placeholder_B0 = lds.state_model.B0_prior
     placeholder_AB = lds.state_model.AB_prior
     placeholder_CD = lds.obs_model.CD_prior
 
@@ -933,7 +929,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
     return KalmanWorkspace{T}(
         D,                              # latent_dim
         p,                              # obs_dim
-        init_input_dim,                 # initial_control_dim
         state_input_dim,                # control_dim
         obs_input_dim,                  # observation_control_dim
         tsteps,                         # time_steps
@@ -957,7 +952,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         Ref(placeholder_D),             # Q_PD
         Ref(placeholder_D),             # P0_PD
         Ref(placeholder_p),             # R_PD
-        placeholder_B0,                 # B0_prior
         placeholder_P0_mu,              # P0_mu
         placeholder_P0_df,              # P0_df
         placeholder_AB,                 # AB_prior

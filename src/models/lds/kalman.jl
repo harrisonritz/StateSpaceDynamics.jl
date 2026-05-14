@@ -12,8 +12,8 @@
 #   `ntrials` is large.
 #
 # * Optional input support: `x_{t+1} = A·x_t + b + B·u_t + ε` and
-#   `x_1 ~ N(x0 + B0·u0, P0)`. Activated when `state_model.B` / `state_model.B0`
-#   are supplied (not `nothing`). Inputs flow in through kwargs `u`, `u0`.
+#   `x_1 ~ N(x0, P0)`. Dynamics-input support activated when `state_model.B`
+#   is supplied; the per-step control sequence flows in through kwarg `u`.
 #
 # * Covariances are stored as `PDMat` so Cholesky factors stay cached; all
 #   stabilization goes through `tol_PD` (eigen-floor) rather than
@@ -30,7 +30,7 @@
 # using BenchmarkTools
 
 """
-    _fit_kalman!(lds, y; u, u0, max_iter, tol, progress)
+    _fit_kalman!(lds, y; u, d, max_iter, tol, progress)
 
 Kalman-path EM driver. Called from the main `fit!` in `gaussian.jl` when
 `lds.kalman_filter == true`.
@@ -38,7 +38,6 @@ Kalman-path EM driver. Called from the main `fit!` in `gaussian.jl` when
 function _fit_kalman!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractArray{T,3};
-    u0::Union{Nothing,AbstractMatrix{T}}=nothing,
     u::Union{Nothing,AbstractArray{T,3}}=nothing,
     d::Union{Nothing,AbstractArray{T,3}}=nothing,
     max_iter::Int=100,
@@ -52,7 +51,7 @@ function _fit_kalman!(
     ntrials = size(y, 3)
 
     # format inputs and preallocate workspace + sufficient statistics
-    data = format_kf_data!(lds, y, u0, u, d, tsteps, ntrials)
+    data = format_kf_data!(lds, y, u, d, tsteps, ntrials)
     validate_kalman_inputs(lds, data, ntrials, tsteps)
     kws = KalmanWorkspace(lds, tsteps, ntrials)
     suf = initialize_SufficientStatistics(lds, data, kws) # reset sufficient statistics
@@ -97,10 +96,9 @@ function update_vestigials!(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
-    # update vestigial parameters for backward compatibility (to be removed in future)
-    if all(data.u0[:, 1] .== 1)
-        lds.state_model.x0 = vec(lds.state_model.B0)
-    end
+    # Back-fill the affine biases `b` and `obs_model.d` from `B` / `D` when the
+    # corresponding control was the implicit constant-1 input. With B0 removed
+    # the initial state is `x0` directly — no back-fill needed for it.
     if all(data.d[:, 1, :] .== 1)
         lds.obs_model.d = vec(lds.obs_model.D)
     end
@@ -113,21 +111,16 @@ end
 function format_kf_data!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractArray{T,3},
-    u0::Union{Nothing,AbstractMatrix{T}},
     u::Union{Nothing,AbstractArray{T,3}},
     d::Union{Nothing,AbstractArray{T,3}},
     tsteps::Int,
     ntrials::Int,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
-    # Move x0, b, and d into u0, u, and d respectively
-    if u0 === nothing
-        u0_formatted = ones(T, 1, ntrials)
-        lds.state_model.B0 = reshape(lds.state_model.x0, :, 1)
-    else
-        u0_formatted = u0
-    end
-
+    # When no `u` / `d` is supplied, fold `b` / `obs_model.d` into the input
+    # matrices `B` / `D` against an implicit constant-1 input (see
+    # `update_vestigials!` for the inverse map). The initial state `x0` is
+    # used directly in `precompute_kalman_constants!` and needs no folding.
     if u === nothing
         u_formatted = ones(T, 1, tsteps, ntrials)
         lds.state_model.B = reshape(lds.state_model.b, :, 1)
@@ -142,7 +135,7 @@ function format_kf_data!(
         d_formatted = d
     end
 
-    data = Data(; y=y, u0=u0_formatted, u=u_formatted, d=d_formatted)
+    data = Data(; y=y, u=u_formatted, d=d_formatted)
 
     return data
 end
@@ -154,7 +147,6 @@ end
     obs_dim = model.obs_dim
     tsteps = size(data.y, 2);
     ntrials = size(data.y, 3);
-    u0_dim = model.init_input_dim
     u_dim = model.state_input_dim
     d_dim = model.obs_input_dim
 
@@ -168,9 +160,10 @@ end
     # leaves JET seeing a `Union{Array{T,3}, Matrix}` from `diagm`'s signature.
     PD_init(T, dim) = PDMat(Matrix{T}(I, dim, dim))
 
-    # precompute initial conditions
-    init_xx = zeros(T, u0_dim, u0_dim);
-    mul!(init_xx, data.u0, data.u0', one(T), zero(T));
+    # precompute initial conditions — `x0` is estimated as a per-trial mean.
+    # The 1×1 `init_xx` scaffold stores `ntrials` so `regress`/`est_cov` still
+    # express the math as a regression of `x_init` on a constant.
+    init_xx = fill(T(ntrials), 1, 1);
 
     # precompute dynamics — populate kws.dyn_xx_buf in place. Only the bottom-right
     # u·uᵀ block is constant across E-steps; the (1,1) and (1,2) blocks are
@@ -200,8 +193,8 @@ end
     return SufficientStatistics{T}(
         # initial conditions
         ntrials,                                        # init_n
-        Ref(tol_PD(init_xx)),                           # init_xx
-        zeros(T, u0_dim, latent_dim),                   # init_xy
+        Ref(tol_PD(init_xx)),                           # init_xx (1×1, holds ntrials)
+        zeros(T, 1, latent_dim),                        # init_xy (1×D, holds Σ x_init)
         Ref(PD_init(T, latent_dim)),                    # init_yy
 
         # dynamics model
@@ -223,7 +216,7 @@ end
 # using BenchmarkTools
 
 """
-    estep!(lds, suf, y, kws::KalmanWorkspace; u=nothing, u0=nothing)
+    estep!(lds, suf, kws::KalmanWorkspace, data::Data)
 
 Kalman-path E-step. Runs `smooth!` via the Kalman/RTS backend, computes
 sufficient statistics, and calls `calculate_elbo` using the companion
@@ -250,36 +243,12 @@ end
 
 Validate input/parameter dimensional consistency for the Kalman path. Called
 **once** at fit entry (not per E-step). Throws `DimensionMismatchError` or
-`ArgumentError` on any mismatch between `B`, `B0`, `D` and the supplied `u`,
-`u0`, `d` arrays in `data`.
+`ArgumentError` on any mismatch between `B`, `D` and the supplied `u`,
+`d` arrays in `data`.
 """
 function validate_kalman_inputs(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}, ntrials::Int, tsteps::Int
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    B0 = lds.state_model.B0
-    if B0 !== nothing
-        data.u0 === nothing &&
-            throw(DimensionMismatchError("u0 (required because B0 !== nothing)", 1, 0))
-        if size(data.u0, 1) != size(B0, 2)
-            throw(
-                DimensionMismatchError("u0 rows vs B0 cols", size(B0, 2), size(data.u0, 1))
-            )
-        end
-        if size(data.u0, 2) != ntrials
-            throw(
-                DimensionMismatchError(
-                    "u0 shape (u0_dim, ntrials)", (size(B0, 2), ntrials), size(data.u0)
-                ),
-            )
-        end
-    elseif data.u0 !== nothing
-        throw(
-            ArgumentError(
-                "u0 was supplied but state_model.B0 is nothing; set B0 before passing u0"
-            ),
-        )
-    end
-
     B = lds.state_model.B
     if B !== nothing
         data.u === nothing &&
@@ -353,8 +322,10 @@ function precompute_kalman_constants!(
     copyto!(kws.CiR, C'/kws.R_PD[])
     kws.CiRC[] = tol_PD(Xt_invA_X(kws.R_PD[], C))
 
-    if data.u0 !== nothing
-        @views mul!(kws.pred_mean[:, 1, :], lds.state_model.B0, data.u0)
+    # Initial-state mean is now `x0` directly (no `B0·u0` term). Broadcast it
+    # into each trial column of `pred_mean[:, 1, :]`.
+    @views for n in axes(kws.pred_mean, 3)
+        kws.pred_mean[:, 1, n] .= lds.state_model.x0
     end
 
     if data.u !== nothing
@@ -572,9 +543,12 @@ end
     # initial conditions -------
     kws.x_init .= kws.smooth_mean[:, 1, :]
     suf.init_n = kws.ntrials
-    # init_xx (preset)
-    # init_xy
-    mul!(suf.init_xy, data.u0, kws.x_init', one(T), zero(T));
+    # init_xx is preset to [ntrials] (1×1) by initialize_SufficientStatistics.
+    # init_xy: row vector Σ_n x_init[:, n], shape (1, D).
+    fill!(suf.init_xy, zero(T))
+    @inbounds for n in axes(kws.x_init, 2), i in axes(kws.x_init, 1)
+        suf.init_xy[1, i] += kws.x_init[i, n]
+    end
     # init_yy
     suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1].mat, suf.init_n);
 
@@ -698,20 +672,22 @@ function mstep!(
     # TODO: include filt_bool
 
     # initials ===============================================
-    B0 = regress(suf.init_xx[], suf.init_xy, kws.B0_prior)
+    # x0 = (Σ x_init) / ntrials, expressed as a 1×1 → D×1 regression so the
+    # same `regress`/`est_cov` machinery feeds into P0 via the empirical scatter.
+    x0_mat = regress(suf.init_xx[], suf.init_xy, nothing)  # D × 1
 
     P0 = est_cov(
-        B0,
+        x0_mat,
         suf.init_xx[],
         suf.init_xy,
         suf.init_yy[],
         suf.init_n,
-        kws.B0_prior,
+        nothing,
         kws.P0_df,
         kws.P0_mu,
     )
 
-    lds.state_model.B0 .= B0
+    lds.state_model.x0 .= vec(x0_mat)
     lds.state_model.P0 .= P0
 
     # dynamics ===============================================
@@ -837,12 +813,14 @@ function compute_elbo(
     R_PD = tol_PD(lds.obs_model.R)
 
     # Initial Conditions --------------------------------------
+    # The init "regression" has 1 parameter (x0), so the NIW posterior df
+    # correction is `n - 1` rather than `n - u0_dim`.
     n = suf.init_n
     v = kws.latent_dim;
     v0 = kws.P0_df;
-    vN = v0 + (n - kws.init_input_dim);
-    lam0 = _prior_Λ_PD(kws.B0_prior)
-    lamN = lam0 === nothing ? suf.init_xx[] : lam0 + suf.init_xx[];
+    vN = v0 + (n - 1);
+    lam0 = nothing
+    lamN = suf.init_xx[];
     Sig0 = kws.P0_mu * kws.P0_df
     SigN = P0_PD * vN;
 

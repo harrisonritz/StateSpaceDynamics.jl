@@ -93,7 +93,6 @@ end
 
 Base.@kwdef struct Data{T<:Real}
     y::Array{T,3}
-    u0::Matrix{T}
     u::Array{T,3}
     d::Array{T,3}
 end
