@@ -33,7 +33,7 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
-    B::M = zeros(eltype(A), size(A, 1), 1)
+    B::M = zeros(eltype(A), size(A, 1), 0)
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
     AB_prior::Union{Nothing,MNPrior{T,M}} = nothing
@@ -87,7 +87,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     C::M
     R::M
     d::Union{Nothing,V}
-    D::M = zeros(eltype(C), size(C, 1), 1)  # eltype-preserving default
+    D::M = zeros(eltype(C), size(C, 1), 0)  # eltype-preserving default
     R_prior::Union{Nothing,IWPrior{T}} = nothing
     CD_prior::Union{Nothing,MNPrior{T,M}} = nothing
 end
@@ -121,7 +121,7 @@ function GaussianStateModel(
         b=b,
         x0=x0,
         P0=P0,
-        B=zeros(T, size(A, 1), 1),
+        B=zeros(T, size(A, 1), 0),
         Q_prior=nothing,
         P0_prior=nothing,
         AB_prior=nothing,
@@ -153,7 +153,7 @@ function GaussianObservationModel(
         C=C,
         R=R,
         d=d,
-        D=zeros(eltype(C), size(C, 1), 1),
+        D=zeros(eltype(C), size(C, 1), 0),
         R_prior=nothing,
         CD_prior=nothing,
     )
@@ -254,8 +254,8 @@ Base.@kwdef struct LinearDynamicalSystem{
     obs_model::O
     latent_dim::Int
     obs_dim::Int
-    state_input_dim::Int = 1
-    obs_input_dim::Int = 1
+    state_input_dim::Int = 0
+    obs_input_dim::Int = 0
     fit_bool::Vector{Bool}
     kalman_filter::Bool = false
 end
@@ -273,10 +273,10 @@ function LinearDynamicalSystem(
     state_input_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
         size(state_model.B, 2)
     else
-        1
+        0
     end
     obs_input_dim =
-        hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 1
+        hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 0
 
     # Set default fit_bool based on observation model type / Kalman flag
     if fit_bool === nothing
