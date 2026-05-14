@@ -206,12 +206,22 @@ struct SmoothWorkspace{T<:Real}
 end
 
 """
-    SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int)
+    SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
+                    u_dim=0, d_dim=0)
 
 Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
+
+- `u_dim` is the dynamics-input dimension (`size(state_model.B, 2)`), used to
+  size the M-step regression buffers `Sxz`/`Szz_Ab`/`AB` to fit `[A b B]`.
+- `d_dim` is the observation-input dimension (`size(obs_model.D, 2)`), used
+  to size `Syz`/`Szz_Cd`/`CD` to fit `[C d D]`.
+
+Either being zero (the default) means no inputs — buffers fit `[A b]` and/or
+`[C d]` only.
 """
 function SmoothWorkspace(
-    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int
+    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
+    u_dim::Int=0, d_dim::Int=0,
 ) where {T<:Real}
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 
@@ -260,12 +270,16 @@ function SmoothWorkspace(
     # Hessian temp matrix
     I_mat = Matrix{T}(I, latent_dim, latent_dim)
 
-    # M-step buffers
-    Sxz = zeros(T, latent_dim, latent_dim + 1)
-    Szz_Ab = zeros(T, latent_dim + 1, latent_dim + 1)
-    AB = zeros(T, latent_dim, latent_dim + 1)
-    Syz = zeros(T, obs_dim, latent_dim + 1)
-    Szz_Cd = zeros(T, latent_dim + 1, latent_dim + 1)
+    # M-step buffers. The "+1" is for the affine bias column (b for the
+    # dynamics regression, d for the observation regression); u_dim / d_dim
+    # add the user input columns when controls are supplied.
+    dyn_reg_dim = latent_dim + 1 + u_dim
+    obs_reg_dim = latent_dim + 1 + d_dim
+    Sxz = zeros(T, latent_dim, dyn_reg_dim)
+    Szz_Ab = zeros(T, dyn_reg_dim, dyn_reg_dim)
+    AB = zeros(T, latent_dim, dyn_reg_dim)
+    Syz = zeros(T, obs_dim, obs_reg_dim)
+    Szz_Cd = zeros(T, obs_reg_dim, obs_reg_dim)
     Q_sum = zeros(T, latent_dim, latent_dim)
     R_sum = zeros(T, obs_dim, obs_dim)
     S0_sum = zeros(T, latent_dim, latent_dim)
@@ -283,7 +297,7 @@ function SmoothWorkspace(
     state_uncertainty = zeros(T, latent_dim, latent_dim)
     work_yz = zeros(T, obs_dim, latent_dim)
     work_outer = zeros(T, latent_dim, latent_dim)
-    CD = zeros(T, obs_dim, latent_dim + 1)
+    CD = zeros(T, obs_dim, obs_reg_dim)
 
     # ELBO / Q_state buffers
     elbo_temp = zeros(T, latent_dim, latent_dim)

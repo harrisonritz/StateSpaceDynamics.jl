@@ -5,6 +5,7 @@ function _extract_state_params(state_model::GaussianStateModel{T}) where {T}
         b=state_model.b,
         x0=state_model.x0,
         P0=state_model.P0,
+        B=state_model.B,
     )
 end
 
@@ -42,7 +43,7 @@ function initialize_FilterSmooth(
 end
 
 function _extract_obs_params(obs_model::GaussianObservationModel{T}) where {T}
-    return (C=obs_model.C, R=obs_model.R, d=obs_model.d)
+    return (C=obs_model.C, R=obs_model.R, d=obs_model.d, D=obs_model.D)
 end
 
 function _extract_obs_params(obs_model::PoissonObservationModel{T}) where {T}
@@ -74,32 +75,52 @@ function _get_all_params_vec(
 end
 
 function _sample_trial!(
-    rng, x_trial, y_trial, state_params, obs_params, obs_model::GaussianObservationModel
+    rng, x_trial, y_trial, state_params, obs_params, obs_model::GaussianObservationModel,
+    u_trial::AbstractMatrix, v_trial::AbstractMatrix,
 )
     tsteps = size(x_trial, 2)
 
-    # Initial state
+    # Initial state. The observation at t=1 includes the obs-input term D·v_1
+    # when v_trial has nonzero rows; zero-row matmul is a no-op.
     x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
     y_trial[:, 1] = rand(
-        rng, MvNormal(obs_params.C * x_trial[:, 1] + obs_params.d, obs_params.R)
+        rng,
+        MvNormal(
+            obs_params.C * x_trial[:, 1] + obs_params.d + obs_params.D * v_trial[:, 1],
+            obs_params.R,
+        ),
     )
 
-    # Subsequent states
+    # Subsequent states. The dynamics input B·u_{t-1} kicks the state forward;
+    # again, zero-row u_trial degenerates to no input.
     for t in 2:tsteps
         x_trial[:, t] = rand(
             rng,
-            MvNormal(state_params.A * x_trial[:, t - 1] + state_params.b, state_params.Q),
+            MvNormal(
+                state_params.A * x_trial[:, t - 1]
+                + state_params.b
+                + state_params.B * u_trial[:, t - 1],
+                state_params.Q,
+            ),
         )
         y_trial[:, t] = rand(
-            rng, MvNormal(obs_params.C * x_trial[:, t] + obs_params.d, obs_params.R)
+            rng,
+            MvNormal(
+                obs_params.C * x_trial[:, t] + obs_params.d + obs_params.D * v_trial[:, t],
+                obs_params.R,
+            ),
         )
     end
 end
 
 function _sample_trial!(
-    rng, x_trial, y_trial, state_params, obs_params, obs_model::PoissonObservationModel
+    rng, x_trial, y_trial, state_params, obs_params, obs_model::PoissonObservationModel,
+    u_trial::AbstractMatrix, v_trial::AbstractMatrix,
 )
     tsteps = size(x_trial, 2)
+    # Poisson obs model has no D matrix; v_trial is accepted for signature
+    # parity with the Gaussian path but must be empty (validated by callers).
+    @assert size(v_trial, 1) == 0 "Poisson observation model does not support obs inputs"
 
     # Initial state
     x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
@@ -109,7 +130,12 @@ function _sample_trial!(
     for t in 2:tsteps
         x_trial[:, t] = rand(
             rng,
-            MvNormal(state_params.A * x_trial[:, t - 1] + state_params.b, state_params.Q),
+            MvNormal(
+                state_params.A * x_trial[:, t - 1]
+                + state_params.b
+                + state_params.B * u_trial[:, t - 1],
+                state_params.Q,
+            ),
         )
         y_trial[:, t] = rand.(
             rng, Poisson.(exp.(obs_params.C * x_trial[:, t] + obs_params.d))
@@ -118,8 +144,9 @@ function _sample_trial!(
 end
 
 """
-    Random.rand([rng,] lds, tsteps::Integer)
-    Random.rand([rng,] lds, tsteps_per_trial::AbstractVector{<:Integer})
+    Random.rand([rng,] lds, tsteps::Integer; control_seq=nothing, obs_control_seq=nothing)
+    Random.rand([rng,] lds, tsteps_per_trial::AbstractVector{<:Integer};
+                control_seq=nothing, obs_control_seq=nothing)
 
 Sample from a Linear Dynamical System.
 
@@ -127,23 +154,38 @@ Sample from a Linear Dynamical System.
   `(latent_dim, tsteps)` and `(obs_dim, tsteps)` respectively.
 - With a vector of per-trial lengths, returns
   `(x::Vector{Matrix}, y::Vector{Matrix})`. Lengths may differ across trials.
+
+Optional control sequences:
+- `control_seq`: dynamics-input sequence consumed by `B`. Single-trial form
+  is an `(u_dim, tsteps)` matrix; multi-trial is a `Vector{<:AbstractMatrix}`
+  of per-trial matrices. Required when `size(state_model.B, 2) > 0`.
+- `obs_control_seq`: same shape for the observation input `D`. Required when
+  `size(obs_model.D, 2) > 0`. Gaussian observation model only.
 """
 function Random.rand(
-    rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer
+    rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer;
+    control_seq::Union{Nothing,AbstractMatrix{T}}=nothing,
+    obs_control_seq::Union{Nothing,AbstractMatrix{T}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     state_params = _extract_state_params(lds.state_model)
     obs_params = _extract_obs_params(lds.obs_model)
+    Ti = Int(tsteps)
 
-    x = Matrix{T}(undef, lds.latent_dim, Int(tsteps))
-    y = Matrix{T}(undef, lds.obs_dim, Int(tsteps))
-    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model)
+    u_trial = _check_control(control_seq, lds.state_input_dim, Ti, "control_seq")
+    v_trial = _check_obs_control(obs_control_seq, lds.obs_input_dim, Ti, lds.obs_model)
+
+    x = Matrix{T}(undef, lds.latent_dim, Ti)
+    y = Matrix{T}(undef, lds.obs_dim, Ti)
+    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, u_trial, v_trial)
     return x, y
 end
 
 function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
-    tsteps_per_trial::AbstractVector{<:Integer},
+    tsteps_per_trial::AbstractVector{<:Integer};
+    control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    obs_control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     state_params = _extract_state_params(lds.state_model)
     obs_params = _extract_obs_params(lds.obs_model)
@@ -157,27 +199,137 @@ function Random.rand(
         y[i] = Matrix{T}(undef, lds.obs_dim, Ti)
     end
 
+    u_seq = _normalize_multitrial_control(
+        control_seq, lds.state_input_dim, tsteps_per_trial, T, "control_seq",
+    )
+    v_seq = _normalize_multitrial_obs_control(
+        obs_control_seq, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model,
+    )
+
     if ntrials > 10
         Threads.@threads for trial in 1:ntrials
-            _sample_trial!(rng, x[trial], y[trial], state_params, obs_params, lds.obs_model)
+            _sample_trial!(
+                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model,
+                u_seq[trial], v_seq[trial],
+            )
         end
     else
         for trial in 1:ntrials
-            _sample_trial!(rng, x[trial], y[trial], state_params, obs_params, lds.obs_model)
+            _sample_trial!(
+                rng, x[trial], y[trial], state_params, obs_params, lds.obs_model,
+                u_seq[trial], v_seq[trial],
+            )
         end
     end
 
     return x, y
 end
 
-function Random.rand(lds::LinearDynamicalSystem, tsteps::Integer)
-    return rand(Random.default_rng(), lds, tsteps)
+function Random.rand(lds::LinearDynamicalSystem, tsteps::Integer; kwargs...)
+    return rand(Random.default_rng(), lds, tsteps; kwargs...)
 end
 
 function Random.rand(
-    lds::LinearDynamicalSystem, tsteps_per_trial::AbstractVector{<:Integer}
+    lds::LinearDynamicalSystem, tsteps_per_trial::AbstractVector{<:Integer}; kwargs...
 )
-    return rand(Random.default_rng(), lds, tsteps_per_trial)
+    return rand(Random.default_rng(), lds, tsteps_per_trial; kwargs...)
+end
+
+# ============================================================================
+# Control-sequence normalization helpers. The public `control_seq`/`obs_control_seq`
+# kwargs accept either `nothing` (no inputs — must match a zero-column `B`/`D`)
+# or per-trial matrices. Internally every sampler/smoother/M-step expects an
+# `AbstractMatrix{T}` of shape `(u_dim, T_i)` (possibly `0 × T_i`), so these
+# helpers canonicalize on the way in.
+# ============================================================================
+
+function _check_control(
+    cs::Nothing, expected_dim::Int, tsteps::Int, name::AbstractString,
+)
+    expected_dim == 0 || throw(
+        ArgumentError(
+            "$(name)=nothing is only valid when the corresponding input matrix is " *
+            "zero-column; got expected_dim=$(expected_dim). Pass a $(expected_dim)×T " *
+            "matrix or shrink the input matrix.",
+        ),
+    )
+    return zeros(eltype(Float64), 0, tsteps)
+end
+
+function _check_control(
+    cs::AbstractMatrix{T}, expected_dim::Int, tsteps::Int, name::AbstractString,
+) where {T<:Real}
+    size(cs, 1) == expected_dim || throw(
+        DimensionMismatchError("$(name) rows vs input-matrix cols", expected_dim, size(cs, 1)),
+    )
+    size(cs, 2) == tsteps || throw(
+        DimensionMismatchError("$(name) tsteps", tsteps, size(cs, 2)),
+    )
+    return cs
+end
+
+@inline function _check_obs_control(
+    cs, expected_dim::Int, tsteps::Int, ::GaussianObservationModel,
+)
+    return _check_control(cs, expected_dim, tsteps, "obs_control_seq")
+end
+
+@inline function _check_obs_control(
+    cs::Nothing, expected_dim::Int, tsteps::Int, ::PoissonObservationModel,
+)
+    expected_dim == 0 || error(
+        "Poisson observation model does not support obs_control_seq (expected_dim must be 0)",
+    )
+    return zeros(Float64, 0, tsteps)
+end
+
+function _normalize_multitrial_control(
+    cs::Nothing, expected_dim::Int, tsteps_per_trial, ::Type{T}, name::AbstractString,
+) where {T<:Real}
+    expected_dim == 0 || throw(
+        ArgumentError("$(name)=nothing is only valid when expected_dim == 0; got $(expected_dim)"),
+    )
+    return [zeros(T, 0, Int(Ti)) for Ti in tsteps_per_trial]
+end
+
+function _normalize_multitrial_control(
+    cs::AbstractVector{<:AbstractMatrix{T}},
+    expected_dim::Int,
+    tsteps_per_trial,
+    ::Type{T},
+    name::AbstractString,
+) where {T<:Real}
+    length(cs) == length(tsteps_per_trial) || throw(
+        DimensionMismatchError("$(name) ntrials", length(tsteps_per_trial), length(cs)),
+    )
+    for (i, ci) in enumerate(cs)
+        size(ci, 1) == expected_dim || throw(
+            DimensionMismatchError("$(name)[$i] rows", expected_dim, size(ci, 1)),
+        )
+        size(ci, 2) == Int(tsteps_per_trial[i]) || throw(
+            DimensionMismatchError(
+                "$(name)[$i] tsteps", Int(tsteps_per_trial[i]), size(ci, 2),
+            ),
+        )
+    end
+    return cs
+end
+
+@inline function _normalize_multitrial_obs_control(
+    cs, expected_dim::Int, tsteps_per_trial, ::Type{T}, ::GaussianObservationModel,
+) where {T<:Real}
+    return _normalize_multitrial_control(
+        cs, expected_dim, tsteps_per_trial, T, "obs_control_seq",
+    )
+end
+
+@inline function _normalize_multitrial_obs_control(
+    cs::Nothing, expected_dim::Int, tsteps_per_trial, ::Type{T}, ::PoissonObservationModel,
+) where {T<:Real}
+    expected_dim == 0 || error(
+        "Poisson observation model does not support obs_control_seq (expected_dim must be 0)",
+    )
+    return [zeros(T, 0, Int(Ti)) for Ti in tsteps_per_trial]
 end
 
 """
@@ -191,13 +343,17 @@ function loglikelihood!(
     x::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T0,S,O},
     y::AbstractMatrix{T0},
+    u::AbstractMatrix{T0},
+    v::AbstractMatrix{T0},
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
     tsteps = size(y, 2)
 
     A = lds.state_model.A
     b = lds.state_model.b
+    B = lds.state_model.B
     x0 = lds.state_model.x0
     d = lds.obs_model.d
+    D_obs = lds.obs_model.D
 
     R_U = UpperTriangular(ws.R_chol_U)
     Q_U = UpperTriangular(ws.Q_chol_U)
@@ -226,16 +382,19 @@ function loglikelihood!(
             ll_t += cP0 - T(0.5) * sum(abs2, temp_solve_Q)
         end
 
-        # Dynamics (t>1): log p(x_t | x_{t-1})
+        # Dynamics (t>1): log p(x_t | x_{t-1}, u_{t-1}) where mean = A x_{t-1} + b + B u_{t-1}.
+        # `B*u` is a no-op when `u` has zero rows (size(B,2) == size(u,1) == 0).
         if t > 1
             @views mul!(temp_dx, A, x[:, t - 1])
+            @views mul!(temp_dx, B, u[:, t - 1], one(T0), one(T0))
             @views temp_dx .= x[:, t] .- temp_dx .- b
             ldiv!(temp_solve_Q, Q_U, temp_dx)
             ll_t += cQ - T(0.5) * sum(abs2, temp_solve_Q)
         end
 
-        # Emission: log p(y_t | x_t)
+        # Emission: log p(y_t | x_t, v_t) where mean = C x_t + d + D v_t.
         @views mul!(temp_dy, lds.obs_model.C, x[:, t])
+        @views mul!(temp_dy, D_obs, v[:, t], one(T0), one(T0))
         @views temp_dy .= y[:, t] .- temp_dy .- d
         ldiv!(temp_solve_R, R_U, temp_dy)
         ll_t += cR - T(0.5) * sum(abs2, temp_solve_R)
@@ -244,6 +403,21 @@ function loglikelihood!(
     end
 
     return ll_vec
+end
+
+# Backward-compatible 4-arg overload: no inputs. Forwards to the 6-arg form
+# with zero-row u/v matrices, so callers that don't use controls don't have
+# to pass them.
+function loglikelihood!(
+    ws::SmoothWorkspace{T},
+    x::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T0,S,O},
+    y::AbstractMatrix{T0},
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
+    tsteps = size(y, 2)
+    u = zeros(T0, 0, tsteps)
+    v = zeros(T0, 0, tsteps)
+    return loglikelihood!(ws, x, lds, y, u, v)
 end
 
 """
@@ -325,16 +499,21 @@ function Gradient!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractMatrix{T},
     x::AbstractMatrix{T},
+    u::AbstractMatrix{T},
+    v::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     latent_dim, tsteps = size(x)
     A = lds.state_model.A
     b = lds.state_model.b
+    B = lds.state_model.B
     x0 = lds.state_model.x0
+    C = lds.obs_model.C
+    d_obs = lds.obs_model.d
+    D_obs = lds.obs_model.D
 
     C_inv_R = ws.C_inv_R
     A_inv_Q = ws.A_inv_Q
     # ws.x_t = -P0^{-1}, ws.xt_given_xt_1 = -Q^{-1}
-    # So P0^{-1}*v = -(ws.x_t * v), Q^{-1}*v = -(ws.xt_given_xt_1 * v)
     neg_P0_inv = ws.x_t         # = -P0^{-1}
     neg_Q_inv = ws.xt_given_xt_1  # = -Q^{-1}
 
@@ -346,36 +525,40 @@ function Gradient!(
     tmp2 = ws.tmp2
     tmp3 = ws.tmp3
 
+    # Helper macros (inlined): residual `x_t - A x_{t-1} - b - B u_{t-1}` and
+    # `y_t - C x_t - d - D v_t`. The `B*u` / `D*v` updates are no-ops when
+    # `u` / `v` have zero rows.
+
     # First time step
-    dxt .= x[:, 1] .- x0
-    mul!(dxt_next, A, view(x, :, 1))
+    @views dxt .= x[:, 1] .- x0
+    @views mul!(dxt_next, A, x[:, 1])
+    @views mul!(dxt_next, B, u[:, 1], one(T), one(T))
     @views dxt_next .= x[:, 2] .- dxt_next .- b
-    mul!(dyt, lds.obs_model.C, view(x, :, 1))
-    @views dyt .= y[:, 1] .- dyt .- lds.obs_model.d
+    @views mul!(dyt, C, x[:, 1])
+    @views mul!(dyt, D_obs, v[:, 1], one(T), one(T))
+    @views dyt .= y[:, 1] .- dyt .- d_obs
 
     mul!(tmp1, C_inv_R, dyt)
     mul!(tmp2, A_inv_Q, dxt_next)
-    # P0^{-1} * dxt = -(neg_P0_inv * dxt)
     mul!(tmp3, neg_P0_inv, dxt)
-
-    # grad[:,1] = tmp1 + tmp2 - (-neg_P0_inv * dxt) = tmp1 + tmp2 + tmp3
     grad[:, 1] .= tmp1 .+ tmp2 .+ tmp3
 
     # Middle steps
     @views for t in 2:(tsteps - 1)
         mul!(dxt, A, x[:, t - 1])
+        mul!(dxt, B, u[:, t - 1], one(T), one(T))
         dxt .= x[:, t] .- dxt .- b
 
         mul!(dxt_next, A, x[:, t])
+        mul!(dxt_next, B, u[:, t], one(T), one(T))
         dxt_next .= x[:, t + 1] .- dxt_next .- b
 
-        mul!(dyt, lds.obs_model.C, x[:, t])
-        dyt .= y[:, t] .- dyt .- lds.obs_model.d
+        mul!(dyt, C, x[:, t])
+        mul!(dyt, D_obs, v[:, t], one(T), one(T))
+        dyt .= y[:, t] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
         mul!(tmp2, A_inv_Q, dxt_next)
-        # Q^{-1}*dxt = -neg_Q_inv * dxt, so neg_Q_inv*dxt = -Q^{-1}*dxt
-        # grad = tmp1 - Q^{-1}*dxt + tmp2 = tmp1 + neg_Q_inv*dxt + tmp2
         mul!(tmp3, neg_Q_inv, dxt)
 
         grad[:, t] .= tmp1 .+ tmp3 .+ tmp2
@@ -384,9 +567,11 @@ function Gradient!(
     # Last time step
     @views begin
         mul!(dxt, A, x[:, tsteps - 1])
+        mul!(dxt, B, u[:, tsteps - 1], one(T), one(T))
         dxt .= x[:, tsteps] .- dxt .- b
-        mul!(dyt, lds.obs_model.C, x[:, tsteps])
-        dyt .= y[:, tsteps] .- dyt .- lds.obs_model.d
+        mul!(dyt, C, x[:, tsteps])
+        mul!(dyt, D_obs, v[:, tsteps], one(T), one(T))
+        dyt .= y[:, tsteps] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
         mul!(tmp3, neg_Q_inv, dxt)
@@ -395,6 +580,19 @@ function Gradient!(
     end
 
     return grad
+end
+
+# Backward-compatible no-input overload.
+function Gradient!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T},
+    x::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(x, 2)
+    u = zeros(T, 0, tsteps)
+    v = zeros(T, 0, tsteps)
+    return Gradient!(ws, lds, y, x, u, v)
 end
 
 """
@@ -486,6 +684,8 @@ function smooth!(
     fs::FilterSmooth{T},
     y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
+    u::AbstractMatrix{T},
+    v::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
     n_active = D * tsteps
@@ -504,12 +704,14 @@ function smooth!(
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat)
+    Gradient!(sws, lds, y, x_mat, u, v)
     # grad_vec = -gradient (minimize negative log-likelihood)
     for t in 1:tsteps, i in 1:D
         sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
     end
 
+    # Hessian is independent of `u`/`v` (linear-Gaussian model has identical
+    # precision blocks regardless of input means).
     Hessian!(sws, lds, y, x_mat)
     _negate_blocks!(btd, tsteps)
 
@@ -534,6 +736,19 @@ function smooth!(
     return fs
 end
 
+# Backward-compatible no-input overload (zero-row u/v).
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O},
+    fs::FilterSmooth{T},
+    y::AbstractMatrix{T},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(y, 2)
+    u = zeros(T, 0, tsteps)
+    v = zeros(T, 0, tsteps)
+    return smooth!(lds, fs, y, sws, u, v)
+end
+
 """
     smooth!(lds, tfs, y::AbstractVector{<:AbstractMatrix}, sws_pool)
 
@@ -553,11 +768,13 @@ function smooth!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = length(y)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1])
+        smooth!(lds, tfs[1], y[1], sws_pool[1], u_seq[1], v_seq[1])
         return tfs
     end
 
@@ -571,7 +788,7 @@ function smooth!(
         @spawn begin
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws)
+                smooth!(lds, tfs[trial], y[trial], sws, u_seq[trial], v_seq[trial])
             end
         end
     end
@@ -579,12 +796,25 @@ function smooth!(
     return tfs
 end
 
-"""
-    Q_state!(ws, lds, E_z, E_zz, E_zz_prev)
+# Backward-compatible no-input overload.
+function smooth!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return smooth!(lds, tfs, y, sws_pool, u_seq, v_seq)
+end
 
-State Q-term for an LDS with affine dynamics x_t ~ N(A x_{t-1} + b, Q).
+"""
+    Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
+
+State Q-term for an LDS with affine dynamics `x_t ~ N(A x_{t-1} + b + B u_{t-1}, Q)`.
 In-place version of `Q_state` that uses pre-allocated buffers from `SmoothWorkspace`.
-Uses cached Cholesky factors from `compute_smooth_constants!`.
+Uses cached Cholesky factors from `compute_smooth_constants!`. `u` is the per-trial
+dynamics-control matrix `(u_dim, T_i)`; pass a `0×T_i` matrix when no inputs.
 """
 function Q_state!(
     ws::SmoothWorkspace{T},
@@ -592,19 +822,20 @@ function Q_state!(
     E_z::AbstractMatrix{T},
     E_zz::AbstractArray{T,3},
     E_zz_prev::AbstractArray{T,3},
+    u::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tstep = size(E_z, 2)
     D = lds.latent_dim
+    u_dim = size(u, 1)
     A = lds.state_model.A
     b = lds.state_model.b
+    B = lds.state_model.B
     x0 = lds.state_model.x0
 
     # Use cached Cholesky factors (already computed by compute_smooth_constants!)
-    # For Cholesky P0 = U'U, we need to solve P0 \ temp = inv(U) * inv(U') * temp
     Q_U = UpperTriangular(ws.Q_chol_U)
     P0_U = UpperTriangular(ws.P0_chol_U)
 
-    # Compute log determinants from cached Cholesky factors
     log_det_Q = zero(T)
     log_det_P0 = zero(T)
     for j in 1:D
@@ -612,7 +843,6 @@ function Q_state!(
         log_det_P0 += 2 * log(P0_U[j, j])
     end
 
-    # Use workspace buffers
     temp = ws.elbo_temp
     sum_E_zz = ws.elbo_sum_E_zz
     sum_E_zzm1 = ws.elbo_sum_E_zzm1
@@ -625,15 +855,12 @@ function Q_state!(
     fill!(temp, zero(T))
     @views begin
         temp .+= E_zz[:, :, 1]
-        mul!(temp, E_z[:, 1:1], x0', -one(T), one(T))  # temp -= E_z[:,1] * x0'
-        mul!(temp, x0, E_z[:, 1:1]', -one(T), one(T))  # temp -= x0 * E_z[:,1]'
-        mul!(temp, x0, x0', one(T), one(T))            # temp += x0 * x0'
+        mul!(temp, E_z[:, 1:1], x0', -one(T), one(T))
+        mul!(temp, x0, E_z[:, 1:1]', -one(T), one(T))
+        mul!(temp, x0, x0', one(T), one(T))
     end
-
-    # Solve P0 \ temp = inv(P0) * temp = inv(U) * inv(U') * temp
-    # First: temp2 = inv(U') * temp (solve U' * temp2 = temp)
-    ldiv!(P0_U', temp)  # temp = inv(U') * temp
-    ldiv!(P0_U, temp)   # temp = inv(U) * temp = P0 \ original_temp
+    ldiv!(P0_U', temp)
+    ldiv!(P0_U, temp)
     Q_val = T(-0.5) * (log_det_P0 + tr(temp))
 
     # Transition part: accumulate sums over t=2:tstep
@@ -643,40 +870,83 @@ function Q_state!(
     fill!(sum_mu_t, zero(T))
     fill!(sum_mu_tm1, zero(T))
 
+    # Input-specific accumulators (only meaningful when u_dim > 0).
+    sum_u = zeros(T, u_dim)                          # Σ u_{t-1}
+    sum_mu_t_u = zeros(T, D, u_dim)                  # Σ E_z[:,t] u_{t-1}'
+    sum_mu_tm1_u = zeros(T, D, u_dim)                # Σ E_z[:,t-1] u_{t-1}'
+    sum_uu = zeros(T, u_dim, u_dim)                  # Σ u_{t-1} u_{t-1}'
+
     @views for t in 2:tstep
         sum_E_zz .+= E_zz[:, :, t]
         sum_E_zzm1 .+= E_zz[:, :, t - 1]
         sum_E_cross .+= E_zz_prev[:, :, t]
         sum_mu_t .+= E_z[:, t]
         sum_mu_tm1 .+= E_z[:, t - 1]
+
+        if u_dim > 0
+            u_tm1 = u[:, t - 1]
+            sum_u .+= u_tm1
+            BLAS.ger!(one(T), E_z[:, t], u_tm1, sum_mu_t_u)
+            BLAS.ger!(one(T), E_z[:, t - 1], u_tm1, sum_mu_tm1_u)
+            BLAS.ger!(one(T), u_tm1, u_tm1, sum_uu)
+        end
     end
 
-    # Build temp = sum_E_zz - A*sum_E_cross' - sum_E_cross*A' + A*sum_E_zzm1*A'
+    # No-input batched terms:
+    #   temp = sum_E_zz - A·sum_E_cross' - sum_E_cross·A' + A·sum_E_zzm1·A'
     copyto!(temp, sum_E_zz)
-    mul!(temp, A, sum_E_cross', -one(T), one(T))       # temp -= A * sum_E_cross'
-    mul!(temp, sum_E_cross, A', -one(T), one(T))       # temp -= sum_E_cross * A'
-    mul!(temp2, A, sum_E_zzm1)                          # temp2 = A * sum_E_zzm1
-    mul!(temp, temp2, A', one(T), one(T))              # temp += temp2 * A'
+    mul!(temp, A, sum_E_cross', -one(T), one(T))
+    mul!(temp, sum_E_cross, A', -one(T), one(T))
+    mul!(temp2, A, sum_E_zzm1)
+    mul!(temp, temp2, A', one(T), one(T))
 
-    # Bias terms (use rank-1 updates to avoid allocations)
-    # temp -= sum_mu_t * b'
+    # Bias terms (b alone):
     mul!(temp, sum_mu_t, b', -one(T), one(T))
-    # temp -= b * sum_mu_t'
     mul!(temp, b, sum_mu_t', -one(T), one(T))
-    # temp += A * sum_mu_tm1 * b' (use temp2 as intermediate)
-    mul!(ws.tmp1, A, sum_mu_tm1)  # tmp1 = A * sum_mu_tm1
+    mul!(ws.tmp1, A, sum_mu_tm1)
     mul!(temp, ws.tmp1, b', one(T), one(T))
-    # temp += b * (A * sum_mu_tm1)'  = b * sum_mu_tm1' * A'
     mul!(temp, b, ws.tmp1', one(T), one(T))
-    # temp += (tstep - 1) * b * b'
     mul!(temp, b, b', T(tstep - 1), one(T))
 
-    # Solve Q \ temp = inv(Q) * temp
+    # Input cross terms (`Bu_{t-1} := B u_{t-1}`). All terms here are
+    # contributions to `Σ_t E[(x_t - A x_{t-1} - b - B u_{t-1})(...)']` that
+    # involve at least one `B u_{t-1}` factor.
+    if u_dim > 0
+        # -= sum_mu_t_u · B'  and  -= B · sum_mu_t_u'
+        mul!(temp, sum_mu_t_u, B', -one(T), one(T))
+        mul!(temp, B, sum_mu_t_u', -one(T), one(T))
+        # += (A · sum_mu_tm1_u) · B'  and  += B · (A · sum_mu_tm1_u)'
+        # Intermediate has shape (D × u_dim); no fixed-size workspace buffer.
+        A_sumXU = A * sum_mu_tm1_u
+        mul!(temp, A_sumXU, B', one(T), one(T))
+        mul!(temp, B, A_sumXU', one(T), one(T))
+        # += b · (B · sum_u)'  and  += (B · sum_u) · b'
+        B_sumu = B * sum_u  # D-vector
+        mul!(temp, reshape(b, :, 1), reshape(B_sumu, 1, :), one(T), one(T))
+        mul!(temp, reshape(B_sumu, :, 1), reshape(b, 1, :), one(T), one(T))
+        # += B · sum_uu · B'
+        B_sumuu = B * sum_uu  # D × u_dim
+        mul!(temp, B_sumuu, B', one(T), one(T))
+    end
+
+    # Solve Q \ temp
     ldiv!(Q_U', temp)
     ldiv!(Q_U, temp)
     Q_val += T(-0.5) * ((tstep - 1) * log_det_Q + tr(temp))
 
     return Q_val
+end
+
+# Backward-compatible no-input overload.
+function Q_state!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    E_z::AbstractMatrix{T},
+    E_zz::AbstractArray{T,3},
+    E_zz_prev::AbstractArray{T,3},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    u = zeros(T, 0, size(E_z, 2))
+    return Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
 end
 
 """
@@ -720,11 +990,11 @@ function Q_obs!(
 end
 
 """
-    Q_obs!(ws, lds, E_z, E_zz, y)
+    Q_obs!(ws, lds, E_z, E_zz, y, v)
 
-Full observation Q-term for Gaussian LDS over all time steps. 
-In-place version of `Q_obs` that uses pre-allocated buffers from `SmoothWorkspace`.
-Uses cached Cholesky factors from `compute_smooth_constants!`.
+Full observation Q-term for Gaussian LDS over all time steps with affine
+observation `y_t ~ N(C x_t + d + D v_t, R)`. `v` is the per-trial obs-control
+matrix `(d_dim, T_i)`; pass a `0×T_i` matrix when no obs inputs.
 """
 function Q_obs!(
     ws::SmoothWorkspace{T},
@@ -732,23 +1002,22 @@ function Q_obs!(
     E_z::AbstractMatrix{T},
     E_zz::AbstractArray{T,3},
     y::AbstractMatrix{T},
+    v::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     obs_dim = lds.obs_dim
     tsteps = size(y, 2)
     C = lds.obs_model.C
     d = lds.obs_model.d
+    D_obs = lds.obs_model.D
+    d_dim = size(v, 1)
 
-    # Use cached Cholesky factor
     R_U = UpperTriangular(ws.R_chol_U)
-
-    # Compute log determinant from cached Cholesky
     log_det_R = zero(T)
     for j in 1:obs_dim
         log_det_R += 2 * log(R_U[j, j])
     end
     const_term = obs_dim * log(T(2π))
 
-    # Use workspace buffers
     temp = ws.elbo_obs_temp
     work_matrix = ws.elbo_obs_work
     ytil = ws.elbo_ytil
@@ -760,32 +1029,43 @@ function Q_obs!(
     fill!(temp, zero(T))
 
     @views for t in axes(y, 2)
-        # Residualize: ytil = y[:,t] - d
+        # Residualize: ytil = y[:,t] - d - D · v[:,t]
         ytil .= y[:, t] .- d
+        if d_dim > 0
+            mul!(ytil, D_obs, v[:, t], -one(T), one(T))
+        end
 
-        # sum_yy = ytil * ytil'
         mul!(sum_yy, ytil, ytil')
 
-        # sum_yz = ytil * E_z[:,t]' (outer product)
         fill!(sum_yz, zero(T))
         BLAS.ger!(one(T), ytil, E_z[:, t], sum_yz)
 
-        # Build work_matrix
+        # work_matrix = sum_yy - C·sum_yz' - sum_yz·C' + C·E_zz·C'
         copyto!(work_matrix, sum_yy)
-        mul!(work_matrix, C, sum_yz', -one(T), one(T))   # work_matrix -= C * sum_yz'
-        mul!(work1, sum_yz, C')                           # work1 = sum_yz * C'
-        work_matrix .-= work1                             # work_matrix -= work1
-        mul!(work2, E_zz[:, :, t], C')                    # work2 = E_zz * C'
-        mul!(work_matrix, C, work2, one(T), one(T))       # work_matrix += C * work2
+        mul!(work_matrix, C, sum_yz', -one(T), one(T))
+        mul!(work1, sum_yz, C')
+        work_matrix .-= work1
+        mul!(work2, E_zz[:, :, t], C')
+        mul!(work_matrix, C, work2, one(T), one(T))
 
-        # Accumulate
         temp .+= work_matrix
     end
 
-    # Solve R \ temp = inv(R) * temp = inv(U) * inv(U') * temp
     ldiv!(R_U', temp)
     ldiv!(R_U, temp)
     return T(-0.5) * (tsteps * (const_term + log_det_R) + tr(temp))
+end
+
+# Backward-compatible no-input overload.
+function Q_obs!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    E_z::AbstractMatrix{T},
+    E_zz::AbstractArray{T,3},
+    y::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    v = zeros(T, 0, size(y, 2))
+    return Q_obs!(ws, lds, E_z, E_zz, y, v)
 end
 
 """
@@ -801,6 +1081,8 @@ function calculate_elbo(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = length(y)
 
@@ -825,8 +1107,8 @@ function calculate_elbo(
                 fs = tfs[trial]
                 compute_smooth_constants!(sws, lds)
                 acc +=
-                    Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
-                    Q_obs!(sws, lds, fs.E_z, fs.E_zz, y[trial])
+                    Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev, u_seq[trial]) +
+                    Q_obs!(sws, lds, fs.E_z, fs.E_zz, y[trial], v_seq[trial])
             end
             partial[i] = acc
         end
@@ -846,6 +1128,18 @@ function calculate_elbo(
     end
 
     return Q_total + prior_term + total_entropy
+end
+
+# Backward-compatible no-input overload.
+function calculate_elbo(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return calculate_elbo(lds, tfs, y, sws_pool, u_seq, v_seq)
 end
 
 """
@@ -910,11 +1204,25 @@ function estep!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    smooth!(lds, tfs, y, sws_pool)
+    smooth!(lds, tfs, y, sws_pool, u_seq, v_seq)
     sufficient_statistics!(tfs)
-    elbo = calculate_elbo(lds, tfs, y, sws_pool)
+    elbo = calculate_elbo(lds, tfs, y, sws_pool, u_seq, v_seq)
     return elbo
+end
+
+# Backward-compatible no-input overload.
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return estep!(lds, tfs, y, sws_pool, u_seq, v_seq)
 end
 
 """
@@ -960,15 +1268,30 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     update_initial_state_mean!(lds, tfs, w)
     update_initial_state_covariance!(lds, tfs, sws, w)
-    update_A_b!(lds, tfs, sws, w)
-    update_Q!(lds, tfs, sws, w)
-    update_C_d!(lds, tfs, y, sws, w)
-    update_R!(lds, tfs, y, sws, w)
+    update_A_b!(lds, tfs, sws, u_seq, w)
+    update_Q!(lds, tfs, sws, u_seq, w)
+    update_C_d!(lds, tfs, y, sws, v_seq, w)
+    update_R!(lds, tfs, y, sws, v_seq, w)
     return nothing
+end
+
+# Backward-compatible no-input overload.
+function mstep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return mstep!(lds, tfs, y, sws, u_seq, v_seq, w)
 end
 
 """
@@ -1027,39 +1350,67 @@ function update_A_b!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     sws::SmoothWorkspace{T},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
     D = lds.latent_dim
+    u_dim = lds.state_input_dim
     ntrials = length(tfs)
 
-    Sxz = sws.Sxz
-    Szz = sws.Szz_Ab
-    AB = sws.AB
+    Sxz = sws.Sxz       # (D, D + 1 + u_dim)
+    Szz = sws.Szz_Ab    # (D + 1 + u_dim, D + 1 + u_dim)
+    AB = sws.AB         # (D, D + 1 + u_dim)
     fill!(Sxz, zero(T))
     fill!(Szz, zero(T))
 
+    # Gram-matrix layout:
+    #   cols 1:D                 — x_prev outer products
+    #   col  D+1                 — constant-1 column (fits the bias `b`)
+    #   cols D+2 : D+1+u_dim     — u_prev (fits `B`)
     for trial in 1:ntrials
         fs = tfs[trial]
+        u_trial = u_seq[trial]
         tsteps = size(fs.E_z, 2)
         weights = isnothing(w) ? nothing : w[trial]
 
         @views for t in 2:tsteps
             weight = isnothing(weights) ? one(T) : weights[t]
 
+            # x-block (Sxz[:, 1:D], Szz[1:D, 1:D])
             Sxz[:, 1:D] .+= weight .* fs.E_zz_prev[:, :, t]
-            Sxz[:, D + 1] .+= weight .* fs.E_z[:, t]
-
             Szz[1:D, 1:D] .+= weight .* fs.E_zz[:, :, t - 1]
+
+            # bias column (Sxz[:, D+1], Szz[1:D, D+1], Szz[D+1, 1:D], Szz[D+1, D+1])
+            Sxz[:, D + 1] .+= weight .* fs.E_z[:, t]
             Szz[1:D, D + 1] .+= weight .* fs.E_z[:, t - 1]
             Szz[D + 1, 1:D] .+= weight .* fs.E_z[:, t - 1]
             Szz[D + 1, D + 1] += weight
+
+            if u_dim > 0
+                u_tm1 = u_trial[:, t - 1]
+                # Sxz[:, D+2:end] += weight * E_z[:, t] * u_tm1'
+                BLAS.ger!(weight, fs.E_z[:, t], u_tm1, Sxz[:, (D + 2):end])
+                # Szz[1:D, D+2:end] += weight * E_z[:, t-1] * u_tm1'
+                BLAS.ger!(weight, fs.E_z[:, t - 1], u_tm1, Szz[1:D, (D + 2):end])
+                # Szz[D+1, D+2:end] += weight * u_tm1'
+                Szz[D + 1, (D + 2):end] .+= weight .* u_tm1
+                # Szz[D+2:end, D+2:end] += weight * u_tm1 * u_tm1'
+                BLAS.ger!(weight, u_tm1, u_tm1, Szz[(D + 2):end, (D + 2):end])
+            end
         end
     end
 
-    # MN-prior shrinkage on [A b]: posterior MAP is
-    #   [A b] = (Sxz + M₀ Λ) (Szz + Λ)⁻¹
-    # `Λ` is (D+1) × (D+1), `M₀` is D × (D+1). Reduces to OLS when prior is nothing.
+    # Mirror the upper triangle to the lower for the cross blocks.
+    if u_dim > 0
+        @views Szz[(D + 2):end, 1:D] .= Szz[1:D, (D + 2):end]'
+        @views Szz[(D + 2):end, D + 1] .= Szz[D + 1, (D + 2):end]
+    end
+
+    # MN-prior shrinkage on [A b B]: posterior MAP is
+    #   [A b B] = (Sxz + M₀ Λ) (Szz + Λ)⁻¹
+    # `Λ` is (D+1+u_dim) × (D+1+u_dim) when inputs are present, (D+1) × (D+1) otherwise.
+    # `M₀` is D × (D+1+u_dim). Reduces to OLS when prior is nothing.
     prior = lds.state_model.AB_prior
     if prior !== nothing
         Szz .+= prior.Λ
@@ -1067,12 +1418,26 @@ function update_A_b!(
     end
 
     F = factorize(Szz')
-    ldiv!(transpose(AB), F, transpose(Sxz)) # AB' = (Szz') \ (Sxz')
+    ldiv!(transpose(AB), F, transpose(Sxz))
 
     copyto!(lds.state_model.A, view(AB, :, 1:D))
-    copyto!(lds.state_model.b, view(AB, :, D+1))
+    copyto!(lds.state_model.b, view(AB, :, D + 1))
+    if u_dim > 0
+        copyto!(lds.state_model.B, view(AB, :, (D + 2):(D + 1 + u_dim)))
+    end
 
     return nothing
+end
+
+# Backward-compatible no-input overload (zero-row controls).
+function update_A_b!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    sws::SmoothWorkspace{T},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    u_seq = [zeros(T, 0, size(tfs[trial].E_z, 2)) for trial in 1:length(tfs)]
+    return update_A_b!(lds, tfs, sws, u_seq, w)
 end
 
 """
@@ -1089,13 +1454,16 @@ function update_Q!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     sws::SmoothWorkspace{T},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[4] || return nothing
     ntrials = length(tfs)
     state_dim = lds.latent_dim
+    u_dim = lds.state_input_dim
     A = lds.state_model.A
     b = lds.state_model.b
+    B = lds.state_model.B
 
     Q_sum = sws.Q_sum
     fill!(Q_sum, zero(T))
@@ -1111,8 +1479,13 @@ function update_Q!(
 
     total_weight = zero(T)
 
+    # Per-timestep input residual scratch: `Bu_t = B u_{t-1}` (D-vector). When
+    # `u_dim == 0`, this is just zeros and the input-specific updates are skipped.
+    Bu_t = zeros(T, state_dim)
+
     for trial in 1:ntrials
         fs = tfs[trial]
+        u_trial = u_seq[trial]
         tsteps = size(fs.E_zz, 3)
         weights = isnothing(w) ? nothing : w[trial]
 
@@ -1133,26 +1506,41 @@ function update_Q!(
             @. innovation_cov = Σt - temp1 - temp2 + temp4
 
             mul!(temp5, A, μtm1)
-            # innovation_cov += α * x * y'
-            mul!(innovation_cov, reshape(μt, :, 1), reshape(b, 1, :), -one(T), one(T))  # -= μt*b'
-            mul!(innovation_cov, reshape(b, :, 1), reshape(μt, 1, :), -one(T), one(T))  # -= b*μt'
-            mul!(innovation_cov, reshape(temp5, :, 1), reshape(b, 1, :), one(T), one(T))  # += temp5*b'
-            mul!(innovation_cov, reshape(b, :, 1), reshape(temp5, 1, :), one(T), one(T))  # += b*temp5'
+            mul!(innovation_cov, reshape(μt, :, 1), reshape(b, 1, :), -one(T), one(T))
+            mul!(innovation_cov, reshape(b, :, 1), reshape(μt, 1, :), -one(T), one(T))
+            mul!(innovation_cov, reshape(temp5, :, 1), reshape(b, 1, :), one(T), one(T))
+            mul!(innovation_cov, reshape(b, :, 1), reshape(temp5, 1, :), one(T), one(T))
 
             innovation_cov .+= bbT
+
+            # Input contribution (`B u_{t-1}`). With `Bu_t := B u_{t-1}`:
+            #   -= μt · Bu_t' + Bu_t · μt'
+            #   += (A μtm1) · Bu_t' + Bu_t · (A μtm1)'
+            #   += b · Bu_t' + Bu_t · b'
+            #   += Bu_t · Bu_t'
+            if u_dim > 0
+                mul!(Bu_t, B, u_trial[:, t - 1])
+                mul!(innovation_cov, reshape(μt, :, 1), reshape(Bu_t, 1, :), -one(T), one(T))
+                mul!(innovation_cov, reshape(Bu_t, :, 1), reshape(μt, 1, :), -one(T), one(T))
+                mul!(innovation_cov, reshape(temp5, :, 1), reshape(Bu_t, 1, :), one(T), one(T))
+                mul!(innovation_cov, reshape(Bu_t, :, 1), reshape(temp5, 1, :), one(T), one(T))
+                mul!(innovation_cov, reshape(b, :, 1), reshape(Bu_t, 1, :), one(T), one(T))
+                mul!(innovation_cov, reshape(Bu_t, :, 1), reshape(b, 1, :), one(T), one(T))
+                mul!(innovation_cov, reshape(Bu_t, :, 1), reshape(Bu_t, 1, :), one(T), one(T))
+            end
 
             Q_sum .+= weight .* innovation_cov
             total_weight += weight
         end
     end
 
-    # MN-prior contribution to the IW posterior scale matrix:
-    # add (W - M₀) Λ (W - M₀)' where W = [A b] is the freshly-fit regression
-    # MAP. Mathematically the matrix-normal half of an MNIW posterior on (W, Q).
+    # MN-prior contribution to the IW posterior scale. W = [A b B] for the
+    # regression; Λ is (D+1+u_dim) × (D+1+u_dim) when inputs are present.
     AB_prior = lds.state_model.AB_prior
     if AB_prior !== nothing
-        Wm_state = hcat(A, b) .- AB_prior.M₀          # (D × (D+1))
-        Q_sum .+= Wm_state * AB_prior.Λ * Wm_state'   # (D × D), symmetric
+        W = u_dim > 0 ? hcat(A, b, B) : hcat(A, b)
+        Wm_state = W .- AB_prior.M₀
+        Q_sum .+= Wm_state * AB_prior.Λ * Wm_state'
     end
 
     if lds.state_model.Q_prior === nothing
@@ -1166,6 +1554,17 @@ function update_Q!(
     return nothing
 end
 
+# Backward-compatible no-input overload.
+function update_Q!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    sws::SmoothWorkspace{T},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    u_seq = [zeros(T, 0, size(tfs[trial].E_z, 2)) for trial in 1:length(tfs)]
+    return update_Q!(lds, tfs, sws, u_seq, w)
+end
+
 """
     update_C_d!(lds, tfs, y, sws, w=nothing)
 
@@ -1177,16 +1576,18 @@ function update_C_d!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
 
     ntrials = length(tfs)
     D = lds.latent_dim
+    d_dim = lds.obs_input_dim
 
-    Syz = sws.Syz
-    Szz = sws.Szz_Cd
-    CD = sws.CD
+    Syz = sws.Syz       # (obs_dim, D + 1 + d_dim)
+    Szz = sws.Szz_Cd    # (D + 1 + d_dim, D + 1 + d_dim)
+    CD = sws.CD         # (obs_dim, D + 1 + d_dim)
 
     fill!(Syz, zero(T))
     fill!(Szz, zero(T))
@@ -1197,6 +1598,7 @@ function update_C_d!(
     for trial in 1:ntrials
         fs = tfs[trial]
         y_trial = y[trial]
+        v_trial = v_seq[trial]
         tsteps = size(y_trial, 2)
         weights = isnothing(w) ? nothing : w[trial]
         @views for t in 1:tsteps
@@ -1217,12 +1619,28 @@ function update_C_d!(
             Szz[1:D, D + 1] .+= wt .* μ
             Szz[D + 1, 1:D] .+= wt .* μ
             Szz[D + 1, D + 1] += wt
+
+            if d_dim > 0
+                vt = v_trial[:, t]
+                # Syz[:, D+2:end] += wt * yt * vt'
+                BLAS.ger!(wt, yt, vt, Syz[:, (D + 2):end])
+                # Szz[1:D, D+2:end] += wt * μ * vt'
+                BLAS.ger!(wt, μ, vt, Szz[1:D, (D + 2):end])
+                # Szz[D+1, D+2:end] += wt * vt'
+                Szz[D + 1, (D + 2):end] .+= wt .* vt
+                # Szz[D+2:end, D+2:end] += wt * vt * vt'
+                BLAS.ger!(wt, vt, vt, Szz[(D + 2):end, (D + 2):end])
+            end
         end
     end
 
-    # MN-prior shrinkage on [C d]: posterior MAP is
-    #   [C d] = (Syz + M₀ Λ) (Szz + Λ)⁻¹
-    # `Λ` is (D+1) × (D+1), `M₀` is obs_dim × (D+1). Reduces to OLS when prior is nothing.
+    # Mirror symmetric cross blocks.
+    if d_dim > 0
+        @views Szz[(D + 2):end, 1:D] .= Szz[1:D, (D + 2):end]'
+        @views Szz[(D + 2):end, D + 1] .= Szz[D + 1, (D + 2):end]
+    end
+
+    # MN-prior shrinkage on [C d D]: same pattern as the dynamics regression.
     CD_prior = lds.obs_model.CD_prior
     if CD_prior !== nothing
         Szz .+= CD_prior.Λ
@@ -1234,8 +1652,23 @@ function update_C_d!(
 
     copyto!(lds.obs_model.C, view(CD, :, 1:D))
     copyto!(lds.obs_model.d, view(CD, :, D + 1))
+    if d_dim > 0
+        copyto!(lds.obs_model.D, view(CD, :, (D + 2):(D + 1 + d_dim)))
+    end
 
     return nothing
+end
+
+# Backward-compatible no-input overload.
+function update_C_d!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return update_C_d!(lds, tfs, y, sws, v_seq, w)
 end
 
 function update_R!(
@@ -1243,17 +1676,20 @@ function update_R!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[6] || return nothing
 
     obs_dim = lds.obs_dim
+    d_dim = lds.obs_input_dim
     ntrials = length(tfs)
 
     R_new = sws.R_sum
     fill!(R_new, zero(T))
     C = lds.obs_model.C
     d = lds.obs_model.d
+    D_obs = lds.obs_model.D
 
     total_weight = zero(T)
 
@@ -1266,14 +1702,19 @@ function update_R!(
     for trial in 1:ntrials
         fs = tfs[trial]
         y_trial = y[trial]
+        v_trial = v_seq[trial]
         tsteps = size(y_trial, 2)
         weights = isnothing(w) ? nothing : w[trial]
 
         @views for t in 1:tsteps
             wt = isnothing(weights) ? one(T) : weights[t]
 
+            # Innovation = y_t - (C E[x_t] + d + D v_t)
             mul!(Czt, C, fs.E_z[:, t])
             @. innovation = y_trial[:, t] - (Czt + d)
+            if d_dim > 0
+                mul!(innovation, D_obs, v_trial[:, t], -one(T), one(T))
+            end
 
             BLAS.ger!(wt, innovation, innovation, R_new)
 
@@ -1288,12 +1729,12 @@ function update_R!(
         end
     end
 
-    # MN-prior contribution to the IW posterior scale matrix for R:
-    # add (W - M₀) Λ (W - M₀)' where W = [C d] is the freshly-fit regression MAP.
+    # MN-prior contribution: W = [C d D] regression coefficient.
     CD_prior = lds.obs_model.CD_prior
     if CD_prior !== nothing
-        Wm_obs = hcat(C, d) .- CD_prior.M₀            # (obs_dim × (D+1))
-        R_new .+= Wm_obs * CD_prior.Λ * Wm_obs'       # (obs_dim × obs_dim)
+        W = d_dim > 0 ? hcat(C, d, D_obs) : hcat(C, d)
+        Wm_obs = W .- CD_prior.M₀
+        R_new .+= Wm_obs * CD_prior.Λ * Wm_obs'
     end
 
     if lds.obs_model.R_prior === nothing
@@ -1307,8 +1748,21 @@ function update_R!(
     return nothing
 end
 
+# Backward-compatible no-input overload.
+function update_R!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T},
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return update_R!(lds, tfs, y, sws, v_seq, w)
+end
+
 """
-    fit!(lds, y; max_iter=100, tol=1e-6, progress=true)
+    fit!(lds, y; max_iter=100, tol=1e-6, progress=true,
+         control_seq=nothing, obs_control_seq=nothing)
 
 Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
@@ -1323,6 +1777,10 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 - `max_iter::Int=100`: maximum EM iterations
 - `tol::Float64=1e-6`: convergence tolerance on ELBO change
 - `progress::Bool=true`: show progress bar
+- `control_seq`: optional dynamics-input sequence. `Vector{<:AbstractMatrix}`
+  for multi-trial (each `(u_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
+- `obs_control_seq`: optional observation-input sequence (same shape) for the
+  obs-side input matrix `D`. Required when `size(obs_model.D, 2) > 0`.
 
 Returns a `Vector{T}` of ELBO values, one per iteration.
 """
@@ -1332,10 +1790,19 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    u=nothing,
-    d=nothing,
+    control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    obs_control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    return _fit!(lds, y, max_iter, tol, progress, u, d, Val(lds.kalman_filter))
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    u_seq = _normalize_multitrial_control(
+        control_seq, lds.state_input_dim, tsteps_per_trial, T, "control_seq",
+    )
+    v_seq = _normalize_multitrial_obs_control(
+        obs_control_seq, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model,
+    )
+    return _fit!(
+        lds, y, max_iter, tol, progress, u_seq, v_seq, Val(lds.kalman_filter),
+    )
 end
 
 function _fit!(
@@ -1344,8 +1811,8 @@ function _fit!(
     max_iter::Int,
     tol::Float64,
     progress::Bool,
-    u,
-    d,
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
     ::Val{true},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     y_combined = zeros(T, size(y_vec[1], 1), size(y_vec[1], 2), length(y_vec))
@@ -1364,8 +1831,14 @@ function _fit!(
         )
     end
 
+    # Kalman path consumes 3-D arrays. Stack per-trial controls if any.
+    u_combined = isempty(u_seq) || size(u_seq[1], 1) == 0 ? nothing : cat(u_seq...; dims=3)
+    v_combined = isempty(v_seq) || size(v_seq[1], 1) == 0 ? nothing : cat(v_seq...; dims=3)
+
     return _fit_kalman!(
-        lds, y_combined; u=u, d=d, max_iter=max_iter, tol=tol, progress=progress
+        lds, y_combined;
+        control_seq=u_combined, obs_control_seq=v_combined,
+        max_iter=max_iter, tol=tol, progress=progress,
     )
 end
 
@@ -1375,16 +1848,21 @@ function _fit!(
     max_iter::Int,
     tol::Float64,
     progress::Bool,
-    u,
-    d,
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
     ::Val{false},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    return _fit_tridiag!(lds, y; max_iter=max_iter, tol=tol, progress=progress)
+    return _fit_tridiag!(
+        lds, y; control_seq=u_seq, obs_control_seq=v_seq,
+        max_iter=max_iter, tol=tol, progress=progress,
+    )
 end
 
 function _fit_tridiag!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractVector{<:AbstractMatrix{T}};
+    control_seq::AbstractVector{<:AbstractMatrix{T}},
+    obs_control_seq::AbstractVector{<:AbstractMatrix{T}},
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
@@ -1398,9 +1876,11 @@ function _fit_tridiag!(
 
     tfs = initialize_FilterSmooth(lds, tsteps_per_trial)::TrialFilterSmooth{T}
 
+    u_dim = lds.state_input_dim
+    d_dim = lds.obs_input_dim
     sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for
-        _ in 1:Threads.maxthreadid()
+        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max; u_dim=u_dim, d_dim=d_dim)
+        for _ in 1:Threads.maxthreadid()
     ]
 
     prog = if progress
@@ -1410,8 +1890,8 @@ function _fit_tridiag!(
     end
 
     for _ in 1:max_iter
-        elbo = estep!(lds, tfs, y, sws_pool)
-        mstep!(lds, tfs, y, sws_pool[1])
+        elbo = estep!(lds, tfs, y, sws_pool, control_seq, obs_control_seq)
+        mstep!(lds, tfs, y, sws_pool[1], control_seq, obs_control_seq)
         push!(elbos, elbo)
 
         prog !== nothing && next!(prog)

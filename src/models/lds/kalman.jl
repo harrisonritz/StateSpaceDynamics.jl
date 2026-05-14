@@ -30,16 +30,18 @@
 # using BenchmarkTools
 
 """
-    _fit_kalman!(lds, y; u, d, max_iter, tol, progress)
+    _fit_kalman!(lds, y; control_seq, obs_control_seq, max_iter, tol, progress)
 
 Kalman-path EM driver. Called from the main `fit!` in `gaussian.jl` when
-`lds.kalman_filter == true`.
+`lds.kalman_filter == true`. `control_seq` carries dynamics inputs (`B*u_t`),
+`obs_control_seq` carries observation inputs (`D*v_t`). Both are 3-D arrays
+`(input_dim, tsteps, ntrials)` or `nothing` for no inputs.
 """
 function _fit_kalman!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractArray{T,3};
-    u::Union{Nothing,AbstractArray{T,3}}=nothing,
-    d::Union{Nothing,AbstractArray{T,3}}=nothing,
+    control_seq::Union{Nothing,AbstractArray{T,3}}=nothing,
+    obs_control_seq::Union{Nothing,AbstractArray{T,3}}=nothing,
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
@@ -51,7 +53,7 @@ function _fit_kalman!(
     ntrials = size(y, 3)
 
     # format inputs and preallocate workspace + sufficient statistics
-    data = format_kf_data!(lds, y, u, d, tsteps, ntrials)
+    data = format_kf_data!(lds, y, control_seq, obs_control_seq, tsteps, ntrials)
     validate_kalman_inputs(lds, data, ntrials, tsteps)
     kws = KalmanWorkspace(lds, tsteps, ntrials)
     suf = initialize_SufficientStatistics(lds, data, kws) # reset sufficient statistics

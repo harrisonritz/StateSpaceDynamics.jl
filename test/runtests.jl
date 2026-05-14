@@ -160,6 +160,8 @@ include("helper_functions.jl")
             test_kalman_with_B_input_equivalent_to_bias()
             test_kalman_rejects_poisson_obs()
             test_kalman_missing_u_errors()
+            test_td_fit_with_dynamics_input()
+            test_td_sampling_zero_input_matches_no_control()
         end
 
         include("LinearDynamicalSystems/PoissonLDS.jl")

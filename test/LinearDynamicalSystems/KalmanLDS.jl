@@ -156,9 +156,10 @@ function test_kalman_covariance_shared_across_trials()
 end
 
 function test_kalman_with_B_input_equivalent_to_bias()
+    # B·u with u ≡ 1 reduces to an additive constant; setting b = B·1 should
+    # produce identical sample paths.
     D, p, T, N = 3, 4, 30, 2
     u_dim = D
-    # B = I, u = ones → effective bias of 1 at every step.
     B = Matrix{Float64}(I, D, u_dim)
     Random.seed!(11)
     sm = GaussianStateModel(;
@@ -175,30 +176,120 @@ function test_kalman_with_B_input_equivalent_to_bias()
     lds_B = LinearDynamicalSystem(sm, om; kalman_filter=true)
 
     u = ones(u_dim, T, N)
-    y = _simulate_lds(lds_B, T, N; u=u)
+    y_B = _simulate_lds(lds_B, T, N; u=u)
 
-    # Equivalent LDS where bias b=1 replaces B·u=1.
-    Random.seed!(11)
+    # Same model but with the bias absorbed into `b` instead of `B·u`.
     sm_b = GaussianStateModel(;
         A=lds_B.state_model.A,
         Q=lds_B.state_model.Q,
         x0=lds_B.state_model.x0,
         P0=lds_B.state_model.P0,
-        b=ones(D),
+        b=vec(B * ones(u_dim)),
     )
     om_b = GaussianObservationModel(;
         C=lds_B.obs_model.C, R=lds_B.obs_model.R, d=lds_B.obs_model.d
     )
     lds_b = LinearDynamicalSystem(sm_b, om_b; kalman_filter=true)
+    y_b = _simulate_lds(lds_b, T, N)
 
-    # The semantic claim — "B·u = b when u is constant ones" — needs a
-    # smoothing entry point that accepts `u`. `smooth!` does not (the Kalman
-    # path threads inputs through `_fit_kalman!`'s `data` argument and
-    # `precompute_kalman_constants!`, not as a `smooth!` kwarg). Marked
-    # broken until the public smoothing API exposes inputs; for now the
-    # input-aware path is exercised end-to-end by `fit!` instead.
-    _ = (lds_B, lds_b, u, y)   # suppress unused-binding hints
-    @test_skip false
+    @test y_B ≈ y_b atol=1e-10
+end
+
+function test_td_fit_with_dynamics_input()
+    # TD path: simulate from `x_{t+1} = A x_t + b + B u_t`, fit, recover B
+    # (and b) to coarse tolerance.
+    D, p, Tt, N = 3, 5, 60, 8
+    u_dim = 2
+    rng = MersenneTwister(101)
+
+    A_true = 0.85 * SSD.random_rotation_matrix(D, rng)
+    Q_true = 0.05 * Matrix{Float64}(I, D, D)
+    b_true = randn(rng, D)
+    B_true = randn(rng, D, u_dim)
+    x0_true = zeros(D)
+    P0_true = 0.1 * Matrix{Float64}(I, D, D)
+    C_true = randn(rng, p, D)
+    R_true = 0.1 * Matrix{Float64}(I, p, p)
+    d_true = zeros(p)
+
+    sm_true = GaussianStateModel(;
+        A=A_true, Q=Q_true, x0=x0_true, P0=P0_true, b=b_true, B=B_true,
+    )
+    om_true = GaussianObservationModel(; C=C_true, R=R_true, d=d_true)
+    lds_true = LinearDynamicalSystem(sm_true, om_true; kalman_filter=false)
+
+    u_seq = [randn(rng, u_dim, Tt) for _ in 1:N]
+    _, y_seq = rand(lds_true, fill(Tt, N); control_seq=u_seq)
+
+    # Fit from a perturbed init.
+    sm_init = GaussianStateModel(;
+        A=0.5*Matrix{Float64}(I, D, D),
+        Q=Matrix{Float64}(I, D, D),
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=zeros(D),
+        B=zeros(D, u_dim),
+    )
+    om_init = GaussianObservationModel(;
+        C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p),
+    )
+    lds_fit = LinearDynamicalSystem(sm_init, om_init; kalman_filter=false)
+
+    elbos = fit!(lds_fit, y_seq; control_seq=u_seq, max_iter=80, progress=false)
+
+    @test all(diff(elbos) .>= -1e-4)        # ~monotone
+    # B is identifiable up to the same gauge as A/C (rotation of latent space);
+    # check predictive fit instead — the learned B should explain input-driven
+    # variance, so fitting *with* controls should beat fitting *without* on the
+    # same data. The "without" baseline uses a 0-column B (proper no-input model).
+    sm_nofit = GaussianStateModel(;
+        A=0.5*Matrix{Float64}(I, D, D),
+        Q=Matrix{Float64}(I, D, D),
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=zeros(D),
+    )
+    om_nofit = GaussianObservationModel(;
+        C=randn(MersenneTwister(101), p, D), R=Matrix{Float64}(I, p, p), d=zeros(p),
+    )
+    lds_nofit = LinearDynamicalSystem(sm_nofit, om_nofit; kalman_filter=false)
+    elbos_no = fit!(lds_nofit, y_seq; max_iter=80, progress=false)
+
+    @test elbos[end] > elbos_no[end] + 1.0  # controls help, by a lot for these data
+end
+
+function test_td_sampling_zero_input_matches_no_control()
+    # With control_seq present but u ≡ 0 and B = 0, sampling should match
+    # the no-control case (same RNG seed).
+    D, p, Tt = 3, 4, 25
+    rng = MersenneTwister(7)
+    sm = GaussianStateModel(;
+        A=0.6*Matrix{Float64}(I, D, D),
+        Q=0.2*Matrix{Float64}(I, D, D),
+        x0=randn(rng, D),
+        P0=Matrix{Float64}(I, D, D),
+        b=randn(rng, D),
+        B=zeros(D, 2),
+    )
+    om = GaussianObservationModel(;
+        C=randn(rng, p, D), R=0.1*Matrix{Float64}(I, p, p), d=zeros(p),
+    )
+    lds = LinearDynamicalSystem(sm, om; kalman_filter=false)
+
+    u_zero = zeros(2, Tt)
+    rng1 = MersenneTwister(42)
+    x1, y1 = rand(rng1, lds, Tt; control_seq=u_zero)
+
+    # Reset state-model to a 0-column B and call without control_seq.
+    sm2 = GaussianStateModel(;
+        A=sm.A, Q=sm.Q, x0=sm.x0, P0=sm.P0, b=sm.b,
+    )
+    lds2 = LinearDynamicalSystem(sm2, om; kalman_filter=false)
+    rng2 = MersenneTwister(42)
+    x2, y2 = rand(rng2, lds2, Tt)
+
+    @test x1 ≈ x2 atol=1e-12
+    @test y1 ≈ y2 atol=1e-12
 end
 
 function test_kalman_rejects_poisson_obs()
