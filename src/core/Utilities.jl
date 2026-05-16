@@ -368,12 +368,10 @@ function block_tridiagonal_inverse_logdet!(
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
     n = length(B)
+    bs = ws.block_size
 
     D = ws.D
     E = ws.E
-    M = ws.M
-    term1 = ws.term1
-    term2 = ws.term2
     S = ws.S
     Ibs = ws.Ibs
     Z = ws.Z
@@ -384,52 +382,49 @@ function block_tridiagonal_inverse_logdet!(
     # Accumulate log-determinant during forward sweep
     logdet_val = zero(T)
 
-    # Forward sweep for D - accumulate logdet from Schur complement factors
+    # Forward sweep — caches each Schur complement's Cholesky upper-triangle
+    # factor into `ws.chol_factors[i]` so `block_tridiagonal_backsubst!` can
+    # reuse them per trial.
     for i in 1:n
         Ai = (i == 1) ? Z : A[i - 1]
         Ci = (i <= length(C)) ? C[i] : Z
 
-        copyto!(M, B[i])
-        mul!(M, Ai, D[i], -one(T), one(T))
-        F = lu!(M)
+        Mi = ws.chol_factors[i]
+        copyto!(Mi, B[i])
+        mul!(Mi, Ai, D[i], -one(T), one(T))
+        F = cholesky!(Symmetric(Mi, :U))
 
-        # Accumulate log|det(M_i)| from LU factors
-        # det(LU) = det(L) * det(U) = 1 * prod(diag(U))
-        # With pivoting, det = (-1)^p * prod(diag(U)) where p = number of row swaps
-        # For logdet, we sum log|diag(U)|
-        # Note: F.factors stores L\U in place; diagonal is U's diagonal (L has unit diagonal)
-        factors = F.factors
-        bs = size(M, 1)
+        # log|det(Mᵢ)| = 2·Σ log U[j,j] for the cached upper factor.
         for j in 1:bs
-            logdet_val += log(abs(factors[j, j]))
+            logdet_val += 2 * log(Mi[j, j])
         end
 
         ldiv!(D[i + 1], F, Ci)
     end
 
-    # Backward sweep for E
+    # Backward sweep — uses `ws.M` as scratch; not cached (per-trial backsubst
+    # only needs the forward-sweep factors + D arrays).
+    M = ws.M
     for i in n:-1:1
         Ci = (i <= length(C)) ? C[i] : Z
         Ai = (i == 1) ? Z : A[i - 1]
 
         copyto!(M, B[i])
         mul!(M, Ci, E[i + 1], -one(T), one(T))
-        F = lu!(M)
+        F = cholesky!(Symmetric(M, :U))
         ldiv!(E[i], F, Ai)
     end
 
-    # Compute diagonal blocks -> p_smooth[:,:,i]
+    # Diagonal blocks -> p_smooth[:,:,i] via the SPD closed form
+    # `Σᵢ = (Bᵢ - Aᵢ₋₁·Dᵢ - Cᵢ·Eᵢ₊₁)⁻¹`. 
     for i in 1:n
-        copyto!(term1, Ibs)
-        mul!(term1, D[i + 1], E[i + 1], -one(T), one(T))
-
         Ai = (i == 1) ? Z : A[i - 1]
-        copyto!(term2, B[i])
-        mul!(term2, Ai, D[i], -one(T), one(T))
+        Ci = (i <= length(C)) ? C[i] : Z
 
-        mul!(S, term2, term1)
-        F = lu!(S)
-
+        copyto!(S, B[i])
+        mul!(S, Ai, D[i], -one(T), one(T))         # S -= Aᵢ₋₁·Dᵢ
+        mul!(S, Ci, E[i + 1], -one(T), one(T))     # S -= Cᵢ·Eᵢ₊₁
+        F = cholesky!(Symmetric(S, :U))
         @views ldiv!(p_smooth[:, :, i], F, Ibs)
     end
 
@@ -450,6 +445,76 @@ Compute Gaussian entropy from the log-determinant of the precision matrix.
 """
 function gaussian_entropy_from_logdet(logdet_precision::T, n::Int) where {T<:Real}
     return T(0.5) * (n * (1 + log(2π)) - logdet_precision)
+end
+
+"""
+    block_tridiagonal_backsubst!(x, A, b, ws, n)
+
+Solve `H x = b` for the block tridiagonal `H` with lower off-diagonals `A`,
+**using the Cholesky factors cached in `ws` by a prior
+`block_tridiagonal_inverse_logdet!` call**. No factorization is performed
+here — just the per-trial RHS forward elimination and the back-substitution
+against `ws.D` (modified upper diagonals) and `ws.chol_factors` (the
+per-block Cholesky factor of each SPD modified diagonal).
+
+`x` and `b` are length `n * bs` vectors. The cached factors must correspond to
+the same `H` blocks the caller passed to `block_tridiagonal_inverse_logdet!`;
+calling this with a stale cache produces silently wrong results.
+
+This is the per-trial half of the cov-cache fast path: the cov pass runs once
+per E-step on a single workspace (filling the Cholesky cache); every
+per-trial Newton solve then calls back into this function instead of
+`block_tridiagonal_solve!`, saving an `O(T · D³)` factorization per trial.
+"""
+function block_tridiagonal_backsubst!(
+    x::AbstractVector{T},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    b::AbstractVector{T},
+    ws::BlockTridiagonalWorkspace{T},
+    n::Int,
+) where {T<:Real}
+    bs = ws.block_size
+    D = ws.D
+
+    # Block 1: x₁ = F₁ \ b₁  (Cholesky solve against cached upper factor)
+    @views copyto!(x[1:bs], b[1:bs])
+    F1 = LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[1], 'U', 0)
+    @views ldiv!(F1, x[1:bs])
+
+    # Forward elim of the RHS only — the modified diagonals are already
+    # factored in ws.chol_factors[i].
+    for i in 2:n
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_prev_start = (i - 2) * bs + 1
+        idx_prev_end = (i - 1) * bs
+
+        @views copyto!(x[idx_start:idx_end], b[idx_start:idx_end])
+        # b̃ᵢ = bᵢ - Aᵢ₋₁ · x[i-1]
+        @views mul!(
+            x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end],
+            -one(T), one(T),
+        )
+        Fi = LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[i], 'U', 0)
+        @views ldiv!(Fi, x[idx_start:idx_end])
+    end
+
+    # Back-substitution: x[i] -= D[i+1] · x[i+1]. `D[i+1]` was filled by
+    # `block_tridiagonal_inverse_logdet!` during its forward sweep as
+    # `B̃ᵢ⁻¹ · Cᵢ`, which is exactly the modified upper diagonal needed here.
+    for i in (n - 1):-1:1
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_next_start = i * bs + 1
+        idx_next_end = (i + 1) * bs
+
+        @views mul!(
+            x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end],
+            -one(T), one(T),
+        )
+    end
+
+    return x
 end
 
 """

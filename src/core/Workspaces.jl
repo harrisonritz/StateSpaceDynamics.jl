@@ -34,6 +34,7 @@ struct BlockTridiagonalWorkspace{T<:Real}
     neg_diag::Vector{Matrix{T}}
     neg_sub::Vector{Matrix{T}}
     neg_super::Vector{Matrix{T}}
+    chol_factors::Vector{Matrix{T}}
 end
 
 """
@@ -65,6 +66,8 @@ function BlockTridiagonalWorkspace(
     neg_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
     neg_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
 
+    chol_factors = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
+
     return BlockTridiagonalWorkspace{T}(
         block_size,
         n_blocks,
@@ -84,6 +87,7 @@ function BlockTridiagonalWorkspace(
         neg_diag,
         neg_sub,
         neg_super,
+        chol_factors,
     )
 end
 
@@ -203,6 +207,39 @@ struct SmoothWorkspace{T<:Real}
     rho_obs::Vector{T}             # (obs_dim,) - variance correction
     CP_obs::Matrix{T}              # (obs_dim × latent_dim) - C * P_t
     CEz_obs::Vector{T}             # (obs_dim,) - C * E[x_t]
+
+    # Shared smoothed-covariance storage for the equal-length multi-trial fast
+    # path. The BT Hessian (and therefore its inverse) is observation-
+    # independent; when all trials of a fit share the same length, the
+    # smoothed covariances `P_smooth[t]` and cross-covariances `P_smooth[t,t-1]`
+    # are computed once on a designated workspace and aliased by every trial's
+    # `FilterSmooth.p_smooth` / `p_smooth_tt1` field. Mirrors the Kalman
+    # path's `p_smooth_shared` / `p_smooth_tt1_shared` pattern.
+    p_smooth_shared::Array{T,3}      # (latent_dim, latent_dim, tsteps)
+    p_smooth_tt1_shared::Array{T,3}  # (latent_dim, latent_dim, tsteps)
+
+    # Aggregator output buffers, sized to match the shapes of
+    # `SufficientStatistics`. The TD aggregator writes per-trial GEMM/SYRK
+    # contributions into these, then wraps them as PDMats once per E-step.
+    # Reused across iterations (only the contents change).
+    td_init_xy::Matrix{T}              # (1, latent_dim)         Σₙ x_init
+    td_dyn_xy::Matrix{T}               # (dyn_reg_dim, D)        Σₙ Σₜ [x_{t-1};1;u_{t-1}] xₜ'
+    td_obs_xy::Matrix{T}               # (obs_reg_dim, p)        Σₙ Σₜ [xₜ;1;vₜ] yₜ'
+
+    # Cross-trial smoothed-covariance accumulators
+    td_sum_smooth_cov_prev::Matrix{T}  # (D, D)  Σₙ Σ_{t=1:Tₙ-1} P_smooth[t]
+    td_sum_smooth_cov_next::Matrix{T}  # (D, D)  Σₙ Σ_{t=2:Tₙ}   P_smooth[t]
+    td_sum_smooth_cov_all::Matrix{T}   # (D, D)  Σₙ Σ_{t=1:Tₙ}   P_smooth[t]
+    td_sum_smooth_xcov::Matrix{T}      # (D, D)  Σₙ Σ_{t=2:Tₙ}   P_smooth_tt1[t]
+
+    # Constant aggregates over the input data (filled once at fit entry, not
+    # touched again). The y-only / v-only blocks of obs_xx, obs_xy, obs_yy and
+    # the u-only blocks of dyn_xx are observation-independent so we cache them
+    # here to skip re-summing every E-step.
+    td_obs_yy_const::Matrix{T}         # (p, p)                Σₙ Σₜ yₜ yₜ'
+    td_obs_xy_const::Matrix{T}         # (obs_reg_dim, p)      bias + v-rows of obs_xy
+    td_obs_xx_const::Matrix{T}         # (obs_reg_dim, obs_reg_dim) bias / v blocks
+    td_dyn_xx_const::Matrix{T}         # (dyn_reg_dim, dyn_reg_dim) bias / u blocks
 end
 
 """
@@ -323,6 +360,25 @@ function SmoothWorkspace(
     CP_obs = zeros(T, obs_dim, latent_dim)
     CEz_obs = zeros(T, obs_dim)
 
+    # Shared smoothed-covariance storage for the equal-length multi-trial
+    # fast path (filled once per E-step on the designated workspace, then
+    # aliased by every trial's FilterSmooth).
+    p_smooth_shared = zeros(T, latent_dim, latent_dim, tsteps)
+    p_smooth_tt1_shared = zeros(T, latent_dim, latent_dim, tsteps)
+
+    # Kalman-style aggregator buffers
+    td_init_xy = zeros(T, 1, latent_dim)
+    td_dyn_xy = zeros(T, dyn_reg_dim, latent_dim)
+    td_obs_xy = zeros(T, obs_reg_dim, obs_dim)
+    td_sum_smooth_cov_prev = zeros(T, latent_dim, latent_dim)
+    td_sum_smooth_cov_next = zeros(T, latent_dim, latent_dim)
+    td_sum_smooth_cov_all = zeros(T, latent_dim, latent_dim)
+    td_sum_smooth_xcov = zeros(T, latent_dim, latent_dim)
+    td_obs_yy_const = zeros(T, obs_dim, obs_dim)
+    td_obs_xy_const = zeros(T, obs_reg_dim, obs_dim)
+    td_obs_xx_const = zeros(T, obs_reg_dim, obs_reg_dim)
+    td_dyn_xx_const = zeros(T, dyn_reg_dim, dyn_reg_dim)
+
     return SmoothWorkspace{T}(
         btd,
         R_buf,
@@ -398,6 +454,19 @@ function SmoothWorkspace(
         rho_obs,
         CP_obs,
         CEz_obs,
+        p_smooth_shared,
+        p_smooth_tt1_shared,
+        td_init_xy,
+        td_dyn_xy,
+        td_obs_xy,
+        td_sum_smooth_cov_prev,
+        td_sum_smooth_cov_next,
+        td_sum_smooth_cov_all,
+        td_sum_smooth_xcov,
+        td_obs_yy_const,
+        td_obs_xy_const,
+        td_obs_xx_const,
+        td_dyn_xx_const,
     )
 end
 
@@ -467,6 +536,39 @@ function compute_smooth_constants!(
     ws.x_t .*= -one(T)
 
     return nothing
+end
+
+"""
+    _copy_smooth_constants!(dst::SmoothWorkspace, src::SmoothWorkspace)
+
+Copy all fields populated by `compute_smooth_constants!` from `src` to `dst`.
+Used by the equal-length multi-trial fast path to amortize the constants —
+`_precompute_shared_cov!` runs `compute_smooth_constants!` once on the
+designated workspace, and each per-task worker copies into its own
+`SmoothWorkspace` instead of recomputing the Cholesky factors and derived
+terms per trial. The copies are pure `copyto!` over fixed-size matrices and
+do not allocate.
+
+Only the Gaussian-observation set of fields is copied; Poisson fits don't
+go through the cov-cache fast path.
+"""
+function _copy_smooth_constants!(
+    dst::SmoothWorkspace{T}, src::SmoothWorkspace{T}
+) where {T<:Real}
+    copyto!(dst.R_chol_U, src.R_chol_U)
+    copyto!(dst.Q_chol_U, src.Q_chol_U)
+    copyto!(dst.P0_chol_U, src.P0_chol_U)
+    copyto!(dst.tmp_RC, src.tmp_RC)
+    copyto!(dst.tmp_QA, src.tmp_QA)
+    copyto!(dst.C_inv_R, src.C_inv_R)
+    copyto!(dst.A_inv_Q, src.A_inv_Q)
+    copyto!(dst.H_sub_entry, src.H_sub_entry)
+    copyto!(dst.H_super_entry, src.H_super_entry)
+    copyto!(dst.yt_given_xt, src.yt_given_xt)
+    copyto!(dst.xt_given_xt_1, src.xt_given_xt_1)
+    copyto!(dst.xt1_given_xt, src.xt1_given_xt)
+    copyto!(dst.x_t, src.x_t)
+    return dst
 end
 
 function compute_smooth_constants!(

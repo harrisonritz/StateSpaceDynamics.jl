@@ -142,17 +142,96 @@ function test_kalman_fit_matches_newton()
 end
 
 function test_kalman_covariance_shared_across_trials()
-    # The original test indexed `kws[1].smooth_cov === kws[2].smooth_cov`,
+    # The original Kalman test indexed `kws[1].smooth_cov === kws[2].smooth_cov`,
     # but the current `KalmanWorkspace` is a single struct shared across all
-    # trials (not a per-trial collection) — `kws[i]` is no longer defined.
-    # The semantic property the test wanted to assert ("covariance storage is
-    # shared across trials") is now structurally true: only one
-    # KalmanWorkspace exists per fit, and `kws.smooth_cov` / `kws.filt_cov`
-    # are populated once per E-step and read by every trial. Marked broken
-    # until the assertion is re-expressed against the new API (e.g. by
-    # checking that per-trial FilterSmooth.p_smooth aliases
-    # KalmanWorkspace.p_smooth_shared).
-    @test_skip false
+    # trials — that property is structurally true and not amenable to a
+    # `===` test. For the TD path (the new cov-sharing fast path), each
+    # `FilterSmooth.p_smooth` is aliased to the shared workspace array after
+    # a multi-trial equal-length fit; we can check that directly.
+    D, p, Tt, N = 3, 4, 20, 5
+    rng = MersenneTwister(123)
+    sm = GaussianStateModel(;
+        A=0.6*Matrix{Float64}(I, D, D),
+        Q=0.2*Matrix{Float64}(I, D, D),
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=zeros(D),
+    )
+    om = GaussianObservationModel(;
+        C=randn(rng, p, D), R=0.1*Matrix{Float64}(I, p, p), d=zeros(p),
+    )
+    lds_td = LinearDynamicalSystem(sm, om; kalman_filter=false)
+    _, y_seq = rand(rng, lds_td, fill(Tt, N))
+
+    # Trigger one smooth! (multi-trial, equal-length → fast path).
+    tsteps_per_trial = [size(yt, 2) for yt in y_seq]
+    tfs = SSD.initialize_FilterSmooth(lds_td, tsteps_per_trial)
+    T_max = maximum(tsteps_per_trial)
+    sws_pool = [
+        SSD.SmoothWorkspace(Float64, lds_td.latent_dim, lds_td.obs_dim, T_max)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    SSD.smooth!(lds_td, tfs, y_seq, sws_pool)
+
+    # All trials' p_smooth must alias the shared storage on sws_pool[1].
+    shared_p = sws_pool[1].p_smooth_shared
+    shared_p_tt1 = sws_pool[1].p_smooth_tt1_shared
+    for trial in 1:N
+        @test tfs[trial].p_smooth === shared_p
+        @test tfs[trial].p_smooth_tt1 === shared_p_tt1
+    end
+
+    # Entropy should also be identical across trials (depends only on the
+    # shared covariance via its log-determinant).
+    for trial in 2:N
+        @test tfs[trial].entropy == tfs[1].entropy
+    end
+end
+
+function test_td_shared_cov_matches_per_trial_path()
+    # Sanity check: the cov-sharing fast path produces the same smoothed
+    # estimates as a brute-force per-trial smoother on the same data. We
+    # exercise the slow path by feeding *variable*-length trials (one shorter
+    # than the others) so the fast path is skipped — the shared-cov code path
+    # should still produce numerically equivalent results to running the
+    # equal-length smoother per trial.
+    D, p, Tt, N = 3, 4, 25, 4
+    rng = MersenneTwister(321)
+    sm = GaussianStateModel(;
+        A=0.7*Matrix{Float64}(I, D, D),
+        Q=0.15*Matrix{Float64}(I, D, D),
+        x0=zeros(D),
+        P0=Matrix{Float64}(I, D, D),
+        b=0.1*ones(D),
+    )
+    om = GaussianObservationModel(;
+        C=randn(rng, p, D), R=0.1*Matrix{Float64}(I, p, p), d=zeros(p),
+    )
+    lds = LinearDynamicalSystem(sm, om; kalman_filter=false)
+    _, y_seq = rand(rng, lds, fill(Tt, N))
+
+    # Fast path (equal-length, multi-trial).
+    tfs_fast = SSD.initialize_FilterSmooth(lds, fill(Tt, N))
+    sws_pool = [
+        SSD.SmoothWorkspace(Float64, D, p, Tt) for _ in 1:Threads.maxthreadid()
+    ]
+    SSD.smooth!(lds, tfs_fast, y_seq, sws_pool)
+
+    # Per-trial reference path: run single-trial `smooth!` once per trial.
+    refs_x = Vector{Matrix{Float64}}(undef, N)
+    refs_p = Vector{Array{Float64,3}}(undef, N)
+    for trial in 1:N
+        fs = SSD.initialize_FilterSmooth(lds, Tt)
+        sws = SSD.SmoothWorkspace(Float64, D, p, Tt)
+        SSD.smooth!(lds, fs, y_seq[trial], sws)
+        refs_x[trial] = copy(fs.x_smooth)
+        refs_p[trial] = copy(fs.p_smooth)
+    end
+
+    for trial in 1:N
+        @test tfs_fast[trial].x_smooth ≈ refs_x[trial] atol=1e-9
+        @test tfs_fast[trial].p_smooth ≈ refs_p[trial] atol=1e-9
+    end
 end
 
 function test_kalman_with_B_input_equivalent_to_bias()

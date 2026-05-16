@@ -99,13 +99,47 @@ function test_block_tridiagonal_inverse_mutating()
     end
 end
 
+# Build a random SPD block tridiagonal matrix by forming `H = L Lᵀ` for a
+# block-bidiagonal `L`. This matches the precondition of
+# `block_tridiagonal_inverse_logdet!`, which factors the SPD Schur
+# complements via Cholesky.
+function _random_spd_block_tridiag(::Type{T}, block_size::Int, n::Int, rng) where {T<:Real}
+    # Block-bidiagonal L: diagonal L_diag and lower off-diagonal L_off.
+    L_diag = Matrix{T}[
+        T(2.0) * Matrix{T}(I, block_size, block_size) +
+        T(0.3) * randn(rng, T, block_size, block_size) for _ in 1:n
+    ]
+    L_off = Matrix{T}[
+        T(0.3) * randn(rng, T, block_size, block_size) for _ in 1:(n - 1)
+    ]
+    # Assemble L (lower block-bidiagonal) densely, then H = L Lᵀ.
+    Ldense = zeros(T, n * block_size, n * block_size)
+    for i in 1:n
+        rows = ((i - 1) * block_size + 1):(i * block_size)
+        Ldense[rows, rows] = L_diag[i]
+        if i < n
+            rows_next = (i * block_size + 1):((i + 1) * block_size)
+            Ldense[rows_next, rows] = L_off[i]
+        end
+    end
+    H = Ldense * Ldense'
+    H = (H + H') / 2  # exact symmetry
+    # Extract the block tridiagonal pieces.
+    A = Matrix{T}[copy(H[(i * block_size + 1):((i + 1) * block_size),
+                         ((i - 1) * block_size + 1):(i * block_size)]) for i in 1:(n - 1)]
+    B = Matrix{T}[copy(H[((i - 1) * block_size + 1):(i * block_size),
+                         ((i - 1) * block_size + 1):(i * block_size)]) for i in 1:n]
+    C = Matrix{T}[copy(transpose(A[i])) for i in 1:(n - 1)]
+    return A, B, C, H
+end
+
 function test_block_tridiagonal_inverse_logdet()
     rng = MersenneTwister(7)
     T = Float64
     block_size = 3
     n = 5
 
-    A, B, C, H = _random_block_tridiag(T, block_size, n, rng)
+    A, B, C, H = _random_spd_block_tridiag(T, block_size, n, rng)
     expected_logdet = logdet(H)
 
     ws = StateSpaceDynamics.BlockTridiagonalWorkspace(T, block_size, n)

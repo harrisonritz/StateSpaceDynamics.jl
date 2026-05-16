@@ -36,3 +36,6 @@ benchmarking/benchmark.jl.claude/worktrees/
 /.claude
 /benchmarking/results
 CLAUDE.md
+
+# Local profiling sandbox (never committed)
+/dev/

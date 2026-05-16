@@ -162,6 +162,7 @@ include("helper_functions.jl")
             test_kalman_missing_u_errors()
             test_td_fit_with_dynamics_input()
             test_td_sampling_zero_input_matches_no_control()
+            test_td_shared_cov_matches_per_trial_path()
         end
 
         include("LinearDynamicalSystems/PoissonLDS.jl")
