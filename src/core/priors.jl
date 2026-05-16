@@ -101,8 +101,6 @@ the cached Cholesky of `XX + Λ` is reused (PDMats handles the addition).
     return transpose((XX + prior.Λ) \ (XY + prior.Λ * prior.M₀'))
 end
 
-@inline function mn_map(
-    XX::AbstractMatrix{T}, XY::AbstractMatrix{T}, ::Nothing
-) where {T}
+@inline function mn_map(XX::AbstractMatrix{T}, XY::AbstractMatrix{T}, ::Nothing) where {T}
     return transpose(XX \ XY)
 end

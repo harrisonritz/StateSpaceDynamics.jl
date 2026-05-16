@@ -392,9 +392,7 @@ function test_EM_matlab()
         b=zeros(2),
     )
 
-    pom = PoissonObservationModel(;
-        C=[1.2 1.2; 1.2 1.2; 1.2 1.2], d=[0.1, 0.1, 0.1]
-    )
+    pom = PoissonObservationModel(; C=[1.2 1.2; 1.2 1.2; 1.2 1.2], d=[0.1, 0.1, 0.1])
 
     plds = LinearDynamicalSystem(;
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 6)
@@ -537,13 +535,13 @@ function test_poisson_low_rate_recovery()
 
         # Simulation truth: latent dynamics decoupled from emissions (C = 0)
         # so observed mean rate is exactly exp(d).
-        A_true  = 0.9 .* Matrix{Float64}(I, D, D)
-        Q_true  = 0.05 .* Matrix{Float64}(I, D, D)
-        b_true  = zeros(D)
+        A_true = 0.9 .* Matrix{Float64}(I, D, D)
+        Q_true = 0.05 .* Matrix{Float64}(I, D, D)
+        b_true = zeros(D)
         x0_true = zeros(D)
         P0_true = 0.05 .* Matrix{Float64}(I, D, D)
-        C_true  = zeros(P, D)
-        d_true  = log.(true_rates)               # d = log(rate) since C ≡ 0
+        C_true = zeros(P, D)
+        d_true = log.(true_rates)               # d = log(rate) since C ≡ 0
 
         sm_true = GaussianStateModel(A=A_true, Q=Q_true, b=b_true, x0=x0_true, P0=P0_true)
         om_true = PoissonObservationModel(C=C_true, d=d_true)
@@ -559,8 +557,11 @@ function test_poisson_low_rate_recovery()
 
         # Fit from a different starting point (rate ≈ 1 spikes/bin baseline).
         sm_fit = GaussianStateModel(
-            A=copy(A_true), Q=copy(Q_true), b=copy(b_true),
-            x0=copy(x0_true), P0=copy(P0_true),
+            A=copy(A_true),
+            Q=copy(Q_true),
+            b=copy(b_true),
+            x0=copy(x0_true),
+            P0=copy(P0_true),
         )
         om_fit = PoissonObservationModel(C=zeros(P, D), d=zeros(P))
         plds_fit = LinearDynamicalSystem(sm_fit, om_fit)

@@ -492,8 +492,7 @@ function block_tridiagonal_backsubst!(
         @views copyto!(x[idx_start:idx_end], b[idx_start:idx_end])
         # b̃ᵢ = bᵢ - Aᵢ₋₁ · x[i-1]
         @views mul!(
-            x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end],
-            -one(T), one(T),
+            x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end], -one(T), one(T)
         )
         Fi = LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[i], 'U', 0)
         @views ldiv!(Fi, x[idx_start:idx_end])
@@ -509,8 +508,7 @@ function block_tridiagonal_backsubst!(
         idx_next_end = (i + 1) * bs
 
         @views mul!(
-            x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end],
-            -one(T), one(T),
+            x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end], -one(T), one(T)
         )
     end
 

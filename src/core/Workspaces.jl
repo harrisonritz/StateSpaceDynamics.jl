@@ -257,8 +257,7 @@ Either being zero (the default) means no inputs — buffers fit `[A b]` and/or
 `[C d]` only.
 """
 function SmoothWorkspace(
-    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
-    u_dim::Int=0, d_dim::Int=0,
+    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int; u_dim::Int=0, d_dim::Int=0
 ) where {T<:Real}
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 

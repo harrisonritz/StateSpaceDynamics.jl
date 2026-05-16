@@ -74,7 +74,7 @@ function _fit_kalman!(
         # elbo = marginal_loglikelihood(lds, kws)
         # elbo = compute_elbo(lds, suf, kws)        
         mstep!(lds, suf, kws)
-        elbo = compute_elbo(lds, suf, kws)        
+        elbo = compute_elbo(lds, suf, kws)
 
         # report progress
         push!(elbos, elbo)
@@ -128,9 +128,7 @@ end
     obs_reg_dim = latent_dim + 1 + d_dim
 
     y_wide = reshape(data.y, size(data.y, 1), size(data.y, 2)*size(data.y, 3));
-    u_wide = reshape(
-        data.u[:, 1:(end - 1), :], u_dim, (size(data.u, 2)-1)*size(data.u, 3)
-    );
+    u_wide = reshape(data.u[:, 1:(end - 1), :], u_dim, (size(data.u, 2)-1)*size(data.u, 3));
     d_wide = reshape(data.d, d_dim, size(data.d, 2)*size(data.d, 3));
 
     # Matrix{T}(I, dim, dim) is fully type-stable; `diagm(ones(T, dim))`
@@ -158,7 +156,8 @@ end
         sum_u = sum(u_wide; dims=2)                                     # u_dim × 1
         kws.dyn_xx_buf[latent_dim + 1, (latent_dim + 2):end] .= vec(sum_u)
         kws.dyn_xx_buf[(latent_dim + 2):end, latent_dim + 1] .= vec(sum_u)
-        kws.dyn_xx_buf[(latent_dim + 2):end, (latent_dim + 2):end] .= tol_PD(u_wide*u_wide').mat
+        kws.dyn_xx_buf[(latent_dim + 2):end, (latent_dim + 2):end] .=
+            tol_PD(u_wide*u_wide').mat
     end
 
     # Observation Gram matrix layout (same pattern as dynamics).
@@ -169,7 +168,8 @@ end
         sum_d = sum(d_wide; dims=2)                                     # d_dim × 1
         kws.obs_xx_buf[latent_dim + 1, (latent_dim + 2):end] .= vec(sum_d)
         kws.obs_xx_buf[(latent_dim + 2):end, latent_dim + 1] .= vec(sum_d)
-        kws.obs_xx_buf[(latent_dim + 2):end, (latent_dim + 2):end] .= tol_PD(d_wide*d_wide').mat
+        kws.obs_xx_buf[(latent_dim + 2):end, (latent_dim + 2):end] .=
+            tol_PD(d_wide*d_wide').mat
     end
 
     # obs_xy: regress y on [x; 1; d]. The constant and d rows are observation-
@@ -425,7 +425,9 @@ function backwards_cov!(
             kws.sum_smooth_cov_next .+= kws.smooth_cov[tt].mat;
         end
 
-        mul!(kws.sum_smooth_xcov, kws.G[:, :, tt], kws.smooth_cov[tt + 1].mat, one(T), one(T));
+        mul!(
+            kws.sum_smooth_xcov, kws.G[:, :, tt], kws.smooth_cov[tt + 1].mat, one(T), one(T)
+        );
 
         # entropy contribution of backward-conditional cov
         # ent_logdet += logdet(kws.filt_cov[tt]) .+ logdet_Q .- logdet(kws.pred_cov[tt + 1])
@@ -433,7 +435,11 @@ function backwards_cov!(
     end
 
     kws.shared_entropy[] =
-        T(0.5) * (kws.tsteps * kws.latent_dim * (one(T) + log(T(2π))) + ent_logdet + (kws.tsteps-1) * logdet(kws.Q_PD[]))
+        T(0.5) * (
+            kws.tsteps * kws.latent_dim * (one(T) + log(T(2π))) +
+            ent_logdet +
+            (kws.tsteps-1) * logdet(kws.Q_PD[])
+        )
 
     return kws
 end
@@ -485,7 +491,7 @@ end
 function backwards_mean!(kws::KalmanWorkspace{T}) where {T<:Real}
     kws.smooth_mean[:, end, :] .= kws.filt_mean[:, end, :];
 
-    @views for tt in eachindex(kws.pred_icov)[(end-1):-1:1]
+    @views for tt in eachindex(kws.pred_icov)[(end - 1):-1:1]
         kws.mean_tmp .= kws.smooth_mean[:, tt + 1, :] .- kws.pred_mean[:, tt + 1, :];
         mul!(kws.smooth_mean[:, tt, :], kws.G[:, :, tt], kws.mean_tmp, one(T), zero(T));
         kws.smooth_mean[:, tt, :] .+= kws.filt_mean[:, tt, :];
@@ -630,9 +636,7 @@ end
 # Sharing `mn_map` with `core/priors.jl` means the same math will eventually
 # back the tridiag and Poisson M-steps after their Phase 2 migration.
 
-function regress(
-    XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, ::Nothing
-) where {T<:Real}
+function regress(XX::PDMat{T,Matrix{T}}, XY::AbstractMatrix{T}, ::Nothing) where {T<:Real}
     return transpose(XX \ XY)
 end
 
@@ -677,9 +681,9 @@ function est_cov(
     # `prior.Λ` is a plain `Matrix`. Matrix-of-matrix triple product is a
     # one-liner here and avoids a cholesky-of-Λ wrap per E-step.
     WmΛWmT = Wm * prior.Λ * Wm'
-    Cov = (
-        YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ WmΛWmT .+ (prior_df * prior_mu)
-    ) / (N + prior_df)
+    Cov =
+        (YY .- Wxy .- Wxy' .+ X_A_Xt(XX, W) .+ WmΛWmT .+ (prior_df * prior_mu)) /
+        (N + prior_df)
     return Cov
 end
 
@@ -942,13 +946,14 @@ end
 function marginal_loglikelihood(
     lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    
     total_ll = zero(T)
     # kws.obs_pd_tmp[] = PDMat(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
     MV = MvNormal(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
 
     Cmu = zeros(T, lds.obs_dim, kws.tsteps * kws.ntrials)
-    mul!(Cmu, lds.obs_model.C, reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials))
+    mul!(
+        Cmu, lds.obs_model.C, reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials)
+    )
     kws.innovation .= kws.y_minus_d .- reshape(Cmu, kws.obs_dim, kws.tsteps, kws.ntrials)
 
     @views for t in eachindex(kws.pred_cov)

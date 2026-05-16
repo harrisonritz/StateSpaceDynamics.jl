@@ -128,9 +128,7 @@ function GaussianStateModel(
     )
 end
 
-function GaussianStateModel(
-    A::M, Q::M, B::M, P0::M
-) where {T<:Real,M<:AbstractMatrix{T}}
+function GaussianStateModel(A::M, Q::M, B::M, P0::M) where {T<:Real,M<:AbstractMatrix{T}}
     return GaussianStateModel{T,M,Vector{T}}(;
         A=A,
         Q=Q,
@@ -150,12 +148,7 @@ function GaussianObservationModel(
     C::M, R::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     return GaussianObservationModel{T,M,V}(;
-        C=C,
-        R=R,
-        d=d,
-        D=zeros(eltype(C), size(C, 1), 0),
-        R_prior=nothing,
-        CD_prior=nothing,
+        C=C, R=R, d=d, D=zeros(eltype(C), size(C, 1), 0), R_prior=nothing, CD_prior=nothing
     )
 end
 
@@ -214,7 +207,11 @@ function Base.show(io::IO, pom::PoissonObservationModel; gap="")
     else
         println(io, gap, " C    = $(round.(pom.C, digits=2))")
         println(io, gap, " d    = $(round.(pom.d, sigdigits = 3))")
-        println(io, gap, " rate = $(round.(exp.(pom.d), digits = 2))   # exp(d) for inspection only")
+        println(
+            io,
+            gap,
+            " rate = $(round.(exp.(pom.d), digits = 2))   # exp(d) for inspection only",
+        )
     end
 
     return nothing

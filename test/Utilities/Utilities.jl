@@ -109,9 +109,7 @@ function _random_spd_block_tridiag(::Type{T}, block_size::Int, n::Int, rng) wher
         T(2.0) * Matrix{T}(I, block_size, block_size) +
         T(0.3) * randn(rng, T, block_size, block_size) for _ in 1:n
     ]
-    L_off = Matrix{T}[
-        T(0.3) * randn(rng, T, block_size, block_size) for _ in 1:(n - 1)
-    ]
+    L_off = Matrix{T}[T(0.3) * randn(rng, T, block_size, block_size) for _ in 1:(n - 1)]
     # Assemble L (lower block-bidiagonal) densely, then H = L Lᵀ.
     Ldense = zeros(T, n * block_size, n * block_size)
     for i in 1:n
@@ -125,10 +123,22 @@ function _random_spd_block_tridiag(::Type{T}, block_size::Int, n::Int, rng) wher
     H = Ldense * Ldense'
     H = (H + H') / 2  # exact symmetry
     # Extract the block tridiagonal pieces.
-    A = Matrix{T}[copy(H[(i * block_size + 1):((i + 1) * block_size),
-                         ((i - 1) * block_size + 1):(i * block_size)]) for i in 1:(n - 1)]
-    B = Matrix{T}[copy(H[((i - 1) * block_size + 1):(i * block_size),
-                         ((i - 1) * block_size + 1):(i * block_size)]) for i in 1:n]
+    A = Matrix{T}[
+        copy(
+            H[
+                (i * block_size + 1):((i + 1) * block_size),
+                ((i - 1) * block_size + 1):(i * block_size),
+            ],
+        ) for i in 1:(n - 1)
+    ]
+    B = Matrix{T}[
+        copy(
+            H[
+                ((i - 1) * block_size + 1):(i * block_size),
+                ((i - 1) * block_size + 1):(i * block_size),
+            ],
+        ) for i in 1:n
+    ]
     C = Matrix{T}[copy(transpose(A[i])) for i in 1:(n - 1)]
     return A, B, C, H
 end
