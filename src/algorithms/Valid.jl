@@ -322,14 +322,10 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     # Check observation model dimensions and properties
     _validate_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
 
-    # Check fit_bool length
-    expected_fit_length = if lds.obs_model isa PoissonObservationModel
-        5
-    elseif lds.kalman_filter
-        8
-    else
-        6
-    end
+    # Check fit_bool length. Gaussian path (BTD and Kalman) uses length 6 —
+    # the regression M-step fits A&b&B and C&d&D jointly, so flag layout is
+    # the same across backends.
+    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end

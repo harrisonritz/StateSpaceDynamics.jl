@@ -970,7 +970,6 @@ struct KalmanWorkspace{T<:Real}
     CiRY::Array{T,3}         # (D, T, ntrials)
     y_minus_d::Array{T,3}    # (p, T, ntrials)
     innovation::Array{T,3}   # (p, T, ntrials)
-    # Dd::Array{T,3}           # (p, T, ntrials)
 
     x_prev::Matrix{T}
     x_next::Matrix{T}
@@ -1085,7 +1084,6 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         zeros(T, D, tsteps, ntrials),   # CiRY
         zeros(T, p, tsteps, ntrials),   # y_minus_d
         zeros(T, p, tsteps, ntrials),   # innovations
-        # zeros(T, p, tsteps, ntrials),   # Dd
         zeros(T, D, (tsteps-1)*ntrials),# x_prev
         zeros(T, D, (tsteps-1)*ntrials),# x_next
         zeros(T, D, ntrials),           # x_init

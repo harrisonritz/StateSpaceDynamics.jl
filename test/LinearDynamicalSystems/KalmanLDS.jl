@@ -373,6 +373,72 @@ function test_kalman_rejects_poisson_obs()
     @test_throws Exception LinearDynamicalSystem(sm, om; kalman_filter=true)
 end
 
+function test_kalman_fit_bool_freezes_params()
+    # Kalman mstep! must honor fit_bool: when a flag is false, the corresponding
+    # parameter (or parameter group) is left bit-exact unchanged across EM iters.
+    D, p, Tt, N = 3, 4, 30, 4
+    rng = MersenneTwister(202605)
+    A0 = SSD.random_rotation_matrix(D, rng)
+    Q0 = 0.1 * Matrix{Float64}(I, D, D)
+    x0_0 = randn(rng, D)
+    P0_0 = 0.5 * Matrix{Float64}(I, D, D)
+    C0 = randn(rng, p, D)
+    R0 = 0.2 * Matrix{Float64}(I, p, p)
+    b0 = randn(rng, D)
+    d0 = randn(rng, p)
+
+    function make_lds(fit_bool)
+        sm = GaussianStateModel(; A=copy(A0), Q=copy(Q0), x0=copy(x0_0), P0=copy(P0_0), b=copy(b0))
+        om = GaussianObservationModel(; C=copy(C0), R=copy(R0), d=copy(d0))
+        return LinearDynamicalSystem(sm, om; kalman_filter=true, fit_bool=fit_bool)
+    end
+
+    # Generate data from the fit_bool=all-true baseline.
+    lds_data = make_lds(fill(true, 6))
+    y = _simulate_lds(lds_data, Tt, N)
+
+    # Freeze each parameter individually and verify it is bit-exact unchanged.
+    cases = [
+        (1, :x0,  lds -> copy(lds.state_model.x0)),
+        (2, :P0,  lds -> copy(lds.state_model.P0)),
+        (3, :A,   lds -> (copy(lds.state_model.A), copy(lds.state_model.b))),
+        (4, :Q,   lds -> copy(lds.state_model.Q)),
+        (5, :C,   lds -> (copy(lds.obs_model.C), copy(lds.obs_model.d))),
+        (6, :R,   lds -> copy(lds.obs_model.R)),
+    ]
+    for (idx, _name, getter) in cases
+        flags = fill(true, 6); flags[idx] = false
+        lds = make_lds(flags)
+        snap = getter(lds)
+        fit!(lds, y; max_iter=3, progress=false)
+        @test getter(lds) == snap
+    end
+
+    # All-false: nothing changes.
+    lds_frozen = make_lds(fill(false, 6))
+    snap_all = (
+        copy(lds_frozen.state_model.A),
+        copy(lds_frozen.state_model.b),
+        copy(lds_frozen.state_model.Q),
+        copy(lds_frozen.state_model.x0),
+        copy(lds_frozen.state_model.P0),
+        copy(lds_frozen.obs_model.C),
+        copy(lds_frozen.obs_model.d),
+        copy(lds_frozen.obs_model.R),
+    )
+    fit!(lds_frozen, y; max_iter=3, progress=false)
+    @test snap_all == (
+        copy(lds_frozen.state_model.A),
+        copy(lds_frozen.state_model.b),
+        copy(lds_frozen.state_model.Q),
+        copy(lds_frozen.state_model.x0),
+        copy(lds_frozen.state_model.P0),
+        copy(lds_frozen.obs_model.C),
+        copy(lds_frozen.obs_model.d),
+        copy(lds_frozen.obs_model.R),
+    )
+end
+
 function test_kalman_missing_u_errors()
     D, p, T, N = 2, 3, 15, 2
     B = Matrix{Float64}(I, D, D)

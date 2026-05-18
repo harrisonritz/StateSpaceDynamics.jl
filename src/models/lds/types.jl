@@ -86,7 +86,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
 } <: AbstractObservationModel{T}
     C::M
     R::M
-    d::Union{Nothing,V}
+    d::V
     D::M = zeros(eltype(C), size(C, 1), 0)  # eltype-preserving default
     R_prior::Union{Nothing,IWPrior{T}} = nothing
     CD_prior::Union{Nothing,MNPrior{T,M}} = nothing
@@ -237,9 +237,9 @@ Represents a unified Linear Dynamical System with customizable state and observa
 - `latent_dim::Int`: Dimension of the latent state
 - `obs_dim::Int`: Dimension of the observations
 - `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
-    Length 6 for the default Gaussian path (`[x0, P0, A&b, Q, C&d, R]`), length 5 for the
-    Poisson path (`[x0, P0, A&b, Q, C&d]`), and length 8 when `kalman_filter=true`
-    (`[x0, P0, A, Q, C, R, B, D]`).
+    Length 6 for the Gaussian path (`[x0, P0, A&b&B, Q, C&d&D, R]`) — same layout for
+    both the BTD and Kalman backends, since the M-step regression fits each row jointly.
+    Length 5 for the Poisson path (`[x0, P0, A&b, Q, C&d]`).
 - `kalman_filter::Bool`: If `true`, use the information-form Kalman/RTS smoother for the
     E-step. Only valid with `GaussianObservationModel`. Defaults to `false`, preserving
     the existing block-tridiagonal MAP path.
@@ -275,16 +275,17 @@ function LinearDynamicalSystem(
     obs_input_dim =
         hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 0
 
-    # Set default fit_bool based on observation model type / Kalman flag
+    # Set default fit_bool based on observation model type.
+    # Kalman and TD paths share the same length-6 layout because both M-steps
+    # fit [A b B] and [C d D] as joint regressions — the previous length-8
+    # "[x0, P0, A, Q, C, R, B, D]" variant decomposed flags that the math
+    # cannot honor independently.
     if fit_bool === nothing
         if obs_model isa PoissonObservationModel
-            # For Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
+            # Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
             fit_bool = [true, true, true, true, true]
-        elseif kalman_filter
-            # Kalman-path Gaussian: [x0, P0, A, Q, C, R, B, D] (length 8)
-            fit_bool = [true, true, true, true, true, true, true, true]
         else
-            # For Tridiagonal Gaussian: [x0, P0, A&b, Q, C&d, R] (6 parameters)
+            # Gaussian (BTD and Kalman): [x0, P0, A&b&B, Q, C&d&D, R] (6 parameters)
             fit_bool = [true, true, true, true, true, true]
         end
     end
@@ -321,11 +322,12 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     if lds.obs_model isa PoissonObservationModel
         # C and d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
-    elseif lds.kalman_filter && length(lds.fit_bool) == 8
-        labels = ["x0", "P0", "A", "Q", "C", "R", "B", "D"]
-        prms = labels[lds.fit_bool]
     else
-        prms = ["x0", "P0", "A (and b)", "Q", "C (and d)", "R"][lds.fit_bool[1:6]]
+        # Same labels for BTD and Kalman backends (length 6). The compound
+        # entries "A (and b, B)" / "C (and d, D)" reflect that each row is
+        # fit jointly as one regression — the bias and user-input columns
+        # are not gated independently.
+        prms = ["x0", "P0", "A (and b, B)", "Q", "C (and d, D)", "R"][lds.fit_bool[1:6]]
     end
 
     println(io, gap, "  $(join(prms, ", "))")

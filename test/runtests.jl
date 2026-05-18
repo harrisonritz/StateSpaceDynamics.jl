@@ -149,6 +149,10 @@ include("helper_functions.jl")
                 test_gaussian_iw_priors_shape_map_and_R_sanity()
                 test_gaussian_update_R_matches_residual_cov()
                 test_gaussian_weighting_equiv_to_duplication()
+                test_td_aggregator_matches_legacy_mstep()
+                test_td_mn_priors_shrink()
+                test_td_with_obs_control_seq()
+                test_td_ragged_multi_trial()
             end
         end
 
@@ -160,6 +164,7 @@ include("helper_functions.jl")
             test_kalman_with_B_input_equivalent_to_bias()
             test_kalman_rejects_poisson_obs()
             test_kalman_missing_u_errors()
+            test_kalman_fit_bool_freezes_params()
             test_td_fit_with_dynamics_input()
             test_td_sampling_zero_input_matches_no_control()
             test_td_shared_cov_matches_per_trial_path()

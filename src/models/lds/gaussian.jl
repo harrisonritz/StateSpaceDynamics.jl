@@ -1872,6 +1872,34 @@ function calculate_elbo(
         prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
     end
 
+    # MN-prior log-prior contributions for [A b B] (dynamics) and [C d D] (obs).
+    # Required for ELBO monotonicity under MN priors — the M-step's `mn_map`
+    # update + the IW posterior scale modification together maximize the
+    # MAP objective, but without this term the displayed ELBO drops the
+    # MN-quadratic piece and can appear non-monotone.
+    if lds.state_model.AB_prior !== nothing
+        D = lds.latent_dim
+        u_dim = lds.state_input_dim
+        W_ab = view(sws.AB, :, 1:(D + 1 + u_dim))
+        copyto!(view(W_ab, :, 1:D), lds.state_model.A)
+        copyto!(view(W_ab, :, D + 1), lds.state_model.b)
+        if u_dim > 0
+            copyto!(view(W_ab, :, (D + 2):(D + 1 + u_dim)), lds.state_model.B)
+        end
+        prior_term += mn_logprior_term(W_ab, lds.state_model.Q, lds.state_model.AB_prior)
+    end
+    if lds.obs_model.CD_prior !== nothing
+        D = lds.latent_dim
+        d_dim = lds.obs_input_dim
+        W_cd = view(sws.CD, :, 1:(D + 1 + d_dim))
+        copyto!(view(W_cd, :, 1:D), lds.obs_model.C)
+        copyto!(view(W_cd, :, D + 1), lds.obs_model.d)
+        if d_dim > 0
+            copyto!(view(W_cd, :, (D + 2):(D + 1 + d_dim)), lds.obs_model.D)
+        end
+        prior_term += mn_logprior_term(W_cd, lds.obs_model.R, lds.obs_model.CD_prior)
+    end
+
     return Q_total + prior_term + total_entropy
 end
 
@@ -3020,7 +3048,6 @@ function filter_loglikelihood(
                 mul!(P_p, tmp_DD, A')
                 P_p .+= Q
                 Symmetrize!(P_p)
-                # P_p .= (P_p .+ P_p') .* T(0.5)
             end
 
             # Innovation: e = y_t - C x_p - d
@@ -3032,7 +3059,6 @@ function filter_loglikelihood(
             mul!(Smat, C, PCt)
             Smat .+= R
             Symmetrize!(Smat)
-            # Smat .= (Smat .+ Smat') .* T(0.5)
 
             # One-step predictive log-likelihood: log N(e; 0, S)
             S_ch = cholesky(Hermitian(Smat))
@@ -3050,7 +3076,6 @@ function filter_loglikelihood(
             mul!(P_f, PCt, SiPCt)
             P_f .= P_p .- P_f
             Symmetrize!(P_f)
-            # P_f .= (P_f .+ P_f') .* T(0.5)
         end
     end
 

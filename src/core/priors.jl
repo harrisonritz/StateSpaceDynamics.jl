@@ -104,3 +104,30 @@ end
 @inline function mn_map(XX::AbstractMatrix{T}, XY::AbstractMatrix{T}, ::Nothing) where {T}
     return transpose(XX \ XY)
 end
+
+"""
+    mn_logprior_term(W, Σ, prior) -> Real
+
+W-dependent part of the matrix-normal log prior `log p(W | Σ)` evaluated at the
+current `(W, Σ)`. Drops Σ- and Λ-only constants that the IW prior + the `mn_map`
+M-step already cover, leaving the quadratic term
+
+    -½ tr(Σ^{-1} (W - M₀) Λ (W - M₀)')
+
+This is the contribution the ELBO needs to display the true MAP objective when
+an `MNPrior` is set on a regression coefficient (e.g. `[A b B]` or `[C d D]`).
+Without it, EM is still maximizing the right thing internally, but the displayed
+ELBO can decrease under strong shrinkage — see git log for the fix context.
+"""
+@inline function mn_logprior_term(
+    W::AbstractMatrix{T}, Σ::AbstractMatrix{T}, prior::MNPrior{T}
+) where {T<:Real}
+    Wm = W .- prior.M₀
+    # tr(Σ^{-1} Wm Λ Wm') = tr(Λ Wm' Σ^{-1} Wm); pick the cheaper order based
+    # on shape, but both are k × k after the trace, so just go left-to-right.
+    M = Wm * prior.Λ * Wm'
+    F = cholesky(Symmetric(Σ))
+    return -T(0.5) * tr(F \ M)
+end
+
+@inline mn_logprior_term(W::AbstractMatrix, ::AbstractMatrix, ::Nothing) = zero(eltype(W))

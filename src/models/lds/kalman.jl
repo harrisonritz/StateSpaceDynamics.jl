@@ -27,8 +27,6 @@
 #   trial's view would corrupt all trials.
 # =============================================================================
 
-# using BenchmarkTools
-
 """
     _fit_kalman!(lds, y; control_seq, obs_control_seq, max_iter, tol, progress)
 
@@ -214,8 +212,6 @@ end
 end
 
 # ==== E-STEP =============================================================================
-
-# using BenchmarkTools
 
 """
     estep!(lds, suf, kws::KalmanWorkspace, data::Data)
@@ -430,7 +426,6 @@ function backwards_cov!(
         );
 
         # entropy contribution of backward-conditional cov
-        # ent_logdet += logdet(kws.filt_cov[tt]) .+ logdet_Q .- logdet(kws.pred_cov[tt + 1])
         ent_logdet += logdet(kws.filt_cov[tt]) .- logdet(kws.pred_cov[tt + 1])
     end
 
@@ -450,9 +445,6 @@ function smooth_mean!(
     lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     forwards_mean!(lds, kws)
-    # bench = @benchmark forwards_mean!($lds, $kws) samples=100
-    # display(bench)
-
     return backwards_mean!(kws)
 end
 
@@ -477,7 +469,6 @@ function forwards_mean!(
             one(T),
             one(T),
         );
-        # kws.pred_mean[:,tt,:] .+= kws.Bu[:,tt-1,:];
 
         mul!(kws.mean_tmp, kws.pred_icov[tt].mat, kws.pred_mean[:, tt, :], one(T), zero(T));
         kws.mean_tmp .+= kws.CiRY[:, tt, :];
@@ -501,7 +492,6 @@ function backwards_mean!(kws::KalmanWorkspace{T}) where {T<:Real}
 end
 
 # ==== SUFFICIENT STATISTICS =============================================================================
-# using BenchmarkTools
 
 function sym_syrk!(out, x::Matrix{T}) where {T<:Real}
     BLAS.syrk!('U', 'N', one(T), x, one(T), out)
@@ -521,19 +511,6 @@ end
 
     return PDMat(xx)
 end
-
-# @inline function aggregate_xx(
-#     smooth_mean::Matrix{T}, 
-#     smooth_cov::AbstractVector{PDMat{T,Matrix{T}}}, 
-#     ntrials::Int
-#     )::PDMat{T,Matrix{T}} where {T<:Real}
-
-#     xx = sum(smooth_cov).mat*ntrials;
-#     sym_syrk!(xx, smooth_mean)
-
-#     return tol_PD(xx)
-
-# end
 
 @views @inline function sufficient_statistics!(
     suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}, data::Data{T}
@@ -690,73 +667,115 @@ end
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
-    # TODO: include filt_bool
-
-    # initials ===============================================
-    # x0 = (Σ x_init) / ntrials, expressed as a 1×1 → D×1 regression so the
-    # same `regress`/`est_cov` machinery feeds into P0 via the empirical scatter.
-    x0_mat = regress(suf.init_xx[], suf.init_xy, nothing)  # D × 1
-
-    P0 = est_cov(
-        x0_mat,
-        suf.init_xx[],
-        suf.init_xy,
-        suf.init_yy[],
-        suf.init_n,
-        nothing,
-        kws.P0_df,
-        kws.P0_mu,
-    )
-
-    lds.state_model.x0 .= vec(x0_mat)
-    lds.state_model.P0 .= P0
-
-    # dynamics ===============================================
-    # Regression returns [A b B] across columns: A at 1:D, bias at D+1, user-B
-    # at D+2:end (empty when state_input_dim == 0).
-    AbB = regress(suf.dyn_xx[], suf.dyn_xy, kws.AB_prior)
     D_lat = kws.latent_dim
 
-    Q = est_cov(
-        AbB,
-        suf.dyn_xx[],
-        suf.dyn_xy,
-        suf.dyn_yy[],
-        suf.dyn_n,
-        kws.AB_prior,
-        kws.Q_df,
-        kws.Q_mu,
-    )
-
-    lds.state_model.A .= view(AbB, :, 1:D_lat)
-    lds.state_model.b .= view(AbB, :, D_lat + 1)
-    if kws.state_input_dim > 0
-        lds.state_model.B .= view(AbB, :, (D_lat + 2):size(AbB, 2))
+    # initials =================================================
+    # fit_bool[1] gates x0, fit_bool[2] gates P0. They share the same scatter,
+    # so we run the regression only if at least one flag is set, then assign
+    # selectively. (P0 uses the freshly-updated x0; if x0 is frozen, the
+    # existing model x0 is used in the scatter.)
+    if lds.fit_bool[1] || lds.fit_bool[2]
+        x0_mat = regress(suf.init_xx[], suf.init_xy, nothing)  # D × 1
+        if lds.fit_bool[2]
+            x0_used = lds.fit_bool[1] ? x0_mat : reshape(lds.state_model.x0, D_lat, 1)
+            P0 = est_cov(
+                x0_used,
+                suf.init_xx[],
+                suf.init_xy,
+                suf.init_yy[],
+                suf.init_n,
+                nothing,
+                kws.P0_df,
+                kws.P0_mu,
+            )
+            lds.state_model.P0 .= P0
+        end
+        if lds.fit_bool[1]
+            lds.state_model.x0 .= vec(x0_mat)
+        end
     end
-    lds.state_model.Q .= Q
 
-    # observations ===============================================
-    # Regression returns [C d_bias D]: C at 1:D, obs-bias at D+1, user-D at D+2:end.
-    CdD = regress(suf.obs_xx[], suf.obs_xy, kws.CD_prior)
+    # dynamics =================================================
+    # fit_bool[3] gates the joint [A b B] regression; fit_bool[4] gates Q.
+    # Q's residual scatter depends on the regression coefficient, so when Q
+    # is fit but [A b B] is frozen, use the existing state-model values.
+    if lds.fit_bool[3] || lds.fit_bool[4]
+        AbB = if lds.fit_bool[3]
+            regress(suf.dyn_xx[], suf.dyn_xy, kws.AB_prior)
+        else
+            # Reassemble current model [A b B] for Q's scatter; never written back.
+            buf = Matrix{T}(undef, D_lat, D_lat + 1 + kws.state_input_dim)
+            buf[:, 1:D_lat] .= lds.state_model.A
+            buf[:, D_lat + 1] .= lds.state_model.b
+            if kws.state_input_dim > 0
+                buf[:, (D_lat + 2):end] .= lds.state_model.B
+            end
+            buf
+        end
 
-    R = est_cov(
-        CdD,
-        suf.obs_xx[],
-        suf.obs_xy,
-        suf.obs_yy[],
-        suf.obs_n,
-        kws.CD_prior,
-        kws.R_df,
-        kws.R_mu,
-    )
+        if lds.fit_bool[4]
+            Q = est_cov(
+                AbB,
+                suf.dyn_xx[],
+                suf.dyn_xy,
+                suf.dyn_yy[],
+                suf.dyn_n,
+                kws.AB_prior,
+                kws.Q_df,
+                kws.Q_mu,
+            )
+            lds.state_model.Q .= Q
+        end
 
-    lds.obs_model.C .= view(CdD, :, 1:D_lat)
-    lds.obs_model.d .= view(CdD, :, D_lat + 1)
-    if kws.obs_input_dim > 0
-        lds.obs_model.D .= view(CdD, :, (D_lat + 2):size(CdD, 2))
+        if lds.fit_bool[3]
+            lds.state_model.A .= view(AbB, :, 1:D_lat)
+            lds.state_model.b .= view(AbB, :, D_lat + 1)
+            if kws.state_input_dim > 0
+                lds.state_model.B .= view(AbB, :, (D_lat + 2):size(AbB, 2))
+            end
+        end
     end
-    return lds.obs_model.R .= R
+
+    # observations =============================================
+    # fit_bool[5] gates the joint [C d D] regression; fit_bool[6] gates R.
+    # Same residual-scatter dependency as Q above.
+    if lds.fit_bool[5] || lds.fit_bool[6]
+        CdD = if lds.fit_bool[5]
+            regress(suf.obs_xx[], suf.obs_xy, kws.CD_prior)
+        else
+            buf = Matrix{T}(undef, kws.obs_dim, D_lat + 1 + kws.obs_input_dim)
+            buf[:, 1:D_lat] .= lds.obs_model.C
+            buf[:, D_lat + 1] .= lds.obs_model.d
+            if kws.obs_input_dim > 0
+                buf[:, (D_lat + 2):end] .= lds.obs_model.D
+            end
+            buf
+        end
+
+        if lds.fit_bool[6]
+            R = est_cov(
+                CdD,
+                suf.obs_xx[],
+                suf.obs_xy,
+                suf.obs_yy[],
+                suf.obs_n,
+                kws.CD_prior,
+                kws.R_df,
+                kws.R_mu,
+            )
+            lds.obs_model.R .= R
+        end
+
+        if lds.fit_bool[5]
+            lds.obs_model.C .= view(CdD, :, 1:D_lat)
+            lds.obs_model.d .= view(CdD, :, D_lat + 1)
+            if kws.obs_input_dim > 0
+                lds.obs_model.D .= view(CdD, :, (D_lat + 2):size(CdD, 2))
+            end
+        end
+    end
+
+    return lds
 end
 
 # ==== COMPUTE ELBO =============================================================================
@@ -907,48 +926,10 @@ function compute_elbo(
     return elbo
 end
 
-# function marginal_loglikelihood(
-#     lds::LinearDynamicalSystem{T,S,O},
-#     kws::KalmanWorkspace{T},
-# ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-
-#     total_ll = zero(T)
-#     CVCR = PDMat(Matrix(I(lds.obs_dim))) # placeholder, will be updated in loop
-#     Cmu = zeros(T, lds.obs_dim)
-#     MV = MvNormal(Cmu, CVCR)
-
-#     @inline @views for t in eachindex(kws.pred_cov)
-
-#         CVCR = tol_PD(X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
-
-#         @inline @views for n in 1:kws.ntrials
-
-#             mul!(Cmu, lds.obs_model.C, kws.pred_mean[:,t,n])
-#             MV = MvNormal(Cmu, CVCR)
-#             total_ll += logpdf(MV, kws.y_minus_d[:,t,n]);
-
-#         end
-#     end
-
-#     return total_ll
-
-# end
-
-# function logpdf_sum!(
-#     MV::MvNormal{T,PDMat{T,Matrix{T}}},
-#     x::AbstractVector{T},
-#     out::T,
-# ) where {T<:Real} 
-# out += Distributions.logpdf(MV, x)
-# out
-# end
-
 function marginal_loglikelihood(
     lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     total_ll = zero(T)
-    # kws.obs_pd_tmp[] = PDMat(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
-    MV = MvNormal(Matrix{T}(I, lds.obs_dim, lds.obs_dim))
 
     Cmu = zeros(T, lds.obs_dim, kws.tsteps * kws.ntrials)
     mul!(
