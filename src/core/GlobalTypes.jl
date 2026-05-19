@@ -72,20 +72,24 @@ Base.length(f::TrialFilterSmooth) = length(f.FilterSmooths)
 
 mutable struct SufficientStatistics{T<:Real}
 
-    # initial conditions
-    init_n::Int
+    # initial conditions. `init_n` is the effective sample count (e.g.
+    # `ntrials` for unweighted fits; `Σₙ w[n,1]` for SLDS-style soft
+    # responsibility weights). Stored as `T` rather than `Int` so the
+    # weighted aggregator can flow non-integer counts through the M-step
+    # without truncation.
+    init_n::T
     init_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     init_xy::Matrix{T}
     init_yy::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # transitions model
-    dyn_n::Int
+    dyn_n::T
     dyn_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     dyn_xy::Matrix{T}
     dyn_yy::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # observation model
-    obs_n::Int
+    obs_n::T
     obs_xx::Base.RefValue{PDMat{T,Matrix{T}}}
     obs_xy::Matrix{T}
     obs_yy::Base.RefValue{PDMat{T,Matrix{T}}}

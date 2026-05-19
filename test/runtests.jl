@@ -30,16 +30,21 @@ include("helper_functions.jl")
 
         @testset "JET.jl Code Linting" begin
             if VERSION >= v"1.11"
-                # JET reports ~6 union-split false positives in the Kalman
-                # workspace path: `@views` indexing into `KalmanWorkspace`
-                # array fields (kws.G[:, :, t], kws.x_prev, etc.) makes JET
-                # see SubArray{Any, …} on one branch of its inference union
-                # split, even though the runtime types are concrete and the
-                # functional tests (KalmanLDS testset, low-rate Poisson
-                # recovery, gradient parity) all pass. Skipped until the
-                # Kalman-path workspace types tighten enough to satisfy
-                # JET; replace with `JET.test_package(...)` once the
-                # warnings clear.
+                # JET reports ~19 union-split false positives, all from the
+                # same pattern: `@views` over a workspace field typed
+                # `Array{T,3}` / `Vector{PDMat{T,Matrix{T}}}` produces a
+                # `maybeview` whose return JET infers as
+                # `Union{SubArray{Any, …}, SubArray{T, …}}`. The `Any` branch
+                # then fails to match downstream `BLAS.ger!` / `BLAS.syrk!` /
+                # `Symmetrize!` / `X_A_Xt` / `logpdf` signatures. Affected
+                # callsites are entirely in `kalman.jl` (`backwards_cov!`,
+                # `sufficient_statistics!`, `marginal_loglikelihood`) and the
+                # TD aggregator in `gaussian.jl` (uses `sws.p_smooth_shared`
+                # and the legacy `S0_sum` outer product). Runtime types are
+                # concrete and all functional tests pass — fixing requires
+                # narrowing each field access with a `::Vector{...}` /
+                # `::Array{T,3}` assertion, which is a follow-up. Replace
+                # with `JET.test_package(...)` once those land.
                 @test_skip JET.test_package(
                     StateSpaceDynamics; target_modules=(StateSpaceDynamics,)
                 )
@@ -150,6 +155,7 @@ include("helper_functions.jl")
                 test_gaussian_update_R_matches_residual_cov()
                 test_gaussian_weighting_equiv_to_duplication()
                 test_td_aggregator_matches_legacy_mstep()
+                test_td_weighted_aggregator_matches_legacy()
                 test_td_mn_priors_shrink()
                 test_td_with_obs_control_seq()
                 test_td_ragged_multi_trial()

@@ -192,19 +192,19 @@ end
 
     return SufficientStatistics{T}(
         # initial conditions
-        ntrials,                                        # init_n
+        T(ntrials),                                     # init_n
         Ref(tol_PD(init_xx)),                           # init_xx (1×1, holds ntrials)
         zeros(T, 1, latent_dim),                        # init_xy (1×D, holds Σ x_init)
         Ref(PD_init(T, latent_dim)),                    # init_yy
 
         # dynamics model
-        (tsteps - 1.0) * ntrials,                       # dyn_n
+        T((tsteps - 1) * ntrials),                      # dyn_n
         Ref(PDMat(init_dyn_xx)),                        # dyn_xx
         zeros(T, dyn_reg_dim, latent_dim),              # dyn_xy
         Ref(PD_init(T, latent_dim)),                    # dyn_yy
 
         # observation model
-        tsteps * ntrials,                               # obs_n
+        T(tsteps * ntrials),                            # obs_n
         Ref(PDMat(init_obs_xx)),                        # obs_xx
         obs_xy,                                         # obs_xy
         Ref(tol_PD(obs_yy)),                            # obs_yy
@@ -518,7 +518,7 @@ end
 
     # initial conditions -------
     kws.x_init .= kws.smooth_mean[:, 1, :]
-    suf.init_n = kws.ntrials
+    suf.init_n = T(kws.ntrials)
     # init_xx is preset to [ntrials] (1×1) by initialize_SufficientStatistics.
     # init_xy: row vector Σ_n x_init[:, n], shape (1, D).
     fill!(suf.init_xy, zero(T))
@@ -526,7 +526,7 @@ end
         suf.init_xy[1, i] += kws.x_init[i, n]
     end
     # init_yy
-    suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1].mat, suf.init_n);
+    suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1].mat, kws.ntrials);
 
     # transitions -------
     # Regression layout: regress x_next on [x_prev; 1; u_prev] to fit [A b B].
@@ -534,9 +534,10 @@ end
     # user inputs (if any) occupy `latent_dim + 2 : end`.
     D = kws.latent_dim
     u_dim = kws.state_input_dim
-    suf.dyn_n = (kws.tsteps - 1) * kws.ntrials
-    kws.x_prev .= reshape(kws.smooth_mean[:, 1:(end - 1), :], D, suf.dyn_n)
-    kws.x_next .= reshape(kws.smooth_mean[:, 2:end, :], D, suf.dyn_n)
+    dyn_n_int = (kws.tsteps - 1) * kws.ntrials
+    suf.dyn_n = T(dyn_n_int)
+    kws.x_prev .= reshape(kws.smooth_mean[:, 1:(end - 1), :], D, dyn_n_int)
+    kws.x_next .= reshape(kws.smooth_mean[:, 2:end, :], D, dyn_n_int)
 
     # Reuse the preallocated workspace buffer; the constant blocks at the bias
     # row/col and uᵀu sub-matrix are populated once in
@@ -556,7 +557,7 @@ end
     end
     # Top-right user-input block: x_prev · u_prevᵀ (only if user inputs present)
     if u_dim > 0
-        u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, suf.dyn_n)
+        u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, dyn_n_int)
         mul!(dyn_xx[1:D, (D + 2):end], kws.x_prev, u_prev', one(T), zero(T))
     end
     LinearAlgebra.copytri!(dyn_xx, 'U')
@@ -571,7 +572,7 @@ end
         suf.dyn_xy[D + 1, j] += kws.x_next[j, n]
     end
     if u_dim > 0
-        u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, suf.dyn_n)
+        u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, dyn_n_int)
         mul!(suf.dyn_xy[(D + 2):end, :], u_prev, kws.x_next', one(T), zero(T))
     end
     # dyn_yy
@@ -580,9 +581,10 @@ end
     # observations -------
     # Same layout: regress y on [x; 1; d] to fit [C d_bias D].
     d_dim = kws.obs_input_dim
-    suf.obs_n = kws.tsteps * kws.ntrials
-    kws.x_cur .= reshape(kws.smooth_mean, D, suf.obs_n)
-    y_cur = reshape(data.y, kws.obs_dim, suf.obs_n)
+    obs_n_int = kws.tsteps * kws.ntrials
+    suf.obs_n = T(obs_n_int)
+    kws.x_cur .= reshape(kws.smooth_mean, D, obs_n_int)
+    y_cur = reshape(data.y, kws.obs_dim, obs_n_int)
 
     obs_xx = kws.obs_xx_buf
     obs_xx[1:D, 1:D] .= kws.sum_smooth_cov_all .* kws.ntrials
@@ -593,7 +595,7 @@ end
         obs_xx[i, D + 1] += kws.x_cur[i, n]
     end
     if d_dim > 0
-        d_cur = reshape(data.d, d_dim, suf.obs_n)
+        d_cur = reshape(data.d, d_dim, obs_n_int)
         mul!(obs_xx[1:D, (D + 2):end], kws.x_cur, d_cur', one(T), zero(T))
     end
     LinearAlgebra.copytri!(obs_xx, 'U')
@@ -631,7 +633,7 @@ function est_cov(
     XX::PDMat{T,Matrix{T}},
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
-    N::Int,
+    N::Real,
     ::Nothing,
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
@@ -646,7 +648,7 @@ function est_cov(
     XX::PDMat{T,Matrix{T}},
     XY::AbstractMatrix{T},
     YY::PDMat{T,Matrix{T}},
-    N::Int,
+    N::Real,
     prior::MNPrior{T},
     prior_df::Int,
     prior_mu::AbstractMatrix{T},
@@ -780,12 +782,15 @@ end
 
 # ==== COMPUTE ELBO =============================================================================
 
-# full priors
+# full priors. `n` / `vN` are `Real` rather than `Int` so the SLDS / weighted
+# aggregator path (where effective sample sizes are Σₙ w[n,1] ∈ ℝ) flows
+# through unchanged. Integer values still hit these signatures via implicit
+# Int <: Real subtyping.
 function log_post(
-    n::Int,
+    n::Real,
     v::Int,
     v0::Int,
-    vN::Int,
+    vN::Real,
     lam0::PDMat{T,Matrix{T}},
     lamN::PDMat{T,Matrix{T}},
     Sig0::Matrix{T},
@@ -798,10 +803,10 @@ end;
 
 # no beta prior
 function log_post(
-    n::Int,
+    n::Real,
     v::Int,
     v0::Int,
-    vN::Int,
+    vN::Real,
     lam0::Nothing,
     lamN::PDMat{T,Matrix{T}},
     Sig0::Matrix{T},
@@ -814,9 +819,9 @@ end;
 
 # no cov prior
 function log_post(
-    n::Int,
+    n::Real,
     v::Int,
-    vN::Int,
+    vN::Real,
     lam0::PDMat{T,Matrix{T}},
     lamN::PDMat{T,Matrix{T}},
     SigN::PDMat{T,Matrix{T}},
@@ -827,9 +832,9 @@ end;
 
 # no prior
 function log_post(
-    n::Int,
+    n::Real,
     v::Int,
-    vN::Int,
+    vN::Real,
     lam0::Nothing,
     lamN::PDMat{T,Matrix{T}},
     SigN::PDMat{T,Matrix{T}},

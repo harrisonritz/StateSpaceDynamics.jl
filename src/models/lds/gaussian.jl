@@ -1531,15 +1531,15 @@ function _initialize_td_sufficient_statistics(
     PD_init(d) = PDMat(Matrix{T}(I, d, d))
 
     return SufficientStatistics{T}(
-        ntrials,
+        T(ntrials),
         Ref(PDMat(fill(T(ntrials), 1, 1))),       # init_xx (1×1 = N)
         zeros(T, 1, D),                            # init_xy
         Ref(PD_init(D)),                           # init_yy
-        total_dyn,
+        T(total_dyn),
         Ref(PD_init(dyn_reg_dim)),                 # dyn_xx
         zeros(T, dyn_reg_dim, D),                  # dyn_xy
         Ref(PD_init(D)),                           # dyn_yy
-        total_obs,
+        T(total_obs),
         Ref(PD_init(obs_reg_dim)),                 # obs_xx
         zeros(T, obs_reg_dim, p),                  # obs_xy
         Ref(PD_init(p)),                           # obs_yy
@@ -1707,9 +1707,9 @@ function _aggregate_td_suff_stats!(
 
     # backing storage; each E-step rewraps so the cached Cholesky reflects
     # the latest aggregate.
-    suf.init_n = ntrials
-    suf.dyn_n = sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials) - ntrials
-    suf.obs_n = sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials)
+    suf.init_n = T(ntrials)
+    suf.dyn_n = T(sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials) - ntrials)
+    suf.obs_n = T(sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials))
 
     copyto!(suf.init_xy, sws.td_init_xy)
     copyto!(suf.dyn_xy, sws.td_dyn_xy)
@@ -1721,6 +1721,212 @@ function _aggregate_td_suff_stats!(
     suf.dyn_yy[] = PDMat(copy(sws.Q_sum))
     suf.obs_xx[] = PDMat(copy(sws.Szz_Cd))
     suf.obs_yy[] = PDMat(copy(sws.R_sum))
+
+    return suf
+end
+
+"""
+    _aggregate_td_suff_stats_weighted!(suf, tfs, lds, u, v, y, weights, sws)
+
+Weighted variant of `_aggregate_td_suff_stats!`. Each per-timestep
+accumulation is scaled by `weights[trial][t]`, which carries the
+responsibility γₖ,ₜ in the SLDS context (`q(zₜ = k)`).
+
+The weighted form cannot reuse the precomputed `td_*_const` blocks —
+weights change every E-step, so the data-side sums must be rebuilt fresh.
+Likewise, the cov-cache fast path is skipped (responsibilities vary across
+trials so `P_smooth[t]` is not shared in any useful way).
+
+Conventions, mirroring the legacy weighted M-step:
+- init terms use `weights[trial][1]` (responsibility at t=1)
+- dynamics factor at time t uses `weights[trial][t]` (couples xₜ₋₁ and xₜ)
+- emission at time t uses `weights[trial][t]`
+"""
+function _aggregate_td_suff_stats_weighted!(
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    weights::AbstractVector{<:AbstractVector{T}},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    D = lds.latent_dim
+    p = lds.obs_dim
+    u_dim = lds.state_input_dim
+    d_dim = lds.obs_input_dim
+    ntrials = length(tfs)
+    dyn_reg_dim = D + 1 + u_dim
+    obs_reg_dim = D + 1 + d_dim
+
+    # Clear the accumulators we'll write into.
+    init_xy = sws.td_init_xy;        fill!(init_xy, zero(T))
+    init_yy = sws.S0_sum;            fill!(init_yy, zero(T))
+    dyn_xx  = sws.Szz_Ab;            fill!(dyn_xx,  zero(T))
+    dyn_xy  = sws.td_dyn_xy;         fill!(dyn_xy,  zero(T))
+    dyn_yy  = sws.Q_sum;             fill!(dyn_yy,  zero(T))
+    obs_xx  = sws.Szz_Cd;            fill!(obs_xx,  zero(T))
+    obs_xy  = sws.td_obs_xy;         fill!(obs_xy,  zero(T))
+    obs_yy  = sws.R_sum;             fill!(obs_yy,  zero(T))
+
+    init_n_acc = zero(T)
+    dyn_n_acc  = zero(T)
+    obs_n_acc  = zero(T)
+
+    for trial in 1:ntrials
+        fs = tfs[trial]
+        x_smooth = fs.x_smooth
+        P_smooth = fs.p_smooth
+        P_smooth_tt1 = fs.p_smooth_tt1
+        y_trial = y[trial]
+        T_n = size(x_smooth, 2)
+        w = weights[trial]
+
+        # Initial term — weighted by w[1].
+        w1 = w[1]
+        @views begin
+            x1 = x_smooth[:, 1]
+            for i in 1:D
+                init_xy[1, i] += w1 * x1[i]
+            end
+            # init_yy += w1 * (x1 x1' + P_smooth[:, :, 1])
+            BLAS.ger!(w1, x1, x1, init_yy)
+            init_yy .+= w1 .* P_smooth[:, :, 1]
+        end
+        init_n_acc += w1
+
+        # Dynamics factors at t = 2..T_n.
+        @views for t in 2:T_n
+            wt = w[t]
+            x_prev = x_smooth[:, t - 1]
+            x_next = x_smooth[:, t]
+
+            # dyn_xx[1:D, 1:D] += wt * (x_prev x_prev' + P_smooth[t-1])
+            BLAS.ger!(wt, x_prev, x_prev, view(dyn_xx, 1:D, 1:D))
+            view(dyn_xx, 1:D, 1:D) .+= wt .* P_smooth[:, :, t - 1]
+            # dyn_xx bias col / row
+            for i in 1:D
+                dyn_xx[i, D + 1] += wt * x_prev[i]
+                dyn_xx[D + 1, i] += wt * x_prev[i]
+            end
+            dyn_xx[D + 1, D + 1] += wt
+
+            # dyn_xy[1:D, :] += wt * (x_prev x_next' + P_smooth_tt1[t]')
+            # cov(xₜ₋₁, xₜ) = P_smooth_tt1[t]'  (cf. unweighted aggregator).
+            BLAS.ger!(wt, x_prev, x_next, view(dyn_xy, 1:D, :))
+            view(dyn_xy, 1:D, :) .+= wt .* transpose(P_smooth_tt1[:, :, t])
+            for j in 1:D
+                dyn_xy[D + 1, j] += wt * x_next[j]
+            end
+
+            # dyn_yy += wt * (x_next x_next' + P_smooth[t])
+            BLAS.ger!(wt, x_next, x_next, dyn_yy)
+            dyn_yy .+= wt .* P_smooth[:, :, t]
+
+            # User-input cross blocks (only when u_dim > 0). The lower-tri
+            # mirror of the off-diagonal x_prev·u_prev' block is filled
+            # once at the end of the function via `copytri!(dyn_xx, 'U')`.
+            if u_dim > 0
+                u_trial = u_seq[trial]
+                u_prev = u_trial[:, t - 1]
+                # dyn_xx[1:D, D+2:end] += wt * x_prev u_prev'
+                BLAS.ger!(wt, x_prev, u_prev, view(dyn_xx, 1:D, (D + 2):dyn_reg_dim))
+                # dyn_xx[D+1, D+2:end] += wt * u_prev   (bias × u cross; mirrored later)
+                for k in 1:u_dim
+                    dyn_xx[D + 1, D + 1 + k] += wt * u_prev[k]
+                end
+                # dyn_xx[D+2:end, D+2:end] += wt * u_prev u_prev'
+                BLAS.ger!(wt, u_prev, u_prev, view(dyn_xx, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim))
+                # dyn_xy[D+2:end, :] += wt * u_prev x_next'
+                BLAS.ger!(wt, u_prev, x_next, view(dyn_xy, (D + 2):dyn_reg_dim, :))
+            end
+
+            dyn_n_acc += wt
+        end
+
+        # Mirror the symmetric dyn_xx[D+2:end, 1:D] from dyn_xx[1:D, D+2:end].
+        # (We could do this once after the loop; doing it per-trial keeps the
+        # accumulator strictly symmetric throughout.) We'll mirror at the end
+        # of the trial pass instead.
+
+        # Emissions at t = 1..T_n.
+        @views for t in 1:T_n
+            wt = w[t]
+            x_t = x_smooth[:, t]
+            y_t = y_trial[:, t]
+
+            # obs_xx[1:D, 1:D] += wt * (x_t x_t' + P_smooth[t])
+            BLAS.ger!(wt, x_t, x_t, view(obs_xx, 1:D, 1:D))
+            view(obs_xx, 1:D, 1:D) .+= wt .* P_smooth[:, :, t]
+            for i in 1:D
+                obs_xx[i, D + 1] += wt * x_t[i]
+                obs_xx[D + 1, i] += wt * x_t[i]
+            end
+            obs_xx[D + 1, D + 1] += wt
+
+            # obs_xy[1:D, :] += wt * x_t y_t'
+            BLAS.ger!(wt, x_t, y_t, view(obs_xy, 1:D, :))
+            for j in 1:p
+                obs_xy[D + 1, j] += wt * y_t[j]
+            end
+
+            # obs_yy += wt * y_t y_t'
+            BLAS.ger!(wt, y_t, y_t, obs_yy)
+
+            # Obs-input cross blocks.
+            if d_dim > 0
+                v_trial = v_seq[trial]
+                v_t = v_trial[:, t]
+                # obs_xx[1:D, D+2:end] += wt * x_t v_t'
+                BLAS.ger!(wt, x_t, v_t, view(obs_xx, 1:D, (D + 2):obs_reg_dim))
+                # obs_xx[D+1, D+2:end] / [D+2:end, D+1] += wt * v_t
+                for k in 1:d_dim
+                    obs_xx[D + 1, D + 1 + k] += wt * v_t[k]
+                    obs_xx[D + 1 + k, D + 1] += wt * v_t[k]
+                end
+                # obs_xx[D+2:end, D+2:end] += wt * v_t v_t'
+                BLAS.ger!(wt, v_t, v_t, view(obs_xx, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim))
+                # obs_xy[D+2:end, :] += wt * v_t y_t'
+                BLAS.ger!(wt, v_t, y_t, view(obs_xy, (D + 2):obs_reg_dim, :))
+            end
+
+            obs_n_acc += wt
+        end
+    end
+
+    # Mirror the symmetric u-cross block in dyn_xx (the in-loop mirror was a
+    # placeholder; do the real mirror once here using the upper half).
+    if u_dim > 0
+        @views dyn_xx[(D + 2):dyn_reg_dim, 1:D] .= transpose(dyn_xx[1:D, (D + 2):dyn_reg_dim])
+    end
+    if d_dim > 0
+        @views obs_xx[(D + 2):obs_reg_dim, 1:D] .= transpose(obs_xx[1:D, (D + 2):obs_reg_dim])
+    end
+
+    # Symmetrize PD blocks (BLAS.ger! is not symmetric and we touched the
+    # bias row/col by hand; round-trip via Symmetrize! keeps PDMat happy).
+    Symmetrize!(init_yy)
+    LinearAlgebra.copytri!(dyn_xx, 'U')   # use upper to mirror everything to lower
+    LinearAlgebra.copytri!(dyn_yy, 'U')
+    LinearAlgebra.copytri!(obs_xx, 'U')
+    LinearAlgebra.copytri!(obs_yy, 'U')
+
+    # init_xx is the (1×1) effective sample count for x_init.
+    suf.init_n = init_n_acc
+    suf.dyn_n  = dyn_n_acc
+    suf.obs_n  = obs_n_acc
+
+    copyto!(suf.init_xy, init_xy)
+    copyto!(suf.dyn_xy,  dyn_xy)
+    copyto!(suf.obs_xy,  obs_xy)
+
+    suf.init_xx[] = PDMat(fill(init_n_acc, 1, 1))
+    suf.init_yy[] = PDMat(copy(init_yy))
+    suf.dyn_xx[]  = PDMat(copy(dyn_xx))
+    suf.dyn_yy[]  = PDMat(copy(dyn_yy))
+    suf.obs_xx[]  = PDMat(copy(obs_xx))
+    suf.obs_yy[]  = PDMat(copy(obs_yy))
 
     return suf
 end
