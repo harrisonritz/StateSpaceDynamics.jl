@@ -1050,7 +1050,12 @@ M-step for SLDS.
 
 - Updates discrete parameters (`slds.A`, `slds.πₖ`) via `StatsAPI.fit!` on the discrete
   layer (uses HMMs.jl's `ξ[t2]` scratch trick).
-- Updates each LDS component using γ-weighted sufficient statistics.
+- Updates each LDS component using γ-weighted sufficient statistics aggregated
+  by `_aggregate_td_suff_stats_weighted!`. For Gaussian sub-LDSs this is the
+  full suf-based M-step (regression + IW MAP). For Poisson sub-LDSs the state-
+  side updates flow through the same suf path; the emission [C d] is updated
+  via the existing LBFGS routine (Poisson is non-conjugate and cannot be
+  folded into the regression).
 """
 function mstep!(
     slds::SLDS{T,S,O},
@@ -1068,14 +1073,38 @@ function mstep!(
     # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
     StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
 
-    # LDS-component M-step: per-trial weights are slices of fb_storage.γ.
+    # SLDS doesn't currently expose user controls; pass zero-column u/v.
+    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+
+    # One reusable SufficientStatistics; overwritten per regime by the
+    # weighted aggregator.
+    suf = _initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial)
+
     weights = Vector{AbstractVector{T}}(undef, ntrials)
     for k in 1:K
+        lds_k = slds.LDSs[k]
         for trial in 1:ntrials
             t1, t2 = HMMs.seq_limits(seq_ends, trial)
             weights[trial] = view(fb_storage.γ, k, t1:t2)
         end
-        mstep!(slds.LDSs[k], tfs, y, sws, weights)
+
+        _aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, weights, sws
+        )
+
+        if lds_k.obs_model isa GaussianObservationModel{T}
+            mstep!(lds_k, suf, sws)
+        elseif lds_k.obs_model isa PoissonObservationModel{T}
+            update_initial_state_mean!(lds_k, suf)
+            update_initial_state_covariance!(lds_k, suf)
+            update_A_b!(lds_k, suf)
+            update_Q!(lds_k, suf)
+            update_observation_model!(lds_k, tfs, y, sws, weights)
+        else
+            throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))
+        end
     end
 
     return nothing
