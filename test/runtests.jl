@@ -198,6 +198,10 @@ include("helper_functions.jl")
                 test_poisson_gradient_shape_and_finiteness()
             end
 
+            @testset "TD Aggregator (Poisson)" begin
+                test_poisson_td_aggregator_matches_legacy_mstep()
+            end
+
             @testset "EM Algorithm" begin
                 test_parameter_gradient()
                 test_initial_observation_parameter_updates()

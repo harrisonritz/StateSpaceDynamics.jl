@@ -726,8 +726,13 @@ function gradient_observation_model!(
                         fs = tfs[k]
                         weights = isnothing(w) ? nothing : w[k]
 
+                        # Pass `x_smooth` directly. `E_z = x_smooth` for a
+                        # Gaussian-state model after `sufficient_statistics!`,
+                        # so this is the same numerical value but avoids the
+                        # dependency on having run `sufficient_statistics!` —
+                        # the suf-based estep! no longer populates `fs.E_z`.
                         gradient_observation_model_single_trial!(
-                            tmp, C, d, fs.E_z, fs.p_smooth, y[k], weights
+                            tmp, C, d, fs.x_smooth, fs.p_smooth, y[k], weights
                         )
 
                         @simd for i in 1:npar
@@ -799,7 +804,9 @@ function update_observation_model!(
         for trial in 1:ntrials
             fs = tfs[trial]
             weights = isnothing(w) ? nothing : w[trial]
-            acc += Q_obs!(sws, plds, fs.E_z, fs.p_smooth, y[trial]; weights=weights)
+            # `x_smooth` is the same value as `E_z` for a Gaussian state model
+            # — see `gradient_observation_model!` for context.
+            acc += Q_obs!(sws, plds, fs.x_smooth, fs.p_smooth, y[trial]; weights=weights)
         end
 
         f_prior = zero(T)
@@ -855,6 +862,110 @@ function mstep!(
     update_Q!(plds, tfs, sws, w)
     update_observation_model!(plds, tfs, y, sws, w)
     return nothing
+end
+
+"""
+    mstep!(plds, suf, tfs, y, sws)
+
+Suf-based M-step for a Poisson LDS. The Gaussian-state half (x0, P0, A&b, Q)
+is updated from the aggregated sufficient statistics in `suf`. The Poisson
+emission `[C d]` is non-conjugate and still goes through the existing LBFGS
+routine (`update_observation_model!`) which reads `fs.x_smooth` / `fs.p_smooth`
+directly from `tfs`.
+"""
+function mstep!(
+    plds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    update_initial_state_mean!(plds, suf)
+    update_initial_state_covariance!(plds, suf)
+    update_A_b!(plds, suf)
+    update_Q!(plds, suf)
+    update_observation_model!(plds, tfs, y, sws)
+    return nothing
+end
+
+"""
+    calculate_elbo(plds, suf, tfs, y, sws_pool)
+
+Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
+
+* state-side Q-term via `Q_state!(sws, plds, suf)` from the aggregated
+  sufficient statistics (O(D³) per E-step, not O(N·T·D²)),
+* observation-side Q-term per-trial via the existing Poisson `Q_obs!`,
+  which is irreducibly non-conjugate (no aggregator equivalent),
+* posterior entropy from `tfs[trial].entropy` (filled by `smooth!`),
+* `IWPrior` log-prior contributions on `Q` and `P0`, and the MN log-prior
+  trace term on `[C d]` to match the LBFGS objective.
+"""
+function calculate_elbo(
+    plds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    ntrials = length(y)
+
+    total_entropy = zero(T)
+    for fs in tfs.FilterSmooths
+        total_entropy += fs.entropy
+    end
+
+    # State-side Q via aggregated suff-stats. `compute_smooth_constants!` on a
+    # Poisson LDS only fills state-side constants (Q_chol_U / P0_chol_U /
+    # derived blocks); `Q_state!(sws, lds, suf)` reads exactly those.
+    compute_smooth_constants!(sws_pool[1], plds)
+    Q_state_total = Q_state!(sws_pool[1], plds, suf)
+
+    # Per-trial Poisson Q_obs. Each task uses its own sws (the Poisson
+    # buffers `h_obs` / `rho_obs` / `CP_obs` / `CEz_obs` are local to sws).
+    ntasks = min(ntrials, length(sws_pool))
+    partial = zeros(T, ntasks)
+    chunksize = cld(ntrials, ntasks)
+    @sync for i in 1:ntasks
+        lo = (i - 1) * chunksize + 1
+        hi = min(i * chunksize, ntrials)
+        lo > hi && continue
+        @spawn begin
+            sws = sws_pool[i]
+            acc = zero(T)
+            for trial in lo:hi
+                fs = tfs[trial]
+                acc += Q_obs!(sws, plds, fs.x_smooth, fs.p_smooth, y[trial])
+            end
+            partial[i] = acc
+        end
+    end
+    Q_obs_total = sum(partial)
+
+    prior_term = zero(T)
+    if plds.state_model.Q_prior !== nothing
+        prior_term += iw_logprior_term(plds.state_model.Q, plds.state_model.Q_prior)
+    end
+    if plds.state_model.P0_prior !== nothing
+        prior_term += iw_logprior_term(plds.state_model.P0, plds.state_model.P0_prior)
+    end
+
+    # MN log-prior on [C d]. No row covariance Σ for Poisson, so this is the
+    # plain quadratic kernel `-½ tr((W - M₀) Λ (W - M₀)')` (matches the
+    # `+½ tr(...)` penalty `update_observation_model!` adds to its LBFGS
+    # objective). Λ-only and Λ-logdet constants are absorbed into the
+    # additive ELBO constant.
+    if plds.obs_model.CD_prior !== nothing
+        D = plds.latent_dim
+        W_cd = Matrix{T}(undef, plds.obs_dim, D + 1)
+        @views W_cd[:, 1:D] .= plds.obs_model.C
+        @views W_cd[:, D + 1] .= plds.obs_model.d
+        prior = plds.obs_model.CD_prior
+        Wm = W_cd .- prior.M₀
+        prior_term -= T(0.5) * sum(Wm .* (Wm * prior.Λ))
+    end
+
+    return Q_state_total + Q_obs_total + prior_term + total_entropy
 end
 
 """
@@ -1181,6 +1292,33 @@ function estep!(
     return elbo
 end
 
+"""
+    estep!(lds, suf, tfs, y, u_seq, v_seq, sws_pool; max_iter=20, tol=1e-6)
+
+Suf-based Poisson E-step. Smooths, aggregates state-side sufficient
+statistics into `suf` from each trial's smoother output (`x_smooth`,
+`p_smooth`, `p_smooth_tt1`), and returns the suf-based ELBO. The legacy
+per-trial `sufficient_statistics!(tfs)` call is skipped — the suf-based
+M-step doesn't need `fs.E_z` / `fs.E_zz` / `fs.E_zz_prev`, and the
+Poisson emission update now reads `fs.x_smooth` directly.
+"""
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    u_seq::AbstractVector{<:AbstractMatrix{T}},
+    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}};
+    max_iter::Int=20,
+    tol::T=T(1e-6),
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
+    _aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, sws_pool[1])
+    elbo = calculate_elbo(lds, suf, tfs, y, sws_pool)
+    return elbo
+end
+
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
@@ -1232,6 +1370,16 @@ function fit!(
     npool = Threads.maxthreadid()
     sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, T_max) for _ in 1:npool]
 
+    # Suf-based state-side M-step (mirrors the Gaussian TD fit path). Poisson
+    # has no controls, so `u_seq` / `v_seq` are zero-row matrices. The const
+    # blocks (bias-row entries, obs_yy_const, …) are precomputed once; the
+    # `obs_*` blocks are written by the aggregator but unread by the Poisson
+    # M-step (emission stays LBFGS), which is a tiny constant overhead.
+    suf = _initialize_td_sufficient_statistics(T, plds, tsteps_per_trial)
+    u_seq = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    _td_init_const_blocks!(sws_pool[1], plds, tsteps_per_trial, y, u_seq, v_seq)
+
     elbos = Vector{T}(undef, max_iter)
 
     prog = if progress
@@ -1247,9 +1395,10 @@ function fit!(
 
     for iter in 1:max_iter
         elbos[iter] = estep!(
-            plds, tfs, y, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
+            plds, suf, tfs, y, u_seq, v_seq, sws_pool;
+            max_iter=newton_max_iter, tol=T(newton_tol),
         )
-        mstep!(plds, tfs, y, sws_pool[1])
+        mstep!(plds, suf, tfs, y, sws_pool[1])
 
         prog !== nothing && next!(prog)
 
