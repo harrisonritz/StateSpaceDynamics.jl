@@ -1029,16 +1029,26 @@ function test_weighted_update_initial_state_mean()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
         lds_k.fit_bool[1] = true
 
-        # Create weights for this LDS
+        # Per-trial weight slice for this regime.
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_initial_state_mean!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_initial_state_mean!(lds_k, suf)
 
-        # Check result is finite
         @test all(isfinite.(lds_k.state_model.x0))
     end
 end
@@ -1087,16 +1097,25 @@ function test_weighted_update_A_b()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
         lds_k.fit_bool[3] = true
 
-        # Create weights for this LDS
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_A_b!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_A_b!(lds_k, suf)
 
-        # Check results are finite and correct size
         @test all(isfinite.(lds_k.state_model.A))
         @test all(isfinite.(lds_k.state_model.b))
         @test size(lds_k.state_model.A) == (latent_dim, latent_dim)
@@ -1148,20 +1167,30 @@ function test_weighted_update_Q()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
+        lds_k.fit_bool[3] = true   # A&b must be fitted for Q's residual scatter to be meaningful
         lds_k.fit_bool[4] = true
 
-        # Create weights for this LDS
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_Q!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_A_b!(lds_k, suf)
+        StateSpaceDynamics.update_Q!(lds_k, suf)
 
-        # Check results are finite, symmetric, and PSD
         @test all(isfinite.(lds_k.state_model.Q))
         @test isapprox(lds_k.state_model.Q, lds_k.state_model.Q', atol=1e-10)
 
-        # Check positive semi-definite
         eigvals_Q = eigvals(lds_k.state_model.Q)
         @test all(eigvals_Q .>= -1e-10)
     end

@@ -364,22 +364,22 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     # Fit flags: update C and R here (d is bundled with C via CD)
     lds, x, y = toy_lds(ntrials, [false, false, false, false, true, true])
 
-    # tfs
     tsteps_per_trial = [size(yt, 2) for yt in y]
+    tsteps = tsteps_per_trial[1]
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
 
-    # run the E_Step
-    ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
-
-    tsteps = tsteps_per_trial[1]
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
-    # Save original parameters
     C_orig = copy(lds.obs_model.C)
     d_orig = copy(lds.obs_model.d)
     R_orig = copy(lds.obs_model.R)
 
-    # Objective over (C,d,R)
     function obj_obs(CD::AbstractMatrix, R_sqrt::AbstractMatrix, lds)
         D = size(CD, 2) - 1
         lds.obs_model.C .= CD[:, 1:D]
@@ -402,13 +402,17 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     CD_opt = optimize(CD -> obj_obs(CD, R_sqrt0, lds), CD0, LBFGS()).minimizer
     R_opt_sqrt = optimize(Rs -> obj_obs(CD_opt, Rs, lds), R_sqrt0, LBFGS()).minimizer
 
-    # Restore original parameters before M-step
     lds.obs_model.C .= C_orig
     lds.obs_model.d .= d_orig
     lds.obs_model.R .= R_orig
 
-    # M-step updates the model
-    StateSpaceDynamics.mstep!(lds, tfs, y)
+    # M-step via the suf-based path: aggregate, then mstep!(lds, suf, ws).
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, ws)
+    StateSpaceDynamics.mstep!(lds, suf, ws)
 
     @test isapprox(lds.obs_model.C, CD_opt[:, 1:D], atol=1e-6, rtol=1e-6)
     @test isapprox(lds.obs_model.d, CD_opt[:, D + 1], atol=1e-6, rtol=1e-6)
@@ -488,89 +492,25 @@ function test_gaussian_update_R_matches_residual_cov(; rng=MersenneTwister(7))
 
         X, Y = rand(rng, lds, fill(Tt, N))
 
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, fill(Tt, N))
-        StateSpaceDynamics.estep!(lds, tfs, Y)
+        tsteps_per_trial = fill(Tt, N)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
+        ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
+        sws_pool = [
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()
+        ]
+        StateSpaceDynamics.smooth!(lds, tfs, Y, sws_pool)
 
         # only update R
         lds.fit_bool .= [false, false, false, false, false, true]
-        StateSpaceDynamics.update_R!(lds, tfs, Y)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+        u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
+        v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
+        StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, Y, u_seq, v_seq)
+        StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, Y, ws)
+        StateSpaceDynamics.update_R!(lds, suf)
 
         @test issymmetric(lds.obs_model.R)
         @test norm(lds.obs_model.R - Rtrue) / norm(Rtrue) < 0.25
-    end
-    return nothing
-end
-
-function test_td_weighted_aggregator_matches_legacy(; rng=MersenneTwister(20260522))
-    # Weighted aggregator equivalence: feed identical per-trial
-    # per-timestep responsibilities into both the new weighted suf-based
-    # mstep! and the legacy weighted tfs-based mstep!. Parameters must
-    # agree. This is the regression guard before migrating SLDS off the
-    # legacy weighted path.
-    @testset "TD: weighted aggregator suf-based mstep! ≈ tfs-based mstep! (with w)" begin
-        D, p, Tt, N = 3, 4, 20, 3
-        A = 0.7 * StateSpaceDynamics.random_rotation_matrix(D, rng)
-        Q = Matrix(0.15 * I(D))
-        b = randn(rng, D)
-        x0 = randn(rng, D)
-        P0 = Matrix(0.4 * I(D))
-        C = randn(rng, p, D)
-        R = Matrix(0.2 * I(p))
-        d = 0.1 * randn(rng, p)
-
-        function make_lds()
-            sm = GaussianStateModel(; A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0))
-            om = GaussianObservationModel(; C=copy(C), R=copy(R), d=copy(d))
-            return LinearDynamicalSystem(sm, om)
-        end
-
-        lds_data = make_lds()
-        _, y = rand(rng, lds_data, fill(Tt, N))
-
-        # Per-trial random non-uniform weights in (0.1, 1.0).
-        weights = [0.1 .+ 0.9 .* rand(rng, Tt) for _ in 1:N]
-
-        lds_suf = make_lds()
-        lds_tfs = make_lds()
-
-        tsteps_per_trial = fill(Tt, N)
-        ws_t = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt)
-
-        # Identical E-step output for both.
-        tfs_suf = StateSpaceDynamics.initialize_FilterSmooth(lds_suf, tsteps_per_trial)
-        tfs_tfs = StateSpaceDynamics.initialize_FilterSmooth(lds_tfs, tsteps_per_trial)
-        for trial in 1:N
-            sws_a = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt)
-            StateSpaceDynamics.smooth!(lds_suf, tfs_suf[trial], y[trial], sws_a)
-            StateSpaceDynamics.sufficient_statistics!(tfs_suf[trial])
-            sws_b = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt)
-            StateSpaceDynamics.smooth!(lds_tfs, tfs_tfs[trial], y[trial], sws_b)
-            StateSpaceDynamics.sufficient_statistics!(tfs_tfs[trial])
-        end
-
-        # Suf path: weighted aggregate + suf-based mstep!.
-        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
-            Float64, lds_suf, tsteps_per_trial
-        )
-        u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs_suf, lds_suf, u_seq, v_seq, y, weights, ws_t
-        )
-        StateSpaceDynamics.mstep!(lds_suf, suf, ws_t)
-
-        # Legacy weighted path: pass weights into the tfs-based mstep!.
-        ws_t2 = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt)
-        StateSpaceDynamics.mstep!(lds_tfs, tfs_tfs, y, ws_t2, weights)
-
-        @test lds_suf.state_model.A ≈ lds_tfs.state_model.A atol=1e-8 rtol=1e-8
-        @test lds_suf.state_model.b ≈ lds_tfs.state_model.b atol=1e-8 rtol=1e-8
-        @test lds_suf.state_model.Q ≈ lds_tfs.state_model.Q atol=1e-8 rtol=1e-8
-        @test lds_suf.state_model.x0 ≈ lds_tfs.state_model.x0 atol=1e-8 rtol=1e-8
-        @test lds_suf.state_model.P0 ≈ lds_tfs.state_model.P0 atol=1e-8 rtol=1e-8
-        @test lds_suf.obs_model.C ≈ lds_tfs.obs_model.C atol=1e-8 rtol=1e-8
-        @test lds_suf.obs_model.d ≈ lds_tfs.obs_model.d atol=1e-8 rtol=1e-8
-        @test lds_suf.obs_model.R ≈ lds_tfs.obs_model.R atol=1e-8 rtol=1e-8
     end
     return nothing
 end
@@ -747,99 +687,6 @@ function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
     return nothing
 end
 
-function test_td_aggregator_matches_legacy_mstep(; rng=MersenneTwister(20260518))
-    # Aggregator equivalence: the suf-based mstep! (new fast path) and the
-    # tfs-based mstep! (legacy per-trial loops) must produce bit-close
-    # parameter updates from the same E-step output. If this drifts, the new
-    # aggregator's math has diverged from the proven reference path.
-    @testset "TD aggregator: suf-based mstep! ≈ tfs-based mstep!" begin
-        D, p, Tt, N = 3, 4, 25, 3
-        u_dim, d_dim = 2, 2
-
-        A = 0.7 * StateSpaceDynamics.random_rotation_matrix(D, rng)
-        Q = Matrix(0.15 * I(D))
-        b = randn(rng, D)
-        x0 = randn(rng, D)
-        P0 = Matrix(0.4 * I(D))
-        B = randn(rng, D, u_dim)
-        C = randn(rng, p, D)
-        R = Matrix(0.2 * I(p))
-        d = 0.1 * randn(rng, p)
-        D_obs = randn(rng, p, d_dim)
-
-        function make_lds()
-            sm = GaussianStateModel(; A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0), B=copy(B))
-            om = GaussianObservationModel(; C=copy(C), R=copy(R), d=copy(d), D=copy(D_obs))
-            return LinearDynamicalSystem(sm, om)
-        end
-
-        lds_data = make_lds()
-        u_seq = [randn(rng, u_dim, Tt) for _ in 1:N]
-        v_seq = [randn(rng, d_dim, Tt) for _ in 1:N]
-        _, y = rand(rng, lds_data, fill(Tt, N); control_seq=u_seq, obs_control_seq=v_seq)
-
-        # Two independent copies, smooth both identically.
-        lds_suf = make_lds()
-        lds_tfs = make_lds()
-
-        tsteps_per_trial = fill(Tt, N)
-        ws = StateSpaceDynamics.SmoothWorkspace(
-            Float64, D, p, Tt; u_dim=u_dim, d_dim=d_dim
-        )
-
-        # Use the per-trial smoother (slow path) for both, so the E-step output
-        # is byte-identical — the aggregator's job is only to reduce.
-        tfs_suf = StateSpaceDynamics.initialize_FilterSmooth(lds_suf, tsteps_per_trial)
-        tfs_tfs = StateSpaceDynamics.initialize_FilterSmooth(lds_tfs, tsteps_per_trial)
-        for trial in 1:N
-            sws_t = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt; u_dim=u_dim, d_dim=d_dim)
-            StateSpaceDynamics.smooth!(
-                lds_suf, tfs_suf[trial], y[trial], sws_t, u_seq[trial], v_seq[trial]
-            )
-            StateSpaceDynamics.sufficient_statistics!(tfs_suf[trial])
-
-            sws_t2 = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, Tt; u_dim=u_dim, d_dim=d_dim)
-            StateSpaceDynamics.smooth!(
-                lds_tfs, tfs_tfs[trial], y[trial], sws_t2, u_seq[trial], v_seq[trial]
-            )
-            StateSpaceDynamics.sufficient_statistics!(tfs_tfs[trial])
-        end
-
-        # Suf path: aggregate + suf-based mstep!.
-        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
-            Float64, lds_suf, tsteps_per_trial
-        )
-        StateSpaceDynamics._td_init_const_blocks!(
-            ws, lds_suf, tsteps_per_trial, y, u_seq, v_seq
-        )
-        StateSpaceDynamics._aggregate_td_suff_stats!(
-            suf, tfs_suf, lds_suf, u_seq, v_seq, y, ws
-        )
-        StateSpaceDynamics.mstep!(lds_suf, suf, ws)
-
-        # Legacy path: tfs-based mstep!.
-        ws2 = StateSpaceDynamics.SmoothWorkspace(
-            Float64, D, p, Tt; u_dim=u_dim, d_dim=d_dim
-        )
-        StateSpaceDynamics.mstep!(lds_tfs, tfs_tfs, y, ws2, u_seq, v_seq)
-
-        # Compare every parameter. Tolerances are loose because the two paths
-        # take different floating-point routes through PDMats/BLAS, but the
-        # arithmetic agreement should be tight (~1e-9 on this dataset size).
-        @test lds_suf.state_model.A ≈ lds_tfs.state_model.A atol=1e-9 rtol=1e-9
-        @test lds_suf.state_model.b ≈ lds_tfs.state_model.b atol=1e-9 rtol=1e-9
-        @test lds_suf.state_model.B ≈ lds_tfs.state_model.B atol=1e-9 rtol=1e-9
-        @test lds_suf.state_model.Q ≈ lds_tfs.state_model.Q atol=1e-9 rtol=1e-9
-        @test lds_suf.state_model.x0 ≈ lds_tfs.state_model.x0 atol=1e-9 rtol=1e-9
-        @test lds_suf.state_model.P0 ≈ lds_tfs.state_model.P0 atol=1e-9 rtol=1e-9
-        @test lds_suf.obs_model.C ≈ lds_tfs.obs_model.C atol=1e-9 rtol=1e-9
-        @test lds_suf.obs_model.d ≈ lds_tfs.obs_model.d atol=1e-9 rtol=1e-9
-        @test lds_suf.obs_model.D ≈ lds_tfs.obs_model.D atol=1e-9 rtol=1e-9
-        @test lds_suf.obs_model.R ≈ lds_tfs.obs_model.R atol=1e-9 rtol=1e-9
-    end
-    return nothing
-end
-
 function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
     @testset "GaussianLDS: weighting ≈ duplicating data" begin
         D, P, Tt, N = 2, 2, 30, 2
@@ -865,12 +712,23 @@ function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
 
         _, Y = rand(rng, lds1, fill(Tt, N))
 
-        # manual weighted EM
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds1, fill(Tt, N))
+        # Manual weighted EM via the suf-based weighted aggregator.
+        tsteps_per_trial = fill(Tt, N)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(lds1, tsteps_per_trial)
+        ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
+        sws_pool = [
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()
+        ]
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds1, tsteps_per_trial)
+        u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
+        v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
         w = [ones(Float64, Tt), 2.0 .* ones(Float64, Tt)]
         for _ in 1:6
-            StateSpaceDynamics.estep!(lds1, tfs, Y)
-            StateSpaceDynamics.mstep!(lds1, tfs, Y, w)
+            StateSpaceDynamics.smooth!(lds1, tfs, Y, sws_pool)
+            StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+                suf, tfs, lds1, u_seq, v_seq, Y, w, ws
+            )
+            StateSpaceDynamics.mstep!(lds1, suf, ws)
         end
         θw = vec([lds1.state_model.A; lds1.obs_model.C])
 

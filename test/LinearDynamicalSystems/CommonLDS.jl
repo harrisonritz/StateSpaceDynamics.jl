@@ -106,12 +106,21 @@ end
 """
     test_estep_common(lds, x, y)
 
-Test E-step produces correct dimensions and valid marginal likelihood.
+Test that smoothing + sufficient_statistics! populates the FilterSmooth
+fields with the right shapes. Replaces the legacy `estep!(lds, tfs, y)`
+convenience — production fit! uses the suf-based path; tests run the two
+pieces explicitly.
 """
 function test_estep_common(lds, x, y)
     tsteps_per_trial = [size(yt, 2) for yt in y]
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
-    ml_total = StateSpaceDynamics.estep!(lds, tfs, y)
+    T_max = maximum(tsteps_per_trial)
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, T_max)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
     n_tsteps = size(y[1], 2)
 
@@ -123,7 +132,6 @@ function test_estep_common(lds, x, y)
     @test size(E_zz_prev) == (lds.latent_dim, lds.latent_dim, n_tsteps)
     @test size(x_smooth) == (lds.latent_dim, n_tsteps)
     @test size(p_smooth) == (lds.latent_dim, lds.latent_dim, n_tsteps)
-    @test isa(ml_total, Float64)
 end
 
 """
@@ -137,9 +145,15 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     tsteps = tsteps_per_trial[1]
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
-    StateSpaceDynamics.estep!(lds, tfs, y)
-
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+
+    # Smooth + populate E_z/E_zz/E_zz_prev for the reference Q_state objective.
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
     x0_orig = copy(lds.state_model.x0)
     P0_orig = copy(lds.state_model.P0)
@@ -167,7 +181,22 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     lds.state_model.x0 .= x0_orig
     lds.state_model.P0 .= P0_orig
 
-    StateSpaceDynamics.mstep!(lds, tfs, y, ws)
+    # M-step via the suf-based path: aggregate sufficient statistics from
+    # tfs.x_smooth/p_smooth/p_smooth_tt1, then run mstep!(lds, suf, ws).
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, ws)
+    if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
+        StateSpaceDynamics.mstep!(lds, suf, ws)
+    else
+        StateSpaceDynamics.update_initial_state_mean!(lds, suf)
+        StateSpaceDynamics.update_initial_state_covariance!(lds, suf)
+        StateSpaceDynamics.update_A_b!(lds, suf)
+        StateSpaceDynamics.update_Q!(lds, suf)
+        StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
+    end
 
     @test isapprox(lds.state_model.x0, x0_opt, atol=1e-6)
     @test isapprox(lds.state_model.P0, P0_opt * P0_opt', atol=1e-6)
@@ -184,9 +213,13 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     tsteps = tsteps_per_trial[1]
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
-    StateSpaceDynamics.estep!(lds, tfs, y)
-
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
     A_orig = copy(lds.state_model.A)
     b_orig = copy(lds.state_model.b)
@@ -218,7 +251,20 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     lds.state_model.b .= b_orig
     lds.state_model.Q .= Q_orig
 
-    StateSpaceDynamics.mstep!(lds, tfs, y, ws)
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, ws)
+    if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
+        StateSpaceDynamics.mstep!(lds, suf, ws)
+    else
+        StateSpaceDynamics.update_initial_state_mean!(lds, suf)
+        StateSpaceDynamics.update_initial_state_covariance!(lds, suf)
+        StateSpaceDynamics.update_A_b!(lds, suf)
+        StateSpaceDynamics.update_Q!(lds, suf)
+        StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
+    end
 
     @test isapprox(lds.state_model.A, AB_opt[:, 1:D], atol=1e-6, rtol=1e-6)
     @test isapprox(lds.state_model.b, AB_opt[:, D + 1], atol=1e-6, rtol=1e-6)

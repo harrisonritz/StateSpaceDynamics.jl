@@ -561,73 +561,6 @@ function Q_obs!(
 end
 
 """
-    calculate_elbo(
-        plds::LinearDynamicalSystem{T,S,O},
-        E_z::AbstractArray{T, 3},
-        E_zz::AbstractArray{T, 4},
-        E_zz_prev::AbstractArray{T, 4},
-        P_smooth::AbstractArray{T, 4},
-        y::AbstractArray{T, 3},
-        total_entropy::T
-    ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-
-Calculate the Evidence Lower Bound (ELBO) for a Poisson Linear Dynamical System (PLDS). Adds constant-free IW log-prior terms 
-for `Q` and `P0` when priors are set, so the ELBO tracks the MAP objective.
-
-# Note
-Ensure that the dimensions of input arrays match the expected dimensions as described in the
-arguments section.
-"""
-function calculate_elbo(
-    lds::LinearDynamicalSystem{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-    sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    ntrials = length(y)
-
-    total_entropy = zero(T)
-    for fs in tfs.FilterSmooths
-        total_entropy += fs.entropy
-    end
-
-    ntasks = min(ntrials, length(sws_pool))
-    partial = zeros(T, ntasks)
-    chunksize = cld(ntrials, ntasks)
-
-    @sync for i in 1:ntasks
-        lo = (i - 1) * chunksize + 1
-        hi = min(i * chunksize, ntrials)
-        lo > hi && continue
-
-        @spawn begin
-            sws = sws_pool[i]
-            acc = zero(T)
-            for trial in lo:hi
-                fs = tfs[trial]
-                compute_smooth_constants!(sws, lds)
-                acc +=
-                    Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev) +
-                    Q_obs!(sws, lds, fs.E_z, fs.p_smooth, y[trial])
-            end
-            partial[i] = acc
-        end
-    end
-
-    Q_total = sum(partial)
-
-    prior_term = zero(T)
-    if lds.state_model.Q_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.Q, lds.state_model.Q_prior)
-    end
-    if lds.state_model.P0_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.P0, lds.state_model.P0_prior)
-    end
-
-    return Q_total + prior_term + total_entropy
-end
-
-"""
     gradient_observation_model_single_trial!(grad, C, d, E_z, p_smooth, y, weights)
 
 Compute the gradient for a single trial and add it to the accumulated gradient.
@@ -841,26 +774,6 @@ function update_observation_model!(
     @views plds.obs_model.C .= result_W[:, 1:latent_dim]
     @views plds.obs_model.d .= result_W[:, Dp1]
 
-    return nothing
-end
-
-"""
-    mstep!(plds, tfs, y, w)
-
-Perform the M-step of the EM algorithm for a Poisson Linear Dynamical System with multi-trial data.
-"""
-function mstep!(
-    plds::LinearDynamicalSystem{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-    sws::SmoothWorkspace{T},
-    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    update_initial_state_mean!(plds, tfs, w)
-    update_initial_state_covariance!(plds, tfs, sws, w)
-    update_A_b!(plds, tfs, sws, w)
-    update_Q!(plds, tfs, sws, w)
-    update_observation_model!(plds, tfs, y, sws, w)
     return nothing
 end
 
@@ -1274,25 +1187,6 @@ function smooth!(
 end
 
 """
-    estep!(lds, tfs, y, sws_pool; max_iter=20, tol=1e-6)
-
-E-step for Poisson LDS: smooth and compute sufficient statistics.
-"""
-function estep!(
-    lds::LinearDynamicalSystem{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-    sws_pool::Vector{SmoothWorkspace{T}};
-    max_iter::Int=20,
-    tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
-    sufficient_statistics!(tfs)
-    elbo = calculate_elbo(lds, tfs, y, sws_pool)
-    return elbo
-end
-
-"""
     estep!(lds, suf, tfs, y, u_seq, v_seq, sws_pool; max_iter=20, tol=1e-6)
 
 Suf-based Poisson E-step. Smooths, aggregates state-side sufficient
@@ -1317,19 +1211,6 @@ function estep!(
     _aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, sws_pool[1])
     elbo = calculate_elbo(lds, suf, tfs, y, sws_pool)
     return elbo
-end
-
-function estep!(
-    lds::LinearDynamicalSystem{T,S,O},
-    tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}};
-    max_iter::Int=20,
-    tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    T_max = maximum(size(yt, 2) for yt in y)
-    npool = Threads.maxthreadid()
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for _ in 1:npool]
-    return estep!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
 end
 
 """

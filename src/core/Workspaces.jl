@@ -163,25 +163,7 @@ struct SmoothWorkspace{T<:Real}
     R_sum::Matrix{T}          # (obs_dim × obs_dim)
     S0_sum::Matrix{T}         # (latent_dim × latent_dim)
 
-    # update_Q! temps
-    temp_Q1::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q2::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q3::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q4::Matrix{T}        # (latent_dim × latent_dim)
-    temp_Q5::Vector{T}        # (latent_dim,)
-    bbT::Matrix{T}           # (latent_dim × latent_dim)
-    innovation_cov::Matrix{T} # (latent_dim × latent_dim)
-
-    # update_R! temps
-    innovation::Vector{T}     # (obs_dim,)
-    Czt::Vector{T}            # (obs_dim,)
-    temp_R_matrix::Matrix{T}  # (obs_dim × latent_dim)
-    outer_product::Matrix{T}  # (latent_dim × latent_dim)
-    state_uncertainty::Matrix{T} # (latent_dim × latent_dim)
-
     # update_C_d! temps
-    work_yz::Matrix{T}        # (obs_dim × latent_dim)
-    work_outer::Matrix{T}     # (latent_dim × latent_dim)
     CD::Matrix{T}             # (obs_dim × latent_dim + 1)
 
     # ELBO / Q_state buffers
@@ -319,20 +301,6 @@ function SmoothWorkspace(
     Q_sum = zeros(T, latent_dim, latent_dim)
     R_sum = zeros(T, obs_dim, obs_dim)
     S0_sum = zeros(T, latent_dim, latent_dim)
-    temp_Q1 = zeros(T, latent_dim, latent_dim)
-    temp_Q2 = zeros(T, latent_dim, latent_dim)
-    temp_Q3 = zeros(T, latent_dim, latent_dim)
-    temp_Q4 = zeros(T, latent_dim, latent_dim)
-    temp_Q5 = zeros(T, latent_dim)
-    bbT = zeros(T, latent_dim, latent_dim)
-    innovation_cov = zeros(T, latent_dim, latent_dim)
-    innovation = zeros(T, obs_dim)
-    Czt = zeros(T, obs_dim)
-    temp_R_matrix = zeros(T, obs_dim, latent_dim)
-    outer_product = zeros(T, latent_dim, latent_dim)
-    state_uncertainty = zeros(T, latent_dim, latent_dim)
-    work_yz = zeros(T, obs_dim, latent_dim)
-    work_outer = zeros(T, latent_dim, latent_dim)
     CD = zeros(T, obs_dim, obs_reg_dim)
 
     # ELBO / Q_state buffers
@@ -420,20 +388,6 @@ function SmoothWorkspace(
         Q_sum,
         R_sum,
         S0_sum,
-        temp_Q1,
-        temp_Q2,
-        temp_Q3,
-        temp_Q4,
-        temp_Q5,
-        bbT,
-        innovation_cov,
-        innovation,
-        Czt,
-        temp_R_matrix,
-        outer_product,
-        state_uncertainty,
-        work_yz,
-        work_outer,
         CD,
         elbo_temp,
         elbo_sum_E_zz,

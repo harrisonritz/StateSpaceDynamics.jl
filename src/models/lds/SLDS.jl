@@ -999,7 +999,6 @@ function estep!(
         w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
 
         smooth!(slds, tfs[trial], y_trial, w; ws=slds_ws)
-        sufficient_statistics!(tfs[trial])
 
         trial_elbo = zero(T)
         x_smooth_trial = tfs[trial].x_smooth

@@ -154,8 +154,6 @@ include("helper_functions.jl")
                 test_gaussian_iw_priors_shape_map_and_R_sanity()
                 test_gaussian_update_R_matches_residual_cov()
                 test_gaussian_weighting_equiv_to_duplication()
-                test_td_aggregator_matches_legacy_mstep()
-                test_td_weighted_aggregator_matches_legacy()
                 test_td_mn_priors_shrink()
                 test_td_with_obs_control_seq()
                 test_td_ragged_multi_trial()
@@ -196,10 +194,6 @@ include("helper_functions.jl")
             @testset "Priors - Poisson LDS" begin
                 test_poisson_map_step_improves_Q()
                 test_poisson_gradient_shape_and_finiteness()
-            end
-
-            @testset "TD Aggregator (Poisson)" begin
-                test_poisson_td_aggregator_matches_legacy_mstep()
             end
 
             @testset "EM Algorithm" begin

@@ -313,8 +313,14 @@ function test_parameter_gradient()
     tsteps_per_trial = [size(yt, 2) for yt in y]
     tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, tsteps_per_trial)
 
-    # run estep
-    ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
+    # Smooth + populate tfs.E_z / E_zz / E_zz_prev for the legacy gradient call.
+    T_max = maximum(tsteps_per_trial)
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, plds.latent_dim, plds.obs_dim, T_max)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(plds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
     # params
     C, d = plds.obs_model.C, plds.obs_model.d
@@ -398,10 +404,17 @@ function test_EM_matlab()
         state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 6)
     )
 
-    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, [size(yt, 2) for yt in y])
+    tsteps_per_trial = [size(yt, 2) for yt in y]
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, tsteps_per_trial)
 
     # first smooth results
-    ml_total = StateSpaceDynamics.estep!(plds, tfs, y)
+    T_max = maximum(tsteps_per_trial)
+    sws_pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, plds.latent_dim, plds.obs_dim, T_max)
+        for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(plds, tfs, y, sws_pool)
+    StateSpaceDynamics.sufficient_statistics!(tfs)
 
     # Check each posterior moment against MATLAB's reference.
     # MATLAB stores Vsm as `(T·D, D)` — vertically-stacked (D × D) covariance
@@ -459,7 +472,9 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         _, Y = rand(rng, plds, fill(Tt, N))
 
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
-        StateSpaceDynamics.estep!(plds, tfs, Y)
+        sws_pool = [StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()]
+        StateSpaceDynamics.smooth!(plds, tfs, Y, sws_pool)
+        StateSpaceDynamics.sufficient_statistics!(tfs)
 
         ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
         StateSpaceDynamics.compute_smooth_constants!(ws, plds)
@@ -501,7 +516,9 @@ function test_poisson_gradient_shape_and_finiteness()
 
         _, Y = rand(plds, fill(Tt, N))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
-        StateSpaceDynamics.estep!(plds, tfs, Y)
+        sws_pool = [StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()]
+        StateSpaceDynamics.smooth!(plds, tfs, Y, sws_pool)
+        StateSpaceDynamics.sufficient_statistics!(tfs)
 
         g = zeros(Float64, length(vec(C)) + length(d))
         StateSpaceDynamics.gradient_observation_model!(
@@ -585,75 +602,3 @@ function test_poisson_low_rate_recovery()
     return nothing
 end
 
-function test_poisson_td_aggregator_matches_legacy_mstep(; rng=MersenneTwister(20260524))
-    # Poisson aggregator equivalence: state-side suf-based updates must match
-    # legacy tfs-based updates after a shared E-step. Mirror of the Gaussian
-    # `test_td_aggregator_matches_legacy_mstep` test; the emission [C d] is
-    # excluded from the comparison because it's updated by LBFGS in both
-    # paths and the LBFGS init / convergence path is identical.
-    @testset "Poisson TD aggregator: suf-based state mstep ≈ legacy" begin
-        D, p, Tt, N = 2, 3, 50, 3
-
-        A = 0.85 * StateSpaceDynamics.random_rotation_matrix(D, rng)
-        Q = Matrix(0.1 * I(D))
-        b = randn(rng, D)
-        x0 = randn(rng, D)
-        P0 = Matrix(0.3 * I(D))
-        C = 0.5 .* randn(rng, p, D)
-        d = log.([0.1, 0.2, 0.15])
-
-        function make_plds()
-            sm = GaussianStateModel(; A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0))
-            om = PoissonObservationModel(; C=copy(C), d=copy(d))
-            return LinearDynamicalSystem(sm, om)
-        end
-
-        plds_data = make_plds()
-        _, y = rand(rng, plds_data, fill(Tt, N))
-
-        plds_suf = make_plds()
-        plds_tfs = make_plds()
-
-        tsteps_per_trial = fill(Tt, N)
-        T_max = Tt
-        sws_pool_suf = [StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max) for _ in 1:Threads.maxthreadid()]
-        sws_pool_tfs = [StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max) for _ in 1:Threads.maxthreadid()]
-
-        # Identical E-step output for both: smooth twice with deterministic init.
-        tfs_suf = StateSpaceDynamics.initialize_FilterSmooth(plds_suf, tsteps_per_trial)
-        tfs_tfs = StateSpaceDynamics.initialize_FilterSmooth(plds_tfs, tsteps_per_trial)
-        StateSpaceDynamics.smooth!(plds_suf, tfs_suf, y, sws_pool_suf)
-        StateSpaceDynamics.smooth!(plds_tfs, tfs_tfs, y, sws_pool_tfs)
-        StateSpaceDynamics.sufficient_statistics!(tfs_tfs)  # legacy path needs E_z/E_zz
-
-        # Suf path.
-        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
-            Float64, plds_suf, tsteps_per_trial
-        )
-        u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        StateSpaceDynamics._td_init_const_blocks!(
-            sws_pool_suf[1], plds_suf, tsteps_per_trial, y, u_seq, v_seq
-        )
-        StateSpaceDynamics._aggregate_td_suff_stats!(
-            suf, tfs_suf, plds_suf, u_seq, v_seq, y, sws_pool_suf[1]
-        )
-        StateSpaceDynamics.update_initial_state_mean!(plds_suf, suf)
-        StateSpaceDynamics.update_initial_state_covariance!(plds_suf, suf)
-        StateSpaceDynamics.update_A_b!(plds_suf, suf)
-        StateSpaceDynamics.update_Q!(plds_suf, suf)
-
-        # Legacy path.
-        StateSpaceDynamics.update_initial_state_mean!(plds_tfs, tfs_tfs)
-        StateSpaceDynamics.update_initial_state_covariance!(plds_tfs, tfs_tfs, sws_pool_tfs[1])
-        StateSpaceDynamics.update_A_b!(plds_tfs, tfs_tfs, sws_pool_tfs[1])
-        StateSpaceDynamics.update_Q!(plds_tfs, tfs_tfs, sws_pool_tfs[1])
-
-        @test plds_suf.state_model.A ≈ plds_tfs.state_model.A atol=1e-9 rtol=1e-9
-        @test plds_suf.state_model.b ≈ plds_tfs.state_model.b atol=1e-9 rtol=1e-9
-        @test plds_suf.state_model.Q ≈ plds_tfs.state_model.Q atol=1e-9 rtol=1e-9
-        @test plds_suf.state_model.x0 ≈ plds_tfs.state_model.x0 atol=1e-9 rtol=1e-9
-        @test plds_suf.state_model.P0 ≈ plds_tfs.state_model.P0 atol=1e-9 rtol=1e-9
-    end
-    return nothing
-end
