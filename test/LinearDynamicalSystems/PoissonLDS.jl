@@ -334,7 +334,7 @@ function test_parameter_gradient()
 
     # get analytical gradient
     grad_analytical = StateSpaceDynamics.gradient_observation_model!(
-        zeros(length(params)), C, d, tfs, y
+        zeros(length(params)), C, d, tfs, y, sws_pool
     )
 
     # numerical gradient against trial 1 only
@@ -492,7 +492,7 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
             StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
             k in 1:N
         )
-        StateSpaceDynamics.update_observation_model!(plds, tfs, Y, ws)  # LBFGS inside
+        StateSpaceDynamics.update_observation_model!(plds, tfs, Y, sws_pool)  # LBFGS inside
         Q1 = sum(
             StateSpaceDynamics.Q_obs!(ws, plds, tfs[k].E_z, tfs[k].p_smooth, Y[k]) for
             k in 1:N
@@ -534,7 +534,7 @@ function test_poisson_gradient_shape_and_finiteness()
 
         g = zeros(Float64, length(vec(C)) + length(d))
         StateSpaceDynamics.gradient_observation_model!(
-            g, plds.obs_model.C, plds.obs_model.d, tfs, Y
+            g, plds.obs_model.C, plds.obs_model.d, tfs, Y, sws_pool
         )
 
         @test all(isfinite, g)

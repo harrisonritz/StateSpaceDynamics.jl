@@ -593,17 +593,15 @@ function gradient_observation_model_single_trial!(
     E_z::AbstractMatrix{T},
     p_smooth::AbstractArray{T,3},
     y::AbstractMatrix{T},
-    weights::Union{Nothing,AbstractVector{T}}=nothing,
+    weights::Union{Nothing,AbstractVector{T}},
+    h::AbstractVector{T},
+    ρ::AbstractVector{T},
+    λ::AbstractVector{T},
+    CP::AbstractMatrix{T},
 ) where {T<:Real}
     obs_dim, latent_dim = size(C)
     Dp1 = latent_dim + 1
     tsteps = size(y, 2)
-
-    # Pre-allocate temporary arrays
-    h = Vector{T}(undef, obs_dim)
-    ρ = Vector{T}(undef, obs_dim)
-    λ = Vector{T}(undef, obs_dim)
-    CP = Matrix{T}(undef, obs_dim, latent_dim)
 
     # 2-D view of the gradient buffer as `[C d]`-shaped W (obs_dim × Dp1).
     grad_W = reshape(view(grad, 1:(obs_dim * Dp1)), obs_dim, Dp1)
@@ -649,23 +647,44 @@ function gradient_observation_model!(
     d::AbstractVector{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
     tasks_per_thread::Int=2,
 ) where {T<:Real}
     trials = length(tfs.FilterSmooths)
     npar = length(grad)
 
-    chunk_size = max(1, trials ÷ (tasks_per_thread * Threads.nthreads()))
-    chunks = partition(1:trials, chunk_size)
+    # Cap ntasks at `length(sws_pool)` so each task gets its own
+    # pre-allocated workspace slot indexed by its position in the chunk
+    # iteration (not `threadid()`, which can migrate under task
+    # scheduling).
+    desired = max(1, tasks_per_thread * Threads.nthreads())
+    ntasks = min(trials, desired, length(sws_pool))
+    chunk_size = max(1, cld(trials, ntasks))
+    chunks = collect(partition(1:trials, chunk_size))
 
     tasks = Task[]
     @sync begin
-        for chunk in chunks
+        for (task_idx, chunk) in enumerate(chunks)
             push!(
                 tasks,
                 Threads.@spawn begin
-                    acc = zeros(T, npar)
-                    tmp = zeros(T, npar)
+                    # Each task owns one workspace from the pool — buffers
+                    # used by `gradient_observation_model_single_trial!`
+                    # (h/ρ/λ/CP) come from this workspace's existing
+                    # `Q_obs!` scratch fields, and the per-task `acc`/`tmp`
+                    # gradient accumulators are views into `.CD` / `.Syz`
+                    # (both sized `obs_dim × Dp1 = npar` for Poisson, where
+                    # `obs_input_dim = 0`).
+                    sws = sws_pool[task_idx]
+                    acc = vec(sws.CD)
+                    tmp = vec(sws.Syz)
+                    fill!(acc, zero(T))
+
+                    h_buf = sws.h_obs
+                    ρ_buf = sws.rho_obs
+                    λ_buf = sws.CEz_obs
+                    CP_buf = sws.CP_obs
 
                     for k in chunk
                         fill!(tmp, zero(T))
@@ -679,7 +698,8 @@ function gradient_observation_model!(
                         # dependency on having run `sufficient_statistics!` —
                         # the suf-based estep! no longer populates `fs.E_z`.
                         gradient_observation_model_single_trial!(
-                            tmp, C, d, fs.x_smooth, fs.p_smooth, y[k], weights
+                            tmp, C, d, fs.x_smooth, fs.p_smooth, y[k], weights,
+                            h_buf, ρ_buf, λ_buf, CP_buf,
                         )
 
                         @simd for i in 1:npar
@@ -715,11 +735,12 @@ function update_observation_model!(
     plds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    sws::SmoothWorkspace{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     plds.fit_bool[5] || return nothing
 
+    sws = sws_pool[1]       # f(params) is sequential; one workspace suffices
     obs_dim = plds.obs_dim
     latent_dim = plds.latent_dim
     Dp1 = latent_dim + 1
@@ -769,7 +790,7 @@ function update_observation_model!(
         Cd_view = reshape(view(params, 1:n_W), obs_dim, Dp1)
         @views C_view = Cd_view[:, 1:latent_dim]
         @views d_view = Cd_view[:, Dp1]
-        gradient_observation_model!(grad, C_view, d_view, tfs, y, w)
+        gradient_observation_model!(grad, C_view, d_view, tfs, y, sws_pool, w)
         if CD_prior !== nothing
             grad_W_view = reshape(view(grad, 1:n_W), obs_dim, Dp1)
             grad_W_view .+= (Cd_view .- CD_prior.M₀) * CD_prior.Λ
@@ -777,8 +798,20 @@ function update_observation_model!(
         return grad
     end
 
+    # LBFGS tolerances + iteration cap. The previous `1e-12` everywhere
+    # was inherited from a per-trial loop on `main` and dominated the
+    # wall-clock cost of every Poisson EM iteration (the surrounding EM
+    # converges at `tol=1e-6`, so `1e-12` per inner step is ~10⁴×
+    # overkill). `1e-8` keeps us comfortably tighter than EM while
+    # letting LBFGS exit promptly; the iteration cap is a safety net
+    # for pathological steps where the line search makes slow progress.
     opts = Optim.Options(;
-        x_reltol=1e-12, x_abstol=1e-12, g_abstol=1e-12, f_reltol=1e-12, f_abstol=1e-12
+        x_reltol=1e-8,
+        x_abstol=1e-8,
+        g_abstol=1e-8,
+        f_reltol=1e-8,
+        f_abstol=1e-8,
+        iterations=200,
     )
 
     result = optimize(f, g!, params, LBFGS(; linesearch=LineSearches.HagerZhang()), opts)
@@ -805,13 +838,14 @@ function mstep!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    sws::SmoothWorkspace{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    sws = sws_pool[1]
     update_initial_state_mean!(plds, suf)
     update_initial_state_covariance!(plds, suf, sws)
     update_A_b!(plds, suf, sws)
     update_Q!(plds, suf, sws)
-    update_observation_model!(plds, tfs, y, sws)
+    update_observation_model!(plds, tfs, y, sws_pool)
     return nothing
 end
 
@@ -1300,7 +1334,7 @@ function fit!(
             max_iter=newton_max_iter,
             tol=T(newton_tol),
         )
-        mstep!(plds, suf, tfs, y, sws_pool[1])
+        mstep!(plds, suf, tfs, y, sws_pool)
 
         prog !== nothing && next!(prog)
 

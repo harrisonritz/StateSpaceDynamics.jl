@@ -197,7 +197,7 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.update_initial_state_covariance!(lds, suf, ws)
         StateSpaceDynamics.update_A_b!(lds, suf, ws)
         StateSpaceDynamics.update_Q!(lds, suf, ws)
-        StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
+        StateSpaceDynamics.update_observation_model!(lds, tfs, y, [ws])
     end
 
     @test isapprox(lds.state_model.x0, x0_opt, atol=1e-6)
@@ -267,7 +267,7 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.update_initial_state_covariance!(lds, suf, ws)
         StateSpaceDynamics.update_A_b!(lds, suf, ws)
         StateSpaceDynamics.update_Q!(lds, suf, ws)
-        StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
+        StateSpaceDynamics.update_observation_model!(lds, tfs, y, [ws])
     end
 
     @test isapprox(lds.state_model.A, AB_opt[:, 1:D], atol=1e-6, rtol=1e-6)

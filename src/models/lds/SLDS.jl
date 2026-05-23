@@ -1098,7 +1098,11 @@ function mstep!(
             update_initial_state_covariance!(lds_k, suf, sws)
             update_A_b!(lds_k, suf, sws)
             update_Q!(lds_k, suf, sws)
-            update_observation_model!(lds_k, tfs, y, sws, weights)
+            # SLDS owns a single sws (not a pool); wrap as a singleton so
+            # `update_observation_model!`'s threaded gradient path runs
+            # serially. SLDS Poisson is a niche path; the threading
+            # overhead isn't a meaningful win here.
+            update_observation_model!(lds_k, tfs, y, [sws], weights)
         else
             throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))
         end
