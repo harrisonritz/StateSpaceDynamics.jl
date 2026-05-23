@@ -1916,6 +1916,17 @@ function Q_state!(
     N = suf.init_n
     dyn_n = suf.dyn_n
 
+    # Multivariate-normal constants. The per-step log N(x_t; ., Σ) carries a
+    # `-D/2 · log(2π)` constant in addition to the logdet + trace terms; we
+    # were previously dropping those, which biased the displayed ELBO above
+    # the true marginal log-likelihood by `+½·(N + dyn_n)·D·log(2π)` for a
+    # Gaussian LDS. Including them now means `calculate_elbo` matches
+    # `filter_loglikelihood` exactly at the EM fixed point (cf. the
+    # `benchmarking/elbo_investigation.jl` script).
+    log2π = log(T(2π))
+    const_init  = T(N) * D * log2π
+    const_trans = T(dyn_n) * D * log2π
+
     # S_init = init_yy - μ x0' - x0 μ' + N x0 x0'    (μ = Σ x_init)
     S_init = sws.elbo_temp
     copyto!(S_init, suf.init_yy[].mat)
@@ -1926,7 +1937,7 @@ function Q_state!(
 
     ldiv!(P0_U', S_init)
     ldiv!(P0_U, S_init)
-    Q_val = T(-0.5) * (T(N) * log_det_P0 + tr(S_init))
+    Q_val = T(-0.5) * (const_init + T(N) * log_det_P0 + tr(S_init))
 
     # W = [A b B] (D × dyn_reg_dim)
     W = view(sws.AB, :, 1:dyn_reg_dim)
@@ -1947,7 +1958,7 @@ function Q_state!(
 
     ldiv!(Q_U', S_trans)
     ldiv!(Q_U, S_trans)
-    Q_val += T(-0.5) * (T(dyn_n) * log_det_Q + tr(S_trans))
+    Q_val += T(-0.5) * (const_trans + T(dyn_n) * log_det_Q + tr(S_trans))
 
     return Q_val
 end

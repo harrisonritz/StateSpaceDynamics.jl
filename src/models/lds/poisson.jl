@@ -497,15 +497,20 @@ function Hessian!(
 end
 
 """
-    Q_obs!(sws, cc, E_z, p_smooth, y; weights=nothing)
+    Q_obs!(sws, lds, E_z, p_smooth, y; weights=nothing)
 
-Allocation-free Poisson observation-model Q for a *single trial*:
+Allocation-free Poisson observation-model Q for a *single trial* (full
+expected complete log-likelihood, including the `-log(y!)` normalizer):
 
-Q = Σ_t w_t [ y_t' h_t - 1' exp(h_t + ρ_t) ]
-where
-  h_t   = C * E[x_t] + d
-  ρ_i,t = 0.5 * c_i' * P_t * c_i
-and `d` is the canonical log-link Poisson intercept (free in ℝ).
+```
+Q = Σ_t w_t [ y_t' h_t  -  1' exp(h_t + ρ_t)  -  Σ_i log Γ(y_{t,i} + 1) ]
+```
+
+where `h_t = C · E[x_t] + d` and `ρ_{i,t} = ½ c_i' P_t c_i`, and `d` is the
+canonical log-link Poisson intercept (free in ℝ). Including the factorial
+term means `calculate_elbo` matches the Laplace-approximation marginal
+log-likelihood at the EM fixed point, instead of being off by a fixed
+data-only constant.
 """
 function Q_obs!(
     sws::SmoothWorkspace{T},                      # must provide cc.C and cc.d
@@ -521,7 +526,7 @@ function Q_obs!(
     obs_dim, _ = size(C)
     tsteps = size(y, 2)
 
-    # workspace buffers 
+    # workspace buffers
     h = sws.h_obs::Vector{T}            # obs_dim
     rho = sws.rho_obs::Vector{T}            # obs_dim
     CP = sws.CP_obs::Matrix{T}            # obs_dim × state_dim
@@ -539,10 +544,10 @@ function Q_obs!(
         # CEz = C * Ez_t
         mul!(CEz, C, Ez_t)
 
-        # h = CEz + d   
+        # h = CEz + d
         @. h = CEz + d
 
-        # CP = C * P_t 
+        # CP = C * P_t
         mul!(CP, C, P_t)
 
         # rho[i] = 0.5 * dot(CP[i,:], C[i,:])
@@ -553,8 +558,17 @@ function Q_obs!(
         # rho := exp(h + rho)
         @. rho = exp(h + rho)
 
-        # Q += wt * (dot(y_t, h) - sum(rho))
-        Q_val += wt * (dot(y_t, h) - sum(rho))
+        # log-factorial normalizer Σ_i log Γ(y_{t,i} + 1). Parameter-free, so
+        # it only shifts the ELBO baseline (it does not affect monotonicity or
+        # M-step updates) — but including it lets the displayed ELBO match
+        # the Laplace marginal log-likelihood we'd report externally.
+        log_fact = zero(T)
+        for i in 1:obs_dim
+            log_fact += loggamma(y_t[i] + one(T))
+        end
+
+        # Q += wt * (dot(y_t, h) - sum(rho) - log_fact)
+        Q_val += wt * (dot(y_t, h) - sum(rho) - log_fact)
     end
 
     return Q_val
