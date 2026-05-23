@@ -388,7 +388,9 @@ function test_kalman_fit_bool_freezes_params()
     d0 = randn(rng, p)
 
     function make_lds(fit_bool)
-        sm = GaussianStateModel(; A=copy(A0), Q=copy(Q0), x0=copy(x0_0), P0=copy(P0_0), b=copy(b0))
+        sm = GaussianStateModel(;
+            A=copy(A0), Q=copy(Q0), x0=copy(x0_0), P0=copy(P0_0), b=copy(b0)
+        )
         om = GaussianObservationModel(; C=copy(C0), R=copy(R0), d=copy(d0))
         return LinearDynamicalSystem(sm, om; kalman_filter=true, fit_bool=fit_bool)
     end
@@ -399,15 +401,16 @@ function test_kalman_fit_bool_freezes_params()
 
     # Freeze each parameter individually and verify it is bit-exact unchanged.
     cases = [
-        (1, :x0,  lds -> copy(lds.state_model.x0)),
-        (2, :P0,  lds -> copy(lds.state_model.P0)),
-        (3, :A,   lds -> (copy(lds.state_model.A), copy(lds.state_model.b))),
-        (4, :Q,   lds -> copy(lds.state_model.Q)),
-        (5, :C,   lds -> (copy(lds.obs_model.C), copy(lds.obs_model.d))),
-        (6, :R,   lds -> copy(lds.obs_model.R)),
+        (1, :x0, lds -> copy(lds.state_model.x0)),
+        (2, :P0, lds -> copy(lds.state_model.P0)),
+        (3, :A, lds -> (copy(lds.state_model.A), copy(lds.state_model.b))),
+        (4, :Q, lds -> copy(lds.state_model.Q)),
+        (5, :C, lds -> (copy(lds.obs_model.C), copy(lds.obs_model.d))),
+        (6, :R, lds -> copy(lds.obs_model.R)),
     ]
     for (idx, _name, getter) in cases
-        flags = fill(true, 6); flags[idx] = false
+        flags = fill(true, 6);
+        flags[idx] = false
         lds = make_lds(flags)
         snap = getter(lds)
         fit!(lds, y; max_iter=3, progress=false)

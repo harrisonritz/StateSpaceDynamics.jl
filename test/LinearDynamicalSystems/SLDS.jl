@@ -1114,7 +1114,7 @@ function test_weighted_update_A_b()
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
             suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
         )
-        StateSpaceDynamics.update_A_b!(lds_k, suf)
+        StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
 
         @test all(isfinite.(lds_k.state_model.A))
         @test all(isfinite.(lds_k.state_model.b))
@@ -1185,8 +1185,8 @@ function test_weighted_update_Q()
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
             suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
         )
-        StateSpaceDynamics.update_A_b!(lds_k, suf)
-        StateSpaceDynamics.update_Q!(lds_k, suf)
+        StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
+        StateSpaceDynamics.update_Q!(lds_k, suf, sws)
 
         @test all(isfinite.(lds_k.state_model.Q))
         @test isapprox(lds_k.state_model.Q, lds_k.state_model.Q', atol=1e-10)

@@ -478,7 +478,10 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         _, Y = rand(rng, plds, fill(Tt, N))
 
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
-        sws_pool = [StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()]
+        sws_pool = [
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for
+            _ in 1:Threads.maxthreadid()
+        ]
         StateSpaceDynamics.smooth!(plds, tfs, Y, sws_pool)
         StateSpaceDynamics.sufficient_statistics!(tfs)
 
@@ -522,7 +525,10 @@ function test_poisson_gradient_shape_and_finiteness()
 
         _, Y = rand(plds, fill(Tt, N))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(Tt, N))
-        sws_pool = [StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()]
+        sws_pool = [
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for
+            _ in 1:Threads.maxthreadid()
+        ]
         StateSpaceDynamics.smooth!(plds, tfs, Y, sws_pool)
         StateSpaceDynamics.sufficient_statistics!(tfs)
 

@@ -1089,17 +1089,15 @@ function mstep!(
             weights[trial] = view(fb_storage.γ, k, t1:t2)
         end
 
-        _aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, u_seq, v_seq, y, weights, sws
-        )
+        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, u_seq, v_seq, y, weights, sws)
 
         if lds_k.obs_model isa GaussianObservationModel{T}
             mstep!(lds_k, suf, sws)
         elseif lds_k.obs_model isa PoissonObservationModel{T}
             update_initial_state_mean!(lds_k, suf)
-            update_initial_state_covariance!(lds_k, suf)
-            update_A_b!(lds_k, suf)
-            update_Q!(lds_k, suf)
+            update_initial_state_covariance!(lds_k, suf, sws)
+            update_A_b!(lds_k, suf, sws)
+            update_Q!(lds_k, suf, sws)
             update_observation_model!(lds_k, tfs, y, sws, weights)
         else
             throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))

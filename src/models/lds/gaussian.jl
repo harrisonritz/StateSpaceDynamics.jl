@@ -915,7 +915,7 @@ function _precompute_shared_cov!(
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
     p_smooth_v = view(p_smooth_shared,:,:,(1:tsteps))
-    p_smooth_tt1_v = view(sws.p_smooth_tt1_shared::Array{T,3},:,:,(1:tsteps))
+    p_smooth_tt1_v = view((sws.p_smooth_tt1_shared::Array{T,3}),:,:,(1:tsteps))
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
         p_smooth_v, p_smooth_tt1_v, neg_sub_v, neg_diag_v, neg_super_v, btd
@@ -1363,9 +1363,7 @@ function _td_init_const_blocks!(
             v_t = v_seq[trial]
             y_t = y[trial]
             # obs_xy[D+2:end, :] += Σ_t v_t y_t'
-            mul!(
-                view(td_obs_xy_const, (D + 2):obs_reg_dim, :), v_t, y_t', one(T), one(T)
-            )
+            mul!(view(td_obs_xy_const, (D + 2):obs_reg_dim, :), v_t, y_t', one(T), one(T))
             # obs_xx[D+2:end, D+2:end] += Σ_t v_t v_t'  (upper tri)
             BLAS.syrk!(
                 'U',
@@ -1495,22 +1493,22 @@ function _aggregate_td_suff_stats!(
     obs_reg_dim = D + 1 + d_dim
 
     # Hoist workspace fields with concrete eltype for JET (cf. backwards_cov!).
-    Szz_Ab           = sws.Szz_Ab::Matrix{T}
-    Szz_Cd           = sws.Szz_Cd::Matrix{T}
-    Q_sum            = sws.Q_sum::Matrix{T}
-    R_sum            = sws.R_sum::Matrix{T}
-    S0_sum           = sws.S0_sum::Matrix{T}
-    td_init_xy       = sws.td_init_xy::Matrix{T}
-    td_dyn_xy        = sws.td_dyn_xy::Matrix{T}
-    td_obs_xy        = sws.td_obs_xy::Matrix{T}
-    td_obs_xy_const  = sws.td_obs_xy_const::Matrix{T}
-    td_obs_xx_const  = sws.td_obs_xx_const::Matrix{T}
-    td_dyn_xx_const  = sws.td_dyn_xx_const::Matrix{T}
-    td_obs_yy_const  = sws.td_obs_yy_const::Matrix{T}
-    sum_cov_prev     = sws.td_sum_smooth_cov_prev::Matrix{T}
-    sum_cov_next     = sws.td_sum_smooth_cov_next::Matrix{T}
-    sum_cov_all      = sws.td_sum_smooth_cov_all::Matrix{T}
-    sum_xcov         = sws.td_sum_smooth_xcov::Matrix{T}
+    Szz_Ab = sws.Szz_Ab::Matrix{T}
+    Szz_Cd = sws.Szz_Cd::Matrix{T}
+    Q_sum = sws.Q_sum::Matrix{T}
+    R_sum = sws.R_sum::Matrix{T}
+    S0_sum = sws.S0_sum::Matrix{T}
+    td_init_xy = sws.td_init_xy::Matrix{T}
+    td_dyn_xy = sws.td_dyn_xy::Matrix{T}
+    td_obs_xy = sws.td_obs_xy::Matrix{T}
+    td_obs_xy_const = sws.td_obs_xy_const::Matrix{T}
+    td_obs_xx_const = sws.td_obs_xx_const::Matrix{T}
+    td_dyn_xx_const = sws.td_dyn_xx_const::Matrix{T}
+    td_obs_yy_const = sws.td_obs_yy_const::Matrix{T}
+    sum_cov_prev = sws.td_sum_smooth_cov_prev::Matrix{T}
+    sum_cov_next = sws.td_sum_smooth_cov_next::Matrix{T}
+    sum_cov_all = sws.td_sum_smooth_cov_all::Matrix{T}
+    sum_xcov = sws.td_sum_smooth_xcov::Matrix{T}
 
     # Detect cov-cache fast path (equal-length trials share p_smooth storage).
     cov_cache = ntrials > 1 && tfs[1].p_smooth === tfs[2].p_smooth
@@ -1534,7 +1532,7 @@ function _aggregate_td_suff_stats!(
     if cov_cache
         fs1 = tfs[1]
         T_shared = size(fs1.x_smooth, 2)
-        p_smooth1     = fs1.p_smooth::Array{T,3}
+        p_smooth1 = fs1.p_smooth::Array{T,3}
         p_smooth_tt11 = fs1.p_smooth_tt1::Array{T,3}
         @views for t in 1:T_shared
             sum_cov_all .+= p_smooth1[:, :, t]
@@ -1557,7 +1555,7 @@ function _aggregate_td_suff_stats!(
     for trial in 1:ntrials
         fs = tfs[trial]
         x = fs.x_smooth::Matrix{T}
-        p_smooth     = fs.p_smooth::Array{T,3}
+        p_smooth = fs.p_smooth::Array{T,3}
         p_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
 
@@ -1615,12 +1613,8 @@ function _aggregate_td_suff_stats!(
         if u_dim > 0
             u_trial = u_seq[trial]
             u_prev = view(u_trial, :, 1:(T_n - 1))
-            mul!(
-                view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, u_prev', one(T), one(T)
-            )
-            mul!(
-                view(td_dyn_xy, (D + 2):dyn_reg_dim, :), u_prev, x_next', one(T), one(T)
-            )
+            mul!(view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, u_prev', one(T), one(T))
+            mul!(view(td_dyn_xy, (D + 2):dyn_reg_dim, :), u_prev, x_next', one(T), one(T))
         end
         if d_dim > 0
             v_trial = v_seq[trial]
@@ -1705,23 +1699,31 @@ function _aggregate_td_suff_stats_weighted!(
     # Clear the accumulators we'll write into. Each field is hoisted with a
     # concrete `Matrix{T}` annotation so the BLAS.ger!/syrk! callsites below
     # stay in JET's typed union branch (cf. `backwards_cov!`).
-    init_xy = sws.td_init_xy::Matrix{T}; fill!(init_xy, zero(T))
-    init_yy = sws.S0_sum::Matrix{T};     fill!(init_yy, zero(T))
-    dyn_xx  = sws.Szz_Ab::Matrix{T};     fill!(dyn_xx,  zero(T))
-    dyn_xy  = sws.td_dyn_xy::Matrix{T};  fill!(dyn_xy,  zero(T))
-    dyn_yy  = sws.Q_sum::Matrix{T};      fill!(dyn_yy,  zero(T))
-    obs_xx  = sws.Szz_Cd::Matrix{T};     fill!(obs_xx,  zero(T))
-    obs_xy  = sws.td_obs_xy::Matrix{T};  fill!(obs_xy,  zero(T))
-    obs_yy  = sws.R_sum::Matrix{T};      fill!(obs_yy,  zero(T))
+    init_xy = sws.td_init_xy::Matrix{T};
+    fill!(init_xy, zero(T))
+    init_yy = sws.S0_sum::Matrix{T};
+    fill!(init_yy, zero(T))
+    dyn_xx = sws.Szz_Ab::Matrix{T};
+    fill!(dyn_xx, zero(T))
+    dyn_xy = sws.td_dyn_xy::Matrix{T};
+    fill!(dyn_xy, zero(T))
+    dyn_yy = sws.Q_sum::Matrix{T};
+    fill!(dyn_yy, zero(T))
+    obs_xx = sws.Szz_Cd::Matrix{T};
+    fill!(obs_xx, zero(T))
+    obs_xy = sws.td_obs_xy::Matrix{T};
+    fill!(obs_xy, zero(T))
+    obs_yy = sws.R_sum::Matrix{T};
+    fill!(obs_yy, zero(T))
 
     init_n_acc = zero(T)
-    dyn_n_acc  = zero(T)
-    obs_n_acc  = zero(T)
+    dyn_n_acc = zero(T)
+    obs_n_acc = zero(T)
 
     for trial in 1:ntrials
         fs = tfs[trial]
-        x_smooth     = fs.x_smooth::Matrix{T}
-        P_smooth     = fs.p_smooth::Array{T,3}
+        x_smooth = fs.x_smooth::Matrix{T}
+        P_smooth = fs.p_smooth::Array{T,3}
         P_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
         y_trial = y[trial]
         T_n = size(x_smooth, 2)
@@ -1781,7 +1783,12 @@ function _aggregate_td_suff_stats_weighted!(
                     dyn_xx[D + 1, D + 1 + k] += wt * u_prev[k]
                 end
                 # dyn_xx[D+2:end, D+2:end] += wt * u_prev u_prev'
-                BLAS.ger!(wt, u_prev, u_prev, view(dyn_xx, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim))
+                BLAS.ger!(
+                    wt,
+                    u_prev,
+                    u_prev,
+                    view(dyn_xx, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim),
+                )
                 # dyn_xy[D+2:end, :] += wt * u_prev x_next'
                 BLAS.ger!(wt, u_prev, x_next, view(dyn_xy, (D + 2):dyn_reg_dim, :))
             end
@@ -1830,7 +1837,9 @@ function _aggregate_td_suff_stats_weighted!(
                     obs_xx[D + 1 + k, D + 1] += wt * v_t[k]
                 end
                 # obs_xx[D+2:end, D+2:end] += wt * v_t v_t'
-                BLAS.ger!(wt, v_t, v_t, view(obs_xx, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim))
+                BLAS.ger!(
+                    wt, v_t, v_t, view(obs_xx, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim)
+                )
                 # obs_xy[D+2:end, :] += wt * v_t y_t'
                 BLAS.ger!(wt, v_t, y_t, view(obs_xy, (D + 2):obs_reg_dim, :))
             end
@@ -1842,10 +1851,14 @@ function _aggregate_td_suff_stats_weighted!(
     # Mirror the symmetric u-cross block in dyn_xx (the in-loop mirror was a
     # placeholder; do the real mirror once here using the upper half).
     if u_dim > 0
-        @views dyn_xx[(D + 2):dyn_reg_dim, 1:D] .= transpose(dyn_xx[1:D, (D + 2):dyn_reg_dim])
+        @views dyn_xx[(D + 2):dyn_reg_dim, 1:D] .= transpose(
+            dyn_xx[1:D, (D + 2):dyn_reg_dim]
+        )
     end
     if d_dim > 0
-        @views obs_xx[(D + 2):obs_reg_dim, 1:D] .= transpose(obs_xx[1:D, (D + 2):obs_reg_dim])
+        @views obs_xx[(D + 2):obs_reg_dim, 1:D] .= transpose(
+            obs_xx[1:D, (D + 2):obs_reg_dim]
+        )
     end
 
     # Symmetrize PD blocks (BLAS.ger! is not symmetric and we touched the
@@ -1858,19 +1871,19 @@ function _aggregate_td_suff_stats_weighted!(
 
     # init_xx is the (1×1) effective sample count for x_init.
     suf.init_n = init_n_acc
-    suf.dyn_n  = dyn_n_acc
-    suf.obs_n  = obs_n_acc
+    suf.dyn_n = dyn_n_acc
+    suf.obs_n = obs_n_acc
 
     copyto!(suf.init_xy, init_xy)
-    copyto!(suf.dyn_xy,  dyn_xy)
-    copyto!(suf.obs_xy,  obs_xy)
+    copyto!(suf.dyn_xy, dyn_xy)
+    copyto!(suf.obs_xy, obs_xy)
 
     suf.init_xx[] = PDMat(fill(init_n_acc, 1, 1))
     suf.init_yy[] = PDMat(copy(init_yy))
-    suf.dyn_xx[]  = PDMat(copy(dyn_xx))
-    suf.dyn_yy[]  = PDMat(copy(dyn_yy))
-    suf.obs_xx[]  = PDMat(copy(obs_xx))
-    suf.obs_yy[]  = PDMat(copy(obs_yy))
+    suf.dyn_xx[] = PDMat(copy(dyn_xx))
+    suf.dyn_yy[] = PDMat(copy(dyn_yy))
+    suf.obs_xx[] = PDMat(copy(obs_xx))
+    suf.obs_yy[] = PDMat(copy(obs_yy))
 
     return suf
 end
@@ -1913,7 +1926,7 @@ function Q_state!(
     # `filter_loglikelihood` exactly at the EM fixed point (cf. the
     # `benchmarking/elbo_investigation.jl` script).
     log2π = log(T(2π))
-    const_init  = T(N) * D * log2π
+    const_init = T(N) * D * log2π
     const_trans = T(dyn_n) * D * log2π
 
     # S_init = init_yy - μ x0' - x0 μ' + N x0 x0'    (μ = Σ x_init)
@@ -2061,44 +2074,77 @@ function update_initial_state_mean!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[1] || return nothing
-    @views lds.state_model.x0 .= vec(suf.init_xy) ./ T(suf.init_n)
+    inv_n = inv(T(suf.init_n))
+    x0 = lds.state_model.x0
+    @inbounds for j in eachindex(x0)
+        x0[j] = suf.init_xy[1, j] * inv_n
+    end
     return nothing
 end
 
 function update_initial_state_covariance!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[2] || return nothing
     D = lds.latent_dim
     x0 = lds.state_model.x0
     N = suf.init_n
 
-    S0 = copy(suf.init_yy[].mat)
-    μ = vec(suf.init_xy)
-    BLAS.ger!(-one(T), x0, μ, S0)
-    BLAS.ger!(-one(T), μ, x0, S0)
-    BLAS.ger!(T(N), x0, x0, S0)
+    S0 = sws.S0_sum                                  # D × D scratch
+    copyto!(S0, suf.init_yy[].mat)
+
+    # Rank-1 updates inline (BLAS.ger! would need a contiguous μ vector and
+    # `view(init_xy, 1, :)` allocates a SubArray header — small but nonzero).
+    @inbounds for j in 1:D
+        μ_j = suf.init_xy[1, j]
+        x0_j = x0[j]
+        for i in 1:D
+            μ_i = suf.init_xy[1, i]
+            x0_i = x0[i]
+            S0[i, j] += T(N) * x0_i * x0_j - x0_i * μ_j - μ_i * x0_j
+        end
+    end
     Symmetrize!(S0)
 
     if lds.state_model.P0_prior === nothing
         S0 ./= T(N)
     else
         Ψ, ν = lds.state_model.P0_prior.Ψ, lds.state_model.P0_prior.ν
-        S0 .= iw_map(Ψ, ν, S0, T(N), D)
+        # iw_map inlined: (Ψ + S0) / (ν + N + D + 1)
+        denom = ν + T(N) + T(D + 1)
+        @inbounds for i in eachindex(S0)
+            S0[i] = (Ψ[i] + S0[i]) / denom
+        end
     end
     copyto!(lds.state_model.P0, S0)
     return nothing
 end
 
 function update_A_b!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
     D = lds.latent_dim
     u_dim = lds.state_input_dim
+    AB_prior = lds.state_model.AB_prior
 
-    # MAP for the [A b B] regression. mn_map handles `prior===nothing` (OLS).
-    W = mn_map(suf.dyn_xx[], suf.dyn_xy, lds.state_model.AB_prior)
+    if AB_prior === nothing
+        # Zero-alloc OLS fast path. `sws.Sxz` is exactly (D × dyn_reg_dim);
+        # its transpose is the (dyn_reg_dim × D) view we ldiv! into. After
+        # the in-place solve, `sws.Sxz` itself holds the transposed solution
+        # `transpose(dyn_xx \ dyn_xy)` = the W = [A b B] regression matrix.
+        Sxz_T = transpose(sws.Sxz)
+        copyto!(Sxz_T, suf.dyn_xy)
+        ldiv!(suf.dyn_xx[], Sxz_T)
+        W = sws.Sxz
+    else
+        # MN-prior MAP path — keep `mn_map` (allocates) for now.
+        W = mn_map(suf.dyn_xx[], suf.dyn_xy, AB_prior)
+    end
 
     copyto!(lds.state_model.A, view(W, :, 1:D))
     copyto!(lds.state_model.b, view(W, :, D + 1))
@@ -2109,27 +2155,46 @@ function update_A_b!(
 end
 
 function update_Q!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[4] || return nothing
     D = lds.latent_dim
     u_dim = lds.state_input_dim
-    dyn_reg_dim = D + 1 + u_dim
 
-    # W = [A b B] using the freshly-updated A/b/B.
-    W = Matrix{T}(undef, D, dyn_reg_dim)
+    # sws.AB is exactly (D × dyn_reg_dim); no view needed.
+    W = sws.AB
     copyto!(view(W, :, 1:D), lds.state_model.A)
     copyto!(view(W, :, D + 1), lds.state_model.b)
     if u_dim > 0
-        copyto!(view(W, :, (D + 2):dyn_reg_dim), lds.state_model.B)
+        copyto!(view(W, :, (D + 2):(D + 1 + u_dim)), lds.state_model.B)
     end
 
     # Residual scatter S = dyn_yy - W·dyn_xy - dyn_xy'·W' + W·dyn_xx·W'
-    Wxy = W * suf.dyn_xy
-    S_res = Matrix(suf.dyn_yy[].mat)
+    Wxy = sws.elbo_temp                        # D × D scratch (free post-Q_state!)
+    mul!(Wxy, W, suf.dyn_xy)
+
+    S_res = sws.Q_sum                          # D × D scratch
+    copyto!(S_res, suf.dyn_yy[].mat)
     S_res .-= Wxy
     S_res .-= Wxy'
-    S_res .+= PDMats.X_A_Xt(suf.dyn_xx[], W)
+    # In-place X_A_Xt = W · dyn_xx · W'. Mimic PDMats' X_A_Xt: compute
+    # `WL = W · L` (where dyn_xx = L·L' via the cached Cholesky) and add
+    # `WL · WL'` to the upper triangle of S_res via a symmetric rank-k
+    # BLAS call, then reflect upper → lower so the matrix is EXACTLY
+    # symmetric and positive-semidefinite by construction. (`mul!(S_res,
+    # WL, WL', 1, 1)` followed by `Symmetrize!` is *not* equivalent —
+    # BLAS gemm can produce 1-ULP-asymmetric output, and averaging then
+    # halves the off-diagonal X_A_Xt contribution.)
+    WL = sws.Sxz                               # (D × dyn_reg_dim) scratch
+    # WL = W · L where L is the lower-triangular Cholesky factor of
+    # dyn_xx. PDMats stores the *upper* factor U in `.chol.factors`
+    # (uplo='U'); L = U', so the equivalent BLAS call is
+    # `trmm!(…, 'U', 'T', …)` on the raw factor matrix. This avoids
+    # the per-call `LowerTriangular(...)` wrapper that
+    # `mul!(WL, W, chol.L)` would allocate.
+    copyto!(WL, W)
+    BLAS.trmm!('R', 'U', 'T', 'N', one(T), suf.dyn_xx[].chol.factors, WL)
+    mul!(S_res, WL, transpose(WL), one(T), one(T))
 
     # MN-prior contribution to the IW posterior scale.
     AB_prior = lds.state_model.AB_prior
@@ -2137,26 +2202,54 @@ function update_Q!(
         Wm = W .- AB_prior.M₀
         S_res .+= Wm * AB_prior.Λ * Wm'
     end
-    Symmetrize!(S_res)
+    # Reflect upper → lower so the matrix is exactly symmetric. (`mul!`
+    # of `WL · WL'` above can give 1-ULP-asymmetric output; mirroring
+    # the upper triangle wins back exact symmetry and preserves the
+    # mathematically-PSD upper values.)
+    @inbounds for j in 2:D, i in 1:(j - 1)
+        S_res[j, i] = S_res[i, j]
+    end
 
-    if lds.state_model.Q_prior === nothing
+    Q_prior = lds.state_model.Q_prior
+    if Q_prior === nothing
         S_res ./= T(suf.dyn_n)
     else
-        Ψ, ν = lds.state_model.Q_prior.Ψ, lds.state_model.Q_prior.ν
-        S_res .= iw_map(Ψ, ν, S_res, T(suf.dyn_n), D)
+        # iw_map(Ψ, ν, S, N, d) = (Ψ + S) / (ν + N + d + 1), inlined to
+        # avoid a fresh `(Ψ .+ S)` matrix. `Ψ` is `AbstractMatrix` at the
+        # type level (IWPrior{T,M<:AbstractMatrix} doesn't pin M on the
+        # `state_model.Q_prior` field), so we assert the concrete type
+        # locally to keep the loop type-stable.
+        denom = Q_prior.ν + T(suf.dyn_n) + T(D + 1)
+        Ψ = Q_prior.Ψ::Matrix{T}
+        @inbounds for i in eachindex(S_res)
+            S_res[i] = (Ψ[i] + S_res[i]) / denom
+        end
     end
     copyto!(lds.state_model.Q, S_res)
     return nothing
 end
 
 function update_C_d!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
     D = lds.latent_dim
     d_dim = lds.obs_input_dim
+    CD_prior = lds.obs_model.CD_prior
 
-    V = mn_map(suf.obs_xx[], suf.obs_xy, lds.obs_model.CD_prior)
+    if CD_prior === nothing
+        # Zero-alloc OLS fast path. `sws.Syz` is exactly (p × obs_reg_dim);
+        # its transpose is the (obs_reg_dim × p) view we ldiv! into. After
+        # the in-place solve, `sws.Syz` itself holds V = [C d D].
+        Syz_T = transpose(sws.Syz)
+        copyto!(Syz_T, suf.obs_xy)
+        ldiv!(suf.obs_xx[], Syz_T)
+        V = sws.Syz
+    else
+        V = mn_map(suf.obs_xx[], suf.obs_xy, CD_prior)
+    end
 
     copyto!(lds.obs_model.C, view(V, :, 1:D))
     copyto!(lds.obs_model.d, view(V, :, D + 1))
@@ -2167,33 +2260,52 @@ function update_C_d!(
 end
 
 function update_R!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[6] || return nothing
     p = lds.obs_dim
     D = lds.latent_dim
     d_dim = lds.obs_input_dim
-    obs_reg_dim = D + 1 + d_dim
 
-    V = Matrix{T}(undef, p, obs_reg_dim)
+    # sws.CD is exactly (p × obs_reg_dim); no view needed.
+    V = sws.CD
     copyto!(view(V, :, 1:D), lds.obs_model.C)
     copyto!(view(V, :, D + 1), lds.obs_model.d)
     if d_dim > 0
-        copyto!(view(V, :, (D + 2):obs_reg_dim), lds.obs_model.D)
+        copyto!(view(V, :, (D + 2):(D + 1 + d_dim)), lds.obs_model.D)
     end
 
-    Vxy = V * suf.obs_xy
-    S_res = Matrix(suf.obs_yy[].mat)
+    # Residual scatter S = obs_yy - V·obs_xy - obs_xy'·V' + V·obs_xx·V'
+    Vxy = sws.elbo_obs_temp                    # p × p scratch (free post-Q_obs!)
+    mul!(Vxy, V, suf.obs_xy)
+
+    S_res = sws.elbo_obs_work                  # p × p scratch
+    copyto!(S_res, suf.obs_yy[].mat)
     S_res .-= Vxy
     S_res .-= Vxy'
-    S_res .+= PDMats.X_A_Xt(suf.obs_xx[], V)
+    # In-place X_A_Xt = V · obs_xx · V'. Mirror PDMats' X_A_Xt: compute
+    # `VL = V · L` (obs_xx = L·L' via the cached Cholesky) and add
+    # `VL · VL'` to the upper triangle via a symmetric rank-k BLAS call,
+    # then reflect upper → lower for exact symmetry. (`mul!` + `Symmetrize!`
+    # would halve the off-diagonal contribution because gemm can produce
+    # 1-ULP-asymmetric output that averaging then collapses.)
+    VL = sws.Syz                               # (p × obs_reg_dim) scratch
+    # See `update_Q!`: `BLAS.trmm!` on the raw upper-stored
+    # `chol.factors` (with transa='T' since L = U') avoids the
+    # `LowerTriangular(...)` wrapper alloc that `mul!(VL, V, chol.L)`
+    # would do.
+    copyto!(VL, V)
+    BLAS.trmm!('R', 'U', 'T', 'N', one(T), suf.obs_xx[].chol.factors, VL)
+    mul!(S_res, VL, transpose(VL), one(T), one(T))
 
     CD_prior = lds.obs_model.CD_prior
     if CD_prior !== nothing
         Wm = V .- CD_prior.M₀
         S_res .+= Wm * CD_prior.Λ * Wm'
     end
-    Symmetrize!(S_res)
+    @inbounds for j in 2:p, i in 1:(j - 1)
+        S_res[j, i] = S_res[i, j]
+    end
 
     if lds.obs_model.R_prior === nothing
         S_res ./= T(suf.obs_n)
@@ -2217,14 +2329,13 @@ function mstep!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     update_initial_state_mean!(lds, suf)
-    update_initial_state_covariance!(lds, suf)
-    update_A_b!(lds, suf)
-    update_Q!(lds, suf)
-    update_C_d!(lds, suf)
-    update_R!(lds, suf)
+    update_initial_state_covariance!(lds, suf, sws)
+    update_A_b!(lds, suf, sws)
+    update_Q!(lds, suf, sws)
+    update_C_d!(lds, suf, sws)
+    update_R!(lds, suf, sws)
     return nothing
 end
-
 
 """
     fit!(lds, y; max_iter=100, tol=1e-6, progress=true,

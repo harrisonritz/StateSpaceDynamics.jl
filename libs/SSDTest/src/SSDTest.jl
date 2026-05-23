@@ -60,7 +60,9 @@ latents than the pre-EM estimate, after solving for the best linear map
 between the two (latent coordinates are identifiable only up to invertible
 change-of-basis). `x_true`, `x_pre`, `x_post` are each `D × T` matrices.
 """
-function test_smooth_improves(x_true::AbstractMatrix, x_pre::AbstractMatrix, x_post::AbstractMatrix)
+function test_smooth_improves(
+    x_true::AbstractMatrix, x_pre::AbstractMatrix, x_post::AbstractMatrix
+)
     @testset "Smoothing improves with EM" begin
         @test size(x_true) == size(x_pre) == size(x_post)
         err_pre = _aligned_residual(x_true, x_pre)

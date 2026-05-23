@@ -808,9 +808,9 @@ function mstep!(
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     update_initial_state_mean!(plds, suf)
-    update_initial_state_covariance!(plds, suf)
-    update_A_b!(plds, suf)
-    update_Q!(plds, suf)
+    update_initial_state_covariance!(plds, suf, sws)
+    update_A_b!(plds, suf, sws)
+    update_Q!(plds, suf, sws)
     update_observation_model!(plds, tfs, y, sws)
     return nothing
 end
@@ -1290,8 +1290,15 @@ function fit!(
 
     for iter in 1:max_iter
         elbos[iter] = estep!(
-            plds, suf, tfs, y, u_seq, v_seq, sws_pool;
-            max_iter=newton_max_iter, tol=T(newton_tol),
+            plds,
+            suf,
+            tfs,
+            y,
+            u_seq,
+            v_seq,
+            sws_pool;
+            max_iter=newton_max_iter,
+            tol=T(newton_tol),
         )
         mstep!(plds, suf, tfs, y, sws_pool[1])
 

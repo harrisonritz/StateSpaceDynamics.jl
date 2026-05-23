@@ -370,8 +370,8 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
 
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
     sws_pool = [
-        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
-        for _ in 1:Threads.maxthreadid()
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps) for
+        _ in 1:Threads.maxthreadid()
     ]
     StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
     StateSpaceDynamics.sufficient_statistics!(tfs)
@@ -407,7 +407,9 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     lds.obs_model.R .= R_orig
 
     # M-step via the suf-based path: aggregate, then mstep!(lds, suf, ws).
-    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+        Float64, lds, tsteps_per_trial
+    )
     u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
@@ -496,18 +498,23 @@ function test_gaussian_update_R_matches_residual_cov(; rng=MersenneTwister(7))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
         ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
         sws_pool = [
-            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for
+            _ in 1:Threads.maxthreadid()
         ]
         StateSpaceDynamics.smooth!(lds, tfs, Y, sws_pool)
 
         # only update R
         lds.fit_bool .= [false, false, false, false, false, true]
-        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds, tsteps_per_trial
+        )
         u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
         v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, Y, u_seq, v_seq)
+        StateSpaceDynamics._td_init_const_blocks!(
+            ws, lds, tsteps_per_trial, Y, u_seq, v_seq
+        )
         StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, Y, ws)
-        StateSpaceDynamics.update_R!(lds, suf)
+        StateSpaceDynamics.update_R!(lds, suf, ws)
 
         @test issymmetric(lds.obs_model.R)
         @test norm(lds.obs_model.R - Rtrue) / norm(Rtrue) < 0.25
@@ -532,7 +539,9 @@ function test_td_mn_priors_shrink(; rng=MersenneTwister(20260519))
         d = 0.1 * randn(rng, p)
 
         # Reference fit: no priors.
-        sm_ref = GaussianStateModel(; A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0))
+        sm_ref = GaussianStateModel(;
+            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0)
+        )
         om_ref = GaussianObservationModel(; C=copy(C), R=copy(R), d=copy(d))
         lds_ref = LinearDynamicalSystem(sm_ref, om_ref)
         _, y = rand(rng, lds_ref, fill(Tt, N))
@@ -548,11 +557,17 @@ function test_td_mn_priors_shrink(; rng=MersenneTwister(20260519))
         CD_Λ = 1e6 * Matrix{Float64}(I, D + 1, D + 1)
 
         sm_p = GaussianStateModel(;
-            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0),
+            A=copy(A),
+            Q=copy(Q),
+            b=copy(b),
+            x0=copy(x0),
+            P0=copy(P0),
             AB_prior=StateSpaceDynamics.MNPrior(; M₀=AB_M0, Λ=AB_Λ),
         )
         om_p = GaussianObservationModel(;
-            C=copy(C), R=copy(R), d=copy(d),
+            C=copy(C),
+            R=copy(R),
+            d=copy(d),
             CD_prior=StateSpaceDynamics.MNPrior(; M₀=CD_M0, Λ=CD_Λ),
         )
         lds_p = LinearDynamicalSystem(sm_p, om_p)
@@ -595,9 +610,7 @@ function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
         sm_true = GaussianStateModel(;
             A=A_true, Q=Q_true, x0=x0_true, P0=P0_true, b=b_true, B=B_true
         )
-        om_true = GaussianObservationModel(;
-            C=C_true, R=R_true, d=d_true, D=D_true
-        )
+        om_true = GaussianObservationModel(; C=C_true, R=R_true, d=d_true, D=D_true)
         lds_true = LinearDynamicalSystem(sm_true, om_true)
 
         v_seq = [randn(rng, d_dim, Tt) for _ in 1:N]
@@ -605,12 +618,14 @@ function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
 
         # Fit with obs controls.
         sm_init = GaussianStateModel(;
-            A=0.5*Matrix{Float64}(I, D, D), Q=Matrix{Float64}(I, D, D),
-            x0=zeros(D), P0=Matrix{Float64}(I, D, D), b=zeros(D),
+            A=0.5*Matrix{Float64}(I, D, D),
+            Q=Matrix{Float64}(I, D, D),
+            x0=zeros(D),
+            P0=Matrix{Float64}(I, D, D),
+            b=zeros(D),
         )
         om_init = GaussianObservationModel(;
-            C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p),
-            D=zeros(p, d_dim),
+            C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p), D=zeros(p, d_dim)
         )
         lds_fit = LinearDynamicalSystem(sm_init, om_init)
 
@@ -619,11 +634,14 @@ function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
 
         # Baseline: fit without obs controls (0-column D).
         sm_nofit = GaussianStateModel(;
-            A=0.5*Matrix{Float64}(I, D, D), Q=Matrix{Float64}(I, D, D),
-            x0=zeros(D), P0=Matrix{Float64}(I, D, D), b=zeros(D),
+            A=0.5*Matrix{Float64}(I, D, D),
+            Q=Matrix{Float64}(I, D, D),
+            x0=zeros(D),
+            P0=Matrix{Float64}(I, D, D),
+            b=zeros(D),
         )
         om_nofit = GaussianObservationModel(;
-            C=randn(MersenneTwister(20260520), p, D), R=Matrix{Float64}(I, p, p), d=zeros(p),
+            C=randn(MersenneTwister(20260520), p, D), R=Matrix{Float64}(I, p, p), d=zeros(p)
         )
         lds_nofit = LinearDynamicalSystem(sm_nofit, om_nofit)
         elbos_no = fit!(lds_nofit, y_seq; max_iter=60, progress=false)
@@ -678,7 +696,9 @@ function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
         end
 
         # Fit converges monotonically.
-        sm2 = GaussianStateModel(; A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0))
+        sm2 = GaussianStateModel(;
+            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0)
+        )
         om2 = GaussianObservationModel(; C=copy(C), R=copy(R), d=copy(d))
         lds_fit = LinearDynamicalSystem(sm2, om2)
         elbos = fit!(lds_fit, y; max_iter=20, progress=false)
@@ -717,9 +737,12 @@ function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
         tfs = StateSpaceDynamics.initialize_FilterSmooth(lds1, tsteps_per_trial)
         ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt)
         sws_pool = [
-            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for _ in 1:Threads.maxthreadid()
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, Tt) for
+            _ in 1:Threads.maxthreadid()
         ]
-        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds1, tsteps_per_trial)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds1, tsteps_per_trial
+        )
         u_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
         v_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
         w = [ones(Float64, Tt), 2.0 .* ones(Float64, Tt)]

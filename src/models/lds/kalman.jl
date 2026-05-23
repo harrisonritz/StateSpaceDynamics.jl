@@ -381,11 +381,11 @@ function backwards_cov!(
     # `Vector{PDMat{T,Matrix{T}}}` / `Array{T,3}`, but JET can't propagate
     # `T` through `maybeview` without the assertion.
     smooth_cov = kws.smooth_cov::Vector{PDMat{T,Matrix{T}}}
-    filt_cov   = kws.filt_cov::Vector{PDMat{T,Matrix{T}}}
-    pred_cov   = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
-    Q_PD       = kws.Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
-    G          = kws.G::Array{T,3}
-    A          = lds.state_model.A
+    filt_cov = kws.filt_cov::Vector{PDMat{T,Matrix{T}}}
+    pred_cov = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
+    Q_PD = kws.Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    G = kws.G::Array{T,3}
+    A = lds.state_model.A
 
     # init smoothed cov & accumulators
     smooth_cov[end] = filt_cov[end];
@@ -432,9 +432,7 @@ function backwards_cov!(
             kws.sum_smooth_cov_next .+= smooth_cov[tt].mat;
         end
 
-        mul!(
-            kws.sum_smooth_xcov, G[:, :, tt], smooth_cov[tt + 1].mat, one(T), one(T)
-        );
+        mul!(kws.sum_smooth_xcov, G[:, :, tt], smooth_cov[tt + 1].mat, one(T), one(T));
 
         # entropy contribution of backward-conditional cov
         ent_logdet += logdet(filt_cov[tt]) .- logdet(pred_cov[tt + 1])
@@ -529,13 +527,13 @@ end
     # Hoist workspace fields into concretely-typed locals — see
     # `backwards_cov!` for the same JET-vs-`@views` interaction.
     smooth_mean = kws.smooth_mean::Array{T,3}
-    smooth_cov  = kws.smooth_cov::Vector{PDMat{T,Matrix{T}}}
-    x_init      = kws.x_init::Matrix{T}
-    x_prev      = kws.x_prev::Matrix{T}
-    x_next      = kws.x_next::Matrix{T}
-    x_cur       = kws.x_cur::Matrix{T}
-    dyn_xx_buf  = kws.dyn_xx_buf::Matrix{T}
-    obs_xx_buf  = kws.obs_xx_buf::Matrix{T}
+    smooth_cov = kws.smooth_cov::Vector{PDMat{T,Matrix{T}}}
+    x_init = kws.x_init::Matrix{T}
+    x_prev = kws.x_prev::Matrix{T}
+    x_next = kws.x_next::Matrix{T}
+    x_cur = kws.x_cur::Matrix{T}
+    dyn_xx_buf = kws.dyn_xx_buf::Matrix{T}
+    obs_xx_buf = kws.obs_xx_buf::Matrix{T}
 
     # initial conditions -------
     x_init .= smooth_mean[:, 1, :]
@@ -959,7 +957,7 @@ function marginal_loglikelihood(
 
     # Hoist workspace fields with concrete eltype for JET; see backwards_cov!.
     innovation = kws.innovation::Array{T,3}
-    pred_cov   = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
+    pred_cov = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
 
     Cmu = zeros(T, lds.obs_dim, kws.tsteps * kws.ntrials)
     mul!(
@@ -968,9 +966,7 @@ function marginal_loglikelihood(
     innovation .= kws.y_minus_d .- reshape(Cmu, kws.obs_dim, kws.tsteps, kws.ntrials)
 
     @views for t in eachindex(pred_cov)
-        kws.obs_pd_tmp[] = tol_PD(
-            X_A_Xt(pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R
-        )
+        kws.obs_pd_tmp[] = tol_PD(X_A_Xt(pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R)
         MV = MvNormal(kws.obs_pd_tmp[])
 
         for n in axes(innovation, 3)

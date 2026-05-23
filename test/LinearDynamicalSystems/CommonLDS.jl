@@ -116,8 +116,8 @@ function test_estep_common(lds, x, y)
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     T_max = maximum(tsteps_per_trial)
     sws_pool = [
-        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, T_max)
-        for _ in 1:Threads.maxthreadid()
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, T_max) for
+        _ in 1:Threads.maxthreadid()
     ]
     StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
     StateSpaceDynamics.sufficient_statistics!(tfs)
@@ -149,8 +149,8 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
 
     # Smooth + populate E_z/E_zz/E_zz_prev for the reference Q_state objective.
     sws_pool = [
-        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
-        for _ in 1:Threads.maxthreadid()
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps) for
+        _ in 1:Threads.maxthreadid()
     ]
     StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
     StateSpaceDynamics.sufficient_statistics!(tfs)
@@ -183,7 +183,9 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
 
     # M-step via the suf-based path: aggregate sufficient statistics from
     # tfs.x_smooth/p_smooth/p_smooth_tt1, then run mstep!(lds, suf, ws).
-    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+        Float64, lds, tsteps_per_trial
+    )
     u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
@@ -192,9 +194,9 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.mstep!(lds, suf, ws)
     else
         StateSpaceDynamics.update_initial_state_mean!(lds, suf)
-        StateSpaceDynamics.update_initial_state_covariance!(lds, suf)
-        StateSpaceDynamics.update_A_b!(lds, suf)
-        StateSpaceDynamics.update_Q!(lds, suf)
+        StateSpaceDynamics.update_initial_state_covariance!(lds, suf, ws)
+        StateSpaceDynamics.update_A_b!(lds, suf, ws)
+        StateSpaceDynamics.update_Q!(lds, suf, ws)
         StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
     end
 
@@ -215,8 +217,8 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     ws = StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
     sws_pool = [
-        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps)
-        for _ in 1:Threads.maxthreadid()
+        StateSpaceDynamics.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, tsteps) for
+        _ in 1:Threads.maxthreadid()
     ]
     StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool)
     StateSpaceDynamics.sufficient_statistics!(tfs)
@@ -251,7 +253,9 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     lds.state_model.b .= b_orig
     lds.state_model.Q .= Q_orig
 
-    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
+    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+        Float64, lds, tsteps_per_trial
+    )
     u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
     StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
@@ -260,9 +264,9 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
         StateSpaceDynamics.mstep!(lds, suf, ws)
     else
         StateSpaceDynamics.update_initial_state_mean!(lds, suf)
-        StateSpaceDynamics.update_initial_state_covariance!(lds, suf)
-        StateSpaceDynamics.update_A_b!(lds, suf)
-        StateSpaceDynamics.update_Q!(lds, suf)
+        StateSpaceDynamics.update_initial_state_covariance!(lds, suf, ws)
+        StateSpaceDynamics.update_A_b!(lds, suf, ws)
+        StateSpaceDynamics.update_Q!(lds, suf, ws)
         StateSpaceDynamics.update_observation_model!(lds, tfs, y, ws)
     end
 
