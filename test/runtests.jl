@@ -7,6 +7,7 @@ using JET
 using LinearAlgebra
 using MAT
 using Optim
+using Pkg
 using Printf
 using Random
 using StableRNGs
@@ -16,6 +17,14 @@ using SparseArrays
 using StatsFuns
 using SpecialFunctions
 using Test
+
+# Run docs/examples headless (no display window).
+ENV["GKSwstype"] = "100"
+
+# In-repo sub-package of assertion helpers shared by `docs/examples/`
+# tutorials. Pattern lifted from HiddenMarkovModels.jl's `HMMTest`.
+Pkg.develop(; path=joinpath(dirname(@__DIR__), "libs", "SSDTest"))
+using SSDTest
 
 # Helper functions
 include("helper_functions.jl")
@@ -266,5 +275,16 @@ include("helper_functions.jl")
     @testset verbose=true "Pretty Printing" begin
         include("PrettyPrinting/PrettyPrinting.jl")
         test_pretty_printing()
+    end
+
+    # Docs/examples tests. Pattern lifted from HiddenMarkovModels.jl.
+    @testset verbose=true "Docs Examples" begin
+        examples_src = joinpath(dirname(@__DIR__), "docs", "examples")
+        for file in sort(readdir(examples_src))
+            endswith(file, ".jl") || continue
+            @testset "Example - $file" begin
+                include(joinpath(examples_src, file))
+            end
+        end
     end
 end
