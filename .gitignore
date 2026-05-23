@@ -12,6 +12,8 @@ test/*/notebooks
 docs/build/
 docs/Manifest.toml
 test/*/notebooks
+# SSDTest is dev'd in from libs/ at the start of every Pkg.test() run.
+test/Manifest.toml
 
 # Julia-specific files
 Manifest.toml
