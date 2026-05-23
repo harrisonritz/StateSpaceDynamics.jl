@@ -103,15 +103,13 @@ struct SmoothWorkspace{T<:Real}
     # Sub-workspace for block tridiagonal operations
     btd::BlockTridiagonalWorkspace{T}
 
-    # cholesky buffers
-    R_buf::Matrix{T}      # (obs_dim × obs_dim)
-    Q_buf::Matrix{T}      # (latent_dim × latent_dim)
-    P0_buf::Matrix{T}     # (latent_dim × latent_dim)
-
-    # Cached upper-tri Chol factors
-    R_chol_U::Matrix{T}       # (obs_dim × obs_dim)
-    Q_chol_U::Matrix{T}       # (latent_dim × latent_dim)
-    P0_chol_U::Matrix{T}      # (latent_dim × latent_dim)
+    # Cached PDMats for R, Q, P0. Rewrapped once per E-step in
+    # `compute_smooth_constants!`; downstream code consumes via
+    # `ws.R_PD[].chol.U` (triangular factor) and `logdet(ws.R_PD[])`.
+    # Mirrors `KalmanWorkspace`'s `Q_PD` / `P0_PD` / `R_PD` pattern.
+    R_PD::Base.RefValue{PDMat{T,Matrix{T}}}      # (obs_dim × obs_dim)
+    Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}      # (latent_dim × latent_dim)
+    P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}     # (latent_dim × latent_dim)
 
     # Solve Outputs
     tmp_RC::Matrix{T}    # obs_dim × latent_dim   (R^{-1} C)
@@ -243,14 +241,11 @@ function SmoothWorkspace(
 ) where {T<:Real}
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 
-    # Pre-computed constant terms (will be filled by compute_smooth_constants!)
-    R_buf = zeros(T, obs_dim, obs_dim)
-    Q_buf = zeros(T, latent_dim, latent_dim)
-    P0_buf = zeros(T, latent_dim, latent_dim)
-
-    R_chol_U = zeros(T, obs_dim, obs_dim)
-    Q_chol_U = zeros(T, latent_dim, latent_dim)
-    P0_chol_U = zeros(T, latent_dim, latent_dim)
+    # Placeholder PDMats — rewrapped at the start of every E-step
+    # by `compute_smooth_constants!`.
+    R_PD = Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim)))
+    Q_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
+    P0_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
 
     tmp_RC = zeros(T, obs_dim, latent_dim)
     tmp_QA = zeros(T, latent_dim, latent_dim)
@@ -348,12 +343,9 @@ function SmoothWorkspace(
 
     return SmoothWorkspace{T}(
         btd,
-        R_buf,
-        Q_buf,
-        P0_buf,
-        R_chol_U,
-        Q_chol_U,
-        P0_chol_U,
+        R_PD,
+        Q_PD,
+        P0_PD,
         tmp_RC,
         tmp_QA,
         C_inv_R,
@@ -443,20 +435,15 @@ function compute_smooth_constants!(
     C = lds.obs_model.C
     R = lds.obs_model.R
 
-    # Cholesky in-place
-    copyto!(ws.R_buf, R)
-    Rchol = cholesky!(Symmetric(ws.R_buf))
-
-    copyto!(ws.Q_buf, Q)
-    Qchol = cholesky!(Symmetric(ws.Q_buf))
-
-    copyto!(ws.P0_buf, P0)
-    P0chol = cholesky!(Symmetric(ws.P0_buf))
-
-    # store U factors
-    copyto!(ws.R_chol_U, Rchol.U)
-    copyto!(ws.Q_chol_U, Qchol.U)
-    copyto!(ws.P0_chol_U, P0chol.U)
+    # Rewrap covariances as PDMats — each PDMat caches its own Cholesky
+    # factor internally and is consumed downstream via `ws.X_PD[].chol.U`
+    # for triangular solves and `logdet(ws.X_PD[])` for the normalizer.
+    ws.R_PD[] = PDMat(Symmetric(R))
+    ws.Q_PD[] = PDMat(Symmetric(Q))
+    ws.P0_PD[] = PDMat(Symmetric(P0))
+    Rchol = ws.R_PD[].chol
+    Qchol = ws.Q_PD[].chol
+    P0chol = ws.P0_PD[].chol
 
     # tmp_RC = R^{-1} C
     copyto!(ws.tmp_RC, C)
@@ -508,9 +495,9 @@ go through the cov-cache fast path.
 function _copy_smooth_constants!(
     dst::SmoothWorkspace{T}, src::SmoothWorkspace{T}
 ) where {T<:Real}
-    copyto!(dst.R_chol_U, src.R_chol_U)
-    copyto!(dst.Q_chol_U, src.Q_chol_U)
-    copyto!(dst.P0_chol_U, src.P0_chol_U)
+    dst.R_PD[] = src.R_PD[]
+    dst.Q_PD[] = src.Q_PD[]
+    dst.P0_PD[] = src.P0_PD[]
     copyto!(dst.tmp_RC, src.tmp_RC)
     copyto!(dst.tmp_QA, src.tmp_QA)
     copyto!(dst.C_inv_R, src.C_inv_R)
@@ -531,12 +518,12 @@ function compute_smooth_constants!(
     Q = lds.state_model.Q
     P0 = lds.state_model.P0
 
-    # Compute Cholesky factors for state model only
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    copyto!(ws.Q_chol_U, Q_chol.U)
-    copyto!(ws.P0_chol_U, P0_chol.U)
+    # Wrap state-side covariances as PDMats (Poisson path doesn't need R
+    # in this workspace path). Each PDMat caches its own Cholesky factor.
+    ws.Q_PD[] = PDMat(Symmetric(Q))
+    ws.P0_PD[] = PDMat(Symmetric(P0))
+    Q_chol = ws.Q_PD[].chol
+    P0_chol = ws.P0_PD[].chol
 
     # Gradient terms: A_inv_Q = (Q_chol \ A)'
     tmp_QA = Q_chol \ A   # latent_dim × latent_dim
@@ -571,15 +558,12 @@ This mirrors the *constant* parts of `SmoothWorkspace`, but does not include opt
 or block-tridiagonal storage.
 """
 mutable struct LDSConstantCache{T<:Real}
-    # Cholesky buffers (for in-place factorization)
-    R_buf::Matrix{T}
-    Q_buf::Matrix{T}
-    P0_buf::Matrix{T}
-
-    # Cached upper factors
-    R_chol_U::Matrix{T}
-    Q_chol_U::Matrix{T}
-    P0_chol_U::Matrix{T}
+    # PDMats for R, Q, P0. Rewrapped once per SLDS smoothing pass by
+    # `compute_slds_constants!`; downstream consumers use `.chol.U` and
+    # `logdet(...)`. Mirrors `SmoothWorkspace`'s `R_PD` / `Q_PD` / `P0_PD`.
+    R_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    P0_PD::Base.RefValue{PDMat{T,Matrix{T}}}
 
     # LL constant terms
     cP0::T
@@ -608,12 +592,9 @@ end
 
 function LDSConstantCache(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
     return LDSConstantCache{T}(
-        zeros(T, obs_dim, obs_dim),             # R_buf
-        zeros(T, latent_dim, latent_dim),       # Q_buf
-        zeros(T, latent_dim, latent_dim),       # P0_buf
-        zeros(T, obs_dim, obs_dim),             # R_chol_U
-        zeros(T, latent_dim, latent_dim),       # Q_chol_U
-        zeros(T, latent_dim, latent_dim),       # P0_chol_U
+        Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim))),         # R_PD placeholder
+        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # Q_PD placeholder
+        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # P0_PD placeholder
         zero(T),                                # cP0
         zero(T),                                # cQ
         zero(T),                                # cR
@@ -658,20 +639,13 @@ function compute_slds_constants!(
         fill!(cc.d, zero(T))
     end
 
-    if lds.obs_model isa GaussianObservationModel{T}
-        cc.cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + _logdet_from_U(cc.R_chol_U, obs_dim))
-    else
-        cc.cR = zero(T)  # unused for Poisson
-    end
-
-    # Q, P0 cholesky (in-place)
-    copyto!(cc.Q_buf, Q)
-    Qchol = cholesky!(Symmetric(cc.Q_buf))
-    copyto!(cc.Q_chol_U, Qchol.U)
-
-    copyto!(cc.P0_buf, P0)
-    P0chol = cholesky!(Symmetric(cc.P0_buf))
-    copyto!(cc.P0_chol_U, P0chol.U)
+    # Wrap state-side covariances as PDMats. Observation R is wrapped further
+    # below only on the Gaussian branch — Poisson leaves cc.R_PD on its
+    # identity placeholder and `cc.cR` zero.
+    cc.Q_PD[] = PDMat(Symmetric(Q))
+    cc.P0_PD[] = PDMat(Symmetric(P0))
+    Qchol = cc.Q_PD[].chol
+    P0chol = cc.P0_PD[].chol
 
     # tmp_QA = Q^{-1}A, A_inv_Q = (Q^{-1}A)'
     copyto!(cc.tmp_QA, A)
@@ -696,10 +670,8 @@ function compute_slds_constants!(
 
     # Observation terms only if Gaussian
     if lds.obs_model isa GaussianObservationModel{T}
-        R = lds.obs_model.R
-        copyto!(cc.R_buf, R)
-        Rchol = cholesky!(Symmetric(cc.R_buf))
-        copyto!(cc.R_chol_U, Rchol.U)
+        cc.R_PD[] = PDMat(Symmetric(lds.obs_model.R))
+        Rchol = cc.R_PD[].chol
 
         # tmp_RC = R^{-1}C, C_inv_R = (R^{-1}C)'
         copyto!(cc.tmp_RC, C)
@@ -714,13 +686,12 @@ function compute_slds_constants!(
         fill!(cc.C_inv_R, zero(T))  # unused for Poisson
     end
 
-    # Now safe to compute constants (state-specific, needed for SLDS)
-    cc.cP0 =
-        -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(cc.P0_chol_U, latent_dim))
-    cc.cQ = -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(cc.Q_chol_U, latent_dim))
+    # LL normalizers from cached Cholesky factors.
+    cc.cP0 = -T(0.5) * (T(latent_dim) * log(T(2π)) + logdet(cc.P0_PD[]))
+    cc.cQ = -T(0.5) * (T(latent_dim) * log(T(2π)) + logdet(cc.Q_PD[]))
 
     if lds.obs_model isa GaussianObservationModel{T}
-        cc.cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + _logdet_from_U(cc.R_chol_U, obs_dim))
+        cc.cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + logdet(cc.R_PD[]))
     else
         cc.cR = zero(T)
     end

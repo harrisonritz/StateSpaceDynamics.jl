@@ -677,15 +677,6 @@ id_PD(A::Matrix; tol::Real=1e-6)::PDMat = PDMat(
     hermitianpart(A + (tol * tr(A) / size(A, 1)) * I)
 )
 
-# logdet(Σ) from Cholesky Σ = U'U => logdet(Σ) = 2 * sum(log(diag(U)))
-function _logdet_from_U(U::AbstractMatrix{T}, n::Int) where {T}
-    s = zero(T)
-    for i in 1:n
-        s += log(U[i, i])
-    end
-    return 2s
-end
-
 """
     gaussian_entropy(H::Symmetric{T}) where {T<:Real}
 

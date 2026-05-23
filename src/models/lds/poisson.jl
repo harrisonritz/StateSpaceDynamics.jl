@@ -111,7 +111,7 @@ function _loglikelihood_ws(
     @views begin
         @. dx = x[:, 1] - x0
         copyto!(z, dx)
-        ldiv!(LowerTriangular(ws.P0_chol_U'), z)  # z := U' \ dx
+        ldiv!(ws.P0_PD[].chol.L, z)               # z := U' \ dx = L \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
@@ -120,7 +120,7 @@ function _loglikelihood_ws(
         mul!(dx, A, x[:, t - 1])          # dx := A * x_{t-1}
         @. dx = x[:, t] - (dx + b)      # dx := x_t - (A x_{t-1} + b)
         copyto!(z, dx)
-        ldiv!(LowerTriangular(ws.Q_chol_U'), z)   # z := U' \ dx
+        ldiv!(ws.Q_PD[].chol.L, z)                # z := U' \ dx = L \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
@@ -146,8 +146,8 @@ function loglikelihood!(
     z = ws.z
     λ = ws.λ
 
-    Q_U = UpperTriangular(cc.Q_chol_U)
-    P0_U = UpperTriangular(cc.P0_chol_U)
+    Q_U = cc.Q_PD[].chol.U
+    P0_U = cc.P0_PD[].chol.U
 
     dxt = ws.dxt
     tmp = ws.tmp1
@@ -843,7 +843,7 @@ function calculate_elbo(
     end
 
     # State-side Q via aggregated suff-stats. `compute_smooth_constants!` on a
-    # Poisson LDS only fills state-side constants (Q_chol_U / P0_chol_U /
+    # Poisson LDS only fills state-side constants (Q_PD / P0_PD /
     # derived blocks); `Q_state!(sws, lds, suf)` reads exactly those.
     compute_smooth_constants!(sws_pool[1], plds)
     Q_state_total = Q_state!(sws_pool[1], plds, suf)
@@ -975,9 +975,9 @@ function _compute_gradient_poisson!(
     tsteps = size(y, 2)
     latent_dim, obs_dim = lds.latent_dim, lds.obs_dim
 
-    # Cholesky factors from workspace (stored as upper triangular)
-    Q_chol_U = UpperTriangular(ws.Q_chol_U)
-    P0_chol_U = UpperTriangular(ws.P0_chol_U)
+    # Cholesky factors from cached PDMats (upper triangular factor)
+    Q_chol_U = ws.Q_PD[].chol.U
+    P0_chol_U = ws.P0_PD[].chol.U
 
     # Reuse workspace temp vectors
     Cx_t = ws.dyt           # obs_dim

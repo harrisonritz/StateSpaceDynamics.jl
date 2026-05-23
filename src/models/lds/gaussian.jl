@@ -391,9 +391,9 @@ function loglikelihood!(
     d = lds.obs_model.d
     D_obs = lds.obs_model.D
 
-    R_U = UpperTriangular(ws.R_chol_U)
-    Q_U = UpperTriangular(ws.Q_chol_U)
-    P0_U = UpperTriangular(ws.P0_chol_U)
+    R_U = ws.R_PD[].chol.U
+    Q_U = ws.Q_PD[].chol.U
+    P0_U = ws.P0_PD[].chol.U
 
     ll_vec = ws.ll_vec
     temp_dx = ws.temp_dx
@@ -404,9 +404,9 @@ function loglikelihood!(
     latent_dim = lds.latent_dim
     obs_dim = lds.obs_dim
 
-    cP0 = -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(ws.P0_chol_U, latent_dim))
-    cQ = -T(0.5) * (T(latent_dim) * log(T(2π)) + _logdet_from_U(ws.Q_chol_U, latent_dim))
-    cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + _logdet_from_U(ws.R_chol_U, obs_dim))
+    cP0 = -T(0.5) * (T(latent_dim) * log(T(2π)) + logdet(ws.P0_PD[]))
+    cQ = -T(0.5) * (T(latent_dim) * log(T(2π)) + logdet(ws.Q_PD[]))
+    cR = -T(0.5) * (T(obs_dim) * log(T(2π)) + logdet(ws.R_PD[]))
 
     for t in 1:tsteps
         ll_t = zero(T)
@@ -487,9 +487,9 @@ function loglikelihood!(
     C = lds.obs_model.C
     d = lds.obs_model.d
 
-    Q_U = UpperTriangular(cc.Q_chol_U)
-    P0_U = UpperTriangular(cc.P0_chol_U)
-    R_U = UpperTriangular(cc.R_chol_U)
+    Q_U = cc.Q_PD[].chol.U
+    P0_U = cc.P0_PD[].chol.U
+    R_U = cc.R_PD[].chol.U
 
     dxt = ws.dxt
     dyt = ws.dyt
@@ -832,7 +832,7 @@ function smooth!(
 
     if all_equal
         # `_precompute_shared_cov!` populates `sws_pool[1]`'s smoothing constants
-        # (`R_chol_U`/`Q_chol_U`/…/`C_inv_R`/`A_inv_Q`/…), the `btd.neg_*` blocks,
+        # (`R_PD`/`Q_PD`/`P0_PD`/`C_inv_R`/`A_inv_Q`/…), the `btd.neg_*` blocks,
         # and the BT forward-sweep LU cache (`btd.LU_factors`/`LU_ipivs`/`D`).
         # Per-task back-subs and gradient evaluations read from that same
         # workspace (no mutation), so it's safe to share across `@spawn`'d tasks.
@@ -1027,15 +1027,11 @@ function Q_state!(
     x0 = lds.state_model.x0
 
     # Use cached Cholesky factors (already computed by compute_smooth_constants!)
-    Q_U = UpperTriangular(ws.Q_chol_U)
-    P0_U = UpperTriangular(ws.P0_chol_U)
+    Q_U = ws.Q_PD[].chol.U
+    P0_U = ws.P0_PD[].chol.U
 
-    log_det_Q = zero(T)
-    log_det_P0 = zero(T)
-    for j in 1:D
-        log_det_Q += 2 * log(Q_U[j, j])
-        log_det_P0 += 2 * log(P0_U[j, j])
-    end
+    log_det_Q = logdet(ws.Q_PD[])
+    log_det_P0 = logdet(ws.P0_PD[])
 
     temp = ws.elbo_temp
     sum_E_zz = ws.elbo_sum_E_zz
@@ -1208,11 +1204,8 @@ function Q_obs!(
     D_obs = lds.obs_model.D
     d_dim = size(v, 1)
 
-    R_U = UpperTriangular(ws.R_chol_U)
-    log_det_R = zero(T)
-    for j in 1:obs_dim
-        log_det_R += 2 * log(R_U[j, j])
-    end
+    R_U = ws.R_PD[].chol.U
+    log_det_R = logdet(ws.R_PD[])
     const_term = obs_dim * log(T(2π))
 
     temp = ws.elbo_obs_temp
@@ -1903,15 +1896,11 @@ function Q_state!(
     u_dim = lds.state_input_dim
     dyn_reg_dim = D + 1 + u_dim
 
-    Q_U = UpperTriangular(sws.Q_chol_U)
-    P0_U = UpperTriangular(sws.P0_chol_U)
+    Q_U = sws.Q_PD[].chol.U
+    P0_U = sws.P0_PD[].chol.U
 
-    log_det_Q = zero(T)
-    log_det_P0 = zero(T)
-    for j in 1:D
-        log_det_Q += 2 * log(Q_U[j, j])
-        log_det_P0 += 2 * log(P0_U[j, j])
-    end
+    log_det_Q = logdet(sws.Q_PD[])
+    log_det_P0 = logdet(sws.P0_PD[])
 
     N = suf.init_n
     dyn_n = suf.dyn_n
@@ -1981,11 +1970,8 @@ function Q_obs!(
     d = lds.obs_model.d
     D_obs = lds.obs_model.D
 
-    R_U = UpperTriangular(sws.R_chol_U)
-    log_det_R = zero(T)
-    for j in 1:p
-        log_det_R += 2 * log(R_U[j, j])
-    end
+    R_U = sws.R_PD[].chol.U
+    log_det_R = logdet(sws.R_PD[])
     const_term = p * log(T(2π))
 
     obs_n = suf.obs_n
