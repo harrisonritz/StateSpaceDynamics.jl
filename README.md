@@ -56,26 +56,31 @@ d = log.([0.1, 0.1, 0.1])       # baseline log-rates: λ_i = exp(C_i' x + d_i)
 tsteps = 100
 trials = 10
 
-gaussian_state_model = GaussianStateModel(;A=A, Q=Q, P0=P0, x0=x0)
+b = zeros(2)                                       # dynamics bias
+
+gaussian_state_model = GaussianStateModel(;A=A, Q=Q, b=b, P0=P0, x0=x0)
 poisson_obs_model = PoissonObservationModel(;C=C, d=d)
 
-plds_true = LinearDynamicalSystem(;state_model=gaussian_state_model, 
-                                   obs_model=poisson_obs_model, 
-                                   latent_dim=2, obs_dim=3, fit_bool=fill(true, 6))
+plds_true = LinearDynamicalSystem(;state_model=gaussian_state_model,
+                                   obs_model=poisson_obs_model,
+                                   latent_dim=2, obs_dim=3, fit_bool=fill(true, 5))
 
-latents, observations = rand(rng, plds_true; tsteps=tsteps, ntrials=trials)
+# Multi-trial sampling: pass per-trial timestep counts as a Vector. Returns
+# `Vector{Matrix}` for both latents and observations (one entry per trial).
+latents, observations = rand(rng, plds_true, fill(tsteps, trials))
 
 # fit the data to a new naive model
 A_init = random_rotation_matrix(2, rng)
 Q_init = Matrix(0.1 * I(2))
 P0_init = Matrix(0.1 * I(2))
 x0_init = zeros(2)
+b_init = zeros(2)
 
 C_init = rand(3, 2)
 d_init = zeros(3)
 
-plds_true = LinearDynamicalSystem(;state_model=GaussianStateModel(;A=A_init, Q=Q_init, P0=P0_init, x0=x0_init), obs_model=PoissonObservationModel(;C=C_init, d=d_init), latent_dim=2, obs_dim=3, fit_bool=fill(true, 6))
-fit!(plds_true, observations; max_iter=15, tol=1e-3)
+plds_naive = LinearDynamicalSystem(;state_model=GaussianStateModel(;A=A_init, Q=Q_init, b=b_init, P0=P0_init, x0=x0_init), obs_model=PoissonObservationModel(;C=C_init, d=d_init), latent_dim=2, obs_dim=3, fit_bool=fill(true, 5))
+elbos = fit!(plds_naive, observations; max_iter=15, tol=1e-3)
 ```
 
 ## Inference

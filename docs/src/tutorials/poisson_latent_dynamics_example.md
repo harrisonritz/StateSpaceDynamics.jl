@@ -145,7 +145,7 @@ Generate both latent trajectories and count observations
 
 ````@example poisson_latent_dynamics_example
 tSteps = 500
-latents, observations = rand(rng, true_plds; tsteps=tSteps, ntrials=1);
+latents, observations = rand(rng, true_plds, tSteps);
 nothing #hide
 ````
 
@@ -180,7 +180,7 @@ Plot vector field with simulated trajectory
 ````@example poisson_latent_dynamics_example
 p1 = quiver(X, Y, quiver=(U_norm, V_norm), color=:blue, alpha=0.3,
            linewidth=1, arrow=arrow(:closed, :head, 0.1, 0.1))
-plot!(latents[1, :, 1], latents[2, :, 1], xlabel=L"x_1", ylabel=L"x_2",
+plot!(latents[1, :], latents[2, :], xlabel=L"x_1", ylabel=L"x_2",
       color=:black, linewidth=1.5, title="Latent Dynamics", legend=false)
 
 p1
@@ -192,8 +192,8 @@ Create visualizations highlighting the contrast between continuous latent
 dynamics and discrete count observations (spike trains).
 
 ````@example poisson_latent_dynamics_example
-states = latents[:, :, 1]
-emissions = observations[:, :, 1]
+states = latents
+emissions = observations
 ````
 
 Two-panel layout: continuous latent states above, discrete spike rasters below
@@ -291,7 +291,7 @@ p3 = plot()
 for d in 1:latent_dim
     plot!(1:tSteps, states[d, :] .+ lim_states * (d-1), color=:black,
           linewidth=2, label=(d==1 ? "True" : ""), alpha=0.8)
-    plot!(1:tSteps, smoothed_x_pre[d, :, 1] .+ lim_states * (d-1), color=:red,
+    plot!(1:tSteps, smoothed_x_pre[d, :] .+ lim_states * (d-1), color=:red,
           linewidth=2, label=(d==1 ? "Initial Est." : ""), alpha=0.8)
 end
 
@@ -306,7 +306,7 @@ p3
 Fit the model - using fewer iterations due to computational cost
 
 ````@example poisson_latent_dynamics_example
-elbo, _ = fit!(naive_plds, observations; max_iter=25, tol=1e-6);
+elbo = fit!(naive_plds, observations; max_iter=25, tol=1e-6);
 
 print("Laplace-EM completed in $(length(elbo)) iterations\n")
 ````
@@ -330,7 +330,7 @@ p4 = plot()
 for d in 1:latent_dim
     plot!(1:tSteps, states[d, :] .+ lim_states * (d-1), color=:black,
           linewidth=2, label=(d==1 ? "True" : ""), alpha=0.8)
-    plot!(1:tSteps, smoothed_x_post[d, :, 1] .+ lim_states * (d-1), color=:red,
+    plot!(1:tSteps, smoothed_x_post[d, :] .+ lim_states * (d-1), color=:red,
           linewidth=2, label=(d==1 ? "Post-EM Est." : ""), alpha=0.8)
 end
 

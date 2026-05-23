@@ -30,21 +30,29 @@ include("helper_functions.jl")
 
         @testset "JET.jl Code Linting" begin
             if VERSION >= v"1.11"
-                # JET reports ~19 union-split false positives, all from the
-                # same pattern: `@views` over a workspace field typed
-                # `Array{T,3}` / `Vector{PDMat{T,Matrix{T}}}` produces a
-                # `maybeview` whose return JET infers as
+                # JET reports ~23 union-split false positives in `kalman.jl`
+                # (`backwards_cov!`, `sufficient_statistics!`,
+                # `marginal_loglikelihood`) and the TD aggregator in
+                # `gaussian.jl` (`_precompute_shared_cov!`,
+                # `_td_init_const_blocks!`, `_aggregate_td_suff_stats!`,
+                # `_aggregate_td_suff_stats_weighted!`). Pattern: `@views`
+                # over a workspace field typed `Array{T,3}` /
+                # `Vector{PDMat{T,Matrix{T}}}` (where `T<:Real`) produces a
+                # `maybeview` whose return type JET infers as
                 # `Union{SubArray{Any, …}, SubArray{T, …}}`. The `Any` branch
-                # then fails to match downstream `BLAS.ger!` / `BLAS.syrk!` /
-                # `Symmetrize!` / `X_A_Xt` / `logpdf` signatures. Affected
-                # callsites are entirely in `kalman.jl` (`backwards_cov!`,
-                # `sufficient_statistics!`, `marginal_loglikelihood`) and the
-                # TD aggregator in `gaussian.jl` (uses `sws.p_smooth_shared`
-                # and the legacy `S0_sum` outer product). Runtime types are
-                # concrete and all functional tests pass — fixing requires
-                # narrowing each field access with a `::Vector{...}` /
-                # `::Array{T,3}` assertion, which is a follow-up. Replace
-                # with `JET.test_package(...)` once those land.
+                # then fails to match downstream `BLAS.ger!` /
+                # `BLAS.syrk!` / `Symmetrize!` / `X_A_Xt` / `logpdf` /
+                # `aggregate_xx` signatures.
+                #
+                # Runtime types are concrete and all functional tests pass;
+                # the field-hoist + `::Type` assertion pattern was tried
+                # (see `backwards_cov!`, `sufficient_statistics!`,
+                # `_precompute_shared_cov!`, etc.) and **does not** clear
+                # JET — its parametric analysis still sees the outer
+                # `where T<:Real` on the field and splits the union. To
+                # fully clear, the workspaces would need to be parametrized
+                # on concrete `Matrix{T}` element type at each call site (a
+                # bigger refactor — JET issue tracked but deferred).
                 @test_skip JET.test_package(
                     StateSpaceDynamics; target_modules=(StateSpaceDynamics,)
                 )

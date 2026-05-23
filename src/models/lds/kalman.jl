@@ -375,25 +375,36 @@ end
 function backwards_cov!(
     lds::LinearDynamicalSystem{T,S,O}, kws::KalmanWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    # Hoist workspace fields into locals with concrete element types so
+    # `@views` indexing below stays inside the typed branch of JET's
+    # union-split analysis. `KalmanWorkspace{T}` declares these fields as
+    # `Vector{PDMat{T,Matrix{T}}}` / `Array{T,3}`, but JET can't propagate
+    # `T` through `maybeview` without the assertion.
+    smooth_cov = kws.smooth_cov::Vector{PDMat{T,Matrix{T}}}
+    filt_cov   = kws.filt_cov::Vector{PDMat{T,Matrix{T}}}
+    pred_cov   = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
+    Q_PD       = kws.Q_PD::Base.RefValue{PDMat{T,Matrix{T}}}
+    G          = kws.G::Array{T,3}
+    A          = lds.state_model.A
 
     # init smoothed cov & accumulators
-    kws.smooth_cov[end] = kws.filt_cov[end];
-    kws.sum_smooth_cov_all .= kws.smooth_cov[end].mat
+    smooth_cov[end] = filt_cov[end];
+    kws.sum_smooth_cov_all .= smooth_cov[end].mat
     kws.sum_smooth_cov_prev .= zeros(T, kws.latent_dim, kws.latent_dim)
-    kws.sum_smooth_cov_next .= kws.smooth_cov[end].mat
+    kws.sum_smooth_cov_next .= smooth_cov[end].mat
     kws.sum_smooth_xcov .= zeros(T, kws.latent_dim, kws.latent_dim)
 
     # smooth covariance + joint Gaussian entropy ================================
     # H(x_{1:T}|y) = H(x_T|y) + Σ_{t=1}^{T-1} H(x_t | x_{t+1}, y)
     # backward-conditional cov: Σ_{t|x_{t+1},y} = filt_cov[t] - G[t]*pred_cov[t+1]*G[t]'
     #                                             = filt_cov[t] - filt_cov[t]*(G[t]*A)'
-    ent_logdet = logdet(kws.smooth_cov[end].mat)
+    ent_logdet = logdet(smooth_cov[end].mat)
 
-    @views for tt in eachindex(kws.filt_cov)[(end - 1):-1:1]
+    @views for tt in eachindex(filt_cov)[(end - 1):-1:1]
 
         # reverse kalman gain G[t] = filt_cov[t] · A' · pred_cov[t+1]^{-1}
-        mul!(kws.G[:, :, tt], kws.filt_cov[tt], lds.state_model.A', one(T), zero(T));
-        kws.G[:, :, tt] /= kws.pred_cov[tt + 1];
+        mul!(G[:, :, tt], filt_cov[tt], A', one(T), zero(T));
+        G[:, :, tt] /= pred_cov[tt + 1];
 
         # smoothed covariance — Joseph-style form, algebraically equivalent to
         # the standard RTS update `P_s[t] = P_f[t] + G[t]·(P_s[t+1] - P_p[t+1])·G[t]'`
@@ -407,33 +418,33 @@ function backwards_cov!(
         # built `smooth_cov[t+1] + Q` into a separate `Ref{PDMat}` first
         # tripped the strict cholesky in `PDMat(::Matrix)` from accumulated
         # asymmetry; folding the sum into the X_A_Xt argument avoids that.
-        mul!(kws.cov_tmp1, kws.G[:, :, tt], lds.state_model.A, one(T), zero(T))
+        mul!(kws.cov_tmp1, G[:, :, tt], A, one(T), zero(T))
         kws.cov_tmp2 .=
-            X_A_Xt(kws.smooth_cov[tt + 1] + kws.Q_PD[], kws.G[:, :, tt]) .+
-            X_A_Xt(kws.filt_cov[tt], I - kws.cov_tmp1)
+            X_A_Xt(smooth_cov[tt + 1] + Q_PD[], G[:, :, tt]) .+
+            X_A_Xt(filt_cov[tt], I - kws.cov_tmp1)
         Symmetrize!(kws.cov_tmp2)
-        kws.smooth_cov[tt] = PDMat(kws.cov_tmp2)
+        smooth_cov[tt] = PDMat(kws.cov_tmp2)
 
         # accumulate smoothed covs
-        kws.sum_smooth_cov_all .+= kws.smooth_cov[tt].mat;
-        kws.sum_smooth_cov_prev .+= kws.smooth_cov[tt].mat;
+        kws.sum_smooth_cov_all .+= smooth_cov[tt].mat;
+        kws.sum_smooth_cov_prev .+= smooth_cov[tt].mat;
         if tt > 1
-            kws.sum_smooth_cov_next .+= kws.smooth_cov[tt].mat;
+            kws.sum_smooth_cov_next .+= smooth_cov[tt].mat;
         end
 
         mul!(
-            kws.sum_smooth_xcov, kws.G[:, :, tt], kws.smooth_cov[tt + 1].mat, one(T), one(T)
+            kws.sum_smooth_xcov, G[:, :, tt], smooth_cov[tt + 1].mat, one(T), one(T)
         );
 
         # entropy contribution of backward-conditional cov
-        ent_logdet += logdet(kws.filt_cov[tt]) .- logdet(kws.pred_cov[tt + 1])
+        ent_logdet += logdet(filt_cov[tt]) .- logdet(pred_cov[tt + 1])
     end
 
     kws.shared_entropy[] =
         T(0.5) * (
             kws.tsteps * kws.latent_dim * (one(T) + log(T(2π))) +
             ent_logdet +
-            (kws.tsteps-1) * logdet(kws.Q_PD[])
+            (kws.tsteps-1) * logdet(Q_PD[])
         )
 
     return kws
@@ -515,18 +526,28 @@ end
 @views @inline function sufficient_statistics!(
     suf::SufficientStatistics{T}, kws::KalmanWorkspace{T}, data::Data{T}
 ) where {T<:Real}
+    # Hoist workspace fields into concretely-typed locals — see
+    # `backwards_cov!` for the same JET-vs-`@views` interaction.
+    smooth_mean = kws.smooth_mean::Array{T,3}
+    smooth_cov  = kws.smooth_cov::Vector{PDMat{T,Matrix{T}}}
+    x_init      = kws.x_init::Matrix{T}
+    x_prev      = kws.x_prev::Matrix{T}
+    x_next      = kws.x_next::Matrix{T}
+    x_cur       = kws.x_cur::Matrix{T}
+    dyn_xx_buf  = kws.dyn_xx_buf::Matrix{T}
+    obs_xx_buf  = kws.obs_xx_buf::Matrix{T}
 
     # initial conditions -------
-    kws.x_init .= kws.smooth_mean[:, 1, :]
+    x_init .= smooth_mean[:, 1, :]
     suf.init_n = T(kws.ntrials)
     # init_xx is preset to [ntrials] (1×1) by initialize_SufficientStatistics.
     # init_xy: row vector Σ_n x_init[:, n], shape (1, D).
     fill!(suf.init_xy, zero(T))
-    @inbounds for n in axes(kws.x_init, 2), i in axes(kws.x_init, 1)
-        suf.init_xy[1, i] += kws.x_init[i, n]
+    @inbounds for n in axes(x_init, 2), i in axes(x_init, 1)
+        suf.init_xy[1, i] += x_init[i, n]
     end
     # init_yy
-    suf.init_yy[] = aggregate_xx(kws.x_init, kws.smooth_cov[1].mat, kws.ntrials);
+    suf.init_yy[] = aggregate_xx(x_init, smooth_cov[1].mat, kws.ntrials);
 
     # transitions -------
     # Regression layout: regress x_next on [x_prev; 1; u_prev] to fit [A b B].
@@ -536,8 +557,8 @@ end
     u_dim = kws.state_input_dim
     dyn_n_int = (kws.tsteps - 1) * kws.ntrials
     suf.dyn_n = T(dyn_n_int)
-    kws.x_prev .= reshape(kws.smooth_mean[:, 1:(end - 1), :], D, dyn_n_int)
-    kws.x_next .= reshape(kws.smooth_mean[:, 2:end, :], D, dyn_n_int)
+    x_prev .= reshape(smooth_mean[:, 1:(end - 1), :], D, dyn_n_int)
+    x_next .= reshape(smooth_mean[:, 2:end, :], D, dyn_n_int)
 
     # Reuse the preallocated workspace buffer; the constant blocks at the bias
     # row/col and uᵀu sub-matrix are populated once in
@@ -545,20 +566,20 @@ end
     # `cholesky()` makes its own copy of the factors, and downstream readers
     # (mstep!, compute_elbo) operate via `XX + prior` / `X_A_Xt(XX, W)` which
     # produce fresh PDMats — they never write into .mat.
-    dyn_xx = kws.dyn_xx_buf
+    dyn_xx = dyn_xx_buf
     # Top-left x_prev block: smooth_cov_prev*N + x_prev x_prevᵀ
     dyn_xx[1:D, 1:D] .= kws.sum_smooth_cov_prev .* kws.ntrials
-    BLAS.syrk!('U', 'N', one(T), kws.x_prev, one(T), dyn_xx[1:D, 1:D])
+    BLAS.syrk!('U', 'N', one(T), x_prev, one(T), dyn_xx[1:D, 1:D])
     # Top-middle: x_prev · 1 = Σ_n,t x_prev[:, n, t] (column sum). Filling row
     # D+1 of the upper triangle; copytri! mirrors to the symmetric position.
     fill!(view(dyn_xx, 1:D, D + 1), zero(T))
-    @inbounds for n in axes(kws.x_prev, 2), i in 1:D
-        dyn_xx[i, D + 1] += kws.x_prev[i, n]
+    @inbounds for n in axes(x_prev, 2), i in 1:D
+        dyn_xx[i, D + 1] += x_prev[i, n]
     end
     # Top-right user-input block: x_prev · u_prevᵀ (only if user inputs present)
     if u_dim > 0
         u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, dyn_n_int)
-        mul!(dyn_xx[1:D, (D + 2):end], kws.x_prev, u_prev', one(T), zero(T))
+        mul!(dyn_xx[1:D, (D + 2):end], x_prev, u_prev', one(T), zero(T))
     end
     LinearAlgebra.copytri!(dyn_xx, 'U')
     suf.dyn_xx[] = PDMat(dyn_xx)
@@ -566,43 +587,43 @@ end
     # dyn_xy: [x_prev; 1; u_prev] x_nextᵀ. Row D+1 (bias) is Σ x_next.
     fill!(view(suf.dyn_xy, 1:D, :), zero(T))
     suf.dyn_xy[1:D, :] .= kws.sum_smooth_xcov .* kws.ntrials
-    mul!(suf.dyn_xy[1:D, :], kws.x_prev, kws.x_next', one(T), one(T))
+    mul!(suf.dyn_xy[1:D, :], x_prev, x_next', one(T), one(T))
     fill!(view(suf.dyn_xy, D + 1, :), zero(T))
-    @inbounds for n in axes(kws.x_next, 2), j in 1:D
-        suf.dyn_xy[D + 1, j] += kws.x_next[j, n]
+    @inbounds for n in axes(x_next, 2), j in 1:D
+        suf.dyn_xy[D + 1, j] += x_next[j, n]
     end
     if u_dim > 0
         u_prev = reshape(data.u[:, 1:(end - 1), :], u_dim, dyn_n_int)
-        mul!(suf.dyn_xy[(D + 2):end, :], u_prev, kws.x_next', one(T), zero(T))
+        mul!(suf.dyn_xy[(D + 2):end, :], u_prev, x_next', one(T), zero(T))
     end
     # dyn_yy
-    suf.dyn_yy[] = aggregate_xx(kws.x_next, kws.sum_smooth_cov_next, kws.ntrials);
+    suf.dyn_yy[] = aggregate_xx(x_next, kws.sum_smooth_cov_next, kws.ntrials);
 
     # observations -------
     # Same layout: regress y on [x; 1; d] to fit [C d_bias D].
     d_dim = kws.obs_input_dim
     obs_n_int = kws.tsteps * kws.ntrials
     suf.obs_n = T(obs_n_int)
-    kws.x_cur .= reshape(kws.smooth_mean, D, obs_n_int)
+    x_cur .= reshape(smooth_mean, D, obs_n_int)
     y_cur = reshape(data.y, kws.obs_dim, obs_n_int)
 
-    obs_xx = kws.obs_xx_buf
+    obs_xx = obs_xx_buf
     obs_xx[1:D, 1:D] .= kws.sum_smooth_cov_all .* kws.ntrials
-    BLAS.syrk!('U', 'N', one(T), kws.x_cur, one(T), obs_xx[1:D, 1:D])
+    BLAS.syrk!('U', 'N', one(T), x_cur, one(T), obs_xx[1:D, 1:D])
     # Bias column: Σ x_cur
     fill!(view(obs_xx, 1:D, D + 1), zero(T))
-    @inbounds for n in axes(kws.x_cur, 2), i in 1:D
-        obs_xx[i, D + 1] += kws.x_cur[i, n]
+    @inbounds for n in axes(x_cur, 2), i in 1:D
+        obs_xx[i, D + 1] += x_cur[i, n]
     end
     if d_dim > 0
         d_cur = reshape(data.d, d_dim, obs_n_int)
-        mul!(obs_xx[1:D, (D + 2):end], kws.x_cur, d_cur', one(T), zero(T))
+        mul!(obs_xx[1:D, (D + 2):end], x_cur, d_cur', one(T), zero(T))
     end
     LinearAlgebra.copytri!(obs_xx, 'U')
     suf.obs_xx[] = PDMat(obs_xx)
 
     # obs_xy: row D+1 (bias for obs) is constant (= Σ y) and was preset.
-    mul!(suf.obs_xy[1:D, :], kws.x_cur, y_cur', one(T), zero(T))
+    mul!(suf.obs_xy[1:D, :], x_cur, y_cur', one(T), zero(T))
     return suf
     # obs_yy (preset)
 
@@ -936,20 +957,24 @@ function marginal_loglikelihood(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     total_ll = zero(T)
 
+    # Hoist workspace fields with concrete eltype for JET; see backwards_cov!.
+    innovation = kws.innovation::Array{T,3}
+    pred_cov   = kws.pred_cov::Vector{PDMat{T,Matrix{T}}}
+
     Cmu = zeros(T, lds.obs_dim, kws.tsteps * kws.ntrials)
     mul!(
         Cmu, lds.obs_model.C, reshape(kws.pred_mean, kws.latent_dim, kws.tsteps*kws.ntrials)
     )
-    kws.innovation .= kws.y_minus_d .- reshape(Cmu, kws.obs_dim, kws.tsteps, kws.ntrials)
+    innovation .= kws.y_minus_d .- reshape(Cmu, kws.obs_dim, kws.tsteps, kws.ntrials)
 
-    @views for t in eachindex(kws.pred_cov)
+    @views for t in eachindex(pred_cov)
         kws.obs_pd_tmp[] = tol_PD(
-            X_A_Xt(kws.pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R
+            X_A_Xt(pred_cov[t], lds.obs_model.C) .+ lds.obs_model.R
         )
         MV = MvNormal(kws.obs_pd_tmp[])
 
-        for n in axes(kws.innovation, 3)
-            total_ll += Distributions.logpdf(MV, kws.innovation[:, t, n]);
+        for n in axes(innovation, 3)
+            total_ll += Distributions.logpdf(MV, innovation[:, t, n]);
         end
     end
 

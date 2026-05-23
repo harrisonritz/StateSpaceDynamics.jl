@@ -142,23 +142,21 @@ nothing #hide
 
 ````@example switching_linear_dynamical_system_example
 T = 1000
-z, x, y = rand(rng, model; tsteps=T, ntrials=1);
+z, x, y = rand(rng, model, T);
 nothing #hide
 ````
 
-The simulation returns:
-- z: discrete state sequence (T × 1 matrix)
-- x: continuous latent states (state_dim × T × 1 array)
-- y: observations (obs_dim × T × 1 array)
+The single-trial form of `rand` returns:
+- z: discrete state sequence (Vector{Int} of length T)
+- x: continuous latent states (state_dim × T matrix)
+- y: observations (obs_dim × T matrix)
 
 Notice how the discrete states z create "regimes" in the continuous dynamics x.
 
-Extract single trial data for visualization
-
 ````@example switching_linear_dynamical_system_example
-z_vec = vec(z[:, 1])
-x_trial = x[:, :, 1]
-y_trial = y[:, :, 1];
+z_vec = z
+x_trial = x
+y_trial = y;
 nothing #hide
 ````
 
@@ -265,19 +263,34 @@ annotate!(p2, length(elbos)*0.7, elbos[end]-abs(elbos[end])*0.05,
 After fitting, we can extract the smoothed latent states.
 The learned model stores the most recent smoothed states from the last EM iteration.
 
-For visualization, we need to run one more smoothing pass to get the final
+For visualization, run one final E-step to get both the smoothed continuous states
+and the discrete-state posteriors under the learned model.
 
 ````@example switching_linear_dynamical_system_example
-tfs = StateSpaceDynamics.initialize_FilterSmooth(learned_model.LDSs[1], T, 1)
-fbs = [StateSpaceDynamics.initialize_forward_backward(learned_model, T, Float64)]
+ld = learned_model.LDSs[1]
+seq_ends = [T]
+obs_seq = collect(1:T)
+ctrl_seq = fill(nothing, T)
 
-w_uniform = ones(Float64, K, T) ./ K # Initialize with uniform weights and smooth
-StateSpaceDynamics.smooth!(learned_model, tfs[1], y_trial, w_uniform)
+tfs = StateSpaceDynamics.initialize_FilterSmooth(ld, [T])
+dl = StateSpaceDynamics.SLDSDiscreteLayer(
+    learned_model.A, learned_model.πₖ, zeros(Float64, K, T)
+)
+fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
+slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, learned_model, T)
 
-x_samples, _ = StateSpaceDynamics.sample_posterior(tfs, 1) # Sample and run one E-step to get final discrete state posteriors
-StateSpaceDynamics.estep!(learned_model, tfs, fbs, y, x_samples)
+w_uniform = fill(1.0 / K, K, T)
+StateSpaceDynamics.smooth!(learned_model, tfs[1], y_trial, w_uniform; ws=slds_ws)
 
-latents_learned = tfs[1].x_smooth; # Get the final smoothed continuous states
+x_samples = [Matrix{Float64}(undef, ld.latent_dim, T)]
+randn_buf = Vector{Float64}(undef, ld.latent_dim)
+StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
+StateSpaceDynamics.estep!(
+    learned_model, tfs, fb_storage, dl, [y_trial], x_samples, slds_ws;
+    obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+)
+
+latents_learned = tfs[1].x_smooth;
 nothing #hide
 ````
 
@@ -310,7 +323,7 @@ plot!(title="True vs. Learned Latent States",
 Decode discrete modes using posterior responsibilities and assess accuracy.
 
 ````@example switching_linear_dynamical_system_example
-responsibilities = exp.(fbs[1].γ)  # Convert from log-space (K × T)
+responsibilities = fb_storage.γ  # K × T, already in probability space
 z_decoded = [argmax(responsibilities[:, t]) for t in 1:T];
 nothing #hide
 ````

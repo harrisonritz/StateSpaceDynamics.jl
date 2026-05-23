@@ -902,6 +902,9 @@ function _precompute_shared_cov!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
     btd = sws.btd
+    # Hoist `p_smooth_shared` with a concrete eltype so the `Symmetrize!`
+    # call below stays in JET's typed union branch (cf. `backwards_cov!`).
+    p_smooth_shared = sws.p_smooth_shared::Array{T,3}
 
     compute_smooth_constants!(sws, lds)
     _fill_hessian_blocks!(sws, tsteps)
@@ -911,15 +914,15 @@ function _precompute_shared_cov!(
     neg_sub_v = view(btd.neg_sub, 1:(tsteps - 1))
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
-    p_smooth_v = view(sws.p_smooth_shared,:,:,(1:tsteps))
-    p_smooth_tt1_v = view(sws.p_smooth_tt1_shared,:,:,(1:tsteps))
+    p_smooth_v = view(p_smooth_shared,:,:,(1:tsteps))
+    p_smooth_tt1_v = view(sws.p_smooth_tt1_shared::Array{T,3},:,:,(1:tsteps))
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
         p_smooth_v, p_smooth_tt1_v, neg_sub_v, neg_diag_v, neg_super_v, btd
     )
 
     @views for i in 1:tsteps
-        Symmetrize!(sws.p_smooth_shared[:, :, i])
+        Symmetrize!(p_smooth_shared[:, :, i])
     end
 
     return gaussian_entropy_from_logdet(logdet_precision, D * tsteps)
@@ -1333,27 +1336,34 @@ function _td_init_const_blocks!(
     total_obs = sum(tsteps_per_trial)
     total_dyn = total_obs - ntrials
 
-    fill!(sws.td_obs_yy_const, zero(T))
-    fill!(sws.td_obs_xy_const, zero(T))
-    fill!(sws.td_obs_xx_const, zero(T))
-    fill!(sws.td_dyn_xx_const, zero(T))
+    # Hoist workspace fields with concrete eltype to clear JET union-split
+    # false positives on the syrk!/copytri! callsites below.
+    td_obs_yy_const = sws.td_obs_yy_const::Matrix{T}
+    td_obs_xy_const = sws.td_obs_xy_const::Matrix{T}
+    td_obs_xx_const = sws.td_obs_xx_const::Matrix{T}
+    td_dyn_xx_const = sws.td_dyn_xx_const::Matrix{T}
+
+    fill!(td_obs_yy_const, zero(T))
+    fill!(td_obs_xy_const, zero(T))
+    fill!(td_obs_xx_const, zero(T))
+    fill!(td_dyn_xx_const, zero(T))
 
     # obs_yy = Σ_n Σ_t y_t y_t'
     for trial in 1:ntrials
-        BLAS.syrk!('U', 'N', one(T), y[trial], one(T), sws.td_obs_yy_const)
+        BLAS.syrk!('U', 'N', one(T), y[trial], one(T), td_obs_yy_const)
     end
-    LinearAlgebra.copytri!(sws.td_obs_yy_const, 'U')
+    LinearAlgebra.copytri!(td_obs_yy_const, 'U')
 
     # obs_xy[D+1, :] = Σ_n Σ_t y_t   (bias row sum)
     for trial in 1:ntrials
         y_trial = y[trial]
         for t in axes(y_trial, 2), j in 1:p
-            sws.td_obs_xy_const[D + 1, j] += y_trial[j, t]
+            td_obs_xy_const[D + 1, j] += y_trial[j, t]
         end
     end
 
     # obs_xx bias-bias entry
-    sws.td_obs_xx_const[D + 1, D + 1] = T(total_obs)
+    td_obs_xx_const[D + 1, D + 1] = T(total_obs)
 
     if d_dim > 0
         for trial in 1:ntrials
@@ -1361,7 +1371,7 @@ function _td_init_const_blocks!(
             y_t = y[trial]
             # obs_xy[D+2:end, :] += Σ_t v_t y_t'
             mul!(
-                view(sws.td_obs_xy_const, (D + 2):obs_reg_dim, :), v_t, y_t', one(T), one(T)
+                view(td_obs_xy_const, (D + 2):obs_reg_dim, :), v_t, y_t', one(T), one(T)
             )
             # obs_xx[D+2:end, D+2:end] += Σ_t v_t v_t'  (upper tri)
             BLAS.syrk!(
@@ -1370,25 +1380,25 @@ function _td_init_const_blocks!(
                 one(T),
                 v_t,
                 one(T),
-                view(sws.td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim),
+                view(td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim),
             )
         end
         LinearAlgebra.copytri!(
-            view(sws.td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim), 'U'
+            view(td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim), 'U'
         )
         # obs_xx[D+1, D+2:end] / [D+2:end, D+1] = Σ_t v_t   (bias × v cross)
         for trial in 1:ntrials
             v_trial = v_seq[trial]
             for t in axes(v_trial, 2), k in 1:d_dim
-                sws.td_obs_xx_const[D + 1, D + 1 + k] += v_trial[k, t]
+                td_obs_xx_const[D + 1, D + 1 + k] += v_trial[k, t]
             end
         end
-        @views sws.td_obs_xx_const[(D + 2):obs_reg_dim, D + 1] .= sws.td_obs_xx_const[
+        @views td_obs_xx_const[(D + 2):obs_reg_dim, D + 1] .= td_obs_xx_const[
             D + 1, (D + 2):obs_reg_dim
         ]
     end
 
-    sws.td_dyn_xx_const[D + 1, D + 1] = T(total_dyn)
+    td_dyn_xx_const[D + 1, D + 1] = T(total_dyn)
 
     if u_dim > 0
         for trial in 1:ntrials
@@ -1403,21 +1413,21 @@ function _td_init_const_blocks!(
                 one(T),
                 u_used,
                 one(T),
-                view(sws.td_dyn_xx_const, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim),
+                view(td_dyn_xx_const, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim),
             )
         end
         LinearAlgebra.copytri!(
-            view(sws.td_dyn_xx_const, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim), 'U'
+            view(td_dyn_xx_const, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim), 'U'
         )
         # bias × u cross
         for trial in 1:ntrials
             u_trial = u_seq[trial]
             T_n = size(u_trial, 2)
             for t in 1:(T_n - 1), k in 1:u_dim
-                sws.td_dyn_xx_const[D + 1, D + 1 + k] += u_trial[k, t]
+                td_dyn_xx_const[D + 1, D + 1 + k] += u_trial[k, t]
             end
         end
-        @views sws.td_dyn_xx_const[(D + 2):dyn_reg_dim, D + 1] .= sws.td_dyn_xx_const[
+        @views td_dyn_xx_const[(D + 2):dyn_reg_dim, D + 1] .= td_dyn_xx_const[
             D + 1, (D + 2):dyn_reg_dim
         ]
     end
@@ -1491,136 +1501,158 @@ function _aggregate_td_suff_stats!(
     dyn_reg_dim = D + 1 + u_dim
     obs_reg_dim = D + 1 + d_dim
 
+    # Hoist workspace fields with concrete eltype for JET (cf. backwards_cov!).
+    Szz_Ab           = sws.Szz_Ab::Matrix{T}
+    Szz_Cd           = sws.Szz_Cd::Matrix{T}
+    Q_sum            = sws.Q_sum::Matrix{T}
+    R_sum            = sws.R_sum::Matrix{T}
+    S0_sum           = sws.S0_sum::Matrix{T}
+    td_init_xy       = sws.td_init_xy::Matrix{T}
+    td_dyn_xy        = sws.td_dyn_xy::Matrix{T}
+    td_obs_xy        = sws.td_obs_xy::Matrix{T}
+    td_obs_xy_const  = sws.td_obs_xy_const::Matrix{T}
+    td_obs_xx_const  = sws.td_obs_xx_const::Matrix{T}
+    td_dyn_xx_const  = sws.td_dyn_xx_const::Matrix{T}
+    td_obs_yy_const  = sws.td_obs_yy_const::Matrix{T}
+    sum_cov_prev     = sws.td_sum_smooth_cov_prev::Matrix{T}
+    sum_cov_next     = sws.td_sum_smooth_cov_next::Matrix{T}
+    sum_cov_all      = sws.td_sum_smooth_cov_all::Matrix{T}
+    sum_xcov         = sws.td_sum_smooth_xcov::Matrix{T}
+
     # Detect cov-cache fast path (equal-length trials share p_smooth storage).
     cov_cache = ntrials > 1 && tfs[1].p_smooth === tfs[2].p_smooth
 
-    fill!(sws.td_init_xy, zero(T))
-    fill!(sws.S0_sum, zero(T))                  # init_yy
-    fill!(sws.td_dyn_xy, zero(T))               # dyn_xy
-    fill!(sws.Q_sum, zero(T))                   # dyn_yy
-    fill!(sws.td_obs_xy, zero(T))               # obs_xy (will copy const next)
-    fill!(sws.td_sum_smooth_cov_prev, zero(T))
-    fill!(sws.td_sum_smooth_cov_next, zero(T))
-    fill!(sws.td_sum_smooth_cov_all, zero(T))
-    fill!(sws.td_sum_smooth_xcov, zero(T))
+    fill!(td_init_xy, zero(T))
+    fill!(S0_sum, zero(T))                  # init_yy
+    fill!(td_dyn_xy, zero(T))               # dyn_xy
+    fill!(Q_sum, zero(T))                   # dyn_yy
+    fill!(td_obs_xy, zero(T))               # obs_xy (will copy const next)
+    fill!(sum_cov_prev, zero(T))
+    fill!(sum_cov_next, zero(T))
+    fill!(sum_cov_all, zero(T))
+    fill!(sum_xcov, zero(T))
 
     # Seed xx/yy/xy buffers with the precomputed data-only constants.
-    copyto!(sws.Szz_Ab, sws.td_dyn_xx_const)
-    copyto!(sws.Szz_Cd, sws.td_obs_xx_const)
-    copyto!(sws.R_sum, sws.td_obs_yy_const)
-    copyto!(sws.td_obs_xy, sws.td_obs_xy_const)
+    copyto!(Szz_Ab, td_dyn_xx_const)
+    copyto!(Szz_Cd, td_obs_xx_const)
+    copyto!(R_sum, td_obs_yy_const)
+    copyto!(td_obs_xy, td_obs_xy_const)
 
     if cov_cache
         fs1 = tfs[1]
         T_shared = size(fs1.x_smooth, 2)
+        p_smooth1     = fs1.p_smooth::Array{T,3}
+        p_smooth_tt11 = fs1.p_smooth_tt1::Array{T,3}
         @views for t in 1:T_shared
-            sws.td_sum_smooth_cov_all .+= fs1.p_smooth[:, :, t]
+            sum_cov_all .+= p_smooth1[:, :, t]
             if t < T_shared
-                sws.td_sum_smooth_cov_prev .+= fs1.p_smooth[:, :, t]
+                sum_cov_prev .+= p_smooth1[:, :, t]
             end
             if t > 1
-                sws.td_sum_smooth_cov_next .+= fs1.p_smooth[:, :, t]
-                sws.td_sum_smooth_xcov .+= fs1.p_smooth_tt1[:, :, t]
+                sum_cov_next .+= p_smooth1[:, :, t]
+                sum_xcov .+= p_smooth_tt11[:, :, t]
             end
         end
         # Scale to total across N trials.
         N_T = T(ntrials)
-        sws.td_sum_smooth_cov_all .*= N_T
-        sws.td_sum_smooth_cov_prev .*= N_T
-        sws.td_sum_smooth_cov_next .*= N_T
-        sws.td_sum_smooth_xcov .*= N_T
+        sum_cov_all .*= N_T
+        sum_cov_prev .*= N_T
+        sum_cov_next .*= N_T
+        sum_xcov .*= N_T
     end
 
     for trial in 1:ntrials
         fs = tfs[trial]
-        x = fs.x_smooth
+        x = fs.x_smooth::Matrix{T}
+        p_smooth     = fs.p_smooth::Array{T,3}
+        p_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
 
         # Per-trial cov sums when not on the cov-cache fast path.
         if !cov_cache
             @views for t in 1:T_n
-                sws.td_sum_smooth_cov_all .+= fs.p_smooth[:, :, t]
+                sum_cov_all .+= p_smooth[:, :, t]
                 if t < T_n
-                    sws.td_sum_smooth_cov_prev .+= fs.p_smooth[:, :, t]
+                    sum_cov_prev .+= p_smooth[:, :, t]
                 end
                 if t > 1
-                    sws.td_sum_smooth_cov_next .+= fs.p_smooth[:, :, t]
-                    sws.td_sum_smooth_xcov .+= fs.p_smooth_tt1[:, :, t]
+                    sum_cov_next .+= p_smooth[:, :, t]
+                    sum_xcov .+= p_smooth_tt1[:, :, t]
                 end
             end
         end
 
         # init_xy[1, :] += x[:, 1];   init_yy += x[:, 1] x[:, 1]'
         for j in 1:D
-            sws.td_init_xy[1, j] += x[j, 1]
+            td_init_xy[1, j] += x[j, 1]
         end
-        @views BLAS.ger!(one(T), x[:, 1], x[:, 1], sws.S0_sum)
+        @views BLAS.ger!(one(T), x[:, 1], x[:, 1], S0_sum)
 
         x_prev = view(x, :, 1:(T_n - 1))
         x_next = view(x, :, 2:T_n)
 
         # dyn_xx[1:D, 1:D] += x_prev x_prev'   (upper triangle via syrk)
-        BLAS.syrk!('U', 'N', one(T), x_prev, one(T), view(sws.Szz_Ab, 1:D, 1:D))
+        BLAS.syrk!('U', 'N', one(T), x_prev, one(T), view(Szz_Ab, 1:D, 1:D))
         # obs_xx[1:D, 1:D] += x x'             (upper triangle via syrk)
-        BLAS.syrk!('U', 'N', one(T), x, one(T), view(sws.Szz_Cd, 1:D, 1:D))
+        BLAS.syrk!('U', 'N', one(T), x, one(T), view(Szz_Cd, 1:D, 1:D))
 
         # dyn_xx[1:D, D+1] += Σ x_prev   (column-sum into upper-only bias col)
         for t in 1:(T_n - 1), i in 1:D
-            sws.Szz_Ab[i, D + 1] += x_prev[i, t]
+            Szz_Ab[i, D + 1] += x_prev[i, t]
         end
         # obs_xx[1:D, D+1] += Σ x
         for t in 1:T_n, i in 1:D
-            sws.Szz_Cd[i, D + 1] += x[i, t]
+            Szz_Cd[i, D + 1] += x[i, t]
         end
 
         # dyn_xy[1:D, :] += x_prev x_next'
-        mul!(view(sws.td_dyn_xy, 1:D, :), x_prev, x_next', one(T), one(T))
+        mul!(view(td_dyn_xy, 1:D, :), x_prev, x_next', one(T), one(T))
         # dyn_xy[D+1, :] += Σ x_next
         for t in 1:(T_n - 1), j in 1:D
-            sws.td_dyn_xy[D + 1, j] += x_next[j, t]
+            td_dyn_xy[D + 1, j] += x_next[j, t]
         end
 
         # dyn_yy += x_next x_next'  (upper tri)
-        BLAS.syrk!('U', 'N', one(T), x_next, one(T), sws.Q_sum)
+        BLAS.syrk!('U', 'N', one(T), x_next, one(T), Q_sum)
 
         # obs_xy[1:D, :] += x y'
-        mul!(view(sws.td_obs_xy, 1:D, :), x, y[trial]', one(T), one(T))
+        mul!(view(td_obs_xy, 1:D, :), x, y[trial]', one(T), one(T))
 
         # Input-side cross blocks (x × u, u × x).
         if u_dim > 0
             u_trial = u_seq[trial]
             u_prev = view(u_trial, :, 1:(T_n - 1))
             mul!(
-                view(sws.Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, u_prev', one(T), one(T)
+                view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, u_prev', one(T), one(T)
             )
             mul!(
-                view(sws.td_dyn_xy, (D + 2):dyn_reg_dim, :), u_prev, x_next', one(T), one(T)
+                view(td_dyn_xy, (D + 2):dyn_reg_dim, :), u_prev, x_next', one(T), one(T)
             )
         end
         if d_dim > 0
             v_trial = v_seq[trial]
-            mul!(view(sws.Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, v_trial', one(T), one(T))
+            mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, v_trial', one(T), one(T))
         end
     end
 
     # init_yy: need Σ_n P_smooth[n,:,:,1].
     if cov_cache
-        @views sws.S0_sum .+= T(ntrials) .* tfs[1].p_smooth[:, :, 1]
+        @views S0_sum .+= T(ntrials) .* (tfs[1].p_smooth::Array{T,3})[:, :, 1]
     else
         @views for trial in 1:ntrials
-            sws.S0_sum .+= tfs[trial].p_smooth[:, :, 1]
+            S0_sum .+= (tfs[trial].p_smooth::Array{T,3})[:, :, 1]
         end
     end
-    @views sws.Szz_Ab[1:D, 1:D] .+= sws.td_sum_smooth_cov_prev
-    @views sws.Szz_Cd[1:D, 1:D] .+= sws.td_sum_smooth_cov_all
-    sws.Q_sum .+= sws.td_sum_smooth_cov_next
+    @views Szz_Ab[1:D, 1:D] .+= sum_cov_prev
+    @views Szz_Cd[1:D, 1:D] .+= sum_cov_all
+    Q_sum .+= sum_cov_next
     # dyn_xy[1:D, :] += (Σ p_smooth_tt1)'   — adjoint because cov(x_{t-1}, x_t) = p_smooth_tt1'.
-    @views sws.td_dyn_xy[1:D, :] .+= adjoint(sws.td_sum_smooth_xcov)
+    @views td_dyn_xy[1:D, :] .+= adjoint(sum_xcov)
 
-    LinearAlgebra.copytri!(sws.Szz_Ab, 'U')
-    LinearAlgebra.copytri!(sws.Szz_Cd, 'U')
-    LinearAlgebra.copytri!(sws.Q_sum, 'U')
-    Symmetrize!(sws.S0_sum)
+    LinearAlgebra.copytri!(Szz_Ab, 'U')
+    LinearAlgebra.copytri!(Szz_Cd, 'U')
+    LinearAlgebra.copytri!(Q_sum, 'U')
+    Symmetrize!(S0_sum)
 
     # backing storage; each E-step rewraps so the cached Cholesky reflects
     # the latest aggregate.
@@ -1628,16 +1660,16 @@ function _aggregate_td_suff_stats!(
     suf.dyn_n = T(sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials) - ntrials)
     suf.obs_n = T(sum(size(tfs[trial].x_smooth, 2) for trial in 1:ntrials))
 
-    copyto!(suf.init_xy, sws.td_init_xy)
-    copyto!(suf.dyn_xy, sws.td_dyn_xy)
-    copyto!(suf.obs_xy, sws.td_obs_xy)
+    copyto!(suf.init_xy, td_init_xy)
+    copyto!(suf.dyn_xy, td_dyn_xy)
+    copyto!(suf.obs_xy, td_obs_xy)
 
     suf.init_xx[] = PDMat(fill(T(ntrials), 1, 1))
-    suf.init_yy[] = PDMat(copy(sws.S0_sum))
-    suf.dyn_xx[] = PDMat(copy(sws.Szz_Ab))
-    suf.dyn_yy[] = PDMat(copy(sws.Q_sum))
-    suf.obs_xx[] = PDMat(copy(sws.Szz_Cd))
-    suf.obs_yy[] = PDMat(copy(sws.R_sum))
+    suf.init_yy[] = PDMat(copy(S0_sum))
+    suf.dyn_xx[] = PDMat(copy(Szz_Ab))
+    suf.dyn_yy[] = PDMat(copy(Q_sum))
+    suf.obs_xx[] = PDMat(copy(Szz_Cd))
+    suf.obs_yy[] = PDMat(copy(R_sum))
 
     return suf
 end
@@ -1677,15 +1709,17 @@ function _aggregate_td_suff_stats_weighted!(
     dyn_reg_dim = D + 1 + u_dim
     obs_reg_dim = D + 1 + d_dim
 
-    # Clear the accumulators we'll write into.
-    init_xy = sws.td_init_xy;        fill!(init_xy, zero(T))
-    init_yy = sws.S0_sum;            fill!(init_yy, zero(T))
-    dyn_xx  = sws.Szz_Ab;            fill!(dyn_xx,  zero(T))
-    dyn_xy  = sws.td_dyn_xy;         fill!(dyn_xy,  zero(T))
-    dyn_yy  = sws.Q_sum;             fill!(dyn_yy,  zero(T))
-    obs_xx  = sws.Szz_Cd;            fill!(obs_xx,  zero(T))
-    obs_xy  = sws.td_obs_xy;         fill!(obs_xy,  zero(T))
-    obs_yy  = sws.R_sum;             fill!(obs_yy,  zero(T))
+    # Clear the accumulators we'll write into. Each field is hoisted with a
+    # concrete `Matrix{T}` annotation so the BLAS.ger!/syrk! callsites below
+    # stay in JET's typed union branch (cf. `backwards_cov!`).
+    init_xy = sws.td_init_xy::Matrix{T}; fill!(init_xy, zero(T))
+    init_yy = sws.S0_sum::Matrix{T};     fill!(init_yy, zero(T))
+    dyn_xx  = sws.Szz_Ab::Matrix{T};     fill!(dyn_xx,  zero(T))
+    dyn_xy  = sws.td_dyn_xy::Matrix{T};  fill!(dyn_xy,  zero(T))
+    dyn_yy  = sws.Q_sum::Matrix{T};      fill!(dyn_yy,  zero(T))
+    obs_xx  = sws.Szz_Cd::Matrix{T};     fill!(obs_xx,  zero(T))
+    obs_xy  = sws.td_obs_xy::Matrix{T};  fill!(obs_xy,  zero(T))
+    obs_yy  = sws.R_sum::Matrix{T};      fill!(obs_yy,  zero(T))
 
     init_n_acc = zero(T)
     dyn_n_acc  = zero(T)
@@ -1693,9 +1727,9 @@ function _aggregate_td_suff_stats_weighted!(
 
     for trial in 1:ntrials
         fs = tfs[trial]
-        x_smooth = fs.x_smooth
-        P_smooth = fs.p_smooth
-        P_smooth_tt1 = fs.p_smooth_tt1
+        x_smooth     = fs.x_smooth::Matrix{T}
+        P_smooth     = fs.p_smooth::Array{T,3}
+        P_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
         y_trial = y[trial]
         T_n = size(x_smooth, 2)
         w = weights[trial]
@@ -2177,9 +2211,10 @@ end
 """
     mstep!(lds, suf::SufficientStatistics, sws)
 
-New M-step path consuming aggregated `SufficientStatistics`. Calls the
-suf-based `update_*!` overloads sequentially. The legacy
-`mstep!(lds, tfs, y, sws, …)` path remains available for tests.
+Aggregated M-step: runs the six suf-based `update_*!` overloads in sequence
+(`x0`, `P0`, `A&b&B`, `Q`, `C&d&D`, `R`). Each respects the corresponding
+`lds.fit_bool` flag. The fit hot path in `_fit_tridiag!` calls this once per
+EM iteration after `_aggregate_td_suff_stats!`.
 """
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}

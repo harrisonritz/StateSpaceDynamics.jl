@@ -67,7 +67,7 @@ true_lds = LinearDynamicalSystem(
     fill(true, 6)
 );
 
-latent_states, observations = rand(rng, true_lds; tsteps=T, ntrials=1); # Generate ground truth data
+latent_states, observations = rand(rng, true_lds, T); # Generate ground truth data
 nothing #hide
 ````
 
@@ -94,7 +94,7 @@ plot!(1:T, observations[5, :], label="Obs 5", alpha=0.7, subplot=4)
 plot!(1:T, observations[6, :], label="Obs 6", alpha=0.7, subplot=4)
 
 # Prepare Data for Cross-Validation
-y_data = reshape(observations, D, T, 1)  # (obs_dim, tsteps, ntrials)
+y_data = observations  # single trial, (obs_dim, tsteps)
 
 # Cross-Validation Setup
 K_candidates = 1:8  # Test latent dimensions from 1 to 8
@@ -126,8 +126,8 @@ for (k_idx, K) in enumerate(K_candidates)
         train_indices = vcat(1:(val_start-1), (val_end+1):T)
         val_indices = val_start:val_end
 
-        y_train = y_data[:, train_indices, :]
-        y_val = y_data[:, val_indices, :]
+        y_train = y_data[:, train_indices]
+        y_val = y_data[:, val_indices]
 
 
         A_init = 0.9 * Matrix(I(K)) + 0.1 * randn(rng, K, K)
@@ -148,10 +148,10 @@ for (k_idx, K) in enumerate(K_candidates)
         )
 
         try
-            lls, _ = fit!(lds_candidate, y_train; max_iter=200, tol=1e-6, progress=false);
+            lls = fit!(lds_candidate, y_train; max_iter=200, tol=1e-6, progress=false);
 
-            x_val, _ = smooth(lds_candidate, y_val[:, :, 1])
-            val_ll = loglikelihood(x_val, lds_candidate, y_val[:, :, 1])
+            x_val, _ = smooth(lds_candidate, y_val)
+            val_ll = loglikelihood(x_val, lds_candidate, y_val)
 
             fold_scores[fold] = sum(val_ll) / length(val_indices)  # Normalize by sequence length
 
@@ -225,11 +225,10 @@ final_lds = LinearDynamicalSystem(
 Fit on full dataset
 
 ````@example lds_model_selection_example
-final_lls, _ = fit!(final_lds, y_data; max_iter=500, tol=1e-8)
+final_lls = fit!(final_lds, y_data; max_iter=500, tol=1e-8)
 ````
 
 Compare Learned vs True Dynamics
-Use the correct input format for smooth function (needs 3D array)
 
 ````@example lds_model_selection_example
 x_learned, P_learned = smooth(final_lds, y_data)
@@ -263,11 +262,8 @@ p3 = plot(plt1, plt2, layout = @layout([a; b]), size=(1000,600))
 ````
 
 Compute reconstruction error
-`x_learned` is now `(latent_dim, tsteps, 1)`, so we need to handle the singleton trial dimension
 
 ````@example lds_model_selection_example
-x_learned = x_learned[:, :, 1]
-
 y_pred = final_lds.obs_model.C * x_learned
 reconstruction_error = mean((observations - y_pred).^2)
 
