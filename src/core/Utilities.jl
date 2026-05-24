@@ -1,3 +1,44 @@
+# In-place LU helpers — `LinearAlgebra.lu!(A)` allocates a fresh
+# `Vector{BlasInt}` pivot vector on every call. These wrappers reuse a
+# caller-provided `ipiv`, so a tight inner loop (e.g. the per-block LUs in
+# `block_tridiagonal_solve!`) can run allocation-free for `Float64`/`Float32`.
+for (gtrf, elty) in ((:dgetrf_, :Float64), (:sgetrf_, :Float32))
+    @eval function _getrf_inplace!(
+        A::Matrix{$elty}, ipiv::Vector{LinearAlgebra.BlasInt}
+    )
+        m, n = size(A)
+        @boundscheck length(ipiv) >= min(m, n) ||
+            throw(ArgumentError("ipiv too small for getrf!"))
+        info = Ref{LinearAlgebra.BlasInt}(0)
+        ccall(
+            (LinearAlgebra.BLAS.@blasfunc($gtrf), LinearAlgebra.libblastrampoline),
+            Cvoid,
+            (
+                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+                Ptr{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+            ),
+            m, n, A, max(1, stride(A, 2)), ipiv, info,
+        )
+        LinearAlgebra.LAPACK.chklapackerror(info[])
+        return A
+    end
+end
+
+# Generic fallback for non-BLAS element types (e.g. BigFloat). The pivot
+# vector is sized large enough at the workspace level, so `copyto!`
+# can't underflow.
+function _getrf_inplace!(A::AbstractMatrix, ipiv::Vector{LinearAlgebra.BlasInt})
+    F = LinearAlgebra.lu!(A)
+    n = length(F.ipiv)
+    @boundscheck length(ipiv) >= n ||
+        throw(ArgumentError("ipiv too small for getrf! fallback"))
+    @inbounds for i in 1:n
+        ipiv[i] = F.ipiv[i]
+    end
+    return A
+end
+
 # Type checking utilities
 """
     check_same_type(args...)
@@ -558,14 +599,19 @@ function block_tridiagonal_solve!(
     # Forward elimination (modify diagonal and upper off-diagonal, and RHS)
     # Store modified C[i] in D[i+1] and modified b[i] in x[block i] temporarily
 
+    # Per-block LU pivots are reused across iterations (the backward sweep
+    # only consumes `D[i+1]`, not the factorisations themselves).
+    ipiv = ws.lu_ipiv
+
     # First block: just copy b₁ to x₁ block and store C₁' in D[2]
     @views copyto!(x[1:bs], b[1:bs])
 
     # Process first block specially (no A[0])
     copyto!(M, B[1])
-    F = lu!(M)
-    @views ldiv!(F, x[1:bs])  # x₁ = B₁⁻¹ b₁
-    ldiv!(D[2], F, C[1])       # D[2] = B₁⁻¹ C₁
+    _getrf_inplace!(M, ipiv)
+    @views LinearAlgebra.LAPACK.getrs!('N', M, ipiv, x[1:bs])   # x₁ = B₁⁻¹ b₁
+    copyto!(D[2], C[1])
+    LinearAlgebra.LAPACK.getrs!('N', M, ipiv, D[2])             # D[2] = B₁⁻¹ C₁
 
     # Forward sweep for blocks 2 to n
     for i in 2:n
@@ -587,15 +633,16 @@ function block_tridiagonal_solve!(
             x[idx_start:idx_end], A[i - 1], x[idx_prev_start:idx_prev_end], -one(T), one(T)
         )
 
-        # Factor modified diagonal
-        F = lu!(M)
+        # Factor modified diagonal (in-place, reusing `ipiv`).
+        _getrf_inplace!(M, ipiv)
 
         # Solve for x[i] block
-        @views ldiv!(F, x[idx_start:idx_end])
+        @views LinearAlgebra.LAPACK.getrs!('N', M, ipiv, x[idx_start:idx_end])
 
         # Compute modified upper off-diagonal for next iteration (if not last block)
         if i < n
-            ldiv!(D[i + 1], F, C[i])
+            copyto!(D[i + 1], C[i])
+            LinearAlgebra.LAPACK.getrs!('N', M, ipiv, D[i + 1])
         end
     end
 

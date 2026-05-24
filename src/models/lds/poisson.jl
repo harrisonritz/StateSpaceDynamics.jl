@@ -107,11 +107,19 @@ function _loglikelihood_ws(
         ll += dot(y[:, t], η) - sum(exp, η)
     end
 
+    # Bind the raw Cholesky factor matrices once and use `LAPACK.trtrs!`
+    # directly. `pdm.chol.L` would allocate a fresh
+    # `LowerTriangular{T,Matrix{T}}` wrapper on every access; PDMats
+    # stores the upper factor in `.chol.factors` (uplo='U'), so trans='T'
+    # turns the call into a solve against L = U'.
+    P0_factors = ws.P0_PD[].chol.factors
+    Q_factors = ws.Q_PD[].chol.factors
+
     # Prior: -0.5 * || P0^{-1/2} (x1 - x0) ||^2  with P0 = U'U
     @views begin
         @. dx = x[:, 1] - x0
         copyto!(z, dx)
-        ldiv!(ws.P0_PD[].chol.L, z)               # z := U' \ dx = L \ dx
+        LinearAlgebra.LAPACK.trtrs!('U', 'T', 'N', P0_factors, z)   # z := L \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
@@ -120,7 +128,7 @@ function _loglikelihood_ws(
         mul!(dx, A, x[:, t - 1])          # dx := A * x_{t-1}
         @. dx = x[:, t] - (dx + b)      # dx := x_t - (A x_{t-1} + b)
         copyto!(z, dx)
-        ldiv!(ws.Q_PD[].chol.L, z)                # z := U' \ dx = L \ dx
+        LinearAlgebra.LAPACK.trtrs!('U', 'T', 'N', Q_factors, z)    # z := L \ dx
         ll -= T(0.5) * dot(z, z)
     end
 
@@ -945,10 +953,14 @@ function _fill_hessian_blocks_poisson!(
     d = lds.obs_model.d
     obs_dim, latent_dim = size(C)
 
-    # Pre-compute diagonal templates
-    Q_middle = ws.xt1_given_xt .+ ws.xt_given_xt_1
-    Q_first = ws.x_t .+ ws.xt1_given_xt
-    Q_last = ws.xt_given_xt_1
+    # Diagonal templates (the state-side part is constant for all t; we
+    # build them into pre-existing workspace scratch to avoid the two
+    # `Q_middle = ... .+ ...` / `Q_first = ... .+ ...` allocations).
+    Q_middle = ws.elbo_temp                              # (D × D) scratch
+    Q_first = ws.elbo_temp2                              # (D × D) scratch
+    @. Q_middle = ws.xt1_given_xt + ws.xt_given_xt_1
+    @. Q_first = ws.x_t + ws.xt1_given_xt
+    Q_last = ws.xt_given_xt_1                            # already at-rest in ws
 
     # Fill sub/super-diagonal blocks (constant for all timesteps)
     for i in 1:(tsteps - 1)
@@ -956,9 +968,11 @@ function _fill_hessian_blocks_poisson!(
         copyto!(btd.H_super[i], ws.H_super_entry)
     end
 
-    # Temporaries for Poisson observation term
-    λ = Vector{T}(undef, obs_dim)
-    z = Vector{T}(undef, obs_dim)
+    # Reuse existing obs-dim workspace scratch instead of allocating
+    # fresh per-call `λ` / `z` vectors. `h_obs` / `rho_obs` are owned
+    # by `Q_obs!`, which isn't on the Hessian-construction call path.
+    λ = ws.h_obs
+    z = ws.rho_obs
 
     @views for t in 1:tsteps
         # Start with state model contribution
@@ -1109,9 +1123,9 @@ function smooth!(
     x = fs.x_smooth
 
     if all(fs.E_z .== 0)
-        x[:, 1] .= lds.state_model.x0
-        for t in 2:tsteps
-            mul!(view(x, :, t), lds.state_model.A, view(x, :, t - 1))
+        @views x[:, 1] .= lds.state_model.x0
+        @views for t in 2:tsteps
+            mul!(x[:, t], lds.state_model.A, x[:, t - 1])
             x[:, t] .+= lds.state_model.b
         end
     else

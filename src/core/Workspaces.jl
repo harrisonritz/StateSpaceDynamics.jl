@@ -35,6 +35,12 @@ struct BlockTridiagonalWorkspace{T<:Real}
     neg_sub::Vector{Matrix{T}}
     neg_super::Vector{Matrix{T}}
     chol_factors::Vector{Matrix{T}}
+
+    # Preallocated ipiv for the per-block LU factorisations inside
+    # `block_tridiagonal_solve!`. `lu!(M)` would otherwise allocate a
+    # fresh `Vector{BlasInt}` of length `block_size` on every call, and
+    # the BT solve runs `n_blocks` LUs per Newton evaluation.
+    lu_ipiv::Vector{LinearAlgebra.BlasInt}
 end
 
 """
@@ -67,6 +73,7 @@ function BlockTridiagonalWorkspace(
     neg_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
 
     chol_factors = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
+    lu_ipiv = Vector{LinearAlgebra.BlasInt}(undef, block_size)
 
     return BlockTridiagonalWorkspace{T}(
         block_size,
@@ -88,6 +95,7 @@ function BlockTridiagonalWorkspace(
         neg_sub,
         neg_super,
         chol_factors,
+        lu_ipiv,
     )
 end
 
