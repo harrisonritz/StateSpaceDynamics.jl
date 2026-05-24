@@ -1192,14 +1192,40 @@ function smooth!(
         tol=tol,
     )
 
+    # DIAGNOSTIC (Poisson PosDef CI flake, 2026-05-24): pin down where NaN
+    # first appears on the failing Linux+OpenBLAS run. `Symmetrize!` below
+    # writes NaN to both off-diagonals if the BT inverse produced NaN, then
+    # the aggregator's `PDMat(copy(S0_sum))` reports the misleading
+    # "matrix is not Hermitian" (Julia's `ishermitian` returns `false`
+    # because `NaN != NaN` per IEEE). Catch it at the source instead.
+    if !all(isfinite, x)
+        error("Poisson smooth!: non-finite latent `x` after newton_smooth! " *
+              "(size=$(size(x)), n_nonfinite=$(count(!isfinite, x)))")
+    end
+
     _fill_hessian_blocks_poisson!(sws, lds, x)
     _negate_blocks!(btd, tsteps)
+
+    # `neg_diag` / `neg_sub` are `Vector{Matrix}` — fold element-wise.
+    if !all(M -> all(isfinite, M), btd.neg_diag) ||
+       !all(M -> all(isfinite, M), btd.neg_sub)
+        error("Poisson smooth!: non-finite Hessian blocks after " *
+              "_fill_hessian_blocks_poisson!/_negate_blocks!")
+    end
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
         fs.p_smooth, fs.p_smooth_tt1, neg_sub_v, neg_diag_v, neg_super_v, btd
     )
 
     fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
+
+    if !all(isfinite, fs.p_smooth) || !all(isfinite, fs.p_smooth_tt1)
+        error("Poisson smooth!: non-finite p_smooth from " *
+              "block_tridiagonal_inverse_logdet! " *
+              "(logdet_precision=$logdet_precision, " *
+              "p_smooth nonfinite=$(count(!isfinite, fs.p_smooth)), " *
+              "p_smooth_tt1 nonfinite=$(count(!isfinite, fs.p_smooth_tt1)))")
+    end
 
     @views for i in 1:tsteps
         Symmetrize!(fs.p_smooth[:, :, i])

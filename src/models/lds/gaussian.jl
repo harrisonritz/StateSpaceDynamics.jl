@@ -1882,6 +1882,22 @@ function _aggregate_td_suff_stats!(
     copyto!(suf.dyn_xy, td_dyn_xy)
     copyto!(suf.obs_xy, td_obs_xy)
 
+    # DIAGNOSTIC (Poisson PosDef CI flake, 2026-05-24): surface NaN with a
+    # descriptive message instead of the misleading "matrix is not Hermitian"
+    # PosDefException that fires when `PDMat(::Matrix)` runs `ishermitian` on
+    # a buffer containing NaN (`NaN != NaN`). Each buffer is checked
+    # separately so the failure pinpoints which sufficient-statistic is bad.
+    _assert_finite_suff(name, M) = all(isfinite, M) || error(
+        "_aggregate_td_suff_stats!: non-finite values in `$name` " *
+        "(size=$(size(M)), n_nonfinite=$(count(!isfinite, M))); " *
+        "ntrials=$ntrials, cov_cache=$cov_cache",
+    )
+    _assert_finite_suff("S0_sum (init_yy)", S0_sum)
+    _assert_finite_suff("Szz_Ab (dyn_xx)", Szz_Ab)
+    _assert_finite_suff("Q_sum (dyn_yy)", Q_sum)
+    _assert_finite_suff("Szz_Cd (obs_xx)", Szz_Cd)
+    _assert_finite_suff("R_sum (obs_yy)", R_sum)
+
     suf.init_xx[] = PDMat(fill(T(ntrials), 1, 1))
     suf.init_yy[] = PDMat(copy(S0_sum))
     suf.dyn_xx[] = PDMat(copy(Szz_Ab))
