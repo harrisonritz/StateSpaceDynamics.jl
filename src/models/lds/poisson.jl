@@ -1141,6 +1141,27 @@ function smooth!(
         copyto!(x, fs.E_z)
     end
 
+    # DIAGNOSTIC (Poisson PosDef CI flake, 2026-05-24): distinguish "Newton
+    # diverged from a finite start" vs "upstream already pushed NaN into
+    # `fs.x_smooth` / `fs.E_z`". If THIS fires, the bug is in the prior
+    # E-step or M-step parameter update — not in newton_smooth! itself.
+    # Also dump model parameters so we can tell whether `A`/`Q`/etc. went
+    # NaN in the M-step.
+    if !all(isfinite, x)
+        msg = "Poisson smooth!: non-finite `x` BEFORE newton_smooth! " *
+              "(size=$(size(x)), n_nonfinite=$(count(!isfinite, x))). " *
+              "Came from $(all(fs.E_z .== 0) ? "x0/A-rollout" : "fs.E_z (previous E-step)"). " *
+              "Param check: " *
+              "A=$(all(isfinite, lds.state_model.A))  " *
+              "b=$(all(isfinite, lds.state_model.b))  " *
+              "Q=$(all(isfinite, lds.state_model.Q))  " *
+              "x0=$(all(isfinite, lds.state_model.x0))  " *
+              "P0=$(all(isfinite, lds.state_model.P0))  " *
+              "C=$(all(isfinite, lds.obs_model.C))  " *
+              "d=$(all(isfinite, lds.obs_model.d))"
+        error(msg)
+    end
+
     # Active-length views into (possibly) oversized workspace buffers.
     X0 = view(sws.X₀, 1:n_active)
     grad_active = view(sws.grad_buf, :, 1:tsteps)
