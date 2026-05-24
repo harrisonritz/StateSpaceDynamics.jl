@@ -515,9 +515,20 @@ function compute_smooth_constants!(
     # Rewrap covariances as PDMats — each PDMat caches its own Cholesky
     # factor internally and is consumed downstream via `ws.X_PD[].chol.U`
     # for triangular solves and `logdet(ws.X_PD[])` for the normalizer.
-    ws.R_PD[] = PDMat(Symmetric(R))
-    ws.Q_PD[] = PDMat(Symmetric(Q))
-    ws.P0_PD[] = PDMat(Symmetric(P0))
+    #
+    # When `WT === T` (the hot path) `convert(Matrix{WT}, M)` returns `M`
+    # unchanged — no copy, no alloc. When the workspace eltype differs
+    # (e.g. `ForwardDiff.Dual` for autodiff `loglikelihood`), constructing
+    # the PDMat directly with `WT`-typed factors avoids the
+    # `convert(::Type{PDMat{WT}}, ::PDMat{T})` fallback that requires a
+    # single-arg `Cholesky{WT}(::Cholesky{T})` method — present in
+    # Julia 1.12 but not Julia 1.10's stdlib `LinearAlgebra`.
+    R_w = convert(Matrix{WT}, R)
+    Q_w = convert(Matrix{WT}, Q)
+    P0_w = convert(Matrix{WT}, P0)
+    ws.R_PD[] = PDMat(Symmetric(R_w))
+    ws.Q_PD[] = PDMat(Symmetric(Q_w))
+    ws.P0_PD[] = PDMat(Symmetric(P0_w))
     Rchol = ws.R_PD[].chol
     Qchol = ws.Q_PD[].chol
     P0chol = ws.P0_PD[].chol
@@ -596,9 +607,13 @@ function compute_smooth_constants!(
     P0 = lds.state_model.P0
 
     # Wrap state-side covariances as PDMats (Poisson path doesn't need R
-    # in this workspace path). Each PDMat caches its own Cholesky factor.
-    ws.Q_PD[] = PDMat(Symmetric(Q))
-    ws.P0_PD[] = PDMat(Symmetric(P0))
+    # in this workspace path). See the Gaussian overload for the `convert`
+    # rationale: it's a no-op when `WT === T` and avoids a Julia 1.10
+    # `Cholesky` convert-method gap when `WT !== T` (ForwardDiff path).
+    Q_w = convert(Matrix{WT}, Q)
+    P0_w = convert(Matrix{WT}, P0)
+    ws.Q_PD[] = PDMat(Symmetric(Q_w))
+    ws.P0_PD[] = PDMat(Symmetric(P0_w))
     Q_chol = ws.Q_PD[].chol
     P0_chol = ws.P0_PD[].chol
 
