@@ -1201,6 +1201,10 @@ function smooth!(
 
     fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
 
+    @views for i in 1:tsteps
+        Symmetrize!(fs.p_smooth[:, :, i])
+    end
+
     return fs
 end
 
