@@ -706,8 +706,17 @@ function gradient_observation_model!(
                         # dependency on having run `sufficient_statistics!` —
                         # the suf-based estep! no longer populates `fs.E_z`.
                         gradient_observation_model_single_trial!(
-                            tmp, C, d, fs.x_smooth, fs.p_smooth, y[k], weights,
-                            h_buf, ρ_buf, λ_buf, CP_buf,
+                            tmp,
+                            C,
+                            d,
+                            fs.x_smooth,
+                            fs.p_smooth,
+                            y[k],
+                            weights,
+                            h_buf,
+                            ρ_buf,
+                            λ_buf,
+                            CP_buf,
                         )
 
                         @simd for i in 1:npar

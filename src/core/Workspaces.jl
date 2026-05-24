@@ -238,11 +238,33 @@ struct SmoothWorkspace{T<:Real}
     td_obs_xy_const::Matrix{T}         # (obs_reg_dim, p)      bias + v-rows of obs_xy
     td_obs_xx_const::Matrix{T}         # (obs_reg_dim, obs_reg_dim) bias / v blocks
     td_dyn_xx_const::Matrix{T}         # (dyn_reg_dim, dyn_reg_dim) bias / u blocks
+
+    # Batched mean-pass buffers (equal-length cov-cache fast path). Only the
+    # designated `sws_pool[1]` workspace allocates these with `ntrials > 1`;
+    # the rest of the pool keeps them at `ntrials = 1` (effectively empty).
+    # The (D, T, N) tensors share storage with their `(D*T, N)` reshaped views
+    # used as matrix RHS for `block_tridiagonal_backsubst!`.
+    batched_x_mat::Array{T,3}         # (latent_dim, tsteps, ntrials) - current iterate
+    batched_grad_buf::Array{T,3}      # (latent_dim, tsteps, ntrials) - Gradient! output
+    batched_dxt::Matrix{T}            # (latent_dim, ntrials)
+    batched_dxt_next::Matrix{T}       # (latent_dim, ntrials)
+    batched_dyt::Matrix{T}            # (obs_dim, ntrials)
+    batched_tmp1::Matrix{T}           # (latent_dim, ntrials)
+    batched_tmp2::Matrix{T}           # (latent_dim, ntrials)
+    batched_tmp3::Matrix{T}           # (latent_dim, ntrials)
+
+    # Stacked observation / control tensors used by the batched mean pass.
+    # Populated once at the first batched `smooth!` call (data is constant
+    # across EM iters within a fit). 0-sized when `ntrials = 1`.
+    batched_y::Array{T,3}             # (obs_dim, tsteps, ntrials)
+    batched_u::Array{T,3}             # (u_dim, tsteps, ntrials)
+    batched_v::Array{T,3}             # (d_dim, tsteps, ntrials)
+    batched_data_valid::Base.RefValue{Bool}  # true after first populate
 end
 
 """
     SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
-                    u_dim=0, d_dim=0)
+                    u_dim=0, d_dim=0, ntrials=1)
 
 Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
 
@@ -250,12 +272,21 @@ Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
   size the M-step regression buffers `Sxz`/`Szz_Ab`/`AB` to fit `[A b B]`.
 - `d_dim` is the observation-input dimension (`size(obs_model.D, 2)`), used
   to size `Syz`/`Szz_Cd`/`CD` to fit `[C d D]`.
+- `ntrials` sizes the batched mean-pass buffers used by the equal-length
+  cov-cache fast path. Default 1 (effectively empty). Only `sws_pool[1]` at
+  fit entry needs the real `ntrials`; the rest of the pool keeps the default.
 
-Either being zero (the default) means no inputs — buffers fit `[A b]` and/or
-`[C d]` only.
+Either of `u_dim` / `d_dim` being zero (the default) means no inputs — buffers
+fit `[A b]` and/or `[C d]` only.
 """
 function SmoothWorkspace(
-    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int; u_dim::Int=0, d_dim::Int=0
+    ::Type{T},
+    latent_dim::Int,
+    obs_dim::Int,
+    tsteps::Int;
+    u_dim::Int=0,
+    d_dim::Int=0,
+    ntrials::Int=1,
 ) where {T<:Real}
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 
@@ -359,6 +390,22 @@ function SmoothWorkspace(
     td_obs_xx_const = zeros(T, obs_reg_dim, obs_reg_dim)
     td_dyn_xx_const = zeros(T, dyn_reg_dim, dyn_reg_dim)
 
+    # Batched mean-pass buffers. Sized at `ntrials = 1` by default — only
+    # `sws_pool[1]` at fit entry passes the actual ntrials so the batched
+    # backsubst can do BLAS-3 across trials.
+    batched_x_mat = zeros(T, latent_dim, tsteps, ntrials)
+    batched_grad_buf = zeros(T, latent_dim, tsteps, ntrials)
+    batched_dxt = zeros(T, latent_dim, ntrials)
+    batched_dxt_next = zeros(T, latent_dim, ntrials)
+    batched_dyt = zeros(T, obs_dim, ntrials)
+    batched_tmp1 = zeros(T, latent_dim, ntrials)
+    batched_tmp2 = zeros(T, latent_dim, ntrials)
+    batched_tmp3 = zeros(T, latent_dim, ntrials)
+    batched_y = zeros(T, obs_dim, tsteps, ntrials)
+    batched_u = zeros(T, u_dim, tsteps, ntrials)
+    batched_v = zeros(T, d_dim, tsteps, ntrials)
+    batched_data_valid = Ref(false)
+
     return SmoothWorkspace{T}(
         btd,
         R_PD,
@@ -430,6 +477,18 @@ function SmoothWorkspace(
         td_obs_xy_const,
         td_obs_xx_const,
         td_dyn_xx_const,
+        batched_x_mat,
+        batched_grad_buf,
+        batched_dxt,
+        batched_dxt_next,
+        batched_dyt,
+        batched_tmp1,
+        batched_tmp2,
+        batched_tmp3,
+        batched_y,
+        batched_u,
+        batched_v,
+        batched_data_valid,
     )
 end
 

@@ -15,30 +15,66 @@ end
 Initialize a per-trial `FilterSmooth` buffer sized for `tsteps` timesteps.
 """
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O}, tsteps::Int
+    model::LinearDynamicalSystem{T,S,O}, tsteps::Int; cov_alias::Bool=false
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = model.latent_dim
+    # `cov_alias=true` is the equal-length cov-cache hint from
+    # `_fit_tridiag!`: the new TD aggregator never reads `E_zz` / `E_zz_prev`
+    # (it consumes `x_smooth` / `p_smooth` / `p_smooth_tt1` directly), and
+    # the smoother aliases `p_smooth` / `p_smooth_tt1` to
+    # `sws.p_smooth_shared` on every E-step — so all four `(D, D, tsteps)`
+    # arrays are allocated then either ignored or immediately overwritten.
+    # At `(D=128, T=250, N=500)` that's ≈ 64 GB of pure waste.
+    #
+    # Default (`cov_alias=false`) preserves the original layout: SLDS /
+    # Poisson / ragged / single-trial paths write into the per-trial
+    # `p_smooth` and may invoke the legacy `sufficient_statistics!(fs)`
+    # which populates `E_zz` / `E_zz_prev`.
+    if cov_alias
+        p_smooth = zeros(T, 0, 0, 0)
+        p_smooth_tt1 = zeros(T, 0, 0, 0)
+        E_zz = zeros(T, 0, 0, 0)
+        E_zz_prev = zeros(T, 0, 0, 0)
+    else
+        p_smooth = zeros(T, D, D, tsteps)
+        p_smooth_tt1 = zeros(T, D, D, tsteps)
+        E_zz = zeros(T, D, D, tsteps)
+        E_zz_prev = zeros(T, D, D, tsteps)
+    end
     return FilterSmooth{T}(
-        zeros(T, D, tsteps),                              # x_smooth
-        zeros(T, D, D, tsteps),                           # p_smooth
-        zeros(T, D, D, tsteps),                           # p_smooth_tt1
-        zeros(T, D, tsteps),                              # E_z
-        zeros(T, D, D, tsteps),                           # E_zz
-        zeros(T, D, D, tsteps),                           # E_zz_prev
-        zero(T),                                          # entropy
+        zeros(T, D, tsteps),       # x_smooth
+        p_smooth,
+        p_smooth_tt1,
+        zeros(T, D, tsteps),       # E_z
+        E_zz,
+        E_zz_prev,
+        zero(T),                   # entropy
     )
 end
 
 """
-    initialize_FilterSmooth(model, tsteps_per_trial::AbstractVector{<:Integer})
+    initialize_FilterSmooth(model, tsteps_per_trial::AbstractVector{<:Integer};
+                            cov_alias=false)
 
-Initialize a `TrialFilterSmooth` with one `FilterSmooth` per trial. Trial lengths may
-differ.
+Initialize a `TrialFilterSmooth` with one `FilterSmooth` per trial. Trial lengths
+may differ.
+
+Set `cov_alias=true` only when the caller knows the cov-cache fast path will
+run (equal-length multi-trial Gaussian via `_fit_tridiag!`) — in that case
+every per-trial `p_smooth` / `p_smooth_tt1` is allocated as a `(0, 0, 0)` stub
+because `smooth!` aliases them to `sws.p_smooth_shared` on every E-step. The
+SLDS / Poisson / ragged paths invoke the per-trial smoother directly and
+write into `fs.p_smooth`, so they must keep the default `cov_alias=false`.
 """
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{<:Integer}
+    model::LinearDynamicalSystem{T,S,O},
+    tsteps_per_trial::AbstractVector{<:Integer};
+    cov_alias::Bool=false,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    filter_smooths = [initialize_FilterSmooth(model, Int(t)) for t in tsteps_per_trial]
+    filter_smooths = [
+        initialize_FilterSmooth(model, Int(t); cov_alias=cov_alias) for
+        t in tsteps_per_trial
+    ]
     return TrialFilterSmooth(filter_smooths)
 end
 
@@ -848,6 +884,19 @@ function smooth!(
             tfs[trial].entropy = shared_entropy
         end
 
+        # Batched mean pass: when `sws_pool[1]` was constructed with the right
+        # `ntrials`, every per-trial Newton step collapses into a single
+        # `(D*T) × N` matrix-RHS backsubst, doing the same total math as the
+        # per-trial loop below but with BLAS-3 dispatch (matches the Kalman
+        # path's batched-trial efficiency).
+        if size(source_sws.batched_x_mat, 3) == ntrials && ntrials > 1
+            if !source_sws.batched_data_valid[]
+                _populate_batched_data!(source_sws, y, u_seq, v_seq)
+            end
+            _smooth_mean_only_batched!(lds, tfs, source_sws)
+            return tfs
+        end
+
         ntasks = min(ntrials, length(sws_pool))
         chunksize = cld(ntrials, ntasks)
         @sync for i in 1:ntasks
@@ -992,6 +1041,177 @@ function _smooth_mean_only!(
     fs.x_smooth .-= step_mat
 
     return fs
+end
+
+"""
+    Gradient_batched!(ws, lds, y_batched, x_batched, u_batched, v_batched)
+
+Batched form of `Gradient!`: every `mul!` is promoted from BLAS-2
+(`bs × bs × bs`) to BLAS-3 (`bs × bs × bs × N`) by stacking the trial axis as
+the trailing matrix dimension. The shared-cov fast path only ever needs
+gradient evaluation at the *current iterate* across all trials, so the work
+is structurally identical to N independent per-trial gradients — but BLAS
+dispatch overhead is paid once instead of N times.
+
+Writes the result into `ws.batched_grad_buf` (shape `(D, T, N)`); the affine
+bias subtractions (`-b`, `-d_obs`, `-x0`) broadcast across the trial axis.
+"""
+function Gradient_batched!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractArray{T,3},
+    x::AbstractArray{T,3},
+    u::AbstractArray{T,3},
+    v::AbstractArray{T,3},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    tsteps = size(x, 2)
+    A = lds.state_model.A
+    b = lds.state_model.b
+    B = lds.state_model.B
+    x0 = lds.state_model.x0
+    C = lds.obs_model.C
+    d_obs = lds.obs_model.d
+    D_obs = lds.obs_model.D
+
+    C_inv_R = ws.C_inv_R
+    A_inv_Q = ws.A_inv_Q
+    neg_P0_inv = ws.x_t            # = -P0^{-1}
+    neg_Q_inv = ws.xt_given_xt_1   # = -Q^{-1}
+
+    grad = ws.batched_grad_buf
+    dxt = ws.batched_dxt
+    dxt_next = ws.batched_dxt_next
+    dyt = ws.batched_dyt
+    tmp1 = ws.batched_tmp1
+    tmp2 = ws.batched_tmp2
+    tmp3 = ws.batched_tmp3
+
+    # First time step
+    @views begin
+        dxt .= x[:, 1, :] .- x0
+        mul!(dxt_next, A, x[:, 1, :])
+        mul!(dxt_next, B, u[:, 1, :], one(T), one(T))
+        dxt_next .= x[:, 2, :] .- dxt_next .- b
+        mul!(dyt, C, x[:, 1, :])
+        mul!(dyt, D_obs, v[:, 1, :], one(T), one(T))
+        dyt .= y[:, 1, :] .- dyt .- d_obs
+    end
+
+    mul!(tmp1, C_inv_R, dyt)
+    mul!(tmp2, A_inv_Q, dxt_next)
+    mul!(tmp3, neg_P0_inv, dxt)
+    @views grad[:, 1, :] .= tmp1 .+ tmp2 .+ tmp3
+
+    # Middle steps
+    @views for t in 2:(tsteps - 1)
+        mul!(dxt, A, x[:, t - 1, :])
+        mul!(dxt, B, u[:, t - 1, :], one(T), one(T))
+        dxt .= x[:, t, :] .- dxt .- b
+
+        mul!(dxt_next, A, x[:, t, :])
+        mul!(dxt_next, B, u[:, t, :], one(T), one(T))
+        dxt_next .= x[:, t + 1, :] .- dxt_next .- b
+
+        mul!(dyt, C, x[:, t, :])
+        mul!(dyt, D_obs, v[:, t, :], one(T), one(T))
+        dyt .= y[:, t, :] .- dyt .- d_obs
+
+        mul!(tmp1, C_inv_R, dyt)
+        mul!(tmp2, A_inv_Q, dxt_next)
+        mul!(tmp3, neg_Q_inv, dxt)
+
+        grad[:, t, :] .= tmp1 .+ tmp3 .+ tmp2
+    end
+
+    # Last time step
+    @views begin
+        mul!(dxt, A, x[:, tsteps - 1, :])
+        mul!(dxt, B, u[:, tsteps - 1, :], one(T), one(T))
+        dxt .= x[:, tsteps, :] .- dxt .- b
+        mul!(dyt, C, x[:, tsteps, :])
+        mul!(dyt, D_obs, v[:, tsteps, :], one(T), one(T))
+        dyt .= y[:, tsteps, :] .- dyt .- d_obs
+
+        mul!(tmp1, C_inv_R, dyt)
+        mul!(tmp3, neg_Q_inv, dxt)
+
+        grad[:, tsteps, :] .= tmp1 .+ tmp3
+    end
+
+    return grad
+end
+
+"""
+    _populate_batched_data!(sws, y, u, v)
+
+Stack the per-trial `y`/`u`/`v` `Vector{Matrix}` inputs into the contiguous
+`(p, T, N)` / `(u_dim, T, N)` / `(d_dim, T, N)` tensors used by the batched
+mean pass. Called once per fit (data is constant across EM iterations).
+"""
+function _populate_batched_data!(
+    sws::SmoothWorkspace{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    u::AbstractVector{<:AbstractMatrix{T}},
+    v::AbstractVector{<:AbstractMatrix{T}},
+) where {T<:Real}
+    @views for trial in eachindex(y)
+        sws.batched_y[:, :, trial] .= y[trial]
+    end
+    if size(sws.batched_u, 1) > 0
+        @views for trial in eachindex(u)
+            sws.batched_u[:, :, trial] .= u[trial]
+        end
+    end
+    if size(sws.batched_v, 1) > 0
+        @views for trial in eachindex(v)
+            sws.batched_v[:, :, trial] .= v[trial]
+        end
+    end
+    sws.batched_data_valid[] = true
+    return sws
+end
+
+"""
+    _smooth_mean_only_batched!(lds, tfs, sws)
+
+Batched form of `_smooth_mean_only!`: runs one Newton step for *all trials at
+once* by stacking the per-trial iterate / gradient / RHS into `(D, T, N)`
+tensors and performing a single BLAS-3 backsubst.
+
+Assumes `_precompute_shared_cov!` has already populated `sws.btd`'s Cholesky
+cache and `sws.batched_data_valid[] == true` (data was stacked at fit entry).
+"""
+function _smooth_mean_only_batched!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    ntrials = length(tfs)
+    D = lds.latent_dim
+    tsteps = size(tfs[1].x_smooth, 2)
+
+    # Stage previous-iter smoothed means into the batched iterate buffer.
+    @views for trial in 1:ntrials
+        sws.batched_x_mat[:, :, trial] .= tfs[trial].E_z
+    end
+
+    Gradient_batched!(sws, lds, sws.batched_y, sws.batched_x_mat, sws.batched_u, sws.batched_v)
+
+    # Pack negated gradient into the (D*T, N) matrix RHS layout.
+    n_active = D * tsteps
+    grad_flat = reshape(sws.batched_grad_buf, n_active, ntrials)
+    x_flat = reshape(sws.batched_x_mat, n_active, ntrials)
+    @. grad_flat = -grad_flat
+
+    neg_sub_v = view(sws.btd.neg_sub, 1:(tsteps - 1))
+    block_tridiagonal_backsubst!(x_flat, neg_sub_v, grad_flat, sws.btd, tsteps)
+
+    # x_flat now holds the Newton step. Update each tfs[trial].x_smooth.
+    @views for trial in 1:ntrials
+        tfs[trial].x_smooth .= tfs[trial].E_z .- sws.batched_x_mat[:, :, trial]
+    end
+
+    return tfs
 end
 
 # Backward-compatible no-input overload.
@@ -1273,6 +1493,13 @@ Compute sufficient statistics for the EM algorithm in a Linear Dynamical System.
 """
 function sufficient_statistics!(fs::FilterSmooth{T}) where {T<:Real}
     latent_dim, tsteps = size(fs.x_smooth)
+
+    # `initialize_FilterSmooth` leaves these as `(0, 0, 0)` stubs — the TD
+    # aggregator never reads them. Materialize on demand for legacy callers.
+    if size(fs.E_zz, 1) != latent_dim || size(fs.E_zz, 3) != tsteps
+        fs.E_zz = zeros(T, latent_dim, latent_dim, tsteps)
+        fs.E_zz_prev = zeros(T, latent_dim, latent_dim, tsteps)
+    end
 
     # E_z is just a copy of x_smooth
     fs.E_z .= fs.x_smooth
@@ -2087,9 +2314,7 @@ function update_initial_state_mean!(
 end
 
 function update_initial_state_covariance!(
-    lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
-    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[2] || return nothing
     D = lds.latent_dim
@@ -2127,9 +2352,7 @@ function update_initial_state_covariance!(
 end
 
 function update_A_b!(
-    lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
-    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
     D = lds.latent_dim
@@ -2234,9 +2457,7 @@ function update_Q!(
 end
 
 function update_C_d!(
-    lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
-    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
     D = lds.latent_dim
@@ -2462,14 +2683,38 @@ function _fit_tridiag!(
     elbos = Vector{T}()
     sizehint!(elbos, max_iter)
 
-    tfs = initialize_FilterSmooth(lds, tsteps_per_trial)::TrialFilterSmooth{T}
+    # Opt in to the cov-alias stub for `p_smooth` / `p_smooth_tt1` when the
+    # cov-cache fast path is going to fire (equal-length multi-trial). The
+    # smoother aliases them to shared storage on every E-step, so per-trial
+    # allocations of `(D, D, T)` are pure waste at large `N`.
+    ntrials_total = length(y)
+    cov_alias = ntrials_total > 1 &&
+        all(t -> t == tsteps_per_trial[1], tsteps_per_trial)
+    tfs = initialize_FilterSmooth(
+        lds, tsteps_per_trial; cov_alias=cov_alias
+    )::TrialFilterSmooth{T}
 
     u_dim = lds.state_input_dim
     d_dim = lds.obs_input_dim
-    sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max; u_dim=u_dim, d_dim=d_dim) for
-        _ in 1:Threads.maxthreadid()
-    ]
+    # Only `sws_pool[1]` needs the batched mean-pass buffers (used by the
+    # equal-length cov-cache fast path); the other workspaces back the
+    # per-trial fallback / @spawn'd tasks and stay at `ntrials = 1`.
+    pool_size = Threads.maxthreadid()
+    sws_pool = Vector{SmoothWorkspace{T}}(undef, pool_size)
+    sws_pool[1] = SmoothWorkspace(
+        T,
+        lds.latent_dim,
+        lds.obs_dim,
+        T_max;
+        u_dim=u_dim,
+        d_dim=d_dim,
+        ntrials=ntrials_total,
+    )
+    for i in 2:pool_size
+        sws_pool[i] = SmoothWorkspace(
+            T, lds.latent_dim, lds.obs_dim, T_max; u_dim=u_dim, d_dim=d_dim
+        )
+    end
 
     # Sufficient-statistics aggregator: allocated once, mutated each E-step.
     # Data-only constants (Σ y y', Σ y, Σ u u' …) are precomputed here once

@@ -3,9 +3,7 @@
 # caller-provided `ipiv`, so a tight inner loop (e.g. the per-block LUs in
 # `block_tridiagonal_solve!`) can run allocation-free for `Float64`/`Float32`.
 for (gtrf, elty) in ((:dgetrf_, :Float64), (:sgetrf_, :Float32))
-    @eval function _getrf_inplace!(
-        A::Matrix{$elty}, ipiv::Vector{LinearAlgebra.BlasInt}
-    )
+    @eval function _getrf_inplace!(A::Matrix{$elty}, ipiv::Vector{LinearAlgebra.BlasInt})
         m, n = size(A)
         @boundscheck length(ipiv) >= min(m, n) ||
             throw(ArgumentError("ipiv too small for getrf!"))
@@ -14,11 +12,19 @@ for (gtrf, elty) in ((:dgetrf_, :Float64), (:sgetrf_, :Float32))
             (LinearAlgebra.BLAS.@blasfunc($gtrf), LinearAlgebra.libblastrampoline),
             Cvoid,
             (
-                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                Ptr{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
+                Ptr{$elty},
+                Ref{LinearAlgebra.BlasInt},
+                Ptr{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
             ),
-            m, n, A, max(1, stride(A, 2)), ipiv, info,
+            m,
+            n,
+            A,
+            max(1, stride(A, 2)),
+            ipiv,
+            info,
         )
         LinearAlgebra.LAPACK.chklapackerror(info[])
         return A
@@ -47,27 +53,38 @@ end
 # are overwritten. Falls back to the dense path for non-BLAS eltypes.
 for (pbsv, elty) in ((:dpbsv_, :Float64), (:spbsv_, :Float32))
     @eval function _pbsv_inplace!(
-        uplo::Char,
-        n::Int,
-        kd::Int,
-        AB::Matrix{$elty},
-        B::AbstractVecOrMat{$elty},
+        uplo::Char, n::Int, kd::Int, AB::Matrix{$elty}, B::AbstractVecOrMat{$elty}
     )
         ldab = stride(AB, 2)
         @boundscheck ldab >= kd + 1 ||
             throw(ArgumentError("AB row stride too small for pbsv"))
-        @boundscheck size(AB, 2) >= n ||
-            throw(ArgumentError("AB has fewer than n columns"))
+        @boundscheck size(AB, 2) >= n || throw(ArgumentError("AB has fewer than n columns"))
         nrhs = B isa AbstractVector ? 1 : size(B, 2)
         ldb = B isa AbstractVector ? n : stride(B, 2)
         info = Ref{LinearAlgebra.BlasInt}(0)
         ccall(
             (LinearAlgebra.BLAS.@blasfunc($pbsv), LinearAlgebra.libblastrampoline),
             Cvoid,
-            (Ref{UInt8}, Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-             Ref{LinearAlgebra.BlasInt}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-             Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt}),
-            uplo, n, kd, nrhs, AB, ldab, B, ldb, info,
+            (
+                Ref{UInt8},
+                Ref{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
+                Ptr{$elty},
+                Ref{LinearAlgebra.BlasInt},
+                Ptr{$elty},
+                Ref{LinearAlgebra.BlasInt},
+                Ref{LinearAlgebra.BlasInt},
+            ),
+            uplo,
+            n,
+            kd,
+            nrhs,
+            AB,
+            ldab,
+            B,
+            ldb,
+            info,
         )
         LinearAlgebra.LAPACK.chklapackerror(info[])
         return B
@@ -585,6 +602,62 @@ function block_tridiagonal_backsubst!(
 
         @views mul!(
             x[idx_start:idx_end], D[i + 1], x[idx_next_start:idx_next_end], -one(T), one(T)
+        )
+    end
+
+    return x
+end
+
+# Matrix-RHS overload: each column is an independent system sharing the same
+# cached Cholesky factors. With `N` columns, every `ldiv!` becomes a triangular
+# solve with `bs × N` RHS, and every `mul!` is a `bs × bs × bs × N` matmul —
+# i.e. BLAS-3 instead of BLAS-2. This is the entry point for the batched
+# multi-trial mean pass in the cov-cache fast path.
+function block_tridiagonal_backsubst!(
+    x::AbstractMatrix{T},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    b::AbstractMatrix{T},
+    ws::BlockTridiagonalWorkspace{T},
+    n::Int,
+) where {T<:Real}
+    bs = ws.block_size
+    D = ws.D
+
+    # Block 1
+    @views copyto!(x[1:bs, :], b[1:bs, :])
+    F1 = LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[1], 'U', 0)
+    @views ldiv!(F1, x[1:bs, :])
+
+    for i in 2:n
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_prev_start = (i - 2) * bs + 1
+        idx_prev_end = (i - 1) * bs
+
+        @views copyto!(x[idx_start:idx_end, :], b[idx_start:idx_end, :])
+        @views mul!(
+            x[idx_start:idx_end, :],
+            A[i - 1],
+            x[idx_prev_start:idx_prev_end, :],
+            -one(T),
+            one(T),
+        )
+        Fi = LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[i], 'U', 0)
+        @views ldiv!(Fi, x[idx_start:idx_end, :])
+    end
+
+    for i in (n - 1):-1:1
+        idx_start = (i - 1) * bs + 1
+        idx_end = i * bs
+        idx_next_start = i * bs + 1
+        idx_next_end = (i + 1) * bs
+
+        @views mul!(
+            x[idx_start:idx_end, :],
+            D[i + 1],
+            x[idx_next_start:idx_next_end, :],
+            -one(T),
+            one(T),
         )
     end
 
