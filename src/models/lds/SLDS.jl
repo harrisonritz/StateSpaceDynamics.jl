@@ -772,7 +772,10 @@ function smooth!(
             gvec = vec(gcur)
             pvec = vec(pcur)
             copyto!(pvec, gvec)
-            block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
+            # SPD path (negated Hessian at MAP).
+            block_tridiagonal_solve_spd!(
+                pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd
+            )
             return nothing
         end
 

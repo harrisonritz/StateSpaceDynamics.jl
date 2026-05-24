@@ -41,6 +41,14 @@ struct BlockTridiagonalWorkspace{T<:Real}
     # fresh `Vector{BlasInt}` of length `block_size` on every call, and
     # the BT solve runs `n_blocks` LUs per Newton evaluation.
     lu_ipiv::Vector{LinearAlgebra.BlasInt}
+
+    # Banded-format scratch for the SPD `pbsv`-based fast path used when
+    # `block_size ≤ 8`. Layout: `(2*block_size, block_size * n_blocks)`
+    # — `ldab = 2D` (one row past `kd+1 = 2D-1+1 = 2D`), one column per
+    # global matrix column. `pbsv` overwrites this with the Cholesky
+    # factor on each call, so it gets refilled from the block storage
+    # every BT solve.
+    Hb::Matrix{T}
 end
 
 """
@@ -74,6 +82,7 @@ function BlockTridiagonalWorkspace(
 
     chol_factors = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
     lu_ipiv = Vector{LinearAlgebra.BlasInt}(undef, block_size)
+    Hb = zeros(T, 2 * block_size, block_size * n_blocks)
 
     return BlockTridiagonalWorkspace{T}(
         block_size,
@@ -96,6 +105,7 @@ function BlockTridiagonalWorkspace(
         neg_super,
         chol_factors,
         lu_ipiv,
+        Hb,
     )
 end
 

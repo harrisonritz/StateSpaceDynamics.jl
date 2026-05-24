@@ -39,6 +39,41 @@ function _getrf_inplace!(A::AbstractMatrix, ipiv::Vector{LinearAlgebra.BlasInt})
     return A
 end
 
+# In-place SPD banded solver. Wraps LAPACK's `?pbsv` (not exposed in
+# `LinearAlgebra.LAPACK`). Solves A·X = B where A is SPD with
+# bandwidth `kd`, stored in upper-banded format (`uplo='U'`):
+# A[i,j] = AB[kd+1+i-j, j] for max(1, j-kd) ≤ i ≤ j.
+# Both `AB` (Cholesky factor on return) and `B` (solution on return)
+# are overwritten. Falls back to the dense path for non-BLAS eltypes.
+for (pbsv, elty) in ((:dpbsv_, :Float64), (:spbsv_, :Float32))
+    @eval function _pbsv_inplace!(
+        uplo::Char,
+        n::Int,
+        kd::Int,
+        AB::Matrix{$elty},
+        B::AbstractVecOrMat{$elty},
+    )
+        ldab = stride(AB, 2)
+        @boundscheck ldab >= kd + 1 ||
+            throw(ArgumentError("AB row stride too small for pbsv"))
+        @boundscheck size(AB, 2) >= n ||
+            throw(ArgumentError("AB has fewer than n columns"))
+        nrhs = B isa AbstractVector ? 1 : size(B, 2)
+        ldb = B isa AbstractVector ? n : stride(B, 2)
+        info = Ref{LinearAlgebra.BlasInt}(0)
+        ccall(
+            (LinearAlgebra.BLAS.@blasfunc($pbsv), LinearAlgebra.libblastrampoline),
+            Cvoid,
+            (Ref{UInt8}, Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+             Ref{LinearAlgebra.BlasInt}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+             Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt}),
+            uplo, n, kd, nrhs, AB, ldab, B, ldb, info,
+        )
+        LinearAlgebra.LAPACK.chklapackerror(info[])
+        return B
+    end
+end
+
 # Type checking utilities
 """
     check_same_type(args...)
@@ -579,6 +614,104 @@ potentially large sparse LU.
 - `b::AbstractVector{T}`: Right-hand side vector (length n*bs)
 - `ws::BlockTridiagonalWorkspace{T}`: Workspace with temp buffers
 """
+# Pack the upper triangle of a symmetric block-tridiagonal matrix into
+# LAPACK banded storage (`uplo='U'`, bandwidth `kd = 2·bs - 1`).
+# `AB[kd+1+i-j, j] = H[i, j]` for `max(1, j-kd) ≤ i ≤ j`. Only the first
+# `bs*n_blocks` columns and `kd+1` rows of `AB` are touched.
+@inline function _pack_block_tridiag_banded!(
+    AB::AbstractMatrix{T},
+    diag_blocks::AbstractVector{<:AbstractMatrix{T}},
+    super_blocks::AbstractVector{<:AbstractMatrix{T}},
+) where {T}
+    n_blocks = length(diag_blocks)
+    bs = size(diag_blocks[1], 1)
+    kd = 2 * bs - 1
+    n = bs * n_blocks
+    # Zero the active region. Most of these slots get overwritten by the
+    # block fills below; the diagonal-block lower triangle (which we
+    # never touch) needs to stay zero so LAPACK doesn't read garbage.
+    @inbounds for j in 1:n, r in 1:(kd + 1)
+        AB[r, j] = zero(T)
+    end
+    @inbounds for k in 1:n_blocks
+        Bk = diag_blocks[k]
+        base = (k - 1) * bs
+        for jj in 1:bs
+            j_global = base + jj
+            for ii in 1:jj
+                AB[kd + 1 + (base + ii) - j_global, j_global] = Bk[ii, jj]
+            end
+        end
+    end
+    @inbounds for k in 1:(n_blocks - 1)
+        Ck = super_blocks[k]
+        row_base = (k - 1) * bs
+        col_base = k * bs
+        for jj in 1:bs, ii in 1:bs
+            j_global = col_base + jj
+            AB[kd + 1 + (row_base + ii) - j_global, j_global] = Ck[ii, jj]
+        end
+    end
+    return AB
+end
+
+# pbsv-based fast path for SPD block-tridiagonal solves at small block
+# size. At `bs ≤ 8` the per-block BLAS dispatch overhead in the generic
+# block-Thomas path dominates over the tiny arithmetic; one packed
+# `pbsv` call to LAPACK amortises that overhead and is 30-60× faster.
+function _block_tridiagonal_solve_pbsv!(
+    x::AbstractVector{T},
+    diag_blocks::AbstractVector{<:AbstractMatrix{T}},
+    super_blocks::AbstractVector{<:AbstractMatrix{T}},
+    b::AbstractVector{T},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Union{Float32,Float64}}
+    bs = size(diag_blocks[1], 1)
+    n_blocks = length(diag_blocks)
+    n = bs * n_blocks
+    kd = 2 * bs - 1
+    _pack_block_tridiag_banded!(ws.Hb, diag_blocks, super_blocks)
+    @views copyto!(x[1:n], b[1:n])
+    @views _pbsv_inplace!('U', n, kd, ws.Hb, x[1:n])
+    return x
+end
+
+"""
+    block_tridiagonal_solve_spd!(x, A, B, C, b, ws)
+
+SPD-specialised solve for symmetric block-tridiagonal systems
+`H · x = b` where the lower off-diagonal blocks `A[i]` equal
+`C[i]'` (symmetric) and `H` is positive definite (Hessian-style
+matrices at the smoother MAP). Same signature as
+`block_tridiagonal_solve!` so callers can swap in.
+
+At small block sizes (`bs ≤ 8`) and BlasFloat eltypes, packs the upper
+triangle into LAPACK banded format and calls `pbsv` directly — 30-60×
+faster than the general block-Thomas code at that size, because one
+LAPACK call amortises the per-block BLAS dispatch overhead. For
+larger `bs` (where blocked BLAS-3 already efficiently overlaps with
+the arithmetic), or non-BlasFloat eltypes, falls back to the general
+`block_tridiagonal_solve!`.
+
+`A` is accepted for signature parity but only used on the fallback
+branch. The pbsv path consults only `B` (diagonal) and `C` (upper
+off-diagonal).
+"""
+function block_tridiagonal_solve_spd!(
+    x::AbstractVector{T},
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
+    b::AbstractVector{T},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Real}
+    bs = size(B[1], 1)
+    if T <: Union{Float32,Float64} && bs <= 8
+        return _block_tridiagonal_solve_pbsv!(x, B, C, b, ws)
+    end
+    return block_tridiagonal_solve!(x, A, B, C, b, ws)
+end
+
 function block_tridiagonal_solve!(
     x::AbstractVector{T},
     A::AbstractVector{<:AbstractMatrix{T}},

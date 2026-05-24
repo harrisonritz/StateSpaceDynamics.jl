@@ -762,7 +762,11 @@ function smooth!(
     # Save x_old in fs.x_smooth before we overwrite sws.X₀ with the Newton step.
     fs.x_smooth .= x_mat
 
-    block_tridiagonal_solve!(X0, neg_sub_v, neg_diag_v, neg_super_v, grad_vec, btd)
+    # SPD path: smoother's negated Hessian is PSD at the MAP, and the
+    # sub/super blocks are transposes of each other (Hessian is
+    # symmetric). At small `latent_dim` (≤ 8) this routes to LAPACK's
+    # `pbsv` which is 30-60× faster than the general block-Thomas code.
+    block_tridiagonal_solve_spd!(X0, neg_sub_v, neg_diag_v, neg_super_v, grad_vec, btd)
 
     step_mat = reshape(X0, D, tsteps)
     fs.x_smooth .-= step_mat

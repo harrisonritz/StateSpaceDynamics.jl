@@ -1161,7 +1161,11 @@ function smooth!(
             gvec = vec(gcur)
             pvec = vec(pcur)
             copyto!(pvec, gvec)
-            block_tridiagonal_solve!(pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd)
+            # Negated Hessian is SPD at the MAP — use the SPD-specialised
+            # solve so small `latent_dim` (≤ 8) routes to LAPACK `pbsv`.
+            block_tridiagonal_solve_spd!(
+                pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd
+            )
             return nothing
         end
 
