@@ -56,6 +56,22 @@ function backtracking!(
         ϕx1 = ϕ!()
     end
 
+    # Bail if phase 1 couldn't get to a finite ϕ in `max_halvings` halvings.
+    # Falling through into phase 2 with `ϕx1` non-finite poisons the cubic /
+    # quadratic interpolation (`NaN - ϕ0 = NaN` in the denominator), which
+    # produces `αtmp = NaN`, which then writes `NaN` to every entry of `x`
+    # via `@. x = x + α2*p`. The Poisson smoother trips on this on the very
+    # first Newton step from `x = 0` when the Hessian gives a large-norm
+    # direction that drives `Cx + d` into the `exp` overflow regime —
+    # halving α doesn't help because `||p||` is already huge.
+    # Revert the most recent step and return zero progress; the outer
+    # Newton loop's `α * norm(p) < tol` check handles termination from
+    # here.
+    if !isfinite(ϕx1)
+        @. x = x - α2*p
+        return zero(T), ϕ0
+    end
+
     # phase 2: interpolation
     for k in 1:ls.max_iters
         if armijo_ok(sense, ϕx1, ϕ0, α2, dϕ0, ls.c1)
