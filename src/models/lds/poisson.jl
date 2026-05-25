@@ -1141,27 +1141,6 @@ function smooth!(
         copyto!(x, fs.E_z)
     end
 
-    # DIAGNOSTIC (Poisson PosDef CI flake, 2026-05-24): distinguish "Newton
-    # diverged from a finite start" vs "upstream already pushed NaN into
-    # `fs.x_smooth` / `fs.E_z`". If THIS fires, the bug is in the prior
-    # E-step or M-step parameter update — not in newton_smooth! itself.
-    # Also dump model parameters so we can tell whether `A`/`Q`/etc. went
-    # NaN in the M-step.
-    if !all(isfinite, x)
-        msg = "Poisson smooth!: non-finite `x` BEFORE newton_smooth! " *
-              "(size=$(size(x)), n_nonfinite=$(count(!isfinite, x))). " *
-              "Came from $(all(fs.E_z .== 0) ? "x0/A-rollout" : "fs.E_z (previous E-step)"). " *
-              "Param check: " *
-              "A=$(all(isfinite, lds.state_model.A))  " *
-              "b=$(all(isfinite, lds.state_model.b))  " *
-              "Q=$(all(isfinite, lds.state_model.Q))  " *
-              "x0=$(all(isfinite, lds.state_model.x0))  " *
-              "P0=$(all(isfinite, lds.state_model.P0))  " *
-              "C=$(all(isfinite, lds.obs_model.C))  " *
-              "d=$(all(isfinite, lds.obs_model.d))"
-        error(msg)
-    end
-
     # Active-length views into (possibly) oversized workspace buffers.
     X0 = view(sws.X₀, 1:n_active)
     grad_active = view(sws.grad_buf, :, 1:tsteps)
@@ -1213,26 +1192,8 @@ function smooth!(
         tol=tol,
     )
 
-    # DIAGNOSTIC (Poisson PosDef CI flake, 2026-05-24): pin down where NaN
-    # first appears on the failing Linux+OpenBLAS run. `Symmetrize!` below
-    # writes NaN to both off-diagonals if the BT inverse produced NaN, then
-    # the aggregator's `PDMat(copy(S0_sum))` reports the misleading
-    # "matrix is not Hermitian" (Julia's `ishermitian` returns `false`
-    # because `NaN != NaN` per IEEE). Catch it at the source instead.
-    if !all(isfinite, x)
-        error("Poisson smooth!: non-finite latent `x` after newton_smooth! " *
-              "(size=$(size(x)), n_nonfinite=$(count(!isfinite, x)))")
-    end
-
     _fill_hessian_blocks_poisson!(sws, lds, x)
     _negate_blocks!(btd, tsteps)
-
-    # `neg_diag` / `neg_sub` are `Vector{Matrix}` — fold element-wise.
-    if !all(M -> all(isfinite, M), btd.neg_diag) ||
-       !all(M -> all(isfinite, M), btd.neg_sub)
-        error("Poisson smooth!: non-finite Hessian blocks after " *
-              "_fill_hessian_blocks_poisson!/_negate_blocks!")
-    end
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
         fs.p_smooth, fs.p_smooth_tt1, neg_sub_v, neg_diag_v, neg_super_v, btd
@@ -1240,14 +1201,10 @@ function smooth!(
 
     fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
 
-    if !all(isfinite, fs.p_smooth) || !all(isfinite, fs.p_smooth_tt1)
-        error("Poisson smooth!: non-finite p_smooth from " *
-              "block_tridiagonal_inverse_logdet! " *
-              "(logdet_precision=$logdet_precision, " *
-              "p_smooth nonfinite=$(count(!isfinite, fs.p_smooth)), " *
-              "p_smooth_tt1 nonfinite=$(count(!isfinite, fs.p_smooth_tt1)))")
-    end
-
+    # `block_tridiagonal_inverse_logdet!` blocks are symmetric in exact
+    # arithmetic but carry ~1e-12 asymmetry from the forward/back sweeps;
+    # matches `gaussian.jl:780`. Without this, the aggregator's
+    # `PDMat(copy(S0_sum))` can trip `ishermitian` downstream.
     @views for i in 1:tsteps
         Symmetrize!(fs.p_smooth[:, :, i])
     end
