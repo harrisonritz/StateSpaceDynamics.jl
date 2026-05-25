@@ -99,6 +99,14 @@ function backtracking!(
         αtmp = min(αtmp, α2*ls.ρ_hi)
         αtmp = max(αtmp, α2*ls.ρ_lo)
 
+        # If the interpolation itself produced a non-finite trial step
+        # (e.g. `ϕx1` was already NaN from a previous overflow), bail out
+        # before we write `NaN*p` into `x`.
+        if !isfinite(αtmp)
+            @. x = x - α2*p
+            return zero(T), ϕ0
+        end
+
         # update step: revert old α2, apply αtmp
         @. x = x - α2*p
         α1 = α2
@@ -106,6 +114,15 @@ function backtracking!(
         @. x = x + α2*p
 
         ϕx0, ϕx1 = ϕx1, ϕ!()
+
+        # Defensive: phase 2 can land at a point where `ϕ!()` overflows
+        # even with a smaller step than phase 1 chose, because the cubic /
+        # quadratic interpolation extrapolates rather than purely shrinking
+        # α. Treat this the same as phase 1 max_halvings — revert and bail.
+        if !isfinite(ϕx1)
+            @. x = x - α2*p
+            return zero(T), ϕ0
+        end
     end
 
     # if we get here, return best we have (or throw)
