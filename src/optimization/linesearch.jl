@@ -26,6 +26,16 @@ In-place backtracking along direction `p` from current `x`.
 - `ϕ!()` must return ϕ(x) using current `x` (and should be allocation-free).
 Returns (α, ϕ_new).
 """
+# Improvement check in the sense direction (max wants ϕ > ϕ0; min wants ϕ < ϕ0).
+# Strict comparison so a step that doesn't change ϕ at all doesn't count as
+# "progress" — it just wastes Newton's budget.
+@inline function _improves(::Val{:max}, ϕ, ϕ0)
+    return isfinite(ϕ) && ϕ > ϕ0
+end
+@inline function _improves(::Val{:min}, ϕ, ϕ0)
+    return isfinite(ϕ) && ϕ < ϕ0
+end
+
 function backtracking!(
     sense::Val,
     ls::BackTrackingLS{T},
@@ -45,9 +55,15 @@ function backtracking!(
     ϕx0 = ϕ0
     ϕx1 = ϕ!()
 
-    # phase 1: ensure finite
+    # Phase 1: halve α until ϕ is *finite and monotone* (improves on ϕ0).
+    # `dϕ0 = g·p` is the directional derivative — if Newton handed us an
+    # ascent/descent direction, calculus guarantees small-enough α gives
+    # `ϕ > ϕ0` (max) / `ϕ < ϕ0` (min). The original loop only checked for
+    # finiteness, which let phase 2 start from a non-monotone foothold;
+    # then if phase 2's interpolation overshot back into the exp-overflow
+    # regime and bailed, the outer Newton step regressed.
     h = 0
-    while !isfinite(ϕx1) && h < ls.max_halvings
+    while h < ls.max_halvings && !_improves(sense, ϕx1, ϕ0)
         h += 1
         @. x = x - α2*p     # revert
         α1 = α2
@@ -56,21 +72,21 @@ function backtracking!(
         ϕx1 = ϕ!()
     end
 
-    # Bail if phase 1 couldn't get to a finite ϕ in `max_halvings` halvings.
-    # Falling through into phase 2 with `ϕx1` non-finite poisons the cubic /
-    # quadratic interpolation (`NaN - ϕ0 = NaN` in the denominator), which
-    # produces `αtmp = NaN`, which then writes `NaN` to every entry of `x`
-    # via `@. x = x + α2*p`. The Poisson smoother trips on this on the very
-    # first Newton step from `x = 0` when the Hessian gives a large-norm
-    # direction that drives `Cx + d` into the `exp` overflow regime —
-    # halving α doesn't help because `||p||` is already huge.
-    # Revert the most recent step and return zero progress; the outer
-    # Newton loop's `α * norm(p) < tol` check handles termination from
-    # here.
-    if !isfinite(ϕx1)
+    # Phase 1 couldn't find any monotone finite step — direction is bad
+    # (orthogonal-to-gradient roundoff, or `||p||` so huge that even
+    # `α = 2^-max_halvings · ||p||` lands at an overflow). Revert to
+    # `x_start` and return zero progress; Newton's outer `α*||p|| < tol`
+    # check handles termination from here.
+    if !_improves(sense, ϕx1, ϕ0)
         @. x = x - α2*p
         return zero(T), ϕ0
     end
+
+    # Track the best step found so we can fall back to it if phase 2's
+    # interpolation lands at a non-finite point. `α_best` always satisfies
+    # the improvement check.
+    α_best = α2
+    ϕ_best = ϕx1
 
     # phase 2: interpolation
     for k in 1:ls.max_iters
@@ -99,12 +115,13 @@ function backtracking!(
         αtmp = min(αtmp, α2*ls.ρ_hi)
         αtmp = max(αtmp, α2*ls.ρ_lo)
 
-        # If the interpolation itself produced a non-finite trial step
-        # (e.g. `ϕx1` was already NaN from a previous overflow), bail out
-        # before we write `NaN*p` into `x`.
+        # Interp itself produced a non-finite trial step (typically from a
+        # zero / NaN denominator). Fall back to the best monotone step
+        # found so far — phase 1 guaranteed this exists.
         if !isfinite(αtmp)
             @. x = x - α2*p
-            return zero(T), ϕ0
+            @. x = x + α_best*p
+            return α_best, ϕ_best
         end
 
         # update step: revert old α2, apply αtmp
@@ -115,16 +132,25 @@ function backtracking!(
 
         ϕx0, ϕx1 = ϕx1, ϕ!()
 
-        # Defensive: phase 2 can land at a point where `ϕ!()` overflows
-        # even with a smaller step than phase 1 chose, because the cubic /
-        # quadratic interpolation extrapolates rather than purely shrinking
-        # α. Treat this the same as phase 1 max_halvings — revert and bail.
+        # Phase 2 landed at a point where `ϕ!()` overflows even though α
+        # shrank (cubic interpolation can pick the upper safeguard
+        # `α2*ρ_hi`, leaving α only halved — borderline overflow inputs can
+        # still tip). Fall back to the best monotone step.
         if !isfinite(ϕx1)
             @. x = x - α2*p
-            return zero(T), ϕ0
+            @. x = x + α_best*p
+            return α_best, ϕ_best
+        end
+
+        # Track the best monotone step seen so far for potential fallback.
+        if _improves(sense, ϕx1, ϕ_best)
+            α_best = α2
+            ϕ_best = ϕx1
         end
     end
 
-    # if we get here, return best we have (or throw)
+    # Out of phase-2 iters; return whatever we converged toward. The
+    # best-monotone fallback isn't needed here because `ϕx1` is finite by
+    # the loop invariant.
     return α2, ϕx1
 end
