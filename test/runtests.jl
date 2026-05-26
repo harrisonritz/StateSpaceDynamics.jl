@@ -239,6 +239,22 @@ include("helper_functions.jl")
             test_block_tridiagonal_inverse_logdet()
             test_block_tridiagonal_solve()
         end
+
+        @testset "Spline Inputs" begin
+            include("Utilities/SplineInputs.jl")
+            test_spline_inputs_shape_and_kron_structure()
+            test_spline_inputs_partition_of_unity()
+            test_spline_inputs_default_trial_pred_broadcasts_across_trials()
+            test_spline_inputs_target_d()
+            test_spline_inputs_penalty_nullspace()
+            test_difference_matrix_nullspace()
+            test_spline_inputs_size_mismatch_throws()
+            test_spline_inputs_trial_pred_row_mismatch_throws()
+            test_spline_inputs_manual_knots()
+            test_spline_inputs_manual_knots_wrong_length_throws()
+            test_spline_inputs_float32_type_preservation()
+            test_spline_inputs_invalid_args()
+        end
     end
 
     # Validation Tests

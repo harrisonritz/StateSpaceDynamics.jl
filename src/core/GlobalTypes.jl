@@ -99,5 +99,6 @@ Base.@kwdef struct Data{T<:Real}
     y::Array{T,3}
     u::Array{T,3}
     d::Array{T,3}
+    trial_pred::Matrix{T} = Matrix{T}(undef, 0, 0)
 end
 
