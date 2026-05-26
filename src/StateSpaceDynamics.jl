@@ -3,6 +3,7 @@ module StateSpaceDynamics
 import HiddenMarkovModels as HMMs
 
 using ArrayLayouts
+using BSplines
 using Distributions
 using ForwardDiff
 using LinearAlgebra
@@ -42,6 +43,7 @@ include("models/lds/SLDS.jl")
 
 # Algorithms
 include("algorithms/Preprocessing.jl")
+include("algorithms/SplineInputs.jl")
 include("algorithms/Valid.jl")
 
 # Errors/Exceptions/Validations
@@ -62,6 +64,7 @@ export valid_Σ, gaussian_entropy
 export random_rotation_matrix
 export print_full
 export info_update!
+export generate_spline_inputs!
 
 # Common functions
 export rand, smooth, fit!, loglikelihood, filter_loglikelihood
