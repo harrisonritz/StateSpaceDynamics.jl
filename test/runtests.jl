@@ -255,6 +255,21 @@ include("helper_functions.jl")
             test_spline_inputs_float32_type_preservation()
             test_spline_inputs_invalid_args()
         end
+
+        @testset "Null Models" begin
+            include("Utilities/NullModels.jl")
+            test_null_intercept_matches_mvnormal_loglik()
+            test_null_test_ll_matches_plugin_gaussian()
+            test_null_inputs_collapses_to_intercept_when_no_inputs()
+            test_null_inputs_helps_when_signal_present()
+            test_null_var_recovers_true_F_on_var_data()
+            test_null_R_prior_shifts_LL_by_iw_logprior_term()
+            test_null_inputs_override_uses_supplied_array()
+            test_null_var_requires_tsteps_ge_2()
+            test_null_input_shape_mismatch_throws()
+            test_null_test_data_obs_dim_mismatch_throws()
+            test_null_capacity_ordering_on_var_data()
+        end
     end
 
     # Validation Tests

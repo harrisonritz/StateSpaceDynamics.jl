@@ -45,6 +45,7 @@ include("models/lds/SLDS.jl")
 include("algorithms/Preprocessing.jl")
 include("algorithms/SplineInputs.jl")
 include("algorithms/Valid.jl")
+include("algorithms/NullModels.jl")
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
@@ -68,5 +69,8 @@ export generate_spline_inputs!
 
 # Common functions
 export rand, smooth, fit!, loglikelihood, filter_loglikelihood
+
+# Baseline / null model log-likelihoods
+export test_null
 
 end
