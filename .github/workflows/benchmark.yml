@@ -88,7 +88,7 @@ jobs:
                     )
 
                     # Generate data
-                    _, y = rand(rng, model; tsteps=T, ntrials=1)
+                    _, y = rand(rng, model, T)
 
                     SUITE["GaussianLDS"]["smooth", "latent=$latent_dim", "obs=$obs_dim", "T=$T"] =
                         @benchmarkable smooth($model, $y) samples=10 seconds=5
@@ -121,7 +121,7 @@ jobs:
                         fit_bool=fill(true, 5)
                     )
 
-                    _, y = rand(rng, model; tsteps=T, ntrials=1)
+                    _, y = rand(rng, model, T)
 
                     SUITE["PoissonLDS"]["smooth", "latent=$latent_dim", "obs=$obs_dim", "T=$T"] =
                         @benchmarkable smooth($model, $y) samples=10 seconds=5
