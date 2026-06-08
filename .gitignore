@@ -11,7 +11,11 @@ test/*/notebooks
 # Documentation
 docs/build/
 docs/Manifest.toml
+# Literate-generated tutorials.
+docs/src/tutorials/
 test/*/notebooks
+# SSDTest is dev'd in from libs/ at the start of every Pkg.test() run.
+test/Manifest.toml
 
 # Julia-specific files
 Manifest.toml
@@ -36,3 +40,6 @@ benchmarking/benchmark.jl.claude/worktrees/
 /.claude
 /benchmarking/results
 CLAUDE.md
+
+# Local profiling sandbox (never committed)
+/dev/

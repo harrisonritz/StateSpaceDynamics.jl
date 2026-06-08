@@ -8,6 +8,7 @@ DocMeta.setdocmeta!(StateSpaceDynamics, :DocTestSetup, :(using StateSpaceDynamic
 
 # Define tutorial configurations
 tutorials = [
+    ("QuickStart.jl", "quick_start_example"),
     ("GaussianLDS.jl", "gaussian_latent_dynamics_example"),
     ("PoissonLDS.jl", "poisson_latent_dynamics_example"),
     ("LDSModelSelection.jl", "lds_model_selection_example"),
@@ -45,6 +46,7 @@ makedocs(;
             "Switching Linear Dynamical Systems" => "SLDS.md",
         ],
         "Tutorials" => [
+            "Quick Start" => "tutorials/quick_start_example.md",
             "Gaussian LDS Example" => "tutorials/gaussian_latent_dynamics_example.md",
             "Poisson LDS Example" => "tutorials/poisson_latent_dynamics_example.md",
             "LDS Model Selection Example" => "tutorials/lds_model_selection_example.md",

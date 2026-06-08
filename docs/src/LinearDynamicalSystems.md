@@ -78,10 +78,12 @@ PoissonObservationModel
 
 ## Sampling from Linear Dynamical Systems
 
-You can generate synthetic data from fitted LDS models:
+You can generate synthetic data from fitted LDS models. Pass a scalar
+`tsteps::Integer` for a single trial, or a vector of per-trial lengths
+to sample a multi-trial dataset (trial lengths may differ):
 
 ```@docs
-Random.rand(lds::LinearDynamicalSystem; tsteps::Int, ntrials::Int)
+Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem, tsteps::Integer; control_seq, obs_control_seq)
 ```
 
 ## Inference in Linear Dynamical Systems

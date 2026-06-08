@@ -2,46 +2,49 @@ module StateSpaceDynamics
 
 import HiddenMarkovModels as HMMs
 
-using ArrayLayouts
 using Distributions
-using ForwardDiff
 using LinearAlgebra
-using LineSearches
-using Optim
 using PDMats
-using ProgressMeter
 using Random
 using SparseArrays
-using SpecialFunctions
-using Statistics
+
+using Optim: Optim, optimize, LBFGS, HagerZhang
+using ProgressMeter: Progress, next!, finish!
+using SpecialFunctions: loggamma
+using Statistics: mean
 using StatsAPI: StatsAPI
-using StatsBase
-using StatsFuns
+import StatsAPI: loglikelihood, fit!
 
 using Base.Threads: @threads, @spawn
 using Base.Iterators: partition
 using Base: show
 
-# Core types and utilities
-include("core/GlobalTypes.jl")
-include("models/lds/types.jl")
-include("core/Workspaces.jl")
-include("core/Utilities.jl")
+# Model-agnostic numerical kernels (no package types — reusable primitives).
+include("numerics/linalg.jl")
+include("numerics/optimization.jl")        # line search + Newton
+include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
+include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 
-# Include optimization utilities
-include("optimization/linesearch.jl")
-include("optimization/newton.jl")
+# Model definitions + inference-state containers.
+include("priors.jl")
+include("types.jl")                         # abstract types, Data, model structs, SLDS
+include("workspaces.jl")                    # FilterSmooth / SufficientStatistics / workspaces
+include("show.jl")
+include("validation.jl")
 
-# Linear Dynamical Systems
-include("models/lds/kalman.jl")
-include("models/lds/gaussian.jl")
-include("models/lds/poisson.jl")
-include("models/lds/cov_update.jl")
-include("models/lds/SLDS.jl")
+# Shared inference machinery.
+# kalman.jl is retained for the Kalman filter + marginal likelihood (and future
+# particle-filter use); the Kalman path is no longer a selectable E-step backend.
+include("kalman.jl")
+include("sufficient_statistics.jl")
+include("dynamics.jl")                      # state-model Q-term + state M-step
 
-# Algorithms
-include("algorithms/Preprocessing.jl")
-include("algorithms/Valid.jl")
+# Observation models + composite / standalone models.
+include("gaussian.jl")
+include("poisson.jl")
+include("simulate.jl")
+include("slds.jl")
+include("preprocessing.jl")                 # PPCA (standalone model)
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
@@ -52,17 +55,17 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
-export IWPrior
+export IWPrior, MNPrior
 export CovUpdateCache
 
 # Utilities
-export fit!, block_tridgm
+export block_tridgm
 export valid_Σ, gaussian_entropy
 export random_rotation_matrix
 export print_full
 export info_update!
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, filter_loglikelihood
+export rand, smooth, fit!, loglikelihood
 
 end

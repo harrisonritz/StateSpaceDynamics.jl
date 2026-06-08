@@ -30,10 +30,10 @@ function _make_poisson_lds(latent_dim::Int, obs_dim::Int)
     P0 = Matrix(1.0 * I(latent_dim))
 
     C = zeros(obs_dim, latent_dim)
-    log_d = zeros(obs_dim)
+    d = zeros(obs_dim)
 
     gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
-    pom = PoissonObservationModel(; C=C, log_d=log_d)
+    pom = PoissonObservationModel(; C=C, d=d)
     return LinearDynamicalSystem(;
         state_model=gsm,
         obs_model=pom,
@@ -1029,16 +1029,26 @@ function test_weighted_update_initial_state_mean()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
         lds_k.fit_bool[1] = true
 
-        # Create weights for this LDS
+        # Per-trial weight slice for this regime.
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_initial_state_mean!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_initial_state_mean!(lds_k, suf)
 
-        # Check result is finite
         @test all(isfinite.(lds_k.state_model.x0))
     end
 end
@@ -1087,16 +1097,25 @@ function test_weighted_update_A_b()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
         lds_k.fit_bool[3] = true
 
-        # Create weights for this LDS
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_A_b!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
 
-        # Check results are finite and correct size
         @test all(isfinite.(lds_k.state_model.A))
         @test all(isfinite.(lds_k.state_model.b))
         @test size(lds_k.state_model.A) == (latent_dim, latent_dim)
@@ -1148,20 +1167,30 @@ function test_weighted_update_Q()
     end
     tfs = StateSpaceDynamics.TrialFilterSmooth(tfs_array)
 
+    tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
+    sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
+        lds_k.fit_bool[3] = true   # A&b must be fitted for Q's residual scatter to be meaningful
         lds_k.fit_bool[4] = true
 
-        # Create weights for this LDS
         w_k = [w[trial][active_k, :] for trial in 1:ntrials]
 
-        StateSpaceDynamics.update_Q!(lds_k, tfs, w_k)
+        suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
+            Float64, lds_k, tsteps_per_trial
+        )
+        StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
+            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+        )
+        StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
+        StateSpaceDynamics.update_Q!(lds_k, suf, sws)
 
-        # Check results are finite, symmetric, and PSD
         @test all(isfinite.(lds_k.state_model.Q))
         @test isapprox(lds_k.state_model.Q, lds_k.state_model.Q', atol=1e-10)
 
-        # Check positive semi-definite
         eigvals_Q = eigvals(lds_k.state_model.Q)
         @test all(eigvals_Q .>= -1e-10)
     end
@@ -1263,8 +1292,9 @@ function test_SLDS_gradient_numerical_poisson()
             x0_k = lds_k.state_model.x0
             P0_k = lds_k.state_model.P0
             C_k = lds_k.obs_model.C
-            log_d_k = lds_k.obs_model.log_d
-            d_k = exp.(log_d_k)
+            d_k = lds_k.obs_model.d
+            # Canonical Poisson: λ = exp(C x + d). Previous version had
+            # `d_k = exp.(d_k)` mirroring the (now-fixed) double-exp.
 
             # Precompute inverses
             inv_P0 = inv(P0_k)
@@ -1429,7 +1459,7 @@ function test_SLDS_mstep_updates_parameters_poisson()
 
     for k in 1:K
         @test all(isfinite, slds.LDSs[k].obs_model.C)
-        @test all(isfinite, slds.LDSs[k].obs_model.log_d)
+        @test all(isfinite, slds.LDSs[k].obs_model.d)
     end
 end
 
@@ -1507,26 +1537,23 @@ function test_SLDS_poisson_count_validation()
     @test all(all(abs.(yn .- round.(yn)) .< 1e-10) for yn in y)
 end
 
-function test_SLDS_poisson_log_d_interpretation()
-    # Test that d correctly controls firing rates via the log link function
+function test_SLDS_poisson_d_interpretation()
+    # Verify the canonical Poisson GLM: λ = exp(C x + d). With C ≡ 0, the
+    # observed rates should equal exp(d) directly.
     K = 1
     latent_dim = 2
     obs_dim = 3
 
-    # Create LDS with specific log_d values
     lds = _make_poisson_lds(latent_dim, obs_dim)
-    lds.obs_model.log_d .= log.([1.0, 2.0, 3.0])  # This gives d = [1, 2, 3]
-    lds.obs_model.C .= 0.0  # No latent influence
+    lds.obs_model.d .= log.([1.0, 2.0, 3.0])  # log-rates: rate = exp(d) = [1, 2, 3]
+    lds.obs_model.C .= 0.0                    # no latent influence
 
     slds = SLDS(; A=reshape([1.0], 1, 1), πₖ=[1.0], LDSs=[lds])
 
     tsteps, ntrials = 1000, 1
     z, x, y = rand(slds, fill(tsteps, ntrials))
 
-    # The rate λ = exp(C*x + d) = exp(0 + d) = exp(d) when C=0
-    d_values = exp.(lds.obs_model.log_d)  # [1, 2, 3]
-    expected_rates = exp.(d_values)        # [e^1, e^2, e^3]
-
+    expected_rates = exp.(lds.obs_model.d)    # [1, 2, 3]
     mean_rates = vec(mean(y[1]; dims=2))
 
     for i in 1:obs_dim

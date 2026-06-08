@@ -109,10 +109,10 @@ jobs:
                     P0 = Matrix(0.1 * I, latent_dim, latent_dim)
 
                     C = abs.(randn(rng, obs_dim, latent_dim))
-                    log_d = log.(fill(0.1, obs_dim))
+                    d = log.(fill(0.1, obs_dim))
 
                     state_model = GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0)
-                    obs_model = PoissonObservationModel(C=C, log_d=log_d)
+                    obs_model = PoissonObservationModel(C=C, d=d)
                     model = LinearDynamicalSystem(
                         state_model=state_model,
                         obs_model=obs_model,
