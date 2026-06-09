@@ -43,6 +43,55 @@ function _make_poisson_lds(latent_dim::Int, obs_dim::Int)
     )
 end
 
+# Dense variants with non-zero C and d so the emission terms in the
+# gradient/Hessian are actually exercised (the plain `_make_*` helpers use
+# C = 0, which zeroes out every emission contribution).
+function _make_gaussian_lds_dense(latent_dim::Int, obs_dim::Int; seed::Int=0)
+    rng = MersenneTwister(seed)
+    A = 0.5 * rand(rng, latent_dim, latent_dim)
+    Q = Matrix(0.1 * I(latent_dim))
+    b = 0.1 * randn(rng, latent_dim)
+    x0 = 0.1 * randn(rng, latent_dim)
+    P0 = Matrix(1.0 * I(latent_dim))
+
+    C = 0.3 * randn(rng, obs_dim, latent_dim)
+    R = Matrix(1.0 * I(obs_dim))
+    d = 0.1 * randn(rng, obs_dim)
+
+    gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
+    gom = GaussianObservationModel(; C=C, R=R, d=d)
+    return LinearDynamicalSystem(;
+        state_model=gsm,
+        obs_model=gom,
+        latent_dim=latent_dim,
+        obs_dim=obs_dim,
+        fit_bool=fill(true, 6),
+    )
+end
+
+function _make_poisson_lds_dense(latent_dim::Int, obs_dim::Int; seed::Int=0)
+    rng = MersenneTwister(seed)
+    A = 0.5 * rand(rng, latent_dim, latent_dim)
+    Q = Matrix(0.1 * I(latent_dim))
+    b = 0.1 * randn(rng, latent_dim)
+    x0 = 0.1 * randn(rng, latent_dim)
+    P0 = Matrix(1.0 * I(latent_dim))
+
+    # Small C/d keep λ = exp(C x + d) modest so the Poisson terms stay finite.
+    C = 0.2 * randn(rng, obs_dim, latent_dim)
+    d = 0.1 * randn(rng, obs_dim)
+
+    gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
+    pom = PoissonObservationModel(; C=C, d=d)
+    return LinearDynamicalSystem(;
+        state_model=gsm,
+        obs_model=pom,
+        latent_dim=latent_dim,
+        obs_dim=obs_dim,
+        fit_bool=fill(true, 6),
+    )
+end
+
 # Simple probability vector / row-stochastic makers
 _probvec(K) = fill(1.0 / K, K)
 function _rowstochastic(K)
@@ -339,6 +388,30 @@ function test_SLDS_minimal_dimensions()
     @test all(all(isfinite, yn) for yn in y)
 end
 
+function test_SLDS_rand_integer_overload()
+    K = 2
+    latent_dim, obs_dim, tsteps = 2, 3, 15
+    lds = _make_gaussian_lds(latent_dim, obs_dim)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
+
+    # Single-Integer overload returns one trial as bare arrays (not vectors-of).
+    z, x, y = rand(slds, tsteps)
+    @test z isa Vector{Int}
+    @test length(z) == tsteps
+    @test size(x) == (latent_dim, tsteps)
+    @test size(y) == (obs_dim, tsteps)
+    @test all(isfinite, x)
+    @test all(isfinite, y)
+    @test all(1 .<= z .<= K)
+
+    # Explicit-RNG single-Integer overload is reproducible.
+    z1, x1, y1 = rand(MersenneTwister(123), slds, tsteps)
+    z2, x2, y2 = rand(MersenneTwister(123), slds, tsteps)
+    @test z1 == z2
+    @test x1 ≈ x2
+    @test y1 ≈ y2
+end
+
 function test_valid_SLDS_probability_helper_functions()
     # Test probability vector validation
     @test validate_probvec([0.3, 0.7]) === nothing
@@ -475,6 +548,163 @@ function test_SLDS_hessian_numerical()
     Hv_num = Hnum * v
 
     @test isapprox(Hv_blocks, Hv_num; rtol=1e-5, atol=1e-5)
+end
+
+function test_SLDS_gradient_single_timestep_gaussian()
+    K = 2
+    lds = _make_gaussian_lds_dense(2, 3; seed=11)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
+
+    # Single time step exercises the `Tsteps == 1` early-return branch.
+    z, x, y = rand(MersenneTwister(1), slds, fill(1, 1))
+    tsteps = size(y[1], 2)
+    @test tsteps == 1
+    w = rand(MersenneTwister(2), K, tsteps)
+    w ./= sum(w; dims=1)
+
+    y_trial = y[1]
+    x_trial = x[1]
+
+    grad_analytical = _slds_gradient(slds, y_trial, x_trial, w)
+
+    function weighted_ll(x_flat)
+        x_mat = reshape(x_flat, size(x_trial))
+        ll = 0.0
+        for k in 1:K
+            lds_k = slds.LDSs[k]
+            x0_k, P0_k = lds_k.state_model.x0, lds_k.state_model.P0
+            C_k, R_k, d_k = lds_k.obs_model.C, lds_k.obs_model.R, lds_k.obs_model.d
+            R_chol = cholesky(Symmetric(R_k)).U
+            P0_chol = cholesky(Symmetric(P0_k)).U
+
+            dx0 = x_mat[:, 1] - x0_k
+            ll += w[k, 1] * (-0.5 * sum(abs2, P0_chol \ dx0))
+
+            dy = y_trial[:, 1] - (C_k * x_mat[:, 1] + d_k)
+            ll += w[k, 1] * (-0.5 * sum(abs2, R_chol \ dy))
+        end
+        return ll
+    end
+
+    grad_numerical = reshape(ForwardDiff.gradient(weighted_ll, vec(x_trial)), size(x_trial))
+    @test isapprox(grad_analytical, grad_numerical, rtol=1e-5, atol=1e-5)
+end
+
+function test_SLDS_gradient_single_timestep_poisson()
+    K = 2
+    lds = _make_poisson_lds_dense(2, 3; seed=12)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
+
+    z, x, y = rand(MersenneTwister(3), slds, fill(1, 1))
+    tsteps = size(y[1], 2)
+    @test tsteps == 1
+    w = rand(MersenneTwister(4), K, tsteps)
+    w ./= sum(w; dims=1)
+
+    y_trial = y[1]
+    x_trial = x[1]
+
+    grad_analytical = _slds_gradient(slds, y_trial, x_trial, w)
+
+    function weighted_ll(x_flat)
+        x_mat = reshape(x_flat, size(x_trial))
+        ll = 0.0
+        for k in 1:K
+            lds_k = slds.LDSs[k]
+            x0_k, P0_k = lds_k.state_model.x0, lds_k.state_model.P0
+            C_k, d_k = lds_k.obs_model.C, lds_k.obs_model.d
+            inv_P0 = inv(P0_k)
+
+            dx0 = x_mat[:, 1] - x0_k
+            ll += w[k, 1] * (-0.5 * dot(dx0, inv_P0 * dx0))
+
+            obs_mean = C_k * x_mat[:, 1] .+ d_k
+            ll += w[k, 1] * (dot(y_trial[:, 1], obs_mean) - sum(exp, obs_mean))
+        end
+        return ll
+    end
+
+    grad_numerical = reshape(ForwardDiff.gradient(weighted_ll, vec(x_trial)), size(x_trial))
+    @test isapprox(grad_analytical, grad_numerical, rtol=1e-5, atol=1e-5)
+end
+
+function test_SLDS_hessian_single_timestep_gaussian()
+    K = 2
+    lds = _make_gaussian_lds_dense(2, 3; seed=13)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
+
+    _, x, y = rand(MersenneTwister(5), slds, fill(1, 1))
+    tsteps = size(y[1], 2)
+    @test tsteps == 1
+    w = rand(MersenneTwister(6), K, tsteps)
+    w ./= sum(w; dims=1)
+
+    y_trial = y[1]
+    x_trial = x[1]
+
+    H_diag, H_super, H_sub = _slds_hessian_blocks(slds, y_trial, x_trial, w)
+    @test length(H_super) == 0
+    @test length(H_sub) == 0
+
+    function weighted_ll(x_flat)
+        x_mat = reshape(x_flat, size(x_trial))
+        ll = 0.0
+        for k in 1:K
+            lds_k = slds.LDSs[k]
+            x0_k, P0_k = lds_k.state_model.x0, lds_k.state_model.P0
+            C_k, R_k, d_k = lds_k.obs_model.C, lds_k.obs_model.R, lds_k.obs_model.d
+            R_chol = cholesky(Symmetric(R_k)).U
+            P0_chol = cholesky(Symmetric(P0_k)).U
+
+            dx0 = x_mat[:, 1] - x0_k
+            ll += w[k, 1] * (-0.5 * sum(abs2, P0_chol \ dx0))
+            dy = y_trial[:, 1] - (C_k * x_mat[:, 1] + d_k)
+            ll += w[k, 1] * (-0.5 * sum(abs2, R_chol \ dy))
+        end
+        return ll
+    end
+
+    Hnum = ForwardDiff.hessian(weighted_ll, vec(x_trial))
+    @test isapprox(H_diag[1], Hnum; rtol=1e-5, atol=1e-5)
+end
+
+function test_SLDS_hessian_single_timestep_poisson()
+    K = 2
+    lds = _make_poisson_lds_dense(2, 3; seed=14)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fill(lds, K))
+
+    _, x, y = rand(MersenneTwister(7), slds, fill(1, 1))
+    tsteps = size(y[1], 2)
+    @test tsteps == 1
+    w = rand(MersenneTwister(8), K, tsteps)
+    w ./= sum(w; dims=1)
+
+    y_trial = y[1]
+    x_trial = x[1]
+
+    H_diag, H_super, H_sub = _slds_hessian_blocks(slds, y_trial, x_trial, w)
+    @test length(H_super) == 0
+    @test length(H_sub) == 0
+
+    function weighted_ll(x_flat)
+        x_mat = reshape(x_flat, size(x_trial))
+        ll = 0.0
+        for k in 1:K
+            lds_k = slds.LDSs[k]
+            x0_k, P0_k = lds_k.state_model.x0, lds_k.state_model.P0
+            C_k, d_k = lds_k.obs_model.C, lds_k.obs_model.d
+            inv_P0 = inv(P0_k)
+
+            dx0 = x_mat[:, 1] - x0_k
+            ll += w[k, 1] * (-0.5 * dot(dx0, inv_P0 * dx0))
+            obs_mean = C_k * x_mat[:, 1] .+ d_k
+            ll += w[k, 1] * (dot(y_trial[:, 1], obs_mean) - sum(exp, obs_mean))
+        end
+        return ll
+    end
+
+    Hnum = ForwardDiff.hessian(weighted_ll, vec(x_trial))
+    @test isapprox(H_diag[1], Hnum; rtol=1e-5, atol=1e-5)
 end
 
 function test_SLDS_gradient_reduces_to_single_LDS()

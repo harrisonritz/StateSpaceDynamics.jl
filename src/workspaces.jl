@@ -1189,30 +1189,3 @@ end
 function _extract_obs_params(obs_model::PoissonObservationModel{T}) where {T}
     return (C=obs_model.C, d=obs_model.d)
 end
-
-function _get_all_params_vec(
-    lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
-    state_params = _extract_state_params(lds.state_model)
-    obs_params = _extract_obs_params(lds.obs_model)
-
-    # Convert named tuples to vectors and concatenate
-    state_vec = vcat(
-        vec(state_params.A),
-        vec(state_params.B),
-        vec(state_params.Q),
-        vec(state_params.b),
-        vec(state_params.x0),
-        vec(state_params.P0),
-    )
-
-    if lds.obs_model isa GaussianObservationModel
-        obs_vec = vcat(
-            vec(obs_params.C), vec(obs_params.R), vec(obs_params.d), vec(obs_params.D)
-        )
-    else # PoissonObservationModel
-        obs_vec = vcat(vec(obs_params.C), vec(obs_params.d))
-    end
-
-    return vcat(state_vec, obs_vec)
-end

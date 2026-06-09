@@ -88,12 +88,17 @@ using SSDTest
                 test_SLDS_reproducibility()
                 test_SLDS_single_state_edge_case()
                 test_SLDS_minimal_dimensions()
+                test_SLDS_rand_integer_overload()
                 test_valid_SLDS_probability_helper_functions()
             end
 
             @testset "Gradient and Hessian" begin
                 test_SLDS_gradient_numerical()
                 test_SLDS_hessian_numerical()
+                test_SLDS_gradient_single_timestep_gaussian()
+                test_SLDS_gradient_single_timestep_poisson()
+                test_SLDS_hessian_single_timestep_gaussian()
+                test_SLDS_hessian_single_timestep_poisson()
                 test_SLDS_gradient_reduces_to_single_LDS()
                 test_SLDS_hessian_block_structure_gaussian()
                 test_SLDS_gradient_weight_normalization()

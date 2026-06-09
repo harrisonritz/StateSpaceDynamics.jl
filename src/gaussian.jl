@@ -830,46 +830,6 @@ function smooth!(
 end
 
 """
-    Q_obs!(C, d, E_z, E_zz, y)
-
-Single time-step observation component of the Q-function for
-y_t ~ 𝓝(C x_t + d, R), before applying R^{-1} and constants.
-"""
-function Q_obs!(
-    result::AbstractMatrix{T},
-    C::AbstractMatrix{T},
-    d::AbstractVector{T},
-    E_z::AbstractVector{T},
-    E_zz::AbstractMatrix{T},
-    y::AbstractVector{T},
-    buffers,
-) where {T<:Real}
-
-    # Unpack buffers
-    ytil, sum_yy, sum_yz, work1, work2 = buffers
-
-    # Residualize: ytil = y - d (pre-allocated buffer)
-    ytil .= y .- d
-
-    # All operations use pre-allocated buffers
-    mul!(sum_yy, ytil, ytil')
-
-    # Efficient outer product: sum_yz = ytil * E_z'
-    fill!(sum_yz, zero(T))
-    BLAS.ger!(one(T), ytil, E_z, sum_yz)
-
-    # Build result using buffers
-    copyto!(result, sum_yy)
-    mul!(result, C, sum_yz', -one(T), one(T))   # result -= C * sum_yz'
-    mul!(work1, sum_yz, C')                      # work1 = sum_yz * C'  
-    result .-= work1                             # result -= work1
-    mul!(work2, E_zz, C')                        # work2 = E_zz * C'
-    mul!(result, C, work2, one(T), one(T))       # result += C * work2
-
-    return result
-end
-
-"""
     Q_obs!(ws, lds, E_z, E_zz, y, v)
 
 Full observation Q-term for Gaussian LDS over all time steps with affine

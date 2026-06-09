@@ -814,37 +814,6 @@ function sample_posterior(fs::FilterSmooth{T}) where {T<:Real}
 end
 
 """
-    sample_posterior(rng::AbstractRNG, tfs::TrialFilterSmooth{T}, nsamples::Int=1) where {T<:Real}
-
-Sample trajectories from the posterior for multiple trials and compute entropies.
-
-Returns:
-- samples: array of size (latent_dim, tsteps, ntrials, nsamples)
-- entropies: matrix of size (ntrials, nsamples) containing entropy for each sample
-"""
-function sample_posterior(
-    rng::AbstractRNG, tfs::TrialFilterSmooth{T}, nsamples::Int=1
-) where {T<:Real}
-    ntrials = length(tfs.FilterSmooths)
-    latent_dim, tsteps = size(tfs[1].x_smooth)
-
-    samples = Array{T,4}(undef, latent_dim, tsteps, ntrials, nsamples)
-    entropies = Matrix{T}(undef, ntrials, nsamples)
-
-    for trial in 1:ntrials
-        for s in 1:nsamples
-            samples[:, :, trial, s], entropies[trial, s] = sample_posterior(rng, tfs[trial])
-        end
-    end
-
-    return samples, entropies
-end
-
-function sample_posterior(tfs::TrialFilterSmooth{T}, nsamples::Int=1) where {T<:Real}
-    return sample_posterior(Random.GLOBAL_RNG, tfs, nsamples)
-end
-
-"""
     estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; obs_seq, ctrl_seq, seq_ends)
 
 E-step for SLDS using a single sample from the continuous posterior.
