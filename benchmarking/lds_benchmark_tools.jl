@@ -28,7 +28,6 @@ function build_model(::SSD_LDSImplem, instance::LDSInstance, params::LDSParams)
             latent_dim=latent_dim,
             obs_dim=obs_dim,
             fit_bool=fill(true, 6),
-            kalman_filter=true,
             )
 
     return glds
