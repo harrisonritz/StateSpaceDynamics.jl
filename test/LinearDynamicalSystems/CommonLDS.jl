@@ -33,7 +33,11 @@ function test_gradient_common(lds, x, y)
     for i in eachindex(y)
         f = latents -> sum(StateSpaceDynamics.joint_loglikelihood(latents, lds, y[i]))
         grad_numerical = ForwardDiff.gradient(f, x[i])
-        grad_analytical = StateSpaceDynamics.Gradient(lds, y[i], x[i])
+        ws = StateSpaceDynamics.SmoothWorkspace(
+            Float64, lds.latent_dim, lds.obs_dim, size(y[i], 2)
+        )
+        StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+        grad_analytical = copy(StateSpaceDynamics.Gradient!(ws, lds, y[i], x[i]))
         @test norm(grad_numerical - grad_analytical) < 1e-8
     end
 end
@@ -98,7 +102,11 @@ function test_smooth_common(lds, x, y)
     for i in eachindex(y)
         f = latents -> sum(StateSpaceDynamics.joint_loglikelihood(latents, lds, y[i]))
         grad_numerical = ForwardDiff.gradient(f, tfs[i].x_smooth)
-        grad_analytical = StateSpaceDynamics.Gradient(lds, y[i], tfs[i].x_smooth)
+        ws = StateSpaceDynamics.SmoothWorkspace(
+            Float64, lds.latent_dim, lds.obs_dim, size(y[i], 2)
+        )
+        StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+        grad_analytical = copy(StateSpaceDynamics.Gradient!(ws, lds, y[i], tfs[i].x_smooth))
         @test norm(grad_numerical - grad_analytical) < 1e-7
     end
 end

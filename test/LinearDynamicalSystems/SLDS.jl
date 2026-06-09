@@ -88,6 +88,33 @@ function _block_tridiag_mul(H_diag, H_super, H_sub, x::AbstractVector)
     return y
 end
 
+# The package no longer ships allocating `Gradient`/`Hessian` wrappers; these
+# tiny test helpers build a workspace and call the in-place `!` versions, then
+# copy the blocks out so the surrounding assertions are unchanged.
+function _slds_gradient(slds, y, x, w)
+    ws = StateSpaceDynamics.SLDSSmoothWorkspace(eltype(y), slds, size(y, 2))
+    StateSpaceDynamics.Gradient!(ws, slds, y, x, w)
+    return copy(ws.grad_buf)
+end
+
+function _slds_hessian_blocks(slds, y, x, w)
+    Tsteps = size(y, 2)
+    ws = StateSpaceDynamics.SLDSSmoothWorkspace(eltype(y), slds, Tsteps)
+    StateSpaceDynamics.Hessian_blocks!(ws, slds, y, x, w)
+    H_diag = [copy(ws.btd.H_diag[t]) for t in 1:Tsteps]
+    H_super = [copy(ws.btd.H_super[t]) for t in 1:(Tsteps - 1)]
+    H_sub = [copy(ws.btd.H_sub[t]) for t in 1:(Tsteps - 1)]
+    return H_diag, H_super, H_sub
+end
+
+function _lds_gradient(lds, y, x)
+    ws = StateSpaceDynamics.SmoothWorkspace(
+        eltype(y), lds.latent_dim, lds.obs_dim, size(y, 2)
+    )
+    StateSpaceDynamics.compute_smooth_constants!(ws, lds)
+    return copy(StateSpaceDynamics.Gradient!(ws, lds, y, x))
+end
+
 """
 Compute q = x' * H * x for block-tridiagonal H without building H.
 
@@ -113,7 +140,7 @@ function _block_tridiag_quadform(H_diag, H_super, H_sub, x::AbstractVector)
 end
 
 function _test_hessian_blocks_basic(slds, y_trial, x_trial, w; atol=1e-10)
-    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
+    H_diag, H_super, H_sub = _slds_hessian_blocks(slds, y_trial, x_trial, w)
 
     Tsteps = size(y_trial, 2)
     D = slds.LDSs[1].latent_dim
@@ -343,7 +370,7 @@ function test_SLDS_gradient_numerical()
     x_trial = x[1]
 
     # Analytical gradient
-    grad_analytical = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w)
+    grad_analytical = _slds_gradient(slds, y_trial, x_trial, w)
 
     function weighted_ll(x_flat)
         x_mat = reshape(x_flat, size(x_trial))
@@ -409,7 +436,7 @@ function test_SLDS_hessian_numerical()
     y_trial = y[1]
     x_trial = x[1]
 
-    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y_trial, x_trial, w)
+    H_diag, H_super, H_sub = _slds_hessian_blocks(slds, y_trial, x_trial, w)
 
     function weighted_ll(x_flat)
         x_mat = reshape(x_flat, size(x_trial))
@@ -465,8 +492,8 @@ function test_SLDS_gradient_reduces_to_single_LDS()
         w = zeros(K, tsteps)
         w[active_k, :] .= 1.0
 
-        grad_slds = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
-        grad_lds = StateSpaceDynamics.Gradient(slds.LDSs[active_k], y[1], x[1])
+        grad_slds = _slds_gradient(slds, y[1], x[1], w)
+        grad_lds = _lds_gradient(slds.LDSs[active_k], y[1], x[1])
 
         @test isapprox(grad_slds, grad_lds, rtol=1e-10)
     end
@@ -502,8 +529,8 @@ function test_SLDS_gradient_weight_normalization()
     w2 ./= sum(w2; dims=1)  # Renormalize
 
     # Gradients should be the same (weights are normalized)
-    grad1 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w1)
-    grad2 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w2)
+    grad1 = _slds_gradient(slds, y[1], x[1], w1)
+    grad2 = _slds_gradient(slds, y[1], x[1], w2)
 
     @test isapprox(grad1, grad2, rtol=1e-10)
 end
@@ -627,7 +654,7 @@ function test_SLDS_smooth_consistency_with_gradients()
     x_smooth, _ = smooth(slds, y_trial, w)
 
     # Gradient at optimum should be small
-    grad = StateSpaceDynamics.Gradient(slds, y_trial, x_smooth, w)
+    grad = _slds_gradient(slds, y_trial, x_smooth, w)
 
     @test norm(grad) < 1e-4  # Should be near zero at optimum
 end
@@ -1210,12 +1237,12 @@ function test_weighted_gradient_linearity()
     w ./= sum(w; dims=1)
 
     # Compute gradient with base weights
-    grad1 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
+    grad1 = _slds_gradient(slds, y[1], x[1], w)
 
     # Compute gradient with scaled weights (should produce same result after normalization)
     w_scaled = 2.5 * w
     w_scaled ./= sum(w_scaled; dims=1)
-    grad2 = StateSpaceDynamics.Gradient(slds, y[1], x[1], w_scaled)
+    grad2 = _slds_gradient(slds, y[1], x[1], w_scaled)
 
     # After normalization, gradients should be equal
     @test isapprox(grad1, grad2, rtol=1e-10)
@@ -1235,10 +1262,10 @@ function test_zero_weights_behavior()
     w[1, :] .= 1.0  # Only state 1 is active
 
     # This should work without errors
-    grad = StateSpaceDynamics.Gradient(slds, y[1], x[1], w)
+    grad = _slds_gradient(slds, y[1], x[1], w)
     @test all(isfinite.(grad))
 
-    H_diag, H_super, H_sub = StateSpaceDynamics.Hessian(slds, y[1], x[1], w)
+    H_diag, H_super, H_sub = _slds_hessian_blocks(slds, y[1], x[1], w)
     @test all(all(isfinite, h) for h in H_diag)
     @test all(all(isfinite, h) for h in H_super)
     @test all(all(isfinite, h) for h in H_sub)
@@ -1275,7 +1302,7 @@ function test_SLDS_gradient_numerical_poisson()
     x_trial = x[1]
 
     # Analytical gradient
-    grad_analytical = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w)
+    grad_analytical = _slds_gradient(slds, y_trial, x_trial, w)
 
     # For numerical gradient, manually compute weighted log-likelihood
     function weighted_ll(x_flat)
@@ -1578,7 +1605,7 @@ function test_SLDS_gradient_weight_normalization_poisson()
 
     # Gradient with uniform weights should equal unweighted gradient
     w_uniform = ones(K, tsteps) ./ K
-    grad_weighted = StateSpaceDynamics.Gradient(slds, y_trial, x_trial, w_uniform)
+    grad_weighted = _slds_gradient(slds, y_trial, x_trial, w_uniform)
 
     @test all(isfinite, grad_weighted)
     @test size(grad_weighted) == size(x_trial)

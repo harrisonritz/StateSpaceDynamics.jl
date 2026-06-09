@@ -24,6 +24,14 @@ function bench_one_smooth(D, p, T_t)
     _, y_multi = StateSpaceDynamics.rand(rng, lds, fill(T_t, 1))
     y = y_multi[1]
 
+    # The package dropped the allocating Gradient/Hessian wrappers; build the
+    # workspaces once and shim the old allocating API over the `!` versions.
+    grad_ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; u_dim=0, d_dim=0)
+    StateSpaceDynamics.compute_smooth_constants!(grad_ws, lds)
+    hess_ws = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, D, T_t)
+    _Gradient(lds, y, x) = copy(StateSpaceDynamics.Gradient!(grad_ws, lds, y, x))
+    _Hessian(lds, y, x) = StateSpaceDynamics.Hessian!(hess_ws, lds, y, x)
+
     # ---- Hand-rolled ----
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, [T_t])
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; u_dim=0, d_dim=0)
@@ -39,13 +47,13 @@ function bench_one_smooth(D, p, T_t)
     end
     function g!(g::Vector{Float64}, vec_x::Vector{Float64})
         x = reshape(vec_x, D, T_t)
-        grad = StateSpaceDynamics.Gradient(lds, y, x)
+        grad = _Gradient(lds, y, x)
         g .= vec(-grad)
         return g
     end
     function h!(h::SparseMatrixCSC{Float64,Int}, vec_x::Vector{Float64})
         x = reshape(vec_x, D, T_t)
-        H, _, _, _ = StateSpaceDynamics.Hessian(lds, y, x)
+        H = _Hessian(lds, y, x)
         h.nzval .= -H.nzval
         return nothing
     end
@@ -54,7 +62,7 @@ function bench_one_smooth(D, p, T_t)
     initial_f = nll(X₀)
     initial_g = similar(X₀)
     g!(initial_g, X₀)
-    _H, _, _, _ = StateSpaceDynamics.Hessian(lds, y, reshape(X₀, D, T_t))
+    _H = _Hessian(lds, y, reshape(X₀, D, T_t))
     initial_h = SparseMatrixCSC{Float64,Int}(
         _H.m, _H.n, _H.colptr, _H.rowval, zeros(length(_H.nzval))
     )

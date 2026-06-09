@@ -1320,48 +1320,6 @@ function fit!(
     end
 end
 
-function Gradient(
-    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
-    ws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
-    compute_smooth_constants!(ws, lds)
-    return copy(Gradient!(ws, lds, y, x))
-end
-
-function Gradient(
-    ws::SmoothWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    compute_smooth_constants!(ws, lds)
-    return copy(Gradient!(ws, lds, y, x))
-end
-
-function Hessian(
-    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
-    ws = SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, tsteps)
-    compute_smooth_constants!(ws, lds)
-    Hessian!(ws, lds, y, x)
-    block_tridgm!(ws.btd)
-    return copy(ws.btd.H_sparse)
-end
-
-function Hessian(
-    ws::SmoothWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    compute_smooth_constants!(ws, lds)
-    Hessian!(ws, lds, y, x)
-    block_tridgm!(ws.btd)
-    return copy(ws.btd.H_sparse)
-end
-
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},

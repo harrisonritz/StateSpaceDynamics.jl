@@ -44,7 +44,8 @@ function make_poisson_hessian(D::Int, T::Int, p::Int)
     _, y_multi = StateSpaceDynamics.rand(rng2, lds, fill(T, 1))
     y = y_multi[1]
     x = zeros(D, T)
-    H, _, _, _ = StateSpaceDynamics.Hessian(lds, y, x)
+    hess_ws = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, D, T)
+    H = StateSpaceDynamics.Hessian!(hess_ws, lds, y, x)
     return -Matrix(H)   # negate to make SPD (Hessian at MAP is neg-def for max)
 end
 

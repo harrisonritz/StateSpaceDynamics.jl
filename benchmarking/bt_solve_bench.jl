@@ -61,7 +61,8 @@ println("  t=$(round(median(b3).time / 1e6; digits=3)) ms allocs=$(b3.allocs) me
 
 # Compare to UMFPACK solve on equivalent sparse Hessian
 println("\n=== UMFPACK sparse solve (for comparison) ===")
-_H, _, _, _ = StateSpaceDynamics.Hessian(lds, y, x0_mat)
+hess_ws = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, D, T_t)
+_H = StateSpaceDynamics.Hessian!(hess_ws, lds, y, x0_mat)
 neg_H = -_H
 b4 = @benchmark $neg_H \ $g_vec
 println("  t=$(round(median(b4).time / 1e6; digits=3)) ms allocs=$(b4.allocs) mem=$(round(b4.memory/1024; digits=1)) KB")

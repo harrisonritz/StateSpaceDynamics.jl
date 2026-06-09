@@ -239,209 +239,22 @@ function loglikelihood(
 end
 
 """
-    Gradient(lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T})
+    Gradient!(ws, lds, y, x)
 
-Calculate the gradient of the log-likelihood of a Poisson Linear Dynamical System model for a single trial.
+In-place gradient of the Poisson LDS complete-data log-likelihood for a single
+trial. Mirrors the Gaussian `Gradient!`: assumes `compute_smooth_constants!(ws, lds)`
+has already populated `ws`, writes into `ws.grad_buf`, and returns the active view.
 """
-function Gradient(
+function Gradient!(
+    ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractMatrix{T},
     x::AbstractMatrix{T},
-    w::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    if w === nothing
-        w = ones(T, size(y, 2))
-    end
-
-    # Extract model parameters
-    A, Q, b = lds.state_model.A, lds.state_model.Q, lds.state_model.b
-    C, d = lds.obs_model.C, lds.obs_model.d
-    x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    # Get dimensions
     tsteps = size(y, 2)
-    latent_dim = lds.latent_dim
-    obs_dim = lds.obs_dim
-
-    # Precompute Cholesky factorizations
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    # Pre-allocate gradient
-    grad = zeros(T, latent_dim, tsteps)
-
-    # Pre-allocate ALL temporary vectors (reused across timesteps)
-    Cx_t = Vector{T}(undef, obs_dim)           # C * x[:, t]
-    exp_term = Vector{T}(undef, obs_dim)       # exp(C * x[:, t] + d)
-    innovation = Vector{T}(undef, obs_dim)     # y[:, t] - exp_term
-    common_term = Vector{T}(undef, latent_dim) # C' * innovation
-
-    # Temporary vectors for state dynamics terms
-    Ax_t = Vector{T}(undef, latent_dim)        # A * x[:, t]
-    Ax_prev = Vector{T}(undef, latent_dim)     # A * x[:, t-1]
-    state_diff = Vector{T}(undef, latent_dim)  # Various state differences
-    temp_grad = Vector{T}(undef, latent_dim)   # Temporary for accumulating gradient parts
-
-    # Calculate gradient for each time step
-    @views for t in 1:tsteps
-        # Compute observation term efficiently
-        # temp = exp.(C * x[:, t] .+ d)
-        mul!(Cx_t, C, x[:, t])                 # Cx_t = C * x[:, t]
-        for i in 1:obs_dim
-            exp_term[i] = exp(Cx_t[i] + d[i])  # exp_term = exp(C * x[:, t] + d)
-        end
-
-        # common_term = C' * (y[:, t] - temp)
-        innovation .= y[:, t] .- exp_term      # innovation = y[:, t] - exp_term
-        mul!(common_term, C', innovation)      # common_term = C' * innovation
-
-        if t == 1
-            # First time step: common_term + A' * inv_Q * (x[:, 2] - A * x[:, t]) - inv_P0 * (x[:, t] - x0)
-
-            # Compute A * x[:, t]
-            mul!(Ax_t, A, x[:, t])
-
-            # Compute x[:, 2] - A * x[:, t]
-            state_diff .= x[:, 2] .- Ax_t
-
-            # Compute Q \ (x[:, 2] - A * x[:, t])
-            copyto!(temp_grad, state_diff)
-            ldiv!(Q_chol, temp_grad)
-
-            # Compute A' * Q \ (x[:, 2] - A * x[:, t])
-            mul!(grad[:, t], A', temp_grad)
-
-            # Add common_term
-            grad[:, t] .+= common_term
-
-            # Subtract P0 \ (x[:, t] - x0)
-            state_diff .= x[:, t] .- x0
-            copyto!(temp_grad, state_diff)
-            ldiv!(P0_chol, temp_grad)
-            grad[:, t] .-= temp_grad
-
-        elseif t == tsteps
-            # Last time step: common_term - Q \ (x[:, t] - A * x[:, t-1])
-
-            # Compute A * x[:, t-1]
-            mul!(Ax_prev, A, x[:, t - 1])
-
-            # Compute x[:, t] - A * x[:, t-1]
-            state_diff .= x[:, t] .- Ax_prev
-
-            # Compute Q \ (x[:, t] - A * x[:, t-1])
-            copyto!(temp_grad, state_diff)
-            ldiv!(Q_chol, temp_grad)
-
-            # grad[:, t] = common_term - Q \ (...)
-            grad[:, t] .= common_term .- temp_grad
-
-        else
-            # Intermediate time steps:
-            # common_term + A' * Q \ (x[:, t+1] - A * x[:, t]) - Q \ (x[:, t] - A * x[:, t-1])
-
-            # First part: A' * Q \ (x[:, t+1] - A * x[:, t])
-            mul!(Ax_t, A, x[:, t])                   # Ax_t = A * x[:, t]
-            state_diff .= x[:, t + 1] .- Ax_t       # state_diff = x[:, t+1] - A * x[:, t]
-            copyto!(temp_grad, state_diff)           # temp_grad = state_diff
-            ldiv!(Q_chol, temp_grad)                 # temp_grad = Q \ state_diff
-            mul!(grad[:, t], A', temp_grad)          # grad[:, t] = A' * temp_grad
-
-            # Add common_term
-            grad[:, t] .+= common_term
-
-            # Second part: - Q \ (x[:, t] - A * x[:, t-1])
-            mul!(Ax_prev, A, x[:, t - 1])           # Ax_prev = A * x[:, t-1]
-            state_diff .= x[:, t] .- Ax_prev        # state_diff = x[:, t] - A * x[:, t-1]
-            copyto!(temp_grad, state_diff)           # temp_grad = state_diff
-            ldiv!(Q_chol, temp_grad)                 # temp_grad = Q \ state_diff
-            grad[:, t] .-= temp_grad                 # grad[:, t] -= temp_grad
-        end
-    end
-
+    grad = view(ws.grad_buf, :, 1:tsteps)
+    _compute_gradient_poisson!(grad, ws, lds, y, x)
     return grad
-end
-
-"""
-    Hessian(lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}, x::AbstractMatrix{T})
-
-Calculate the Hessian matrix of the log-likelihood for a Poisson Linear Dynamical System.
-"""
-function Hessian(
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
-    w::Union{Nothing,AbstractVector{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    if w === nothing
-        w=ones(T, size(y, 2))
-    end
-
-    # Extract model components
-    A, Q = lds.state_model.A, lds.state_model.Q
-    C, d = lds.obs_model.C, lds.obs_model.d
-    x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    # Pre-compute a few things
-    tsteps = size(y, 2)
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    # Calculate super and sub diagonals
-    H_sub_entry = Q_chol \ A
-    H_super_entry = permutedims(H_sub_entry)
-
-    # Fill the super and sub diagonals
-    H_sub = [H_sub_entry for _ in 1:(tsteps - 1)]
-    H_super = [H_super_entry for _ in 1:(tsteps - 1)]
-
-    λ = zeros(T, size(C, 1))
-    z = similar(λ)
-    poisson_tmp = Matrix{T}(undef, size(C, 2), size(C, 2))
-    H_diag = [Matrix{T}(undef, size(x, 1), size(x, 1)) for _ in 1:tsteps]
-
-    # minnimal allocation Hessian helper function
-    function calculate_poisson_hess!(out::Matrix{T}, C::Matrix{T}, λ::Vector{T}) where {T}
-        n, p = size(C)
-        for j in 1:p, i in 1:p
-            acc = zero(T)
-            for k in 1:n
-                acc += C[k, i] * λ[k] * C[k, j]
-            end
-            out[i, j] = -acc
-        end
-    end
-
-    # Pre-computed values for the Hessian
-    state_dim = size(A, 1)
-    I_mat = Matrix{T}(I, state_dim, state_dim)
-    xt_given_xt_1 = -(Q_chol \ I_mat)
-    xt1_given_xt = -A' * (Q_chol \ A)
-    x_t = -(P0_chol \ I_mat)
-
-    Q_middle = xt1_given_xt + xt_given_xt_1
-    Q_first = x_t + xt1_given_xt
-    Q_last = xt_given_xt_1
-
-    @views for t in 1:tsteps
-        mul!(z, C, x[:, t])  # z = C * x[:, t]
-        @. λ = exp(z + d)
-
-        if t == 1
-            H_diag[t] .= Q_first
-        elseif t == tsteps
-            H_diag[t] .= Q_last
-        else
-            H_diag[t] .= Q_middle
-        end
-
-        calculate_poisson_hess!(poisson_tmp, C, λ)
-        H_diag[t] .+= poisson_tmp
-    end
-
-    H = block_tridgm(H_diag, H_super, H_sub)
-
-    return H, H_diag, H_super, H_sub
 end
 
 """
