@@ -109,6 +109,22 @@ function test_smooth_common(lds, x, y)
         grad_analytical = copy(StateSpaceDynamics.Gradient!(ws, lds, y[i], tfs[i].x_smooth))
         @test norm(grad_numerical - grad_analytical) < 1e-7
     end
+
+    # The allocating `smooth` convenience wrappers (single-trial + multi-trial)
+    # should reproduce the in-place `smooth!` result: same algorithm, fresh
+    # buffers. This is the only direct coverage of those public entry points.
+    xs_multi, Ps_multi = StateSpaceDynamics.smooth(lds, y)
+    @test length(xs_multi) == length(y)
+    @test length(Ps_multi) == length(y)
+    for i in eachindex(y)
+        x_single, P_single = StateSpaceDynamics.smooth(lds, y[i])
+        @test size(x_single) == size(tfs[i].x_smooth)
+        @test size(P_single) == size(tfs[i].p_smooth)
+        @test x_single ≈ tfs[i].x_smooth
+        @test P_single ≈ tfs[i].p_smooth
+        @test xs_multi[i] ≈ tfs[i].x_smooth
+        @test Ps_multi[i] ≈ tfs[i].p_smooth
+    end
 end
 
 """
