@@ -5,13 +5,13 @@ Custom exception for dimension mismatches in model parameters.
 
 # Fields
 - `parameter::String`: Name of the parameter with incorrect dimensions
-- `expected::Union{Int,Tuple{Int,Int}}`: Expected dimension(s)
-- `got::Union{Int,Tuple{Int,Int}}`: Actual dimension(s)
+- `expected::Union{Int,Tuple{Vararg{Int}}}`: Expected dimension(s)
+- `got::Union{Int,Tuple{Vararg{Int}}}`: Actual dimension(s)
 """
 struct DimensionMismatchError <: Exception
     parameter::String
-    expected::Union{Int,Tuple{Int,Int}}
-    got::Union{Int,Tuple{Int,Int}}
+    expected::Union{Int,Tuple{Vararg{Int}}}
+    got::Union{Int,Tuple{Vararg{Int}}}
 end
 
 function Base.showerror(io::IO, e::DimensionMismatchError)

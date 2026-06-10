@@ -197,6 +197,15 @@ using SSDTest
             test_marginal_loglikelihood()
         end
 
+        @testset "Kalman-path EM (information form)" begin
+            test_kalman_fit_basic()
+            test_kalman_fit_with_inputs()
+            test_kalman_fit_with_priors()
+            test_kalman_fit_bool_combinations()
+            test_kalman_validate_inputs_errors()
+            test_kalman_marginal_loglikelihood_internals()
+        end
+
         include("LinearDynamicalSystems/PoissonLDS.jl")
         @testset "Poisson LDS" begin
             @testset "Constructors" begin
