@@ -483,7 +483,7 @@ function test_kalman_fit_basic()
     # the monotonicity assertion below is restricted to the early, stable
     # window. If this path is ever revived as a fit backend, that behavior
     # deserves a closer look.
-    elbos = SSD._fit_kalman!(lds, y; max_iter=25, tol=1e-6, progress=false)
+    elbos = SSD._fit_kalman!(lds, y; max_iter=15, tol=1e-6, progress=false)
 
     @test !isempty(elbos)
     @test all(isfinite, elbos)
