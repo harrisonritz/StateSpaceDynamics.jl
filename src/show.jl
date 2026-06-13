@@ -89,6 +89,28 @@ function Base.show(io::IO, pom::PoissonObservationModel; gap="")
     return nothing
 end
 
+function Base.show(io::IO, om::GaussianObservationModelStitched; gap="")
+    G = length(om.models)
+    println(io, gap, "Stitched Gaussian Observation Model:")
+    println(io, gap, "------------------------------------")
+    println(io, gap, " Number of groups: $G")
+    println(io, gap, " group_ids = $(om.group_ids)")
+    obs_dims = [size(m.C, 1) for m in om.models]
+    println(io, gap, " obs_dim per group = $(obs_dims)")
+    return nothing
+end
+
+function Base.show(io::IO, om::PoissonObservationModelStitched; gap="")
+    G = length(om.models)
+    println(io, gap, "Stitched Poisson Observation Model:")
+    println(io, gap, "-----------------------------------")
+    println(io, gap, " Number of groups: $G")
+    println(io, gap, " group_ids = $(om.group_ids)")
+    obs_dims = [size(m.C, 1) for m in om.models]
+    println(io, gap, " obs_dim per group = $(obs_dims)")
+    return nothing
+end
+
 function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "Linear Dynamical System:")
     println(io, gap, "------------------------")
@@ -97,7 +119,7 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, " Parameters to update:")
     println(io, gap, " ---------------------")
 
-    if lds.obs_model isa PoissonObservationModel
+    if _is_poisson_like(lds.obs_model)
         # C and d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
     else

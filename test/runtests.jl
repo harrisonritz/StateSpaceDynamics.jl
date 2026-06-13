@@ -206,6 +206,38 @@ using SSDTest
             test_kalman_marginal_loglikelihood_internals()
         end
 
+        include("LinearDynamicalSystems/StitchedLDS.jl")
+        @testset "Stitched LDS" begin
+            @testset "Constructors & Validation" begin
+                test_stitched_constructors()
+                test_stitched_validation()
+                test_stitched_show()
+                test_stitched_resolve_obs_group()
+            end
+
+            @testset "Sampling" begin
+                test_stitched_gaussian_rand()
+                test_stitched_poisson_rand()
+                test_stitched_no_controls_error()
+            end
+
+            @testset "Gaussian EM" begin
+                test_stitched_gaussian_reduces_to_plain()
+                test_stitched_gaussian_fit_multigroup()
+                test_stitched_gaussian_ragged_and_strings()
+            end
+
+            @testset "Poisson EM" begin
+                test_stitched_poisson_fit_multigroup()
+            end
+
+            @testset "Switching (SLDS)" begin
+                test_stitched_slds_rand()
+                test_stitched_slds_fit_gaussian()
+                test_stitched_slds_fit_poisson()
+            end
+        end
+
         include("LinearDynamicalSystems/PoissonLDS.jl")
         @testset "Poisson LDS" begin
             @testset "Constructors" begin

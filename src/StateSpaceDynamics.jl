@@ -44,6 +44,7 @@ include("gaussian.jl")
 include("poisson.jl")
 include("simulate.jl")
 include("slds.jl")
+include("stitched.jl")                      # stitched (per-session) observation models
 include("preprocessing.jl")                 # PPCA (standalone model)
 
 # Errors/Exceptions/Validations
@@ -55,6 +56,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
+export GaussianObservationModelStitched, PoissonObservationModelStitched
 export IWPrior, MNPrior
 export CovUpdateCache
 

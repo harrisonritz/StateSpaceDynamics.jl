@@ -179,6 +179,123 @@ function PoissonObservationModel(
 end
 
 """
+    GaussianObservationModelStitched{T,OM<:GaussianObservationModel{T},G}
+
+Stitched Gaussian observation model for "stitching" together several recording
+sessions (groups) that share a common latent state model but observe different
+channels. Each group `g` carries its own emission `(C_g, R_g, d_g)`, and the
+number of observed channels (`obs_dim`) may differ across groups.
+
+The latent state model (`A, Q, b, x0, P0`) is shared across all groups; only the
+emission is group-specific. The per-trial group assignment is supplied to
+`fit!` / `rand` / `smooth` / `loglikelihood` via the `obs_group` keyword, whose
+entries are matched against `group_ids`.
+
+# Fields
+- `models::Vector{OM}`: one `GaussianObservationModel` per group; `models[g]` has
+    emission dimension `obs_dim_g × latent_dim`.
+- `group_ids::Vector{G}`: ordered group labels (integers or strings). Group `g`
+    corresponds to `models[g]`; `obs_group` entries are looked up here.
+"""
+mutable struct GaussianObservationModelStitched{
+    T<:Real,OM<:GaussianObservationModel{T},G
+} <: AbstractObservationModel{T}
+    models::Vector{OM}
+    group_ids::Vector{G}
+
+    # Inner constructor enforces the (models ⇄ group_ids) invariant. Defining it
+    # also suppresses the default constructors, so the validating convenience
+    # constructors below are the only construction path.
+    function GaussianObservationModelStitched{T,OM,G}(
+        models::Vector{OM}, group_ids::Vector{G}
+    ) where {T<:Real,OM<:GaussianObservationModel{T},G}
+        length(models) == length(group_ids) || throw(
+            DimensionMismatchError("group_ids length", length(models), length(group_ids))
+        )
+        allunique(group_ids) ||
+            throw(ArgumentError("group_ids must be unique; got $(group_ids)"))
+        return new{T,OM,G}(models, group_ids)
+    end
+end
+
+"""
+    PoissonObservationModelStitched{T,OM<:PoissonObservationModel{T},G}
+
+Stitched Poisson observation model — the Poisson analogue of
+[`GaussianObservationModelStitched`](@ref). Each group `g` carries its own
+emission `(C_g, d_g)` (possibly different `obs_dim`); the latent state model is
+shared. See [`GaussianObservationModelStitched`](@ref) for the `obs_group`
+convention.
+
+# Fields
+- `models::Vector{OM}`: one `PoissonObservationModel` per group.
+- `group_ids::Vector{G}`: ordered group labels (integers or strings).
+"""
+mutable struct PoissonObservationModelStitched{
+    T<:Real,OM<:PoissonObservationModel{T},G
+} <: AbstractObservationModel{T}
+    models::Vector{OM}
+    group_ids::Vector{G}
+
+    function PoissonObservationModelStitched{T,OM,G}(
+        models::Vector{OM}, group_ids::Vector{G}
+    ) where {T<:Real,OM<:PoissonObservationModel{T},G}
+        length(models) == length(group_ids) || throw(
+            DimensionMismatchError("group_ids length", length(models), length(group_ids))
+        )
+        allunique(group_ids) ||
+            throw(ArgumentError("group_ids must be unique; got $(group_ids)"))
+        return new{T,OM,G}(models, group_ids)
+    end
+end
+
+const AbstractStitchedObservationModel{T} = Union{
+    GaussianObservationModelStitched{T},PoissonObservationModelStitched{T}
+}
+
+# Convenience constructors: derive `group_ids = 1:G` when not supplied, and
+# accept any `AbstractVector` of labels (normalized to a `Vector`).
+function GaussianObservationModelStitched(
+    models::Vector{OM}
+) where {T<:Real,OM<:GaussianObservationModel{T}}
+    return GaussianObservationModelStitched{T,OM,Int}(models, collect(1:length(models)))
+end
+
+function GaussianObservationModelStitched(
+    models::Vector{OM}, group_ids::AbstractVector{G}
+) where {T<:Real,OM<:GaussianObservationModel{T},G}
+    return GaussianObservationModelStitched{T,OM,G}(models, collect(group_ids))
+end
+
+function PoissonObservationModelStitched(
+    models::Vector{OM}
+) where {T<:Real,OM<:PoissonObservationModel{T}}
+    return PoissonObservationModelStitched{T,OM,Int}(models, collect(1:length(models)))
+end
+
+function PoissonObservationModelStitched(
+    models::Vector{OM}, group_ids::AbstractVector{G}
+) where {T<:Real,OM<:PoissonObservationModel{T},G}
+    return PoissonObservationModelStitched{T,OM,G}(models, collect(group_ids))
+end
+
+# ---------------------------------------------------------------------------
+# Observation-model traits used by the `LinearDynamicalSystem` constructor and
+# validation so the stitched models slot into the same code paths. For stitched
+# models `obs_dim` is the max channel count across groups (used only for
+# cosmetic/validation purposes — the stitched fit path sizes its workspaces per
+# group from each `models[g]`).
+# ---------------------------------------------------------------------------
+_lds_obs_dim(obs_model::AbstractObservationModel) = size(obs_model.C, 1)
+function _lds_obs_dim(obs_model::AbstractStitchedObservationModel)
+    return maximum(size(m.C, 1) for m in obs_model.models)
+end
+
+_is_poisson_like(::AbstractObservationModel) = false
+_is_poisson_like(::PoissonObservationModel) = true
+_is_poisson_like(::PoissonObservationModelStitched) = true
+
+"""
     LinearDynamicalSystem{T<:Real, S<:AbstractStateModel{T}, O<:AbstractObservationModel{T}}
 
 Represents a unified Linear Dynamical System with customizable state and observation models.
@@ -210,9 +327,10 @@ function LinearDynamicalSystem(
     state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},Nothing}=nothing
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
-    # Infer dimensions from matrices
+    # Infer dimensions from matrices. Stitched obs models have no single `C`;
+    # `_lds_obs_dim` returns the max channel count across groups for them.
     latent_dim = size(state_model.A, 1)
-    obs_dim = size(obs_model.C, 1)
+    obs_dim = _lds_obs_dim(obs_model)
     state_input_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
         size(state_model.B, 2)
     else
@@ -224,7 +342,7 @@ function LinearDynamicalSystem(
     # Set default fit_bool based on observation model type. The M-step fits
     # [A b B] and [C d D] as joint regressions, so the Gaussian layout is length 6.
     if fit_bool === nothing
-        if obs_model isa PoissonObservationModel
+        if _is_poisson_like(obs_model)
             # Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
             fit_bool = [true, true, true, true, true]
         else

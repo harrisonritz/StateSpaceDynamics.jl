@@ -273,6 +273,62 @@ function _validate_obs_model(
 end
 
 """
+    _validate_obs_model(obs_model::GaussianObservationModelStitched, obs_dim, latent_dim)
+
+Validate a stitched Gaussian observation model: each per-group emission must be a
+valid `GaussianObservationModel` and share the common `latent_dim`. The `obs_dim`
+argument is the max channel count (unused here — each group validates against its
+own emission dimension). `group_ids` must be non-empty and unique.
+"""
+function _validate_obs_model(
+    obs_model::GaussianObservationModelStitched{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    _validate_stitched_groups(obs_model, latent_dim)
+    for m in obs_model.models
+        _validate_obs_model(m, size(m.C, 1), latent_dim)
+    end
+    return nothing
+end
+
+function _validate_obs_model(
+    obs_model::PoissonObservationModelStitched{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    _validate_stitched_groups(obs_model, latent_dim)
+    for m in obs_model.models
+        _validate_obs_model(m, size(m.C, 1), latent_dim)
+    end
+    return nothing
+end
+
+function _validate_stitched_groups(
+    obs_model::AbstractStitchedObservationModel, latent_dim::Int
+)
+    if isempty(obs_model.models)
+        throw(ArgumentError("stitched observation model must have at least one group"))
+    end
+    if length(obs_model.models) != length(obs_model.group_ids)
+        throw(
+            DimensionMismatchError(
+                "stitched group_ids", length(obs_model.models), length(obs_model.group_ids)
+            ),
+        )
+    end
+    if !allunique(obs_model.group_ids)
+        throw(ArgumentError("stitched group_ids must be unique; got $(obs_model.group_ids)"))
+    end
+    for (g, m) in enumerate(obs_model.models)
+        if size(m.C, 2) != latent_dim
+            throw(
+                DimensionMismatchError(
+                    "stitched group $g C columns", latent_dim, size(m.C, 2)
+                ),
+            )
+        end
+    end
+    return nothing
+end
+
+"""
     validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
 
 Validate that all parameters in a LinearDynamicalSystem are dimensionally consistent
@@ -316,14 +372,14 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     # Check fit_bool length. Gaussian path (BTD and Kalman) uses length 6 —
     # the regression M-step fits A&b&B and C&d&D jointly, so flag layout is
     # the same across backends.
-    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    expected_fit_length = _is_poisson_like(lds.obs_model) ? 5 : 6
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end
 
     # Check consistency between inferred and stored dimensions
     inferred_latent = size(lds.state_model.A, 1)
-    inferred_obs = size(lds.obs_model.C, 1)
+    inferred_obs = _lds_obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent
         throw(
