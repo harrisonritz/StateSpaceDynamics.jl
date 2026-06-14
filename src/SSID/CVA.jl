@@ -135,7 +135,11 @@ function _make_pd(M::AbstractMatrix, ::Type{T}; jitter) where {T}
     Ms = (M .+ M') ./ 2
     E = eigen(Symmetric(Matrix(Ms)))
     λmax = isempty(E.values) ? one(real(T)) : maximum(E.values)
-    floorλ = max(T(jitter), T(jitter) * (λmax > 0 ? λmax : one(real(T))))
+    scale = λmax > 0 ? λmax : one(real(T))
+    # Floor eigenvalues so the reconstruction is positive-definite even after
+    # rounding: an absolute jitter, plus a relative term that stays above the
+    # reconstruction's floating-point noise (important for Float32 at any scale).
+    floorλ = max(T(jitter), T(jitter) * scale, sqrt(eps(real(T))) * scale)
     vals = max.(E.values, floorλ)
     P = E.vectors * Diagonal(vals) * E.vectors'
     P = (P .+ P') ./ 2
