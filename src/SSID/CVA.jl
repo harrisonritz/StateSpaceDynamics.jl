@@ -475,7 +475,7 @@ function _cva_fit!(
     n <= size(Or, 2) || throw(ArgumentError(
         "CVA: model order n=$n exceeds identifiable subspace dimension $(size(Or, 2))"))
 
-    Aestimator = alg.ridge ? ((x, yy) -> _ridge(x, yy, T(alg.λ))) : \
+    Aestimator = alg.ridge ? ((x, yy) -> _ridge(x, yy, T(alg.λ))) : ((x, yy) -> x \ yy)
     A, C = _cva_AC(Or, p, r, n, Aestimator, alg.stable)
     Q, R = _find_PK_cva(L1, L2, Or, n, p, m, r, s1, s2, T; jitter=T(alg.jitter))
 
@@ -488,7 +488,7 @@ function _cva_fit!(
     else
         Uorig = m > 0 ? reduce(hcat, u_seq) : zeros(T, 0, Ttot)
         Vorig = mD > 0 ? reduce(hcat, v_seq) : zeros(T, 0, Ttot)
-        BDest = alg.ridge ? ((x, yy) -> _ridge(x, yy, T(alg.λ))) : \
+        BDest = alg.ridge ? ((x, yy) -> _ridge(x, yy, T(alg.λ))) : ((x, yy) -> x \ yy)
         B, D, x0 = _find_BD_cva(A, C, Uorig, Vorig, Ydm, zeroD, BDest, T)
     end
 

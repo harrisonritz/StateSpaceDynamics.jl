@@ -307,7 +307,8 @@ function test_cva_findBD_recovers_known_system()
     # Noiseless output of the deterministic system.
     Y = StateSpaceDynamics._ltisim(A, Btrue, C, U, x0true)
     V = zeros(Float64, 0, N)
-    B, D, x0 = StateSpaceDynamics._find_BD_cva(A, C, U, V, Y, true, \, Float64)
+    ols = (x, yy) -> x \ yy
+    B, D, x0 = StateSpaceDynamics._find_BD_cva(A, C, U, V, Y, true, ols, Float64)
     # Reconstructed output should match (B, x0 identified exactly up to noise).
     Yhat = StateSpaceDynamics._ltisim(A, B, C, U, x0)
     @test isapprox(Yhat, Y; atol=1e-6)
