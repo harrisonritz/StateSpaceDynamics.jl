@@ -186,6 +186,41 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/SSID_CVA.jl")
+        @testset "CVA SSID" begin
+            @testset "Mechanics" begin
+                test_cva_shapes_and_mutation()
+                test_cva_fve_and_singular_values()
+                test_cva_pd_covariances_and_validation()
+                test_cva_stability_enforced()
+                test_cva_weightings_run()
+                test_cva_ridge_vs_backslash()
+                test_cva_reproducibility()
+            end
+            @testset "Recovery" begin
+                test_cva_eigenvalue_recovery()
+                test_cva_markov_recovery_with_input()
+                test_cva_input_BD_shapes()
+                test_cva_bias_reconstructs_mean()
+                test_cva_cross_trial_paths()
+                test_cva_new_init_placeholder()
+                test_cva_init_then_EM_improves()
+            end
+            @testset "Internal kernels" begin
+                test_cva_dlyap_identity_and_fallback()
+                test_cva_reflectd_stabilizes()
+                test_cva_ltisim_matches_recursion()
+                test_cva_findBD_recovers_known_system()
+            end
+            @testset "Errors & dispatch" begin
+                test_cva_errors_wrong_model_type()
+                test_cva_errors_bad_inputs()
+                test_cva_2d_3d_overloads()
+                test_cva_fit_bool_respected()
+                test_cva_type_preservation()
+            end
+        end
+
         include("LinearDynamicalSystems/KalmanLDS.jl")
         @testset "LDS smoother + marginal LL" begin
             test_td_covariance_shared_across_trials()

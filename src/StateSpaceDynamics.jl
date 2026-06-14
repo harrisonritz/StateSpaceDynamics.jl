@@ -46,6 +46,7 @@ include("simulate.jl")
 include("slds.jl")
 include("stitched.jl")                      # stitched (per-session) observation models
 include("preprocessing.jl")                 # PPCA (standalone model)
+include("SSID/CVA.jl")                       # CVA subspace-identification initializer
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
@@ -54,6 +55,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
+export CVA
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export GaussianObservationModelStitched, PoissonObservationModelStitched
