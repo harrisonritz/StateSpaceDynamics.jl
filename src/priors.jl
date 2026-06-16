@@ -1,16 +1,16 @@
-# =============================================================================
-# Conjugate priors used across LDS-family models.
-#
-# Currently:
-#   * `IWPrior`  — inverse-Wishart prior on a covariance matrix (Q, P0, R, ...).
-#   * `MNPrior`  — matrix-normal prior on a regression coefficient matrix
-#                  ([A B], [C D], ...). Pair with an `IWPrior` on the same
-#                  regression to obtain the full MNIW conjugate prior on
-#                  (W, Σ).
-#
-# Each prior ships with a small `*_map` helper that returns the closed-form
-# MAP update so M-steps stay one-liner-clean.
-# =============================================================================
+#=============================================================================
+Conjugate priors used across LDS-family models.
+
+Currently:
+  * `IWPrior`  — inverse-Wishart prior on a covariance matrix (Q, P0, R, ...).
+  * `MNPrior`  — matrix-normal prior on a regression coefficient matrix
+                 ([A B], [C D], ...). Pair with an `IWPrior` on the same
+                 regression to obtain the full MNIW conjugate prior on
+                 (W, Σ).
+
+Each prior ships with a small `*_map` helper that returns the closed-form
+MAP update so M-steps stay one-liner-clean.
+=============================================================================#
 
 """
     IWPrior{T<:Real, M<:AbstractMatrix}

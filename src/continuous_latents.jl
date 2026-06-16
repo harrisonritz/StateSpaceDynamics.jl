@@ -1,3 +1,15 @@
+#=============================================================================
+Continuous (Linear Gaussian) latents
+
+    E-Step: Q_state!(sws, lds, suf)
+
+    M-Step: update_initial_state_mean!(lds, suf)
+            update_initial_state_covariance!(lds, suf, sws)
+            update_A_b!(lds, suf, sws)
+            update_Q!(lds, suf, sws)
+=============================================================================#
+
+
 """
     Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
 

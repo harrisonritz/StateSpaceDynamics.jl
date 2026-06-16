@@ -32,19 +32,26 @@ include("workspaces.jl")                    # FilterSmooth / SufficientStatistic
 include("show.jl")
 include("validation.jl")
 
-# Shared inference machinery.
+# Shared latent inference machinery.
 # kalman.jl is retained for the Kalman filter + marginal likelihood (and future
 # particle-filter use); the Kalman path is no longer a selectable E-step backend.
 include("kalman.jl")
 include("sufficient_statistics.jl")
-include("dynamics.jl")                      # state-model Q-term + state M-step
+include("continuous_latents.jl")                      # state-model Q-term + state M-step
 
 # Observation models + composite / standalone models.
-include("gaussian.jl")
-include("poisson.jl")
+include("gaussian_observations.jl")
+include("poisson_observations.jl")
+
+# Utilities
 include("simulate.jl")
-include("slds.jl")
 include("preprocessing.jl")                 # PPCA (standalone model)
+
+# Fitting Functions
+include("_fit_LDS.jl")
+include("_fit_PLDS.jl")
+include("_fit_SLDS.jl")
+
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec

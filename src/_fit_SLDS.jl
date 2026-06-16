@@ -1,3 +1,27 @@
+#=============================================================================
+Switching LDS (SLDS)
+
+    Sample:         rand(rng, slds, tsteps)
+
+    Log-Likelihood: joint_loglikelihood!(ws, slds, x, y, w)
+
+    Gradient:       Gradient!(ws, slds, y, x, w)
+
+    Hessian:        Hessian_blocks!(ws, slds, y, x, w)
+
+    Smooth:         smooth!(slds, fs, y, w)
+
+    Posterior:      sample_posterior!(x_out, rng, tfs, randn_buf)
+                    sample_posterior(rng, fs)
+
+    E-Step:         estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws)
+
+    M-Step:         mstep!(slds, tfs, fb_storage, dl, y, sws)
+
+    Fit:            fit!(slds, y)
+=============================================================================#
+
+
 """
     _make_slds_fb_storage(dl, seq_ends)
 
