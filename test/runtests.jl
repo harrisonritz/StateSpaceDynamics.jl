@@ -238,6 +238,29 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/TrialVaryingLDS.jl")
+        @testset "Trial-Varying LDS" begin
+            @testset "Constructors & Validation" begin
+                test_tv_grouped_param()
+                test_tv_constructors_and_validation()
+                test_tv_show()
+            end
+
+            @testset "Sampling & errors" begin
+                test_tv_rand_and_errors()
+            end
+
+            @testset "Gaussian EM" begin
+                test_tv_reduces_to_plain()
+                test_tv_gaussian_fit_multiblock()
+                test_tv_emission_only()
+            end
+
+            @testset "Poisson EM" begin
+                test_tv_poisson_fit()
+            end
+        end
+
         include("LinearDynamicalSystems/PoissonLDS.jl")
         @testset "Poisson LDS" begin
             @testset "Constructors" begin

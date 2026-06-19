@@ -295,6 +295,136 @@ _is_poisson_like(::AbstractObservationModel) = false
 _is_poisson_like(::PoissonObservationModel) = true
 _is_poisson_like(::PoissonObservationModelStitched) = true
 
+# ===========================================================================
+# Trial-varying (grouped) parameters.
+#
+# Generalizes the stitched models: *any* of the six M-step estimation blocks
+# (x0, P0, [A b], Q, [C d], R) can be fit per trial-group, and different blocks
+# may key on different labels. This is the fully general counterpart to the
+# stitched models — kept as a separate type so the trial-invariant
+# `GaussianStateModel` / `GaussianObservationModel` hot paths are untouched.
+#
+# A `GroupedParam` stores one parameter value per group plus the label its
+# grouping keys on; the per-trial label values are supplied at fit/rand/smooth
+# time via a `Dict{Symbol,Vector}`. An *invariant* parameter has a single group
+# under the sentinel label `:__invariant__`.
+# ===========================================================================
+
+const INVARIANT_LABEL = :__invariant__
+
+"""
+    GroupedParam{V}
+
+A model parameter (value type `V`, e.g. `Matrix{T}` or `Vector{T}`) that may take
+a different value per trial group. `values[g]` is the value for group `g`;
+`label` names the trial-label set this parameter keys on (`:__invariant__` for a
+trial-invariant parameter with a single group); `group_ids[g]` is the label value
+identifying group `g`.
+"""
+struct GroupedParam{V}
+    values::Vector{V}
+    label::Symbol
+    group_ids::Vector{Any}
+end
+
+# Invariant parameter (single group).
+GroupedParam(value::V) where {V} = GroupedParam{V}([value], INVARIANT_LABEL, Any[1])
+
+# Trial-varying parameter: one value per group, keyed on `label`.
+function GroupedParam(values::Vector{V}, label::Symbol, group_ids::AbstractVector) where {V}
+    length(values) == length(group_ids) || throw(
+        DimensionMismatchError("GroupedParam group_ids", length(values), length(group_ids))
+    )
+    allunique(group_ids) ||
+        throw(ArgumentError("GroupedParam group_ids must be unique; got $(group_ids)"))
+    return GroupedParam{V}(values, label, collect(Any, group_ids))
+end
+
+ngroups(gp::GroupedParam) = length(gp.values)
+is_invariant(gp::GroupedParam) = gp.label === INVARIANT_LABEL
+
+# Wrap plain arrays as invariant parameters; pass `GroupedParam`s through.
+_as_grouped(x::GroupedParam) = x
+_as_grouped(x::AbstractMatrix) = GroupedParam(Matrix(x))
+_as_grouped(x::AbstractVector{<:Real}) = GroupedParam(Vector(x))
+
+"""
+    TrialVaryingGaussianStateModel{T}
+
+Gaussian state model whose estimation blocks may each vary by a trial label.
+The dynamics-mean block `[A b]` shares one label/grouping; `Q`, `x0`, and `P0`
+each key on their own (possibly different) label. Construct via the keyword
+constructor, passing a `GroupedParam` for a varying block or a plain array for an
+invariant one. Dynamics inputs (`B`) and MN priors are not supported here (use
+the trial-invariant model for those).
+"""
+mutable struct TrialVaryingGaussianStateModel{T<:Real} <: AbstractStateModel{T}
+    A::GroupedParam{Matrix{T}}
+    b::GroupedParam{Vector{T}}
+    Q::GroupedParam{Matrix{T}}
+    x0::GroupedParam{Vector{T}}
+    P0::GroupedParam{Matrix{T}}
+    Q_prior::Union{Nothing,IWPrior{T}}
+    P0_prior::Union{Nothing,IWPrior{T}}
+end
+
+function TrialVaryingGaussianStateModel(;
+    A, b, Q, x0, P0, Q_prior=nothing, P0_prior=nothing
+)
+    gA, gb, gQ, gx0, gP0 = _as_grouped(A),
+    _as_grouped(b), _as_grouped(Q), _as_grouped(x0),
+    _as_grouped(P0)
+    T = eltype(first(gA.values))
+    return TrialVaryingGaussianStateModel{T}(gA, gb, gQ, gx0, gP0, Q_prior, P0_prior)
+end
+
+"""
+    TrialVaryingGaussianObservationModel{T}
+
+Gaussian observation model whose emission-mean block `[C d]` shares one
+label/grouping and `R` keys on its own (possibly different) label.
+"""
+mutable struct TrialVaryingGaussianObservationModel{T<:Real} <: AbstractObservationModel{T}
+    C::GroupedParam{Matrix{T}}
+    d::GroupedParam{Vector{T}}
+    R::GroupedParam{Matrix{T}}
+    R_prior::Union{Nothing,IWPrior{T}}
+end
+
+function TrialVaryingGaussianObservationModel(; C, d, R, R_prior=nothing)
+    gC, gd, gR = _as_grouped(C), _as_grouped(d), _as_grouped(R)
+    T = eltype(first(gC.values))
+    return TrialVaryingGaussianObservationModel{T}(gC, gd, gR, R_prior)
+end
+
+"""
+    TrialVaryingPoissonObservationModel{T}
+
+Poisson observation model whose emission block `[C d]` shares one label/grouping.
+"""
+mutable struct TrialVaryingPoissonObservationModel{T<:Real} <: AbstractObservationModel{T}
+    C::GroupedParam{Matrix{T}}
+    d::GroupedParam{Vector{T}}
+end
+
+function TrialVaryingPoissonObservationModel(; C, d)
+    gC, gd = _as_grouped(C), _as_grouped(d)
+    T = eltype(first(gC.values))
+    return TrialVaryingPoissonObservationModel{T}(gC, gd)
+end
+
+const AbstractTrialVaryingObservationModel{T} = Union{
+    TrialVaryingGaussianObservationModel{T},TrialVaryingPoissonObservationModel{T}
+}
+
+# Dimension / poisson traits for the trial-varying models (all groups share dims).
+_lds_latent_dim(sm::AbstractStateModel) = size(sm.A, 1)
+_lds_latent_dim(sm::TrialVaryingGaussianStateModel) = size(first(sm.A.values), 1)
+function _lds_obs_dim(om::AbstractTrialVaryingObservationModel)
+    return size(first(om.C.values), 1)
+end
+_is_poisson_like(::TrialVaryingPoissonObservationModel) = true
+
 """
     LinearDynamicalSystem{T<:Real, S<:AbstractStateModel{T}, O<:AbstractObservationModel{T}}
 
@@ -327,9 +457,9 @@ function LinearDynamicalSystem(
     state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},Nothing}=nothing
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
-    # Infer dimensions from matrices. Stitched obs models have no single `C`;
-    # `_lds_obs_dim` returns the max channel count across groups for them.
-    latent_dim = size(state_model.A, 1)
+    # Infer dimensions from matrices. Stitched / trial-varying models have no
+    # single `A` / `C`; the `_lds_*_dim` traits handle those.
+    latent_dim = _lds_latent_dim(state_model)
     obs_dim = _lds_obs_dim(obs_model)
     state_input_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
         size(state_model.B, 2)

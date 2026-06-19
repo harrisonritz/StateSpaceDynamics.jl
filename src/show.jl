@@ -111,6 +111,40 @@ function Base.show(io::IO, om::PoissonObservationModelStitched; gap="")
     return nothing
 end
 
+function _show_grouped(io, gap, name, gp)
+    if is_invariant(gp)
+        println(io, gap, " $name: invariant")
+    else
+        println(io, gap, " $name: $(ngroups(gp)) groups by :$(gp.label) = $(gp.group_ids)")
+    end
+    return nothing
+end
+
+function Base.show(io::IO, sm::TrialVaryingGaussianStateModel; gap="")
+    println(io, gap, "Trial-Varying Gaussian State Model:")
+    println(io, gap, "----------------------------------")
+    _show_grouped(io, gap, "[A b]", sm.A)
+    _show_grouped(io, gap, "Q", sm.Q)
+    _show_grouped(io, gap, "x0", sm.x0)
+    _show_grouped(io, gap, "P0", sm.P0)
+    return nothing
+end
+
+function Base.show(io::IO, om::TrialVaryingGaussianObservationModel; gap="")
+    println(io, gap, "Trial-Varying Gaussian Observation Model:")
+    println(io, gap, "-----------------------------------------")
+    _show_grouped(io, gap, "[C d]", om.C)
+    _show_grouped(io, gap, "R", om.R)
+    return nothing
+end
+
+function Base.show(io::IO, om::TrialVaryingPoissonObservationModel; gap="")
+    println(io, gap, "Trial-Varying Poisson Observation Model:")
+    println(io, gap, "----------------------------------------")
+    _show_grouped(io, gap, "[C d]", om.C)
+    return nothing
+end
+
 function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "Linear Dynamical System:")
     println(io, gap, "------------------------")

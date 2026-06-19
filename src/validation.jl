@@ -328,6 +328,96 @@ function _validate_stitched_groups(
     return nothing
 end
 
+# Trial-varying model validators. Each group's matrices must have the common
+# (latent_dim, obs_dim) shapes (fixed dims), covariances must be SPD, and the
+# paired mean blocks (A&b, C&d) must share a grouping.
+function _validate_covariance(M::AbstractMatrix, name::AbstractString)
+    issymmetric(M) || throw(NotSymmetricError(name, maximum(abs.(M - M'))))
+    isposdef(M) || throw(NotPositiveDefiniteError(name, minimum(eigvals(M))))
+    return nothing
+end
+
+function _validate_shared_grouping(g1::GroupedParam, g2::GroupedParam, blockname)
+    (g1.label == g2.label && g1.group_ids == g2.group_ids) || throw(
+        ArgumentError(
+            "$(blockname) parameters must share the same trial label and groups",
+        ),
+    )
+    return nothing
+end
+
+function _validate_state_model(
+    sm::TrialVaryingGaussianStateModel{T}, latent_dim::Int
+) where {T}
+    _validate_shared_grouping(sm.A, sm.b, "dynamics-mean [A b]")
+    for A in sm.A.values
+        size(A) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("A matrix", (latent_dim, latent_dim), size(A)))
+    end
+    for b in sm.b.values
+        length(b) == latent_dim ||
+            throw(DimensionMismatchError("bias vector b", latent_dim, length(b)))
+    end
+    for x0 in sm.x0.values
+        length(x0) == latent_dim ||
+            throw(DimensionMismatchError("initial state x0", latent_dim, length(x0)))
+    end
+    for Q in sm.Q.values
+        size(Q) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("Q matrix", (latent_dim, latent_dim), size(Q)))
+        _validate_covariance(Q, "Q matrix")
+    end
+    for P0 in sm.P0.values
+        size(P0) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("P0 matrix", (latent_dim, latent_dim), size(P0)))
+        _validate_covariance(P0, "P0 matrix")
+    end
+    return nothing
+end
+
+function _validate_obs_model(
+    om::TrialVaryingGaussianObservationModel{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    _validate_shared_grouping(om.C, om.d, "emission-mean [C d]")
+    for C in om.C.values
+        size(C) == (obs_dim, latent_dim) ||
+            throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(C)))
+    end
+    for d in om.d.values
+        length(d) == obs_dim ||
+            throw(DimensionMismatchError("observation bias d", obs_dim, length(d)))
+    end
+    for R in om.R.values
+        size(R) == (obs_dim, obs_dim) ||
+            throw(DimensionMismatchError("R matrix", (obs_dim, obs_dim), size(R)))
+        _validate_covariance(R, "R matrix")
+    end
+    return nothing
+end
+
+function _validate_obs_model(
+    om::TrialVaryingPoissonObservationModel{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    _validate_shared_grouping(om.C, om.d, "emission [C d]")
+    for C in om.C.values
+        size(C) == (obs_dim, latent_dim) ||
+            throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(C)))
+    end
+    for d in om.d.values
+        length(d) == obs_dim ||
+            throw(DimensionMismatchError("d vector", obs_dim, length(d)))
+        if any(x -> abs(x) > 50, d)
+            throw(
+                NumericalStabilityError(
+                    "d vector",
+                    "contains extremely large/small values (max |d| = $(maximum(abs.(d)))), may cause numerical overflow/underflow",
+                ),
+            )
+        end
+    end
+    return nothing
+end
+
 """
     validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
 
@@ -378,7 +468,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     end
 
     # Check consistency between inferred and stored dimensions
-    inferred_latent = size(lds.state_model.A, 1)
+    inferred_latent = _lds_latent_dim(lds.state_model)
     inferred_obs = _lds_obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent
