@@ -871,7 +871,6 @@ function estep!(
     latent_inputs::AbstractVector{<:AbstractMatrix{T}},
     obs_inputs::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
-    elbos::Vector{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # smooth each trial
@@ -879,14 +878,6 @@ function estep!(
 
     # compute the sufficient statistics
     _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
-
-    # compute the ELBO
-    total_entropy = zero(T)
-    for fs in tfs.FilterSmooths
-        total_entropy += fs.entropy
-    end
-    elbo = elbo(lds, suf, sws_pool[1], total_entropy)
-    push!(elbos, elbo)
 
 end
 
@@ -900,7 +891,6 @@ function estep!(
     latent_inputs::AbstractMatrix{T},
     obs_inputs::AbstractMatrix{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-    elbos::Vector{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
 
     # smooth each trial
@@ -908,14 +898,6 @@ function estep!(
 
     # compute the sufficient statistics
     _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
-
-    # compute the ELBO
-    total_entropy = zero(T)
-    for fs in tfs.FilterSmooths
-        total_entropy += fs.entropy
-    end
-    elbo = elbo(lds, suf, sws_pool[1], total_entropy)
-    push!(elbos, elbo)
 
 end
 
@@ -1064,10 +1046,7 @@ function _fit_tridiag!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
-
-    prev_elbo = -T(Inf)
-    elbos = Vector{T}()
-    sizehint!(elbos, max_iter)
+    elbos = Vector{T}(undef, max_iter)
 
     # Opt in to the cov-alias stub for `p_smooth` / `p_smooth_tt1` when the
     # cov-cache fast path is going to fire (equal-length multi-trial). The
@@ -1115,21 +1094,27 @@ function _fit_tridiag!(
         nothing
     end
 
-    for _ in 1:max_iter
+    for iter in 1:max_iter
 
         # E-step: smooth + aggregate sufficient statistics + compute ELBO
         estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool, elbos)
 
+        # compute the ELBO
+        total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init = zero(T))
+        elbos[iter] = elbo(lds, suf, sws_pool[1], total_entropy)
+
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
 
+        # print progress
         prog !== nothing && next!(prog)
 
-        if abs(elbo - prev_elbo) < tol
+        # check convergence
+        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
             return elbos
         end
-        prev_elbo = elbo
     end
 
     prog !== nothing && finish!(prog)

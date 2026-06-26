@@ -11,9 +11,9 @@ Poisson LDS
     Smooth:         smooth!(lds, fs, y, sws)
                     smooth!(lds, tfs, y, sws_pool)
 
-    ELBO:           calculate_elbo(plds, suf, tfs, y, sws_pool)
+    ELBO:           elbo(plds, suf, tfs, y, sws_pool)
 
-    E-Step:         estep!(lds, suf, tfs, y, u_seq, v_seq, sws_pool)
+    E-Step:         estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool)
 
     M-Step:         mstep!(plds, suf, tfs, y, sws_pool)
 
@@ -545,7 +545,7 @@ function mstep!(
 end
 
 """
-    calculate_elbo(plds, suf, tfs, y, sws_pool)
+    elbo(plds, suf, tfs, y, sws_pool)
 
 Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 
@@ -557,7 +557,7 @@ Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 * `IWPrior` log-prior contributions on `Q` and `P0`, and the MN log-prior
   trace term on `[C d]` to match the LBFGS objective.
 """
-function calculate_elbo(
+function elbo(
     plds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
@@ -948,7 +948,7 @@ function smooth!(
 end
 
 """
-    estep!(lds, suf, tfs, y, u_seq, v_seq, sws_pool; max_iter=20, tol=1e-6)
+    estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool; max_iter=20, tol=1e-6)
 
 Suf-based Poisson E-step. Smooths, aggregates state-side sufficient
 statistics into `suf` from each trial's smoother output (`x_smooth`,
@@ -962,16 +962,19 @@ function estep!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
-    tol::T=T(1e-6),
+    tol::T=T(1e-6)
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+
+    # smooth each trial
     smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
-    _aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, sws_pool[1])
-    elbo = calculate_elbo(lds, suf, tfs, y, sws_pool)
-    return elbo
+
+    # compute the sufficient statistics
+    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
+
 end
 
 """
@@ -1013,14 +1016,14 @@ function fit!(
     sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, T_max) for _ in 1:npool]
 
     # Suf-based state-side M-step (mirrors the Gaussian TD fit path). Poisson
-    # has no controls, so `u_seq` / `v_seq` are zero-row matrices. The const
+    # has no controls, so `latent_inputs` / `obs_inputs` are zero-row matrices. The const
     # blocks (bias-row entries, obs_yy_const, …) are precomputed once; the
     # `obs_*` blocks are written by the aggregator but unread by the Poisson
     # M-step (emission stays LBFGS), which is a tiny constant overhead.
     suf = _initialize_td_sufficient_statistics(T, plds, tsteps_per_trial)
-    u_seq = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
-    v_seq = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
-    _td_init_const_blocks!(sws_pool[1], plds, tsteps_per_trial, y, u_seq, v_seq)
+    latent_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    obs_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    _td_init_const_blocks!(sws_pool[1], plds, tsteps_per_trial, y, latent_inputs, obs_inputs)
 
     elbos = Vector{T}(undef, max_iter)
 
@@ -1036,24 +1039,34 @@ function fit!(
     end
 
     for iter in 1:max_iter
-        elbos[iter] = estep!(
+
+        # E-step: smooth each trial, aggregate state-side suff-stats, compute ELBO
+        estep!(
             plds,
             suf,
             tfs,
             y,
-            u_seq,
-            v_seq,
+            latent_inputs,
+            obs_inputs,
             sws_pool;
             max_iter=newton_max_iter,
             tol=T(newton_tol),
         )
+                
+        # compute the ELBO
+        elbos[iter] = elbo(plds, suf, tfs, y, sws_pool)
+
+        # M-step: update state-side suff-stats from suf, update Poisson emission via LBFGS
         mstep!(plds, suf, tfs, y, sws_pool)
 
+        # print progress
         prog !== nothing && next!(prog)
 
+        # check convergence
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+            prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            break
+            return elbos
         end
     end
 

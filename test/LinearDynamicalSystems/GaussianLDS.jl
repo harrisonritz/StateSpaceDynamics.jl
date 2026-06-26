@@ -593,10 +593,10 @@ function test_td_mn_priors_shrink(; rng=MersenneTwister(20260519))
     return nothing
 end
 
-function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
+function test_td_with_obs_inputs(; rng=MersenneTwister(20260520))
     # TD path with a non-trivial D matrix: simulate from y = C x + d + D v + ε,
-    # fit, and verify that fitting *with* obs_control_seq beats fitting *without*.
-    @testset "TD: obs_control_seq (D matrix) is learned" begin
+    # fit, and verify that fitting *with* obs_inputs beats fitting *without*.
+    @testset "TD: obs_inputs (D matrix) is learned" begin
         D, p, Tt, N = 3, 5, 50, 6
         d_dim = 2
 
@@ -618,7 +618,7 @@ function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
         lds_true = LinearDynamicalSystem(sm_true, om_true)
 
         v_seq = [randn(rng, d_dim, Tt) for _ in 1:N]
-        _, y_seq = rand(rng, lds_true, fill(Tt, N); obs_control_seq=v_seq)
+        _, y_seq = rand(rng, lds_true, fill(Tt, N); obs_inputs=v_seq)
 
         # Fit with obs controls.
         sm_init = GaussianStateModel(;
@@ -633,7 +633,7 @@ function test_td_with_obs_control_seq(; rng=MersenneTwister(20260520))
         )
         lds_fit = LinearDynamicalSystem(sm_init, om_init)
 
-        elbos = fit!(lds_fit, y_seq; obs_control_seq=v_seq, max_iter=60, progress=false)
+        elbos = fit!(lds_fit, y_seq; obs_inputs=v_seq, max_iter=60, progress=false)
         @test all(diff(elbos) .>= -1e-4)
 
         # Baseline: fit without obs controls (0-column D).
@@ -841,7 +841,7 @@ function test_td_weighted_aggregator_matches_unweighted_with_controls(;
 
         u = 0.5 * randn(rng, u_dim, Tt)
         v = 0.5 * randn(rng, d_dim, Tt)
-        _, y1 = rand(rng, lds, Tt; control_seq=u, obs_control_seq=v)
+        _, y1 = rand(rng, lds, Tt; latent_inputs=u, obs_inputs=v)
         y = [y1]
         u_seq = [u]
         v_seq = [v]

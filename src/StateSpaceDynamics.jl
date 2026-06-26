@@ -25,6 +25,10 @@ include("numerics/optimization.jl")        # line search + Newton
 include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
 include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 
+# Conjugate priors — defined first because model structs reference IWPrior/MNPrior
+# in their field type annotations.
+include("stats/priors.jl")
+
 # Model definitions + inference-state containers.
 include("structs/types.jl")                         # abstract types, Data, model structs, SLDS
 include("structs/workspaces.jl")                    # FilterSmooth / SufficientStatistics / workspaces
@@ -34,7 +38,6 @@ include("utils/validation.jl")
 # Shared latent inference machinery.
 # kalman.jl is retained for the Kalman filter + marginal likelihood (and future
 # particle-filter use); the Kalman path is no longer a selectable E-step backend.
-include("stats/priors.jl")
 include("stats/preprocessing.jl")           # PPCA (standalone model)
 include("stats/kalman.jl")
 include("stats/sufficient_statistics.jl")
