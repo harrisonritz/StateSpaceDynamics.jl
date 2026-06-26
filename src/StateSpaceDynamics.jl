@@ -26,31 +26,31 @@ include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
 include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 
 # Model definitions + inference-state containers.
-include("priors.jl")
-include("types.jl")                         # abstract types, Data, model structs, SLDS
-include("workspaces.jl")                    # FilterSmooth / SufficientStatistics / workspaces
-include("show.jl")
-include("validation.jl")
+include("structs/types.jl")                         # abstract types, Data, model structs, SLDS
+include("structs/workspaces.jl")                    # FilterSmooth / SufficientStatistics / workspaces
+include("utils/show.jl")
+include("utils/validation.jl")
 
 # Shared latent inference machinery.
 # kalman.jl is retained for the Kalman filter + marginal likelihood (and future
 # particle-filter use); the Kalman path is no longer a selectable E-step backend.
-include("kalman.jl")
-include("sufficient_statistics.jl")
-include("continuous_latents.jl")                      # state-model Q-term + state M-step
+include("stats/priors.jl")
+include("stats/preprocessing.jl")           # PPCA (standalone model)
+include("stats/kalman.jl")
+include("stats/sufficient_statistics.jl")
+include("stats/simulate.jl")
+
+# latents models (LDS, PLDS, SLDS) + inference machinery (E-step).
+include("latents/continuous_latents.jl")                      # state-model Q-term + state M-step
 
 # Observation models + composite / standalone models.
-include("gaussian_observations.jl")
-include("poisson_observations.jl")
-
-# Utilities
-include("simulate.jl")
-include("preprocessing.jl")                 # PPCA (standalone model)
+include("observations/gaussian_observations.jl")
+include("observations/poisson_observations.jl")
 
 # Fitting Functions
-include("_fit_LDS.jl")
-include("_fit_PLDS.jl")
-include("_fit_SLDS.jl")
+include("fit_LDS.jl")
+include("fit_PLDS.jl")
+include("fit_SLDS.jl")
 
 
 # Errors/Exceptions/Validations

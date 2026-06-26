@@ -12,7 +12,7 @@ Gaussian LDS
     Smooth:         smooth!(lds, fs, y, sws)
                     smooth!(lds, tfs, y, sws_pool)
 
-    ELBO:           calculate_elbo(lds, suf, sws, total_entropy)
+    ELBO:           elbo(lds, suf, sws, total_entropy)
 
     M-Step:         mstep!(lds, suf, sws)
 
@@ -389,8 +389,8 @@ function smooth!(
     fs::FilterSmooth{T},
     y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    latent_inputs::AbstractMatrix{T},
+    obs_inputs::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
     n_active = D * tsteps
@@ -409,7 +409,7 @@ function smooth!(
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat, u, v)
+    Gradient!(sws, lds, y, x_mat, latent_inputs, obs_inputs)
     # grad_vec = -gradient (minimize negative log-likelihood)
     for t in 1:tsteps, i in 1:D
         sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
@@ -477,13 +477,13 @@ function smooth!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = length(y)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1], u_seq[1], v_seq[1])
+        smooth!(lds, tfs[1], y[1], sws_pool[1], latent_inputs[1], obs_inputs[1])
         return tfs
     end
 
@@ -516,7 +516,7 @@ function smooth!(
         # path's batched-trial efficiency).
         if size(source_sws.batched_x_mat, 3) == ntrials && ntrials > 1
             if !source_sws.batched_data_valid[]
-                _populate_batched_data!(source_sws, y, u_seq, v_seq)
+                _populate_batched_data!(source_sws, y, latent_inputs, obs_inputs)
             end
             _smooth_mean_only_batched!(lds, tfs, source_sws)
             return tfs
@@ -536,8 +536,8 @@ function smooth!(
                         tfs[trial],
                         y[trial],
                         sws,
-                        u_seq[trial],
-                        v_seq[trial],
+                        latent_inputs[trial],
+                        obs_inputs[trial],
                         source_sws,
                     )
                 end
@@ -558,7 +558,7 @@ function smooth!(
         @spawn begin
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws, u_seq[trial], v_seq[trial])
+                smooth!(lds, tfs[trial], y[trial], sws, latent_inputs[trial], obs_inputs[trial])
             end
         end
     end
@@ -846,23 +846,92 @@ function smooth!(
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    return smooth!(lds, tfs, y, sws_pool, u_seq, v_seq)
+    latent_inputs = [zeros(T, 0, size(yt, 2)) for yt in y]
+    obs_inputs = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 end
 
 
 
 """
-    calculate_elbo(lds, suf, sws)
+    estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool; max_iter=20, tol=1e-6)
+
+Gaussian E-step. Smooths, aggregates state-side sufficient
+statistics into `suf` from each trial's smoother output (`x_smooth`,
+`p_smooth`, `p_smooth_tt1`), and returns the suf-based ELBO. The legacy
+per-trial `sufficient_statistics!(tfs)` call is skipped — the suf-based
+M-step doesn't need `fs.E_z` / `fs.E_zz` / `fs.E_zz_prev`, and the
+Gaussian emission update now reads `fs.x_smooth` directly.
+"""
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    elbos::Vector{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+    # smooth each trial
+    smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
+
+    # compute the sufficient statistics
+    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
+
+    # compute the ELBO
+    total_entropy = zero(T)
+    for fs in tfs.FilterSmooths
+        total_entropy += fs.entropy
+    end
+    elbo = elbo(lds, suf, sws_pool[1], total_entropy)
+    push!(elbos, elbo)
+
+end
+
+
+# y/u/v as Matrices
+function estep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractMatrix{T},
+    latent_inputs::AbstractMatrix{T},
+    obs_inputs::AbstractMatrix{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    elbos::Vector{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+
+    # smooth each trial
+    smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
+
+    # compute the sufficient statistics
+    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
+
+    # compute the ELBO
+    total_entropy = zero(T)
+    for fs in tfs.FilterSmooths
+        total_entropy += fs.entropy
+    end
+    elbo = elbo(lds, suf, sws_pool[1], total_entropy)
+    push!(elbos, elbo)
+
+end
+
+
+
+
+"""
+    elbo(lds, suf, sws)
 
 Total ELBO from aggregated sufficient statistics. Computes the same quantity
-as the legacy `calculate_elbo(lds, tfs, y, sws_pool, ...)` but in
+as the legacy `elbo(lds, tfs, y, sws_pool, ...)` but in
 O(D³ + p²·D) instead of O(N·T·p²·D). The Gaussian-posterior entropy comes
 from each trial's `fs.entropy` (filled by the smoother) and is summed by
 the caller before this function is invoked.
 """
-function calculate_elbo(
+function elbo(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
@@ -935,7 +1004,7 @@ end
 
 """
     fit!(lds, y; max_iter=100, tol=1e-6, progress=true,
-         control_seq=nothing, obs_control_seq=nothing)
+         latent_inputs=nothing, obs_inputs=nothing)
 
 Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
@@ -950,9 +1019,9 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 - `max_iter::Int=100`: maximum EM iterations
 - `tol::Float64=1e-6`: convergence tolerance on ELBO change
 - `progress::Bool=true`: show progress bar
-- `control_seq`: optional dynamics-input sequence. `Vector{<:AbstractMatrix}`
+- `latent_inputs`: optional dynamics-input sequence. `Vector{<:AbstractMatrix}`
   for multi-trial (each `(u_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
-- `obs_control_seq`: optional observation-input sequence (same shape) for the
+- `obs_inputs`: optional observation-input sequence (same shape) for the
   obs-side input matrix `D`. Required when `size(obs_model.D, 2) > 0`.
 
 Returns a `Vector{T}` of ELBO values, one per iteration.
@@ -963,21 +1032,21 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    obs_control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    latent_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    obs_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
-    u_seq = _normalize_multitrial_control(
-        control_seq, lds.state_input_dim, tsteps_per_trial, T, "control_seq"
+    latent_inputs = _normalize_multitrial_control(
+        latent_inputs, lds.state_input_dim, tsteps_per_trial, T, "latent_inputs"
     )
-    v_seq = _normalize_multitrial_obs_control(
-        obs_control_seq, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model
+    obs_inputs = _normalize_multitrial_obs_control(
+        obs_inputs, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model
     )
     return _fit_tridiag!(
         lds,
         y;
-        control_seq=u_seq,
-        obs_control_seq=v_seq,
+        latent_inputs=latent_inputs,
+        obs_inputs=obs_inputs,
         max_iter=max_iter,
         tol=tol,
         progress=progress,
@@ -987,8 +1056,8 @@ end
 function _fit_tridiag!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractVector{<:AbstractMatrix{T}};
-    control_seq::AbstractVector{<:AbstractMatrix{T}},
-    obs_control_seq::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
@@ -1037,7 +1106,7 @@ function _fit_tridiag!(
     # and reused across iterations.
     suf = _initialize_td_sufficient_statistics(T, lds, tsteps_per_trial)
     _td_init_const_blocks!(
-        sws_pool[1], lds, tsteps_per_trial, y, control_seq, obs_control_seq
+        sws_pool[1], lds, tsteps_per_trial, y, latent_inputs, obs_inputs
     )
 
     prog = if progress
@@ -1047,22 +1116,9 @@ function _fit_tridiag!(
     end
 
     for _ in 1:max_iter
-        # E-step: smooth + aggregate sufficient stats from x_smooth / p_smooth /
-        # p_smooth_tt1. We skip the legacy `sufficient_statistics!(tfs)` call —
-        # the new aggregator reads smoother outputs directly, so the per-trial
-        # E_zz / E_zz_prev arrays are no longer populated on the hot path.
-        smooth!(lds, tfs, y, sws_pool, control_seq, obs_control_seq)
-        _aggregate_td_suff_stats!(
-            suf, tfs, lds, control_seq, obs_control_seq, y, sws_pool[1]
-        )
 
-        # ELBO uses the same Cholesky factors as the smoother just filled.
-        total_entropy = zero(T)
-        for fs in tfs.FilterSmooths
-            total_entropy += fs.entropy
-        end
-        elbo = calculate_elbo(lds, suf, sws_pool[1], total_entropy)
-        push!(elbos, elbo)
+        # E-step: smooth + aggregate sufficient statistics + compute ELBO
+        estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool, elbos)
 
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
