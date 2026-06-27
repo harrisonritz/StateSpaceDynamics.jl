@@ -199,21 +199,21 @@ end
     return SufficientStatistics{T}(
         # initial conditions
         T(ntrials),                                     # init_n
-        Ref(tol_PD(init_xx)),                           # init_xx (1×1, holds ntrials)
+        _pd_ref(tol_PD(init_xx)),                           # init_xx (1×1, holds ntrials)
         zeros(T, 1, latent_dim),                        # init_xy (1×D, holds Σ x_init)
-        Ref(PD_init(T, latent_dim)),                    # init_yy
+        _pd_ref(PD_init(T, latent_dim)),                    # init_yy
 
         # dynamics model
         T((tsteps - 1) * ntrials),                      # dyn_n
-        Ref(PDMat(init_dyn_xx)),                        # dyn_xx
+        _pd_ref(PDMat(init_dyn_xx)),                        # dyn_xx
         zeros(T, dyn_reg_dim, latent_dim),              # dyn_xy
-        Ref(PD_init(T, latent_dim)),                    # dyn_yy
+        _pd_ref(PD_init(T, latent_dim)),                    # dyn_yy
 
         # observation model
         T(tsteps * ntrials),                            # obs_n
-        Ref(PDMat(init_obs_xx)),                        # obs_xx
+        _pd_ref(PDMat(init_obs_xx)),                        # obs_xx
         obs_xy,                                         # obs_xy
-        Ref(tol_PD(obs_yy)),                            # obs_yy
+        _pd_ref(tol_PD(obs_yy)),                            # obs_yy
     )
 end
 

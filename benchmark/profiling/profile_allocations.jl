@@ -2,16 +2,14 @@
 # Goal: spot any hot-loop function still allocating after the suf-based
 # E-step + IW/MN-MAP M-step unification.
 #
-# Usage: julia --project=benchmarking benchmarking/profile_allocations.jl
+# Usage: julia --project=benchmark/comparison benchmark/profiling/profile_allocations.jl
 #
 # Companion to alloc_profile.jl: that script profiles the high-level E-step
 # stages (smooth! / aggregate / elbo! / mstep!); this one drills down into the
 # inner Newton/BTD kernels and the individual suf-based M-step updates.
 
-if pwd() != @__DIR__
-    using Pkg
-    Pkg.activate("benchmarking")
-end
+using Pkg
+Pkg.activate(joinpath(@__DIR__, "..", "comparison"))
 
 using StateSpaceDynamics
 using LinearAlgebra

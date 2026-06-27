@@ -1,12 +1,12 @@
 using Pkg
-Pkg.activate("benchmarking")
+Pkg.activate(@__DIR__)
 using CSV
 using DataFrames
 using Plots
 using Statistics: median, quantile
 using Measures
 
-function plot_lds_benchmark(fp::AbstractString, sp::AbstractString="benchmarking/results/lds_benchmark_results.svg")
+function plot_lds_benchmark(fp::AbstractString, sp::AbstractString=joinpath(@__DIR__, "results", "lds_benchmark_results.svg"))
 
     # Color palette
     package_colors = Dict(
@@ -113,4 +113,4 @@ function plot_lds_benchmark(fp::AbstractString, sp::AbstractString="benchmarking
 end
 
 # Usage:
-plot_lds_benchmark("benchmarking/results/lds_benchmark_results.csv")
+plot_lds_benchmark(joinpath(@__DIR__, "results", "lds_benchmark_results.csv"))

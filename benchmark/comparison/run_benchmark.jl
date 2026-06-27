@@ -1,5 +1,5 @@
 using Pkg
-Pkg.activate("benchmarking")
+Pkg.activate(@__DIR__)
 
 include("SSD_Benchmark.jl")
 using .SSD_Benchmark
@@ -98,4 +98,4 @@ for row in lds_results
         ))
     end
 end
-CSV.write("benchmarking/results/lds_benchmark_results.csv", df_lds)
+CSV.write(joinpath(@__DIR__, "results", "lds_benchmark_results.csv"), df_lds)

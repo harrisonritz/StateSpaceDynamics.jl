@@ -8,6 +8,14 @@
 # next to the solver that owns it.)
 # =============================================================================
 
+#=
+Wrap a `PDMat` in a `Ref` whose element type matches the workspace field type
+`PDMat{T,Matrix{T}}`. Pinning the eltype here keeps construction working on both 2- and 3-parameter
+PDMats. Reading (`ref[]`) and rebinding (`ref[] = pd`) are unaffected either way. Not my favorite but it works.
+TODO: Consider lowerbounding PDMats to 0.11.40
+=#
+_pd_ref(pd::PDMat{T,Matrix{T}}) where {T} = Base.RefValue{PDMat{T,Matrix{T}}}(pd)
+
 """
     FilterSmooth{T<:Real}
 
@@ -282,9 +290,9 @@ function SmoothWorkspace(
 
     # Placeholder PDMats — rewrapped at the start of every E-step
     # by `compute_smooth_constants!`.
-    R_PD = Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim)))
-    Q_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
-    P0_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
+    R_PD = _pd_ref(PDMat(Matrix{T}(I, obs_dim, obs_dim)))
+    Q_PD = _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
+    P0_PD = _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
 
     tmp_RC = zeros(T, obs_dim, latent_dim)
     tmp_QA = zeros(T, latent_dim, latent_dim)
@@ -674,9 +682,9 @@ end
 
 function LDSConstantCache(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
     return LDSConstantCache{T}(
-        Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim))),         # R_PD placeholder
-        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # Q_PD placeholder
-        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # P0_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, obs_dim, obs_dim))),         # R_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # Q_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # P0_PD placeholder
         zero(T),                                # cP0
         zero(T),                                # cQ
         zero(T),                                # cR
@@ -1066,14 +1074,14 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
         zeros(T, D, D),                 # cov_tmp1
         zeros(T, D, D),                 # cov_tmp2
-        Ref(placeholder_D),             # pd_tmp
-        Ref(placeholder_p),             # obs_pd_tmp
+        _pd_ref(placeholder_D),             # pd_tmp
+        _pd_ref(placeholder_p),             # obs_pd_tmp
         zeros(T, D, ntrials),           # mean_tmp
         p_smooth_shared,                # (D, D, T)
         p_smooth_tt1_shared,            # (D, D, T)
-        Ref(placeholder_D),             # Q_PD
-        Ref(placeholder_D),             # P0_PD
-        Ref(placeholder_p),             # R_PD
+        _pd_ref(placeholder_D),             # Q_PD
+        _pd_ref(placeholder_D),             # P0_PD
+        _pd_ref(placeholder_p),             # R_PD
         placeholder_P0_mu,              # P0_mu
         placeholder_P0_df,              # P0_df
         placeholder_AB,                 # AB_prior
@@ -1083,7 +1091,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_R_mu,               # R_mu
         placeholder_R_df,               # R_df
         zeros(T, D, p),                 # CiR
-        Ref(placeholder_D),             # CiRC
+        _pd_ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
         zeros(T, D, tsteps, ntrials),   # pred_mean
         zeros(T, D, tsteps, ntrials),   # filt_mean

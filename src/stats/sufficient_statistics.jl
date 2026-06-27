@@ -197,17 +197,17 @@ function _initialize_td_sufficient_statistics(
 
     return SufficientStatistics{T}(
         T(ntrials),
-        Ref(PDMat(fill(T(ntrials), 1, 1))),       # init_xx (1×1 = N)
+        _pd_ref(PDMat(fill(T(ntrials), 1, 1))),       # init_xx (1×1 = N)
         zeros(T, 1, D),                            # init_xy
-        Ref(PD_init(D)),                           # init_yy
+        _pd_ref(PD_init(D)),                           # init_yy
         T(total_dyn),
-        Ref(PD_init(dyn_reg_dim)),                 # dyn_xx
+        _pd_ref(PD_init(dyn_reg_dim)),                 # dyn_xx
         zeros(T, dyn_reg_dim, D),                  # dyn_xy
-        Ref(PD_init(D)),                           # dyn_yy
+        _pd_ref(PD_init(D)),                           # dyn_yy
         T(total_obs),
-        Ref(PD_init(obs_reg_dim)),                 # obs_xx
+        _pd_ref(PD_init(obs_reg_dim)),                 # obs_xx
         zeros(T, obs_reg_dim, p),                  # obs_xy
-        Ref(PD_init(p)),                           # obs_yy
+        _pd_ref(PD_init(p)),                           # obs_yy
     )
 end
 

@@ -1,7 +1,7 @@
 # StateSpaceDynamics.jl: A Julia package for probabilistic state space models (SSMs)
 
 [![StateSpaceDynamics-CI](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml/badge.svg)](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml)
-[![Benchmarks](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/benchmark.yml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/benchmark.yml)
+[![Benchmarks](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml)
 [![codecov](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl/graph/badge.svg?token=EQ6B9RJBQ8)](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl)
 [![Aqua QA](https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg)](https://github.com/JuliaTesting/Aqua.jl)
 [![JET](https://img.shields.io/badge/%F0%9F%9B%A9%EF%B8%8F_tested_with-JET.jl-233f9a)](https://github.com/aviatesk/JET.jl)
