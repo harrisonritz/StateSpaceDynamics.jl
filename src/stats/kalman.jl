@@ -130,7 +130,9 @@ end
     obs_reg_dim = latent_dim + 1 + uy_dim
 
     y_wide = reshape(data.y, size(data.y, 1), size(data.y, 2)*size(data.y, 3));
-    ux_wide = reshape(data.ux[:, 1:(end - 1), :], ux_dim, (size(data.ux, 2)-1)*size(data.ux, 3));
+    ux_wide = reshape(
+        data.ux[:, 1:(end - 1), :], ux_dim, (size(data.ux, 2)-1)*size(data.ux, 3)
+    );
     uy_wide = reshape(data.uy, uy_dim, size(data.uy, 2)*size(data.uy, 3));
 
     # Matrix{T}(I, dim, dim) is fully type-stable; `diagm(ones(T, dim))`

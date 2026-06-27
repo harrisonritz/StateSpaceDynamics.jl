@@ -505,7 +505,7 @@ end
     cs::Nothing, expected_dim::Int, tsteps::Int, ::PoissonObservationModel{T}
 ) where {T}
     expected_dim == 0 || error(
-        "Poisson observation model does not support obs_inputs (expected_dim must be 0)",
+        "Poisson observation model does not support obs_inputs (expected_dim must be 0)"
     )
     return zeros(T, 0, tsteps)
 end
@@ -555,7 +555,7 @@ end
     cs::Nothing, expected_dim::Int, tsteps_per_trial, ::Type{T}, ::PoissonObservationModel
 ) where {T<:Real}
     expected_dim == 0 || error(
-        "Poisson observation model does not support obs_inputs (expected_dim must be 0)",
+        "Poisson observation model does not support obs_inputs (expected_dim must be 0)"
     )
     return [zeros(T, 0, Int(Ti)) for Ti in tsteps_per_trial]
 end
