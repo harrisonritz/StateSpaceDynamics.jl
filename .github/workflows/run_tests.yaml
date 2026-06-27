@@ -17,9 +17,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        julia-version: ['lts', '1', 'rc']
+        julia-version: ['lts', '1', 'pre']
 
-    continue-on-error: ${{ matrix.julia-version == 'rc' }}
+    continue-on-error: ${{ matrix.julia-version == 'pre' }}
 
     steps:
       - uses: actions/checkout@v4
