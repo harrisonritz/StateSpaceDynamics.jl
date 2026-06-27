@@ -1700,6 +1700,14 @@ function test_SLDS_mstep_updates_parameters_poisson()
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
 
+    # Warm-start smooth so sample_posterior! has a posterior to draw from. estep!
+    # then re-smooths with the γ weights, filling the posterior covariances the
+    # M-step aggregator reads (estep! → mstep! here; elbo! is skipped).
+    for trial in 1:ntrials
+        w_uniform = ones(Float64, K, tsteps) ./ K
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[trial], w_uniform; ws=slds_ws)
+    end
+
     x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)

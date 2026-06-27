@@ -839,13 +839,15 @@ end
 """
     estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; obs_inputs, latent_inputs, seq_ends)
 
-E-step for SLDS using a single sample from the continuous posterior.
+E-step for SLDS using a single sample from the continuous posterior. Updates both
+variational posteriors in coordinate-ascent order:
 
 - Fills `dl.logL` (`K × sum(T_i)`) with per-state log-likelihoods from sampled continuous states
-- Runs forward-backward via HiddenMarkovModels.jl with `seq_ends` (one storage covers all
-  trials; HMMs.jl `@threads` across trials internally)
-- Smooths continuous states given discrete posteriors per trial
-- Computes sufficient statistics and returns the stochastic ELBO estimate
+- Updates the discrete posterior q(z) via forward-backward (HiddenMarkovModels.jl, one
+  storage covers all trials; HMMs.jl `@threads` across trials internally)
+- Updates the continuous posterior q(x) by running the Laplace/Newton smoother on each
+  trial with the freshly-updated discrete weights `γ`, filling `tfs[*].x_smooth`,
+  `tfs[*].p_smooth`, and `tfs[*].entropy`.
 """
 function estep!(
     slds::SLDS{T,S,O},
@@ -875,8 +877,8 @@ function estep!(
         end
     end
 
-    # Single batched forward-backward (HMMs.jl threads across trials internally).
-    return HMMs.forward_backward!(
+    # Update q(z): single batched forward-backward (HMMs.jl threads across trials).
+    HMMs.forward_backward!(
         fb_storage,
         dl,
         obs_inputs,
@@ -884,11 +886,20 @@ function estep!(
         seq_ends=seq_ends,
         transition_marginals=true,
     )
+
+    # Update q(x): smooth each trial's continuous states with the new discrete weights γ.
+    for trial in 1:ntrials
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
+        smooth!(slds, tfs[trial], y[trial], w; ws=slds_ws)
+    end
+
+    return nothing
 end
 
 """
     elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends)
-Compute the stochastic ELBO for SLDS given a single sample from the continuous posterior.
+Compute the stochastic ELBO for SLDS at the current variational posteriors.
 - Computes E_q[log p(y, x | z)] weighted by discrete posteriors
 - Computes log p(z_1) and log p(z_t | z_{t-1}) weighted by discrete posteriors
 - Subtracts entropies: -H[q(x)] - H[q(z)]
@@ -912,8 +923,6 @@ function elbo!(
         Tsteps = t2 - t1 + 1
         y_trial = y[trial]
         w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
-
-        smooth!(slds, tfs[trial], y_trial, w; ws=slds_ws)
 
         trial_elbo = zero(T)
         x_smooth_trial = tfs[trial].x_smooth
