@@ -21,7 +21,6 @@ Switching LDS (SLDS)
     Fit:            fit!(slds, y)
 =============================================================================#
 
-
 """
     _make_slds_fb_storage(dl, seq_ends)
 
@@ -837,7 +836,6 @@ function sample_posterior(fs::FilterSmooth{T}) where {T<:Real}
     return sample_posterior(Random.GLOBAL_RNG, fs)
 end
 
-
 """
     estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; obs_inputs, latent_inputs, seq_ends)
 
@@ -878,12 +876,15 @@ function estep!(
     end
 
     # Single batched forward-backward (HMMs.jl threads across trials internally).
-    HMMs.forward_backward!(
-        fb_storage, dl, obs_inputs, latent_inputs; seq_ends=seq_ends, transition_marginals=true,
+    return HMMs.forward_backward!(
+        fb_storage,
+        dl,
+        obs_inputs,
+        latent_inputs;
+        seq_ends=seq_ends,
+        transition_marginals=true,
     )
-
 end
-
 
 """
     elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends)
@@ -902,7 +903,6 @@ function elbo(
     slds_ws::SLDSSmoothWorkspace{T};
     seq_ends::AbstractVector{Int},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-
     total_elbo = zero(T)
     ntrials = length(y)
     K = length(slds.LDSs)
@@ -955,10 +955,7 @@ function elbo(
     end
 
     return total_elbo
-
 end
-
-
 
 """
     mstep!(slds, tfs, fb_storage, y, sws; obs_inputs, seq_ends)
@@ -1091,7 +1088,7 @@ function fit!(
     end
 
     for iter in 1:max_iter
-        
+
         # Sample one continuous-state trajectory per trial from the posterior.
         sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 

@@ -2,10 +2,9 @@
 Poisson Observations
 
     E-Step: Q_obs!(sws, lds, suf)
-    
+
     M-Step: update_observation_model!(plds, tfs, y, sws_pool, w)
 =============================================================================#
-
 
 """
     Q_obs!(sws, lds, E_z, p_smooth, y; weights=nothing)
@@ -80,8 +79,6 @@ function Q_obs!(
 
     return Q_val
 end
-
-
 
 """
     update_observation_model!(plds, tfs, y, w)

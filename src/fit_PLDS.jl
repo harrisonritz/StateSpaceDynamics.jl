@@ -20,7 +20,6 @@ Poisson LDS
     Fit:            fit!(plds, y)
 =============================================================================#
 
-
 """
     joint_loglikelihood(
         x::AbstractMatrix{U},
@@ -358,8 +357,6 @@ function Hessian!(
     return ws.H_sparse
 end
 
-
-
 """
     gradient_observation_model_single_trial!(grad, C, d, E_z, p_smooth, y, weights)
 
@@ -516,8 +513,6 @@ function gradient_observation_model!(
     @. grad = -grad
     return grad
 end
-
-
 
 """
     mstep!(plds, suf, tfs, y, sws)
@@ -966,15 +961,16 @@ function estep!(
     obs_inputs::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
-    tol::T=T(1e-6)
+    tol::T=T(1e-6),
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
 
     # smooth each trial
     smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
 
     # compute the sufficient statistics
-    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
-
+    return _aggregate_td_suff_stats!(
+        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
+    )
 end
 
 """
@@ -1023,7 +1019,9 @@ function fit!(
     suf = _initialize_td_sufficient_statistics(T, plds, tsteps_per_trial)
     latent_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
     obs_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
-    _td_init_const_blocks!(sws_pool[1], plds, tsteps_per_trial, y, latent_inputs, obs_inputs)
+    _td_init_const_blocks!(
+        sws_pool[1], plds, tsteps_per_trial, y, latent_inputs, obs_inputs
+    )
 
     elbos = Vector{T}(undef, max_iter)
 
@@ -1052,7 +1050,7 @@ function fit!(
             max_iter=newton_max_iter,
             tol=T(newton_tol),
         )
-                
+
         # compute the ELBO
         elbos[iter] = elbo(plds, suf, tfs, y, sws_pool)
 

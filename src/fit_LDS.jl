@@ -19,7 +19,6 @@ Gaussian LDS
     Fit:            fit!(lds, y)
 =============================================================================#
 
-
 """
 Linear Dynamical System (LDS) implementation with Gaussian state and observation models.
 This module defines functions specific to the Gaussian observation model: log-likelihoods,
@@ -558,7 +557,9 @@ function smooth!(
         @spawn begin
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws, latent_inputs[trial], obs_inputs[trial])
+                smooth!(
+                    lds, tfs[trial], y[trial], sws, latent_inputs[trial], obs_inputs[trial]
+                )
             end
         end
     end
@@ -851,8 +852,6 @@ function smooth!(
     return smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 end
 
-
-
 """
     estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool; max_iter=20, tol=1e-6)
 
@@ -877,10 +876,10 @@ function estep!(
     smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 
     # compute the sufficient statistics
-    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
-
+    return _aggregate_td_suff_stats!(
+        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
+    )
 end
-
 
 # y/u/v as Matrices
 function estep!(
@@ -897,12 +896,10 @@ function estep!(
     smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 
     # compute the sufficient statistics
-    _aggregate_td_suff_stats!(suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1])
-
+    return _aggregate_td_suff_stats!(
+        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
+    )
 end
-
-
-
 
 """
     elbo(lds, suf, sws)
@@ -962,7 +959,6 @@ function elbo(
 
     return Q_total + prior_term + total_entropy
 end
-
 
 """
     mstep!(lds, suf::SufficientStatistics, sws)
@@ -1084,9 +1080,7 @@ function _fit_tridiag!(
     # Data-only constants (Σ y y', Σ y, Σ u u' …) are precomputed here once
     # and reused across iterations.
     suf = _initialize_td_sufficient_statistics(T, lds, tsteps_per_trial)
-    _td_init_const_blocks!(
-        sws_pool[1], lds, tsteps_per_trial, y, latent_inputs, obs_inputs
-    )
+    _td_init_const_blocks!(sws_pool[1], lds, tsteps_per_trial, y, latent_inputs, obs_inputs)
 
     prog = if progress
         Progress(max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true)
@@ -1096,11 +1090,11 @@ function _fit_tridiag!(
 
     for iter in 1:max_iter
 
-        # E-step: smooth + aggregate sufficient statistics + compute ELBO
-        estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool, elbos)
+        # E-step: smooth + aggregate sufficient statistics
+        estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool)
 
         # compute the ELBO
-        total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init = zero(T))
+        total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
         elbos[iter] = elbo(lds, suf, sws_pool[1], total_entropy)
 
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.

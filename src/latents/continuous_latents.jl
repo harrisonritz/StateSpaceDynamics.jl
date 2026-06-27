@@ -9,7 +9,6 @@ Continuous (Linear Gaussian) latents
             update_Q!(lds, suf, sws)
 =============================================================================#
 
-
 """
     Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
 

@@ -1049,7 +1049,6 @@ function test_SLDS_estep_basic()
 
     elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
-
     @test isfinite(elbo)
 
     for trial in 1:ntrials
@@ -1240,7 +1239,6 @@ function test_SLDS_estep_elbo_components()
     )
 
     elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
-
 
     @test isfinite(elbo)
 
@@ -1669,7 +1667,6 @@ function test_SLDS_estep_basic_poisson()
     )
 
     elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
-
 
     @test isfinite(elbo)
 

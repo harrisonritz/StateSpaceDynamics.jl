@@ -55,7 +55,6 @@ include("fit_LDS.jl")
 include("fit_PLDS.jl")
 include("fit_SLDS.jl")
 
-
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
 export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError

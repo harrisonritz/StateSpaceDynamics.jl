@@ -2,11 +2,10 @@
 Gaussian Observations
 
     E-Step: Q_obs!(sws, lds, suf)
-    
+
     M-Step: update_C_d!(lds, suf, sws)
             update_R!(lds, suf, sws)
 =============================================================================#
-
 
 """
     Q_obs!(ws, lds, E_z, E_zz, y, v)
@@ -130,9 +129,6 @@ function Q_obs!(
     return T(-0.5) * (T(obs_n) * (const_term + log_det_R) + tr(S_obs))
 end
 
-
-
-        
 function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}

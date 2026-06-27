@@ -725,6 +725,5 @@ function test_kalman_marginal_loglikelihood_internals()
     @test SSD.marginal_loglikelihood(lds, y) ≈ ll_ref
     y_vec = [y[:, :, n] for n in 1:N]
     @test SSD.marginal_loglikelihood(lds, y_vec) ≈ ll_ref
-    @test SSD.marginal_loglikelihood(lds, y[:, :, 1]) ≈
-        SSD.loglikelihood(lds, y[:, :, 1])
+    @test SSD.marginal_loglikelihood(lds, y[:, :, 1]) ≈ SSD.loglikelihood(lds, y[:, :, 1])
 end
