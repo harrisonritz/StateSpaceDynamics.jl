@@ -46,24 +46,24 @@ tsteps_per_trial = fill(T, N)
 T_max = maximum(tsteps_per_trial)
 tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
 sws_pool = [
-    StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max; u_dim=0, d_dim=0)
+    StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max; ux_dim=0, uy_dim=0)
     for _ in 1:Threads.maxthreadid()
 ]
 suf = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, lds, tsteps_per_trial)
-u_seq = [zeros(0, T) for _ in 1:N]
-v_seq = [zeros(0, T) for _ in 1:N]
-StateSpaceDynamics._td_init_const_blocks!(sws_pool[1], lds, tsteps_per_trial, y, u_seq, v_seq)
+ux_seq = [zeros(0, T) for _ in 1:N]
+uy_seq = [zeros(0, T) for _ in 1:N]
+StateSpaceDynamics._td_init_const_blocks!(sws_pool[1], lds, tsteps_per_trial, y, ux_seq, uy_seq)
 
 println("\n\n[compute_smooth_constants! (1 call)]")
 display(@benchmark StateSpaceDynamics.compute_smooth_constants!($sws_pool[1], $lds))
 
 println("\n[smooth! multi-trial (1 E-step)]")
-display(@benchmark StateSpaceDynamics.smooth!($lds, $tfs, $y, $sws_pool, $u_seq, $v_seq))
+display(@benchmark StateSpaceDynamics.smooth!($lds, $tfs, $y, $sws_pool, $ux_seq, $uy_seq))
 
 println("\n[_aggregate_td_suff_stats! (1 call)]")
-StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool, u_seq, v_seq)
+StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool, ux_seq, uy_seq)
 display(@benchmark StateSpaceDynamics._aggregate_td_suff_stats!(
-    $suf, $tfs, $lds, $u_seq, $v_seq, $y, $sws_pool[1]
+    $suf, $tfs, $lds, $ux_seq, $uy_seq, $y, $sws_pool[1]
 ))
 
 println("\n[elbo! (1 call)]")

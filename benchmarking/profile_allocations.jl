@@ -71,17 +71,17 @@ y_multi = [y]
 tsteps_per_trial = [tsteps]
 
 # Workspace pool + FilterSmooth + suff-stats aggregator, set up exactly as
-# `_fit_tridiag!` does for the no-input (u_dim = d_dim = 0) case.
+# `_fit_tridiag!` does for the no-input (ux_dim = uy_dim = 0) case.
 tfs = StateSpaceDynamics.initialize_FilterSmooth(model, tsteps_per_trial)
 sws_pool = [
-    StateSpaceDynamics.SmoothWorkspace(T, latent_dim, obs_dim, T_max; u_dim=0, d_dim=0)
+    StateSpaceDynamics.SmoothWorkspace(T, latent_dim, obs_dim, T_max; ux_dim=0, uy_dim=0)
     for _ in 1:Threads.maxthreadid()
 ]
 sws = sws_pool[1]
 suf = StateSpaceDynamics._initialize_td_sufficient_statistics(T, model, tsteps_per_trial)
-u_seq = [zeros(T, 0, tsteps)]
-v_seq = [zeros(T, 0, tsteps)]
-StateSpaceDynamics._td_init_const_blocks!(sws, model, tsteps_per_trial, y_multi, u_seq, v_seq)
+ux_seq = [zeros(T, 0, tsteps)]
+uy_seq = [zeros(T, 0, tsteps)]
+StateSpaceDynamics._td_init_const_blocks!(sws, model, tsteps_per_trial, y_multi, ux_seq, uy_seq)
 
 # ---- E-step stages ----------------------------------------------------------
 
@@ -92,19 +92,19 @@ display(result_smooth)
 
 println("\n[smooth! - multi-trial (1 E-step)]")
 result_smooth_multi = @benchmark StateSpaceDynamics.smooth!(
-    $model, $tfs, $y_multi, $sws_pool, $u_seq, $v_seq
+    $model, $tfs, $y_multi, $sws_pool, $ux_seq, $uy_seq
 )
 display(result_smooth_multi)
 
 println("\n[_aggregate_td_suff_stats! - 1 call]")
-StateSpaceDynamics.smooth!(model, tfs, y_multi, sws_pool, u_seq, v_seq)
+StateSpaceDynamics.smooth!(model, tfs, y_multi, sws_pool, ux_seq, uy_seq)
 result_agg = @benchmark StateSpaceDynamics._aggregate_td_suff_stats!(
-    $suf, $tfs, $model, $u_seq, $v_seq, $y_multi, $sws
+    $suf, $tfs, $model, $ux_seq, $uy_seq, $y_multi, $sws
 )
 display(result_agg)
 
 # Refresh the aggregated stats so the suf-based benches below read valid data.
-StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, model, u_seq, v_seq, y_multi, sws)
+StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, model, ux_seq, uy_seq, y_multi, sws)
 
 println("\n[elbo! - suf-based]")
 total_entropy = sum(fsi.entropy for fsi in tfs.FilterSmooths)

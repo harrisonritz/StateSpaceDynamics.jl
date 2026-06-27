@@ -102,20 +102,20 @@ function marginal_loglik(lds, y)
     tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
     sws_pool = [
         StateSpaceDynamics.SmoothWorkspace(
-            Float64, lds.latent_dim, lds.obs_dim, size(y, 2); u_dim=0, d_dim=0,
+            Float64, lds.latent_dim, lds.obs_dim, size(y, 2); ux_dim=0, uy_dim=0,
         ) for _ in 1:Threads.maxthreadid()
     ]
     suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
         Float64, lds, tsteps_per_trial,
     )
-    u_seq = [zeros(0, size(y, 2))]
-    v_seq = [zeros(0, size(y, 2))]
+    ux_seq = [zeros(0, size(y, 2))]
+    uy_seq = [zeros(0, size(y, 2))]
     StateSpaceDynamics._td_init_const_blocks!(
-        sws_pool[1], lds, tsteps_per_trial, [y], u_seq, v_seq,
+        sws_pool[1], lds, tsteps_per_trial, [y], ux_seq, uy_seq,
     )
-    StateSpaceDynamics.smooth!(lds, tfs, [y], sws_pool, u_seq, v_seq)
+    StateSpaceDynamics.smooth!(lds, tfs, [y], sws_pool, ux_seq, uy_seq)
     StateSpaceDynamics._aggregate_td_suff_stats!(
-        suf, tfs, lds, u_seq, v_seq, [y], sws_pool[1],
+        suf, tfs, lds, ux_seq, uy_seq, [y], sws_pool[1],
     )
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
     return StateSpaceDynamics.elbo!(lds, suf, sws_pool[1], total_entropy)
