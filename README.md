@@ -1,6 +1,6 @@
 # StateSpaceDynamics.jl: A Julia package for probabilistic state space models (SSMs)
 
-[![StateSpaceDynamics-CI](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml/badge.svg)](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml)
+[![StateSpaceDynamics-CI](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/run_tests.yaml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/run_tests.yaml)
 [![Benchmarks](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml)
 [![codecov](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl/graph/badge.svg?token=EQ6B9RJBQ8)](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl)
 [![Aqua QA](https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg)](https://github.com/JuliaTesting/Aqua.jl)
@@ -13,7 +13,7 @@
 
 ## Description
 
-StateSpaceDynamics.jl is a comprehensive and self-contained Julia package for working with probabilistic state space models (SSMs). It implements a wide range of state-space models, taking inspiration from  [SSM](https://github.com/lindermanlab/ssm) and the [Dynamax](https://probml.github.io/dynamax/) packages written in Python by the Linderman Lab. This package is designed to be fast, flexible, and all-encompassing, leveraging Julia's speed and expressiveness to provide researchers and data scientists with a powerful toolkit for state-space modeling.
+StateSpaceDynamics.jl is a fast, self-contained Julia package for linear dynamical systems (LDS) and related latent state-space models. It covers Gaussian and Poisson LDS, Switching LDS (SLDS), and Probabilistic PCA, taking inspiration from [SSM](https://github.com/lindermanlab/ssm) (Linderman Lab) and [Dynamax](https://probml.github.io/dynamax/). It leverages Julia's speed and expressiveness to give researchers and data scientists a powerful, efficient toolkit for latent state-space modeling.
 
 This package is geared towards applications in neuroscience, so the models incorporate a certain neuroscience flavor (e.g., many of our models are trialized as common in experimental paradigms). However, the models are general enough to be used in other fields such as finance, robotics, and many other domains involving sequential data analysis.
 

@@ -10,6 +10,7 @@ on:
   pull_request_target:
     branches:
       - main
+  workflow_dispatch:  # manual run from the Actions tab
 
 permissions:
   pull-requests: write
