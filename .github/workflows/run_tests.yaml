@@ -1,5 +1,14 @@
-name: SSM-CI
-on: [push, pull_request]
+name: SSD-CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
