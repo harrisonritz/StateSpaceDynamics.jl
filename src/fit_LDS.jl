@@ -12,7 +12,7 @@ Gaussian LDS
     Smooth:         smooth!(lds, fs, y, sws)
                     smooth!(lds, tfs, y, sws_pool)
 
-    ELBO:           elbo(lds, suf, sws, total_entropy)
+    ELBO:           elbo!(lds, suf, sws, total_entropy)
 
     M-Step:         mstep!(lds, suf, sws)
 
@@ -902,7 +902,7 @@ function estep!(
 end
 
 """
-    elbo(lds, suf, sws)
+    elbo!(lds, suf, sws, total_entropy)
 
 Total ELBO from aggregated sufficient statistics. Computes the same quantity
 as the legacy `elbo(lds, tfs, y, sws_pool, ...)` but in
@@ -910,7 +910,7 @@ O(D³ + p²·D) instead of O(N·T·p²·D). The Gaussian-posterior entropy comes
 from each trial's `fs.entropy` (filled by the smoother) and is summed by
 the caller before this function is invoked.
 """
-function elbo(
+function elbo!(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
@@ -1095,7 +1095,7 @@ function _fit_tridiag!(
 
         # compute the ELBO
         total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
-        elbos[iter] = elbo(lds, suf, sws_pool[1], total_entropy)
+        elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])

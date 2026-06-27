@@ -118,7 +118,7 @@ function marginal_loglik(lds, y)
         suf, tfs, lds, u_seq, v_seq, [y], sws_pool[1],
     )
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
-    return StateSpaceDynamics.elbo(lds, suf, sws_pool[1], total_entropy)
+    return StateSpaceDynamics.elbo!(lds, suf, sws_pool[1], total_entropy)
 end
 
 ll_orig = marginal_loglik(true_lds, y_true)

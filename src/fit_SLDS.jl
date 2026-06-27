@@ -887,7 +887,7 @@ function estep!(
 end
 
 """
-    elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends)
+    elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends)
 Compute the stochastic ELBO for SLDS given a single sample from the continuous posterior.
 - Computes E_q[log p(y, x | z)] weighted by discrete posteriors
 - Computes log p(z_1) and log p(z_t | z_{t-1}) weighted by discrete posteriors
@@ -895,7 +895,7 @@ Compute the stochastic ELBO for SLDS given a single sample from the continuous p
 Returns a scalar ELBO value.
 
 """
-function elbo(
+function elbo!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
@@ -1107,7 +1107,7 @@ function fit!(
         )
 
         # Compute stochastic ELBO estimate for this iteration.
-        elbos[iter] = elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends)
+        elbos[iter] = elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends)
 
         # M-step: update discrete and continuous parameters.
         mstep!(slds, tfs, fb_storage, dl, y, sws; obs_inputs=obs_inputs, seq_ends=seq_ends)

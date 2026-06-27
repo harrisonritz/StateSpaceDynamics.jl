@@ -11,7 +11,7 @@ Poisson LDS
     Smooth:         smooth!(lds, fs, y, sws)
                     smooth!(lds, tfs, y, sws_pool)
 
-    ELBO:           elbo(plds, suf, tfs, y, sws_pool)
+    ELBO:           elbo!(plds, suf, tfs, y, sws_pool)
 
     E-Step:         estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool)
 
@@ -540,7 +540,7 @@ function mstep!(
 end
 
 """
-    elbo(plds, suf, tfs, y, sws_pool)
+    elbo!(plds, suf, tfs, y, sws_pool)
 
 Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 
@@ -552,7 +552,7 @@ Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 * `IWPrior` log-prior contributions on `Q` and `P0`, and the MN log-prior
   trace term on `[C d]` to match the LBFGS objective.
 """
-function elbo(
+function elbo!(
     plds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
@@ -1052,7 +1052,7 @@ function fit!(
         )
 
         # compute the ELBO
-        elbos[iter] = elbo(plds, suf, tfs, y, sws_pool)
+        elbos[iter] = elbo!(plds, suf, tfs, y, sws_pool)
 
         # M-step: update state-side suff-stats from suf, update Poisson emission via LBFGS
         mstep!(plds, suf, tfs, y, sws_pool)

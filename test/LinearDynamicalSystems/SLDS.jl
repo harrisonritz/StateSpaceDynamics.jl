@@ -1047,7 +1047,7 @@ function test_SLDS_estep_basic()
         seq_ends=seq_ends,
     )
 
-    elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 
@@ -1238,7 +1238,7 @@ function test_SLDS_estep_elbo_components()
         seq_ends=seq_ends,
     )
 
-    elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 
@@ -1666,7 +1666,7 @@ function test_SLDS_estep_basic_poisson()
         seq_ends=seq_ends,
     )
 
-    elbo = StateSpaceDynamics.elbo(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 

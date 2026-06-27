@@ -66,9 +66,9 @@ display(@benchmark StateSpaceDynamics._aggregate_td_suff_stats!(
     $suf, $tfs, $lds, $u_seq, $v_seq, $y, $sws_pool[1]
 ))
 
-println("\n[calculate_elbo (1 call)]")
+println("\n[elbo! (1 call)]")
 total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
-display(@benchmark StateSpaceDynamics.calculate_elbo($lds, $suf, $sws_pool[1], $total_entropy))
+display(@benchmark StateSpaceDynamics.elbo!($lds, $suf, $sws_pool[1], $total_entropy))
 
 println("\n[mstep! (1 call)]")
 display(@benchmark StateSpaceDynamics.mstep!($lds, $suf, $sws_pool[1]))

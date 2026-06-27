@@ -61,7 +61,7 @@ for iter in 1:MAX_EM
 
     # ELBO via the suf-based pipeline (same path `fit!` uses)
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
-    elbo = StateSpaceDynamics.calculate_elbo(lds_fit, suf, sws_pool[1], total_entropy)
+    elbo = StateSpaceDynamics.elbo!(lds_fit, suf, sws_pool[1], total_entropy)
     push!(elbos, elbo)
 
     # Marginal log-likelihood via Kalman filter (exact for Gaussian LDS)
@@ -94,7 +94,7 @@ end
 # Diagnostic — what's the expected offset?
 obs_n = N * T_steps
 n_active = N * T_steps * D
-# Q_state in calculate_elbo is missing -0.5 * (N + dyn_n) * D * log(2π).
+# Q_state in elbo! is missing -0.5 * (N + dyn_n) * D * log(2π).
 # Entropy contributes +0.5 * n_active * log(2π).
 # Q_obs contributes -0.5 * obs_n * p * log(2π) — present.
 # True marg_LL has -0.5 * obs_n * p * log(2π) only (no latent 2π's since x is
