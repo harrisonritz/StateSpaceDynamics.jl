@@ -133,7 +133,8 @@ display(result_csc)
 # These operate on the per-timestep latent trajectory; rebuild the smooth
 # constants first so the Cholesky-derived buffers in `sws` are populated.
 StateSpaceDynamics.compute_smooth_constants!(sws, model)
-x_mat = StateSpaceDynamics.smooth!(model, fs, y, sws)  # returns x_smooth (D × T)
+StateSpaceDynamics.smooth!(model, fs, y, sws)
+x_mat = fs.x_smooth  # (D × T) smoothed latent trajectory
 
 println("\n[Gradient!]")
 result_grad = @benchmark StateSpaceDynamics.Gradient!($sws, $model, $y, $x_mat)

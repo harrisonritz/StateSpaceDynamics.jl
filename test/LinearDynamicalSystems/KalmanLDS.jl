@@ -250,7 +250,7 @@ function test_td_fit_with_dynamics_input()
     lds_true = LinearDynamicalSystem(sm_true, om_true)
 
     u_seq = [randn(rng, u_dim, Tt) for _ in 1:N]
-    _, y_seq = rand(lds_true, fill(Tt, N); control_seq=u_seq)
+    _, y_seq = rand(lds_true, fill(Tt, N); latent_inputs=u_seq)
 
     # Fit from a perturbed init.
     sm_init = GaussianStateModel(;
@@ -266,7 +266,7 @@ function test_td_fit_with_dynamics_input()
     )
     lds_fit = LinearDynamicalSystem(sm_init, om_init)
 
-    elbos = fit!(lds_fit, y_seq; control_seq=u_seq, max_iter=80, progress=false)
+    elbos = fit!(lds_fit, y_seq; latent_inputs=u_seq, max_iter=80, progress=false)
 
     @test all(diff(elbos) .>= -1e-4)        # ~monotone
     # B is identifiable up to the same gauge as A/C (rotation of latent space);
@@ -290,7 +290,7 @@ function test_td_fit_with_dynamics_input()
 end
 
 function test_td_sampling_zero_input_matches_no_control()
-    # With control_seq present but u ≡ 0 and B = 0, sampling should match
+    # With latent_inputs present but u ≡ 0 and B = 0, sampling should match
     # the no-control case (same RNG seed).
     D, p, Tt = 3, 4, 25
     rng = MersenneTwister(7)
@@ -309,9 +309,9 @@ function test_td_sampling_zero_input_matches_no_control()
 
     u_zero = zeros(2, Tt)
     rng1 = MersenneTwister(42)
-    x1, y1 = rand(rng1, lds, Tt; control_seq=u_zero)
+    x1, y1 = rand(rng1, lds, Tt; latent_inputs=u_zero)
 
-    # Reset state-model to a 0-column B and call without control_seq.
+    # Reset state-model to a 0-column B and call without latent_inputs.
     sm2 = GaussianStateModel(; A=sm.A, Q=sm.Q, x0=sm.x0, P0=sm.P0, b=sm.b)
     lds2 = LinearDynamicalSystem(sm2, om)
     rng2 = MersenneTwister(42)
