@@ -465,7 +465,7 @@ end
 # Control-sequence normalization helpers. The public `latent_inputs`/`obs_inputs`
 # kwargs accept either `nothing` (no inputs — must match a zero-column `B`/`D`)
 # or per-trial matrices. Internally every sampler/smoother/M-step expects an
-# `AbstractMatrix{T}` of shape `(u_dim, T_i)` (possibly `0 × T_i`), so these
+# `AbstractMatrix{T}` of shape `(ux_dim, T_i)` (possibly `0 × T_i`), so these
 # helpers validate the supplied sequences and canonicalize on the way in.
 # ============================================================================
 

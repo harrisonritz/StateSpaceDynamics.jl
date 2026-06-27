@@ -10,12 +10,12 @@ Continuous (Linear Gaussian) latents
 =============================================================================#
 
 """
-    Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
+    Q_state!(ws, lds, E_z, E_zz, E_zz_prev, ux)
 
 State Q-term for an LDS with affine dynamics `x_t ~ N(A x_{t-1} + b + B u_{t-1}, Q)`.
 In-place version of `Q_state` that uses pre-allocated buffers from `SmoothWorkspace`.
-Uses cached Cholesky factors from `compute_smooth_constants!`. `u` is the per-trial
-dynamics-control matrix `(u_dim, T_i)`; pass a `0×T_i` matrix when no inputs.
+Uses cached Cholesky factors from `compute_smooth_constants!`. `ux` is the per-trial
+dynamics-control matrix `(ux_dim, T_i)`; pass a `0×T_i` matrix when no inputs.
 """
 function Q_state!(
     ws::SmoothWorkspace{T},
@@ -23,11 +23,11 @@ function Q_state!(
     E_z::AbstractMatrix{T},
     E_zz::AbstractArray{T,3},
     E_zz_prev::AbstractArray{T,3},
-    u::AbstractMatrix{T},
+    ux::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tstep = size(E_z, 2)
     D = lds.latent_dim
-    u_dim = size(u, 1)
+    ux_dim = size(ux, 1)
     A = lds.state_model.A
     b = lds.state_model.b
     B = lds.state_model.B
@@ -67,14 +67,14 @@ function Q_state!(
     fill!(sum_mu_t, zero(T))
     fill!(sum_mu_tm1, zero(T))
 
-    # Input-specific accumulators (only allocated when u_dim > 0). Allocating
+    # Input-specific accumulators (only allocated when ux_dim > 0). Allocating
     # 0-element arrays here would still cost an `Array` struct each call,
     # which adds up to thousands of trivial allocations across a fit.
-    has_input = u_dim > 0
-    sum_u = has_input ? zeros(T, u_dim) : Vector{T}()
-    sum_mu_t_u = has_input ? zeros(T, D, u_dim) : Matrix{T}(undef, 0, 0)
-    sum_mu_tm1_u = has_input ? zeros(T, D, u_dim) : Matrix{T}(undef, 0, 0)
-    sum_uu = has_input ? zeros(T, u_dim, u_dim) : Matrix{T}(undef, 0, 0)
+    has_input = ux_dim > 0
+    sum_u = has_input ? zeros(T, ux_dim) : Vector{T}()
+    sum_mu_t_u = has_input ? zeros(T, D, ux_dim) : Matrix{T}(undef, 0, 0)
+    sum_mu_tm1_u = has_input ? zeros(T, D, ux_dim) : Matrix{T}(undef, 0, 0)
+    sum_uu = has_input ? zeros(T, ux_dim, ux_dim) : Matrix{T}(undef, 0, 0)
 
     @views for t in 2:tstep
         sum_E_zz .+= E_zz[:, :, t]
@@ -84,11 +84,11 @@ function Q_state!(
         sum_mu_tm1 .+= E_z[:, t - 1]
 
         if has_input
-            u_tm1 = u[:, t - 1]
-            sum_u .+= u_tm1
-            BLAS.ger!(one(T), E_z[:, t], u_tm1, sum_mu_t_u)
-            BLAS.ger!(one(T), E_z[:, t - 1], u_tm1, sum_mu_tm1_u)
-            BLAS.ger!(one(T), u_tm1, u_tm1, sum_uu)
+            ux_tm1 = ux[:, t - 1]
+            sum_u .+= ux_tm1
+            BLAS.ger!(one(T), E_z[:, t], ux_tm1, sum_mu_t_u)
+            BLAS.ger!(one(T), E_z[:, t - 1], ux_tm1, sum_mu_tm1_u)
+            BLAS.ger!(one(T), ux_tm1, ux_tm1, sum_uu)
         end
     end
 
@@ -111,12 +111,12 @@ function Q_state!(
     # Input cross terms (`Bu_{t-1} := B u_{t-1}`). All terms here are
     # contributions to `Σ_t E[(x_t - A x_{t-1} - b - B u_{t-1})(...)']` that
     # involve at least one `B u_{t-1}` factor.
-    if u_dim > 0
+    if ux_dim > 0
         # -= sum_mu_t_u · B'  and  -= B · sum_mu_t_u'
         mul!(temp, sum_mu_t_u, B', -one(T), one(T))
         mul!(temp, B, sum_mu_t_u', -one(T), one(T))
         # += (A · sum_mu_tm1_u) · B'  and  += B · (A · sum_mu_tm1_u)'
-        # Intermediate has shape (D × u_dim); no fixed-size workspace buffer.
+        # Intermediate has shape (D × ux_dim); no fixed-size workspace buffer.
         A_sumXU = A * sum_mu_tm1_u
         mul!(temp, A_sumXU, B', one(T), one(T))
         mul!(temp, B, A_sumXU', one(T), one(T))
@@ -125,7 +125,7 @@ function Q_state!(
         mul!(temp, reshape(b, :, 1), reshape(B_sumu, 1, :), one(T), one(T))
         mul!(temp, reshape(B_sumu, :, 1), reshape(b, 1, :), one(T), one(T))
         # += B · sum_uu · B'
-        B_sumuu = B * sum_uu  # D × u_dim
+        B_sumuu = B * sum_uu  # D × ux_dim
         mul!(temp, B_sumuu, B', one(T), one(T))
     end
 
@@ -145,8 +145,8 @@ function Q_state!(
     E_zz::AbstractArray{T,3},
     E_zz_prev::AbstractArray{T,3},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    u = zeros(T, 0, size(E_z, 2))
-    return Q_state!(ws, lds, E_z, E_zz, E_zz_prev, u)
+    ux = zeros(T, 0, size(E_z, 2))
+    return Q_state!(ws, lds, E_z, E_zz, E_zz_prev, ux)
 end
 
 """
@@ -154,7 +154,7 @@ end
 
 Total log-likelihood Q-state term across all trials, computed from the
 aggregated sufficient statistics in `suf`. Replaces the per-trial,
-per-timestep loops of the legacy `Q_state!(sws, lds, E_z, E_zz, E_zz_prev, u)`.
+per-timestep loops of the legacy `Q_state!(sws, lds, E_z, E_zz, E_zz_prev, ux)`.
 
 Identical value (up to floating-point) to summing the legacy form across
 trials.
@@ -167,8 +167,8 @@ function Q_state!(
     b = lds.state_model.b
     B = lds.state_model.B
     x0 = lds.state_model.x0
-    u_dim = lds.state_input_dim
-    dyn_reg_dim = D + 1 + u_dim
+    ux_dim = lds.state_input_dim
+    dyn_reg_dim = D + 1 + ux_dim
 
     Q_U = sws.Q_PD[].chol.U
     P0_U = sws.P0_PD[].chol.U
@@ -199,7 +199,7 @@ function Q_state!(
     W = view(sws.AB, :, 1:dyn_reg_dim)
     copyto!(view(W, :, 1:D), A)
     copyto!(view(W, :, D + 1), b)
-    if u_dim > 0
+    if ux_dim > 0
         copyto!(view(W, :, (D + 2):dyn_reg_dim), B)
     end
 
@@ -274,7 +274,7 @@ function update_A_b!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
     D = lds.latent_dim
-    u_dim = lds.state_input_dim
+    ux_dim = lds.state_input_dim
     AB_prior = lds.state_model.AB_prior
 
     if AB_prior === nothing
@@ -293,8 +293,8 @@ function update_A_b!(
 
     copyto!(lds.state_model.A, view(W, :, 1:D))
     copyto!(lds.state_model.b, view(W, :, D + 1))
-    if u_dim > 0
-        copyto!(lds.state_model.B, view(W, :, (D + 2):(D + 1 + u_dim)))
+    if ux_dim > 0
+        copyto!(lds.state_model.B, view(W, :, (D + 2):(D + 1 + ux_dim)))
     end
     return nothing
 end
@@ -304,14 +304,14 @@ function update_Q!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[4] || return nothing
     D = lds.latent_dim
-    u_dim = lds.state_input_dim
+    ux_dim = lds.state_input_dim
 
     # sws.AB is exactly (D × dyn_reg_dim); no view needed.
     W = sws.AB
     copyto!(view(W, :, 1:D), lds.state_model.A)
     copyto!(view(W, :, D + 1), lds.state_model.b)
-    if u_dim > 0
-        copyto!(view(W, :, (D + 2):(D + 1 + u_dim)), lds.state_model.B)
+    if ux_dim > 0
+        copyto!(view(W, :, (D + 2):(D + 1 + ux_dim)), lds.state_model.B)
     end
 
     # Residual scatter S = dyn_yy - W·dyn_xy - dyn_xy'·W' + W·dyn_xx·W'

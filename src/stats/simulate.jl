@@ -7,38 +7,38 @@ function _sample_trial!(
     state_params,
     obs_params,
     obs_model::GaussianObservationModel,
-    u_trial::AbstractMatrix,
-    v_trial::AbstractMatrix,
+    ux_trial::AbstractMatrix,
+    uy_trial::AbstractMatrix,
 )
     tsteps = size(x_trial, 2)
 
     # Initial state. The observation at t=1 includes the obs-input term D·v_1
-    # when v_trial has nonzero rows; zero-row matmul is a no-op.
+    # when uy_trial has nonzero rows; zero-row matmul is a no-op.
     x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
     y_trial[:, 1] = rand(
         rng,
         MvNormal(
-            obs_params.C * x_trial[:, 1] + obs_params.d + obs_params.D * v_trial[:, 1],
+            obs_params.C * x_trial[:, 1] + obs_params.d + obs_params.D * uy_trial[:, 1],
             obs_params.R,
         ),
     )
 
     # Subsequent states. The dynamics input B·u_{t-1} kicks the state forward;
-    # again, zero-row u_trial degenerates to no input.
+    # again, zero-row ux_trial degenerates to no input.
     for t in 2:tsteps
         x_trial[:, t] = rand(
             rng,
             MvNormal(
                 state_params.A * x_trial[:, t - 1] +
                 state_params.b +
-                state_params.B * u_trial[:, t - 1],
+                state_params.B * ux_trial[:, t - 1],
                 state_params.Q,
             ),
         )
         y_trial[:, t] = rand(
             rng,
             MvNormal(
-                obs_params.C * x_trial[:, t] + obs_params.d + obs_params.D * v_trial[:, t],
+                obs_params.C * x_trial[:, t] + obs_params.d + obs_params.D * uy_trial[:, t],
                 obs_params.R,
             ),
         )
@@ -52,13 +52,13 @@ function _sample_trial!(
     state_params,
     obs_params,
     obs_model::PoissonObservationModel,
-    u_trial::AbstractMatrix,
-    v_trial::AbstractMatrix,
+    ux_trial::AbstractMatrix,
+    uy_trial::AbstractMatrix,
 )
     tsteps = size(x_trial, 2)
-    # Poisson obs model has no D matrix; v_trial is accepted for signature
+    # Poisson obs model has no D matrix; uy_trial is accepted for signature
     # parity with the Gaussian path but must be empty (validated by callers).
-    @assert size(v_trial, 1) == 0 "Poisson observation model does not support obs inputs"
+    @assert size(uy_trial, 1) == 0 "Poisson observation model does not support obs inputs"
 
     # Initial state
     x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
@@ -71,7 +71,7 @@ function _sample_trial!(
             MvNormal(
                 state_params.A * x_trial[:, t - 1] +
                 state_params.b +
-                state_params.B * u_trial[:, t - 1],
+                state_params.B * ux_trial[:, t - 1],
                 state_params.Q,
             ),
         )
@@ -95,7 +95,7 @@ Sample from a Linear Dynamical System.
 
 Optional control sequences:
 - `latent_inputs`: dynamics-input sequence consumed by `B`. Single-trial form
-  is an `(u_dim, tsteps)` matrix; multi-trial is a `Vector{<:AbstractMatrix}`
+  is an `(ux_dim, tsteps)` matrix; multi-trial is a `Vector{<:AbstractMatrix}`
   of per-trial matrices. Required when `size(state_model.B, 2) > 0`.
 - `obs_inputs`: same shape for the observation input `D`. Required when
   `size(obs_model.D, 2) > 0`. Gaussian observation model only.
@@ -111,12 +111,12 @@ function Random.rand(
     obs_params = _extract_obs_params(lds.obs_model)
     Ti = Int(tsteps)
 
-    u_trial = _check_control(latent_inputs, lds.state_input_dim, Ti, "latent_inputs", T)
-    v_trial = _check_obs_control(obs_inputs, lds.obs_input_dim, Ti, lds.obs_model)
+    ux_trial = _check_control(latent_inputs, lds.state_input_dim, Ti, "latent_inputs", T)
+    uy_trial = _check_obs_control(obs_inputs, lds.obs_input_dim, Ti, lds.obs_model)
 
     x = Matrix{T}(undef, lds.latent_dim, Ti)
     y = Matrix{T}(undef, lds.obs_dim, Ti)
-    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, u_trial, v_trial)
+    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, ux_trial, uy_trial)
     return x, y
 end
 
@@ -139,10 +139,10 @@ function Random.rand(
         y[i] = Matrix{T}(undef, lds.obs_dim, Ti)
     end
 
-    u_seq = _normalize_multitrial_control(
+    ux_seq = _normalize_multitrial_control(
         latent_inputs, lds.state_input_dim, tsteps_per_trial, T, "latent_inputs"
     )
-    v_seq = _normalize_multitrial_obs_control(
+    uy_seq = _normalize_multitrial_obs_control(
         obs_inputs, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model
     )
 
@@ -150,7 +150,7 @@ function Random.rand(
     # `rng` across `@threads` races on internal state.
     if ntrials == 1
         _sample_trial!(
-            rng, x[1], y[1], state_params, obs_params, lds.obs_model, u_seq[1], v_seq[1]
+            rng, x[1], y[1], state_params, obs_params, lds.obs_model, ux_seq[1], uy_seq[1]
         )
         return x, y
     end
@@ -173,8 +173,8 @@ function Random.rand(
                     state_params,
                     obs_params,
                     lds.obs_model,
-                    u_seq[trial],
-                    v_seq[trial],
+                    ux_seq[trial],
+                    uy_seq[trial],
                 )
             end
         end

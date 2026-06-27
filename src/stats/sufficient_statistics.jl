@@ -51,7 +51,7 @@ function sufficient_statistics!(tfs::TrialFilterSmooth{T}) where {T<:Real}
 end
 
 """
-    _td_init_const_blocks!(sws, lds, tsteps_per_trial, y, u_seq, v_seq)
+    _td_init_const_blocks!(sws, lds, tsteps_per_trial, y, ux_seq, uy_seq)
 
 Fill the data-only constant blocks of the sufficient-statistics buffers
 (`td_obs_yy_const`, `td_obs_xy_const`, `td_obs_xx_const`, `td_dyn_xx_const`)
@@ -63,16 +63,16 @@ function _td_init_const_blocks!(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{Int},
     y::AbstractVector{<:AbstractMatrix{T}},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    ux_seq::AbstractVector{<:AbstractMatrix{T}},
+    uy_seq::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    u_dim = lds.state_input_dim
-    d_dim = lds.obs_input_dim
+    ux_dim = lds.state_input_dim
+    uy_dim = lds.obs_input_dim
     ntrials = length(y)
-    dyn_reg_dim = D + 1 + u_dim
-    obs_reg_dim = D + 1 + d_dim
+    dyn_reg_dim = D + 1 + ux_dim
+    obs_reg_dim = D + 1 + uy_dim
     total_obs = sum(tsteps_per_trial)
     total_dyn = total_obs - ntrials
 
@@ -105,18 +105,18 @@ function _td_init_const_blocks!(
     # obs_xx bias-bias entry
     td_obs_xx_const[D + 1, D + 1] = T(total_obs)
 
-    if d_dim > 0
+    if uy_dim > 0
         for trial in 1:ntrials
-            v_t = v_seq[trial]
+            uy_t = uy_seq[trial]
             y_t = y[trial]
-            # obs_xy[D+2:end, :] += Σ_t v_t y_t'
-            mul!(view(td_obs_xy_const, (D + 2):obs_reg_dim, :), v_t, y_t', one(T), one(T))
-            # obs_xx[D+2:end, D+2:end] += Σ_t v_t v_t'  (upper tri)
+            # obs_xy[D+2:end, :] += Σ_t uy_t y_t'
+            mul!(view(td_obs_xy_const, (D + 2):obs_reg_dim, :), uy_t, y_t', one(T), one(T))
+            # obs_xx[D+2:end, D+2:end] += Σ_t uy_t uy_t'  (upper tri)
             BLAS.syrk!(
                 'U',
                 'N',
                 one(T),
-                v_t,
+                uy_t,
                 one(T),
                 view(td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim),
             )
@@ -124,11 +124,11 @@ function _td_init_const_blocks!(
         LinearAlgebra.copytri!(
             view(td_obs_xx_const, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim), 'U'
         )
-        # obs_xx[D+1, D+2:end] / [D+2:end, D+1] = Σ_t v_t   (bias × v cross)
+        # obs_xx[D+1, D+2:end] / [D+2:end, D+1] = Σ_t uy_t   (bias × v cross)
         for trial in 1:ntrials
-            v_trial = v_seq[trial]
-            for t in axes(v_trial, 2), k in 1:d_dim
-                td_obs_xx_const[D + 1, D + 1 + k] += v_trial[k, t]
+            uy_trial = uy_seq[trial]
+            for t in axes(uy_trial, 2), k in 1:uy_dim
+                td_obs_xx_const[D + 1, D + 1 + k] += uy_trial[k, t]
             end
         end
         @views td_obs_xx_const[(D + 2):obs_reg_dim, D + 1] .= td_obs_xx_const[
@@ -138,13 +138,13 @@ function _td_init_const_blocks!(
 
     td_dyn_xx_const[D + 1, D + 1] = T(total_dyn)
 
-    if u_dim > 0
+    if ux_dim > 0
         for trial in 1:ntrials
-            u_trial = u_seq[trial]
-            T_n = size(u_trial, 2)
+            ux_trial = ux_seq[trial]
+            T_n = size(ux_trial, 2)
             # Convention (matches existing update_A_b!): we use u[:, 1:T_n-1]
             # as `u_{t-1}` for t = 2:T_n.
-            u_used = view(u_trial, :, 1:(T_n - 1))
+            u_used = view(ux_trial, :, 1:(T_n - 1))
             BLAS.syrk!(
                 'U',
                 'N',
@@ -159,10 +159,10 @@ function _td_init_const_blocks!(
         )
         # bias × u cross
         for trial in 1:ntrials
-            u_trial = u_seq[trial]
-            T_n = size(u_trial, 2)
-            for t in 1:(T_n - 1), k in 1:u_dim
-                td_dyn_xx_const[D + 1, D + 1 + k] += u_trial[k, t]
+            ux_trial = ux_seq[trial]
+            T_n = size(ux_trial, 2)
+            for t in 1:(T_n - 1), k in 1:ux_dim
+                td_dyn_xx_const[D + 1, D + 1 + k] += ux_trial[k, t]
             end
         end
         @views td_dyn_xx_const[(D + 2):dyn_reg_dim, D + 1] .= td_dyn_xx_const[
@@ -185,11 +185,11 @@ function _initialize_td_sufficient_statistics(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    u_dim = lds.state_input_dim
-    d_dim = lds.obs_input_dim
+    ux_dim = lds.state_input_dim
+    uy_dim = lds.obs_input_dim
     ntrials = length(tsteps_per_trial)
-    dyn_reg_dim = D + 1 + u_dim
-    obs_reg_dim = D + 1 + d_dim
+    dyn_reg_dim = D + 1 + ux_dim
+    obs_reg_dim = D + 1 + uy_dim
     total_obs = sum(tsteps_per_trial)
     total_dyn = total_obs - ntrials
 
@@ -212,7 +212,7 @@ function _initialize_td_sufficient_statistics(
 end
 
 """
-    _aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, sws)
+    _aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, sws)
 
 Aggregate per-trial smoother output (`x_smooth`, `p_smooth`, `p_smooth_tt1`)
 into `suf` using per-trial GEMM/SYRK. Replaces the per-timestep, per-trial
@@ -226,18 +226,18 @@ function _aggregate_td_suff_stats!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    ux_seq::AbstractVector{<:AbstractMatrix{T}},
+    uy_seq::AbstractVector{<:AbstractMatrix{T}},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    u_dim = lds.state_input_dim
-    d_dim = lds.obs_input_dim
+    ux_dim = lds.state_input_dim
+    uy_dim = lds.obs_input_dim
     ntrials = length(tfs)
-    dyn_reg_dim = D + 1 + u_dim
-    obs_reg_dim = D + 1 + d_dim
+    dyn_reg_dim = D + 1 + ux_dim
+    obs_reg_dim = D + 1 + uy_dim
 
     # Hoist workspace fields with concrete eltype for JET (cf. backwards_cov!).
     Szz_Ab = sws.Szz_Ab::Matrix{T}
@@ -357,15 +357,15 @@ function _aggregate_td_suff_stats!(
         mul!(view(td_obs_xy, 1:D, :), x, y[trial]', one(T), one(T))
 
         # Input-side cross blocks (x × u, u × x).
-        if u_dim > 0
-            u_trial = u_seq[trial]
-            u_prev = view(u_trial, :, 1:(T_n - 1))
-            mul!(view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, u_prev', one(T), one(T))
-            mul!(view(td_dyn_xy, (D + 2):dyn_reg_dim, :), u_prev, x_next', one(T), one(T))
+        if ux_dim > 0
+            ux_trial = ux_seq[trial]
+            ux_prev = view(ux_trial, :, 1:(T_n - 1))
+            mul!(view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, ux_prev', one(T), one(T))
+            mul!(view(td_dyn_xy, (D + 2):dyn_reg_dim, :), ux_prev, x_next', one(T), one(T))
         end
-        if d_dim > 0
-            v_trial = v_seq[trial]
-            mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, v_trial', one(T), one(T))
+        if uy_dim > 0
+            uy_trial = uy_seq[trial]
+            mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, uy_trial', one(T), one(T))
         end
     end
 
@@ -409,7 +409,7 @@ function _aggregate_td_suff_stats!(
 end
 
 """
-    _aggregate_td_suff_stats_weighted!(suf, tfs, lds, u, v, y, weights, sws)
+    _aggregate_td_suff_stats_weighted!(suf, tfs, lds, ux_seq, uy_seq, y, weights, sws)
 
 Weighted variant of `_aggregate_td_suff_stats!`. Each per-timestep
 accumulation is scaled by `weights[trial][t]`, which carries the
@@ -429,19 +429,19 @@ function _aggregate_td_suff_stats_weighted!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    ux_seq::AbstractVector{<:AbstractMatrix{T}},
+    uy_seq::AbstractVector{<:AbstractMatrix{T}},
     y::AbstractVector{<:AbstractMatrix{T}},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    u_dim = lds.state_input_dim
-    d_dim = lds.obs_input_dim
+    ux_dim = lds.state_input_dim
+    uy_dim = lds.obs_input_dim
     ntrials = length(tfs)
-    dyn_reg_dim = D + 1 + u_dim
-    obs_reg_dim = D + 1 + d_dim
+    dyn_reg_dim = D + 1 + ux_dim
+    obs_reg_dim = D + 1 + uy_dim
 
     # Clear the accumulators we'll write into. Each field is hoisted with a
     # concrete `Matrix{T}` annotation so the BLAS.ger!/syrk! callsites below
@@ -517,27 +517,27 @@ function _aggregate_td_suff_stats_weighted!(
             BLAS.ger!(wt, x_next, x_next, dyn_yy)
             dyn_yy .+= wt .* P_smooth[:, :, t]
 
-            # User-input cross blocks (only when u_dim > 0). The lower-tri
-            # mirror of the off-diagonal x_prev·u_prev' block is filled
+            # User-input cross blocks (only when ux_dim > 0). The lower-tri
+            # mirror of the off-diagonal x_prev·ux_prev' block is filled
             # once at the end of the function via `copytri!(dyn_xx, 'U')`.
-            if u_dim > 0
-                u_trial = u_seq[trial]
-                u_prev = u_trial[:, t - 1]
-                # dyn_xx[1:D, D+2:end] += wt * x_prev u_prev'
-                BLAS.ger!(wt, x_prev, u_prev, view(dyn_xx, 1:D, (D + 2):dyn_reg_dim))
-                # dyn_xx[D+1, D+2:end] += wt * u_prev   (bias × u cross; mirrored later)
-                for k in 1:u_dim
-                    dyn_xx[D + 1, D + 1 + k] += wt * u_prev[k]
+            if ux_dim > 0
+                ux_trial = ux_seq[trial]
+                ux_prev = ux_trial[:, t - 1]
+                # dyn_xx[1:D, D+2:end] += wt * x_prev ux_prev'
+                BLAS.ger!(wt, x_prev, ux_prev, view(dyn_xx, 1:D, (D + 2):dyn_reg_dim))
+                # dyn_xx[D+1, D+2:end] += wt * ux_prev   (bias × u cross; mirrored later)
+                for k in 1:ux_dim
+                    dyn_xx[D + 1, D + 1 + k] += wt * ux_prev[k]
                 end
-                # dyn_xx[D+2:end, D+2:end] += wt * u_prev u_prev'
+                # dyn_xx[D+2:end, D+2:end] += wt * ux_prev ux_prev'
                 BLAS.ger!(
                     wt,
-                    u_prev,
-                    u_prev,
+                    ux_prev,
+                    ux_prev,
                     view(dyn_xx, (D + 2):dyn_reg_dim, (D + 2):dyn_reg_dim),
                 )
-                # dyn_xy[D+2:end, :] += wt * u_prev x_next'
-                BLAS.ger!(wt, u_prev, x_next, view(dyn_xy, (D + 2):dyn_reg_dim, :))
+                # dyn_xy[D+2:end, :] += wt * ux_prev x_next'
+                BLAS.ger!(wt, ux_prev, x_next, view(dyn_xy, (D + 2):dyn_reg_dim, :))
             end
 
             dyn_n_acc += wt
@@ -568,34 +568,34 @@ function _aggregate_td_suff_stats_weighted!(
             BLAS.ger!(wt, y_t, y_t, obs_yy)
 
             # Obs-input cross blocks.
-            if d_dim > 0
-                v_trial = v_seq[trial]
-                v_t = v_trial[:, t]
-                # obs_xx[1:D, D+2:end] += wt * x_t v_t'
-                BLAS.ger!(wt, x_t, v_t, view(obs_xx, 1:D, (D + 2):obs_reg_dim))
-                # obs_xx[D+1, D+2:end] / [D+2:end, D+1] += wt * v_t
-                for k in 1:d_dim
-                    obs_xx[D + 1, D + 1 + k] += wt * v_t[k]
-                    obs_xx[D + 1 + k, D + 1] += wt * v_t[k]
+            if uy_dim > 0
+                uy_trial = uy_seq[trial]
+                uy_t = uy_trial[:, t]
+                # obs_xx[1:D, D+2:end] += wt * x_t uy_t'
+                BLAS.ger!(wt, x_t, uy_t, view(obs_xx, 1:D, (D + 2):obs_reg_dim))
+                # obs_xx[D+1, D+2:end] / [D+2:end, D+1] += wt * uy_t
+                for k in 1:uy_dim
+                    obs_xx[D + 1, D + 1 + k] += wt * uy_t[k]
+                    obs_xx[D + 1 + k, D + 1] += wt * uy_t[k]
                 end
-                # obs_xx[D+2:end, D+2:end] += wt * v_t v_t'
+                # obs_xx[D+2:end, D+2:end] += wt * uy_t uy_t'
                 BLAS.ger!(
-                    wt, v_t, v_t, view(obs_xx, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim)
+                    wt, uy_t, uy_t, view(obs_xx, (D + 2):obs_reg_dim, (D + 2):obs_reg_dim)
                 )
-                # obs_xy[D+2:end, :] += wt * v_t y_t'
-                BLAS.ger!(wt, v_t, y_t, view(obs_xy, (D + 2):obs_reg_dim, :))
+                # obs_xy[D+2:end, :] += wt * uy_t y_t'
+                BLAS.ger!(wt, uy_t, y_t, view(obs_xy, (D + 2):obs_reg_dim, :))
             end
 
             obs_n_acc += wt
         end
     end
 
-    if u_dim > 0
+    if ux_dim > 0
         @views dyn_xx[(D + 2):dyn_reg_dim, 1:D] .= transpose(
             dyn_xx[1:D, (D + 2):dyn_reg_dim]
         )
     end
-    if d_dim > 0
+    if uy_dim > 0
         @views obs_xx[(D + 2):obs_reg_dim, 1:D] .= transpose(
             obs_xx[1:D, (D + 2):obs_reg_dim]
         )

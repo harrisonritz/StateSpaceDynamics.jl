@@ -30,8 +30,8 @@ include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 include("stats/priors.jl")
 
 # Model definitions + inference-state containers.
-include("structs/types.jl")                         # abstract types, Data, model structs, SLDS
-include("structs/workspaces.jl")                    # FilterSmooth / SufficientStatistics / workspaces
+include("lds/types.jl")                             # abstract types, Data, model structs, SLDS
+include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
 include("utils/show.jl")
 include("utils/validation.jl")
 
@@ -44,11 +44,11 @@ include("stats/sufficient_statistics.jl")
 include("stats/simulate.jl")
 
 # latents models (LDS, PLDS, SLDS) + inference machinery (E-step).
-include("latents/continuous_latents.jl")                      # state-model Q-term + state M-step
+include("lds/continuous_latents.jl")                # state-model Q-term + state M-step
 
 # Observation models + composite / standalone models.
-include("observations/gaussian_observations.jl")
-include("observations/poisson_observations.jl")
+include("lds/gaussian_observations.jl")
+include("lds/poisson_observations.jl")
 
 # Fitting Functions
 include("fit_LDS.jl")
@@ -75,6 +75,6 @@ export print_full
 export info_update!
 
 # Common functions
-export rand, smooth, fit!, loglikelihood
+export rand, smooth, fit!, loglikelihood, elbo!
 
 end

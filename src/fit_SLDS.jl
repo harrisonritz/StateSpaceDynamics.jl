@@ -996,9 +996,9 @@ function mstep!(
     # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
     StatsAPI.fit!(dl, fb_storage, obs_inputs; seq_ends=seq_ends)
 
-    # SLDS doesn't currently expose user controls; pass zero-column u/v.
-    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    # SLDS doesn't currently expose user controls; pass zero-column ux/uy.
+    ux_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
+    uy_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
     tsteps_per_trial = [size(yt, 2) for yt in y]
 
     # One reusable SufficientStatistics; overwritten per regime by the
@@ -1013,7 +1013,7 @@ function mstep!(
             weights[trial] = view(fb_storage.γ, k, t1:t2)
         end
 
-        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, u_seq, v_seq, y, weights, sws)
+        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, ux_seq, uy_seq, y, weights, sws)
 
         if lds_k.obs_model isa GaussianObservationModel{T}
             mstep!(lds_k, suf, sws)

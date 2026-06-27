@@ -8,11 +8,11 @@ Gaussian Observations
 =============================================================================#
 
 """
-    Q_obs!(ws, lds, E_z, E_zz, y, v)
+    Q_obs!(ws, lds, E_z, E_zz, y, uy)
 
 Full observation Q-term for Gaussian LDS over all time steps with affine
-observation `y_t ~ N(C x_t + d + D v_t, R)`. `v` is the per-trial obs-control
-matrix `(d_dim, T_i)`; pass a `0×T_i` matrix when no obs inputs.
+observation `y_t ~ N(C x_t + d + D uy_t, R)`. `uy` is the per-trial obs-control
+matrix `(uy_dim, T_i)`; pass a `0×T_i` matrix when no obs inputs.
 """
 function Q_obs!(
     ws::SmoothWorkspace{T},
@@ -20,14 +20,14 @@ function Q_obs!(
     E_z::AbstractMatrix{T},
     E_zz::AbstractArray{T,3},
     y::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    uy::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     obs_dim = lds.obs_dim
     tsteps = size(y, 2)
     C = lds.obs_model.C
     d = lds.obs_model.d
     D_obs = lds.obs_model.D
-    d_dim = size(v, 1)
+    uy_dim = size(uy, 1)
 
     R_U = ws.R_PD[].chol.U
     log_det_R = logdet(ws.R_PD[])
@@ -44,10 +44,10 @@ function Q_obs!(
     fill!(temp, zero(T))
 
     @views for t in axes(y, 2)
-        # Residualize: ytil = y[:,t] - d - D · v[:,t]
+        # Residualize: ytil = y[:,t] - d - D · uy[:,t]
         ytil .= y[:, t] .- d
-        if d_dim > 0
-            mul!(ytil, D_obs, v[:, t], -one(T), one(T))
+        if uy_dim > 0
+            mul!(ytil, D_obs, uy[:, t], -one(T), one(T))
         end
 
         mul!(sum_yy, ytil, ytil')
@@ -79,8 +79,8 @@ function Q_obs!(
     E_zz::AbstractArray{T,3},
     y::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    v = zeros(T, 0, size(y, 2))
-    return Q_obs!(ws, lds, E_z, E_zz, y, v)
+    uy = zeros(T, 0, size(y, 2))
+    return Q_obs!(ws, lds, E_z, E_zz, y, uy)
 end
 
 """
@@ -88,15 +88,15 @@ end
 
 Total log-likelihood Q-obs term across all trials and time, computed from
 the aggregated sufficient statistics in `suf`. Replaces the per-trial,
-per-timestep loop of the legacy `Q_obs!(sws, lds, E_z, E_zz, y, v)`.
+per-timestep loop of the legacy `Q_obs!(sws, lds, E_z, E_zz, y, uy)`.
 """
 function Q_obs!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
-    d_dim = lds.obs_input_dim
-    obs_reg_dim = D + 1 + d_dim
+    uy_dim = lds.obs_input_dim
+    obs_reg_dim = D + 1 + uy_dim
     C = lds.obs_model.C
     d = lds.obs_model.d
     D_obs = lds.obs_model.D
@@ -111,7 +111,7 @@ function Q_obs!(
     V = view(sws.CD, :, 1:obs_reg_dim)
     copyto!(view(V, :, 1:D), C)
     copyto!(view(V, :, D + 1), d)
-    if d_dim > 0
+    if uy_dim > 0
         copyto!(view(V, :, (D + 2):obs_reg_dim), D_obs)
     end
 
@@ -134,7 +134,7 @@ function update_C_d!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
     D = lds.latent_dim
-    d_dim = lds.obs_input_dim
+    uy_dim = lds.obs_input_dim
     CD_prior = lds.obs_model.CD_prior
 
     if CD_prior === nothing
@@ -151,8 +151,8 @@ function update_C_d!(
 
     copyto!(lds.obs_model.C, view(V, :, 1:D))
     copyto!(lds.obs_model.d, view(V, :, D + 1))
-    if d_dim > 0
-        copyto!(lds.obs_model.D, view(V, :, (D + 2):(D + 1 + d_dim)))
+    if uy_dim > 0
+        copyto!(lds.obs_model.D, view(V, :, (D + 2):(D + 1 + uy_dim)))
     end
     return nothing
 end
@@ -163,14 +163,14 @@ function update_R!(
     lds.fit_bool[6] || return nothing
     p = lds.obs_dim
     D = lds.latent_dim
-    d_dim = lds.obs_input_dim
+    uy_dim = lds.obs_input_dim
 
     # sws.CD is exactly (p × obs_reg_dim); no view needed.
     V = sws.CD
     copyto!(view(V, :, 1:D), lds.obs_model.C)
     copyto!(view(V, :, D + 1), lds.obs_model.d)
-    if d_dim > 0
-        copyto!(view(V, :, (D + 2):(D + 1 + d_dim)), lds.obs_model.D)
+    if uy_dim > 0
+        copyto!(view(V, :, (D + 2):(D + 1 + uy_dim)), lds.obs_model.D)
     end
 
     # Residual scatter S = obs_yy - V·obs_xy - obs_xy'·V' + V·obs_xx·V'
