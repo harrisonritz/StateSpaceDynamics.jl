@@ -38,6 +38,7 @@ makedocs(;
     format = Documenter.HTML(
         prettyurls = get(ENV, "CI", "false") == "true",
         repolink = "https://github.com/depasquale-lab/StateSpaceDynamics.jl",
+        assets = ["assets/custom.css"],
     ),
     pages=[
         "Home" => "index.md",
@@ -65,5 +66,5 @@ makedocs(;
 println("Deploying documentation...")
 deploydocs(;
     repo="github.com/depasquale-lab/StateSpaceDynamics.jl",
-    devbranch="docs_dev_"
+    devbranch="main"
 )

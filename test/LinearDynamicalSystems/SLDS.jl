@@ -1017,8 +1017,8 @@ function test_SLDS_estep_basic()
     # Batched fb_storage with seq_ends
     seq_ends = cumsum(fill(tsteps, ntrials))
     total_T = last(seq_ends)
-    obs_seq = collect(1:total_T)
-    ctrl_seq = fill(nothing, total_T)
+    obs_inputs = collect(1:total_T)
+    latent_inputs = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
@@ -1034,7 +1034,7 @@ function test_SLDS_estep_basic()
     x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    elbo = StateSpaceDynamics.estep!(
+    StateSpaceDynamics.estep!(
         slds,
         tfs,
         fb_storage,
@@ -1042,10 +1042,12 @@ function test_SLDS_estep_basic()
         y,
         x_samples,
         slds_ws;
-        obs_seq=obs_seq,
-        ctrl_seq=ctrl_seq,
+        obs_inputs=obs_inputs,
+        latent_inputs=latent_inputs,
         seq_ends=seq_ends,
     )
+
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 
@@ -1079,8 +1081,8 @@ function test_SLDS_mstep_updates_parameters()
 
     seq_ends = cumsum(fill(tsteps, ntrials))
     total_T = last(seq_ends)
-    obs_seq = collect(1:total_T)
-    ctrl_seq = fill(nothing, total_T)
+    obs_inputs = collect(1:total_T)
+    latent_inputs = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
@@ -1104,15 +1106,15 @@ function test_SLDS_mstep_updates_parameters()
         y,
         x_samples,
         slds_ws;
-        obs_seq=obs_seq,
-        ctrl_seq=ctrl_seq,
+        obs_inputs=obs_inputs,
+        latent_inputs=latent_inputs,
         seq_ends=seq_ends,
     )
 
     A_old = copy(slds.A)
 
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
+        slds, tfs, fb_storage, dl, y, sws; obs_inputs=obs_inputs, seq_ends=seq_ends
     )
 
     # Check parameters changed (with high probability)
@@ -1208,8 +1210,8 @@ function test_SLDS_estep_elbo_components()
 
     seq_ends = cumsum(fill(tsteps, ntrials))
     total_T = last(seq_ends)
-    obs_seq = collect(1:total_T)
-    ctrl_seq = fill(nothing, total_T)
+    obs_inputs = collect(1:total_T)
+    latent_inputs = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
@@ -1223,7 +1225,7 @@ function test_SLDS_estep_elbo_components()
     x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
-    elbo = StateSpaceDynamics.estep!(
+    StateSpaceDynamics.estep!(
         slds,
         tfs,
         fb_storage,
@@ -1231,10 +1233,12 @@ function test_SLDS_estep_elbo_components()
         y,
         x_samples,
         slds_ws;
-        obs_seq=obs_seq,
-        ctrl_seq=ctrl_seq,
+        obs_inputs=obs_inputs,
+        latent_inputs=latent_inputs,
         seq_ends=seq_ends,
     )
+
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 
@@ -1288,8 +1292,8 @@ function test_weighted_update_initial_state_mean()
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1302,7 +1306,7 @@ function test_weighted_update_initial_state_mean()
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
         )
         StateSpaceDynamics.update_initial_state_mean!(lds_k, suf)
 
@@ -1356,8 +1360,8 @@ function test_weighted_update_A_b()
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1369,7 +1373,7 @@ function test_weighted_update_A_b()
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
         )
         StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
 
@@ -1426,8 +1430,8 @@ function test_weighted_update_Q()
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    u_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    v_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1440,7 +1444,7 @@ function test_weighted_update_Q()
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, u_seq, v_seq, y, w_k, sws
+            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
         )
         StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
         StateSpaceDynamics.update_Q!(lds_k, suf, sws)
@@ -1637,8 +1641,8 @@ function test_SLDS_estep_basic_poisson()
 
     seq_ends = cumsum(fill(tsteps, ntrials))
     total_T = last(seq_ends)
-    obs_seq = collect(1:total_T)
-    ctrl_seq = fill(nothing, total_T)
+    obs_inputs = collect(1:total_T)
+    latent_inputs = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
@@ -1649,7 +1653,7 @@ function test_SLDS_estep_basic_poisson()
     randn_buf = Vector{Float64}(undef, latent_dim)
     StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 
-    elbo = StateSpaceDynamics.estep!(
+    StateSpaceDynamics.estep!(
         slds,
         tfs,
         fb_storage,
@@ -1657,10 +1661,12 @@ function test_SLDS_estep_basic_poisson()
         y,
         x_samples,
         slds_ws;
-        obs_seq=obs_seq,
-        ctrl_seq=ctrl_seq,
+        obs_inputs=obs_inputs,
+        latent_inputs=latent_inputs,
         seq_ends=seq_ends,
     )
+
+    elbo = StateSpaceDynamics.elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends=seq_ends)
 
     @test isfinite(elbo)
 
@@ -1685,14 +1691,22 @@ function test_SLDS_mstep_updates_parameters_poisson()
 
     seq_ends = cumsum(fill(tsteps, ntrials))
     total_T = last(seq_ends)
-    obs_seq = collect(1:total_T)
-    ctrl_seq = fill(nothing, total_T)
+    obs_inputs = collect(1:total_T)
+    latent_inputs = fill(nothing, total_T)
 
     tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], fill(tsteps, ntrials))
     dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(Float64, K, total_T))
     fb_storage = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
     slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
+
+    # Warm-start smooth so sample_posterior! has a posterior to draw from. estep!
+    # then re-smooths with the γ weights, filling the posterior covariances the
+    # M-step aggregator reads (estep! → mstep! here; elbo! is skipped).
+    for trial in 1:ntrials
+        w_uniform = ones(Float64, K, tsteps) ./ K
+        StateSpaceDynamics.smooth!(slds, tfs[trial], y[trial], w_uniform; ws=slds_ws)
+    end
 
     x_samples = [Matrix{Float64}(undef, latent_dim, tsteps) for _ in 1:ntrials]
     randn_buf = Vector{Float64}(undef, latent_dim)
@@ -1705,13 +1719,13 @@ function test_SLDS_mstep_updates_parameters_poisson()
         y,
         x_samples,
         slds_ws;
-        obs_seq=obs_seq,
-        ctrl_seq=ctrl_seq,
+        obs_inputs=obs_inputs,
+        latent_inputs=latent_inputs,
         seq_ends=seq_ends,
     )
 
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
+        slds, tfs, fb_storage, dl, y, sws; obs_inputs=obs_inputs, seq_ends=seq_ends
     )
 
     for k in 1:K

@@ -40,28 +40,28 @@ tsteps_per_trial = fill(T_steps, N)
 tfs = StateSpaceDynamics.initialize_FilterSmooth(lds_fit, tsteps_per_trial)
 T_max = T_steps
 sws_pool = [
-    StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max; u_dim=0, d_dim=0)
+    StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_max; ux_dim=0, uy_dim=0)
     for _ in 1:Threads.maxthreadid()
 ]
 suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
     Float64, lds_fit, tsteps_per_trial
 )
-u_seq = [zeros(Float64, 0, T_steps) for _ in 1:N]
-v_seq = [zeros(Float64, 0, T_steps) for _ in 1:N]
+ux_seq = [zeros(Float64, 0, T_steps) for _ in 1:N]
+uy_seq = [zeros(Float64, 0, T_steps) for _ in 1:N]
 StateSpaceDynamics._td_init_const_blocks!(
-    sws_pool[1], lds_fit, tsteps_per_trial, y, u_seq, v_seq
+    sws_pool[1], lds_fit, tsteps_per_trial, y, ux_seq, uy_seq
 )
 
 for iter in 1:MAX_EM
     # E-step
-    StateSpaceDynamics.smooth!(lds_fit, tfs, y, sws_pool, u_seq, v_seq)
+    StateSpaceDynamics.smooth!(lds_fit, tfs, y, sws_pool, ux_seq, uy_seq)
     StateSpaceDynamics._aggregate_td_suff_stats!(
-        suf, tfs, lds_fit, u_seq, v_seq, y, sws_pool[1]
+        suf, tfs, lds_fit, ux_seq, uy_seq, y, sws_pool[1]
     )
 
     # ELBO via the suf-based pipeline (same path `fit!` uses)
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths)
-    elbo = StateSpaceDynamics.calculate_elbo(lds_fit, suf, sws_pool[1], total_entropy)
+    elbo = StateSpaceDynamics.elbo!(lds_fit, suf, sws_pool[1], total_entropy)
     push!(elbos, elbo)
 
     # Marginal log-likelihood via Kalman filter (exact for Gaussian LDS)
@@ -94,7 +94,7 @@ end
 # Diagnostic — what's the expected offset?
 obs_n = N * T_steps
 n_active = N * T_steps * D
-# Q_state in calculate_elbo is missing -0.5 * (N + dyn_n) * D * log(2π).
+# Q_state in elbo! is missing -0.5 * (N + dyn_n) * D * log(2π).
 # Entropy contributes +0.5 * n_active * log(2π).
 # Q_obs contributes -0.5 * obs_n * p * log(2π) — present.
 # True marg_LL has -0.5 * obs_n * p * log(2π) only (no latent 2π's since x is

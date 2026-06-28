@@ -1,3 +1,24 @@
+#=============================================================================
+Gaussian LDS
+
+    Log-Likelihood: joint_loglikelihood!(ws, x, lds, y)
+                    loglikelihood(lds, y)
+
+    Gradient:       Gradient!(ws, lds, y, x)
+                    Gradient_batched!(ws, lds, y, x, ux, uy)
+
+    Hessian:        Hessian!(sws, lds, y, x)
+
+    Smooth:         smooth!(lds, fs, y, sws)
+                    smooth!(lds, tfs, y, sws_pool)
+
+    ELBO:           elbo!(lds, suf, sws, total_entropy)
+
+    M-Step:         mstep!(lds, suf, sws)
+
+    Fit:            fit!(lds, y)
+=============================================================================#
+
 """
 Linear Dynamical System (LDS) implementation with Gaussian state and observation models.
 This module defines functions specific to the Gaussian observation model: log-likelihoods,
@@ -18,8 +39,8 @@ function joint_loglikelihood!(
     x::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T0,S,O},
     y::AbstractMatrix{T0},
-    u::AbstractMatrix{T0},
-    v::AbstractMatrix{T0},
+    ux::AbstractMatrix{T0},
+    uy::AbstractMatrix{T0},
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
     tsteps = size(y, 2)
 
@@ -58,18 +79,18 @@ function joint_loglikelihood!(
         end
 
         # Dynamics (t>1): log p(x_t | x_{t-1}, u_{t-1}) where mean = A x_{t-1} + b + B u_{t-1}.
-        # `B*u` is a no-op when `u` has zero rows (size(B,2) == size(u,1) == 0).
+        # `B*ux` is a no-op when `ux` has zero rows (size(B,2) == size(ux,1) == 0).
         if t > 1
             @views mul!(temp_dx, A, x[:, t - 1])
-            @views mul!(temp_dx, B, u[:, t - 1], one(T0), one(T0))
+            @views mul!(temp_dx, B, ux[:, t - 1], one(T0), one(T0))
             @views temp_dx .= x[:, t] .- temp_dx .- b
             ldiv!(temp_solve_Q, Q_U, temp_dx)
             ll_t += cQ - T(0.5) * sum(abs2, temp_solve_Q)
         end
 
-        # Emission: log p(y_t | x_t, v_t) where mean = C x_t + d + D v_t.
+        # Emission: log p(y_t | x_t, uy_t) where mean = C x_t + d + D uy_t.
         @views mul!(temp_dy, lds.obs_model.C, x[:, t])
-        @views mul!(temp_dy, D_obs, v[:, t], one(T0), one(T0))
+        @views mul!(temp_dy, D_obs, uy[:, t], one(T0), one(T0))
         @views temp_dy .= y[:, t] .- temp_dy .- d
         ldiv!(temp_solve_R, R_U, temp_dy)
         ll_t += cR - T(0.5) * sum(abs2, temp_solve_R)
@@ -81,7 +102,7 @@ function joint_loglikelihood!(
 end
 
 # Backward-compatible 4-arg overload: no inputs. Forwards to the 6-arg form
-# with zero-row u/v matrices, so callers that don't use controls don't have
+# with zero-row ux/uy matrices, so callers that don't use controls don't have
 # to pass them.
 function joint_loglikelihood!(
     ws::SmoothWorkspace{T},
@@ -90,9 +111,9 @@ function joint_loglikelihood!(
     y::AbstractMatrix{T0},
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
     tsteps = size(y, 2)
-    u = zeros(T0, 0, tsteps)
-    v = zeros(T0, 0, tsteps)
-    return joint_loglikelihood!(ws, x, lds, y, u, v)
+    ux = zeros(T0, 0, tsteps)
+    uy = zeros(T0, 0, tsteps)
+    return joint_loglikelihood!(ws, x, lds, y, ux, uy)
 end
 
 """
@@ -174,8 +195,8 @@ function Gradient!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractMatrix{T},
     x::AbstractMatrix{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    ux::AbstractMatrix{T},
+    uy::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     latent_dim, tsteps = size(x)
     A = lds.state_model.A
@@ -201,16 +222,16 @@ function Gradient!(
     tmp3 = ws.tmp3
 
     # Helper macros (inlined): residual `x_t - A x_{t-1} - b - B u_{t-1}` and
-    # `y_t - C x_t - d - D v_t`. The `B*u` / `D*v` updates are no-ops when
-    # `u` / `v` have zero rows.
+    # `y_t - C x_t - d - D uy_t`. The `B*ux` / `D*uy` updates are no-ops when
+    # `ux` / `uy` have zero rows.
 
     # First time step
     @views dxt .= x[:, 1] .- x0
     @views mul!(dxt_next, A, x[:, 1])
-    @views mul!(dxt_next, B, u[:, 1], one(T), one(T))
+    @views mul!(dxt_next, B, ux[:, 1], one(T), one(T))
     @views dxt_next .= x[:, 2] .- dxt_next .- b
     @views mul!(dyt, C, x[:, 1])
-    @views mul!(dyt, D_obs, v[:, 1], one(T), one(T))
+    @views mul!(dyt, D_obs, uy[:, 1], one(T), one(T))
     @views dyt .= y[:, 1] .- dyt .- d_obs
 
     mul!(tmp1, C_inv_R, dyt)
@@ -221,15 +242,15 @@ function Gradient!(
     # Middle steps
     @views for t in 2:(tsteps - 1)
         mul!(dxt, A, x[:, t - 1])
-        mul!(dxt, B, u[:, t - 1], one(T), one(T))
+        mul!(dxt, B, ux[:, t - 1], one(T), one(T))
         dxt .= x[:, t] .- dxt .- b
 
         mul!(dxt_next, A, x[:, t])
-        mul!(dxt_next, B, u[:, t], one(T), one(T))
+        mul!(dxt_next, B, ux[:, t], one(T), one(T))
         dxt_next .= x[:, t + 1] .- dxt_next .- b
 
         mul!(dyt, C, x[:, t])
-        mul!(dyt, D_obs, v[:, t], one(T), one(T))
+        mul!(dyt, D_obs, uy[:, t], one(T), one(T))
         dyt .= y[:, t] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
@@ -242,10 +263,10 @@ function Gradient!(
     # Last time step
     @views begin
         mul!(dxt, A, x[:, tsteps - 1])
-        mul!(dxt, B, u[:, tsteps - 1], one(T), one(T))
+        mul!(dxt, B, ux[:, tsteps - 1], one(T), one(T))
         dxt .= x[:, tsteps] .- dxt .- b
         mul!(dyt, C, x[:, tsteps])
-        mul!(dyt, D_obs, v[:, tsteps], one(T), one(T))
+        mul!(dyt, D_obs, uy[:, tsteps], one(T), one(T))
         dyt .= y[:, tsteps] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
@@ -265,9 +286,9 @@ function Gradient!(
     x::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(x, 2)
-    u = zeros(T, 0, tsteps)
-    v = zeros(T, 0, tsteps)
-    return Gradient!(ws, lds, y, x, u, v)
+    ux = zeros(T, 0, tsteps)
+    uy = zeros(T, 0, tsteps)
+    return Gradient!(ws, lds, y, x, ux, uy)
 end
 
 """
@@ -367,8 +388,8 @@ function smooth!(
     fs::FilterSmooth{T},
     y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    latent_inputs::AbstractMatrix{T},
+    obs_inputs::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
     n_active = D * tsteps
@@ -387,13 +408,13 @@ function smooth!(
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat, u, v)
+    Gradient!(sws, lds, y, x_mat, latent_inputs, obs_inputs)
     # grad_vec = -gradient (minimize negative log-likelihood)
     for t in 1:tsteps, i in 1:D
         sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
     end
 
-    # Hessian is independent of `u`/`v` (linear-Gaussian model has identical
+    # Hessian is independent of `ux`/`uy` (linear-Gaussian model has identical
     # precision blocks regardless of input means).
     Hessian!(sws, lds, y, x_mat)
     _negate_blocks!(btd, tsteps)
@@ -423,7 +444,7 @@ function smooth!(
     return fs
 end
 
-# Backward-compatible no-input overload (zero-row u/v).
+# Backward-compatible no-input overload (zero-row ux/uy).
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
@@ -431,9 +452,9 @@ function smooth!(
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(y, 2)
-    u = zeros(T, 0, tsteps)
-    v = zeros(T, 0, tsteps)
-    return smooth!(lds, fs, y, sws, u, v)
+    ux = zeros(T, 0, tsteps)
+    uy = zeros(T, 0, tsteps)
+    return smooth!(lds, fs, y, sws, ux, uy)
 end
 
 """
@@ -455,13 +476,13 @@ function smooth!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
-    u_seq::AbstractVector{<:AbstractMatrix{T}},
-    v_seq::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = length(y)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1], u_seq[1], v_seq[1])
+        smooth!(lds, tfs[1], y[1], sws_pool[1], latent_inputs[1], obs_inputs[1])
         return tfs
     end
 
@@ -494,7 +515,7 @@ function smooth!(
         # path's batched-trial efficiency).
         if size(source_sws.batched_x_mat, 3) == ntrials && ntrials > 1
             if !source_sws.batched_data_valid[]
-                _populate_batched_data!(source_sws, y, u_seq, v_seq)
+                _populate_batched_data!(source_sws, y, latent_inputs, obs_inputs)
             end
             _smooth_mean_only_batched!(lds, tfs, source_sws)
             return tfs
@@ -514,8 +535,8 @@ function smooth!(
                         tfs[trial],
                         y[trial],
                         sws,
-                        u_seq[trial],
-                        v_seq[trial],
+                        latent_inputs[trial],
+                        obs_inputs[trial],
                         source_sws,
                     )
                 end
@@ -536,7 +557,9 @@ function smooth!(
         @spawn begin
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws, u_seq[trial], v_seq[trial])
+                smooth!(
+                    lds, tfs[trial], y[trial], sws, latent_inputs[trial], obs_inputs[trial]
+                )
             end
         end
     end
@@ -585,7 +608,7 @@ function _precompute_shared_cov!(
 end
 
 """
-    _smooth_mean_only!(lds, fs, y, sws, u, v, source_sws)
+    _smooth_mean_only!(lds, fs, y, sws, ux, uy, source_sws)
 
 Per-trial Newton step that **assumes**:
 
@@ -611,8 +634,8 @@ function _smooth_mean_only!(
     fs::FilterSmooth{T},
     y::AbstractMatrix{T},
     sws::SmoothWorkspace{T},
-    u::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    ux::AbstractMatrix{T},
+    uy::AbstractMatrix{T},
     source_sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps, D = size(y, 2), lds.latent_dim
@@ -633,7 +656,7 @@ function _smooth_mean_only!(
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat, u, v)
+    Gradient!(sws, lds, y, x_mat, ux, uy)
     for t in 1:tsteps, i in 1:D
         sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
     end
@@ -664,8 +687,8 @@ function Gradient_batched!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractArray{T,3},
     x::AbstractArray{T,3},
-    u::AbstractArray{T,3},
-    v::AbstractArray{T,3},
+    ux::AbstractArray{T,3},
+    uy::AbstractArray{T,3},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(x, 2)
     A = lds.state_model.A
@@ -693,10 +716,10 @@ function Gradient_batched!(
     @views begin
         dxt .= x[:, 1, :] .- x0
         mul!(dxt_next, A, x[:, 1, :])
-        mul!(dxt_next, B, u[:, 1, :], one(T), one(T))
+        mul!(dxt_next, B, ux[:, 1, :], one(T), one(T))
         dxt_next .= x[:, 2, :] .- dxt_next .- b
         mul!(dyt, C, x[:, 1, :])
-        mul!(dyt, D_obs, v[:, 1, :], one(T), one(T))
+        mul!(dyt, D_obs, uy[:, 1, :], one(T), one(T))
         dyt .= y[:, 1, :] .- dyt .- d_obs
     end
 
@@ -708,15 +731,15 @@ function Gradient_batched!(
     # Middle steps
     @views for t in 2:(tsteps - 1)
         mul!(dxt, A, x[:, t - 1, :])
-        mul!(dxt, B, u[:, t - 1, :], one(T), one(T))
+        mul!(dxt, B, ux[:, t - 1, :], one(T), one(T))
         dxt .= x[:, t, :] .- dxt .- b
 
         mul!(dxt_next, A, x[:, t, :])
-        mul!(dxt_next, B, u[:, t, :], one(T), one(T))
+        mul!(dxt_next, B, ux[:, t, :], one(T), one(T))
         dxt_next .= x[:, t + 1, :] .- dxt_next .- b
 
         mul!(dyt, C, x[:, t, :])
-        mul!(dyt, D_obs, v[:, t, :], one(T), one(T))
+        mul!(dyt, D_obs, uy[:, t, :], one(T), one(T))
         dyt .= y[:, t, :] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
@@ -729,10 +752,10 @@ function Gradient_batched!(
     # Last time step
     @views begin
         mul!(dxt, A, x[:, tsteps - 1, :])
-        mul!(dxt, B, u[:, tsteps - 1, :], one(T), one(T))
+        mul!(dxt, B, ux[:, tsteps - 1, :], one(T), one(T))
         dxt .= x[:, tsteps, :] .- dxt .- b
         mul!(dyt, C, x[:, tsteps, :])
-        mul!(dyt, D_obs, v[:, tsteps, :], one(T), one(T))
+        mul!(dyt, D_obs, uy[:, tsteps, :], one(T), one(T))
         dyt .= y[:, tsteps, :] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
@@ -745,29 +768,29 @@ function Gradient_batched!(
 end
 
 """
-    _populate_batched_data!(sws, y, u, v)
+    _populate_batched_data!(sws, y, ux, uy)
 
-Stack the per-trial `y`/`u`/`v` `Vector{Matrix}` inputs into the contiguous
-`(p, T, N)` / `(u_dim, T, N)` / `(d_dim, T, N)` tensors used by the batched
+Stack the per-trial `y`/`ux`/`uy` `Vector{Matrix}` inputs into the contiguous
+`(p, T, N)` / `(ux_dim, T, N)` / `(uy_dim, T, N)` tensors used by the batched
 mean pass. Called once per fit (data is constant across EM iterations).
 """
 function _populate_batched_data!(
     sws::SmoothWorkspace{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    u::AbstractVector{<:AbstractMatrix{T}},
-    v::AbstractVector{<:AbstractMatrix{T}},
+    ux::AbstractVector{<:AbstractMatrix{T}},
+    uy::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real}
     @views for trial in eachindex(y)
         sws.batched_y[:, :, trial] .= y[trial]
     end
-    if size(sws.batched_u, 1) > 0
-        @views for trial in eachindex(u)
-            sws.batched_u[:, :, trial] .= u[trial]
+    if size(sws.batched_ux, 1) > 0
+        @views for trial in eachindex(ux)
+            sws.batched_ux[:, :, trial] .= ux[trial]
         end
     end
-    if size(sws.batched_v, 1) > 0
-        @views for trial in eachindex(v)
-            sws.batched_v[:, :, trial] .= v[trial]
+    if size(sws.batched_uy, 1) > 0
+        @views for trial in eachindex(uy)
+            sws.batched_uy[:, :, trial] .= uy[trial]
         end
     end
     sws.batched_data_valid[] = true
@@ -797,7 +820,7 @@ function _smooth_mean_only_batched!(
     end
 
     Gradient_batched!(
-        sws, lds, sws.batched_y, sws.batched_x_mat, sws.batched_u, sws.batched_v
+        sws, lds, sws.batched_y, sws.batched_x_mat, sws.batched_ux, sws.batched_uy
     )
 
     # Pack negated gradient into the (D*T, N) matrix RHS layout.
@@ -824,143 +847,70 @@ function smooth!(
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    u_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    v_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    return smooth!(lds, tfs, y, sws_pool, u_seq, v_seq)
+    latent_inputs = [zeros(T, 0, size(yt, 2)) for yt in y]
+    obs_inputs = [zeros(T, 0, size(yt, 2)) for yt in y]
+    return smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 end
 
 """
-    Q_obs!(ws, lds, E_z, E_zz, y, v)
+    estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool; max_iter=20, tol=1e-6)
 
-Full observation Q-term for Gaussian LDS over all time steps with affine
-observation `y_t ~ N(C x_t + d + D v_t, R)`. `v` is the per-trial obs-control
-matrix `(d_dim, T_i)`; pass a `0×T_i` matrix when no obs inputs.
+Gaussian E-step. Smooths, aggregates state-side sufficient
+statistics into `suf` from each trial's smoother output (`x_smooth`,
+`p_smooth`, `p_smooth_tt1`), and returns the suf-based ELBO. The legacy
+per-trial `sufficient_statistics!(tfs)` call is skipped — the suf-based
+M-step doesn't need `fs.E_z` / `fs.E_zz` / `fs.E_zz_prev`, and the
+Gaussian emission update now reads `fs.x_smooth` directly.
 """
-function Q_obs!(
-    ws::SmoothWorkspace{T},
+function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    E_z::AbstractMatrix{T},
-    E_zz::AbstractArray{T,3},
-    y::AbstractMatrix{T},
-    v::AbstractMatrix{T},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    obs_dim = lds.obs_dim
-    tsteps = size(y, 2)
-    C = lds.obs_model.C
-    d = lds.obs_model.d
-    D_obs = lds.obs_model.D
-    d_dim = size(v, 1)
 
-    R_U = ws.R_PD[].chol.U
-    log_det_R = logdet(ws.R_PD[])
-    const_term = obs_dim * log(T(2π))
+    # smooth each trial
+    smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
 
-    temp = ws.elbo_obs_temp
-    work_matrix = ws.elbo_obs_work
-    ytil = ws.elbo_ytil
-    sum_yy = ws.elbo_sum_yy
-    sum_yz = ws.elbo_sum_yz
-    work1 = ws.elbo_obs_work1
-    work2 = ws.elbo_obs_work2
-
-    fill!(temp, zero(T))
-
-    @views for t in axes(y, 2)
-        # Residualize: ytil = y[:,t] - d - D · v[:,t]
-        ytil .= y[:, t] .- d
-        if d_dim > 0
-            mul!(ytil, D_obs, v[:, t], -one(T), one(T))
-        end
-
-        mul!(sum_yy, ytil, ytil')
-
-        fill!(sum_yz, zero(T))
-        BLAS.ger!(one(T), ytil, E_z[:, t], sum_yz)
-
-        # work_matrix = sum_yy - C·sum_yz' - sum_yz·C' + C·E_zz·C'
-        copyto!(work_matrix, sum_yy)
-        mul!(work_matrix, C, sum_yz', -one(T), one(T))
-        mul!(work1, sum_yz, C')
-        work_matrix .-= work1
-        mul!(work2, E_zz[:, :, t], C')
-        mul!(work_matrix, C, work2, one(T), one(T))
-
-        temp .+= work_matrix
-    end
-
-    ldiv!(R_U', temp)
-    ldiv!(R_U, temp)
-    return T(-0.5) * (tsteps * (const_term + log_det_R) + tr(temp))
+    # compute the sufficient statistics
+    return _aggregate_td_suff_stats!(
+        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
+    )
 end
 
-# Backward-compatible no-input overload.
-function Q_obs!(
-    ws::SmoothWorkspace{T},
+# y/ux/uy as Matrices
+function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    E_z::AbstractMatrix{T},
-    E_zz::AbstractArray{T,3},
+    suf::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
     y::AbstractMatrix{T},
+    latent_inputs::AbstractMatrix{T},
+    obs_inputs::AbstractMatrix{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    v = zeros(T, 0, size(y, 2))
-    return Q_obs!(ws, lds, E_z, E_zz, y, v)
+
+    # smooth each trial
+    smooth!(lds, tfs, y, sws_pool, latent_inputs, obs_inputs)
+
+    # compute the sufficient statistics
+    return _aggregate_td_suff_stats!(
+        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
+    )
 end
 
 """
-    Q_obs!(sws, lds, suf)
-
-Total log-likelihood Q-obs term across all trials and time, computed from
-the aggregated sufficient statistics in `suf`. Replaces the per-trial,
-per-timestep loop of the legacy `Q_obs!(sws, lds, E_z, E_zz, y, v)`.
-"""
-function Q_obs!(
-    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    D = lds.latent_dim
-    p = lds.obs_dim
-    d_dim = lds.obs_input_dim
-    obs_reg_dim = D + 1 + d_dim
-    C = lds.obs_model.C
-    d = lds.obs_model.d
-    D_obs = lds.obs_model.D
-
-    R_U = sws.R_PD[].chol.U
-    log_det_R = logdet(sws.R_PD[])
-    const_term = p * log(T(2π))
-
-    obs_n = suf.obs_n
-
-    # V = [C d D_obs] (p × obs_reg_dim)
-    V = view(sws.CD, :, 1:obs_reg_dim)
-    copyto!(view(V, :, 1:D), C)
-    copyto!(view(V, :, D + 1), d)
-    if d_dim > 0
-        copyto!(view(V, :, (D + 2):obs_reg_dim), D_obs)
-    end
-
-    # S_obs = obs_yy - V·obs_xy - obs_xy'·V' + V·obs_xx·V'
-    S_obs = sws.elbo_obs_temp
-    copyto!(S_obs, suf.obs_yy[].mat)
-    mul!(S_obs, V, suf.obs_xy, -one(T), one(T))
-    mul!(S_obs, transpose(suf.obs_xy), transpose(V), -one(T), one(T))
-    V_XX = view(sws.Syz, :, 1:obs_reg_dim)
-    mul!(V_XX, V, suf.obs_xx[].mat)
-    mul!(S_obs, V_XX, transpose(V), one(T), one(T))
-
-    ldiv!(R_U', S_obs)
-    ldiv!(R_U, S_obs)
-    return T(-0.5) * (T(obs_n) * (const_term + log_det_R) + tr(S_obs))
-end
-
-"""
-    calculate_elbo(lds, suf, sws)
+    elbo!(lds, suf, sws, total_entropy)
 
 Total ELBO from aggregated sufficient statistics. Computes the same quantity
-as the legacy `calculate_elbo(lds, tfs, y, sws_pool, ...)` but in
+as the legacy `elbo(lds, tfs, y, sws_pool, ...)` but in
 O(D³ + p²·D) instead of O(N·T·p²·D). The Gaussian-posterior entropy comes
 from each trial's `fs.entropy` (filled by the smoother) and is summed by
 the caller before this function is invoked.
 """
-function calculate_elbo(
+function elbo!(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
@@ -986,115 +936,28 @@ function calculate_elbo(
     # MN-quadratic piece and can appear non-monotone.
     if lds.state_model.AB_prior !== nothing
         D = lds.latent_dim
-        u_dim = lds.state_input_dim
-        W_ab = view(sws.AB, :, 1:(D + 1 + u_dim))
+        ux_dim = lds.state_input_dim
+        W_ab = view(sws.AB, :, 1:(D + 1 + ux_dim))
         copyto!(view(W_ab, :, 1:D), lds.state_model.A)
         copyto!(view(W_ab, :, D + 1), lds.state_model.b)
-        if u_dim > 0
-            copyto!(view(W_ab, :, (D + 2):(D + 1 + u_dim)), lds.state_model.B)
+        if ux_dim > 0
+            copyto!(view(W_ab, :, (D + 2):(D + 1 + ux_dim)), lds.state_model.B)
         end
         prior_term += mn_logprior_term(W_ab, lds.state_model.Q, lds.state_model.AB_prior)
     end
     if lds.obs_model.CD_prior !== nothing
         D = lds.latent_dim
-        d_dim = lds.obs_input_dim
-        W_cd = view(sws.CD, :, 1:(D + 1 + d_dim))
+        uy_dim = lds.obs_input_dim
+        W_cd = view(sws.CD, :, 1:(D + 1 + uy_dim))
         copyto!(view(W_cd, :, 1:D), lds.obs_model.C)
         copyto!(view(W_cd, :, D + 1), lds.obs_model.d)
-        if d_dim > 0
-            copyto!(view(W_cd, :, (D + 2):(D + 1 + d_dim)), lds.obs_model.D)
+        if uy_dim > 0
+            copyto!(view(W_cd, :, (D + 2):(D + 1 + uy_dim)), lds.obs_model.D)
         end
         prior_term += mn_logprior_term(W_cd, lds.obs_model.R, lds.obs_model.CD_prior)
     end
 
     return Q_total + prior_term + total_entropy
-end
-
-function update_C_d!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    lds.fit_bool[5] || return nothing
-    D = lds.latent_dim
-    d_dim = lds.obs_input_dim
-    CD_prior = lds.obs_model.CD_prior
-
-    if CD_prior === nothing
-        # Zero-alloc OLS fast path. `sws.Syz` is exactly (p × obs_reg_dim);
-        # its transpose is the (obs_reg_dim × p) view we ldiv! into. After
-        # the in-place solve, `sws.Syz` itself holds V = [C d D].
-        Syz_T = transpose(sws.Syz)
-        copyto!(Syz_T, suf.obs_xy)
-        ldiv!(suf.obs_xx[].chol, Syz_T)
-        V = sws.Syz
-    else
-        V = mn_map(suf.obs_xx[], suf.obs_xy, CD_prior)
-    end
-
-    copyto!(lds.obs_model.C, view(V, :, 1:D))
-    copyto!(lds.obs_model.d, view(V, :, D + 1))
-    if d_dim > 0
-        copyto!(lds.obs_model.D, view(V, :, (D + 2):(D + 1 + d_dim)))
-    end
-    return nothing
-end
-
-function update_R!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    lds.fit_bool[6] || return nothing
-    p = lds.obs_dim
-    D = lds.latent_dim
-    d_dim = lds.obs_input_dim
-
-    # sws.CD is exactly (p × obs_reg_dim); no view needed.
-    V = sws.CD
-    copyto!(view(V, :, 1:D), lds.obs_model.C)
-    copyto!(view(V, :, D + 1), lds.obs_model.d)
-    if d_dim > 0
-        copyto!(view(V, :, (D + 2):(D + 1 + d_dim)), lds.obs_model.D)
-    end
-
-    # Residual scatter S = obs_yy - V·obs_xy - obs_xy'·V' + V·obs_xx·V'
-    Vxy = sws.elbo_obs_temp                    # p × p scratch (free post-Q_obs!)
-    mul!(Vxy, V, suf.obs_xy)
-
-    S_res = sws.elbo_obs_work                  # p × p scratch
-    copyto!(S_res, suf.obs_yy[].mat)
-    S_res .-= Vxy
-    S_res .-= Vxy'
-    # In-place X_A_Xt = V · obs_xx · V'. Mirror PDMats' X_A_Xt: compute
-    # `VL = V · L` (obs_xx = L·L' via the cached Cholesky) and add
-    # `VL · VL'` to the upper triangle via a symmetric rank-k BLAS call,
-    # then reflect upper → lower for exact symmetry. (`mul!` + `Symmetrize!`
-    # would halve the off-diagonal contribution because gemm can produce
-    # 1-ULP-asymmetric output that averaging then collapses.)
-    VL = sws.Syz                               # (p × obs_reg_dim) scratch
-    # See `update_Q!`: `BLAS.trmm!` on the raw upper-stored
-    # `chol.factors` (with transa='T' since L = U') avoids the
-    # `LowerTriangular(...)` wrapper alloc that `mul!(VL, V, chol.L)`
-    # would do.
-    copyto!(VL, V)
-    BLAS.trmm!('R', 'U', 'T', 'N', one(T), suf.obs_xx[].chol.factors, VL)
-    mul!(S_res, VL, transpose(VL), one(T), one(T))
-
-    CD_prior = lds.obs_model.CD_prior
-    if CD_prior !== nothing
-        Wm = V .- CD_prior.M₀
-        S_res .+= Wm * CD_prior.Λ * Wm'
-    end
-
-    for j in 2:p, i in 1:(j - 1)
-        S_res[j, i] = S_res[i, j]
-    end
-
-    if lds.obs_model.R_prior === nothing
-        S_res ./= T(suf.obs_n)
-    else
-        Ψ, ν = lds.obs_model.R_prior.Ψ, lds.obs_model.R_prior.ν
-        S_res .= iw_map(Ψ, ν, S_res, T(suf.obs_n), p)
-    end
-    copyto!(lds.obs_model.R, S_res)
-    return nothing
 end
 
 """
@@ -1119,7 +982,7 @@ end
 
 """
     fit!(lds, y; max_iter=100, tol=1e-6, progress=true,
-         control_seq=nothing, obs_control_seq=nothing)
+         latent_inputs=nothing, obs_inputs=nothing)
 
 Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
@@ -1134,9 +997,9 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 - `max_iter::Int=100`: maximum EM iterations
 - `tol::Float64=1e-6`: convergence tolerance on ELBO change
 - `progress::Bool=true`: show progress bar
-- `control_seq`: optional dynamics-input sequence. `Vector{<:AbstractMatrix}`
-  for multi-trial (each `(u_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
-- `obs_control_seq`: optional observation-input sequence (same shape) for the
+- `latent_inputs`: optional dynamics-input sequence. `Vector{<:AbstractMatrix}`
+  for multi-trial (each `(ux_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
+- `obs_inputs`: optional observation-input sequence (same shape) for the
   obs-side input matrix `D`. Required when `size(obs_model.D, 2) > 0`.
 
 Returns a `Vector{T}` of ELBO values, one per iteration.
@@ -1147,21 +1010,21 @@ function fit!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-    control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    obs_control_seq::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    latent_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    obs_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
-    u_seq = _normalize_multitrial_control(
-        control_seq, lds.state_input_dim, tsteps_per_trial, T, "control_seq"
+    latent_inputs = _normalize_multitrial_control(
+        latent_inputs, lds.state_input_dim, tsteps_per_trial, T, "latent_inputs"
     )
-    v_seq = _normalize_multitrial_obs_control(
-        obs_control_seq, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model
+    obs_inputs = _normalize_multitrial_obs_control(
+        obs_inputs, lds.obs_input_dim, tsteps_per_trial, T, lds.obs_model
     )
     return _fit_tridiag!(
         lds,
         y;
-        control_seq=u_seq,
-        obs_control_seq=v_seq,
+        latent_inputs=latent_inputs,
+        obs_inputs=obs_inputs,
         max_iter=max_iter,
         tol=tol,
         progress=progress,
@@ -1171,18 +1034,15 @@ end
 function _fit_tridiag!(
     lds::LinearDynamicalSystem{T,S,O},
     y::AbstractVector{<:AbstractMatrix{T}};
-    control_seq::AbstractVector{<:AbstractMatrix{T}},
-    obs_control_seq::AbstractVector{<:AbstractMatrix{T}},
+    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
+    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
-
-    prev_elbo = -T(Inf)
-    elbos = Vector{T}()
-    sizehint!(elbos, max_iter)
+    elbos = Vector{T}(undef, max_iter)
 
     # Opt in to the cov-alias stub for `p_smooth` / `p_smooth_tt1` when the
     # cov-cache fast path is going to fire (equal-length multi-trial). The
@@ -1194,8 +1054,8 @@ function _fit_tridiag!(
         lds, tsteps_per_trial; cov_alias=cov_alias
     )::TrialFilterSmooth{T}
 
-    u_dim = lds.state_input_dim
-    d_dim = lds.obs_input_dim
+    ux_dim = lds.state_input_dim
+    uy_dim = lds.obs_input_dim
     # Only `sws_pool[1]` needs the batched mean-pass buffers (used by the
     # equal-length cov-cache fast path); the other workspaces back the
     # per-trial fallback / @spawn'd tasks and stay at `ntrials = 1`.
@@ -1206,23 +1066,21 @@ function _fit_tridiag!(
         lds.latent_dim,
         lds.obs_dim,
         T_max;
-        u_dim=u_dim,
-        d_dim=d_dim,
+        ux_dim=ux_dim,
+        uy_dim=uy_dim,
         ntrials=ntrials_total,
     )
     for i in 2:pool_size
         sws_pool[i] = SmoothWorkspace(
-            T, lds.latent_dim, lds.obs_dim, T_max; u_dim=u_dim, d_dim=d_dim
+            T, lds.latent_dim, lds.obs_dim, T_max; ux_dim=ux_dim, uy_dim=uy_dim
         )
     end
 
     # Sufficient-statistics aggregator: allocated once, mutated each E-step.
-    # Data-only constants (Σ y y', Σ y, Σ u u' …) are precomputed here once
+    # Data-only constants (Σ y y', Σ y, Σ ux ux' …) are precomputed here once
     # and reused across iterations.
     suf = _initialize_td_sufficient_statistics(T, lds, tsteps_per_trial)
-    _td_init_const_blocks!(
-        sws_pool[1], lds, tsteps_per_trial, y, control_seq, obs_control_seq
-    )
+    _td_init_const_blocks!(sws_pool[1], lds, tsteps_per_trial, y, latent_inputs, obs_inputs)
 
     prog = if progress
         Progress(max_iter; desc="Fitting LDS via EM...", barlen=50, showspeed=true)
@@ -1230,34 +1088,27 @@ function _fit_tridiag!(
         nothing
     end
 
-    for _ in 1:max_iter
-        # E-step: smooth + aggregate sufficient stats from x_smooth / p_smooth /
-        # p_smooth_tt1. We skip the legacy `sufficient_statistics!(tfs)` call —
-        # the new aggregator reads smoother outputs directly, so the per-trial
-        # E_zz / E_zz_prev arrays are no longer populated on the hot path.
-        smooth!(lds, tfs, y, sws_pool, control_seq, obs_control_seq)
-        _aggregate_td_suff_stats!(
-            suf, tfs, lds, control_seq, obs_control_seq, y, sws_pool[1]
-        )
+    for iter in 1:max_iter
 
-        # ELBO uses the same Cholesky factors as the smoother just filled.
-        total_entropy = zero(T)
-        for fs in tfs.FilterSmooths
-            total_entropy += fs.entropy
-        end
-        elbo = calculate_elbo(lds, suf, sws_pool[1], total_entropy)
-        push!(elbos, elbo)
+        # E-step: smooth + aggregate sufficient statistics
+        estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool)
+
+        # compute the ELBO
+        total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
+        elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
 
+        # print progress
         prog !== nothing && next!(prog)
 
-        if abs(elbo - prev_elbo) < tol
+        # check convergence
+        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
             return elbos
         end
-        prev_elbo = elbo
     end
 
     prog !== nothing && finish!(prog)

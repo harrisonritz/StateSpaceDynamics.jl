@@ -8,6 +8,14 @@
 # next to the solver that owns it.)
 # =============================================================================
 
+#=
+Wrap a `PDMat` in a `Ref` whose element type matches the workspace field type
+`PDMat{T,Matrix{T}}`. Pinning the eltype here keeps construction working on both 2- and 3-parameter
+PDMats. Reading (`ref[]`) and rebinding (`ref[] = pd`) are unaffected either way. Not my favorite but it works.
+TODO: Consider lowerbounding PDMats to 0.11.40
+=#
+_pd_ref(pd::PDMat{T,Matrix{T}}) where {T} = Base.RefValue{PDMat{T,Matrix{T}}}(pd)
+
 """
     FilterSmooth{T<:Real}
 
@@ -221,13 +229,13 @@ struct SmoothWorkspace{T<:Real}
     td_sum_smooth_xcov::Matrix{T}      # (D, D)  Σₙ Σ_{t=2:Tₙ}   P_smooth_tt1[t]
 
     # Constant aggregates over the input data (filled once at fit entry, not
-    # touched again). The y-only / v-only blocks of obs_xx, obs_xy, obs_yy and
-    # the u-only blocks of dyn_xx are observation-independent so we cache them
+    # touched again). The y-only / uy-only blocks of obs_xx, obs_xy, obs_yy and
+    # the ux-only blocks of dyn_xx are observation-independent so we cache them
     # here to skip re-summing every E-step.
     td_obs_yy_const::Matrix{T}         # (p, p)                Σₙ Σₜ yₜ yₜ'
-    td_obs_xy_const::Matrix{T}         # (obs_reg_dim, p)      bias + v-rows of obs_xy
-    td_obs_xx_const::Matrix{T}         # (obs_reg_dim, obs_reg_dim) bias / v blocks
-    td_dyn_xx_const::Matrix{T}         # (dyn_reg_dim, dyn_reg_dim) bias / u blocks
+    td_obs_xy_const::Matrix{T}         # (obs_reg_dim, p)      bias + uy-rows of obs_xy
+    td_obs_xx_const::Matrix{T}         # (obs_reg_dim, obs_reg_dim) bias / uy blocks
+    td_dyn_xx_const::Matrix{T}         # (dyn_reg_dim, dyn_reg_dim) bias / ux blocks
 
     # Batched mean-pass buffers (equal-length cov-cache fast path). Only the
     # designated `sws_pool[1]` workspace allocates these with `ntrials > 1`;
@@ -247,26 +255,26 @@ struct SmoothWorkspace{T<:Real}
     # Populated once at the first batched `smooth!` call (data is constant
     # across EM iters within a fit). 0-sized when `ntrials = 1`.
     batched_y::Array{T,3}             # (obs_dim, tsteps, ntrials)
-    batched_u::Array{T,3}             # (u_dim, tsteps, ntrials)
-    batched_v::Array{T,3}             # (d_dim, tsteps, ntrials)
+    batched_ux::Array{T,3}             # (ux_dim, tsteps, ntrials)
+    batched_uy::Array{T,3}             # (uy_dim, tsteps, ntrials)
     batched_data_valid::Base.RefValue{Bool}  # true after first populate
 end
 
 """
     SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
-                    u_dim=0, d_dim=0, ntrials=1)
+                    ux_dim=0, uy_dim=0, ntrials=1)
 
 Construct a preallocated `SmoothWorkspace` for the full LDS EM pipeline.
 
-- `u_dim` is the dynamics-input dimension (`size(state_model.B, 2)`), used to
+- `ux_dim` is the dynamics-input dimension (`size(state_model.B, 2)`), used to
   size the M-step regression buffers `Sxz`/`Szz_Ab`/`AB` to fit `[A b B]`.
-- `d_dim` is the observation-input dimension (`size(obs_model.D, 2)`), used
+- `uy_dim` is the observation-input dimension (`size(obs_model.D, 2)`), used
   to size `Syz`/`Szz_Cd`/`CD` to fit `[C d D]`.
 - `ntrials` sizes the batched mean-pass buffers used by the equal-length
   cov-cache fast path. Default 1 (effectively empty). Only `sws_pool[1]` at
   fit entry needs the real `ntrials`; the rest of the pool keeps the default.
 
-Either of `u_dim` / `d_dim` being zero (the default) means no inputs — buffers
+Either of `ux_dim` / `uy_dim` being zero (the default) means no inputs — buffers
 fit `[A b]` and/or `[C d]` only.
 """
 function SmoothWorkspace(
@@ -274,17 +282,17 @@ function SmoothWorkspace(
     latent_dim::Int,
     obs_dim::Int,
     tsteps::Int;
-    u_dim::Int=0,
-    d_dim::Int=0,
+    ux_dim::Int=0,
+    uy_dim::Int=0,
     ntrials::Int=1,
 ) where {T<:Real}
     btd = BlockTridiagonalWorkspace(T, latent_dim, tsteps)
 
     # Placeholder PDMats — rewrapped at the start of every E-step
     # by `compute_smooth_constants!`.
-    R_PD = Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim)))
-    Q_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
-    P0_PD = Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
+    R_PD = _pd_ref(PDMat(Matrix{T}(I, obs_dim, obs_dim)))
+    Q_PD = _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
+    P0_PD = _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim)))
 
     tmp_RC = zeros(T, obs_dim, latent_dim)
     tmp_QA = zeros(T, latent_dim, latent_dim)
@@ -323,10 +331,10 @@ function SmoothWorkspace(
     I_mat = Matrix{T}(I, latent_dim, latent_dim)
 
     # M-step buffers. The "+1" is for the affine bias column (b for the
-    # dynamics regression, d for the observation regression); u_dim / d_dim
+    # dynamics regression, d for the observation regression); ux_dim / uy_dim
     # add the user input columns when controls are supplied.
-    dyn_reg_dim = latent_dim + 1 + u_dim
-    obs_reg_dim = latent_dim + 1 + d_dim
+    dyn_reg_dim = latent_dim + 1 + ux_dim
+    obs_reg_dim = latent_dim + 1 + uy_dim
     Sxz = zeros(T, latent_dim, dyn_reg_dim)
     Szz_Ab = zeros(T, dyn_reg_dim, dyn_reg_dim)
     AB = zeros(T, latent_dim, dyn_reg_dim)
@@ -392,8 +400,8 @@ function SmoothWorkspace(
     batched_tmp2 = zeros(T, latent_dim, ntrials)
     batched_tmp3 = zeros(T, latent_dim, ntrials)
     batched_y = zeros(T, obs_dim, tsteps, ntrials)
-    batched_u = zeros(T, u_dim, tsteps, ntrials)
-    batched_v = zeros(T, d_dim, tsteps, ntrials)
+    batched_ux = zeros(T, ux_dim, tsteps, ntrials)
+    batched_uy = zeros(T, uy_dim, tsteps, ntrials)
     batched_data_valid = Ref(false)
 
     return SmoothWorkspace{T}(
@@ -476,8 +484,8 @@ function SmoothWorkspace(
         batched_tmp2,
         batched_tmp3,
         batched_y,
-        batched_u,
-        batched_v,
+        batched_ux,
+        batched_uy,
         batched_data_valid,
     )
 end
@@ -674,9 +682,9 @@ end
 
 function LDSConstantCache(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
     return LDSConstantCache{T}(
-        Ref(PDMat(Matrix{T}(I, obs_dim, obs_dim))),         # R_PD placeholder
-        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # Q_PD placeholder
-        Ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # P0_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, obs_dim, obs_dim))),         # R_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # Q_PD placeholder
+        _pd_ref(PDMat(Matrix{T}(I, latent_dim, latent_dim))),   # P0_PD placeholder
         zero(T),                                # cP0
         zero(T),                                # cQ
         zero(T),                                # cR
@@ -910,7 +918,7 @@ The workspace is split into three layers:
    `CiRY`, `y_minus_d`). Shape `(D, T, ntrials)` — threads write into disjoint trial
    slices, so no locking is required.
 
-`u_dim` is 0 when the `B` input is absent.
+`ux_dim` is 0 when the `B` input is absent.
 """
 struct KalmanWorkspace{T<:Real}
 
@@ -987,8 +995,8 @@ struct KalmanWorkspace{T<:Real}
     # Sufficient-statistics scratch (reused each E-step; bottom-right uu/dd
     # block is initialized once from `initialize_SufficientStatistics` and not
     # mutated thereafter).
-    dyn_xx_buf::Matrix{T}    # ((D + u_dim) × (D + u_dim))
-    obs_xx_buf::Matrix{T}    # ((D + d_dim) × (D + d_dim))
+    dyn_xx_buf::Matrix{T}    # ((D + ux_dim) × (D + ux_dim))
+    obs_xx_buf::Matrix{T}    # ((D + uy_dim) × (D + uy_dim))
 end
 
 """
@@ -1066,14 +1074,14 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         G,                              # Array{T,3} for G[t] = P_filt[t] * A' * P_pred[t+1]^{-1}
         zeros(T, D, D),                 # cov_tmp1
         zeros(T, D, D),                 # cov_tmp2
-        Ref(placeholder_D),             # pd_tmp
-        Ref(placeholder_p),             # obs_pd_tmp
+        _pd_ref(placeholder_D),             # pd_tmp
+        _pd_ref(placeholder_p),             # obs_pd_tmp
         zeros(T, D, ntrials),           # mean_tmp
         p_smooth_shared,                # (D, D, T)
         p_smooth_tt1_shared,            # (D, D, T)
-        Ref(placeholder_D),             # Q_PD
-        Ref(placeholder_D),             # P0_PD
-        Ref(placeholder_p),             # R_PD
+        _pd_ref(placeholder_D),             # Q_PD
+        _pd_ref(placeholder_D),             # P0_PD
+        _pd_ref(placeholder_p),             # R_PD
         placeholder_P0_mu,              # P0_mu
         placeholder_P0_df,              # P0_df
         placeholder_AB,                 # AB_prior
@@ -1083,7 +1091,7 @@ Allocate a `KalmanWorkspace` sized for the given `lds` and data shape. Requires
         placeholder_R_mu,               # R_mu
         placeholder_R_df,               # R_df
         zeros(T, D, p),                 # CiR
-        Ref(placeholder_D),             # CiRC
+        _pd_ref(placeholder_D),             # CiRC
         Ref(zero(T)),                   # shared_entropy
         zeros(T, D, tsteps, ntrials),   # pred_mean
         zeros(T, D, tsteps, ntrials),   # filt_mean

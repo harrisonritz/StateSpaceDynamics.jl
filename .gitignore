@@ -28,17 +28,17 @@ notebooks/regression_debug.ipynb
 notebooks/benchmarking.jl
 notebooks/debugging.jl
 docs/testfile.jl
-benchmarking/testfile.jl
+benchmark/comparison/testfile.jl
 
 # Paper files
 /paper/jats
 
 # benchmarking files
-benchmarking/.CondaPkg
-benchmarking/.DEAD_CondaPkg
-benchmarking/benchmark.jl.claude/worktrees/
+benchmark/comparison/.CondaPkg
+benchmark/comparison/.DEAD_CondaPkg
+benchmark/comparison/benchmark.jl.claude/worktrees/
 /.claude
-/benchmarking/results
+/benchmark/comparison/results
 CLAUDE.md
 
 # Local profiling sandbox (never committed)

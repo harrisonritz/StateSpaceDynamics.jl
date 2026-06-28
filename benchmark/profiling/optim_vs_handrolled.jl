@@ -25,7 +25,7 @@ y = y_multi[1]
 
 # The package dropped the allocating Gradient/Hessian wrappers; build the
 # workspaces once and shim the old allocating API over the `!` versions.
-const grad_ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; u_dim=0, d_dim=0)
+const grad_ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; ux_dim=0, uy_dim=0)
 StateSpaceDynamics.compute_smooth_constants!(grad_ws, lds)
 const hess_ws = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, D, T_t)
 
@@ -79,7 +79,7 @@ println("  mem        = $(round(b_optim.memory / 1024; digits=1)) KB / $(b_optim
 
 # Hand-rolled benchmark
 tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, [T_t])
-sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; u_dim=0, d_dim=0)
+sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; ux_dim=0, uy_dim=0)
 for _ in 1:3
     StateSpaceDynamics.smooth!(lds, tfs[1], y, sws)
 end
