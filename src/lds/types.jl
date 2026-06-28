@@ -8,13 +8,13 @@ abstract type AbstractObservationModel{T<:Real} end
     Data{T<:Real}
 
 Container for the observed data passed to the Kalman path: observations `y`,
-dynamics inputs `u`, and observation inputs `d`, each `(dim, tsteps, ntrials)`
+dynamics (latent) inputs `ux`, and observation inputs `uy`, each `(dim, tsteps, ntrials)`
 (input fields may have zero rows when no controls are supplied).
 """
 Base.@kwdef struct Data{T<:Real}
     y::Array{T,3}
-    u::Array{T,3}
-    d::Array{T,3}
+    ux::Array{T,3}
+    uy::Array{T,3}
 end
 
 """
@@ -25,9 +25,9 @@ Represents the state model of a Linear Dynamical System with Gaussian noise.
 State evolution:
 ```math
 x_1           ~ N(x_0, P_0)
-x_{t+1} | x_t ~ N(A x_t + b + B u_t, Q)
+x_{t+1} | x_t ~ N(A x_t + b + B ux_t, Q)
 ```
-where `B·u_t` is present only when `B` is supplied (i.e., has nonzero columns).
+where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns).
 
 # Fields
 - `A::M`: Transition matrix (size `latent_dim × latent_dim`).
@@ -35,8 +35,8 @@ where `B·u_t` is present only when `B` is supplied (i.e., has nonzero columns).
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
-- `B::M: Optional dynamics input matrix (`latent_dim × u_dim`).
-    When supplied, inputs `u` must be passed to `fit!`/`smooth!` via a keyword argument.
+- `B::M: Optional dynamics input matrix (`latent_dim × ux_dim`).
+    When supplied, inputs `ux` must be passed to `fit!`/`smooth!` via a keyword argument.
 - `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
 - `AB_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on

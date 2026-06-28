@@ -19,7 +19,7 @@ _, y_multi = StateSpaceDynamics.rand(rng, lds, fill(T_t, 1))
 y = y_multi[1]
 
 # Set up the workspace + run smooth! once so the Hessian buffers are populated.
-sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; u_dim=0, d_dim=0)
+sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, p, T_t; ux_dim=0, uy_dim=0)
 StateSpaceDynamics.compute_smooth_constants!(sws, lds)
 
 x0_vec = zeros(D * T_t)

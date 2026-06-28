@@ -1,153 +1,61 @@
 # Benchmarking Guide
 
 This document explains the benchmarking infrastructure for StateSpaceDynamics.jl.
+For how to run things locally, see [`benchmark/README.md`](../benchmark/README.md).
 
 ## Overview
 
-StateSpaceDynamics.jl uses automated benchmarking to track performance over time and detect regressions. Benchmarks run automatically on:
+Benchmarking has two distinct jobs, which live side by side under `benchmark/`:
 
-- Every push to `main`
-- Every pull request
-- Manual workflow dispatch
+1. **Regression tracking** — [AirspeedVelocity.jl](https://github.com/MilesCranmer/AirspeedVelocity.jl)
+   runs `benchmark/benchmarks.jl` (the `SUITE`) on a PR and its base branch and
+   reports any speed/allocation changes. This is the automated CI check.
+2. **Cross-library comparison** — `benchmark/comparison/` benchmarks against the
+   Python libraries pykalman and Dynamax. This is run manually (it needs a Conda
+   Python environment), not in CI.
 
-## Benchmark Workflow
+> AirspeedVelocity compares *this package across git revisions* — it cannot
+> compare against other packages. The pykalman/Dynamax comparison is therefore a
+> separate harness (`benchmark/comparison/`), not part of the AirspeedVelocity run.
 
-The benchmark workflow ([`.github/workflows/benchmark.yml`](workflows/benchmark.yml)) performs the following:
+## CI workflow
 
-1. **Setup**: Installs Julia and project dependencies
-2. **Run Benchmarks**: Executes the benchmark suite across different problem sizes
-3. **Save Results**: Stores results as workflow artifacts (retained for 90 days)
-4. **Compare**: For PRs, compares against baseline from the target branch
-5. **Report**: Posts comparison results as a PR comment
+[`.github/workflows/airspeed.yml`](workflows/airspeed.yml) runs on every PR
+(`pull_request_target`), benchmarks the PR head and its base in the same
+environment via the `MilesCranmer/AirspeedVelocity.jl@action-v1` action, and posts
+a comparison table as a PR comment. The action freezes the benchmark script at the
+base revision, so PR code cannot rewrite what is measured.
 
-## What Gets Benchmarked
+## What gets benchmarked (regression suite)
 
-### Gaussian LDS Smoothing
-Tests the RTS smoothing algorithm for Gaussian observations:
-- Latent dimensions: 2, 4, 8
-- Observation dimensions: 5, 10, 20
-- Sequence lengths: 100, 500 timesteps
+`benchmark/benchmarks.jl` defines `const SUITE`:
 
-### Poisson LDS Smoothing
-Tests the Laplace approximation-based smoothing for Poisson observations:
-- Latent dimensions: 2, 4
-- Observation dimensions: 5, 10
-- Sequence lengths: 100, 500 timesteps
+- **Gaussian LDS smoothing** — latent ∈ {2, 4, 8}, obs ∈ {5, 10, 20}, T ∈ {100, 500}
+- **Poisson LDS smoothing** — latent ∈ {2, 4}, obs ∈ {5, 10}, T ∈ {100, 500}
 
-## Metrics Tracked
+Metrics per benchmark: median time, allocated memory, allocation count.
 
-For each benchmark:
-- **Execution time**: Median time in milliseconds
-- **Memory usage**: Total allocated memory in MB
-- **Allocations**: Number of memory allocations
+## Adding a new benchmark
 
-## Viewing Results
-
-### In CI
-
-1. Navigate to the [Benchmarks workflow](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/benchmark.yml)
-2. Click on a specific run
-3. Download the `benchmark-results-*` artifact
-4. View `summary.csv` for a readable summary
-
-### In Pull Requests
-
-The benchmark workflow automatically comments on PRs with:
-- Performance comparison vs. the base branch
-- Speedup/slowdown percentages
-- Memory usage changes
-
-## Running Benchmarks Locally
-
-### Quick Julia-only benchmarks
-
-Run the same benchmarks that CI runs:
-
-```bash
-julia --project=benchmarking -e '
-  using Pkg
-  Pkg.instantiate()
-  Pkg.develop(PackageSpec(path=pwd()))
-'
-
-# Then run the benchmark script inline or save it to a file
-julia --project=benchmarking .github/workflows/benchmark.yml  # (extract the Julia script)
-```
-
-### Full benchmark suite (with Python comparisons)
-
-The `benchmarking/` directory contains a more comprehensive suite that compares against Python libraries:
-
-```bash
-cd benchmarking
-julia --project -e 'using Pkg; Pkg.instantiate(); Pkg.develop(PackageSpec(path=".."))'
-julia --project run_benchmark.jl
-```
-
-This requires:
-- Python with `pykalman` and `dynamax` installed
-
-## Interpreting Performance Changes
-
-### Good Changes
-- Speedup > 1.05 (5% faster)
-- Memory reduction > 5%
-- Fewer allocations
-
-### Acceptable Changes
-- Speedup between 0.95-1.05 (within noise)
-- Memory change < 5%
-
-### Concerning Changes
-- Speedup < 0.95 (5% slower) - investigate
-- Memory increase > 10% - investigate
-- Significant allocation increase - investigate
-
-## Adding New Benchmarks
-
-To add a new benchmark to the CI suite:
-
-1. Edit `.github/workflows/benchmark.yml`
-2. Add your benchmark to the `SUITE` BenchmarkGroup:
+Edit `benchmark/benchmarks.jl` and add to `SUITE`:
 
 ```julia
 SUITE["MyCategory"]["operation", "params"] =
-    @benchmarkable my_function($args) samples=10 seconds=5
+    @benchmarkable my_function($args) samples = 10 seconds = 5
 ```
 
-3. Test locally first
-4. Submit a PR
+Use `StableRNG` for reproducibility, and cover small/medium/large problem sizes.
 
-## Best Practices
+## Interpreting performance changes
 
-1. **Consistency**: Benchmarks use `StableRNG` for reproducibility
-2. **Warm-up**: BenchmarkTools handles warm-up automatically
-3. **Sample size**: Default is 10 samples with 5-second timeout per benchmark
-4. **Problem sizes**: Include small, medium, and large problems
-5. **Representative**: Benchmark realistic use cases, not edge cases
+| Verdict | Time | Memory |
+|---------|------|--------|
+| Good | speedup > 1.05 | reduction > 5% |
+| Noise | 0.95–1.05 | < 5% |
+| Investigate | speedup < 0.95 | increase > 10% |
 
 ## Troubleshooting
 
-### Benchmark times out
-- Reduce problem size
-- Increase `seconds` parameter
-- Reduce `samples` parameter
-
-### Results are noisy
-- Increase `samples`
-- Check for system load during benchmarking
-- CI results are typically more stable than local runs
-
-### Out of memory
-- Reduce problem sizes
-- Run fewer benchmarks in parallel
-- GitHub Actions runners have limited memory
-
-## Future Enhancements
-
-Planned improvements:
-- [ ] Historical performance tracking
-- [ ] Benchmark result visualization
-- [ ] Automated performance regression alerts
-- [ ] Comparison with Python libraries in CI
-- [ ] Per-commit performance dashboard
+- **Times out** — reduce problem size, raise `seconds`, or lower `samples`.
+- **Noisy** — raise `samples`; CI is usually more stable than a busy laptop.
+- **OOM** — reduce problem sizes; CI runners have limited memory.

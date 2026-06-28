@@ -190,8 +190,8 @@ function test_lds_with_B_input_equivalent_to_bias()
     # B·u with u ≡ 1 reduces to an additive constant; setting b = B·1 should
     # produce identical sample paths.
     D, p, T, N = 3, 4, 30, 2
-    u_dim = D
-    B = Matrix{Float64}(I, D, u_dim)
+    ux_dim = D
+    B = Matrix{Float64}(I, D, ux_dim)
     Random.seed!(11)
     sm = GaussianStateModel(;
         A=0.7*Matrix{Float64}(I, D, D),
@@ -206,7 +206,7 @@ function test_lds_with_B_input_equivalent_to_bias()
     )
     lds_B = LinearDynamicalSystem(sm, om)
 
-    u = ones(u_dim, T, N)
+    u = ones(ux_dim, T, N)
     y_B = _simulate_lds(lds_B, T, N; u=u)
 
     # Same model but with the bias absorbed into `b` instead of `B·u`.
@@ -215,7 +215,7 @@ function test_lds_with_B_input_equivalent_to_bias()
         Q=lds_B.state_model.Q,
         x0=lds_B.state_model.x0,
         P0=lds_B.state_model.P0,
-        b=vec(B * ones(u_dim)),
+        b=vec(B * ones(ux_dim)),
     )
     om_b = GaussianObservationModel(;
         C=lds_B.obs_model.C, R=lds_B.obs_model.R, d=lds_B.obs_model.d
@@ -230,13 +230,13 @@ function test_td_fit_with_dynamics_input()
     # TD path: simulate from `x_{t+1} = A x_t + b + B u_t`, fit, recover B
     # (and b) to coarse tolerance.
     D, p, Tt, N = 3, 5, 60, 8
-    u_dim = 2
+    ux_dim = 2
     rng = MersenneTwister(101)
 
     A_true = 0.85 * SSD.random_rotation_matrix(D, rng)
     Q_true = 0.05 * Matrix{Float64}(I, D, D)
     b_true = randn(rng, D)
-    B_true = randn(rng, D, u_dim)
+    B_true = randn(rng, D, ux_dim)
     x0_true = zeros(D)
     P0_true = 0.1 * Matrix{Float64}(I, D, D)
     C_true = randn(rng, p, D)
@@ -249,8 +249,8 @@ function test_td_fit_with_dynamics_input()
     om_true = GaussianObservationModel(; C=C_true, R=R_true, d=d_true)
     lds_true = LinearDynamicalSystem(sm_true, om_true)
 
-    u_seq = [randn(rng, u_dim, Tt) for _ in 1:N]
-    _, y_seq = rand(lds_true, fill(Tt, N); control_seq=u_seq)
+    ux_seq = [randn(rng, ux_dim, Tt) for _ in 1:N]
+    _, y_seq = rand(lds_true, fill(Tt, N); latent_inputs=ux_seq)
 
     # Fit from a perturbed init.
     sm_init = GaussianStateModel(;
@@ -259,14 +259,14 @@ function test_td_fit_with_dynamics_input()
         x0=zeros(D),
         P0=Matrix{Float64}(I, D, D),
         b=zeros(D),
-        B=zeros(D, u_dim),
+        B=zeros(D, ux_dim),
     )
     om_init = GaussianObservationModel(;
         C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p)
     )
     lds_fit = LinearDynamicalSystem(sm_init, om_init)
 
-    elbos = fit!(lds_fit, y_seq; control_seq=u_seq, max_iter=80, progress=false)
+    elbos = fit!(lds_fit, y_seq; latent_inputs=ux_seq, max_iter=80, progress=false)
 
     @test all(diff(elbos) .>= -1e-4)        # ~monotone
     # B is identifiable up to the same gauge as A/C (rotation of latent space);
@@ -290,7 +290,7 @@ function test_td_fit_with_dynamics_input()
 end
 
 function test_td_sampling_zero_input_matches_no_control()
-    # With control_seq present but u ≡ 0 and B = 0, sampling should match
+    # With latent_inputs present but u ≡ 0 and B = 0, sampling should match
     # the no-control case (same RNG seed).
     D, p, Tt = 3, 4, 25
     rng = MersenneTwister(7)
@@ -309,9 +309,9 @@ function test_td_sampling_zero_input_matches_no_control()
 
     u_zero = zeros(2, Tt)
     rng1 = MersenneTwister(42)
-    x1, y1 = rand(rng1, lds, Tt; control_seq=u_zero)
+    x1, y1 = rand(rng1, lds, Tt; latent_inputs=u_zero)
 
-    # Reset state-model to a 0-column B and call without control_seq.
+    # Reset state-model to a 0-column B and call without latent_inputs.
     sm2 = GaussianStateModel(; A=sm.A, Q=sm.Q, x0=sm.x0, P0=sm.P0, b=sm.b)
     lds2 = LinearDynamicalSystem(sm2, om)
     rng2 = MersenneTwister(42)
@@ -419,7 +419,7 @@ end
 # Toy model with both a dynamics-input matrix `B` and an observation-input
 # matrix `D`, plus matching simulated data. Shared by the input / fit_bool /
 # validation tests below.
-function _make_kalman_io_setup(; D=2, p=3, Tt=40, N=3, u_dim=2, d_dim=2, seed=44)
+function _make_kalman_io_setup(; D=2, p=3, Tt=40, N=3, ux_dim=2, uy_dim=2, seed=44)
     rng = MersenneTwister(seed)
     sm = GaussianStateModel(;
         A=0.7 * Matrix{Float64}(I, D, D),
@@ -427,17 +427,17 @@ function _make_kalman_io_setup(; D=2, p=3, Tt=40, N=3, u_dim=2, d_dim=2, seed=44
         x0=zeros(D),
         P0=0.5 * Matrix{Float64}(I, D, D),
         b=0.1 * ones(D),
-        B=randn(rng, D, u_dim),
+        B=randn(rng, D, ux_dim),
     )
     om = GaussianObservationModel(;
         C=randn(rng, p, D),
         R=0.2 * Matrix{Float64}(I, p, p),
         d=0.1 * ones(p),
-        D=randn(rng, p, d_dim),
+        D=randn(rng, p, uy_dim),
     )
     lds = LinearDynamicalSystem(sm, om)
-    u = randn(rng, u_dim, Tt, N)
-    v = randn(rng, d_dim, Tt, N)
+    u = randn(rng, ux_dim, Tt, N)
+    v = randn(rng, uy_dim, Tt, N)
     y = _simulate_lds_io(lds, Tt, N, u, v; seed=seed + 1)
     return lds, y, u, v
 end
@@ -502,13 +502,13 @@ end
 
 function test_kalman_fit_with_inputs()
     # Dynamics inputs (`B·u`) and observation inputs (`D·v`) supplied: covers
-    # the `u_dim > 0` / `d_dim > 0` branches in data formatting, the constant
+    # the `ux_dim > 0` / `uy_dim > 0` branches in data formatting, the constant
     # Gram-matrix blocks, the per-E-step offsets, and the input blocks of the
     # M-step regressions.
     lds_true, y, u, v = _make_kalman_io_setup()
     D, p = lds_true.latent_dim, lds_true.obs_dim
-    u_dim = size(u, 1)
-    d_dim = size(v, 1)
+    ux_dim = size(u, 1)
+    uy_dim = size(v, 1)
 
     rng = MersenneTwister(45)
     sm_init = GaussianStateModel(;
@@ -517,10 +517,10 @@ function test_kalman_fit_with_inputs()
         x0=zeros(D),
         P0=Matrix{Float64}(I, D, D),
         b=zeros(D),
-        B=zeros(D, u_dim),
+        B=zeros(D, ux_dim),
     )
     om_init = GaussianObservationModel(;
-        C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p), D=zeros(p, d_dim)
+        C=randn(rng, p, D), R=Matrix{Float64}(I, p, p), d=zeros(p), D=zeros(p, uy_dim)
     )
     lds_fit = LinearDynamicalSystem(sm_init, om_init)
 
@@ -666,7 +666,7 @@ function test_kalman_validate_inputs_errors()
     # `validate_kalman_inputs` throws on every B/D-vs-u/d mismatch.
     lds, y, u, v = _make_kalman_io_setup(; seed=77)
     Tt, N = size(y, 2), size(y, 3)
-    u_dim, d_dim = size(u, 1), size(v, 1)
+    ux_dim, uy_dim = size(u, 1), size(v, 1)
 
     # B has inputs but no `control_seq` supplied (u gets 0 rows).
     @test_throws DimensionMismatchError SSD._fit_kalman!(
@@ -676,7 +676,7 @@ function test_kalman_validate_inputs_errors()
     @test_throws DimensionMismatchError SSD._fit_kalman!(
         deepcopy(lds),
         y;
-        control_seq=randn(u_dim, Tt - 1, N),
+        control_seq=randn(ux_dim, Tt - 1, N),
         obs_control_seq=v,
         max_iter=1,
         progress=false,
@@ -690,7 +690,7 @@ function test_kalman_validate_inputs_errors()
         deepcopy(lds),
         y;
         control_seq=u,
-        obs_control_seq=randn(d_dim, Tt, N + 1),
+        obs_control_seq=randn(uy_dim, Tt, N + 1),
         max_iter=1,
         progress=false,
     )
@@ -725,6 +725,5 @@ function test_kalman_marginal_loglikelihood_internals()
     @test SSD.marginal_loglikelihood(lds, y) ≈ ll_ref
     y_vec = [y[:, :, n] for n in 1:N]
     @test SSD.marginal_loglikelihood(lds, y_vec) ≈ ll_ref
-    @test SSD.marginal_loglikelihood(lds, y[:, :, 1]) ≈
-        SSD.loglikelihood(lds, y[:, :, 1])
+    @test SSD.marginal_loglikelihood(lds, y[:, :, 1]) ≈ SSD.loglikelihood(lds, y[:, :, 1])
 end

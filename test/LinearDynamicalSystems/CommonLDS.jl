@@ -210,10 +210,10 @@ function test_initial_state_parameter_updates_common(toy_fn, ntrials=1)
     suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
         Float64, lds, tsteps_per_trial
     )
-    u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
-    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, ws)
+    ux_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    uy_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, ux_seq, uy_seq)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, y, ws)
     if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
         StateSpaceDynamics.mstep!(lds, suf, ws)
     else
@@ -280,10 +280,10 @@ function test_state_model_parameter_updates_common(toy_fn, ntrials=1)
     suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
         Float64, lds, tsteps_per_trial
     )
-    u_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    v_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, u_seq, v_seq)
-    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, u_seq, v_seq, y, ws)
+    ux_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    uy_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, ux_seq, uy_seq)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, y, ws)
     if lds.obs_model isa StateSpaceDynamics.GaussianObservationModel
         StateSpaceDynamics.mstep!(lds, suf, ws)
     else
