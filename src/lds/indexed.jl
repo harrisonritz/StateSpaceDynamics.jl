@@ -56,9 +56,7 @@ struct Varying{T,G} <: Indexed{T}
     label::Symbol
     group_ids::Vector{G}
 
-    function Varying{T,G}(
-        vals::Vector{T}, label::Symbol, group_ids::Vector{G}
-    ) where {T,G}
+    function Varying{T,G}(vals::Vector{T}, label::Symbol, group_ids::Vector{G}) where {T,G}
         length(vals) == length(group_ids) || throw(
             ArgumentError(
                 "Varying: length(vals)=$(length(vals)) ≠ length(group_ids)=$(length(group_ids))",
