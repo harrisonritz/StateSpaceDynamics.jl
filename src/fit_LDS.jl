@@ -354,7 +354,8 @@ function smooth(lds::LinearDynamicalSystem, y::AbstractMatrix{T}) where {T}
 end
 
 function smooth(
-    lds::LinearDynamicalSystem, y::AbstractVector{<:AbstractMatrix{T}};
+    lds::LinearDynamicalSystem,
+    y::AbstractVector{<:AbstractMatrix{T}};
     labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T}
     if _has_indexed(lds)
