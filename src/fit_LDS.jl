@@ -1268,7 +1268,8 @@ end
 # Alternative observation methods
 # vector of matrices (e.g., for ragged multi-trial observation)
 function loglikelihood(
-    lds::LinearDynamicalSystem{T,SM,OM}, y::AbstractVector{<:AbstractMatrix{T}};
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractVector{<:AbstractMatrix{T}};
     labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
     if _has_indexed(lds)
