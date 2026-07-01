@@ -1022,8 +1022,14 @@ function fit!(
     # Group-aware path when any parameter is Static/Varying (see indexed_fit.jl).
     if _has_indexed(lds)
         return _fit_indexed_gaussian!(
-            lds, y; labels=_resolve_labels(lds, labels), latent_inputs=latent_inputs,
-            obs_inputs=obs_inputs, max_iter=max_iter, tol=tol, progress=progress,
+            lds,
+            y;
+            labels=_resolve_labels(lds, labels),
+            latent_inputs=latent_inputs,
+            obs_inputs=obs_inputs,
+            max_iter=max_iter,
+            tol=tol,
+            progress=progress,
         )
     end
     tsteps_per_trial = [size(yt, 2) for yt in y]
