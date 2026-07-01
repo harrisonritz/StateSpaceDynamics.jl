@@ -1004,8 +1004,14 @@ function fit!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     if _has_indexed(plds)
         return _fit_indexed_poisson!(
-            plds, y; labels=_resolve_labels(plds, labels), max_iter=max_iter, tol=tol,
-            progress=progress, newton_max_iter=newton_max_iter, newton_tol=newton_tol,
+            plds,
+            y;
+            labels=_resolve_labels(plds, labels),
+            max_iter=max_iter,
+            tol=tol,
+            progress=progress,
+            newton_max_iter=newton_max_iter,
+            newton_tol=newton_tol,
         )
     end
     obs_dim = plds.obs_dim
