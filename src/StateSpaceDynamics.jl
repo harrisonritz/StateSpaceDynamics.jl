@@ -29,6 +29,10 @@ include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 # in their field type annotations.
 include("stats/priors.jl")
 
+# Parameter-level indexing (Static/Varying) — defined before the model structs
+# because their field types and the `_lds_*_dim` traits refer to `Indexed`/`at`.
+include("lds/indexed.jl")
+
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, Data, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
@@ -55,11 +59,11 @@ include("fit_LDS.jl")
 include("fit_PLDS.jl")
 include("fit_SLDS.jl")
 
-# Trial-varying parameter models (stitched + general per-block grouping).
-# Included after the fitting functions because they reuse the LDS/PLDS/SLDS
-# smoother, sufficient-statistics aggregator, and M-step primitives.
-include("stitched.jl")                      # stitched (per-session) observation models
-include("trial_varying.jl")                 # general per-block trial-varying parameters
+# Trial-varying parameters: group-aware fit!/smooth/rand/loglikelihood/elbo! for
+# models whose parameters are `Varying`. Included after the fitting functions
+# because it reuses the LDS/PLDS/SLDS smoother, sufficient-statistics aggregator,
+# and M-step primitives (materializing a plain per-regime model per trial group).
+include("lds/indexed_fit.jl")
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
@@ -70,10 +74,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
-export GaussianObservationModelStitched, PoissonObservationModelStitched
-export GroupedParam
-export TrialVaryingGaussianStateModel, TrialVaryingGaussianObservationModel
-export TrialVaryingPoissonObservationModel
+export Indexed, Static, Varying, at
 export IWPrior, MNPrior
 export CovUpdateCache
 

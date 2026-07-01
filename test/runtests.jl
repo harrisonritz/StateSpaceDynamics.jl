@@ -206,58 +206,26 @@ using SSDTest
             test_kalman_marginal_loglikelihood_internals()
         end
 
-        include("LinearDynamicalSystems/StitchedLDS.jl")
-        @testset "Stitched LDS" begin
-            @testset "Constructors & Validation" begin
-                test_stitched_constructors()
-                test_stitched_validation()
-                test_stitched_show()
-                test_stitched_resolve_obs_group()
-            end
-
-            @testset "Sampling" begin
-                test_stitched_gaussian_rand()
-                test_stitched_poisson_rand()
-                test_stitched_no_controls_error()
+        include("LinearDynamicalSystems/IndexedLDS.jl")
+        @testset "Indexed (Static/Varying) parameters" begin
+            @testset "Indexed basics & validation" begin
+                test_indexed_basics()
+                test_indexed_validation()
+                test_indexed_show()
             end
 
             @testset "Gaussian EM" begin
-                test_stitched_gaussian_reduces_to_plain()
-                test_stitched_gaussian_fit_multigroup()
-                test_stitched_gaussian_ragged_and_strings()
+                test_indexed_static_matches_plain()
+                test_indexed_gaussian_fit_multiblock()
+                test_indexed_varying_obsdim()
             end
 
             @testset "Poisson EM" begin
-                test_stitched_poisson_fit_multigroup()
+                test_indexed_poisson_fit()
             end
 
             @testset "Switching (SLDS)" begin
-                test_stitched_slds_rand()
-                test_stitched_slds_fit_gaussian()
-                test_stitched_slds_fit_poisson()
-            end
-        end
-
-        include("LinearDynamicalSystems/TrialVaryingLDS.jl")
-        @testset "Trial-Varying LDS" begin
-            @testset "Constructors & Validation" begin
-                test_tv_grouped_param()
-                test_tv_constructors_and_validation()
-                test_tv_show()
-            end
-
-            @testset "Sampling & errors" begin
-                test_tv_rand_and_errors()
-            end
-
-            @testset "Gaussian EM" begin
-                test_tv_reduces_to_plain()
-                test_tv_gaussian_fit_multiblock()
-                test_tv_emission_only()
-            end
-
-            @testset "Poisson EM" begin
-                test_tv_poisson_fit()
+                test_indexed_slds_fit()
             end
         end
 
