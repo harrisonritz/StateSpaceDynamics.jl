@@ -112,163 +112,148 @@ function Base.showerror(io::IO, e::NumericalStabilityError)
 end
 
 """
-    _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where T
+    _validate_covariance(M, name)
 
-Validate GaussianStateModel parameters. Throws exceptions on validation failure.
-
-# Throws
-- `DimensionMismatchError`: If dimensions don't match expected values
-- `NotSymmetricError`: If covariance matrices aren't symmetric
-- `NotPositiveDefiniteError`: If covariance matrices aren't positive definite
+Throw if `M` is not symmetric positive-definite.
 """
-function _validate_state_model(
-    state_model::GaussianStateModel{T}, latent_dim::Int
-) where {T}
-    # Check A matrix
-    if size(state_model.A) != (latent_dim, latent_dim)
+function _validate_covariance(M::AbstractMatrix, name::AbstractString)
+    issymmetric(M) || throw(NotSymmetricError(name, maximum(abs.(M - M'))))
+    isposdef(M) || throw(NotPositiveDefiniteError(name, minimum(eigvals(M))))
+    return nothing
+end
+
+# Parameters fit by one joint regression block must share indexing (both plain,
+# both Static, or both Varying with identical label + group_ids). Plain and
+# Static both count as invariant.
+function _validate_shared_block(pref, p, name::AbstractString)
+    (param_label(pref) == param_label(p) && param_group_ids(pref) == param_group_ids(p)) ||
         throw(
-            DimensionMismatchError(
-                "A matrix", (latent_dim, latent_dim), size(state_model.A)
+            ArgumentError(
+                "$(name) parameters must share the same indexing (label and group_ids)",
             ),
         )
-    end
+    return nothing
+end
 
-    # Check optional B matrix (dynamics input)
-    if size(state_model.B, 1) != latent_dim
-        throw(DimensionMismatchError("B matrix rows", latent_dim, size(state_model.B, 1)))
-    end
+# `true` if a parameter carries a nonzero input dimension (columns of B/D).
+_has_input(p) = size(at(p, 1), 2) > 0
 
-    # Check Q matrix (process noise covariance)
-    if size(state_model.Q) != (latent_dim, latent_dim)
-        throw(
-            DimensionMismatchError(
-                "Q matrix", (latent_dim, latent_dim), size(state_model.Q)
-            ),
-        )
-    end
+"""
+    _validate_state_model(state_model::GaussianStateModel, latent_dim::Int)
 
-    if !issymmetric(state_model.Q)
-        max_asym = maximum(abs.(state_model.Q - state_model.Q'))
-        throw(NotSymmetricError("Q matrix", max_asym))
-    end
+Validate a (possibly `Indexed`) Gaussian state model. `[A b]` (and `B` when it
+carries inputs) must share indexing; every group's matrices must have the common
+latent shapes and covariances must be SPD.
+"""
+function _validate_state_model(sm::GaussianStateModel, latent_dim::Int)
+    _validate_shared_block(sm.A, sm.b, "dynamics mean [A b]")
+    _has_input(sm.B) && _validate_shared_block(sm.A, sm.B, "dynamics [A B]")
 
-    if !isposdef(state_model.Q)
-        min_eval = minimum(eigvals(state_model.Q))
-        throw(NotPositiveDefiniteError("Q matrix", min_eval))
+    for g in 1:nvals(sm.A)
+        A = at(sm.A, g)
+        size(A) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("A matrix", (latent_dim, latent_dim), size(A)))
     end
-
-    # Check bias vector b
-    if length(state_model.b) != latent_dim
-        throw(DimensionMismatchError("bias vector b", latent_dim, length(state_model.b)))
+    for g in 1:nvals(sm.b)
+        length(at(sm.b, g)) == latent_dim ||
+            throw(DimensionMismatchError("bias vector b", latent_dim, length(at(sm.b, g))))
     end
-
-    # Check initial state x0
-    if length(state_model.x0) != latent_dim
-        throw(
-            DimensionMismatchError("initial state x0", latent_dim, length(state_model.x0))
-        )
+    for g in 1:nvals(sm.B)
+        size(at(sm.B, g), 1) == latent_dim ||
+            throw(DimensionMismatchError("B matrix rows", latent_dim, size(at(sm.B, g), 1)))
     end
-
-    # Check P0 matrix (initial covariance)
-    if size(state_model.P0) != (latent_dim, latent_dim)
-        throw(
-            DimensionMismatchError(
-                "P0 matrix", (latent_dim, latent_dim), size(state_model.P0)
-            ),
-        )
+    for g in 1:nvals(sm.x0)
+        length(at(sm.x0, g)) == latent_dim ||
+            throw(DimensionMismatchError("initial state x0", latent_dim, length(at(sm.x0, g))))
     end
-
-    if !issymmetric(state_model.P0)
-        max_asym = maximum(abs.(state_model.P0 - state_model.P0'))
-        throw(NotSymmetricError("P0 matrix", max_asym))
+    for g in 1:nvals(sm.Q)
+        Q = at(sm.Q, g)
+        size(Q) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("Q matrix", (latent_dim, latent_dim), size(Q)))
+        _validate_covariance(Q, "Q matrix")
     end
-
-    if !isposdef(state_model.P0)
-        min_eval = minimum(eigvals(state_model.P0))
-        throw(NotPositiveDefiniteError("P0 matrix", min_eval))
+    for g in 1:nvals(sm.P0)
+        P0 = at(sm.P0, g)
+        size(P0) == (latent_dim, latent_dim) ||
+            throw(DimensionMismatchError("P0 matrix", (latent_dim, latent_dim), size(P0)))
+        _validate_covariance(P0, "P0 matrix")
     end
-
     return nothing
 end
 
 """
-    _validate_obs_model(obs_model::GaussianObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
+    _validate_obs_model(obs_model::GaussianObservationModel, obs_dim, latent_dim)
 
-Validate GaussianObservationModel parameters. Throws exceptions on validation failure.
-
-# Throws
-- `DimensionMismatchError`: If dimensions don't match expected values
-- `NotSymmetricError`: If R matrix isn't symmetric
-- `NotPositiveDefiniteError`: If R matrix isn't positive definite
+Validate a (possibly `Indexed`) Gaussian observation model. `[C d]` (and `D` when
+it carries inputs) must share indexing. When `C` is `Varying` with differing
+`obs_dim` across groups, `R` must share `C`'s indexing (its dimension is tied to
+the per-group channel count); otherwise `R` may be indexed independently.
 """
-function _validate_obs_model(
-    obs_model::GaussianObservationModel{T}, obs_dim::Int, latent_dim::Int
-) where {T}
-    # Check C matrix
-    if size(obs_model.C) != (obs_dim, latent_dim)
-        throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(obs_model.C)))
+function _validate_obs_model(om::GaussianObservationModel, obs_dim::Int, latent_dim::Int)
+    _validate_shared_block(om.C, om.d, "emission mean [C d]")
+    _has_input(om.D) && _validate_shared_block(om.C, om.D, "emission [C D]")
+
+    cdims = [size(at(om.C, g), 1) for g in 1:nvals(om.C)]
+    varying_obs_dim = length(unique(cdims)) > 1
+    if varying_obs_dim
+        _validate_shared_block(om.C, om.R, "emission covariance R (varying obs_dim)")
     end
 
-    # Check R matrix (observation noise covariance)
-    if size(obs_model.R) != (obs_dim, obs_dim)
-        throw(DimensionMismatchError("R matrix", (obs_dim, obs_dim), size(obs_model.R)))
+    for g in 1:nvals(om.C)
+        C = at(om.C, g)
+        p_g = size(C, 1)
+        size(C, 2) == latent_dim ||
+            throw(DimensionMismatchError("C matrix", (p_g, latent_dim), size(C)))
+        length(at(om.d, g)) == p_g ||
+            throw(DimensionMismatchError("observation bias d", p_g, length(at(om.d, g))))
     end
-
-    # TODO: check D matrix
-
-    if !issymmetric(obs_model.R)
-        max_asym = maximum(abs.(obs_model.R - obs_model.R'))
-        throw(NotSymmetricError("R matrix", max_asym))
+    if _has_input(om.D)
+        for g in 1:nvals(om.D)
+            size(at(om.D, g), 1) == size(at(om.C, g), 1) || throw(
+                DimensionMismatchError(
+                    "D matrix rows", size(at(om.C, g), 1), size(at(om.D, g), 1)
+                ),
+            )
+        end
     end
-
-    if !isposdef(obs_model.R)
-        min_eval = minimum(eigvals(obs_model.R))
-        throw(NotPositiveDefiniteError("R matrix", min_eval))
+    # R groups: track C's per-group obs_dim when tied, else fixed obs_dim.
+    r_tracks_c =
+        param_label(om.R) == param_label(om.C) && param_group_ids(om.R) == param_group_ids(om.C)
+    for g in 1:nvals(om.R)
+        R = at(om.R, g)
+        p_g = r_tracks_c ? size(at(om.C, g), 1) : obs_dim
+        size(R) == (p_g, p_g) ||
+            throw(DimensionMismatchError("R matrix", (p_g, p_g), size(R)))
+        _validate_covariance(R, "R matrix")
     end
-
-    # Check bias vector d
-    if length(obs_model.d) != obs_dim
-        throw(DimensionMismatchError("observation bias d", obs_dim, length(obs_model.d)))
-    end
-
     return nothing
 end
 
 """
-    _validate_obs_model(obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int) where T
+    _validate_obs_model(obs_model::PoissonObservationModel, obs_dim, latent_dim)
 
-Validate PoissonObservationModel parameters. Throws exceptions on validation failure.
-
-# Throws
-- `DimensionMismatchError`: If dimensions don't match expected values
-- `NumericalStabilityError`: If `d` values are extremely large/small
+Validate a (possibly `Indexed`) Poisson observation model. `[C d]` must share
+indexing; each group's `d` must be finite-ish (|d| ≤ 50) to avoid `exp` over/underflow.
 """
-function _validate_obs_model(
-    obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int
-) where {T}
-    # Check C matrix
-    if size(obs_model.C) != (obs_dim, latent_dim)
-        throw(DimensionMismatchError("C matrix", (obs_dim, latent_dim), size(obs_model.C)))
+function _validate_obs_model(om::PoissonObservationModel, obs_dim::Int, latent_dim::Int)
+    _validate_shared_block(om.C, om.d, "emission [C d]")
+    for g in 1:nvals(om.C)
+        C = at(om.C, g)
+        p_g = size(C, 1)
+        size(C, 2) == latent_dim ||
+            throw(DimensionMismatchError("C matrix", (p_g, latent_dim), size(C)))
+        d = at(om.d, g)
+        length(d) == p_g ||
+            throw(DimensionMismatchError("d vector", p_g, length(d)))
+        if any(x -> abs(x) > 50, d)
+            throw(
+                NumericalStabilityError(
+                    "d vector",
+                    "contains extremely large/small values (max |d| = $(maximum(abs.(d)))), may cause numerical overflow/underflow",
+                ),
+            )
+        end
     end
-
-    # Check d vector
-    if length(obs_model.d) != obs_dim
-        throw(DimensionMismatchError("d vector", obs_dim, length(obs_model.d)))
-    end
-
-    # Check that d values are reasonable. `d` enters the linear predictor as
-    # `λ = exp(C x + d)`; |d| above ~50 risks exp overflow/underflow once Cx
-    # is added on top.
-    if any(x -> abs(x) > 50, obs_model.d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
-        max_val = maximum(abs.(obs_model.d))
-        throw(
-            NumericalStabilityError(
-                "d vector",
-                "contains extremely large/small values (max |d| = $max_val), may cause numerical overflow/underflow",
-            ),
-        )
-    end
-
     return nothing
 end
 
@@ -316,14 +301,14 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     # Check fit_bool length. Gaussian path (BTD and Kalman) uses length 6 —
     # the regression M-step fits A&b&B and C&d&D jointly, so flag layout is
     # the same across backends.
-    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    expected_fit_length = _is_poisson_like(lds.obs_model) ? 5 : 6
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end
 
     # Check consistency between inferred and stored dimensions
-    inferred_latent = size(lds.state_model.A, 1)
-    inferred_obs = size(lds.obs_model.C, 1)
+    inferred_latent = _lds_latent_dim(lds.state_model)
+    inferred_obs = _lds_obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent
         throw(

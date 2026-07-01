@@ -70,8 +70,12 @@ function Random.rand(
 end
 
 function Random.rand(
-    rng::AbstractRNG, slds::SLDS{T,S,O}, tsteps_per_trial::AbstractVector{<:Integer}
+    rng::AbstractRNG, slds::SLDS{T,S,O}, tsteps_per_trial::AbstractVector{<:Integer};
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    if _has_indexed(slds)
+        return _rand_indexed_slds(rng, slds, tsteps_per_trial; labels=_resolve_labels(slds, labels))
+    end
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
     ntrials = length(tsteps_per_trial)
@@ -108,8 +112,11 @@ function Random.rand(slds::SLDS, tsteps::Integer)
     return rand(Random.default_rng(), slds, tsteps)
 end
 
-function Random.rand(slds::SLDS, tsteps_per_trial::AbstractVector{<:Integer})
-    return rand(Random.default_rng(), slds, tsteps_per_trial)
+function Random.rand(
+    slds::SLDS, tsteps_per_trial::AbstractVector{<:Integer};
+    labels::Union{Nothing,AbstractDict}=nothing,
+)
+    return rand(Random.default_rng(), slds, tsteps_per_trial; labels=labels)
 end
 
 # Core SLDS trial sampling logic
@@ -1052,7 +1059,14 @@ function fit!(
     max_iter::Int=50,
     progress::Bool=true,
     tol::Float64=1e-6,
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    if _has_indexed(slds)
+        return _fit_indexed_slds!(
+            slds, y; labels=_resolve_labels(slds, labels), max_iter=max_iter,
+            progress=progress,
+        )
+    end
     K = length(slds.LDSs)
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim

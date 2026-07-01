@@ -1000,7 +1000,20 @@ function fit!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    if _has_indexed(plds)
+        return _fit_indexed_poisson!(
+            plds,
+            y;
+            labels=_resolve_labels(plds, labels),
+            max_iter=max_iter,
+            tol=tol,
+            progress=progress,
+            newton_max_iter=newton_max_iter,
+            newton_tol=newton_tol,
+        )
+    end
     obs_dim = plds.obs_dim
     latent_dim = plds.latent_dim
     tsteps_per_trial = [size(yt, 2) for yt in y]

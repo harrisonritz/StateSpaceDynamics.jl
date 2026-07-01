@@ -206,6 +206,29 @@ using SSDTest
             test_kalman_marginal_loglikelihood_internals()
         end
 
+        include("LinearDynamicalSystems/IndexedLDS.jl")
+        @testset "Indexed (Static/Varying) parameters" begin
+            @testset "Indexed basics & validation" begin
+                test_indexed_basics()
+                test_indexed_validation()
+                test_indexed_show()
+            end
+
+            @testset "Gaussian EM" begin
+                test_indexed_static_matches_plain()
+                test_indexed_gaussian_fit_multiblock()
+                test_indexed_varying_obsdim()
+            end
+
+            @testset "Poisson EM" begin
+                test_indexed_poisson_fit()
+            end
+
+            @testset "Switching (SLDS)" begin
+                test_indexed_slds_fit()
+            end
+        end
+
         include("LinearDynamicalSystems/PoissonLDS.jl")
         @testset "Poisson LDS" begin
             @testset "Constructors" begin

@@ -20,72 +20,52 @@ end
 
 print_full(obj) = print_full(stdout, obj)
 
+# Describe one (possibly Indexed) parameter: a representative value's dimensions
+# plus any grouping. Values are not printed in full so the display is stable for
+# both plain and Varying parameters.
+function _show_param(io, gap, name, p)
+    v = at(p, 1)
+    dims = ndims(v) == 1 ? "($(length(v)),)" : "$(size(v))"
+    if is_varying(p)
+        println(
+            io, gap,
+            "  $name: Varying — $(nvals(p)) groups by :$(param_label(p)) = $(param_group_ids(p)); size $dims",
+        )
+    elseif is_indexed(p)
+        println(io, gap, "  $name: Static; size $dims")
+    else
+        println(io, gap, "  $name: size $dims")
+    end
+    return nothing
+end
+
 function Base.show(io::IO, gsm::GaussianStateModel; gap="")
     println(io, gap, "Gaussian State Model:")
     println(io, gap, "---------------------")
-
-    if size(gsm.A, 1) > 4 || size(gsm.A, 2) > 4
-        println(io, gap, " State Parameters:")
-        println(io, gap, "  size(A)  = ($(size(gsm.A,1)), $(size(gsm.A,2)))")
-        println(io, gap, "  size(Q)  = ($(size(gsm.Q,1)), $(size(gsm.Q,2)))")
-        println(io, gap, " Initial State:")
-        println(io, gap, "  size(b)  = ($(length(gsm.b)), )")
-        println(io, gap, "  size(x0) = ($(length(gsm.x0)), )")
-        println(io, gap, "  size(P0) = ($(size(gsm.P0,1)), $(size(gsm.P0,2)))")
-    else
-        println(io, gap, " State Parameters:")
-        println(io, gap, "  A  = $(round.(gsm.A, sigdigits=3))")
-        println(io, gap, "  Q  = $(round.(gsm.Q, sigdigits=3))")
-        println(io, gap, " Initial State:")
-        println(io, gap, "  b  = $(round.(gsm.b, digits=2))")
-        println(io, gap, "  x0 = $(round.(gsm.x0, digits=2))")
-        println(io, gap, "  P0 = $(round.(gsm.P0, sigdigits=3))")
-    end
-
-    println(io, gap, " Dynamics input:")
-    println(io, gap, "  size(B)  = ($(size(gsm.B,1)), $(size(gsm.B,2)))")
-
+    _show_param(io, gap, "A ", gsm.A)
+    _show_param(io, gap, "Q ", gsm.Q)
+    _show_param(io, gap, "b ", gsm.b)
+    _show_param(io, gap, "x0", gsm.x0)
+    _show_param(io, gap, "P0", gsm.P0)
+    _show_param(io, gap, "B ", gsm.B)
     return nothing
 end
 
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     println(io, gap, "Gaussian Observation Model:")
     println(io, gap, "---------------------------")
-
-    if size(gom.C, 1) > 3 || size(gom.C, 2) > 3
-        println(io, gap, " size(C) = ($(size(gom.C,1)), $(size(gom.C,2)))")
-        println(io, gap, " size(R) = ($(size(gom.R,1)), $(size(gom.R,2)))")
-        println(io, gap, " size(d) = ($(length(gom.d)),)")
-        println(io, gap, " size(D) = ($(size(gom.D,1)), $(size(gom.D,2)))")
-    else
-        println(io, gap, " C = $(round.(gom.C, digits=2))")
-        println(io, gap, " R = $(round.(gom.R, digits=2))")
-        println(io, gap, " d = $(round.(gom.d, digits=2))")
-        println(io, gap, " D = $(round.(gom.D, digits=2))")
-    end
-
+    _show_param(io, gap, "C", gom.C)
+    _show_param(io, gap, "R", gom.R)
+    _show_param(io, gap, "d", gom.d)
+    _show_param(io, gap, "D", gom.D)
     return nothing
 end
 
 function Base.show(io::IO, pom::PoissonObservationModel; gap="")
-    nobs, nstate = size(pom.C)
-
     println(io, gap, "Poisson Observation Model:")
     println(io, gap, "--------------------------")
-
-    if nobs > 4 || nstate > 4
-        println(io, gap, " size(C) = ($nobs, $nstate)")
-        println(io, gap, " size(d) = ($(length(pom.d)),)")
-    else
-        println(io, gap, " C    = $(round.(pom.C, digits=2))")
-        println(io, gap, " d    = $(round.(pom.d, sigdigits = 3))")
-        println(
-            io,
-            gap,
-            " rate = $(round.(exp.(pom.d), digits = 2))   # exp(d) for inspection only",
-        )
-    end
-
+    _show_param(io, gap, "C", pom.C)
+    _show_param(io, gap, "d", pom.d)
     return nothing
 end
 
@@ -97,7 +77,7 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, " Parameters to update:")
     println(io, gap, " ---------------------")
 
-    if lds.obs_model isa PoissonObservationModel
+    if _is_poisson_like(lds.obs_model)
         # C and d are either both updated or neither
         prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
     else

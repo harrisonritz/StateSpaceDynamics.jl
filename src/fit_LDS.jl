@@ -354,8 +354,13 @@ function smooth(lds::LinearDynamicalSystem, y::AbstractMatrix{T}) where {T}
 end
 
 function smooth(
-    lds::LinearDynamicalSystem, y::AbstractVector{<:AbstractMatrix{T}}
+    lds::LinearDynamicalSystem,
+    y::AbstractVector{<:AbstractMatrix{T}};
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T}
+    if _has_indexed(lds)
+        return _smooth_indexed(lds, y; labels=_resolve_labels(lds, labels))
+    end
     tsteps_per_trial = [size(yt, 2) for yt in y]
     T_max = maximum(tsteps_per_trial)
     tfs = initialize_FilterSmooth(lds, tsteps_per_trial)::TrialFilterSmooth{T}
@@ -1012,7 +1017,21 @@ function fit!(
     progress::Bool=true,
     latent_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     obs_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    # Group-aware path when any parameter is Static/Varying (see indexed_fit.jl).
+    if _has_indexed(lds)
+        return _fit_indexed_gaussian!(
+            lds,
+            y;
+            labels=_resolve_labels(lds, labels),
+            latent_inputs=latent_inputs,
+            obs_inputs=obs_inputs,
+            max_iter=max_iter,
+            tol=tol,
+            progress=progress,
+        )
+    end
     tsteps_per_trial = [size(yt, 2) for yt in y]
     latent_inputs = _normalize_multitrial_control(
         latent_inputs, lds.state_input_dim, tsteps_per_trial, T, "latent_inputs"
@@ -1249,8 +1268,13 @@ end
 # Alternative observation methods
 # vector of matrices (e.g., for ragged multi-trial observation)
 function loglikelihood(
-    lds::LinearDynamicalSystem{T,SM,OM}, y::AbstractVector{<:AbstractMatrix{T}}
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::AbstractVector{<:AbstractMatrix{T}};
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+    if _has_indexed(lds)
+        return _loglikelihood_indexed(lds, y; labels=_resolve_labels(lds, labels))
+    end
     y_comb = cat(y...; dims=3)
     return loglikelihood(lds, y_comb)
 end

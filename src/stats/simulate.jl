@@ -126,7 +126,11 @@ function Random.rand(
     tsteps_per_trial::AbstractVector{<:Integer};
     latent_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     obs_inputs::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    labels::Union{Nothing,AbstractDict}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    if _has_indexed(lds)
+        return _rand_indexed(rng, lds, tsteps_per_trial; labels=_resolve_labels(lds, labels))
+    end
     state_params = _extract_state_params(lds.state_model)
     obs_params = _extract_obs_params(lds.obs_model)
 
