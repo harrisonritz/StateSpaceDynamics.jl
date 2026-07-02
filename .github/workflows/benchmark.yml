@@ -1,0 +1,282 @@
+name: Benchmarks
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:  # Allow manual triggering
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Fetch all history for comparison
+
+      - name: Setup Julia
+        uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'  # Latest stable
+
+      - name: Cache Julia artifacts
+        uses: actions/cache@v4
+        with:
+          path: ~/.julia
+          key: ${{ runner.os }}-julia-${{ hashFiles('**/Project.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-julia-
+
+      - name: Install StateSpaceDynamics dependencies
+        run: |
+          julia --project -e 'using Pkg; Pkg.instantiate()'
+
+      - name: Install benchmarking dependencies
+        run: |
+          julia --project=benchmarking -e 'using Pkg; Pkg.instantiate(); Pkg.develop(PackageSpec(path=pwd()))'
+
+      - name: Run benchmarks (StateSpaceDynamics only)
+        run: |
+          julia --project=benchmarking -e '
+            using StateSpaceDynamics
+            using BenchmarkTools
+            using LinearAlgebra
+            using StableRNGs
+            using Printf
+            using CSV
+            using DataFrames
+
+            println("Running StateSpaceDynamics.jl benchmarks...")
+
+            # Configure benchmark suite
+            SUITE = BenchmarkGroup()
+
+            # Benchmark: Gaussian LDS smoothing
+            SUITE["GaussianLDS"] = BenchmarkGroup(["LDS", "Gaussian"])
+            for latent_dim in [2, 4, 8], obs_dim in [5, 10, 20]
+                obs_dim < latent_dim && continue
+                for T in [100, 500]
+                    rng = StableRNG(1234)
+
+                    # Create model
+                    A = 0.95 * Matrix(I, latent_dim, latent_dim)
+                    Q = Matrix(0.1 * I, latent_dim, latent_dim)
+                    b = zeros(latent_dim)
+                    x0 = zeros(latent_dim)
+                    P0 = Matrix(0.1 * I, latent_dim, latent_dim)
+
+                    C = randn(rng, obs_dim, latent_dim)
+                    R = Matrix(0.1 * I, obs_dim, obs_dim)
+                    d = zeros(obs_dim)
+
+                    state_model = GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0)
+                    obs_model = GaussianObservationModel(C=C, R=R, d=d)
+                    model = LinearDynamicalSystem(
+                        state_model=state_model,
+                        obs_model=obs_model,
+                        latent_dim=latent_dim,
+                        obs_dim=obs_dim,
+                        fit_bool=fill(true, 6)
+                    )
+
+                    # Generate data
+                    _, y = rand(rng, model, T)
+
+                    SUITE["GaussianLDS"]["smooth", "latent=$latent_dim", "obs=$obs_dim", "T=$T"] =
+                        @benchmarkable smooth($model, $y) samples=10 seconds=5
+                end
+            end
+
+            # Benchmark: Poisson LDS smoothing
+            SUITE["PoissonLDS"] = BenchmarkGroup(["LDS", "Poisson"])
+            for latent_dim in [2, 4], obs_dim in [5, 10]
+                obs_dim < latent_dim && continue
+                for T in [100, 500]
+                    rng = StableRNG(1234)
+
+                    A = 0.95 * Matrix(I, latent_dim, latent_dim)
+                    Q = Matrix(0.1 * I, latent_dim, latent_dim)
+                    b = zeros(latent_dim)
+                    x0 = zeros(latent_dim)
+                    P0 = Matrix(0.1 * I, latent_dim, latent_dim)
+
+                    C = abs.(randn(rng, obs_dim, latent_dim))
+                    d = log.(fill(0.1, obs_dim))
+
+                    state_model = GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0)
+                    obs_model = PoissonObservationModel(C=C, d=d)
+                    model = LinearDynamicalSystem(
+                        state_model=state_model,
+                        obs_model=obs_model,
+                        latent_dim=latent_dim,
+                        obs_dim=obs_dim,
+                        fit_bool=fill(true, 5)
+                    )
+
+                    _, y = rand(rng, model, T)
+
+                    SUITE["PoissonLDS"]["smooth", "latent=$latent_dim", "obs=$obs_dim", "T=$T"] =
+                        @benchmarkable smooth($model, $y) samples=10 seconds=5
+                end
+            end
+
+            # Run benchmarks
+            println("\n" * "="^70)
+            println("Running benchmark suite...")
+            println("="^70 * "\n")
+
+            results = run(SUITE, verbose=true)
+
+            # Save results
+            mkpath("benchmark_results")
+            BenchmarkTools.save("benchmark_results/results.json", results)
+
+            # Create summary report
+            df = DataFrame(
+                category = String[],
+                operation = String[],
+                params = String[],
+                time_ns = Float64[],
+                memory_bytes = Int[],
+                allocs = Int[]
+            )
+
+            for (category, cat_results) in results
+                for (name, bench_result) in cat_results
+                    trial = minimum(bench_result)
+                    push!(df, (
+                        string(category),
+                        string(name[1]),
+                        join(name[2:end], ", "),
+                        time(trial),
+                        memory(trial),
+                        allocs(trial)
+                    ))
+                end
+            end
+
+            # Add human-readable times
+            df.time_ms = df.time_ns ./ 1e6
+            df.memory_mb = df.memory_bytes ./ 1e6
+
+            CSV.write("benchmark_results/summary.csv", df)
+
+            # Print summary
+            println("\n" * "="^70)
+            println("Benchmark Summary")
+            println("="^70 * "\n")
+
+            for row in eachrow(df)
+                @printf("%-15s | %-10s | %-30s | %8.2f ms | %6.2f MB | %6d allocs\n",
+                    row.category, row.operation, row.params,
+                    row.time_ms, row.memory_mb, row.allocs)
+            end
+
+            println("\n" * "="^70)
+            println("Benchmark results saved to benchmark_results/")
+            println("="^70)
+          '
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results-${{ github.sha }}
+          path: benchmark_results/
+          retention-days: 90
+
+      - name: Download baseline benchmark (if exists)
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: dawidd6/action-download-artifact@v3
+        with:
+          workflow: benchmark.yml
+          branch: ${{ github.base_ref }}
+          name: benchmark-results-*
+          path: benchmark_baseline/
+          search_artifacts: true
+
+      - name: Compare with baseline
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: |
+          julia --project=benchmarking -e '
+            using CSV, DataFrames, Printf
+
+            if !isdir("benchmark_baseline") || !isfile("benchmark_baseline/summary.csv")
+                println("No baseline found for comparison")
+                exit(0)
+            end
+
+            current = CSV.read("benchmark_results/summary.csv", DataFrame)
+            baseline = CSV.read("benchmark_baseline/summary.csv", DataFrame)
+
+            println("\n" * "="^70)
+            println("Benchmark Comparison (Current vs Baseline)")
+            println("="^70 * "\n")
+
+            comparison = innerjoin(current, baseline,
+                on=[:category, :operation, :params],
+                makeunique=true)
+
+            if nrow(comparison) == 0
+                println("No matching benchmarks found for comparison")
+                exit(0)
+            end
+
+            comparison.speedup = comparison.time_ms_1 ./ comparison.time_ms
+            comparison.mem_change = (comparison.memory_mb .- comparison.memory_mb_1) ./ comparison.memory_mb_1 .* 100
+
+            for row in eachrow(comparison)
+                speedup_str = row.speedup > 1.0 ?
+                    @sprintf("%.2fx faster", row.speedup) :
+                    @sprintf("%.2fx slower", 1/row.speedup)
+                mem_str = @sprintf("%+.1f%%", row.mem_change)
+
+                println(@sprintf("%-15s | %-30s | %s | memory: %s",
+                    row.category, row.params, speedup_str, mem_str))
+            end
+
+            # Save comparison
+            CSV.write("benchmark_results/comparison.csv", comparison)
+
+            println("\n" * "="^70)
+          '
+
+      - name: Comment PR with results
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let comment = '## Benchmark Results\n\n';
+
+            if (fs.existsSync('benchmark_results/comparison.csv')) {
+              comment += '### Performance Comparison\n\n';
+              const csv = fs.readFileSync('benchmark_results/comparison.csv', 'utf8');
+              comment += '```\n' + csv + '\n```\n\n';
+            }
+
+            comment += '### Current Results\n\n';
+            if (fs.existsSync('benchmark_results/summary.csv')) {
+              const csv = fs.readFileSync('benchmark_results/summary.csv', 'utf8');
+              comment += '```\n' + csv + '\n```\n\n';
+            }
+
+            comment += `\nFull results available in [workflow artifacts](https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });

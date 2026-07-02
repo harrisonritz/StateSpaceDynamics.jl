@@ -20,9 +20,9 @@ end
 
 BenchmarkTools.DEFAULT_PARAMETERS.seconds = 1.0
 
-# ----------------------
-# LDS Benchmarks
-# ----------------------
+#=
+LDS Benchmarks
+=#
 
 lds_config = BenchConfig(
     [2, 4, 6, 8],  # latent_dims
@@ -35,7 +35,7 @@ lds_config = BenchConfig(
 lds_implementations = [
     SSD_LDSImplem(),
     pykalman_LDSImplem(),
-    Dynamax_LDSImplem()
+    # Dynamax_LDSImplem()
 ]
 
 lds_results = []
@@ -99,99 +99,3 @@ for row in lds_results
     end
 end
 CSV.write("benchmarking/results/lds_benchmark_results.csv", df_lds)
-
-
-# ----------------------
-# HMM Benchmarks
-# ----------------------
-
-hmm_config = BenchConfig(
-    [2, 4, 6, 8],          # num_states
-    [1],                   # emission_dim
-    [100, 500, 1000],      # seq_lengths
-    100,
-    5
-)
-
-hmm_implementations = [
-    SSD_HMMImplem(),
-    HiddenMarkovModels_Implem(),
-    Dynamax_HMMImplem()
-]
-
-hmm_results = []
-max_retries = 2  # number of times to retry on failure
-
-for num_states in hmm_config.latent_dims
-    for seq_len in hmm_config.seq_lengths
-        println("\n→ Benchmarking HMM with num_states=$num_states, seq_len=$seq_len")
-
-        instance = HMMInstance(; num_states=num_states, emission_dim=1, num_trials=1, seq_length=seq_len)
-        rng = StableRNG(1234)
-        params = init_params(rng, instance)
-
-        ssd_model = build_model(SSD_HMMImplem(), instance, params)
-        y = build_data(rng, ssd_model, instance)
-
-        results_row = Dict{String, Any}()
-        results_row["config"] = (num_states=num_states, seq_len=seq_len)
-
-        for impl in hmm_implementations
-            print("  Running $(string(impl))... ")
-            attempt = 1
-            success = false
-            result = (time=NaN, memory=0, allocs=0, success=false)  # default placeholder
-
-            while attempt <= max_retries && !success
-                try
-                    println("Attempt $attempt")
-                    model = build_model(impl, instance, params)
-
-                    result = run_benchmark(impl, model, y[1])
-                    success = result.success
-
-                    if success
-                        @printf("✓ time = %.3f sec\n", result.time / 1e9)
-                    else
-                        println("✗ failed")
-                        if attempt < max_retries
-                            println("Retrying...")
-                        end
-                    end
-                catch e
-                    println("✗ exception: ", e)
-                    result = (time=NaN, memory=0, allocs=0, success=false)
-                    if attempt < max_retries
-                        println("Retrying after exception...")
-                    end
-                end
-                attempt += 1
-            end
-
-            # Store final result (success or failure after retries)
-            results_row[string(impl)] = result
-        end
-
-        push!(hmm_results, results_row)
-        println("-"^50)
-    end
-end
-
-# Save HMM results
-df_hmm = DataFrame()
-for row in hmm_results
-    config = row["config"]
-    for (name, result) in row
-        name == "config" && continue
-        push!(df_hmm, (
-            implementation = name,
-            num_states = config.num_states,
-            seq_len = config.seq_len,
-            time_sec = result[:time] / 1e9,
-            memory = result[:memory],
-            allocs = result[:allocs],
-            success = result[:success]
-        ))
-    end
-end
-CSV.write("benchmarking/results/hmm_benchmark_results.csv", df_hmm)

@@ -11,7 +11,11 @@ test/*/notebooks
 # Documentation
 docs/build/
 docs/Manifest.toml
+# Literate-generated tutorials.
+docs/src/tutorials/
 test/*/notebooks
+# SSDTest is dev'd in from libs/ at the start of every Pkg.test() run.
+test/Manifest.toml
 
 # Julia-specific files
 Manifest.toml
@@ -23,6 +27,8 @@ notebooks/benchmarking.ipynb
 notebooks/regression_debug.ipynb
 notebooks/benchmarking.jl
 notebooks/debugging.jl
+docs/testfile.jl
+benchmarking/testfile.jl
 
 # Paper files
 /paper/jats
@@ -30,4 +36,10 @@ notebooks/debugging.jl
 # benchmarking files
 benchmarking/.CondaPkg
 benchmarking/.DEAD_CondaPkg
-benchmarking/benchmark.jl
+benchmarking/benchmark.jl.claude/worktrees/
+/.claude
+/benchmarking/results
+CLAUDE.md
+
+# Local profiling sandbox (never committed)
+/dev/

@@ -2,7 +2,6 @@ module SSD_Benchmark
 
 # Include packages
 using StateSpaceDynamics
-using HiddenMarkovModels
 using BenchmarkTools
 using CSV
 using CondaPkg
@@ -25,7 +24,6 @@ export Implementation
 # Include files
 include("Instances.jl")
 include("Params.jl")
-include("hmm_benchmark_tools.jl")
 include("lds_benchmark_tools.jl")
 
 end
