@@ -105,6 +105,15 @@
         "review",
         "ideas"
       ]
+    },
+    {
+      "login": "GrantMcConachie",
+      "name": "Grant McConachie",
+      "avatar_url": "https://avatars.githubusercontent.com/u/39445771?v=4",
+      "profile": "https://grantmcconachie.github.io/",
+      "contributions": [
+        "code"
+      ]
     }
   ]
 }
