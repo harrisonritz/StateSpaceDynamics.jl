@@ -50,6 +50,9 @@ include("lds/continuous_latents.jl")                # state-model Q-term + state
 include("lds/gaussian_observations.jl")
 include("lds/poisson_observations.jl")
 
+# initialization using subspace ID (SSID)
+include("init/SubspaceID.jl")
+
 # Fitting Functions
 include("lds/fit_LDS.jl")
 include("lds/fit_PLDS.jl")
@@ -66,6 +69,7 @@ export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export IWPrior, MNPrior
 export CovUpdateCache
+export SSID
 
 # Utilities
 export block_tridgm
