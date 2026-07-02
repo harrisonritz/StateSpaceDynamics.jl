@@ -85,6 +85,16 @@
         "doc",
         "test"
       ]
+    },
+    {
+      "login": "tomdstone",
+      "name": "Tom A.D. Stone",
+      "avatar_url": "https://avatars.githubusercontent.com/u/77251489?v=4",
+      "profile": "https://github.com/tomdstone",
+      "contributions": [
+        "code",
+        "test"
+      ]
     }
   ]
 }
