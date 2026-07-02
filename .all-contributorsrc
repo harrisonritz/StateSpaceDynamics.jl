@@ -53,6 +53,16 @@
         "ideas",
         "doc"
       ]
+    },
+    {
+      "login": "briandepasquale",
+      "name": "Brian DePasquale",
+      "avatar_url": "https://avatars.githubusercontent.com/u/21131199?v=4",
+      "profile": "https://briandepasquale.github.io/",
+      "contributions": [
+        "code",
+        "ideas"
+      ]
     }
   ]
 }
