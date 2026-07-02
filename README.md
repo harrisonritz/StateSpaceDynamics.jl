@@ -164,6 +164,9 @@ Thanks go to these wonderful people ([emoji key](https://allcontributors.org/doc
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/jfour1e"><img src="https://avatars.githubusercontent.com/u/146684478?v=4?s=100" width="100px;" alt="James Fourie"/><br /><sub><b>James Fourie</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Documentation">📖</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Tests">⚠️</a></td>
       <td align="center" valign="top" width="14.28%"><a href="https://github.com/tomdstone"><img src="https://avatars.githubusercontent.com/u/77251489?v=4?s=100" width="100px;" alt="Tom A.D. Stone"/><br /><sub><b>Tom A.D. Stone</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=tomdstone" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=tomdstone" title="Tests">⚠️</a></td>
     </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://gdalle.github.io/"><img src="https://avatars.githubusercontent.com/u/22795598?v=4?s=100" width="100px;" alt="Guillaume Dalle"/><br /><sub><b>Guillaume Dalle</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/pulls?q=is%3Apr+reviewed-by%3Agdalle" title="Reviewed Pull Requests">👀</a> <a href="#ideas-gdalle" title="Ideas, Planning, & Feedback">🤔</a></td>
+    </tr>
   </tbody>
 </table>
 
