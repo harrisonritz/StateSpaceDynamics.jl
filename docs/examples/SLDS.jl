@@ -130,8 +130,8 @@ p_elbo = plot(elbos; xlabel="iteration", ylabel="ELBO",
 
 ld = learned_model.LDSs[1]
 seq_ends = [T]
-obs_seq = collect(1:T)
-ctrl_seq = fill(nothing, T)
+obs_inputs = collect(1:T)
+latent_inputs = fill(nothing, T)
 
 tfs = StateSpaceDynamics.initialize_FilterSmooth(ld, [T])
 dl = StateSpaceDynamics.SLDSDiscreteLayer(
@@ -148,7 +148,7 @@ randn_buf = Vector{Float64}(undef, ld.latent_dim)
 StateSpaceDynamics.sample_posterior!(x_samples, Random.default_rng(), tfs, randn_buf)
 StateSpaceDynamics.estep!(
     learned_model, tfs, fb_storage, dl, [y], x_samples, slds_ws;
-    obs_seq=obs_seq, ctrl_seq=ctrl_seq, seq_ends=seq_ends,
+    obs_inputs=obs_inputs, latent_inputs=latent_inputs, seq_ends=seq_ends,
 )
 
 x_learned = tfs[1].x_smooth

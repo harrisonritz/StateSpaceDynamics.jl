@@ -4,9 +4,11 @@ using DataFrames
 using Distributions
 using ForwardDiff
 using JET
+using JuliaFormatter
 using LinearAlgebra
 using MAT
 using Optim
+using PDMats
 using Pkg
 using Printf
 using Random
@@ -26,15 +28,16 @@ ENV["GKSwstype"] = "100"
 Pkg.develop(; path=joinpath(dirname(@__DIR__), "libs", "SSDTest"))
 using SSDTest
 
-# Helper functions
-include("helper_functions.jl")
-
-@testset verbose=true "StateSpaceDynamics.jl" begin
+@testset verbose = true "StateSpaceDynamics.jl" begin
     # Package-wide quality tests
-    @testset verbose=true "Package Quality" begin
+    @testset verbose = true "Package Quality" begin
         @testset "Aqua.jl" begin
             Aqua.test_all(StateSpaceDynamics; ambiguities=false)
             @test isempty(Test.detect_ambiguities(StateSpaceDynamics))
+        end
+
+        @testset "Code Formatting" begin
+            @test JuliaFormatter.format(StateSpaceDynamics; verbose=false, overwrite=false)
         end
 
         @testset "JET.jl Code Linting" begin
@@ -62,6 +65,10 @@ include("helper_functions.jl")
                 # fully clear, the workspaces would need to be parametrized
                 # on concrete `Matrix{T}` element type at each call site (a
                 # bigger refactor — JET issue tracked but deferred).
+                #
+                # TODO(#91): un-skip once workspace fields are parametrized on
+                # concrete `Matrix{T}` so JET stops union-splitting the
+                # `@views`-over-`Array{T,3}`/`Vector{PDMat}` accessors.
                 @test_skip JET.test_package(
                     StateSpaceDynamics; target_modules=(StateSpaceDynamics,)
                 )
@@ -70,7 +77,7 @@ include("helper_functions.jl")
     end
 
     # Linear Dynamical Systems Tests
-    @testset verbose=true "Linear Dynamical Systems" begin
+    @testset verbose = true "Linear Dynamical Systems" begin
         include("LinearDynamicalSystems/SLDS.jl")
         @testset "SLDS" begin
             @testset "Validation" begin
@@ -86,12 +93,17 @@ include("helper_functions.jl")
                 test_SLDS_reproducibility()
                 test_SLDS_single_state_edge_case()
                 test_SLDS_minimal_dimensions()
+                test_SLDS_rand_integer_overload()
                 test_valid_SLDS_probability_helper_functions()
             end
 
             @testset "Gradient and Hessian" begin
                 test_SLDS_gradient_numerical()
                 test_SLDS_hessian_numerical()
+                test_SLDS_gradient_single_timestep_gaussian()
+                test_SLDS_gradient_single_timestep_poisson()
+                test_SLDS_hessian_single_timestep_gaussian()
+                test_SLDS_hessian_single_timestep_poisson()
                 test_SLDS_gradient_reduces_to_single_LDS()
                 test_SLDS_hessian_block_structure_gaussian()
                 test_SLDS_gradient_weight_normalization()
@@ -172,23 +184,31 @@ include("helper_functions.jl")
                 test_gaussian_update_R_matches_residual_cov()
                 test_gaussian_weighting_equiv_to_duplication()
                 test_td_mn_priors_shrink()
-                test_td_with_obs_control_seq()
+                test_td_with_obs_inputs()
                 test_td_ragged_multi_trial()
+                test_td_weighted_aggregator_matches_unweighted_with_inputs()
+                test_mn_prior_type_decoupled_from_model_matrix()
             end
         end
 
         include("LinearDynamicalSystems/KalmanLDS.jl")
-        @testset "Kalman LDS" begin
-            test_kalman_smooth_agrees_with_newton()
-            test_kalman_fit_matches_newton()
-            test_kalman_covariance_shared_across_trials()
-            test_kalman_with_B_input_equivalent_to_bias()
-            test_kalman_rejects_poisson_obs()
-            test_kalman_missing_u_errors()
-            test_kalman_fit_bool_freezes_params()
-            test_td_fit_with_dynamics_input()
-            test_td_sampling_zero_input_matches_no_control()
+        @testset "LDS smoother + marginal LL" begin
+            test_td_covariance_shared_across_trials()
             test_td_shared_cov_matches_per_trial_path()
+            test_lds_with_B_input_equivalent_to_bias()
+            test_td_fit_with_latent_input()
+            test_td_sampling_zero_input_matches_no_input()
+            test_td_fit_missing_u_errors()
+            test_marginal_loglikelihood()
+        end
+
+        @testset "Kalman-path EM (information form)" begin
+            test_kalman_fit_basic()
+            test_kalman_fit_with_inputs()
+            test_kalman_fit_with_priors()
+            test_kalman_fit_bool_combinations()
+            test_kalman_validate_inputs_errors()
+            test_kalman_marginal_loglikelihood_internals()
         end
 
         include("LinearDynamicalSystems/PoissonLDS.jl")
@@ -211,6 +231,7 @@ include("helper_functions.jl")
             @testset "Priors - Poisson LDS" begin
                 test_poisson_map_step_improves_Q()
                 test_poisson_gradient_shape_and_finiteness()
+                test_poisson_cd_prior_shrink()
             end
 
             @testset "EM Algorithm" begin
@@ -228,52 +249,44 @@ include("helper_functions.jl")
         end
     end
 
+    # Optimization primitives (line search + Newton)
+    @testset verbose = true "Optimization" begin
+        include("Optimization/Optimization.jl")
+        test_backtracking_min_sense_decreases()
+        test_backtracking_returns_best_on_exhaustion()
+        test_newton_smooth_no_linesearch_converges()
+        test_newton_smooth_returns_false_on_linesearch_stall()
+        test_newton_smooth_returns_false_on_max_iter()
+    end
+
     # Utilities Tests
-    @testset verbose=true "Utilities" begin
+    @testset verbose = true "Utilities" begin
         include("Utilities/Utilities.jl")
         test_block_tridgm()
         test_gaussian_entropy()
+        test_valid_Σ()
 
         @testset "Block Tridiagonal Inverse" begin
             test_block_tridiagonal_inverse_mutating()
             test_block_tridiagonal_inverse_logdet()
             test_block_tridiagonal_solve()
+            test_block_tridiagonal_solve_spd()
         end
 
-        @testset "Spline Inputs" begin
-            include("Utilities/SplineInputs.jl")
-            test_spline_inputs_shape_and_kron_structure()
-            test_spline_inputs_partition_of_unity()
-            test_spline_inputs_default_trial_pred_broadcasts_across_trials()
-            test_spline_inputs_target_d()
-            test_spline_inputs_penalty_nullspace()
-            test_difference_matrix_nullspace()
-            test_spline_inputs_size_mismatch_throws()
-            test_spline_inputs_trial_pred_row_mismatch_throws()
-            test_spline_inputs_manual_knots()
-            test_spline_inputs_manual_knots_wrong_length_throws()
-            test_spline_inputs_float32_type_preservation()
-            test_spline_inputs_invalid_args()
-        end
-
-        @testset "Null Models" begin
-            include("Utilities/NullModels.jl")
-            test_null_intercept_matches_mvnormal_loglik()
-            test_null_test_ll_matches_plugin_gaussian()
-            test_null_inputs_collapses_to_intercept_when_no_inputs()
-            test_null_inputs_helps_when_signal_present()
-            test_null_var_recovers_true_F_on_var_data()
-            test_null_R_prior_shifts_LL_by_iw_logprior_term()
-            test_null_inputs_override_uses_supplied_array()
-            test_null_var_requires_tsteps_ge_2()
-            test_null_input_shape_mismatch_throws()
-            test_null_test_data_obs_dim_mismatch_throws()
-            test_null_capacity_ordering_on_var_data()
+        @testset "Covariance info-form update" begin
+            test_info_update()
         end
     end
 
+    # Conjugate-prior helpers (IW / MN MAP + log-prior terms)
+    @testset verbose = true "Priors" begin
+        include("Priors/Priors.jl")
+        test_iw_prior_helpers()
+        test_mn_prior_helpers()
+    end
+
     # Validation Tests
-    @testset verbose=true "Validation" begin
+    @testset verbose = true "Validation" begin
         include("Validation/Valid.jl")
 
         @testset "Probability Vector Validation" begin
@@ -288,13 +301,24 @@ include("helper_functions.jl")
             test_validate_LDS_wrong_fit_bool_length()
             test_validate_LDS_poisson_extreme_d()
             test_validate_LDS_asymmetric_covariance()
+            test_validate_LDS_poisson_fit_bool_length()
+        end
+
+        @testset "Model Validators (per-field)" begin
+            test_validate_state_model_fields()
+            test_validate_obs_model_gaussian_fields()
+            test_validate_obs_model_poisson_fields()
+        end
+
+        @testset "Validation Error Messages" begin
+            test_validation_error_messages()
         end
     end
 
     # Preprocessing Tests
-    @testset verbose=true "Preprocessing" begin
+    @testset verbose = true "Preprocessing" begin
         include("Preprocessing/Preprocessing.jl")
-        @testset verbose=true "PPCA" begin
+        @testset verbose = true "PPCA" begin
             test_PPCA_with_params()
             test_PPCA_E_and_M_Step()
             test_PPCA_fit()
@@ -303,13 +327,13 @@ include("helper_functions.jl")
     end
 
     # Pretty Printing Tests
-    @testset verbose=true "Pretty Printing" begin
+    @testset verbose = true "Pretty Printing" begin
         include("PrettyPrinting/PrettyPrinting.jl")
         test_pretty_printing()
     end
 
     # Docs/examples tests. Pattern lifted from HiddenMarkovModels.jl.
-    @testset verbose=true "Docs Examples" begin
+    @testset verbose = true "Docs Examples" begin
         examples_src = joinpath(dirname(@__DIR__), "docs", "examples")
         for file in sort(readdir(examples_src))
             endswith(file, ".jl") || continue

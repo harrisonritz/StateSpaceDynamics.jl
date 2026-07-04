@@ -1,7 +1,7 @@
 # StateSpaceDynamics.jl: A Julia package for probabilistic state space models (SSMs)
 
-[![StateSpaceDynamics-CI](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml/badge.svg)](https://github.com/rsenne/ssm_julia/actions/workflows/run_tests.yaml)
-[![Benchmarks](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/benchmark.yml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/benchmark.yml)
+[![StateSpaceDynamics-CI](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/run_tests.yaml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/run_tests.yaml)
+[![Benchmarks](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml/badge.svg)](https://github.com/depasquale-lab/StateSpaceDynamics.jl/actions/workflows/airspeed.yml)
 [![codecov](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl/graph/badge.svg?token=EQ6B9RJBQ8)](https://codecov.io/github/depasquale-lab/StateSpaceDynamics.jl)
 [![Aqua QA](https://raw.githubusercontent.com/JuliaTesting/Aqua.jl/master/badge.svg)](https://github.com/JuliaTesting/Aqua.jl)
 [![JET](https://img.shields.io/badge/%F0%9F%9B%A9%EF%B8%8F_tested_with-JET.jl-233f9a)](https://github.com/aviatesk/JET.jl)
@@ -10,12 +10,13 @@
 [![Docs: Stable](https://img.shields.io/badge/docs-stable-blue.svg)](https://depasquale-lab.github.io/StateSpaceDynamics.jl/stable)
 [![status](https://joss.theoj.org/papers/0bcb7b5a500055bb4f9fc5aec65c177b/status.svg)](https://joss.theoj.org/papers/0bcb7b5a500055bb4f9fc5aec65c177b)
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17583787.svg)](https://doi.org/10.5281/zenodo.17583787)
+[![All Contributors](https://img.shields.io/github/all-contributors/depasquale-lab/StateSpaceDynamics.jl?color=ee8449&style=flat-square)](#contributors)
 
 ## Description
 
-StateSpaceDynamics.jl is a comprehensive and self-contained Julia package for working with probabilistic state space models (SSMs). It implements a wide range of state-space models, taking inspiration from  [SSM](https://github.com/lindermanlab/ssm) and the [Dynamax](https://probml.github.io/dynamax/) packages written in Python by the Linderman Lab. This package is designed to be fast, flexible, and all-encompassing, leveraging Julia's speed and expressiveness to provide researchers and data scientists with a powerful toolkit for state-space modeling.
+StateSpaceDynamics.jl is a fast, self-contained Julia package for linear dynamical systems (LDS) and related latent state-space models. It covers Gaussian and Poisson LDS, Switching LDS (SLDS), and Probabilistic PCA, taking inspiration from [ssm](https://github.com/lindermanlab/ssm) (Linderman Lab) and [Dynamax](https://probml.github.io/dynamax/). It leverages Julia's speed and expressiveness to give researchers and data scientists a powerful, efficient toolkit for latent state-space modeling.
 
-This package is geared towards applications in neuroscience, so the models incorporate a certain neuroscience flavor (e.g., many of our models are trialized as common in experimental paradigms). However, the models are general enough to be used in other fields such as finance, robotics, and many other domains involving sequential data analysis.
+This package is geared towards applications in neuroscience, so the models incorporate a certain neuroscience flavor (e.g., many of our models are trialized, as is common in experimental paradigms). However, the models are general enough to be used in other fields such as finance, robotics, and many other domains involving sequential data analysis.
 
 We are continuously working to expand our model offerings. If you have suggestions for additional models or features, please open an issue on our GitHub repository.
 
@@ -108,16 +109,19 @@ Help us maintain a welcoming environment for researchers and developers.
   - [ ] PFLDS
   - [x] Switching Linear Dynamical Systems (SLDS)
   - [ ] Recurrent Switching Linear Dynamical Systems (rSLDS)
+- [x] Probabilistic PCA (PPCA)
 
 ## Related Packages
 
 - [HiddenMarkovModels.jl](https://github.com/maxmouchet/HiddenMarkovModels.jl): A Julia package for Hidden Markov Models. We recommend this package if you need HMMs; StateSpaceDynamics.jl uses it internally for SLDS forward-backward.
 
-- [StateSpaceLearning.jl](https://github.com/LAMPSPUC/StateSpaceLearning.jl) : A Julia package for time series analysis using state space models.
+- [StateSpaceLearning.jl](https://github.com/LAMPSPUC/StateSpaceLearning.jl): A Julia package for time series analysis using state space models.
 
-- [ssm](https://github.com/lindermanlab/ssm) : A python package for state space models.
+- [ssm](https://github.com/lindermanlab/ssm): A python package for state space models.
 
-- [dynamax](https://github.com/probml/dynamax): A python package built on JAX for state space modelling (supercedes ssm).
+- [dynamax](https://github.com/probml/dynamax): A python package built on JAX for state space modelling (supersedes ssm).
+
+- [StateSpaceAnalysis.jl](https://github.com/harrisonritz/StateSpaceAnalysis.jl): A highly performant Julia package for fitting Gaussian LDS models. Currently being absorbed into this package.
 
 ## Contributing
 
@@ -141,6 +145,38 @@ If you use our software in your research please cite our JOSS paper using the fo
   year = {2025}
   }
 ```
+
+## Contributors
+
+Thanks go to these wonderful people ([emoji key](https://allcontributors.org/docs/en/emoji-key)):
+
+<!-- ALL-CONTRIBUTORS-LIST:START - Do not remove or modify this section -->
+<!-- prettier-ignore-start -->
+<!-- markdownlint-disable -->
+<table>
+  <tbody>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/rsenne"><img src="https://avatars.githubusercontent.com/u/50930199?v=4?s=100" width="100px;" alt="Ryan Senne"/><br /><sub><b>Ryan Senne</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=rsenne" title="Code">💻</a> <a href="#maintenance-rsenne" title="Maintenance">🚧</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=rsenne" title="Tests">⚠️</a> <a href="#ideas-rsenne" title="Ideas, Planning, & Feedback">🤔</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/pulls?q=is%3Apr+reviewed-by%3Arsenne" title="Reviewed Pull Requests">👀</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=rsenne" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://harrisonritz.github.io/"><img src="https://avatars.githubusercontent.com/u/17258911?v=4?s=100" width="100px;" alt="Harrison Ritz"/><br /><sub><b>Harrison Ritz</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=harrisonritz" title="Code">💻</a> <a href="#maintenance-harrisonritz" title="Maintenance">🚧</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=harrisonritz" title="Tests">⚠️</a> <a href="#ideas-harrisonritz" title="Ideas, Planning, & Feedback">🤔</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/pulls?q=is%3Apr+reviewed-by%3Aharrisonritz" title="Reviewed Pull Requests">👀</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=harrisonritz" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/ZachLoschin"><img src="https://avatars.githubusercontent.com/u/102312738?v=4?s=100" width="100px;" alt="Zachary Loschinskey"/><br /><sub><b>Zachary Loschinskey</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=ZachLoschin" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=ZachLoschin" title="Tests">⚠️</a> <a href="#ideas-ZachLoschin" title="Ideas, Planning, & Feedback">🤔</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=ZachLoschin" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://briandepasquale.github.io/"><img src="https://avatars.githubusercontent.com/u/21131199?v=4?s=100" width="100px;" alt="Brian DePasquale"/><br /><sub><b>Brian DePasquale</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=briandepasquale" title="Code">💻</a> <a href="#ideas-briandepasquale" title="Ideas, Planning, & Feedback">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/carsonkui"><img src="https://avatars.githubusercontent.com/u/22718834?v=4?s=100" width="100px;" alt="carsonkui"/><br /><sub><b>carsonkui</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=carsonkui" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=carsonkui" title="Tests">⚠️</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=carsonkui" title="Documentation">📖</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/jfour1e"><img src="https://avatars.githubusercontent.com/u/146684478?v=4?s=100" width="100px;" alt="James Fourie"/><br /><sub><b>James Fourie</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Documentation">📖</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=jfour1e" title="Tests">⚠️</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://github.com/tomdstone"><img src="https://avatars.githubusercontent.com/u/77251489?v=4?s=100" width="100px;" alt="Tom A.D. Stone"/><br /><sub><b>Tom A.D. Stone</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=tomdstone" title="Code">💻</a> <a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=tomdstone" title="Tests">⚠️</a></td>
+    </tr>
+    <tr>
+      <td align="center" valign="top" width="14.28%"><a href="https://gdalle.github.io/"><img src="https://avatars.githubusercontent.com/u/22795598?v=4?s=100" width="100px;" alt="Guillaume Dalle"/><br /><sub><b>Guillaume Dalle</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/pulls?q=is%3Apr+reviewed-by%3Agdalle" title="Reviewed Pull Requests">👀</a> <a href="#ideas-gdalle" title="Ideas, Planning, & Feedback">🤔</a></td>
+      <td align="center" valign="top" width="14.28%"><a href="https://grantmcconachie.github.io/"><img src="https://avatars.githubusercontent.com/u/39445771?v=4?s=100" width="100px;" alt="Grant McConachie"/><br /><sub><b>Grant McConachie</b></sub></a><br /><a href="https://github.com/depasquale-lab/StateSpaceDynamics.jl/commits?author=GrantMcConachie" title="Code">💻</a></td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- markdownlint-restore -->
+<!-- prettier-ignore-end -->
+
+<!-- ALL-CONTRIBUTORS-LIST:END -->
+
+This project follows the [all-contributors](https://github.com/all-contributors/all-contributors) specification. Contributions of any kind are welcome!
 
 ## References
 

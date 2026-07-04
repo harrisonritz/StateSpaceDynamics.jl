@@ -274,7 +274,7 @@ function test_poisson_loglikelihood_type_preservation()
         x_mat = x[1]
         y_mat = y[1]
 
-        ll = sum(StateSpaceDynamics.loglikelihood(x_mat, lds, y_mat))
+        ll = sum(StateSpaceDynamics.joint_loglikelihood(x_mat, lds, y_mat))
 
         if ll isa Number
             @test typeof(ll) === T
@@ -471,8 +471,8 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
         C = 0.3 .* randn(rng, P, D)
         d = log.(0.7 .+ rand(rng, P))
 
-        gsm = GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0)
-        pom = PoissonObservationModel(C=C, d=d)
+        gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
+        pom = PoissonObservationModel(; C=C, d=d)
         plds = LinearDynamicalSystem(gsm, pom)
 
         _, Y = rand(rng, plds, fill(Tt, N))
@@ -505,6 +505,74 @@ function test_poisson_map_step_improves_Q(; rng=MersenneTwister(123))
     return nothing
 end
 
+function test_poisson_cd_prior_shrink(; rng=MersenneTwister(20260604))
+    # MN `CD_prior` on the Poisson emission `[C d]` (the MN-only prior; Poisson
+    # has no IW observation-noise counterpart). With a strong prior centered at
+    # M₀ = 0 and Λ ≫ data, the penalized LBFGS emission update should pull the
+    # fitted `[C d]` toward 0. The suf-based Poisson `calculate_elbo` now adds
+    # the matching MN trace term `-½ tr((W-M₀)Λ(W-M₀)')`, so the displayed ELBO
+    # must stay monotone; were that term missing, the ELBO would drop sharply as
+    # `[C d]` shrinks (the data fit worsens while the dropped penalty falls).
+    @testset "PoissonLDS: CD_prior shrinks [C d] toward M₀, ELBO monotone" begin
+        D, P, Tt, N = 2, 3, 50, 4
+
+        A = 0.9 .* Matrix(I, D, D)
+        Q = 0.15 .* Matrix(I, D, D)
+        b = zeros(D)
+        x0 = zeros(D)
+        P0 = 0.15 .* Matrix(I, D, D)
+        C = 0.5 .* randn(rng, P, D)
+        d = log.(0.7 .+ rand(rng, P))
+
+        # Shared dataset, drawn from a prior-free model.
+        gsm_seed = GaussianStateModel(;
+            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0)
+        )
+        pom_seed = PoissonObservationModel(; C=copy(C), d=copy(d))
+        lds_seed = LinearDynamicalSystem(gsm_seed, pom_seed)
+        _, Y = rand(rng, lds_seed, fill(Tt, N))
+
+        # Reference fit: no emission prior.
+        gsm_ref = GaussianStateModel(;
+            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0)
+        )
+        pom_ref = PoissonObservationModel(; C=copy(C), d=copy(d))
+        lds_ref = LinearDynamicalSystem(gsm_ref, pom_ref)
+        elbos_ref = fit!(lds_ref, Y; max_iter=20, progress=false)
+        @test all(diff(elbos_ref) .>= -1e-4 .* abs.(@view elbos_ref[1:(end - 1)]) .- 1e-6)
+
+        # Same data, very strong MN prior on [C d] centered at zero. CD lives in
+        # (P × D+1): D columns for C, one for the intercept d.
+        CD_M0 = zeros(P, D + 1)
+        CD_Λ = 1e6 .* Matrix{Float64}(I, D + 1, D + 1)
+        gsm_p = GaussianStateModel(;
+            A=copy(A), Q=copy(Q), b=copy(b), x0=copy(x0), P0=copy(P0)
+        )
+        pom_p = PoissonObservationModel(;
+            C=copy(C), d=copy(d), CD_prior=StateSpaceDynamics.MNPrior(; M₀=CD_M0, Λ=CD_Λ)
+        )
+        lds_p = LinearDynamicalSystem(gsm_p, pom_p)
+        elbos_p = fit!(lds_p, Y; max_iter=20, progress=false)
+
+        # ELBO monotone under the MN penalty (relative slack for the Laplace
+        # E-step). A missing MN term in calculate_elbo would violate this by a
+        # wide margin given Λ = 1e6.
+        @test all(diff(elbos_p) .>= -1e-4 .* abs.(@view elbos_p[1:(end - 1)]) .- 1e-6)
+        @test all(isfinite, elbos_p)
+
+        # Strong shrinkage: penalized [C d] is smaller than reference and pulled
+        # to ≈ M₀ = 0.
+        W_ref = hcat(lds_ref.obs_model.C, lds_ref.obs_model.d)
+        W_p = hcat(lds_p.obs_model.C, lds_p.obs_model.d)
+        @test norm(W_p) < norm(W_ref)
+        @test norm(lds_p.obs_model.C) < 0.05
+        @test all(abs.(lds_p.obs_model.d) .< 0.05)
+        @test all(isfinite, lds_p.obs_model.C)
+        @test all(isfinite, lds_p.obs_model.d)
+    end
+    return nothing
+end
+
 function test_poisson_gradient_shape_and_finiteness()
     @testset "PoissonLDS: gradient_observation_model! shape & finiteness" begin
         D, P, Tt, N = 2, 3, 20, 2
@@ -519,8 +587,8 @@ function test_poisson_gradient_shape_and_finiteness()
         d = zeros(P)
 
         plds = LinearDynamicalSystem(
-            GaussianStateModel(A=A, Q=Q, b=b, x0=x0, P0=P0),
-            PoissonObservationModel(C=C, d=d),
+            GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0),
+            PoissonObservationModel(; C=C, d=d),
         )
 
         _, Y = rand(plds, fill(Tt, N))
@@ -572,8 +640,8 @@ function test_poisson_low_rate_recovery()
         C_true = zeros(P, D)
         d_true = log.(true_rates)               # d = log(rate) since C ≡ 0
 
-        sm_true = GaussianStateModel(A=A_true, Q=Q_true, b=b_true, x0=x0_true, P0=P0_true)
-        om_true = PoissonObservationModel(C=C_true, d=d_true)
+        sm_true = GaussianStateModel(; A=A_true, Q=Q_true, b=b_true, x0=x0_true, P0=P0_true)
+        om_true = PoissonObservationModel(; C=C_true, d=d_true)
         plds_true = LinearDynamicalSystem(sm_true, om_true)
 
         _, Y = rand(rng, plds_true, fill(Tt, N))
@@ -585,14 +653,14 @@ function test_poisson_low_rate_recovery()
         end
 
         # Fit from a different starting point (rate ≈ 1 spikes/bin baseline).
-        sm_fit = GaussianStateModel(
+        sm_fit = GaussianStateModel(;
             A=copy(A_true),
             Q=copy(Q_true),
             b=copy(b_true),
             x0=copy(x0_true),
             P0=copy(P0_true),
         )
-        om_fit = PoissonObservationModel(C=zeros(P, D), d=zeros(P))
+        om_fit = PoissonObservationModel(; C=zeros(P, D), d=zeros(P))
         plds_fit = LinearDynamicalSystem(sm_fit, om_fit)
 
         fit!(plds_fit, Y; max_iter=20, progress=false)
@@ -613,4 +681,3 @@ function test_poisson_low_rate_recovery()
     end
     return nothing
 end
-

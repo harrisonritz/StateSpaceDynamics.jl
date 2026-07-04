@@ -6,7 +6,7 @@ function test_pretty_printing()
 
     # SPD helper — `validate_LDS` rejects non-symmetric Q/P0/R, so any matrix
     # destined for those slots must be built symmetrically.
-    spd(n) = (X=rand(n, n); X * X' + I)
+    spd(n) = (X = rand(n, n); X * X' + I)
 
     # Filter Smooth object
     fs = StateSpaceDynamics.FilterSmooth(
@@ -52,12 +52,8 @@ function test_pretty_printing()
 
     # Linear Dynamical System
 
-    lds1 = LinearDynamicalSystem(
-        gsm1, gom1; fit_bool=[true, true, true, true, true, true], kalman_filter=false
-    )
-    lds2 = LinearDynamicalSystem(
-        gsm2, gom2; fit_bool=[true, true, true, true, true, true], kalman_filter=false
-    )
+    lds1 = LinearDynamicalSystem(gsm1, gom1; fit_bool=[true, true, true, true, true, true])
+    lds2 = LinearDynamicalSystem(gsm2, gom2; fit_bool=[true, true, true, true, true, true])
 
     push!(objs, lds1, lds2)
 
