@@ -3,7 +3,7 @@
 #
 # `test_null` fits four latent-free baselines on a `Data{T}` struct and reports
 # their training and (optionally) test log-likelihoods, computed under the same
-# convention used by the gaussian.jl SSM ELBO at the EM fixed point:
+# convention used by the SSM's `elbo!` at the EM fixed point:
 #
 #   training LL = data Gaussian LL + iw_logprior_term(R, R_prior)
 #                                  + mn_logprior_term(W, R, W_prior)
@@ -11,7 +11,7 @@
 # i.e. plug-in MAP parameters with the same partial-constant prior
 # contributions that the SSM ELBO uses. The test LL is the plug-in Gaussian
 # log-density on the test arrays (no prior terms), matching the convention of
-# `filter_loglikelihood`.
+# the Kalman-filter marginal `loglikelihood(lds, y)`.
 #
 # The four baselines are:
 #   1. intercept   y_t ~ N(d, R)
@@ -31,28 +31,30 @@
 Fit four latent-free baseline models on `train_data` and return their
 training and (optionally) test log-likelihoods. Designed as a fair baseline
 to compare against an SSM fit on the same data: the training LL uses the
-same plug-in MAP + IW/MN log-prior decomposition as the gaussian.jl ELBO
-at its EM fixed point.
+same plug-in MAP + IW/MN log-prior decomposition as the SSM's `elbo!` at
+its EM fixed point.
 
 # Arguments
-- `train_data::Data{T}`: training data struct (`y` is `obs_dim × tsteps × ntrials`).
+- `train_data::Data{T}`: training data struct
+  (`y` is `obs_dim × tsteps × ntrials`).
 
 # Keyword Arguments
 - `test_data::Union{Nothing,Data{T}} = nothing`: optional test set with the
   same `obs_dim`.
 - `train_inputs::Union{Nothing,AbstractArray{T,3}} = nothing`: per-timestep
   inputs `v_t` for the input-bearing models (variants 2 and 4) on training.
-  Defaults to `train_data.u`; pass `zeros(T, 0, T, N)` to disable inputs.
+  Defaults to `train_data.ux`; pass a zero-row array (e.g. `zeros(T, 0, T, N)`)
+  to disable inputs on those two variants.
 - `test_inputs::Union{Nothing,AbstractArray{T,3}} = nothing`: per-timestep
-  inputs on test; defaults to `test_data.u`.
+  inputs on test; defaults to `test_data.ux`.
 - `intercept_W_prior, inputs_W_prior, var_W_prior, var_inputs_W_prior::Union{Nothing,MNPrior{T}} = nothing`:
   matrix-normal priors on the regression matrices for each of the four
   variants. Shapes must match the variant's regressor count
-  (`1`, `1+v_dim`, `obs_dim+1`, `obs_dim+1+v_dim` respectively).
+  (`1`, `1 + v_dim`, `obs_dim + 1`, `obs_dim + 1 + v_dim` respectively).
 - `R_prior::Union{Nothing,IWPrior{T}} = nothing`: IW prior on the
   observation covariance `R` (applied to all four variants).
 - `R0_prior::Union{Nothing,IWPrior{T}} = nothing`: IW prior on the
-  initial-step covariance `R_0` (applied to the two VAR variants).
+  initial-step covariance `R_0` (applied to the two VAR variants only).
 
 # Returns
 A `NamedTuple` keyed by model name (`intercept`, `inputs`, `var`,
@@ -76,13 +78,13 @@ function test_null(
 ) where {T<:Real}
     obs_dim, tsteps, ntrials = size(train_data.y)
 
-    v_train = train_inputs === nothing ? train_data.u : train_inputs
+    v_train = train_inputs === nothing ? train_data.ux : train_inputs
     v_test = if test_data === nothing
         nothing
     elseif test_inputs !== nothing
         test_inputs
     else
-        test_data.u
+        test_data.ux
     end
 
     _null_check_inputs(v_train, tsteps, ntrials, "train_inputs")
@@ -107,7 +109,13 @@ function test_null(
         train_data, test_data, var_W_prior, R_prior, R0_prior
     )
     var_inputs_res = _null_var_inputs(
-        train_data, test_data, v_train, v_test, var_inputs_W_prior, R_prior, R0_prior
+        train_data,
+        test_data,
+        v_train,
+        v_test,
+        var_inputs_W_prior,
+        R_prior,
+        R0_prior,
     )
 
     return (
@@ -141,11 +149,12 @@ end
 # Core regression + log-likelihood helpers
 # -----------------------------------------------------------------------------
 
-# Fit MAP (W, R) for the regression Y = W X + ε,  ε ~ N(0, R), with optional
-# MN prior on W and IW prior on R. `Y` is (obs_dim × n), `X` is (P × n).
+# Fit MAP (W, R) for the regression Y = W X + ε, ε ~ N(0, R), with optional
+# MN prior on W and IW prior on R. `Y` is `(obs_dim, n)`, `X` is `(P, n)`.
 # Returns the MAP `(W, R)`, the data-only residual scatter
 # `S_data = YY - W·XY - XY'·W' + W·XX·W'`, and the sample count `n`. Mirrors
-# the (mn_map + iw_map) M-step machinery used by gaussian.jl's `update_R!`.
+# the (mn_map + iw_map) M-step machinery used by `update_R!` in
+# `lds/gaussian_observations.jl`.
 function _null_fit_regression(
     Y::AbstractMatrix{T},
     X::AbstractMatrix{T},
@@ -163,8 +172,7 @@ function _null_fit_regression(
     YY = Y * transpose(Y)
 
     # `mn_map` returns a `Transpose` view; materialize to a plain Matrix so
-    # downstream BLAS-level ops (`mul!`, in-place `Wm * Λ * Wm'`, etc.) hit
-    # the concrete-matrix code paths.
+    # downstream BLAS-level ops hit the concrete-matrix code paths.
     W = Matrix(mn_map(XX, XY, W_prior))
 
     # Data-only residual scatter S_data = YY - W·XY - XY'·W' + W·XX·W'.
@@ -190,8 +198,8 @@ function _null_fit_regression(
     return W, R, S_data, n
 end
 
-# Prior-augmented training log-likelihood at the MAP fit. Mirrors
-# `calculate_elbo`'s decomposition: data Gaussian LL + iw_logprior_term(R, R_prior)
+# Prior-augmented training log-likelihood at the MAP fit. Mirrors `elbo!`'s
+# decomposition: data Gaussian LL + iw_logprior_term(R, R_prior)
 # + mn_logprior_term(W, R, W_prior).
 function _null_train_ll(
     W::AbstractMatrix{T},
@@ -202,8 +210,7 @@ function _null_train_ll(
     R_prior::Union{Nothing,IWPrior{T}},
 ) where {T<:Real}
     obs_dim = size(R, 1)
-    R_sym = Symmetric(R)
-    F = cholesky(R_sym)
+    F = cholesky(Symmetric(R))
     log_det_R = 2 * sum(log, diag(F.U))
 
     # tr(R^{-1} · S_data) via two triangular solves.
@@ -223,12 +230,14 @@ end
 
 # Plug-in Gaussian log-likelihood on test data using trained (W, R).
 function _null_test_ll(
-    Y::AbstractMatrix{T}, X::AbstractMatrix{T}, W::AbstractMatrix{T}, R::AbstractMatrix{T}
+    Y::AbstractMatrix{T},
+    X::AbstractMatrix{T},
+    W::AbstractMatrix{T},
+    R::AbstractMatrix{T},
 ) where {T<:Real}
     obs_dim = size(Y, 1)
     n = size(Y, 2)
-    R_sym = Symmetric(R)
-    F = cholesky(R_sym)
+    F = cholesky(Symmetric(R))
     log_det_R = 2 * sum(log, diag(F.U))
 
     # Residuals E = Y - W X, with quadratic term tr(R^{-1} E E').
@@ -368,7 +377,9 @@ function _null_var(
     # Init regression: y_1[:, n] ~ N(μ_0, R_0); regress on a constant.
     Y_init = _stack_y_init(train_data.y)
     X_init = _bias_row(T, size(Y_init, 2))
-    W_init, R0, S_init, n_init = _null_fit_regression(Y_init, X_init, nothing, R0_prior)
+    W_init, R0, S_init, n_init = _null_fit_regression(
+        Y_init, X_init, nothing, R0_prior
+    )
 
     # VAR(1) regression: y_t ~ N(F y_{t-1} + d, R) for t = 2..T.
     Y_var = _stack_y_next(train_data.y)
@@ -377,7 +388,8 @@ function _null_var(
 
     W_var, R, S_var, _ = _null_fit_regression(Y_var, X_var, W_prior, R_prior)
 
-    train_ll = _null_train_ll(W_init, R0, S_init, n_init, nothing, R0_prior) +
+    train_ll =
+        _null_train_ll(W_init, R0, S_init, n_init, nothing, R0_prior) +
         _null_train_ll(W_var, R, S_var, n_var, W_prior, R_prior)
 
     test_ll = if test_data === nothing
@@ -386,9 +398,11 @@ function _null_var(
         Y_init_te = _stack_y_init(test_data.y)
         X_init_te = _bias_row(T, size(Y_init_te, 2))
         Y_var_te = _stack_y_next(test_data.y)
-        X_var_te = vcat(_stack_y_prev(test_data.y), _bias_row(T, size(Y_var_te, 2)))
+        X_var_te = vcat(
+            _stack_y_prev(test_data.y), _bias_row(T, size(Y_var_te, 2))
+        )
         _null_test_ll(Y_init_te, X_init_te, W_init, R0) +
-            _null_test_ll(Y_var_te, X_var_te, W_var, R)
+        _null_test_ll(Y_var_te, X_var_te, W_var, R)
     end
 
     μ_0 = vec(W_init[:, 1])
@@ -413,14 +427,18 @@ function _null_var_inputs(
 ) where {T<:Real}
     obs_dim, tsteps, _ = size(train_data.y)
     tsteps >= 2 || throw(
-        ArgumentError("VAR(1)+inputs null model requires tsteps ≥ 2 (got $tsteps)")
+        ArgumentError(
+            "VAR(1)+inputs null model requires tsteps ≥ 2 (got $tsteps)"
+        ),
     )
     v_dim = size(v_train, 1)
 
     # Init regression: same as the VAR-only model — y_1 is exogenous to inputs.
     Y_init = _stack_y_init(train_data.y)
     X_init = _bias_row(T, size(Y_init, 2))
-    W_init, R0, S_init, n_init = _null_fit_regression(Y_init, X_init, nothing, R0_prior)
+    W_init, R0, S_init, n_init = _null_fit_regression(
+        Y_init, X_init, nothing, R0_prior
+    )
 
     # VAR(1)+inputs regression: y_t ~ N(F y_{t-1} + d + D v_t, R) for t = 2..T.
     Y_var = _stack_y_next(train_data.y)
@@ -433,7 +451,8 @@ function _null_var_inputs(
 
     W_var, R, S_var, _ = _null_fit_regression(Y_var, X_var, W_prior, R_prior)
 
-    train_ll = _null_train_ll(W_init, R0, S_init, n_init, nothing, R0_prior) +
+    train_ll =
+        _null_train_ll(W_init, R0, S_init, n_init, nothing, R0_prior) +
         _null_train_ll(W_var, R, S_var, n_var, W_prior, R_prior)
 
     test_ll = if test_data === nothing
@@ -448,13 +467,15 @@ function _null_var_inputs(
             _stack_inputs_next(v_test),
         )
         _null_test_ll(Y_init_te, X_init_te, W_init, R0) +
-            _null_test_ll(Y_var_te, X_var_te, W_var, R)
+        _null_test_ll(Y_var_te, X_var_te, W_var, R)
     end
 
     μ_0 = vec(W_init[:, 1])
     F = W_var[:, 1:obs_dim]
     d = vec(W_var[:, obs_dim + 1])
-    D = v_dim > 0 ? W_var[:, (obs_dim + 2):end] : Matrix{T}(undef, size(W_var, 1), 0)
+    D =
+        v_dim > 0 ? W_var[:, (obs_dim + 2):end] :
+        Matrix{T}(undef, size(W_var, 1), 0)
     params = (μ_0=μ_0, R_0=R0, F=F, d=d, D=D, R=R)
     return (train_ll=train_ll, test_ll=test_ll, params=params)
 end

@@ -1,6 +1,0 @@
-# Ignore generated benchmark results (stored in CI artifacts)
-*.json
-*.csv
-
-# Keep the README
-!README.md
