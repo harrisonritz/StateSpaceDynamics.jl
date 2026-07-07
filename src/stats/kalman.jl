@@ -426,7 +426,7 @@ function backwards_cov!(
         # asymmetry; folding the sum into the X_A_Xt argument avoids that.
         mul!(kws.cov_tmp1, G[:, :, tt], A, one(T), zero(T))
         kws.cov_tmp2 .=
-            X_A_Xt(smooth_cov[tt + 1] + Q_PD[], G[:, :, tt]) .+
+            X_A_Xt(smooth_cov[tt + 1] + Q_PD[], G[:, :, tt]::SubArray{T}) .+
             X_A_Xt(filt_cov[tt], I - kws.cov_tmp1)
         Symmetrize!(kws.cov_tmp2)
         smooth_cov[tt] = PDMat(kws.cov_tmp2)
@@ -573,7 +573,7 @@ end
     dyn_xx = dyn_xx_buf
     # Top-left x_prev block: smooth_cov_prev*N + x_prev x_prevᵀ
     dyn_xx[1:D, 1:D] .= kws.sum_smooth_cov_prev .* kws.ntrials
-    BLAS.syrk!('U', 'N', one(T), x_prev, one(T), dyn_xx[1:D, 1:D])
+    BLAS.syrk!('U', 'N', one(T), x_prev, one(T), dyn_xx[1:D, 1:D]::SubArray{T})
     # Top-middle: x_prev · 1 = Σ_n,t x_prev[:, n, t] (column sum). Filling row
     # D+1 of the upper triangle; copytri! mirrors to the symmetric position.
     fill!(view(dyn_xx, 1:D, D + 1), zero(T))
@@ -613,7 +613,7 @@ end
 
     obs_xx = obs_xx_buf
     obs_xx[1:D, 1:D] .= kws.sum_smooth_cov_all .* kws.ntrials
-    BLAS.syrk!('U', 'N', one(T), x_cur, one(T), obs_xx[1:D, 1:D])
+    BLAS.syrk!('U', 'N', one(T), x_cur, one(T), obs_xx[1:D, 1:D]::SubArray{T})
     # Bias column: Σ x_cur
     fill!(view(obs_xx, 1:D, D + 1), zero(T))
     @inbounds for n in axes(x_cur, 2), i in 1:D
@@ -978,7 +978,7 @@ function marginal_loglikelihood(
         MV = MvNormal(kws.obs_pd_tmp[])
 
         for n in axes(innovation, 3)
-            total_ll += Distributions.logpdf(MV, innovation[:, t, n])
+            total_ll += Distributions.logpdf(MV, innovation[:, t, n]::SubArray{T})
         end
     end
 

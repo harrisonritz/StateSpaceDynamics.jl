@@ -41,37 +41,9 @@ using SSDTest
         end
 
         @testset "JET.jl Code Linting" begin
-            if VERSION >= v"1.11"
-                # JET reports ~23 union-split false positives in `kalman.jl`
-                # (`backwards_cov!`, `sufficient_statistics!`,
-                # `marginal_loglikelihood`) and the TD aggregator in
-                # `gaussian.jl` (`_precompute_shared_cov!`,
-                # `_td_init_const_blocks!`, `_aggregate_td_suff_stats!`,
-                # `_aggregate_td_suff_stats_weighted!`). Pattern: `@views`
-                # over a workspace field typed `Array{T,3}` /
-                # `Vector{PDMat{T,Matrix{T}}}` (where `T<:Real`) produces a
-                # `maybeview` whose return type JET infers as
-                # `Union{SubArray{Any, …}, SubArray{T, …}}`. The `Any` branch
-                # then fails to match downstream `BLAS.ger!` /
-                # `BLAS.syrk!` / `Symmetrize!` / `X_A_Xt` / `logpdf` /
-                # `aggregate_xx` signatures.
-                #
-                # Runtime types are concrete and all functional tests pass;
-                # the field-hoist + `::Type` assertion pattern was tried
-                # (see `backwards_cov!`, `sufficient_statistics!`,
-                # `_precompute_shared_cov!`, etc.) and **does not** clear
-                # JET — its parametric analysis still sees the outer
-                # `where T<:Real` on the field and splits the union. To
-                # fully clear, the workspaces would need to be parametrized
-                # on concrete `Matrix{T}` element type at each call site (a
-                # bigger refactor — JET issue tracked but deferred).
-                #
-                # TODO(#91): un-skip once workspace fields are parametrized on
-                # concrete `Matrix{T}` so JET stops union-splitting the
-                # `@views`-over-`Array{T,3}`/`Vector{PDMat}` accessors.
-                @test_skip JET.test_package(
-                    StateSpaceDynamics; target_modules=(StateSpaceDynamics,)
-                )
+            # Skip pre-release versions of Julia, which JET does not yet support.
+            if (v"1.11" <= VERSION) && isempty(VERSION.prerelease)
+                JET.test_package(StateSpaceDynamics; target_modules=(StateSpaceDynamics,))
             end
         end
     end
