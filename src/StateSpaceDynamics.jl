@@ -8,7 +8,8 @@ using PDMats
 using Random
 using SparseArrays
 
-using Optim: Optim, optimize, LBFGS, HagerZhang
+using Optim: Optim, optimize, LBFGS
+using LineSearches: HagerZhang
 using ProgressMeter: Progress, next!, finish!
 using SpecialFunctions: loggamma
 using Statistics: mean
@@ -73,6 +74,7 @@ export valid_Σ, gaussian_entropy
 export random_rotation_matrix
 export print_full
 export info_update!
+export tview
 
 # Common functions
 export rand, smooth, fit!, loglikelihood, elbo!
