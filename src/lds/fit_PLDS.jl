@@ -1,7 +1,8 @@
 #=============================================================================
 Poisson LDS
 
-    Log-Likelihood: joint_loglikelihood(x, plds, y)
+    Log-Likelihood: joint_loglikelihood!(ws, x, plds, y[, lognorm_t])
+                    joint_loglikelihood(x, plds, y)
 
     Gradient:       Gradient!(ws, lds, y, x)
                     gradient_observation_model!(grad, C, d, tfs, y, sws_pool)
@@ -21,196 +22,117 @@ Poisson LDS
 =============================================================================#
 
 """
-    joint_loglikelihood(
-        x::AbstractMatrix{U},
-        plds::LinearDynamicalSystem{T,S,O},
-        y::AbstractMatrix{T}
-    )
+    _poisson_lognorm_t(y)
 
-Calculate the complete-data log-likelihood of a Poisson Linear Dynamical System model for a
-single trial.
+Per-timestep Poisson emission normalizer `lognorm_t[t] = Σᵢ log(y[i,t]!)`;
+constant in the latents. Computed once per trial and handed to `joint_loglikelihood!`
+"""
+function _poisson_lognorm_t(y::AbstractMatrix{T}) where {T<:Real}
+    return vec(sum(yi -> loggamma(yi + one(T)), y; dims=1))
+end
+
+"""
+    joint_loglikelihood!(ws, x, plds, y[, lognorm_t])
+
+Per-timestep complete-data log-likelihood of a Poisson LDS, written into
+`ws.ll_vec` (an active-length view is returned — the workspace may be
+pool-oversized). Mirrors the Gaussian `joint_loglikelihood!`; requires
+`compute_smooth_constants!(ws, plds)` to have been called. The rate follows
+the canonical Poisson GLM `λ_t = exp(C x_t + d)`.
+
+- `ll[1]` includes: log p(x₁) + log p(y₁ | x₁)
+- `ll[t]` for t≥2 includes: log p(x_t | x_{t-1}) + log p(y_t | x_t)
+
+Normalization terms (Gaussian logdet + log(2π) and Poisson `-log(y!)`) are
+included, so `sum(ll)` is the exact complete-data log-density `log p(x, y)`.
+"""
+function joint_loglikelihood!(
+    ws::SmoothWorkspace{T},
+    x::AbstractMatrix{T},
+    plds::LinearDynamicalSystem{TM,S,O},
+    y::AbstractMatrix{TM},
+    lognorm_t::AbstractVector{<:Real}=_poisson_lognorm_t(y),
+) where {T<:Real,TM<:Real,S<:GaussianStateModel{TM},O<:PoissonObservationModel{TM}}
+    tsteps = size(y, 2)
+
+    C = plds.obs_model.C
+    d = plds.obs_model.d
+
+    ll_vec = view(ws.ll_vec, 1:tsteps)
+    η = ws.temp_dy                      # length obs_dim
+    dx = ws.temp_dx                     # length latent_dim
+    tmp = ws.temp_solve_Q               # length latent_dim
+
+    @views for t in 1:tsteps
+        # Emission (with -log(y!)): y_t'η_t - sum(exp(η_t)),
+        # with η_t = Cx_t + d
+        mul!(η, C, x[:, t])
+        @. η = η + d
+        ll_vec[t] = dot(y[:, t], η) - sum(exp, η) - lognorm_t[t]
+
+        # Prior (t = 1) / transition (t ≥ 2)
+        ll_vec[t] += stateloglikelihood!(ws, dx, tmp, x, t, plds)
+    end
+
+    return ll_vec
+end
+
+"""
+    joint_loglikelihood(x, plds, y)
+
+Per-timestep complete-data log-likelihood of a Poisson LDS for a single trial
+(allocating convenience wrapper around `joint_loglikelihood!`; mirrors the
+Gaussian `joint_loglikelihood`).
 
 # Arguments
-- `x::AbstractMatrix{T}`: The latent state variables. Dimensions: (latent_dim, tsteps)
-- `lds::LinearDynamicalSystem{T,S,O}`: The Linear Dynamical System model.
-- `y::AbstractMatrix{T}`: The observed data. Dimensions: (obs_dim, tsteps)
-- `w::Vector{T}`: Weights for each observation in the log-likelihood calculation. Not
-    currently used.
-
-# Returns
-- `ll::Vector{T}`: The log-likelihood value.
-
-# Ref
-- joint_loglikelihood(
-    x::AbstractArray{T,3},
-    plds::LinearDynamicalSystem{T,S,O},
-    y::AbstractArray{T,3}
-)
+- `x::AbstractMatrix`: latent states, (latent_dim × tsteps)
+- `plds::LinearDynamicalSystem`: the Poisson LDS model
+- `y::AbstractMatrix`: observed counts, (obs_dim × tsteps)
 """
 function joint_loglikelihood(
     x::AbstractMatrix{U}, plds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}
 ) where {U<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-
-    # Result type and setup
     R = promote_type(T, U)
     tsteps = size(y, 2)
-    ll = zeros(R, tsteps)
 
-    # Canonical Poisson GLM: λ_t = exp(C x_t + d), where `d` is the
-    # log-link intercept (free in ℝ; positivity is provided by exp).
-    d = plds.obs_model.d
+    ws = SmoothWorkspace(R, plds.latent_dim, plds.obs_dim, tsteps)
+    compute_smooth_constants!(ws, plds)
+    x_R = convert(AbstractMatrix{R}, x)
 
-    # Pre-compute Cholesky factorizations
-    P0_chol = cholesky(Symmetric(plds.state_model.P0))
-    Q_chol = cholesky(Symmetric(plds.state_model.Q))
-
-    # Get dimensions
-    C = plds.obs_model.C
-    A = plds.state_model.A
-    x0 = plds.state_model.x0
-    obs_dim, latent_dim = size(C)
-    obs_tmp = Vector{eltype(x)}(undef, obs_dim)
-
-    @views for t in 1:tsteps
-        obs_tmp .= C * x[:, t] .+ d
-        ll[t] += (dot(y[:, t], obs_tmp) - sum(exp, obs_tmp))
-    end
-
-    # Prior term p(x₁) goes to t = 1
-    dx1 = @view(x[:, 1]) .- plds.state_model.x0
-    ll[1] += -R(0.5) * dot(dx1, P0_chol \ dx1)
-
-    # Transition terms p(xₜ|xₜ₋₁) go to their respective t (t ≥ 2)
-    A = plds.state_model.A
-    b = plds.state_model.b
-    trans_tmp = Vector{eltype(x)}(undef, latent_dim)
-
-    @views for t in 2:tsteps
-        trans_tmp .= x[:, t] .- (A * x[:, t - 1] .+ b)
-        ll[t] += -R(0.5) * dot(trans_tmp, Q_chol \ trans_tmp)
-    end
-
-    return ll
+    return joint_loglikelihood!(ws, x_R, plds, y)
 end
 
 """
-    _loglikelihood_ws(x, lds, y, ws)
+    observationloglikelihood!(cc, z, λ, x, y, t, lds[, uy])
 
-Efficient log-likelihood computation using cached Cholesky factors from SmoothWorkspace.
-Returns the total log-likelihood (scalar), not per-timestep.
-Used in the Newton line search to avoid repeated Cholesky factorizations.
+Poisson emission term: with rate `λ = exp(Cx_t + d)`,
+`log p(y_t|x_t) = y⋅log(λ) - sum(λ) - sum(log(y!))`. Method of the generic
+`observationloglikelihood!` dispatch point (see `continuous_latents.jl`); `z` and `λ`
+are `obs_dim` scratch vectors for the linear predictor and the rate. The cache
+and `uy` arguments are unused (no covariance term; Poisson observation inputs
+are not supported).
 """
-function _loglikelihood_ws(
+function observationloglikelihood!(
+    ::LDSLikelihoodCache{T},
+    z::AbstractVector{T},
+    λ::AbstractVector{T},
     x::AbstractMatrix{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    ws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    tsteps = size(y, 2)
-
+    y::AbstractMatrix{T0},
+    t::Int,
+    lds::LinearDynamicalSystem{T0,S,O},
+    ::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
     C = lds.obs_model.C
     d = lds.obs_model.d
-    A = lds.state_model.A
-    b = lds.state_model.b
-    x0 = lds.state_model.x0
 
-    ll = zero(T)
+    # z = Cx + d ; λ = exp(z)
+    @views mul!(z, C, x[:, t])
+    z .+= d
+    @. λ = exp(z)
 
-    η = ws.temp_dy                      # length obs_dim
-    dx = ws.temp_dx                     # length latent_dim
-    z = ws.temp_solve_Q                # length latent_dim
-
-    # Observation term: sum_t [ y_t'η_t - sum(exp(η_t)) ], η_t = Cx_t + d
-    @views for t in 1:tsteps
-        mul!(η, C, x[:, t])             # η := C * x_t
-        @. η = η + d                    # η := η + d
-        ll += dot(y[:, t], η) - sum(exp, η)
-    end
-
-    # Bind the raw Cholesky factor matrices once and use `LAPACK.trtrs!`
-    # directly. `pdm.chol.L` would allocate a fresh
-    # `LowerTriangular{T,Matrix{T}}` wrapper on every access; PDMats
-    # stores the upper factor in `.chol.factors` (uplo='U'), so trans='T'
-    # turns the call into a solve against L = U'.
-    P0_factors = ws.P0_PD[].chol.factors
-    Q_factors = ws.Q_PD[].chol.factors
-
-    # Prior: -0.5 * || P0^{-1/2} (x1 - x0) ||^2  with P0 = U'U
-    @views begin
-        @. dx = x[:, 1] - x0
-        copyto!(z, dx)
-        LinearAlgebra.LAPACK.trtrs!('U', 'T', 'N', P0_factors, z)   # z := L \ dx
-        ll -= T(0.5) * dot(z, z)
-    end
-
-    # Transitions: -0.5 * sum_{t=2}^T || Q^{-1/2} (x_t - A x_{t-1} - b) ||^2, Q = U'U
-    @views for t in 2:tsteps
-        mul!(dx, A, x[:, t - 1])          # dx := A * x_{t-1}
-        @. dx = x[:, t] - (dx + b)      # dx := x_t - (A x_{t-1} + b)
-        copyto!(z, dx)
-        LinearAlgebra.LAPACK.trtrs!('U', 'T', 'N', Q_factors, z)    # z := L \ dx
-        ll -= T(0.5) * dot(z, z)
-    end
-
-    return ll
-end
-
-function joint_loglikelihood!(
-    ll::AbstractVector{T},
-    ws::SLDSSmoothWorkspace{T},
-    cc::LDSConstantCache{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    tsteps = size(y, 2)
-    @assert length(ll) == tsteps
-
-    A = lds.state_model.A
-    b = lds.state_model.b
-    x0 = lds.state_model.x0
-
-    # Poisson obs: λ = exp(Cx + d); log p(y|x) = sum(y .* logλ - λ - log(y!))
-    z = ws.z
-    λ = ws.λ
-
-    Q_U = cc.Q_PD[].chol.U
-    P0_U = cc.P0_PD[].chol.U
-
-    dxt = ws.dxt
-    tmp = ws.tmp1
-
-    C = cc.C
-    d = cc.d
-
-    for t in 1:tsteps
-        ll_t = zero(T)
-
-        # obs: z = Cx + d ; λ = exp(z)
-        @views mul!(z, C, x[:, t])
-        z .+= d
-        @. λ = exp(z)
-
-        # compute y⋅z - λ - log(y!)  (loggamma(n+1) = log(n!) for real n≥0)
-        @views begin
-            ll_t += sum(y[:, t] .* z) - sum(λ) - sum(yi -> loggamma(yi + one(T)), y[:, t])
-        end
-
-        if t == 1
-            @views dxt .= x[:, 1] .- x0
-            ldiv!(dxt, P0_U, dxt)
-            ll_t += cc.cP0 - T(0.5) * sum(abs2, dxt)
-        else
-            @views mul!(tmp, A, x[:, t - 1])
-            @views tmp .= x[:, t] .- tmp .- b
-            ldiv!(tmp, Q_U, tmp)
-            ll_t += cc.cQ - T(0.5) * sum(abs2, tmp)
-        end
-
-        ll[t] = ll_t
-    end
-
-    return ll
+    # y⋅z - λ - log(y!)  (loggamma(n+1) = log(n!) for real n≥0)
+    yt = view(y, :, t)
+    return dot(yt, z) - sum(λ) - sum(yi -> loggamma(yi + one(T)), yt)
 end
 
 """
@@ -825,7 +747,10 @@ function smooth!(
     g = grad_active
     p = reshape(X0, D, tsteps)
 
-    ϕ!() = _loglikelihood_ws(x, lds, y, sws)
+    # The line-search objective is the exact complete-data log-likelihood;
+    # hoisting the data-only normalizer makes that free per evaluation.
+    lognorm_t = _poisson_lognorm_t(y)
+    ϕ!() = sum(joint_loglikelihood!(sws, x, lds, y, lognorm_t))
 
     compute_grad! = (gcur, xcur) -> begin
         _compute_gradient_poisson!(gcur, sws, lds, y, xcur)
