@@ -7,7 +7,8 @@ Poisson LDS
     Gradient:       Gradient!(ws, lds, y, x)
                     gradient_observation_model!(grad, C, d, tfs, y, sws_pool)
 
-    Hessian:        Hessian!(ws, lds, y, x)
+    Hessian:        (generic Hessian! lives in continuous_latents.jl;
+                    emission kernels in poisson_observations.jl)
 
     Smooth:         smooth!(lds, fs, y, sws)
                     smooth!(lds, tfs, y, sws_pool)
@@ -70,7 +71,7 @@ function joint_loglikelihood!(
         ll_vec[t] = dot(y[:, t], η) - sum(exp, η) - lognorm_t[t]
 
         # Prior (t = 1) / transition (t ≥ 2)
-        ll_vec[t] += stateloglikelihood!(ws, dx, tmp, x, t, plds)
+        ll_vec[t] += state_loglikelihood!(ws, dx, tmp, x, t, plds)
     end
 
     return ll_vec
@@ -98,38 +99,6 @@ function joint_loglikelihood(
     x_R = convert(AbstractMatrix{R}, x)
 
     return joint_loglikelihood!(ws, x_R, plds, y)
-end
-
-"""
-    observationloglikelihood!(cc, z, λ, x, y, t, lds[, uy])
-
-Poisson emission term: with rate `λ = exp(Cx_t + d)`,
-`log p(y_t|x_t) = y⋅log(λ) - sum(λ) - sum(log(y!))`. `z` and `λ` are `obs_dim`
-scratch vectors for the linear predictor and the rate. The cache and `uy`
-arguments are unused (no covariance term; Poisson observation inputs are not
-supported).
-"""
-function observationloglikelihood!(
-    ::LDSLikelihoodCache{T},
-    z::AbstractVector{T},
-    λ::AbstractVector{T},
-    x::AbstractMatrix{T},
-    y::AbstractMatrix{T0},
-    t::Int,
-    lds::LinearDynamicalSystem{T0,S,O},
-    ::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
-
-    # z = Cx + d ; λ = exp(z)
-    @views mul!(z, C, x[:, t])
-    z .+= d
-    @. λ = exp(z)
-
-    # y⋅z - λ - log(y!)  (loggamma(n+1) = log(n!) for real n≥0)
-    yt = view(y, :, t)
-    return dot(yt, z) - sum(λ) - sum(yi -> loggamma(yi + one(T)), yt)
 end
 
 """
@@ -175,110 +144,6 @@ function loglikelihood(
         "log p(y) is intractable). Use joint_loglikelihood(x, plds, y) for the " *
         "complete-data log-likelihood, or the ELBO from fit! as a lower bound.",
     )
-end
-
-"""
-    observationgradient!(out, cc, buf, x, y, t, lds[, uy])
-
-Poisson emission gradient: `out = C'(y_t - λ_t)` with `λ_t = exp(Cx_t + d)`.
-The cache and `uy` arguments are unused (no covariance term; Poisson
-observation inputs are not supported).
-"""
-function observationgradient!(
-    out::AbstractVector{T},
-    ::LDSLikelihoodCache{T},
-    buf::AbstractVector{T},
-    x::AbstractMatrix{T},
-    y::AbstractMatrix{T0},
-    t::Int,
-    lds::LinearDynamicalSystem{T0,S,O},
-    ::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
-    @views mul!(buf, C, x[:, t])
-    @views buf .= y[:, t] .- exp.(buf .+ d)
-    return mul!(out, C', buf)
-end
-
-"""
-    Hessian!(ws, lds, y, x; w=nothing)
-
-In-place version of `Hessian` for Poisson LDS that writes blocks into the workspace
-and updates the sparse matrix values. Returns the workspace's sparse matrix.
-"""
-function Hessian!(
-    ws::BlockTridiagonalWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
-    x::AbstractMatrix{T},
-    w::Union{Nothing,AbstractVector{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    if w === nothing
-        w = ones(T, size(y, 2))
-    end
-
-    A, Q = lds.state_model.A, lds.state_model.Q
-    C, d = lds.obs_model.C, lds.obs_model.d
-    x0, P0 = lds.state_model.x0, lds.state_model.P0
-
-    tsteps = size(y, 2)
-    Q_chol = cholesky(Symmetric(Q))
-    P0_chol = cholesky(Symmetric(P0))
-
-    H_sub_entry = Q_chol \ A
-    H_super_entry = permutedims(H_sub_entry)
-
-    for i in 1:(tsteps - 1)
-        copyto!(ws.H_sub[i], H_sub_entry)
-        copyto!(ws.H_super[i], H_super_entry)
-    end
-
-    state_dim = size(A, 1)
-    obs_dim = size(C, 1)
-    λ = zeros(T, obs_dim)
-    z = similar(λ)
-    poisson_tmp = Matrix{T}(undef, state_dim, state_dim)
-
-    function calculate_poisson_hess!(out::Matrix{T}, C::Matrix{T}, λ::Vector{T}) where {T}
-        n, p = size(C)
-        for j in 1:p, i in 1:p
-            acc = zero(T)
-            for k in 1:n
-                acc += C[k, i] * λ[k] * C[k, j]
-            end
-            out[i, j] = -acc
-        end
-    end
-
-    I_mat = Matrix{T}(I, state_dim, state_dim)
-    xt_given_xt_1 = -(Q_chol \ I_mat)
-    xt1_given_xt = -A' * (Q_chol \ A)
-    x_t = -(P0_chol \ I_mat)
-
-    Q_middle = xt1_given_xt + xt_given_xt_1
-    Q_first = x_t + xt1_given_xt
-    Q_last = xt_given_xt_1
-
-    @views for t in 1:tsteps
-        mul!(z, C, x[:, t])
-        @. λ = exp(z + d)
-
-        if t == 1
-            ws.H_diag[t] .= Q_first
-        elseif t == tsteps
-            ws.H_diag[t] .= Q_last
-        else
-            ws.H_diag[t] .= Q_middle
-        end
-
-        calculate_poisson_hess!(poisson_tmp, C, λ)
-        ws.H_diag[t] .+= poisson_tmp
-    end
-
-    block_tridgm!(ws)
-
-    return ws.H_sparse
 end
 
 """
@@ -329,10 +194,12 @@ function gradient_observation_model_single_trial!(
             λ[i] = exp(h[i] + ρ[i])
         end
 
-        # Stacked gradient ∂Q/∂W[i, j] = w · (y_t[i] − λ[i]) · z_aug[j]  −  w · λ[i] · CP_aug[i, j]
-        # where z_aug = [E_z_t; 1] and CP_aug[:, 1:D] = CP, CP_aug[:, D+1] = 0
-        # (since ρ has no dependence on the d-column of W). Split into the two
-        # blocks to skip the always-zero CP_aug column.
+        #=
+        Stacked gradient ∂Q/∂W[i, j] = w · (y_t[i] − λ[i]) · z_aug[j]  −  w · λ[i] · CP_aug[i, j]
+        where z_aug = [E_z_t; 1] and CP_aug[:, 1:D] = CP, CP_aug[:, D+1] = 0
+        (since ρ has no dependence on the d-column of W). Split into the two
+        blocks to skip the always-zero CP_aug column.
+        =#
         for j in 1:latent_dim
             for i in 1:obs_dim
                 grad_W[i, j] += weight * (y_t[i] * E_z_t[j] - λ[i] * (E_z_t[j] + CP[i, j]))
@@ -362,10 +229,12 @@ function gradient_observation_model!(
     npar = length(grad)
     @assert length(sws_pool[1].CD) == npar && length(sws_pool[1].Syz) == npar "Poisson gradient accumulator size $(length(sws_pool[1].CD)) ≠ npar=$npar (obs_input_dim must be 0)"
 
-    # Cap ntasks at `length(sws_pool)` so each task gets its own
-    # pre-allocated workspace slot indexed by its position in the chunk
-    # iteration (not `threadid()`, which can migrate under task
-    # scheduling).
+    #=
+    Cap ntasks at `length(sws_pool)` so each task gets its own
+    pre-allocated workspace slot indexed by its position in the chunk
+    iteration (not `threadid()`, which can migrate under task
+    scheduling).
+    =#
     desired = max(1, tasks_per_thread * Threads.nthreads())
     ntasks = min(trials, desired, length(sws_pool))
     chunk_size = max(1, cld(trials, ntasks))
@@ -377,13 +246,15 @@ function gradient_observation_model!(
             push!(
                 tasks,
                 Threads.@spawn begin
-                    # Each task owns one workspace from the pool. Buffers
-                    # used by `gradient_observation_model_single_trial!`
-                    # (h/ρ/λ/CP) come from this workspace's existing
-                    # `Q_obs!` scratch fields, and the per-task `acc`/`tmp`
-                    # gradient accumulators are views into `.CD` / `.Syz`
-                    # (both sized `obs_dim × Dp1 = npar` for Poisson, where
-                    # `obs_input_dim = 0`).
+                    #=
+                    Each task owns one workspace from the pool. Buffers
+                    used by `gradient_observation_model_single_trial!`
+                    (h/ρ/λ/CP) come from this workspace's existing
+                    `Q_obs!` scratch fields, and the per-task `acc`/`tmp`
+                    gradient accumulators are views into `.CD` / `.Syz`
+                    (both sized `obs_dim × Dp1 = npar` for Poisson, where
+                    `obs_input_dim = 0`).
+                    =#
                     sws = sws_pool[task_idx]
                     acc = vec(sws.CD)
                     tmp = vec(sws.Syz)
@@ -490,9 +361,11 @@ function elbo!(
         total_entropy += fs.entropy
     end
 
-    # State-side Q via aggregated suff-stats. `compute_smooth_constants!` on a
-    # Poisson LDS only fills state-side constants (Q_PD / P0_PD /
-    # derived blocks); `Q_state!(sws, lds, suf)` reads exactly those.
+    #=
+    State-side Q via aggregated suff-stats. `compute_smooth_constants!` on a
+    Poisson LDS only fills state-side constants (Q_PD / P0_PD /
+    derived blocks); `Q_state!(sws, lds, suf)` reads exactly those.
+    =#
     compute_smooth_constants!(sws_pool[1], plds)
     Q_state_total = Q_state!(sws_pool[1], plds, suf)
 
@@ -525,11 +398,13 @@ function elbo!(
         prior_term += iw_logprior_term(plds.state_model.P0, plds.state_model.P0_prior)
     end
 
-    # MN log-prior on [C d]. No row covariance Σ for Poisson, so this is the
-    # plain quadratic kernel `-½ tr((W - M₀) Λ (W - M₀)')` (matches the
-    # `+½ tr(...)` penalty `update_observation_model!` adds to its LBFGS
-    # objective). Λ-only and Λ-logdet constants are absorbed into the
-    # additive ELBO constant.
+    #=
+    MN log-prior on [C d]. No row covariance Σ for Poisson, so this is the
+    plain quadratic kernel `-½ tr((W - M₀) Λ (W - M₀)')` (matches the
+    `+½ tr(...)` penalty `update_observation_model!` adds to its LBFGS
+    objective). Λ-only and Λ-logdet constants are absorbed into the
+    additive ELBO constant.
+    =#
     if plds.obs_model.CD_prior !== nothing
         D = plds.latent_dim
         W_cd = Matrix{T}(undef, plds.obs_dim, D + 1)
@@ -541,70 +416,6 @@ function elbo!(
     end
 
     return Q_state_total + Q_obs_total + prior_term + total_entropy
-end
-
-"""
-    _fill_hessian_blocks_poisson!(ws, lds, x)
-
-Fill the Hessian block diagonal and off-diagonal entries for Poisson LDS.
-Uses pre-computed state model terms from `compute_smooth_constants!`
-and computes the x-dependent Poisson observation term per-timestep.
-"""
-function _fill_hessian_blocks_poisson!(
-    ws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, x::AbstractMatrix{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    tsteps = size(x, 2)
-    btd = ws.btd
-    C = lds.obs_model.C
-    d = lds.obs_model.d
-    obs_dim, latent_dim = size(C)
-
-    # Diagonal templates (the state-side part is constant for all t; we
-    # build them into pre-existing workspace scratch to avoid the two
-    # `Q_middle = ... .+ ...` / `Q_first = ... .+ ...` allocations).
-    Q_middle = ws.elbo_temp                              # (D × D) scratch
-    Q_first = ws.elbo_temp2                              # (D × D) scratch
-    @. Q_middle = ws.xt1_given_xt + ws.xt_given_xt_1
-    @. Q_first = ws.x_t + ws.xt1_given_xt
-    Q_last = ws.xt_given_xt_1                            # already at-rest in ws
-
-    # Fill sub/super-diagonal blocks (constant for all timesteps)
-    for i in 1:(tsteps - 1)
-        copyto!(btd.H_sub[i], ws.H_sub_entry)
-        copyto!(btd.H_super[i], ws.H_super_entry)
-    end
-
-    # Reuse existing obs-dim workspace scratch instead of allocating
-    # fresh per-call `λ` / `z` vectors. `h_obs` / `rho_obs` are owned
-    # by `Q_obs!`, which isn't on the Hessian-construction call path.
-    λ = ws.h_obs
-    z = ws.rho_obs
-
-    @views for t in 1:tsteps
-        # Start with state model contribution
-        if t == 1
-            copyto!(btd.H_diag[t], Q_first)
-        elseif t == tsteps
-            copyto!(btd.H_diag[t], Q_last)
-        else
-            copyto!(btd.H_diag[t], Q_middle)
-        end
-
-        # Add Poisson observation term: -C' * diag(λ) * C
-        mul!(z, C, x[:, t])
-        @. λ = exp(z + d)
-
-        # Compute -C' * diag(λ) * C and add to diagonal block
-        for j in 1:latent_dim, i in 1:latent_dim
-            acc = zero(T)
-            for k in 1:obs_dim
-                acc += C[k, i] * λ[k] * C[k, j]
-            end
-            btd.H_diag[t][i, j] -= acc
-        end
-    end
-
-    return nothing
 end
 
 """
@@ -664,7 +475,7 @@ function smooth!(
     end
 
     build_hess! = (xcur) -> begin
-        _fill_hessian_blocks_poisson!(sws, lds, xcur)
+        Hessian!(sws, lds, y, xcur)
         _negate_blocks!(btd, tsteps)
         return nothing
     end
@@ -696,7 +507,7 @@ function smooth!(
         tol=tol,
     )
 
-    _fill_hessian_blocks_poisson!(sws, lds, x)
+    Hessian!(sws, lds, y, x)
     _negate_blocks!(btd, tsteps)
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
@@ -705,10 +516,12 @@ function smooth!(
 
     fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
 
-    # `block_tridiagonal_inverse_logdet!` blocks are symmetric in exact
-    # arithmetic but carry ~1e-12 asymmetry from the forward/back sweeps;
-    # matches `gaussian.jl:780`. Without this, the aggregator's
-    # `PDMat(copy(S0_sum))` can trip `ishermitian` downstream.
+    #=
+    `block_tridiagonal_inverse_logdet!` blocks are symmetric in exact
+    arithmetic but carry ~1e-12 asymmetry from the forward/back sweeps;
+    matches `gaussian.jl:780`. Without this, the aggregator's
+    `PDMat(copy(S0_sum))` can trip `ishermitian` downstream.
+    =#
     @views for i in 1:tsteps
         Symmetrize!(fs.p_smooth[:, :, i])
     end
@@ -842,11 +655,13 @@ function fit!(
     npool = Threads.maxthreadid()
     sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, T_max) for _ in 1:npool]
 
-    # Suf-based state-side M-step (mirrors the Gaussian TD fit path). Poisson
-    # has no inputs, so `latent_inputs` / `obs_inputs` are zero-row matrices. The const
-    # blocks (bias-row entries, obs_yy_const, …) are precomputed once; the
-    # `obs_*` blocks are written by the aggregator but unread by the Poisson
-    # M-step (emission stays LBFGS), which is a tiny constant overhead.
+    #=
+    Suf-based state-side M-step (mirrors the Gaussian TD fit path). Poisson
+    has no inputs, so `latent_inputs` / `obs_inputs` are zero-row matrices. The const
+    blocks (bias-row entries, obs_yy_const, …) are precomputed once; the
+    `obs_*` blocks are written by the aggregator but unread by the Poisson
+    M-step (emission stays LBFGS), which is a tiny constant overhead.
+    =#
     suf = _initialize_td_sufficient_statistics(T, plds, tsteps_per_trial)
     latent_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
     obs_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]

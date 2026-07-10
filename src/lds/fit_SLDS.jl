@@ -330,7 +330,7 @@ function Gradient!(
         neg_P0_inv = cc.x_t           # -P0^{-1}
 
         # t = 1: emission + prior, both weighted by w[k,1]
-        observationgradient!(tmp1, cc, obs_buf, x, y, 1, lds_k)
+        observation_gradient!(tmp1, cc, obs_buf, x, y, 1, lds_k)
         @. dxt = x[:, 1] - x0
         mul!(tmp3, neg_P0_inv, dxt)
         α = w[k, 1]
@@ -346,7 +346,7 @@ function Gradient!(
         # 2 .. T-1: emission + incoming factor at t (w[k,t]),
         # outgoing factor at t+1 (w[k,t+1])
         for t in 2:(Tsteps - 1)
-            observationgradient!(tmp1, cc, obs_buf, x, y, t, lds_k)
+            observation_gradient!(tmp1, cc, obs_buf, x, y, t, lds_k)
             _transition_residual!(dxt, x, t, lds_k)
             mul!(tmp3, neg_Q_inv, dxt)
             α = w[k, t]
@@ -358,7 +358,7 @@ function Gradient!(
         end
 
         # t = T: emission + incoming factor at T, weighted by w[k,T]
-        observationgradient!(tmp1, cc, obs_buf, x, y, Tsteps, lds_k)
+        observation_gradient!(tmp1, cc, obs_buf, x, y, Tsteps, lds_k)
         _transition_residual!(dxt, x, Tsteps, lds_k)
         mul!(tmp3, neg_Q_inv, dxt)
         α = w[k, Tsteps]
@@ -390,7 +390,7 @@ function Hessian_blocks!(
     x::AbstractMatrix{T},
     w::AbstractMatrix{T},
 ) where {T<:Real}
-    latent_dim, Tsteps = size(x)
+    Tsteps = size(x, 2)
     K = length(slds.LDSs)
 
     H_diag = ws.btd.H_diag
@@ -422,31 +422,7 @@ function Hessian_blocks!(
         if Tsteps == 1
             α = w[k, 1]
             @. H_diag[1] += α * neg_P0_inv
-
-            if lds_k.obs_model isa GaussianObservationModel{T}
-                @. H_diag[1] += α * cc.yt_given_xt
-            elseif lds_k.obs_model isa PoissonObservationModel{T}
-                C = cc.C
-                d = cc.d  # cached Poisson log-link intercept
-
-                mul!(z, C, x[:, 1])
-                @. λ = exp(z + d)
-
-                for j in 1:latent_dim, i in 1:latent_dim
-                    acc = zero(T)
-                    for o in eachindex(λ)
-                        acc += C[o, i] * λ[o] * C[o, j]
-                    end
-                    H_diag[1][i, j] -= α * acc
-                end
-            else
-                throw(
-                    ArgumentError(
-                        "Unsupported observation model $(typeof(lds_k.obs_model))"
-                    ),
-                )
-            end
-
+            observation_hessian!(H_diag[1], cc, z, λ, x, y, 1, lds_k, α)
             continue
         end
 
@@ -473,35 +449,13 @@ function Hessian_blocks!(
         # - At t=T: current-role from factor at T weighted by w[k,T]
         @. H_diag[Tsteps] += w[k, Tsteps] * neg_Q_inv
 
-        # Emission curvature contributions
-        if lds_k.obs_model isa GaussianObservationModel{T}
-            for t in 1:Tsteps
-                @. H_diag[t] += w[k, t] * cc.yt_given_xt   # -C'R^{-1}C
-            end
-
-        elseif lds_k.obs_model isa PoissonObservationModel{T}
-            C = cc.C
-            d = cc.d  # cached Poisson log-link intercept
-
-            # Add -w[k,t] * C' diag(λ_t) C where λ_t = exp(C x_t + d)
-            # This implementation is allocation-free but O(latent^2 * obs) per time. Fix later.
-            for t in 1:Tsteps
-                α = w[k, t]
-
-                mul!(z, C, x[:, t])
-                @. λ = exp(z + d)
-
-                for j in 1:latent_dim, i in 1:latent_dim
-                    acc = zero(T)
-                    for o in eachindex(λ)
-                        acc += C[o, i] * λ[o] * C[o, j]
-                    end
-                    H_diag[t][i, j] -= α * acc
-                end
-            end
-
-        else
-            throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))
+        #=
+        Emission curvature contributions, weighted by w[k,t]. Shared kernel;
+        dispatches on the observation model (Gaussian: cached -C'R⁻¹C,
+        Poisson: -C' diag(λ_t) C with λ_t = exp(C x_t + d)).
+        =#
+        for t in 1:Tsteps
+            observation_hessian!(H_diag[t], cc, z, λ, x, y, t, lds_k, w[k, t])
         end
     end
 
@@ -824,9 +778,11 @@ function elbo!(
             trial_elbo += w[k, 1] * log(slds.πₖ[k] + T(1e-12))
         end
 
-        # log p(z_t | z_{t-1}) = sum_t sum_{i,j} ξ[t][i,j] * log A[i,j].
-        # ξ is indexed by global timestep; the last entry of each trial (ξ[t2]) is zero
-        # by FB convention so we iterate t1..t2-1.
+        #=
+        log p(z_t | z_{t-1}) = sum_t sum_{i,j} ξ[t][i,j] * log A[i,j].
+        ξ is indexed by global timestep; the last entry of each trial (ξ[t2]) is zero
+        by FB convention so we iterate t1..t2-1.
+        =#
         for t in t1:(t2 - 1)
             ξt = fb_storage.ξ[t]
             for i in 1:K, j in 1:K
@@ -903,10 +859,12 @@ function mstep!(
             update_initial_state_covariance!(lds_k, suf, sws)
             update_A_b!(lds_k, suf, sws)
             update_Q!(lds_k, suf, sws)
-            # SLDS owns a single sws (not a pool); wrap as a singleton so
-            # `update_observation_model!`'s threaded gradient path runs
-            # serially. SLDS Poisson is a niche path; the threading
-            # overhead isn't a meaningful win here.
+            #=
+            SLDS owns a single sws (not a pool); wrap as a singleton so
+            `update_observation_model!`'s threaded gradient path runs
+            serially. SLDS Poisson is a niche path; the threading
+            overhead isn't a meaningful win here.
+            =#
             update_observation_model!(lds_k, tfs, y, [sws], weights)
         else
             throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))
@@ -1003,15 +961,7 @@ function fit!(
         mstep!(slds, tfs, fb_storage, dl, y, sws; obs_inputs=obs_inputs, seq_ends=seq_ends)
         refresh_slds_constants!(slds_ws, slds)
 
-        # print progress
         prog !== nothing && next!(prog)
-
-        # check convergence
-        # if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
-        #     prog !== nothing && finish!(prog)
-        #     resize!(elbos, iter)
-        #     return elbos
-        # end
     end
 
     if prog !== nothing

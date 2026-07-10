@@ -1,12 +1,15 @@
 #=============================================================================
 Continuous (Linear Gaussian) latents
 
-    Log-Likelihood kernels: stateloglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
-                            observationloglikelihood!(cc, b1, b2, x, y, t, lds[, uy])
+    Log-Likelihood kernels: state_loglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
+                            observation_loglikelihood!(cc, b1, b2, x, y, t, lds[, uy])
                             joint_loglikelihood!(ll, ws, cc, lds, x, y)
 
-    Gradient kernels:       observationgradient!(out, cc, buf, x, y, t, lds[, uy])
+    Gradient kernels:       observation_gradient!(out, cc, buf, x, y, t, lds[, uy])
                             Gradient!(grad, ws, lds, y, x[, ux, uy])
+
+    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, x, y, t, lds[, α])
+                            Hessian!(sws, lds, y, x)
 
     E-Step: Q_state!(sws, lds, suf)
 
@@ -73,7 +76,7 @@ include the `B u_{t-1}` term; `nothing` (default) skips it. Requires `t ≥ 2`.
 end
 
 """
-    stateloglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
+    state_loglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
 
 State-model (prior/transition) contribution to the complete-data log-likelihood
 at timestep `t`:
@@ -86,7 +89,7 @@ normalizers; `dxt` and `tmp` are `latent_dim` scratch vectors (overwritten).
 Pass `ux` (state inputs, `t`-indexed like `x`) to include the `B u_{t-1}`
 term; `nothing` (default) or a zero-row matrix skips it.
 """
-function stateloglikelihood!(
+function state_loglikelihood!(
     cc::LDSLikelihoodCache{T},
     dxt::AbstractVector{T},
     tmp::AbstractVector{T},
@@ -107,7 +110,7 @@ function stateloglikelihood!(
 end
 
 """
-    observationloglikelihood!(cc, buf1, buf2, x, y, t, lds[, uy])
+    observation_loglikelihood!(cc, buf1, buf2, x, y, t, lds[, uy])
 
 Emission-model contribution `log p(y_t | x_t)` to the complete-data
 log-likelihood at timestep `t`. Dispatches on the observation model type `O`
@@ -121,7 +124,7 @@ into `joint_loglikelihood!` by adding a method here.
 - `uy` (optional): observation inputs, `t`-indexed like `y`; `nothing` or a
   zero-row matrix skips the `D u_t` term.
 """
-function observationloglikelihood! end
+function observation_loglikelihood! end
 
 """
     joint_loglikelihood!(ll, ws, cc, lds, x, y)
@@ -129,7 +132,7 @@ function observationloglikelihood! end
 Per-timestep complete-data log-likelihood for a single SLDS component:
 `ll[t] = log p(y_t | x_t) + log p(x_t | x_{t-1})` (or `+ log p(x_1)` at
 `t == 1`). Generic over the observation model — the emission term comes from
-`observationloglikelihood!`.
+`observation_loglikelihood!`.
 
 Notes:
 - Normalization terms (logdet + log(2π)) are included. These are constant w.r.t.
@@ -151,8 +154,8 @@ function joint_loglikelihood!(
     tmp = ws.tmp1
 
     for t in 1:tsteps
-        ll_t = observationloglikelihood!(cc, ws.z, ws.λ, x, y, t, lds)
-        ll_t += stateloglikelihood!(cc, dxt, tmp, x, t, lds)
+        ll_t = observation_loglikelihood!(cc, ws.z, ws.λ, x, y, t, lds)
+        ll_t += state_loglikelihood!(cc, dxt, tmp, x, t, lds)
         ll[t] = ll_t
     end
 
@@ -160,7 +163,7 @@ function joint_loglikelihood!(
 end
 
 """
-    observationgradient!(out, cc, buf, x, y, t, lds[, uy])
+    observation_gradient!(out, cc, buf, x, y, t, lds[, uy])
 
 Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
 (length `latent_dim`). Dispatches on the observation model type `O` (via
@@ -173,7 +176,7 @@ Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
 - `uy` (optional): observation inputs, `t`-indexed like `y`; `nothing` or a
   zero-row matrix skips the `D u_t` term.
 """
-function observationgradient! end
+function observation_gradient! end
 
 """
     Gradient!(grad, ws, lds, y, x[, ux, uy])
@@ -182,7 +185,7 @@ function observationgradient! end
 Gradient of the complete-data log-likelihood with respect to the latent path
 `x`, written into `grad` (`latent_dim × tsteps`; the convenience form uses the
 active view of `ws.grad_buf` and returns it). Generic over the observation
-model — the emission term comes from `observationgradient!`, while the state
+model — the emission term comes from `observation_gradient!`, while the state
 side (prior / incoming / outgoing transition factors) is shared:
 
 - `grad[:, t] = obs_grad(t) + A'Q⁻¹ r_{t+1} - Q⁻¹ r_t`   (middle steps)
@@ -215,7 +218,7 @@ function Gradient!(
     tmp3 = ws.tmp3
 
     # First time step: emission + prior + outgoing factor at t = 2
-    observationgradient!(tmp1, ws, obs_buf, x, y, 1, lds, uy)
+    observation_gradient!(tmp1, ws, obs_buf, x, y, 1, lds, uy)
     @views dxt .= x[:, 1] .- lds.state_model.x0
     mul!(tmp3, neg_P0_inv, dxt)
     _transition_residual!(dxt_next, x, 2, lds, ux)
@@ -224,7 +227,7 @@ function Gradient!(
 
     # Middle steps: emission + incoming factor at t + outgoing factor at t + 1
     @views for t in 2:(tsteps - 1)
-        observationgradient!(tmp1, ws, obs_buf, x, y, t, lds, uy)
+        observation_gradient!(tmp1, ws, obs_buf, x, y, t, lds, uy)
         _transition_residual!(dxt, x, t, lds, ux)
         mul!(tmp3, neg_Q_inv, dxt)
         _transition_residual!(dxt_next, x, t + 1, lds, ux)
@@ -233,7 +236,7 @@ function Gradient!(
     end
 
     # Last time step: emission + incoming factor at t = T
-    observationgradient!(tmp1, ws, obs_buf, x, y, tsteps, lds, uy)
+    observation_gradient!(tmp1, ws, obs_buf, x, y, tsteps, lds, uy)
     _transition_residual!(dxt, x, tsteps, lds, ux)
     mul!(tmp3, neg_Q_inv, dxt)
     @views grad[:, tsteps] .= tmp1 .+ tmp3
@@ -251,6 +254,98 @@ function Gradient!(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     grad = view(ws.grad_buf, :, 1:size(x, 2))
     return Gradient!(grad, ws, lds, y, x, ux, uy)
+end
+
+"""
+    observation_hessian!(out, cc, buf1, buf2, x, y, t, lds[, α])
+
+Emission-model contribution `∂² log p(y_t | x_t) / ∂x_t²` **accumulated** into
+`out` (`latent_dim × latent_dim`) with weight `α`: `out .+= α .* hess_t`. The
+add-with-weight semantics let the same kernel serve both the single-LDS
+`Hessian!` (α = 1, `out` pre-filled with the state-side block) and the SLDS
+`Hessian_blocks!` (α = w[k,t], accumulating across mixture components).
+
+Dispatches on the observation model type `O` (via
+`lds::LinearDynamicalSystem{T,S,O}`) — the curvature companion to
+`observation_gradient!`: a custom observation model plugs into `Hessian!` (and
+the SLDS `Hessian_blocks!`) by adding a method here, without touching the
+shared state-side Hessian blocks.
+
+Uniform interface:
+- `cc`: an [`LDSLikelihoodCache`](@ref) with Cholesky-derived templates
+  (Gaussian uses the cached `yt_given_xt = -C'R⁻¹C`; Poisson ignores it).
+- `buf1`, `buf2`: two `obs_dim` scratch vectors (overwritten); each model uses
+  what it needs (Gaussian: none; Poisson: linear predictor + rate).
+- `y` is unused by the built-in models (Gaussian/Poisson-canonical curvature is
+  observation-independent) but part of the interface for models whose curvature
+  depends on `y`.
+
+See the `GaussianObservationModel` / `PoissonObservationModel` methods in
+`fit_LDS.jl` / `fit_PLDS.jl` for the pattern to follow.
+"""
+function observation_hessian! end
+
+"""
+    _state_hessian_blocks!(btd, cc, tsteps)
+
+Write the state-side (prior/transition) Hessian blocks — identical for every
+observation model — into `btd.H_diag` / `H_sub` / `H_super`:
+
+- `H_sub[i] = Q⁻¹A`, `H_super[i] = (Q⁻¹A)'` for all i
+- `H_diag[1] = -A'Q⁻¹A - P0⁻¹`
+- `H_diag[t] = -A'Q⁻¹A - Q⁻¹` (middle), `H_diag[T] = -Q⁻¹`
+
+Uses the templates cached on `cc` by `compute_smooth_constants!` /
+`compute_slds_constants!`. Overwrites the diagonal blocks — callers add the
+emission curvature afterwards via `observation_hessian!`. Requires `tsteps ≥ 2`
+(matching the Newton smoother's contract).
+"""
+function _state_hessian_blocks!(btd, cc::LDSLikelihoodCache{T}, tsteps::Int) where {T<:Real}
+    for i in 1:(tsteps - 1)
+        copyto!(btd.H_sub[i], cc.H_sub_entry)
+        copyto!(btd.H_super[i], cc.H_super_entry)
+    end
+
+    btd.H_diag[1] .= cc.xt1_given_xt .+ cc.x_t
+    for t in 2:(tsteps - 1)
+        btd.H_diag[t] .= cc.xt1_given_xt .+ cc.xt_given_xt_1
+    end
+    btd.H_diag[tsteps] .= cc.xt_given_xt_1
+
+    return nothing
+end
+
+"""
+    Hessian!(sws, lds, y, x)
+
+Fill `sws.btd.H_diag`, `H_sub`, `H_super` with the complete-data log-likelihood
+Hessian blocks w.r.t. the latent path (length derived from `size(y, 2)`).
+Returns nothing — the sparse form is **not** built here because the Newton
+solver consumes blocks directly. Workspace buffers may be sized for a longer
+trial; only the first `tsteps` blocks are written, which keeps this hot path
+safe for ragged-length fitting.
+
+Generic over the observation model — the state-side blocks come from
+`_state_hessian_blocks!` and the emission curvature from
+`observation_hessian!`, so supporting a new observation model here only
+requires a new `observation_hessian!` method, not a new `Hessian!` method.
+Requires `compute_smooth_constants!(sws, lds)` to have been called.
+"""
+function Hessian!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    y::AbstractMatrix{T},
+    x::AbstractMatrix{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    tsteps = size(y, 2)
+    btd = sws.btd
+
+    _state_hessian_blocks!(btd, sws, tsteps)
+    for t in 1:tsteps
+        observation_hessian!(btd.H_diag[t], sws, sws.rho_obs, sws.h_obs, x, y, t, lds)
+    end
+
+    return nothing
 end
 
 """
@@ -311,9 +406,11 @@ function Q_state!(
     fill!(sum_mu_t, zero(T))
     fill!(sum_mu_tm1, zero(T))
 
-    # Input-specific accumulators (only allocated when ux_dim > 0). Allocating
-    # 0-element arrays here would still cost an `Array` struct each call,
-    # which adds up to thousands of trivial allocations across a fit.
+    #=
+    Input-specific accumulators (only allocated when ux_dim > 0). Allocating
+    0-element arrays here would still cost an `Array` struct each call,
+    which adds up to thousands of trivial allocations across a fit.
+    =#
     has_input = ux_dim > 0
     sum_u = has_input ? zeros(T, ux_dim) : Vector{T}()
     sum_mu_t_u = has_input ? zeros(T, D, ux_dim) : Matrix{T}(undef, 0, 0)
@@ -352,9 +449,11 @@ function Q_state!(
     mul!(temp, b, ws.tmp1', one(T), one(T))
     mul!(temp, b, b', T(tstep - 1), one(T))
 
-    # Input cross terms (`Bu_{t-1} := B u_{t-1}`). All terms here are
-    # contributions to `Σ_t E[(x_t - A x_{t-1} - b - B u_{t-1})(...)']` that
-    # involve at least one `B u_{t-1}` factor.
+    #=
+    Input cross terms (`Bu_{t-1} := B u_{t-1}`). All terms here are
+    contributions to `Σ_t E[(x_t - A x_{t-1} - b - B u_{t-1})(...)']` that
+    involve at least one `B u_{t-1}` factor.
+    =#
     if ux_dim > 0
         # -= sum_mu_t_u · B'  and  -= B · sum_mu_t_u'
         mul!(temp, sum_mu_t_u, B', -one(T), one(T))
@@ -522,10 +621,12 @@ function update_A_b!(
     AB_prior = lds.state_model.AB_prior
 
     if AB_prior === nothing
-        # Zero-alloc OLS fast path. `sws.Sxz` is exactly (D × dyn_reg_dim);
-        # its transpose is the (dyn_reg_dim × D) view we ldiv! into. After
-        # the in-place solve, `sws.Sxz` itself holds the transposed solution
-        # `transpose(dyn_xx \ dyn_xy)` = the W = [A b B] regression matrix.
+        #=
+        Zero-alloc OLS fast path. `sws.Sxz` is exactly (D × dyn_reg_dim);
+        its transpose is the (dyn_reg_dim × D) view we ldiv! into. After
+        the in-place solve, `sws.Sxz` itself holds the transposed solution
+        `transpose(dyn_xx \ dyn_xy)` = the W = [A b B] regression matrix.
+        =#
         Sxz_T = transpose(sws.Sxz)
         copyto!(Sxz_T, suf.dyn_xy)
         ldiv!(suf.dyn_xx[].chol, Sxz_T)
@@ -566,21 +667,25 @@ function update_Q!(
     copyto!(S_res, suf.dyn_yy[].mat)
     S_res .-= Wxy
     S_res .-= Wxy'
-    # In-place X_A_Xt = W · dyn_xx · W'. Mimic PDMats' X_A_Xt: compute
-    # `WL = W · L` (where dyn_xx = L·L' via the cached Cholesky) and add
-    # `WL · WL'` to the upper triangle of S_res via a symmetric rank-k
-    # BLAS call, then reflect upper → lower so the matrix is EXACTLY
-    # symmetric and positive-semidefinite by construction. (`mul!(S_res,
-    # WL, WL', 1, 1)` followed by `Symmetrize!` is *not* equivalent —
-    # BLAS gemm can produce 1-ULP-asymmetric output, and averaging then
-    # halves the off-diagonal X_A_Xt contribution.)
+    #=
+    In-place X_A_Xt = W · dyn_xx · W'. Mimic PDMats' X_A_Xt: compute
+    `WL = W · L` (where dyn_xx = L·L' via the cached Cholesky) and add
+    `WL · WL'` to the upper triangle of S_res via a symmetric rank-k
+    BLAS call, then reflect upper → lower so the matrix is EXACTLY
+    symmetric and positive-semidefinite by construction. (`mul!(S_res,
+    WL, WL', 1, 1)` followed by `Symmetrize!` is *not* equivalent —
+    BLAS gemm can produce 1-ULP-asymmetric output, and averaging then
+    halves the off-diagonal X_A_Xt contribution.)
+    =#
     WL = sws.Sxz                               # (D × dyn_reg_dim) scratch
-    # WL = W · L where L is the lower-triangular Cholesky factor of
-    # dyn_xx. PDMats stores the *upper* factor U in `.chol.factors`
-    # (uplo='U'); L = U', so the equivalent BLAS call is
-    # `trmm!(…, 'U', 'T', …)` on the raw factor matrix. This avoids
-    # the per-call `LowerTriangular(...)` wrapper that
-    # `mul!(WL, W, chol.L)` would allocate.
+    #=
+    WL = W · L where L is the lower-triangular Cholesky factor of
+    dyn_xx. PDMats stores the *upper* factor U in `.chol.factors`
+    (uplo='U'); L = U', so the equivalent BLAS call is
+    `trmm!(…, 'U', 'T', …)` on the raw factor matrix. This avoids
+    the per-call `LowerTriangular(...)` wrapper that
+    `mul!(WL, W, chol.L)` would allocate.
+    =#
     copyto!(WL, W)
     BLAS.trmm!('R', 'U', 'T', 'N', one(T), suf.dyn_xx[].chol.factors, WL)
     mul!(S_res, WL, transpose(WL), one(T), one(T))
@@ -591,10 +696,12 @@ function update_Q!(
         Wm = W .- AB_prior.M₀
         S_res .+= Wm * AB_prior.Λ * Wm'
     end
-    # Reflect upper → lower so the matrix is exactly symmetric. (`mul!`
-    # of `WL · WL'` above can give 1-ULP-asymmetric output; mirroring
-    # the upper triangle wins back exact symmetry and preserves the
-    # mathematically-PSD upper values.)
+    #=
+    Reflect upper → lower so the matrix is exactly symmetric. (`mul!`
+    of `WL · WL'` above can give 1-ULP-asymmetric output; mirroring
+    the upper triangle wins back exact symmetry and preserves the
+    mathematically-PSD upper values.)
+    =#
     for j in 2:D, i in 1:(j - 1)
         S_res[j, i] = S_res[i, j]
     end
@@ -603,11 +710,13 @@ function update_Q!(
     if Q_prior === nothing
         S_res ./= T(suf.dyn_n)
     else
-        # iw_map(Ψ, ν, S, N, d) = (Ψ + S) / (ν + N + d + 1), inlined to
-        # avoid a fresh `(Ψ .+ S)` matrix. `Ψ` is `AbstractMatrix` at the
-        # type level (IWPrior{T,M<:AbstractMatrix} doesn't pin M on the
-        # `state_model.Q_prior` field), so we assert the concrete type
-        # locally to keep the loop type-stable.
+        #=
+        iw_map(Ψ, ν, S, N, d) = (Ψ + S) / (ν + N + d + 1), inlined to
+        avoid a fresh `(Ψ .+ S)` matrix. `Ψ` is `AbstractMatrix` at the
+        type level (IWPrior{T,M<:AbstractMatrix} doesn't pin M on the
+        `state_model.Q_prior` field), so we assert the concrete type
+        locally to keep the loop type-stable.
+        =#
         denom = Q_prior.ν + T(suf.dyn_n) + T(D + 1)
         Ψ = Q_prior.Ψ::Matrix{T}
         for i in eachindex(S_res)
