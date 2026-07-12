@@ -1,15 +1,15 @@
 #=============================================================================
 Continuous (Linear Gaussian) latents
 
-    Log-Likelihood kernels: state_loglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
-                            observation_loglikelihood!(cc, b1, b2, x, y, t, lds[, uy])
-                            joint_loglikelihood!(ll, ws, cc, lds, x, y)
+    Log-Likelihood kernels: state_loglikelihood!(cc, dxt, tmp, lds, x, t[, ux])
+                            observation_loglikelihood!(cc, b1, b2, lds, x, y, t[, uy])
+                            joint_loglikelihood!(ll, ws, cc, lds, x, y[, ux, uy])
 
-    Gradient kernels:       observation_gradient!(out, cc, buf, x, y, t, lds[, uy])
-                            Gradient!(grad, ws, lds, y, x[, ux, uy])
+    Gradient kernels:       observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+                            gradient!(grad, ws, lds, x, y[, ux, uy])
 
-    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, x, y, t, lds[, α])
-                            Hessian!(sws, lds, y, x)
+    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
+                            hessian!(sws, lds, x, y)
 
     E-Step: Q_state!(sws, lds, suf)
 
@@ -18,26 +18,6 @@ Continuous (Linear Gaussian) latents
             update_A_b!(lds, suf, sws)
             update_Q!(lds, suf, sws)
 =============================================================================#
-
-"""
-    LDSLikelihoodCache{T}
-
-Any container of Cholesky-wrapped covariances (`Q_PD` / `P0_PD` / `R_PD`) and
-cached log-likelihood normalizers (`cP0` / `cQ` / `cR`) that the likelihood
-kernels can consume: a per-trial `SmoothWorkspace` (filled by
-`compute_smooth_constants!`) or a per-SLDS-component `LDSConstantCache`
-(filled by `compute_slds_constants!`).
-"""
-const LDSLikelihoodCache{T} = Union{LDSConstantCache{T},SmoothWorkspace{T}}
-
-# Normalizer accessors — `LDSConstantCache` stores plain scalars (mutable
-# struct), `SmoothWorkspace` stores RefValues (immutable struct).
-_cP0(cc::LDSConstantCache) = cc.cP0
-_cQ(cc::LDSConstantCache) = cc.cQ
-_cR(cc::LDSConstantCache) = cc.cR
-_cP0(ws::SmoothWorkspace) = ws.cP0[]
-_cQ(ws::SmoothWorkspace) = ws.cQ[]
-_cR(ws::SmoothWorkspace) = ws.cR[]
 
 # In-place whitening solve `v := U⁻ᵀ v` against a Cholesky Σ = U'U, so that
 # `sum(abs2, v)` afterwards is the quadratic form `v'Σ⁻¹v`. 
@@ -54,7 +34,7 @@ end
 _whiten!(chol::Cholesky, v::AbstractVector) = ldiv!(chol.U', v)
 
 """
-    _transition_residual!(out, x, t, lds[, ux])
+    _transition_residual!(out, lds, x, t[, ux])
 
 Write the dynamics residual `x_t - A x_{t-1} - b - B u_{t-1}` into `out`
 (length `latent_dim`). Pass `ux` (state inputs, `t`-indexed like `x`) to
@@ -62,9 +42,9 @@ include the `B u_{t-1}` term; `nothing` (default) skips it. Requires `t ≥ 2`.
 """
 @inline function _transition_residual!(
     out::AbstractVector{T},
+    lds::LinearDynamicalSystem,
     x::AbstractMatrix{T},
     t::Int,
-    lds::LinearDynamicalSystem,
     ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
     @views mul!(out, lds.state_model.A, x[:, t - 1])
@@ -76,7 +56,7 @@ include the `B u_{t-1}` term; `nothing` (default) skips it. Requires `t ≥ 2`.
 end
 
 """
-    state_loglikelihood!(cc, dxt, tmp, x, t, lds[, ux])
+    state_loglikelihood!(cc, dxt, tmp, lds, x, t[, ux])
 
 State-model (prior/transition) contribution to the complete-data log-likelihood
 at timestep `t`:
@@ -84,40 +64,40 @@ at timestep `t`:
 - `t == 1`: `cP0 - 0.5‖P0^{-1/2}(x_1 - x_0)‖²`
 - `t ≥ 2`:  `cQ - 0.5‖Q^{-1/2}(x_t - A x_{t-1} - b - B u_{t-1})‖²`
 
-`cc` is an [`LDSLikelihoodCache`](@ref) holding the Cholesky factors and
+`cc` is a [`SmoothConstants`](@ref) holding the Cholesky factors and
 normalizers; `dxt` and `tmp` are `latent_dim` scratch vectors (overwritten).
 Pass `ux` (state inputs, `t`-indexed like `x`) to include the `B u_{t-1}`
 term; `nothing` (default) or a zero-row matrix skips it.
 """
 function state_loglikelihood!(
-    cc::LDSLikelihoodCache{T},
+    cc::SmoothConstants{T},
     dxt::AbstractVector{T},
     tmp::AbstractVector{T},
+    lds::LinearDynamicalSystem{T0,S,O},
     x::AbstractMatrix{T},
     t::Int,
-    lds::LinearDynamicalSystem{T0,S,O},
     ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:AbstractObservationModel{T0}}
     if t == 1
         @views dxt .= x[:, 1] .- lds.state_model.x0
-        _whiten!(cc.P0_PD[].chol, dxt)
-        return _cP0(cc) - T(0.5) * sum(abs2, dxt)
+        _whiten!(cc.P0_PD.chol, dxt)
+        return cc.cP0 - T(0.5) * sum(abs2, dxt)
     else
-        _transition_residual!(tmp, x, t, lds, ux)
-        _whiten!(cc.Q_PD[].chol, tmp)
-        return _cQ(cc) - T(0.5) * sum(abs2, tmp)
+        _transition_residual!(tmp, lds, x, t, ux)
+        _whiten!(cc.Q_PD.chol, tmp)
+        return cc.cQ - T(0.5) * sum(abs2, tmp)
     end
 end
 
 """
-    observation_loglikelihood!(cc, buf1, buf2, x, y, t, lds[, uy])
+    observation_loglikelihood!(cc, buf1, buf2, lds, x, y, t[, uy])
 
 Emission-model contribution `log p(y_t | x_t)` to the complete-data
 log-likelihood at timestep `t`. Dispatches on the observation model type `O`
 (via `lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs
 into `joint_loglikelihood!` by adding a method here.
 
-- `cc`: an [`LDSLikelihoodCache`](@ref) with Cholesky factors / normalizers
+- `cc`: a [`SmoothConstants`](@ref) with Cholesky factors / normalizers
   (unused by models whose emission term needs no covariance, e.g. Poisson).
 - `buf1`, `buf2`: two `obs_dim` scratch vectors (overwritten); each model uses
   what it needs (Gaussian: residual; Poisson: linear predictor + rate).
@@ -127,12 +107,16 @@ into `joint_loglikelihood!` by adding a method here.
 function observation_loglikelihood! end
 
 """
-    joint_loglikelihood!(ll, ws, cc, lds, x, y)
+    joint_loglikelihood!(ll, ws, cc, lds, x, y[, ux, uy])
 
-Per-timestep complete-data log-likelihood for a single SLDS component:
+Per-timestep complete-data log-likelihood of one LDS, written into `ll`:
 `ll[t] = log p(y_t | x_t) + log p(x_t | x_{t-1})` (or `+ log p(x_1)` at
 `t == 1`). Generic over the observation model — the emission term comes from
-`observation_loglikelihood!`.
+`observation_loglikelihood!` — and over the workspace: the single-LDS path
+passes a `SmoothWorkspace`, the SLDS path a `SLDSSmoothWorkspace` (with `cc`
+the component's `SmoothConstants`), both consuming the shared `NewtonBuffers`
+scratch in `ws.opt`. `ux` / `uy` are optional control inputs (`nothing` or
+zero-row matrices skip the `B u` / `D uy` terms).
 
 Notes:
 - Normalization terms (logdet + log(2π)) are included. These are constant w.r.t.
@@ -141,21 +125,24 @@ Notes:
 """
 function joint_loglikelihood!(
     ll::AbstractVector{T},
-    ws::SLDSSmoothWorkspace{T},
-    cc::LDSConstantCache{T},
-    lds::LinearDynamicalSystem{T,S,O},
+    ws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    cc::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T0,S,O},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    y::AbstractMatrix{T0},
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:AbstractObservationModel{T0}}
     tsteps = size(y, 2)
     @assert length(ll) == tsteps
 
-    dxt = ws.dxt
-    tmp = ws.tmp1
+    opt = ws.opt
 
     for t in 1:tsteps
-        ll_t = observation_loglikelihood!(cc, ws.z, ws.λ, x, y, t, lds)
-        ll_t += state_loglikelihood!(cc, dxt, tmp, x, t, lds)
+        ll_t = observation_loglikelihood!(
+            cc, opt.temp_dy, opt.temp_solve_R, lds, x, y, t, uy
+        )
+        ll_t += state_loglikelihood!(cc, opt.temp_dx, opt.temp_solve_Q, lds, x, t, ux)
         ll[t] = ll_t
     end
 
@@ -163,14 +150,15 @@ function joint_loglikelihood!(
 end
 
 """
-    observation_gradient!(out, cc, buf, x, y, t, lds[, uy])
+    observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
 
 Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
 (length `latent_dim`). Dispatches on the observation model type `O` (via
 `lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs into
-`Gradient!` (and the SLDS weighted `Gradient!`) by adding a method here.
+`gradient!` (both the single-LDS and the SLDS weighted form) by adding a
+method here.
 
-- `cc`: an [`LDSLikelihoodCache`](@ref) with Cholesky-derived terms (Gaussian
+- `cc`: a [`SmoothConstants`](@ref) with Cholesky-derived terms (Gaussian
   uses the cached `C_inv_R = C'R⁻¹`; models without a covariance ignore it).
 - `buf`: one `obs_dim` scratch vector (overwritten).
 - `uy` (optional): observation inputs, `t`-indexed like `y`; `nothing` or a
@@ -179,12 +167,12 @@ Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
 function observation_gradient! end
 
 """
-    Gradient!(grad, ws, lds, y, x[, ux, uy])
-    Gradient!(ws, lds, y, x[, ux, uy])
+    gradient!(grad, ws, lds, x, y[, ux, uy])
+    gradient!(ws, lds, x, y[, ux, uy])
 
 Gradient of the complete-data log-likelihood with respect to the latent path
 `x`, written into `grad` (`latent_dim × tsteps`; the convenience form uses the
-active view of `ws.grad_buf` and returns it). Generic over the observation
+active view of `ws.opt.grad_buf` and returns it). Generic over the observation
 model — the emission term comes from `observation_gradient!`, while the state
 side (prior / incoming / outgoing transition factors) is shared:
 
@@ -195,84 +183,85 @@ side (prior / incoming / outgoing transition factors) is shared:
 with `r_t = x_t - A x_{t-1} - b - B u_{t-1}`. Uses the Cholesky-derived
 templates cached by `compute_smooth_constants!`; requires `tsteps ≥ 2`.
 """
-function Gradient!(
+function gradient!(
     grad::AbstractMatrix{T},
     ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
     x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
 
-    A_inv_Q = ws.A_inv_Q          # A'Q⁻¹
-    neg_P0_inv = ws.x_t           # -P0⁻¹
-    neg_Q_inv = ws.xt_given_xt_1  # -Q⁻¹
+    cc = ws.consts
+    A_inv_Q = cc.A_inv_Q          # A'Q⁻¹
+    neg_P0_inv = cc.x_t           # -P0⁻¹
+    neg_Q_inv = cc.xt_given_xt_1  # -Q⁻¹
 
-    dxt = ws.dxt
-    dxt_next = ws.dxt_next
-    obs_buf = ws.dyt
-    tmp1 = ws.tmp1
-    tmp2 = ws.tmp2
-    tmp3 = ws.tmp3
+    dxt = ws.opt.dxt
+    dxt_next = ws.opt.dxt_next
+    obs_buf = ws.opt.dyt
+    tmp1 = ws.opt.tmp1
+    tmp2 = ws.opt.tmp2
+    tmp3 = ws.opt.tmp3
 
     # First time step: emission + prior + outgoing factor at t = 2
-    observation_gradient!(tmp1, ws, obs_buf, x, y, 1, lds, uy)
+    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, 1, uy)
     @views dxt .= x[:, 1] .- lds.state_model.x0
     mul!(tmp3, neg_P0_inv, dxt)
-    _transition_residual!(dxt_next, x, 2, lds, ux)
+    _transition_residual!(dxt_next, lds, x, 2, ux)
     mul!(tmp2, A_inv_Q, dxt_next)
     @views grad[:, 1] .= tmp1 .+ tmp2 .+ tmp3
 
     # Middle steps: emission + incoming factor at t + outgoing factor at t + 1
     @views for t in 2:(tsteps - 1)
-        observation_gradient!(tmp1, ws, obs_buf, x, y, t, lds, uy)
-        _transition_residual!(dxt, x, t, lds, ux)
+        observation_gradient!(tmp1, cc, obs_buf, lds, x, y, t, uy)
+        _transition_residual!(dxt, lds, x, t, ux)
         mul!(tmp3, neg_Q_inv, dxt)
-        _transition_residual!(dxt_next, x, t + 1, lds, ux)
+        _transition_residual!(dxt_next, lds, x, t + 1, ux)
         mul!(tmp2, A_inv_Q, dxt_next)
         grad[:, t] .= tmp1 .+ tmp3 .+ tmp2
     end
 
     # Last time step: emission + incoming factor at t = T
-    observation_gradient!(tmp1, ws, obs_buf, x, y, tsteps, lds, uy)
-    _transition_residual!(dxt, x, tsteps, lds, ux)
+    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, tsteps, uy)
+    _transition_residual!(dxt, lds, x, tsteps, ux)
     mul!(tmp3, neg_Q_inv, dxt)
     @views grad[:, tsteps] .= tmp1 .+ tmp3
 
     return grad
 end
 
-function Gradient!(
+function gradient!(
     ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
     x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    grad = view(ws.grad_buf, :, 1:size(x, 2))
-    return Gradient!(grad, ws, lds, y, x, ux, uy)
+    grad = view(ws.opt.grad_buf, :, 1:size(x, 2))
+    return gradient!(grad, ws, lds, x, y, ux, uy)
 end
 
 """
-    observation_hessian!(out, cc, buf1, buf2, x, y, t, lds[, α])
+    observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
 
 Emission-model contribution `∂² log p(y_t | x_t) / ∂x_t²` **accumulated** into
 `out` (`latent_dim × latent_dim`) with weight `α`: `out .+= α .* hess_t`. The
 add-with-weight semantics let the same kernel serve both the single-LDS
-`Hessian!` (α = 1, `out` pre-filled with the state-side block) and the SLDS
-`Hessian_blocks!` (α = w[k,t], accumulating across mixture components).
+`hessian!` (α = 1, `out` pre-filled with the state-side block) and the SLDS
+`hessian!` (α = w[k,t], accumulating across mixture components).
 
 Dispatches on the observation model type `O` (via
 `lds::LinearDynamicalSystem{T,S,O}`) — the curvature companion to
-`observation_gradient!`: a custom observation model plugs into `Hessian!` (and
-the SLDS `Hessian_blocks!`) by adding a method here, without touching the
-shared state-side Hessian blocks.
+`observation_gradient!`: a custom observation model plugs into both `hessian!`
+forms by adding a method here, without touching the shared state-side Hessian
+blocks.
 
 Uniform interface:
-- `cc`: an [`LDSLikelihoodCache`](@ref) with Cholesky-derived templates
+- `cc`: a [`SmoothConstants`](@ref) with Cholesky-derived templates
   (Gaussian uses the cached `yt_given_xt = -C'R⁻¹C`; Poisson ignores it).
 - `buf1`, `buf2`: two `obs_dim` scratch vectors (overwritten); each model uses
   what it needs (Gaussian: none; Poisson: linear predictor + rate).
@@ -281,7 +270,8 @@ Uniform interface:
   depends on `y`.
 
 See the `GaussianObservationModel` / `PoissonObservationModel` methods in
-`fit_LDS.jl` / `fit_PLDS.jl` for the pattern to follow.
+`gaussian_observations.jl` / `poisson_observations.jl` for the pattern to
+follow.
 """
 function observation_hessian! end
 
@@ -295,12 +285,12 @@ observation model — into `btd.H_diag` / `H_sub` / `H_super`:
 - `H_diag[1] = -A'Q⁻¹A - P0⁻¹`
 - `H_diag[t] = -A'Q⁻¹A - Q⁻¹` (middle), `H_diag[T] = -Q⁻¹`
 
-Uses the templates cached on `cc` by `compute_smooth_constants!` /
-`compute_slds_constants!`. Overwrites the diagonal blocks — callers add the
-emission curvature afterwards via `observation_hessian!`. Requires `tsteps ≥ 2`
-(matching the Newton smoother's contract).
+Uses the templates cached on `cc` by `compute_smooth_constants!`.
+Overwrites the diagonal blocks — callers add the emission curvature
+afterwards via `observation_hessian!`. Requires `tsteps ≥ 2` (matching the
+Newton smoother's contract).
 """
-function _state_hessian_blocks!(btd, cc::LDSLikelihoodCache{T}, tsteps::Int) where {T<:Real}
+function _state_hessian_blocks!(btd, cc::SmoothConstants{T}, tsteps::Int) where {T<:Real}
     for i in 1:(tsteps - 1)
         copyto!(btd.H_sub[i], cc.H_sub_entry)
         copyto!(btd.H_super[i], cc.H_super_entry)
@@ -316,7 +306,7 @@ function _state_hessian_blocks!(btd, cc::LDSLikelihoodCache{T}, tsteps::Int) whe
 end
 
 """
-    Hessian!(sws, lds, y, x)
+    hessian!(sws, lds, x, y)
 
 Fill `sws.btd.H_diag`, `H_sub`, `H_super` with the complete-data log-likelihood
 Hessian blocks w.r.t. the latent path (length derived from `size(y, 2)`).
@@ -328,21 +318,24 @@ safe for ragged-length fitting.
 Generic over the observation model — the state-side blocks come from
 `_state_hessian_blocks!` and the emission curvature from
 `observation_hessian!`, so supporting a new observation model here only
-requires a new `observation_hessian!` method, not a new `Hessian!` method.
+requires a new `observation_hessian!` method, not a new `hessian!` method.
 Requires `compute_smooth_constants!(sws, lds)` to have been called.
 """
-function Hessian!(
+function hessian!(
     sws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractMatrix{T},
     x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(y, 2)
     btd = sws.btd
+    cc = sws.consts
 
-    _state_hessian_blocks!(btd, sws, tsteps)
+    _state_hessian_blocks!(btd, cc, tsteps)
     for t in 1:tsteps
-        observation_hessian!(btd.H_diag[t], sws, sws.rho_obs, sws.h_obs, x, y, t, lds)
+        observation_hessian!(
+            btd.H_diag[t], cc, sws.elbo.rho_obs, sws.elbo.h_obs, lds, x, y, t
+        )
     end
 
     return nothing
@@ -373,19 +366,19 @@ function Q_state!(
     x0 = lds.state_model.x0
 
     # Use cached Cholesky factors (already computed by compute_smooth_constants!)
-    Q_U = ws.Q_PD[].chol.U
-    P0_U = ws.P0_PD[].chol.U
+    Q_U = ws.consts.Q_PD.chol.U
+    P0_U = ws.consts.P0_PD.chol.U
 
-    log_det_Q = logdet(ws.Q_PD[])
-    log_det_P0 = logdet(ws.P0_PD[])
+    log_det_Q = logdet(ws.consts.Q_PD)
+    log_det_P0 = logdet(ws.consts.P0_PD)
 
-    temp = ws.elbo_temp
-    sum_E_zz = ws.elbo_sum_E_zz
-    sum_E_zzm1 = ws.elbo_sum_E_zzm1
-    sum_E_cross = ws.elbo_sum_E_cross
-    sum_mu_t = ws.elbo_sum_mu_t
-    sum_mu_tm1 = ws.elbo_sum_mu_tm1
-    temp2 = ws.elbo_temp2
+    temp = ws.elbo.temp
+    sum_E_zz = ws.elbo.sum_E_zz
+    sum_E_zzm1 = ws.elbo.sum_E_zzm1
+    sum_E_cross = ws.elbo.sum_E_cross
+    sum_mu_t = ws.elbo.sum_mu_t
+    sum_mu_tm1 = ws.elbo.sum_mu_tm1
+    temp2 = ws.elbo.temp2
 
     # Initial-state part: temp = E_zz[:,:,1] - E_z[:,1]*x0' - x0*E_z[:,1]' + x0*x0'
     fill!(temp, zero(T))
@@ -444,9 +437,9 @@ function Q_state!(
     # Bias terms (b alone):
     mul!(temp, sum_mu_t, b', -one(T), one(T))
     mul!(temp, b, sum_mu_t', -one(T), one(T))
-    mul!(ws.tmp1, A, sum_mu_tm1)
-    mul!(temp, ws.tmp1, b', one(T), one(T))
-    mul!(temp, b, ws.tmp1', one(T), one(T))
+    mul!(ws.opt.tmp1, A, sum_mu_tm1)
+    mul!(temp, ws.opt.tmp1, b', one(T), one(T))
+    mul!(temp, b, ws.opt.tmp1', one(T), one(T))
     mul!(temp, b, b', T(tstep - 1), one(T))
 
     #=
@@ -513,11 +506,11 @@ function Q_state!(
     ux_dim = lds.state_input_dim
     dyn_reg_dim = D + 1 + ux_dim
 
-    Q_U = sws.Q_PD[].chol.U
-    P0_U = sws.P0_PD[].chol.U
+    Q_U = sws.consts.Q_PD.chol.U
+    P0_U = sws.consts.P0_PD.chol.U
 
-    log_det_Q = logdet(sws.Q_PD[])
-    log_det_P0 = logdet(sws.P0_PD[])
+    log_det_Q = logdet(sws.consts.Q_PD)
+    log_det_P0 = logdet(sws.consts.P0_PD)
 
     N = suf.init_n
     dyn_n = suf.dyn_n
@@ -527,7 +520,7 @@ function Q_state!(
     const_trans = T(dyn_n) * D * log2π
 
     # S_init = init_yy - μ x0' - x0 μ' + N x0 x0'    (μ = Σ x_init)
-    S_init = sws.elbo_temp
+    S_init = sws.elbo.temp
     copyto!(S_init, suf.init_yy[].mat)
     μ_sum = vec(suf.init_xy)
     BLAS.ger!(-one(T), μ_sum, x0, S_init)
@@ -539,19 +532,19 @@ function Q_state!(
     Q_val = T(-0.5) * (const_init + T(N) * log_det_P0 + tr(S_init))
 
     # W = [A b B] (D × dyn_reg_dim)
-    W = view(sws.AB, :, 1:dyn_reg_dim)
+    W = view(sws.reg.AB, :, 1:dyn_reg_dim)
     copyto!(view(W, :, 1:D), A)
     copyto!(view(W, :, D + 1), b)
     if ux_dim > 0
         copyto!(view(W, :, (D + 2):dyn_reg_dim), B)
     end
 
-    S_trans = sws.elbo_temp                 # reuse (S_init no longer needed)
+    S_trans = sws.elbo.temp                 # reuse (S_init no longer needed)
     copyto!(S_trans, suf.dyn_yy[].mat)
     mul!(S_trans, W, suf.dyn_xy, -one(T), one(T))
     mul!(S_trans, transpose(suf.dyn_xy), transpose(W), -one(T), one(T))
     # S_trans += W · dyn_xx · W'
-    W_XX = view(sws.Sxz, :, 1:dyn_reg_dim)
+    W_XX = view(sws.reg.Sxz, :, 1:dyn_reg_dim)
     mul!(W_XX, W, suf.dyn_xx[].mat)
     mul!(S_trans, W_XX, transpose(W), one(T), one(T))
 
@@ -582,7 +575,7 @@ function update_initial_state_covariance!(
     x0 = lds.state_model.x0
     N = suf.init_n
 
-    S0 = sws.S0_sum                                  # D × D scratch
+    S0 = sws.reg.S0_sum                              # D × D scratch
     copyto!(S0, suf.init_yy[].mat)
 
     # Rank-1 updates inline (BLAS.ger! would need a contiguous μ vector and
@@ -622,15 +615,15 @@ function update_A_b!(
 
     if AB_prior === nothing
         #=
-        Zero-alloc OLS fast path. `sws.Sxz` is exactly (D × dyn_reg_dim);
+        Zero-alloc OLS fast path. `sws.reg.Sxz` is exactly (D × dyn_reg_dim);
         its transpose is the (dyn_reg_dim × D) view we ldiv! into. After
-        the in-place solve, `sws.Sxz` itself holds the transposed solution
+        the in-place solve, `sws.reg.Sxz` itself holds the transposed solution
         `transpose(dyn_xx \ dyn_xy)` = the W = [A b B] regression matrix.
         =#
-        Sxz_T = transpose(sws.Sxz)
+        Sxz_T = transpose(sws.reg.Sxz)
         copyto!(Sxz_T, suf.dyn_xy)
         ldiv!(suf.dyn_xx[].chol, Sxz_T)
-        W = sws.Sxz
+        W = sws.reg.Sxz
     else
         # MN-prior MAP path — keep `mn_map` (allocates) for now.
         W = mn_map(suf.dyn_xx[], suf.dyn_xy, AB_prior)
@@ -651,8 +644,8 @@ function update_Q!(
     D = lds.latent_dim
     ux_dim = lds.state_input_dim
 
-    # sws.AB is exactly (D × dyn_reg_dim); no view needed.
-    W = sws.AB
+    # sws.reg.AB is exactly (D × dyn_reg_dim); no view needed.
+    W = sws.reg.AB
     copyto!(view(W, :, 1:D), lds.state_model.A)
     copyto!(view(W, :, D + 1), lds.state_model.b)
     if ux_dim > 0
@@ -660,10 +653,10 @@ function update_Q!(
     end
 
     # Residual scatter S = dyn_yy - W·dyn_xy - dyn_xy'·W' + W·dyn_xx·W'
-    Wxy = sws.elbo_temp                        # D × D scratch (free post-Q_state!)
+    Wxy = sws.elbo.temp                        # D × D scratch (free post-Q_state!)
     mul!(Wxy, W, suf.dyn_xy)
 
-    S_res = sws.Q_sum                          # D × D scratch
+    S_res = sws.reg.Q_sum                      # D × D scratch
     copyto!(S_res, suf.dyn_yy[].mat)
     S_res .-= Wxy
     S_res .-= Wxy'
@@ -677,7 +670,7 @@ function update_Q!(
     BLAS gemm can produce 1-ULP-asymmetric output, and averaging then
     halves the off-diagonal X_A_Xt contribution.)
     =#
-    WL = sws.Sxz                               # (D × dyn_reg_dim) scratch
+    WL = sws.reg.Sxz                           # (D × dyn_reg_dim) scratch
     #=
     WL = W · L where L is the lower-triangular Cholesky factor of
     dyn_xx. PDMats stores the *upper* factor U in `.chol.factors`

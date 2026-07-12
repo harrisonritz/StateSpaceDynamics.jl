@@ -1,13 +1,13 @@
 #=============================================================================
 Gaussian LDS
 
-    Log-Likelihood: joint_loglikelihood!(ws, x, lds, y)
+    Log-Likelihood: joint_loglikelihood!(ws, lds, x, y)
                     loglikelihood(lds, y)
 
-    Gradient:       Gradient!(ws, lds, y, x)
-                    Gradient_batched!(ws, lds, y, x, ux, uy)
+    Gradient:       gradient!(ws, lds, x, y)
+                    gradient_batched!(ws, lds, x, y, ux, uy)
 
-    Hessian:        (generic Hessian! lives in continuous_latents.jl;
+    Hessian:        (generic hessian! lives in continuous_latents.jl;
                     emission kernels in gaussian_observations.jl)
 
     Smooth:         smooth!(lds, fs, y, sws)
@@ -29,43 +29,37 @@ live in `common.jl`; sampling lives in `simulate.jl`.
 """
 
 """
-    joint_loglikelihood!(ws, x, lds, y[, ux, uy])
+    joint_loglikelihood!(ws, lds, x, y[, ux, uy])
 
 Per-timestep complete-data log-likelihood of a Gaussian LDS, written into
-`ws.ll_vec` (returned):
+`ws.opt.ll_vec` (an active-length view is returned — the workspace may be
+sized for a longer trial):
 
 - `ll[1]` includes: log p(x₁) + log p(y₁ | x₁)
 - `ll[t]` for t≥2 includes: log p(x_t | x_{t-1}, u_{t-1}) + log p(y_t | x_t, uy_t)
 
-Built from the shared `state_loglikelihood!` / `observation_loglikelihood!`
-kernels; requires `compute_smooth_constants!(ws, lds)` to have been called.
-`ux` / `uy` are optional control inputs (`nothing` or zero-row matrices skip
-the `B u` / `D uy` terms).
+Convenience wrapper around the shared per-timestep kernel
+`joint_loglikelihood!(ll, ws, cc, lds, x, y, ux, uy)` in
+`continuous_latents.jl`; requires `compute_smooth_constants!(ws, lds)` to have
+been called. `ux` / `uy` are optional control inputs (`nothing` or zero-row
+matrices skip the `B u` / `D uy` terms).
 """
 function joint_loglikelihood!(
     ws::SmoothWorkspace{T},
-    x::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T0,S,O},
+    x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     ux::Union{Nothing,AbstractMatrix{T0}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T0}}=nothing,
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
-    ll_vec = ws.ll_vec
-
-    for t in eachindex(ll_vec)
-        ll_vec[t] = observation_loglikelihood!(
-            ws, ws.temp_dy, ws.temp_solve_R, x, y, t, lds, uy
-        )
-        ll_vec[t] += state_loglikelihood!(ws, ws.temp_dx, ws.temp_solve_Q, x, t, lds, ux)
-    end
-
-    return ll_vec
+    ll_vec = view(ws.opt.ll_vec, 1:size(y, 2))
+    return joint_loglikelihood!(ll_vec, ws, ws.consts, lds, x, y, ux, uy)
 end
 
 # type promotion wrapper for the common case of mixed-type inputs (e.g. Float32 latent states, Float64 observations)
 function joint_loglikelihood(
-    x::AbstractMatrix{XT},
     lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{XT},
     y::AbstractMatrix{YT},
     ux::Union{Nothing,AbstractMatrix{YT}}=nothing,
     uy::Union{Nothing,AbstractMatrix{YT}}=nothing,
@@ -74,7 +68,7 @@ function joint_loglikelihood(
     WT = promote_type(T, YT, XT)
     ws = SmoothWorkspace(WT, lds.latent_dim, lds.obs_dim, tsteps)
     compute_smooth_constants!(ws, lds)
-    return joint_loglikelihood!(ws, x, lds, y, ux, uy)
+    return joint_loglikelihood!(ws, lds, x, y, ux, uy)
 end
 
 #=
@@ -82,13 +76,13 @@ Length-only Hessian assembly. The BT Hessian for a Gaussian LDS is
 observation-independent — its blocks depend only on `A, Q, C, R, P0`
 (already cached in `sws` by `compute_smooth_constants!`) and the trial
 length. Factored out so the equal-length multi-trial fast path can fill
-blocks without constructing dummy `y`/`x` matrices for `Hessian!`.
+blocks without constructing dummy `x`/`y` matrices for `hessian!`.
 =#
 function _fill_hessian_blocks!(sws::SmoothWorkspace{T}, tsteps::Int) where {T<:Real}
     btd = sws.btd
-    _state_hessian_blocks!(btd, sws, tsteps)
+    _state_hessian_blocks!(btd, sws.consts, tsteps)
     for t in 1:tsteps
-        btd.H_diag[t] .+= sws.yt_given_xt
+        btd.H_diag[t] .+= sws.consts.yt_given_xt
     end
     return nothing
 end
@@ -159,8 +153,8 @@ function smooth!(
     compute_smooth_constants!(sws, lds)
 
     # Workspace buffers may be sized for a longer trial; take active-length views.
-    X0 = view(sws.X₀, 1:n_active)
-    grad_vec = view(sws.grad_vec, 1:n_active)
+    X0 = view(sws.opt.X0, 1:n_active)
+    grad_vec = view(sws.opt.grad_vec, 1:n_active)
     neg_diag_v = view(btd.neg_diag, 1:tsteps)
     neg_sub_v = view(btd.neg_sub, 1:(tsteps - 1))
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
@@ -169,18 +163,18 @@ function smooth!(
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat, latent_inputs, obs_inputs)
+    gradient!(sws, lds, x_mat, y, latent_inputs, obs_inputs)
     # grad_vec = -gradient (minimize negative log-likelihood)
     for t in 1:tsteps, i in 1:D
-        sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
+        sws.opt.grad_vec[(t - 1) * D + i] = -sws.opt.grad_buf[i, t]
     end
 
     # Hessian is independent of `ux`/`uy` (linear-Gaussian model has identical
     # precision blocks regardless of input means).
-    Hessian!(sws, lds, y, x_mat)
+    hessian!(sws, lds, x_mat, y)
     _negate_blocks!(btd, tsteps)
 
-    # Save x_old in fs.x_smooth before we overwrite sws.X₀ with the Newton step.
+    # Save x_old in fs.x_smooth before we overwrite sws.opt.X0 with the Newton step.
     fs.x_smooth .= x_mat
 
     #=
@@ -271,20 +265,22 @@ function smooth!(
         shared_entropy = _precompute_shared_cov!(sws_pool[1], lds, T1)
         source_sws = sws_pool[1]
         for trial in 1:ntrials
-            tfs[trial].p_smooth = source_sws.p_smooth_shared
-            tfs[trial].p_smooth_tt1 = source_sws.p_smooth_tt1_shared
+            tfs[trial].p_smooth = source_sws.agg.p_smooth_shared
+            tfs[trial].p_smooth_tt1 = source_sws.agg.p_smooth_tt1_shared
             tfs[trial].entropy = shared_entropy
         end
 
         #=
         Batched mean pass: when `sws_pool[1]` was constructed with the right
-        `ntrials`, every per-trial Newton step collapses into a single
-        `(D*T) × N` matrix-RHS backsubst, doing the same total math as the
-        per-trial loop below but with BLAS-3 dispatch (matches the Kalman
-        path's batched-trial efficiency).
+        `ntrials` (it then carries a `BatchedBuffers`), every per-trial
+        Newton step collapses into a single `(D*T) × N` matrix-RHS
+        backsubst, doing the same total math as the per-trial loop below but
+        with BLAS-3 dispatch (matches the Kalman path's batched-trial
+        efficiency).
         =#
-        if size(source_sws.batched_x_mat, 3) == ntrials && ntrials > 1
-            if !source_sws.batched_data_valid[]
+        bat = source_sws.batched
+        if bat !== nothing && size(bat.x_mat, 3) == ntrials
+            if !bat.data_valid[]
                 _populate_batched_data!(source_sws, y, latent_inputs, obs_inputs)
             end
             _smooth_mean_only_batched!(lds, tfs, source_sws)
@@ -338,7 +334,7 @@ end
 """
     _precompute_shared_cov!(sws, lds, tsteps)
 
-Fill `sws.p_smooth_shared` and `sws.p_smooth_tt1_shared` with the smoothed
+Fill `sws.agg.p_smooth_shared` and `sws.agg.p_smooth_tt1_shared` with the smoothed
 covariance and lag-1 cross-covariance for a single trial of length `tsteps`
 (any trial; the result is shared across all equal-length trials). Returns
 the per-trial Gaussian entropy contribution `H[q(x_{1:T} | y)]`, which is
@@ -351,7 +347,7 @@ function _precompute_shared_cov!(
     btd = sws.btd
     # Hoist `p_smooth_shared` with a concrete eltype so the `Symmetrize!`
     # call below stays in JET's typed union branch (cf. `backwards_cov!`).
-    p_smooth_shared = sws.p_smooth_shared::Array{T,3}
+    p_smooth_shared = sws.agg.p_smooth_shared::Array{T,3}
 
     compute_smooth_constants!(sws, lds)
     _fill_hessian_blocks!(sws, tsteps)
@@ -362,7 +358,7 @@ function _precompute_shared_cov!(
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
     p_smooth_v = view(p_smooth_shared, :, :, (1:tsteps))
-    p_smooth_tt1_v = view((sws.p_smooth_tt1_shared::Array{T,3}), :, :, (1:tsteps))
+    p_smooth_tt1_v = view((sws.agg.p_smooth_tt1_shared::Array{T,3}), :, :, (1:tsteps))
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
         p_smooth_v, p_smooth_tt1_v, neg_sub_v, neg_diag_v, neg_super_v, btd
@@ -415,20 +411,20 @@ function _smooth_mean_only!(
     task workspace. No-op when `sws === source_sws`.
     =#
     if sws !== source_sws
-        _copy_smooth_constants!(sws, source_sws)
+        _copy_smooth_constants!(sws.consts, source_sws.consts)
     end
 
     shared_btd = source_sws.btd
-    X0 = view(sws.X₀, 1:n_active)
-    grad_vec = view(sws.grad_vec, 1:n_active)
+    X0 = view(sws.opt.X0, 1:n_active)
+    grad_vec = view(sws.opt.grad_vec, 1:n_active)
     neg_sub_v = view(shared_btd.neg_sub, 1:(tsteps - 1))
 
     copyto!(X0, fs.E_z)
 
     x_mat = reshape(X0, D, tsteps)
-    Gradient!(sws, lds, y, x_mat, ux, uy)
+    gradient!(sws, lds, x_mat, y, ux, uy)
     for t in 1:tsteps, i in 1:D
-        sws.grad_vec[(t - 1) * D + i] = -sws.grad_buf[i, t]
+        sws.opt.grad_vec[(t - 1) * D + i] = -sws.opt.grad_buf[i, t]
     end
 
     fs.x_smooth .= x_mat
@@ -440,23 +436,23 @@ function _smooth_mean_only!(
 end
 
 """
-    Gradient_batched!(ws, lds, y_batched, x_batched, u_batched, v_batched)
+    gradient_batched!(ws, lds, x_batched, y_batched, u_batched, v_batched)
 
-Batched form of `Gradient!`: every `mul!` is promoted from BLAS-2
+Batched form of `gradient!`: every `mul!` is promoted from BLAS-2
 (`bs × bs × bs`) to BLAS-3 (`bs × bs × bs × N`) by stacking the trial axis as
 the trailing matrix dimension. The shared-cov fast path only ever needs
 gradient evaluation at the *current iterate* across all trials, so the work
 is structurally identical to N independent per-trial gradients — but BLAS
 dispatch overhead is paid once instead of N times.
 
-Writes the result into `ws.batched_grad_buf` (shape `(D, T, N)`); the affine
+Writes the result into `ws.batched.grad_buf` (shape `(D, T, N)`); the affine
 bias subtractions (`-b`, `-d_obs`, `-x0`) broadcast across the trial axis.
 """
-function Gradient_batched!(
+function gradient_batched!(
     ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-    y::AbstractArray{T,3},
     x::AbstractArray{T,3},
+    y::AbstractArray{T,3},
     ux::AbstractArray{T,3},
     uy::AbstractArray{T,3},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
@@ -469,18 +465,19 @@ function Gradient_batched!(
     d_obs = lds.obs_model.d
     D_obs = lds.obs_model.D
 
-    C_inv_R = ws.C_inv_R
-    A_inv_Q = ws.A_inv_Q
-    neg_P0_inv = ws.x_t            # = -P0^{-1}
-    neg_Q_inv = ws.xt_given_xt_1   # = -Q^{-1}
+    C_inv_R = ws.consts.C_inv_R
+    A_inv_Q = ws.consts.A_inv_Q
+    neg_P0_inv = ws.consts.x_t            # = -P0^{-1}
+    neg_Q_inv = ws.consts.xt_given_xt_1   # = -Q^{-1}
 
-    grad = ws.batched_grad_buf
-    dxt = ws.batched_dxt
-    dxt_next = ws.batched_dxt_next
-    dyt = ws.batched_dyt
-    tmp1 = ws.batched_tmp1
-    tmp2 = ws.batched_tmp2
-    tmp3 = ws.batched_tmp3
+    bat = ws.batched::BatchedBuffers{T}
+    grad = bat.grad_buf
+    dxt = bat.dxt
+    dxt_next = bat.dxt_next
+    dyt = bat.dyt
+    tmp1 = bat.tmp1
+    tmp2 = bat.tmp2
+    tmp3 = bat.tmp3
 
     # First time step
     @views begin
@@ -550,20 +547,21 @@ function _populate_batched_data!(
     ux::AbstractVector{<:AbstractMatrix{T}},
     uy::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real}
+    bat = sws.batched::BatchedBuffers{T}
     @views for trial in eachindex(y)
-        sws.batched_y[:, :, trial] .= y[trial]
+        bat.y[:, :, trial] .= y[trial]
     end
-    if size(sws.batched_ux, 1) > 0
+    if size(bat.ux, 1) > 0
         @views for trial in eachindex(ux)
-            sws.batched_ux[:, :, trial] .= ux[trial]
+            bat.ux[:, :, trial] .= ux[trial]
         end
     end
-    if size(sws.batched_uy, 1) > 0
+    if size(bat.uy, 1) > 0
         @views for trial in eachindex(uy)
-            sws.batched_uy[:, :, trial] .= uy[trial]
+            bat.uy[:, :, trial] .= uy[trial]
         end
     end
-    sws.batched_data_valid[] = true
+    bat.data_valid[] = true
     return sws
 end
 
@@ -575,7 +573,7 @@ once* by stacking the per-trial iterate / gradient / RHS into `(D, T, N)`
 tensors and performing a single BLAS-3 backsubst.
 
 Assumes `_precompute_shared_cov!` has already populated `sws.btd`'s Cholesky
-cache and `sws.batched_data_valid[] == true` (data was stacked at fit entry).
+cache and `sws.batched.data_valid[] == true` (data was stacked at fit entry).
 """
 function _smooth_mean_only_batched!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, sws::SmoothWorkspace{T}
@@ -583,20 +581,19 @@ function _smooth_mean_only_batched!(
     ntrials = length(tfs)
     D = lds.latent_dim
     tsteps = size(tfs[1].x_smooth, 2)
+    bat = sws.batched::BatchedBuffers{T}
 
     # Stage previous-iter smoothed means into the batched iterate buffer.
     @views for trial in 1:ntrials
-        sws.batched_x_mat[:, :, trial] .= tfs[trial].E_z
+        bat.x_mat[:, :, trial] .= tfs[trial].E_z
     end
 
-    Gradient_batched!(
-        sws, lds, sws.batched_y, sws.batched_x_mat, sws.batched_ux, sws.batched_uy
-    )
+    gradient_batched!(sws, lds, bat.x_mat, bat.y, bat.ux, bat.uy)
 
     # Pack negated gradient into the (D*T, N) matrix RHS layout.
     n_active = D * tsteps
-    grad_flat = reshape(sws.batched_grad_buf, n_active, ntrials)
-    x_flat = reshape(sws.batched_x_mat, n_active, ntrials)
+    grad_flat = reshape(bat.grad_buf, n_active, ntrials)
+    x_flat = reshape(bat.x_mat, n_active, ntrials)
     @. grad_flat = -grad_flat
 
     neg_sub_v = tview(sws.btd.neg_sub, 1:(tsteps - 1))
@@ -604,7 +601,7 @@ function _smooth_mean_only_batched!(
 
     # x_flat now holds the Newton step. Update each tfs[trial].x_smooth.
     @views for trial in 1:ntrials
-        tfs[trial].x_smooth .= tfs[trial].E_z .- sws.batched_x_mat[:, :, trial]
+        tfs[trial].x_smooth .= tfs[trial].E_z .- bat.x_mat[:, :, trial]
     end
 
     return tfs
@@ -689,7 +686,7 @@ function elbo!(
     if lds.state_model.AB_prior !== nothing
         D = lds.latent_dim
         ux_dim = lds.state_input_dim
-        W_ab = view(sws.AB, :, 1:(D + 1 + ux_dim))
+        W_ab = view(sws.reg.AB, :, 1:(D + 1 + ux_dim))
         copyto!(view(W_ab, :, 1:D), lds.state_model.A)
         copyto!(view(W_ab, :, D + 1), lds.state_model.b)
         if ux_dim > 0
@@ -700,7 +697,7 @@ function elbo!(
     if lds.obs_model.CD_prior !== nothing
         D = lds.latent_dim
         uy_dim = lds.obs_input_dim
-        W_cd = view(sws.CD, :, 1:(D + 1 + uy_dim))
+        W_cd = view(sws.reg.CD, :, 1:(D + 1 + uy_dim))
         copyto!(view(W_cd, :, 1:D), lds.obs_model.C)
         copyto!(view(W_cd, :, D + 1), lds.obs_model.d)
         if uy_dim > 0
