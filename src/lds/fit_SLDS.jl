@@ -31,7 +31,7 @@ function _make_slds_fb_storage(
     total_T = last(seq_ends)
     #=
     HMMs.jl "observations" are just timestep indices into dl.logL; there is no
-    control sequence. These are unrelated to the LDS latent_inputs / obs_inputs
+    control sequence. These are unrelated to the LDS ux / uy
     control-input kwargs.
     =#
     obs_seq = 1:total_T
@@ -609,7 +609,7 @@ variational posteriors in coordinate-ascent order:
 `x_samples` is thus read (to fill `dl.logL`) then overwritten (with the fresh draw) within
 each call. `obs_seq`/`control_seq` are the HMMs.jl placeholder sequences built in `fit!`
 (timestep indices / `nothing`s) — unrelated to the LDS control-input kwargs
-`latent_inputs`/`obs_inputs`, which the SLDS path does not support.
+`ux`/`uy`, which the SLDS path does not support.
 """
 function estep!(
     slds::SLDS{T,S,O},
@@ -693,7 +693,7 @@ function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
             prior_term += iw_logprior_term(sm.P0, sm.P0_prior)
         end
         if sm.AB_prior !== nothing
-            ux_dim = lds.state_input_dim
+            ux_dim = lds.ux_dim
             W_ab = Matrix{T}(undef, D, D + 1 + ux_dim)
             @views W_ab[:, 1:D] .= sm.A
             @views W_ab[:, D + 1] .= sm.b
@@ -706,7 +706,7 @@ function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
                 prior_term += iw_logprior_term(om.R, om.R_prior)
             end
             if om.CD_prior !== nothing
-                uy_dim = lds.obs_input_dim
+                uy_dim = lds.uy_dim
                 W_cd = Matrix{T}(undef, lds.obs_dim, D + 1 + uy_dim)
                 @views W_cd[:, 1:D] .= om.C
                 @views W_cd[:, D + 1] .= om.d

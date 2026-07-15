@@ -15,7 +15,7 @@ Poisson LDS
 
     ELBO:           elbo!(plds, suf, tfs, y, sws_pool)
 
-    E-Step:         estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool)
+    E-Step:         estep!(lds, suf, tfs, y, ux, uy, sws_pool)
 
     M-Step:         mstep!(plds, suf, tfs, y, sws_pool)
 
@@ -225,7 +225,7 @@ function gradient_observation_model!(
 ) where {T<:Real}
     trials = length(tfs.FilterSmooths)
     npar = length(grad)
-    @assert length(sws_pool[1].reg.CD) == npar && length(sws_pool[1].reg.Syz) == npar "Poisson gradient accumulator size $(length(sws_pool[1].reg.CD)) ≠ npar=$npar (obs_input_dim must be 0)"
+    @assert length(sws_pool[1].reg.CD) == npar && length(sws_pool[1].reg.Syz) == npar "Poisson gradient accumulator size $(length(sws_pool[1].reg.CD)) ≠ npar=$npar (uy_dim must be 0)"
 
     #=
     Cap ntasks at `length(sws_pool)` so each chunk gets its own
@@ -246,7 +246,7 @@ function gradient_observation_model!(
         `Q_obs!` scratch fields, and the per-chunk `acc`/`tmp`
         gradient accumulators are views into `.reg.CD` / `.reg.Syz`
         (both sized `obs_dim × Dp1 = npar` for Poisson, where
-        `obs_input_dim = 0`).
+        `uy_dim = 0`).
         =#
         sws = sws_pool[task_idx]
         acc = vec(sws.reg.CD)
@@ -387,7 +387,7 @@ function elbo!(
     =#
     if plds.state_model.AB_prior !== nothing
         D = plds.latent_dim
-        ux_dim = plds.state_input_dim
+        ux_dim = plds.ux_dim
         W_ab = Matrix{T}(undef, D, D + 1 + ux_dim)
         @views W_ab[:, 1:D] .= plds.state_model.A
         @views W_ab[:, D + 1] .= plds.state_model.b
@@ -575,7 +575,7 @@ function smooth!(
 end
 
 """
-    estep!(lds, suf, tfs, y, latent_inputs, obs_inputs, sws_pool; max_iter=20, tol=1e-6)
+    estep!(lds, suf, tfs, y, ux, uy, sws_pool; max_iter=20, tol=1e-6)
 
 Suf-based Poisson E-step. Smooths, aggregates state-side sufficient
 statistics into `suf` from each trial's smoother output (`x_smooth`,
@@ -586,8 +586,8 @@ function estep!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    latent_inputs::AbstractVector{<:AbstractMatrix{T}},
-    obs_inputs::AbstractVector{<:AbstractMatrix{T}},
+    ux::AbstractVector{<:AbstractMatrix{T}},
+    uy::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
@@ -597,9 +597,7 @@ function estep!(
     smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
 
     # compute the sufficient statistics
-    return _aggregate_td_suff_stats!(
-        suf, tfs, lds, latent_inputs, obs_inputs, y, sws_pool[1]
-    )
+    return _aggregate_td_suff_stats!(suf, tfs, lds, ux, uy, y, sws_pool[1])
 end
 
 """
@@ -641,11 +639,9 @@ function fit!(
     sws_pool = [SmoothWorkspace(T, latent_dim, obs_dim, T_max) for _ in 1:npool]
 
     suf = _initialize_td_sufficient_statistics(T, plds, tsteps_per_trial)
-    latent_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
-    obs_inputs = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
-    _td_init_const_blocks!(
-        sws_pool[1], plds, tsteps_per_trial, y, latent_inputs, obs_inputs
-    )
+    ux = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    uy = [zeros(T, 0, Ti) for Ti in tsteps_per_trial]
+    _td_init_const_blocks!(sws_pool[1], plds, tsteps_per_trial, y, ux, uy)
 
     elbos = Vector{T}(undef, max_iter)
 
@@ -664,15 +660,7 @@ function fit!(
 
         # E-step: smooth each trial, aggregate state-side suff-stats, compute ELBO
         estep!(
-            plds,
-            suf,
-            tfs,
-            y,
-            latent_inputs,
-            obs_inputs,
-            sws_pool;
-            max_iter=newton_max_iter,
-            tol=T(newton_tol),
+            plds, suf, tfs, y, ux, uy, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
         )
 
         # compute the ELBO
