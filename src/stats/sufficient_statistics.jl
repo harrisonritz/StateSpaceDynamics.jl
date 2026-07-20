@@ -610,7 +610,7 @@ function _aggregate_td_suff_stats_weighted!(
 
     # Symmetrize PD blocks (BLAS.ger! is not symmetric and we touched the
     # bias row/col by hand; round-trip via Symmetrize! keeps PDMat happy).
-    Symmetrize!(init_yy + 1e-8I) # add jitter to avoid singularity in case of zero weight
+    Symmetrize!(init_yy) # add jitter to avoid singularity in case of zero weight
     LinearAlgebra.copytri!(dyn_xx, 'U')   # use upper to mirror everything to lower
     LinearAlgebra.copytri!(dyn_yy, 'U')
     LinearAlgebra.copytri!(obs_xx, 'U')
@@ -626,11 +626,11 @@ function _aggregate_td_suff_stats_weighted!(
     copyto!(suf.obs_xy, obs_xy)
 
     suf.init_xx[] = PDMat(fill(init_n_acc, 1, 1))
-    suf.init_yy[] = PDMat(copy(init_yy))
-    suf.dyn_xx[] = PDMat(copy(dyn_xx))
-    suf.dyn_yy[] = PDMat(copy(dyn_yy))
-    suf.obs_xx[] = PDMat(copy(obs_xx))
-    suf.obs_yy[] = PDMat(copy(obs_yy))
+    suf.init_yy[] = PDMat(copy(init_yy) + 1e-8I)
+    suf.dyn_xx[] = PDMat(copy(dyn_xx) + 1e-8I)
+    suf.dyn_yy[] = PDMat(copy(dyn_yy) + 1e-8I)
+    suf.obs_xx[] = PDMat(copy(obs_xx) + 1e-8I)
+    suf.obs_yy[] = PDMat(copy(obs_yy) + 1e-8I)
 
     return suf
 end
