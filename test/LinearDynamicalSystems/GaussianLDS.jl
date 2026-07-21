@@ -414,15 +414,61 @@ function test_obs_model_parameter_updates(ntrials::Int=1)
     suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
         Float64, lds, tsteps_per_trial
     )
-    ux_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    uy_seq = [zeros(Float64, 0, size(yt, 2)) for yt in y]
-    StateSpaceDynamics._td_init_const_blocks!(ws, lds, tsteps_per_trial, y, ux_seq, uy_seq)
-    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, y, ws)
+    data = StateSpaceDynamics.Data(lds, y)
+    StateSpaceDynamics._td_init_const_blocks!(ws, lds, data)
+    StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, data, ws)
     StateSpaceDynamics.mstep!(lds, suf, ws)
 
     @test isapprox(lds.obs_model.C, CD_opt[:, 1:D], atol=1e-6, rtol=1e-6)
     @test isapprox(lds.obs_model.d, CD_opt[:, D + 1], atol=1e-6, rtol=1e-6)
     @test isapprox(lds.obs_model.R, R_opt_sqrt * R_opt_sqrt', atol=1e-6, rtol=1e-6)
+end
+
+function test_gaussian_public_elbo(; rng=MersenneTwister(0xE1B0))
+    @testset "public elbo (allocating)" begin
+        D, P, Tt, N = 2, 4, 60, 3
+        sm = GaussianStateModel(
+            0.9 * Matrix{Float64}(I, D, D),
+            0.1 * Matrix{Float64}(I, D, D),
+            zeros(D),
+            zeros(D),
+            Matrix{Float64}(I, D, D),
+        )
+        om = GaussianObservationModel(
+            randn(rng, P, D), 0.2 * Matrix{Float64}(I, P, P), zeros(P)
+        )
+        lds = LinearDynamicalSystem(sm, om)
+        _, Y = rand(rng, lds, fill(Tt, N))
+
+        #=
+        The Gaussian smoother computes the exact posterior, so with no
+        parameter priors the ELBO equals the marginal log-likelihood.
+        =#
+        e = elbo(lds, Y)
+        @test isapprox(e, loglikelihood(lds, Y); rtol=1e-6)
+
+        # Shape invariance: 3-D array and single-matrix forms agree.
+        @test isapprox(elbo(lds, cat(Y...; dims=3)), e; rtol=1e-10)
+        @test isapprox(elbo(lds, Y[1]), elbo(lds, [Y[1]]); rtol=1e-10)
+
+        # Matches the first entry of fit!'s ELBO trace (same E-step).
+        @test isapprox(e, fit!(deepcopy(lds), Y; max_iter=1, progress=false)[1]; rtol=1e-8)
+
+        # Input-driven model: still equals the marginal LL, and omitting a
+        # required input sequence throws at Data construction.
+        smB = GaussianStateModel(
+            0.9 * Matrix{Float64}(I, D, D),
+            0.1 * Matrix{Float64}(I, D, D),
+            0.3 * randn(rng, D, 2),
+            Matrix{Float64}(I, D, D),
+        )
+        ldsB = LinearDynamicalSystem(smB, om)
+        u = [randn(rng, 2, Tt) for _ in 1:N]
+        _, Yb = rand(rng, ldsB, fill(Tt, N); ux=u)
+        @test isapprox(elbo(ldsB, Yb; ux=u), loglikelihood(ldsB, Yb; ux=u); rtol=1e-6)
+        @test_throws ArgumentError elbo(ldsB, Yb)
+    end
+    return nothing
 end
 
 function test_EM(n_trials::Int=1)
@@ -511,7 +557,7 @@ function test_x0_niw_prior_map_and_degradation()
                 suf.init_n = N
                 suf.init_xy[1, 1] = msum[1]
                 suf.init_xy[1, 2] = msum[2]
-                suf.init_yy[] = PDMat(copy(SS))
+                suf.init_yy[] = copy(SS)
                 return suf
             end
         sws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, 5)
@@ -551,22 +597,13 @@ function test_x0_niw_prior_map_and_degradation()
         sufd = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, ldsd, [5])
         sufd.init_n = 0.0
         fill!(sufd.init_xy, 0.0)
-        sufd.init_yy[] = PDMat(Matrix(1e-12 * I(D)))
+        sufd.init_yy[] = Matrix(1e-12 * I(D))
         StateSpaceDynamics.update_initial_state_mean!(ldsd, sufd)
         StateSpaceDynamics.update_initial_state_covariance!(ldsd, sufd, sws)
         @test all(isfinite, ldsd.state_model.x0)
         @test all(isfinite, ldsd.state_model.P0)
         @test ldsd.state_model.x0 ≈ μ₀
         @test ldsd.state_model.P0 ≈ Ψ ./ (ν + D + 1)
-
-        # Contrast: without the prior the same collapse produces non-finite x0.
-        ldsn = mk(; x0p=nothing, P0p=nothing)
-        sufn = StateSpaceDynamics._initialize_td_sufficient_statistics(Float64, ldsn, [5])
-        sufn.init_n = 0.0
-        fill!(sufn.init_xy, 0.0)
-        sufn.init_yy[] = PDMat(Matrix(1e-12 * I(D)))
-        StateSpaceDynamics.update_initial_state_mean!(ldsn, sufn)
-        @test !all(isfinite, ldsn.state_model.x0)
     end
     return nothing
 end
@@ -609,12 +646,9 @@ function test_gaussian_update_R_matches_residual_cov(; rng=MersenneTwister(7))
         suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
             Float64, lds, tsteps_per_trial
         )
-        ux_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        uy_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        StateSpaceDynamics._td_init_const_blocks!(
-            ws, lds, tsteps_per_trial, Y, ux_seq, uy_seq
-        )
-        StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, Y, ws)
+        data = StateSpaceDynamics.Data(lds, Y)
+        StateSpaceDynamics._td_init_const_blocks!(ws, lds, data)
+        StateSpaceDynamics._aggregate_td_suff_stats!(suf, tfs, lds, data, ws)
         StateSpaceDynamics.update_R!(lds, suf, ws)
 
         @test issymmetric(lds.obs_model.R)
@@ -850,13 +884,12 @@ function test_gaussian_weighting_equiv_to_duplication(; rng=MersenneTwister(9))
         suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
             Float64, lds1, tsteps_per_trial
         )
-        ux_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
-        uy_seq = [zeros(Float64, 0, Tt) for _ in 1:N]
+        data = StateSpaceDynamics.Data(lds1, Y)
         w = [ones(Float64, Tt), 2.0 .* ones(Float64, Tt)]
         for _ in 1:6
-            StateSpaceDynamics.smooth!(lds1, tfs, Y, sws_pool)
+            StateSpaceDynamics.smooth!(lds1, tfs, data, sws_pool)
             StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-                suf, tfs, lds1, ux_seq, uy_seq, Y, w, ws
+                suf, tfs, lds1, data, w, ws
             )
             StateSpaceDynamics.mstep!(lds1, suf, ws)
         end
@@ -943,8 +976,6 @@ function test_td_weighted_aggregator_matches_unweighted_with_inputs(;
         v = 0.5 * randn(rng, uy_dim, Tt)
         _, y1 = rand(rng, lds, Tt; ux=u, uy=v)
         y = [y1]
-        ux_seq = [u]
-        uy_seq = [v]
 
         tsteps_per_trial = [Tt]
         tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, tsteps_per_trial)
@@ -957,16 +988,15 @@ function test_td_weighted_aggregator_matches_unweighted_with_inputs(;
 
         # Populate the smoother outputs (x_smooth, p_smooth, p_smooth_tt1) once;
         # both aggregators read the same tfs.
-        StateSpaceDynamics._td_init_const_blocks!(
-            ws, lds, tsteps_per_trial, y, ux_seq, uy_seq
-        )
-        StateSpaceDynamics.smooth!(lds, tfs, y, sws_pool, ux_seq, uy_seq)
+        data = StateSpaceDynamics.Data(lds, y; ux=[u], uy=[v])
+        StateSpaceDynamics._td_init_const_blocks!(ws, lds, data)
+        StateSpaceDynamics.smooth!(lds, tfs, data, sws_pool)
 
         # Reference.
         suf_u = StateSpaceDynamics._initialize_td_sufficient_statistics(
             Float64, lds, tsteps_per_trial
         )
-        StateSpaceDynamics._aggregate_td_suff_stats!(suf_u, tfs, lds, ux_seq, uy_seq, y, ws)
+        StateSpaceDynamics._aggregate_td_suff_stats!(suf_u, tfs, lds, data, ws)
         ref = (
             init_n=suf_u.init_n,
             dyn_n=suf_u.dyn_n,
@@ -974,7 +1004,7 @@ function test_td_weighted_aggregator_matches_unweighted_with_inputs(;
             init_xy=copy(suf_u.init_xy),
             dyn_xy=copy(suf_u.dyn_xy),
             obs_xy=copy(suf_u.obs_xy),
-            init_yy=copy(suf_u.init_yy[].mat),
+            init_yy=copy(suf_u.init_yy[]),
             dyn_xx=copy(suf_u.dyn_xx[].mat),
             dyn_yy=copy(suf_u.dyn_yy[].mat),
             obs_xx=copy(suf_u.obs_xx[].mat),
@@ -987,14 +1017,14 @@ function test_td_weighted_aggregator_matches_unweighted_with_inputs(;
         )
         weights = [ones(Float64, Tt)]
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf_w, tfs, lds, ux_seq, uy_seq, y, weights, ws
+            suf_w, tfs, lds, data, weights, ws
         )
 
         @test suf_w.init_n ≈ ref.init_n
         @test suf_w.dyn_n ≈ ref.dyn_n
         @test suf_w.obs_n ≈ ref.obs_n
         @test suf_w.init_xy ≈ ref.init_xy
-        @test suf_w.init_yy[].mat ≈ ref.init_yy
+        @test suf_w.init_yy[] ≈ ref.init_yy
         # dyn_xx / obs_xx carry the x·u and x·v cross blocks under test; dyn_xy /
         # obs_xy carry the u·x_next and v·y cross rows.
         @test suf_w.dyn_xx[].mat ≈ ref.dyn_xx

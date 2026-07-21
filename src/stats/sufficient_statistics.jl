@@ -52,7 +52,7 @@ function sufficient_statistics!(tfs::TrialFilterSmooth{T}) where {T<:Real}
 end
 
 """
-    _td_init_const_blocks!(sws, lds, tsteps_per_trial, y, ux_seq, uy_seq)
+    _td_init_const_blocks!(sws, lds, data)
 
 Fill the data-only constant blocks of the sufficient-statistics buffers
 (`sws.agg.obs_yy_const` / `obs_xy_const` / `obs_xx_const` / `dyn_xx_const`)
@@ -60,13 +60,12 @@ once at fit entry. These are observation-independent: they depend only on
 the raw inputs, not on smoother output.
 """
 function _td_init_const_blocks!(
-    sws::SmoothWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
-    tsteps_per_trial::AbstractVector{Int},
-    y::AbstractVector{<:AbstractMatrix{T}},
-    ux_seq::AbstractVector{<:AbstractMatrix{T}},
-    uy_seq::AbstractVector{<:AbstractMatrix{T}},
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    y = data.y
+    ux_seq = data.ux
+    uy_seq = data.uy
+    tsteps_per_trial = data.tsteps
     D = lds.latent_dim
     p = lds.obs_dim
     ux_dim = lds.ux_dim
@@ -198,9 +197,8 @@ function _initialize_td_sufficient_statistics(
 
     return SufficientStatistics{T}(
         T(ntrials),
-        _pd_ref(PDMat(fill(T(ntrials), 1, 1))),       # init_xx (1×1 = N)
         zeros(T, 1, D),                            # init_xy
-        _pd_ref(PD_init(D)),                           # init_yy
+        Base.RefValue{Matrix{T}}(zeros(T, D, D)),  # this does not need to be PD as we do not compute a cholesky
         T(total_dyn),
         _pd_ref(PD_init(dyn_reg_dim)),                 # dyn_xx
         zeros(T, dyn_reg_dim, D),                  # dyn_xy
@@ -213,7 +211,7 @@ function _initialize_td_sufficient_statistics(
 end
 
 """
-    _aggregate_td_suff_stats!(suf, tfs, lds, ux_seq, uy_seq, sws)
+    _aggregate_td_suff_stats!(suf, tfs, lds, data, sws)
 
 Aggregate per-trial smoother output (`x_smooth`, `p_smooth`, `p_smooth_tt1`)
 into `suf` using per-trial GEMM/SYRK. Replaces the per-timestep, per-trial
@@ -227,11 +225,12 @@ function _aggregate_td_suff_stats!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
-    ux_seq::AbstractVector{<:AbstractMatrix{T}},
-    uy_seq::AbstractVector{<:AbstractMatrix{T}},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    data::Data{T},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    y = data.y
+    ux_seq = data.ux
+    uy_seq = data.uy
     D = lds.latent_dim
     p = lds.obs_dim
     ux_dim = lds.ux_dim
@@ -401,8 +400,7 @@ function _aggregate_td_suff_stats!(
     copyto!(suf.dyn_xy, td_dyn_xy)
     copyto!(suf.obs_xy, td_obs_xy)
 
-    suf.init_xx[] = PDMat(fill(T(ntrials), 1, 1))
-    suf.init_yy[] = PDMat(copy(S0_sum))
+    suf.init_yy[] = copy(S0_sum)                # see above; not needed to be PDMat
     suf.dyn_xx[] = PDMat(copy(Szz_Ab))
     suf.dyn_yy[] = PDMat(copy(Q_sum))
     suf.obs_xx[] = PDMat(copy(Szz_Cd))
@@ -412,7 +410,7 @@ function _aggregate_td_suff_stats!(
 end
 
 """
-    _aggregate_td_suff_stats_weighted!(suf, tfs, lds, ux_seq, uy_seq, y, weights, sws)
+    _aggregate_td_suff_stats_weighted!(suf, tfs, lds, data, weights, sws)
 
 Weighted variant of `_aggregate_td_suff_stats!`. Each per-timestep
 accumulation is scaled by `weights[trial][t]`, which carries the
@@ -432,12 +430,13 @@ function _aggregate_td_suff_stats_weighted!(
     suf::SufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
-    ux_seq::AbstractVector{<:AbstractMatrix{T}},
-    uy_seq::AbstractVector{<:AbstractMatrix{T}},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    y = data.y
+    ux_seq = data.ux
+    uy_seq = data.uy
     D = lds.latent_dim
     p = lds.obs_dim
     ux_dim = lds.ux_dim
@@ -616,7 +615,6 @@ function _aggregate_td_suff_stats_weighted!(
     LinearAlgebra.copytri!(obs_xx, 'U')
     LinearAlgebra.copytri!(obs_yy, 'U')
 
-    # init_xx is the (1×1) effective sample count for x_init.
     suf.init_n = init_n_acc
     suf.dyn_n = dyn_n_acc
     suf.obs_n = obs_n_acc
@@ -625,12 +623,11 @@ function _aggregate_td_suff_stats_weighted!(
     copyto!(suf.dyn_xy, dyn_xy)
     copyto!(suf.obs_xy, obs_xy)
 
-    suf.init_xx[] = PDMat(fill(init_n_acc, 1, 1))
-    suf.init_yy[] = PDMat(copy(init_yy) + 1e-8I)
-    suf.dyn_xx[] = PDMat(copy(dyn_xx) + 1e-8I)
-    suf.dyn_yy[] = PDMat(copy(dyn_yy) + 1e-8I)
-    suf.obs_xx[] = PDMat(copy(obs_xx) + 1e-8I)
-    suf.obs_yy[] = PDMat(copy(obs_yy) + 1e-8I)
+    suf.init_yy[] = copy(init_yy)               # see above
+    suf.dyn_xx[] = PDMat(copy(dyn_xx))
+    suf.dyn_yy[] = PDMat(copy(dyn_yy))
+    suf.obs_xx[] = PDMat(copy(obs_xx))
+    suf.obs_yy[] = PDMat(copy(obs_yy))
 
     return suf
 end

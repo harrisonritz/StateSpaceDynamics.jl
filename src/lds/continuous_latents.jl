@@ -306,7 +306,7 @@ function _state_hessian_blocks!(btd, cc::SmoothConstants{T}, tsteps::Int) where 
 end
 
 """
-    hessian!(sws, lds, x, y)
+    hessian!(sws, lds, x, y[, uy])
 
 Fill `sws.btd.H_diag`, `H_sub`, `H_super` with the complete-data log-likelihood
 Hessian blocks w.r.t. the latent path (length derived from `size(y, 2)`).
@@ -319,6 +319,9 @@ Generic over the observation model — the state-side blocks come from
 `_state_hessian_blocks!` and the emission curvature from
 `observation_hessian!`, so supporting a new observation model here only
 requires a new `observation_hessian!` method, not a new `hessian!` method.
+`uy` (optional observation inputs) is forwarded to `observation_hessian!` — the
+Gaussian curvature ignores it, the Poisson curvature depends on it through the
+rate `λ = exp(Cx + d + D uy)`. The state-side blocks never depend on inputs.
 Requires `compute_smooth_constants!(sws, lds)` to have been called.
 """
 function hessian!(
@@ -326,6 +329,7 @@ function hessian!(
     lds::LinearDynamicalSystem{T,S,O},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(y, 2)
     btd = sws.btd
@@ -334,7 +338,7 @@ function hessian!(
     _state_hessian_blocks!(btd, cc, tsteps)
     for t in 1:tsteps
         observation_hessian!(
-            btd.H_diag[t], cc, sws.elbo.rho_obs, sws.elbo.h_obs, lds, x, y, t
+            btd.H_diag[t], cc, sws.elbo.rho_obs, sws.elbo.h_obs, lds, x, y, t, one(T), uy
         )
     end
 
@@ -521,7 +525,7 @@ function Q_state!(
 
     # S_init = init_yy - μ x0' - x0 μ' + N x0 x0'    (μ = Σ x_init)
     S_init = sws.elbo.temp
-    copyto!(S_init, suf.init_yy[].mat)
+    copyto!(S_init, suf.init_yy[])
     μ_sum = vec(suf.init_xy)
     BLAS.ger!(-one(T), μ_sum, x0, S_init)
     BLAS.ger!(-one(T), x0, μ_sum, S_init)
@@ -587,7 +591,7 @@ function update_initial_state_covariance!(
     N = suf.init_n
 
     S0 = sws.reg.S0_sum                              # D × D scratch
-    copyto!(S0, suf.init_yy[].mat)
+    copyto!(S0, suf.init_yy[])
 
     # Scatter of the initial state around x0: S0 = Σγ(x₁-x0)(x₁-x0)' + Σγ P₁.
     # Rank-1 updates inline (BLAS.ger! would need a contiguous μ vector and

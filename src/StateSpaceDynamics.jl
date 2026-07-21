@@ -59,7 +59,7 @@ export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
 export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
-export ProbabilisticPCA, SLDS, LinearDynamicalSystem, Data
+export ProbabilisticPCA, SLDS, LinearDynamicalSystem
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export IWPrior, MNPrior, x0_mean_prior
@@ -74,6 +74,6 @@ export info_update!
 export tview
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, elbo!
+export rand, smooth, fit!, loglikelihood, elbo, elbo!
 
 end
