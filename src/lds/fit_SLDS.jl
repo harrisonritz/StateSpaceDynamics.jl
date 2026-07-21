@@ -854,6 +854,102 @@ function elbo!(
 end
 
 """
+    elbo(slds, y; rng=Random.default_rng())
+
+Evidence lower bound of an `SLDS` at the current parameters (allocating
+convenience wrapper around the workspace-based [`elbo!`](@ref)): warm-starts
+the continuous posterior with uniform discrete weights, runs one variational
+E-step (forward-backward for `q(z)`, Laplace smoothing for `q(x)`), and
+evaluates the ELBO at the resulting posteriors.
+
+The E-step consumes a joint sample from `q(x)` to build the discrete-layer
+log-likelihoods, so the returned value is **stochastic** — pass `rng` for
+reproducibility. This matches the first entry of the ELBO trace returned by
+`fit!` when given the same `rng`.
+
+# Arguments
+- `y`: observations — a `(obs_dim, T)` matrix, a `(obs_dim, T, ntrials)`
+  array, or a `Vector{<:AbstractMatrix}` of per-trial `(obs_dim, T_i)`
+  matrices (ragged lengths allowed).
+
+Returns a scalar.
+"""
+function elbo(
+    slds::SLDS{T,S,O},
+    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    rng::AbstractRNG=Random.default_rng(),
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    # SLDS takes no ux/uy inputs; Data still centralizes shape validation and
+    # canonicalizes the three observation forms (regime dims are uniform, so
+    # validating against LDSs[1] covers all regimes).
+    data = Data(slds.LDSs[1], y)
+    y_seq = data.y
+
+    K = length(slds.LDSs)
+    ntrials = length(y_seq)
+    seq_ends = cumsum(data.tsteps)
+    total_T = last(seq_ends)
+    T_max = maximum(data.tsteps)
+
+    tfs = initialize_FilterSmooth(slds.LDSs[1], data.tsteps)::TrialFilterSmooth{T}
+    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
+    fb_storage = _make_slds_fb_storage(dl, seq_ends)
+    obs_seq = collect(1:total_T)
+    control_seq = fill(nothing, total_T)
+    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
+    x_samples = [Matrix{T}(undef, slds.LDSs[1].latent_dim, Ti) for Ti in data.tsteps]
+
+    # Warm-start q(x) with uniform weights, drawing the sample the E-step's
+    # discrete update consumes (mirrors the fit! warm-start).
+    for trial in 1:ntrials
+        w_uniform = fill(one(T) / K, K, data.tsteps[trial])
+        smooth!(
+            slds,
+            tfs[trial],
+            y_seq[trial],
+            w_uniform;
+            ws=slds_ws,
+            x_sample=x_samples[trial],
+            rng=rng,
+        )
+    end
+
+    estep!(
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y_seq,
+        x_samples,
+        slds_ws;
+        rng=rng,
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+    )
+
+    return elbo!(slds, tfs, fb_storage, y_seq, slds_ws; seq_ends=seq_ends)
+end
+
+"""
+    loglikelihood(slds, y)
+
+Marginal (observed-data) log-likelihood for an SLDS — **not implemented**.
+
+The marginal `log p(y)` requires summing over all `K^T` discrete regime
+sequences (the switching model has no closed-form filter). Use
+[`elbo`](@ref)`(slds, y)` for a variational lower bound on `log p(y)`, or the
+ELBO trace returned by `fit!`.
+"""
+function StatsAPI.loglikelihood(slds::SLDS, y)
+    return error(
+        "marginal loglikelihood is not implemented for the SLDS (marginalizing the " *
+        "discrete regime sequence requires summing over K^T paths). Use " *
+        "elbo(slds, y) for a variational lower bound, or the ELBO trace from fit!.",
+    )
+end
+
+"""
     mstep!(slds, tfs, fb_storage, y, sws; obs_seq, seq_ends)
 
 M-step for SLDS.
@@ -883,14 +979,16 @@ function mstep!(
     # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
     StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
 
-    # SLDS doesn't currently expose user inputs; pass zero-column ux/uy.
-    ux_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    uy_seq = [zeros(T, 0, size(yt, 2)) for yt in y]
-    tsteps_per_trial = [size(yt, 2) for yt in y]
+    #=
+    SLDS doesn't currently expose user inputs; `Data` canonicalizes the
+    absent ux/uy to zero-row matrices. All regimes share the same dims
+    (enforced by `validate_SLDS`), so one `Data` serves every `lds_k`.
+    =#
+    data = Data(slds.LDSs[1], y)
 
     # One reusable SufficientStatistics; overwritten per regime by the
     # weighted aggregator.
-    suf = _initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial)
+    suf = _initialize_td_sufficient_statistics(T, slds.LDSs[1], data.tsteps)
 
     #=
     x0/P0 are tied across modes. Since the smoother gives one q(x) per trial
@@ -910,7 +1008,7 @@ function mstep!(
             weights[trial] = view(fb_storage.γ, k, t1:t2)
         end
 
-        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, ux_seq, uy_seq, y, weights, sws)
+        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, data, weights, sws)
         init_xy .+= suf.init_xy
         init_yy .+= suf.init_yy[]
 
@@ -961,31 +1059,39 @@ function _update_shared_initial_state!(
 end
 
 """
-    fit!(slds::SLDS, y::AbstractVector{<:AbstractMatrix}; max_iter=50, progress=true)
-    fit!(slds::SLDS, y::AbstractMatrix; max_iter=50, progress=true)
+    fit!(slds::SLDS, y; max_iter=50, progress=true)
 
 Fit SLDS using variational Laplace EM. Runs for exactly `max_iter` iterations
 (no early-stopping criterion: the E-step's posterior sampling makes the ELBO
 trace noisy across iterations, so a tolerance check on successive differences
 would fire spuriously). Returns the per-iteration ELBO trace.
 
-`y` is either a single trial `(obs_dim × T)` matrix or a vector of per-trial matrices
-(ragged `T_i` allowed). Internally a single batched `HMMs.ForwardBackwardStorage` of
-length `sum(T_i)` is allocated, with `seq_ends = cumsum(T_i)` to demarcate trials.
+`y` is a single trial `(obs_dim × T)` matrix, a `(obs_dim, T, ntrials)` array,
+or a vector of per-trial matrices (ragged `T_i` allowed). Internally a single
+batched `HMMs.ForwardBackwardStorage` of length `sum(T_i)` is allocated, with
+`seq_ends = cumsum(T_i)` to demarcate trials.
 """
 function fit!(
     slds::SLDS{T,S,O},
-    y::AbstractVector{<:AbstractMatrix{T}};
+    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
     max_iter::Int=50,
     progress::Bool=true,
     rng::AbstractRNG=Random.default_rng(),
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    #=
+    SLDS takes no ux/uy inputs; `Data` still centralizes shape validation and
+    canonicalizes the three observation forms (regime dims are uniform, so
+    validating against LDSs[1] covers all regimes).
+    =#
+    data = Data(slds.LDSs[1], y)
+    y_seq = data.y
+
     K = length(slds.LDSs)
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
 
-    tsteps_per_trial = [size(yt, 2) for yt in y]
-    ntrials = length(y)
+    tsteps_per_trial = data.tsteps
+    ntrials = length(y_seq)
     seq_ends = cumsum(tsteps_per_trial)
     total_T = last(seq_ends)
     T_max = maximum(tsteps_per_trial)
@@ -1025,7 +1131,7 @@ function fit!(
         smooth!(
             slds,
             tfs[trial],
-            y[trial],
+            y_seq[trial],
             w_uniform;
             ws=slds_ws,
             x_sample=x_samples[trial],
@@ -1044,7 +1150,7 @@ function fit!(
             tfs,
             fb_storage,
             dl,
-            y,
+            y_seq,
             x_samples,
             slds_ws;
             rng=rng,
@@ -1054,10 +1160,10 @@ function fit!(
         )
 
         # Compute the ELBO at the current posteriors.
-        elbos[iter] = elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends)
+        elbos[iter] = elbo!(slds, tfs, fb_storage, y_seq, slds_ws; seq_ends)
 
         # M-step: update discrete and continuous parameters.
-        mstep!(slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends)
+        mstep!(slds, tfs, fb_storage, dl, y_seq, sws; obs_seq=obs_seq, seq_ends=seq_ends)
         refresh_slds_constants!(slds_ws, slds)
 
         prog !== nothing && next!(prog)
@@ -1067,10 +1173,4 @@ function fit!(
         finish!(prog)
     end
     return elbos
-end
-
-function fit!(
-    slds::SLDS{T,S,O}, y::AbstractMatrix{T}; kwargs...
-) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    return fit!(slds, [y]; kwargs...)
 end

@@ -899,7 +899,7 @@ function test_SLDS_smooth_consistency_with_gradients(; rng=MersenneTwister(0xC0F
 end
 
 function test_SLDS_smooth_entropy_calculation(; rng=MersenneTwister(0xC0FFEE))
-    # Verify entropy is computed and has reasonable values
+    # Verify entropy is computed and matches an independent dense reference
     K = 2
     latent_dim = 2
     obs_dim = 3
@@ -920,11 +920,28 @@ function test_SLDS_smooth_entropy_calculation(; rng=MersenneTwister(0xC0FFEE))
 
     #=
     smooth! must fill fs.entropy from the BT log-determinant (it was silently
-    left at its zero initialization before the 0.5.0 fix). At these covariance
-    scales (P0 = I, Q = 0.1 I) the joint Gaussian entropy is strictly positive.
+    left at its zero initialization before the 0.5.0 fix). Check the value
+    against an external reference: rebuild the weighted BT Hessian at the MAP
+    on a fresh workspace, invert the dense precision (negated Hessian) into
+    the joint posterior covariance, and take Distributions.jl's entropy of the
+    corresponding MvNormal.
     =#
     @test isfinite(fs.entropy)
-    @test fs.entropy > 0
+
+    ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    StateSpaceDynamics.hessian!(ws, slds, fs.x_smooth, y[1], w)
+    P_dense =
+        -Matrix(
+            StateSpaceDynamics.block_tridgm(
+                ws.btd.H_diag[1:tsteps],
+                ws.btd.H_super[1:(tsteps - 1)],
+                ws.btd.H_sub[1:(tsteps - 1)],
+            ),
+        )
+    n = latent_dim * tsteps
+    Σ_dense = Matrix(inv(Symmetric(P_dense)))
+    entropy_ref = entropy(MvNormal(zeros(n), Σ_dense))
+    @test isapprox(fs.entropy, entropy_ref; rtol=1e-8, atol=1e-8)
     return fs
 end
 
@@ -1256,15 +1273,15 @@ function test_SLDS_shared_initial_state(; rng=MersenneTwister(0xC0FFEE))
     suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
         Float64, lds1, tsteps_per_trial
     )
-    ux_seq = [zeros(Float64, 0, tsteps) for _ in 1:ntrials]
-    uy_seq = [zeros(Float64, 0, tsteps) for _ in 1:ntrials]
+    # No inputs on these modes; the aggregator now consumes a validated `Data`
+    # (canonicalized to zero-row ux/uy). Dims are shared across modes, so one
+    # `Data` serves every LDS, mirroring the SLDS fit path.
+    data = StateSpaceDynamics.Data(lds1, y)
 
     #= LDS 2 gets zero responsibility at t=1 in every trial — the
     aggregator must not throw and must leave a finite (zero) init scatter. =#
     w2 = [vcat(0.0, fill(0.2, tsteps - 1)) for _ in 1:ntrials]
-    StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-        suf, tfs, lds2, ux_seq, uy_seq, y, w2, sws
-    )
+    StateSpaceDynamics._aggregate_td_suff_stats_weighted!(suf, tfs, lds2, data, w2, sws)
     @test suf.init_n < 1e-12
     @test all(isfinite, suf.init_yy[])
 
@@ -1272,9 +1289,7 @@ function test_SLDS_shared_initial_state(; rng=MersenneTwister(0xC0FFEE))
     LDSs, and equal to the plain unweighted initial fit over all trial starts.
     Unit weights give the same pooled result mstep sums over regimes. =#
     unit_w = [ones(Float64, tsteps) for _ in 1:ntrials]
-    StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-        suf, tfs, lds1, ux_seq, uy_seq, y, unit_w, sws
-    )
+    StateSpaceDynamics._aggregate_td_suff_stats_weighted!(suf, tfs, lds1, data, unit_w, sws)
     StateSpaceDynamics._update_shared_initial_state!(slds, suf, sws)
     @test all(isfinite, slds.LDSs[1].state_model.x0)
     @test all(isfinite, slds.LDSs[1].state_model.P0)
@@ -1400,6 +1415,77 @@ function test_SLDS_elbo_matches_LDS_marginal_K1(; rng=MersenneTwister(0xBEEF))
     ll = sum(loglikelihood(lds, y[trial]) for trial in 1:ntrials)
 
     @test isapprox(elbo, ll; rtol=1e-6)
+end
+
+function test_SLDS_public_elbo(; rng=MersenneTwister(0xE1B0))
+    @testset "public elbo (allocating)" begin
+        K = 2
+        latent_dim = 2
+        obs_dim = 3
+        tsteps = 15
+        ntrials = 2
+
+        lds = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=42)
+        slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
+        z, x, y = rand(rng, slds, fill(tsteps, ntrials))
+
+        # The E-step consumes a joint posterior sample, so the value is
+        # stochastic — with a shared rng it must match fit!'s first ELBO.
+        e = StateSpaceDynamics.elbo(slds, y; rng=MersenneTwister(7))
+        @test isfinite(e)
+        e_fit = fit!(deepcopy(slds), y; max_iter=1, progress=false, rng=MersenneTwister(7))[1]
+        @test isapprox(e, e_fit; rtol=1e-8)
+
+        # Shape invariance under a shared rng (single trial: matrix == [matrix]).
+        e_mat = StateSpaceDynamics.elbo(slds, y[1]; rng=MersenneTwister(7))
+        e_vec = StateSpaceDynamics.elbo(slds, [y[1]]; rng=MersenneTwister(7))
+        @test isapprox(e_mat, e_vec; rtol=1e-10)
+
+        #=
+        K=1 Gaussian regime with no priors: q(z) is degenerate, q(x) is the
+        exact posterior, so the ELBO equals the exact marginal log-likelihood
+        (deterministic — the posterior sample only feeds the K=1 FB pass,
+        whose γ ≡ 1 regardless).
+        =#
+        slds1 = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[deepcopy(lds)])
+        _, _, y1 = rand(rng, slds1, fill(tsteps, ntrials))
+        e1 = StateSpaceDynamics.elbo(slds1, y1; rng=MersenneTwister(11))
+        ll = sum(loglikelihood(lds, y1[trial]) for trial in 1:ntrials)
+        @test isapprox(e1, ll; rtol=1e-6)
+    end
+    return nothing
+end
+
+function test_SLDS_fit_shapes_and_validation(; rng=MersenneTwister(0xE1B1))
+    @testset "SLDS fit! shapes + Data validation" begin
+        K = 2
+        latent_dim = 2
+        obs_dim = 3
+        tsteps = 15
+        ntrials = 2
+
+        lds = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=42)
+        slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
+        z, x, y = rand(rng, slds, fill(tsteps, ntrials))
+
+        # 3-D array and vector-of-matrices forms give the same ELBO trace
+        # under a shared rng (equal-length trials).
+        Y3 = cat(y...; dims=3)
+        e_vec = fit!(deepcopy(slds), y; max_iter=2, progress=false, rng=MersenneTwister(7))
+        e_arr = fit!(deepcopy(slds), Y3; max_iter=2, progress=false, rng=MersenneTwister(7))
+        @test e_vec ≈ e_arr
+
+        # Wrong obs_dim now fails fast at Data construction, not deep in the
+        # smoother.
+        y_bad = [yt[1:(obs_dim - 1), :] for yt in y]
+        @test_throws StateSpaceDynamics.DimensionMismatchError fit!(
+            deepcopy(slds), y_bad; max_iter=1, progress=false
+        )
+
+        # Marginal loglikelihood is intractable for an SLDS — informative error.
+        @test_throws ErrorException loglikelihood(slds, y)
+    end
+    return nothing
 end
 
 function test_SLDS_no_priors_zero_prior_logdensity(; rng=MersenneTwister(0xC0FFEE))
@@ -1581,8 +1667,7 @@ function test_weighted_update_initial_state_mean(; rng=MersenneTwister(0xC0FFEE)
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    data = StateSpaceDynamics.Data(slds.LDSs[1], y)
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1595,7 +1680,7 @@ function test_weighted_update_initial_state_mean(; rng=MersenneTwister(0xC0FFEE)
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
+            suf, tfs, lds_k, data, w_k, sws
         )
         StateSpaceDynamics.update_initial_state_mean!(lds_k, suf)
 
@@ -1649,8 +1734,7 @@ function test_weighted_update_A_b(; rng=MersenneTwister(0xC0FFEE))
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    data = StateSpaceDynamics.Data(slds.LDSs[1], y)
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1662,7 +1746,7 @@ function test_weighted_update_A_b(; rng=MersenneTwister(0xC0FFEE))
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
+            suf, tfs, lds_k, data, w_k, sws
         )
         StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
 
@@ -1719,8 +1803,7 @@ function test_weighted_update_Q(; rng=MersenneTwister(0xC0FFEE))
 
     tsteps_per_trial = [size(x[trial], 2) for trial in 1:ntrials]
     sws = StateSpaceDynamics.SmoothWorkspace(Float64, latent_dim, obs_dim, tsteps)
-    ux_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
-    uy_seq = [zeros(Float64, 0, Ti) for Ti in tsteps_per_trial]
+    data = StateSpaceDynamics.Data(slds.LDSs[1], y)
 
     for active_k in 1:K
         lds_k = slds.LDSs[active_k]
@@ -1733,7 +1816,7 @@ function test_weighted_update_Q(; rng=MersenneTwister(0xC0FFEE))
             Float64, lds_k, tsteps_per_trial
         )
         StateSpaceDynamics._aggregate_td_suff_stats_weighted!(
-            suf, tfs, lds_k, ux_seq, uy_seq, y, w_k, sws
+            suf, tfs, lds_k, data, w_k, sws
         )
         StateSpaceDynamics.update_A_b!(lds_k, suf, sws)
         StateSpaceDynamics.update_Q!(lds_k, suf, sws)

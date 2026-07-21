@@ -20,14 +20,30 @@ abstract type AbstractObservationModel{T<:Real} end
 """
     Data{T<:Real}
 
-Container for the observed data passed to the Kalman path: observations `y`,
-dynamics (latent) inputs `ux`, and observation inputs `uy`, each `(dim, tsteps, ntrials)`
-(input fields may have zero rows when no controls are supplied).
+**Internal** container for a normalized, validated multi-trial dataset:
+per-trial observations `y`, dynamics inputs `ux`, and observation inputs `uy`
+(each a vector of `(dim, T_i)` matrices; input matrices have zero rows when
+the model takes no inputs), plus the per-trial lengths `tsteps`.
+
+Not part of the public API. Public entry points (`fit!`, `smooth`,
+`loglikelihood`) accept plain arrays — a `(obs_dim, T)` matrix, a
+`(obs_dim, T, ntrials)` array, or a vector of per-trial matrices — and
+construct a `Data` via the validating constructor, which is the single
+shape/dimension validation site. Everything downstream of a `Data` may
+assume consistent, model-compatible shapes.
+
+See also [`Data(lds, y; ux, uy)`](@ref), the validating constructor (below).
 """
-Base.@kwdef struct Data{T<:Real}
-    y::Array{T,3}
-    ux::Array{T,3}
-    uy::Array{T,3}
+struct Data{
+    T<:Real,
+    YV<:AbstractVector{<:AbstractMatrix{T}},
+    UXV<:AbstractVector{<:AbstractMatrix{T}},
+    UYV<:AbstractVector{<:AbstractMatrix{T}},
+}
+    y::YV
+    ux::UXV
+    uy::UYV
+    tsteps::Vector{Int}
 end
 
 """
@@ -159,38 +175,46 @@ Represents the observation model of a Linear Dynamical System with Poisson obser
 with canonical log-link:
 
 ```math
-λ_t = exp(C x_t + d)
+λ_t = exp(C x_t + d + D v_t)
 ```
 
 `d` is the standard Poisson-GLM intercept — the per-channel baseline log-rate,
-unconstrained in ℝ; positivity of the rate `λ` is provided by the `exp`.
+unconstrained in ℝ; positivity of the rate `λ` is provided by the `exp`. `D v_t`
+is an optional observation-input (covariate) term; when `D` has zero columns the
+model reduces to the canonical `λ_t = exp(C x_t + d)`.
 
 # Fields
 - `C::AbstractMatrix{T}`: Observation matrix of size `(obs_dim × latent_dim)`. Maps latent
     states into observation space.
 - `d::AbstractVector{T}`: Per-neuron baseline log-rate (length `obs_dim`). Free in ℝ.
+- `D::AbstractMatrix{T} = zeros(..., obs_dim, 0)`: Observation-input matrix of size
+    `(obs_dim × uy_dim)` mapping the observation input `v_t` (`uy`) into log-rate space.
+    Defaults to a zero-column matrix (no inputs).
 - `CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
-    the stacked emission matrix `[C d]` (treated as a single regression of `log λ` on
-    `[x; 1]`). Prior matrices are stored as plain `Matrix{T}`, decoupled from `C`'s storage
-    type `M`. `M₀` and `Λ` have shapes `(obs_dim, latent_dim+1)` and
-    `(latent_dim+1, latent_dim+1)` respectively. Unlike the Gaussian path there is no IW
-    counterpart since Poisson has no observation-noise covariance — this is an MN-only
-    prior contributing `½ tr(([C d] - M₀) Λ ([C d] - M₀)')` to the LBFGS objective.
+    the stacked emission matrix `[C d D]` (treated as a single regression of `log λ` on
+    `[x; 1; v]`). Prior matrices are stored as plain `Matrix{T}`, decoupled from `C`'s storage
+    type `M`. `M₀` and `Λ` have shapes `(obs_dim, latent_dim+1+uy_dim)` and
+    `(latent_dim+1+uy_dim, latent_dim+1+uy_dim)` respectively. Unlike the Gaussian path there
+    is no IW counterpart since Poisson has no observation-noise covariance — this is an
+    MN-only prior contributing `½ tr(([C d D] - M₀) Λ ([C d D] - M₀)')` to the LBFGS objective.
 """
 Base.@kwdef mutable struct PoissonObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
 } <: AbstractObservationModel{T}
     C::M
     d::V
+    D::M = zeros(eltype(C), size(C, 1), 0)  # eltype-preserving default (no obs inputs)
     CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
 end
 
 # 2-arg convenience constructor; matches the Gaussian path's positional form
-# so callers don't have to spell out `CD_prior=nothing`.
+# so callers don't have to spell out `D` / `CD_prior`.
 function PoissonObservationModel(
     C::M, d::V
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
-    return PoissonObservationModel{T,M,V}(; C=C, d=d, CD_prior=nothing)
+    return PoissonObservationModel{T,M,V}(;
+        C=C, d=d, D=zeros(eltype(C), size(C, 1), 0), CD_prior=nothing
+    )
 end
 
 """
@@ -327,3 +351,74 @@ Workaround for JET union-split false positive on views with unbound eltype
 (remove when fixed upstream; see: https://github.com/depasquale-lab/StateSpaceDynamics.jl/issues/105)
 =#
 @inline tview(A::AbstractArray{T}, I...) where {T} = view(A, I...)::SubArray{T}
+
+# ============================================================================
+# `Data` construction — the single validation site for the public array API.
+# `fit!` / `smooth` / `loglikelihood` accept observations in three shapes
+# (single matrix, 3-D array, vector of per-trial matrices) plus optional
+# `ux` / `uy` inputs in the same shape family, and canonicalize them here into
+# the private `Data` container consumed by the multi-trial backend. The
+# per-trial input normalization helpers (`_normalize_multitrial_ux` / `_uy`)
+# and `DimensionMismatchError` live in `utils/validation.jl`.
+# ============================================================================
+
+"""
+    Data(lds, y; ux=nothing, uy=nothing)
+
+Validate observations and inputs against `lds` and canonicalize them into the
+internal [`Data`](@ref) container.
+
+`y` may be a `(obs_dim, T)` matrix (single trial), a `(obs_dim, T, ntrials)`
+array, or a vector of per-trial `(obs_dim, T_i)` matrices (ragged trial
+lengths allowed). `ux` / `uy` accept the same shape family as `y`, or
+`nothing` when the model has no `B` / `D` input matrix; absent inputs are
+canonicalized to zero-row matrices.
+
+# Throws
+- `DimensionMismatchError` when observation or input dimensions disagree with
+  the model, or input trial lengths disagree with `y`
+- `ArgumentError` when inputs are omitted for a model that requires them
+  (`ux_dim > 0` / `uy_dim > 0`)
+"""
+function Data(
+    lds::LinearDynamicalSystem{T},
+    y::AbstractVector{<:AbstractMatrix{T}};
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+) where {T<:Real}
+    isempty(y) && throw(ArgumentError("y must contain at least one trial"))
+    for (i, yt) in enumerate(y)
+        size(yt, 1) == lds.obs_dim ||
+            throw(DimensionMismatchError("y[$i] rows", lds.obs_dim, size(yt, 1)))
+    end
+    tsteps = Int[size(yt, 2) for yt in y]
+    ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps, T, "ux")
+    uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps, T, lds.obs_model)
+    return Data(y, ux_seq, uy_seq, tsteps)
+end
+
+function Data(
+    lds::LinearDynamicalSystem{T},
+    y::AbstractMatrix{T};
+    ux::Union{Nothing,AbstractMatrix{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+) where {T<:Real}
+    return Data(
+        lds, [y]; ux=(ux === nothing ? nothing : [ux]), uy=(uy === nothing ? nothing : [uy])
+    )
+end
+
+function Data(
+    lds::LinearDynamicalSystem{T},
+    y::AbstractArray{T,3};
+    ux::Union{Nothing,AbstractArray{T,3}}=nothing,
+    uy::Union{Nothing,AbstractArray{T,3}}=nothing,
+) where {T<:Real}
+    _trials(A) = [view(A, :, :, n) for n in axes(A, 3)]
+    return Data(
+        lds,
+        _trials(y);
+        ux=(ux === nothing ? nothing : _trials(ux)),
+        uy=(uy === nothing ? nothing : _trials(uy)),
+    )
+end

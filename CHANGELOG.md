@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Public allocating `elbo(model, y; ...)` for all three models (Gaussian LDS
+  with `ux`/`uy` keywords, Poisson LDS with Newton-smoother keywords, SLDS
+  with an `rng` keyword since its E-step consumes a posterior sample). Runs
+  one E-step and evaluates the ELBO at the resulting posterior, the same
+  quantity `fit!` reports per iteration,  without requiring the private
+  workspace structs the `elbo!` variants take (#139)
+- `loglikelihood(slds, y)` now throws an informative error (the marginal is
+  intractable for a switching model; use `elbo`) instead of a raw
+  `MethodError`, mirroring the Poisson LDS (#139)
 - Composable Normal-Inverse-Wishart prior on the initial latent state via a new
   `GaussianStateModel` field `x0_prior::Union{Nothing,MNPrior}` (the mean half),
   paired with the existing `P0_prior::IWPrior` (the covariance half). The initial
@@ -20,6 +29,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- **Breaking:** the previously exported (but unused) `Data` struct is now a
+  private, validated container for multi-trial observations + `ux`/`uy` inputs.
+  Public entry points (`fit!`, `smooth`, `loglikelihood`) accept plain arrays —
+  a `(obs_dim, T)` matrix, a `(obs_dim, T, ntrials)` array, or a vector of
+  per-trial matrices, with `ux`/`uy` in the same shape family — and construct
+  a `Data` at the boundary, which is the single shape/dimension validation
+  site (observation rows are now checked against `obs_dim` up front). The
+  multi-trial backend (`estep!`, multi-trial `smooth!`, the sufficient-stats
+  aggregators, `_fit_tridiag!`) consumes `Data` instead of threading
+  `y`/`ux`/`uy` triples through every signature (#139)
+- `fit!(slds, y)` now validates observations through `Data` like the other
+  entry points (dimension mismatches throw a clean `DimensionMismatchError`
+  upfront instead of failing deep in the smoother) and accepts the
+  `(obs_dim, T, ntrials)` array form (#139)
+- `smooth` (public, allocating) now accepts `ux`/`uy` keywords on the Gaussian
+  path and all three observation shapes on both the Gaussian and Poisson
+  paths; multi-trial input returns per-trial vectors, matrix input returns
+  matrices as before (#139)
 - **Breaking:** renamed the control-input arguments `latent_inputs`/`obs_inputs`
   to `ux`/`uy` across the public API (keywords on `fit!`/`rand`, positional on
   `smooth!`/`estep!`) (#139)
