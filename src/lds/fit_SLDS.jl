@@ -297,16 +297,17 @@ function _sample_continuous_given_discrete!(
     # Initial state
     k1 = z_trial[1]
     x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
-    y_trial[:, 1] = rand.(
-        rng,
-        Poisson.(
-            exp.(
-                obs_params[k1].C * x_trial[:, 1] +
-                obs_params[k1].d +
-                obs_params[k1].D * uy_trial[:, 1],
+    y_trial[:, 1] =
+        rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params[k1].C * x_trial[:, 1] +
+                    obs_params[k1].d +
+                    obs_params[k1].D * uy_trial[:, 1],
+                ),
             ),
-        ),
-    )
+        )
 
     # Subsequent states
     for t in 2:tsteps
@@ -322,16 +323,17 @@ function _sample_continuous_given_discrete!(
             ),
         )
 
-        y_trial[:, t] = rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params[k_curr].C * x_trial[:, t] +
-                    obs_params[k_curr].d +
-                    obs_params[k_curr].D * uy_trial[:, t],
+        y_trial[:, t] =
+            rand.(
+                rng,
+                Poisson.(
+                    exp.(
+                        obs_params[k_curr].C * x_trial[:, t] +
+                        obs_params[k_curr].d +
+                        obs_params[k_curr].D * uy_trial[:, t],
+                    ),
                 ),
-            ),
-        )
+            )
     end
 end
 
@@ -1626,7 +1628,7 @@ function _slds_warmstart!(
         return nothing
     end
 
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         _slds_smooth_cell!(
             cell_slds,
             grp,
@@ -1689,7 +1691,7 @@ function _slds_cell_sldss(
     K = length(slds.LDSs)
     return [
         SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, [_cell_lds(slds.LDSs[k], grp, c) for k in 1:K])
-        for c in 1:grp.ncells
+        for c in 1:(grp.ncells)
     ]
 end
 
@@ -1840,7 +1842,7 @@ function _estep_grouped!(
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
 
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         slds_c = cell_slds[c]
         ws_c = _slds_ws_for(cell_ws, slds_ws, c)
         refresh_slds_constants!(ws_c, slds_c)
@@ -1870,7 +1872,7 @@ function _estep_grouped!(
         return view(fb_storage.γ, :, t1:t2)
     end
 
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         _slds_smooth_cell!(
             cell_slds,
             grp,
@@ -1903,7 +1905,7 @@ function _grouped_slds_prior_logdensity(
     K = length(cell_slds[1].LDSs)
     total = zero(T)
     for k in 1:K
-        ldss = [cell_slds[c].LDSs[k] for c in 1:grp.ncells]
+        ldss = [cell_slds[c].LDSs[k] for c in 1:(grp.ncells)]
         total += _grouped_state_prior_logdensity(ldss, grp.cell_slot, T)
         if ldss[1].obs_model isa GaussianObservationModel
             total += _grouped_gaussian_obs_prior_logdensity(ldss, grp.cell_slot, T)
@@ -1933,7 +1935,7 @@ function _elbo_grouped!(
     cell_ws::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     total_elbo = zero(T)
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         slds_c = cell_slds[c]
         ws_c = _slds_ws_for(cell_ws, slds_ws, c)
         refresh_slds_constants!(ws_c, slds_c)
