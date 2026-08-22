@@ -454,6 +454,61 @@ function BatchedBuffers(
 end
 
 """
+    PoissonBatchBuffers{T<:Real}
+
+Scratch for the batched (BLAS-3) Poisson emission kernels: the whole-trial rate
+matrix and the symmetric-pair packing that turns the per-timestep
+`C' diag(λ_t) C` curvature into one `gemm`.
+
+`sym_i` / `sym_j` enumerate the lower triangle `(i ≥ j)` of a `latent_dim`
+block in column-major order, so `Cpair[:, p] = C[:, sym_i[p]] .* C[:, sym_j[p]]`
+and `Hsym[p, t] = Σₙ λ[n, t]·Cpair[n, p]` is the `(sym_i[p], sym_j[p])` entry of
+`C' diag(λ_t) C`. Only the `nsym = D(D+1)/2` distinct entries are formed, which
+also halves the arithmetic relative to the dense `D²` loop.
+
+Sized at construction for the *widest* emission and *longest* trial the
+workspace will see; every kernel takes leading views, so a narrower cell or a
+shorter trial simply uses less of it. Allocated lazily (see
+[`poisson_batch!`](@ref)) because a Gaussian fit never touches these.
+"""
+struct PoissonBatchBuffers{T<:Real}
+    latent_dim::Int
+    obs_dim::Int
+    tsteps::Int
+    sym_i::Vector{Int}
+    sym_j::Vector{Int}
+    Cpair::Matrix{T}          # (obs_dim × nsym)   C[:, i] .* C[:, j]
+    Lam::Matrix{T}            # (obs_dim × tsteps) rates exp(Cx + d + D v [+ ρ])
+    Hsym::Matrix{T}           # (nsym × tsteps)    packed C' diag(λ_t) C
+    Ppack::Matrix{T}          # (nsym × tsteps)    packed P_t (off-diagonals doubled)
+    Eta::Matrix{T}            # (obs_dim × tsteps) linear predictor
+end
+
+function PoissonBatchBuffers(
+    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int
+) where {T<:Real}
+    sym_i = Int[]
+    sym_j = Int[]
+    for j in 1:latent_dim, i in j:latent_dim
+        push!(sym_i, i)
+        push!(sym_j, j)
+    end
+    nsym = length(sym_i)
+    return PoissonBatchBuffers{T}(
+        latent_dim,
+        obs_dim,
+        tsteps,
+        sym_i,
+        sym_j,
+        zeros(T, obs_dim, nsym),
+        zeros(T, obs_dim, tsteps),
+        zeros(T, nsym, tsteps),
+        zeros(T, nsym, tsteps),
+        zeros(T, obs_dim, tsteps),
+    )
+end
+
+"""
     SmoothWorkspace{T<:Real}
 
 Pre-allocated workspace for the full LDS smoothing + EM pipeline, grouped by
@@ -467,8 +522,10 @@ concern:
 - `agg`: TD sufficient-stats aggregator + shared-covariance storage
 - `batched`: batched mean-pass buffers, or `nothing` (only `sws_pool[1]` of a
   multi-trial equal-length fit carries one)
+- `poisson`: batched Poisson emission scratch, or `nothing` until the first
+  Poisson kernel asks for it (see [`poisson_batch!`](@ref))
 
-Every field except `batched` is `const`. `batched` is reassignable so a grouped
+Every field except `batched` and `poisson` is `const`. `batched` is reassignable so a grouped
 fit (see `parameter_groups.jl`) can swap in the buffers sized for the group of
 trials it is about to smooth, while sharing the expensive O(D²·T) storage — the
 block-tridiagonal workspace and the shared-covariance cache — across all groups.
@@ -481,6 +538,37 @@ mutable struct SmoothWorkspace{T<:Real}
     const elbo::ElboBuffers{T}
     const agg::TDAggBuffers{T}
     batched::Union{Nothing,BatchedBuffers{T}}
+    poisson::Union{Nothing,PoissonBatchBuffers{T}}
+end
+
+"""
+    poisson_batch!(sws, latent_dim, obs_dim, tsteps) -> PoissonBatchBuffers
+
+The workspace's batched Poisson scratch, grown on demand. Allocated on first
+use rather than in the constructor: a Gaussian fit never calls a Poisson kernel,
+and the buffers are O(obs_dim · tsteps), which is the largest single block a
+workspace holds.
+
+Reallocates only when the request exceeds what is already there, so within a
+fit this is one allocation on the first Newton step and a field read after.
+"""
+function poisson_batch!(
+    sws::SmoothWorkspace{T}, latent_dim::Int, obs_dim::Int, tsteps::Int
+) where {T<:Real}
+    pb = sws.poisson
+    if pb === nothing ||
+        pb.latent_dim != latent_dim ||
+        pb.obs_dim < obs_dim ||
+        pb.tsteps < tsteps
+        pb = PoissonBatchBuffers(
+            T,
+            latent_dim,
+            pb === nothing ? obs_dim : max(obs_dim, pb.obs_dim),
+            pb === nothing ? tsteps : max(tsteps, pb.tsteps),
+        )
+        sws.poisson = pb
+    end
+    return pb
 end
 
 """
@@ -522,6 +610,7 @@ function SmoothWorkspace(
         ElboBuffers(T, latent_dim, obs_dim),                                                # Buffers for Q_state! / Q_obs! ELBO terms
         TDAggBuffers(T, latent_dim, obs_dim, tsteps; ux_dim=ux_dim, uy_dim=uy_dim),         # Buffers for TD sufficient-statistics aggregator + shared smoothed-covariance storage
         batched,
+        nothing,                                                                            # batched Poisson scratch, allocated on first use
     )
 end
 

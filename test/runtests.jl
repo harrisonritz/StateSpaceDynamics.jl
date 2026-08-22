@@ -230,6 +230,11 @@ using SSDTest
 
             @testset "Priors - Poisson LDS" begin
                 test_poisson_map_step_improves_Q()
+                test_poisson_batched_hessian_matches_kernel()
+                test_poisson_qobs_batched_matches_reference()
+                test_poisson_log_factorial()
+                test_poisson_newton_mstep_matches_lbfgs()
+                test_poisson_newton_mstep_zero_count_rows()
                 test_poisson_gradient_shape_and_finiteness()
                 test_poisson_cd_prior_shrink()
                 test_poisson_ab_prior_shrink()

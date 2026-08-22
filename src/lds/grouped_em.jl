@@ -355,6 +355,7 @@ function _cell_workspace(
         ElboBuffers(T, latent_dim, obs_dim),
         agg,
         nothing,                                   # set by `_prepare_cell!`
+        nothing,                                   # batched Poisson scratch, allocated on first use
     )
 end
 
