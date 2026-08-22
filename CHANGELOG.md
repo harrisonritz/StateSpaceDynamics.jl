@@ -74,6 +74,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- **Poisson emission M-step now solves each neuron's parameters separately by
+  Newton**, replacing the single LBFGS over all `obs_dim × (latent_dim + 1 +
+  uy_dim)` parameters at once. The Q-function separates over the rows of
+  `[C d D]` — no term couples two neurons, the matrix-normal prior included —
+  and each row's problem is strictly convex, so the two solvers maximise the
+  same unique optimum. Newton gets there in a handful of exact-curvature steps
+  from the previous M-step's warm start instead of 25-40 limited-memory ones,
+  which on a 200-neuron, 16-latent, 100-bin fit is the difference between ~35
+  and ~4 sweeps over the trials. Every row backtracks on its own objective, so
+  a badly scaled neuron cannot hold up the rest, and a row whose full Newton
+  step promises less than the tolerance stops being solved for — which is what
+  keeps a unit some session never recorded (optimum at `d = -∞`) from charging
+  the others for its iterations. The previous solver is kept as
+  `_update_observation_model_lbfgs!`, and the two are checked against each
+  other in the tests
+  * Fits are not bit-identical to previous versions: the emission M-step
+    reaches a slightly *better* iterate than LBFGS's stopping rule allowed,
+    so the EM trajectory differs. The ELBO stays monotone
+- The banded LAPACK `pbsv` path in `block_tridiagonal_solve_spd!` now covers
+  block sizes up to 32 rather than 8. Measured on a 100-block system it is
+  2.1× faster than the general block-Thomas solve at block size 4, 1.5× at 16
+  and 1.1× at 32, only losing by 48 — the old cutoff left the whole useful
+  latent-dimensionality range on the slower path
+
+### Performance
+- `block_tridiagonal_inverse_logdet!` replaces its second (UL) sweep and the
+  per-block factorisation that followed with the Kalman-smoother covariance
+  recursion `Σᵢ₋₁,ᵢ₋₁ = Mᵢ₋₁⁻¹ - Dᵢ Σᵢ,ᵢ₋₁` read off the forward sweep's
+  cached Cholesky factors — one factorisation per block where there were
+  three. ~1.65× on the kernel, which is `O(T · D³)` and runs once per trial
+  per E-step, so it dominates a fit at larger latent dimensionality (8.9 ms →
+  5.4 ms per trial at `latent_dim = 32`, `T = 100`)
+- The Poisson emission kernels are batched over a whole trial instead of
+  looping over timesteps:
+  * `hessian!` forms `C' diag(λₜ) C` for every `t` as one `gemm` over the
+    `D(D+1)/2` distinct entries of the symmetric block, which also halves the
+    arithmetic (12.2 ms → 0.4 ms per trial at `obs_dim = 200`, `latent_dim =
+    16`, `T = 100`)
+  * `Q_obs!` forms the linear predictor and the variance correction
+    `ρᵢₜ = ½ cᵢ' Pₜ cᵢ` the same way (3.1 ms → 0.5 ms at the same size), and
+    short-circuits the `log Γ(y+1)` normaliser at counts of 0 and 1, which at
+    typical bin widths is almost all of the data
+  * A `PoissonBatchBuffers` field on `SmoothWorkspace` holds the scratch,
+    allocated on first use so a Gaussian fit never pays for it
+- Together with the Newton M-step, a Poisson EM iteration on a 60-trial,
+  200-neuron, 16-latent, 100-bin problem went from 5.4 s to 0.97 s, and the
+  fraction of the iteration that runs in parallel rose from about half to
+  nearly all of it — the previous LBFGS objective was evaluated on a single
+  thread while only its gradient was chunked across the workspace pool
+
 - **Breaking:** the previously exported (but unused) `Data` struct is now a
   private, validated container for multi-trial observations + `ux`/`uy` inputs.
   Public entry points (`fit!`, `smooth`, `loglikelihood`) accept plain arrays —
@@ -134,6 +184,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P0` now fails.
 
 ### Fixed
+- Multi-trial `rand(rng, lds, tsteps_per_trial)` threw `Attempted to capture and
+  modify outer local variables` under OhMyThreads: its `tforeach` closure shared
+  the `state_params` / `obs_params` bindings, which are assigned in both arms of
+  the `depends_on` branch above it and are therefore boxed. Bound through a
+  `let`, as the SLDS E-step already does
 - SLDS `forward_backward` could produce `NaN`s when a regime received ~no
   responsibility at trial starts: its initial-state effective count `init_n`
   underflowed toward zero, so `x0 = init_xy/init_n` and `P0 = S0/init_n` blew up

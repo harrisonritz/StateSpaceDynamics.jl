@@ -48,6 +48,7 @@ include("lds/continuous_latents.jl")                # state-model Q-term + state
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
 include("lds/poisson_observations.jl")
+include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
 
 # Grouped (`depends_on`) M-step + ELBO machinery, shared by LDS / PLDS / SLDS.
 include("lds/grouped_em.jl")

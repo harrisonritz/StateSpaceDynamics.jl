@@ -60,14 +60,17 @@ function _sample_trial!(
     # Initial state. The observation at t=1 includes the obs-input term D·v_1
     # when uy_trial has nonzero rows; zero-row matmul is a no-op.
     x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
-    y_trial[:, 1] = rand.(
-        rng,
-        Poisson.(
-            exp.(
-                obs_params.C * x_trial[:, 1] + obs_params.d + obs_params.D * uy_trial[:, 1]
+    y_trial[:, 1] =
+        rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params.C * x_trial[:, 1] +
+                    obs_params.d +
+                    obs_params.D * uy_trial[:, 1]
+                ),
             ),
-        ),
-    )
+        )
 
     # Subsequent states. The dynamics input B·u_{t-1} kicks the state forward.
     for t in 2:tsteps
@@ -80,16 +83,17 @@ function _sample_trial!(
                 state_params.Q,
             ),
         )
-        y_trial[:, t] = rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params.C * x_trial[:, t] +
-                    obs_params.d +
-                    obs_params.D * uy_trial[:, t],
+        y_trial[:, t] =
+            rand.(
+                rng,
+                Poisson.(
+                    exp.(
+                        obs_params.C * x_trial[:, t] +
+                        obs_params.d +
+                        obs_params.D * uy_trial[:, t],
+                    ),
                 ),
-            ),
-        )
+            )
     end
 end
 
@@ -164,10 +168,11 @@ function Random.rand(
         obs_params = fill(_extract_obs_params(lds.obs_model), ntrials)
     else
         cell_state = [
-            _extract_state_params(_cell_lds(lds, grp, c).state_model) for c in 1:grp.ncells
+            _extract_state_params(_cell_lds(lds, grp, c).state_model) for
+            c in 1:(grp.ncells)
         ]
         cell_obs = [
-            _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:grp.ncells
+            _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:(grp.ncells)
         ]
         state_params = [cell_state[grp.trial_cell[n]] for n in 1:ntrials]
         obs_params = [cell_obs[grp.trial_cell[n]] for n in 1:ntrials]
@@ -205,22 +210,29 @@ function Random.rand(
     chunksize = cld(ntrials, ntasks)
     task_rngs = [MersenneTwister(rand(rng, UInt64)) for _ in 1:ntasks]
 
-    tforeach(1:ntasks) do i
-        lo = (i - 1) * chunksize + 1
-        hi = min(i * chunksize, ntrials)
-        lo > hi && return nothing
-        trng = task_rngs[i]
-        for trial in lo:hi
-            _sample_trial!(
-                trng,
-                x[trial],
-                y[trial],
-                state_params[trial],
-                obs_params[trial],
-                lds.obs_model,
-                ux_seq[trial],
-                uy_seq[trial],
-            )
+    #=
+    `state_params` / `obs_params` are assigned in both arms of the grouping
+    branch above, so sharing those bindings with the closure would box them,
+    which OhMyThreads rejects (same idiom as `fit_SLDS.jl`'s parallel E-step).
+    =#
+    let state_params = state_params, obs_params = obs_params
+        tforeach(1:ntasks) do i
+            lo = (i - 1) * chunksize + 1
+            hi = min(i * chunksize, ntrials)
+            lo > hi && return nothing
+            trng = task_rngs[i]
+            for trial in lo:hi
+                _sample_trial!(
+                    trng,
+                    x[trial],
+                    y[trial],
+                    state_params[trial],
+                    obs_params[trial],
+                    lds.obs_model,
+                    ux_seq[trial],
+                    uy_seq[trial],
+                )
+            end
         end
     end
 

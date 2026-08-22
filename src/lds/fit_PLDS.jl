@@ -37,9 +37,19 @@ Poisson LDS
 
 Per-timestep Poisson emission normalizer `lognorm_t[t] = Σᵢ log(y[i,t]!)`;
 constant in the latents. Computed once per trial and handed to `joint_loglikelihood!`
+(see [`_log_factorial`](@ref) for why the counts are not all sent to `loggamma`).
 """
 function _poisson_lognorm_t(y::AbstractMatrix{T}) where {T<:Real}
-    return vec(sum(yi -> loggamma(yi + one(T)), y; dims=1))
+    tsteps = size(y, 2)
+    out = Vector{T}(undef, tsteps)
+    @inbounds for t in 1:tsteps
+        acc = zero(T)
+        for i in axes(y, 1)
+            acc += _log_factorial(y[i, t])
+        end
+        out[t] = acc
+    end
+    return out
 end
 
 """
@@ -567,7 +577,8 @@ function smooth!(
             copyto!(pvec, gvec)
             #=
             Negated Hessian is SPD at the MAP — use the SPD-specialised
-            solve so small `latent_dim` (≤ 8) routes to LAPACK `pbsv`.
+            solve, which routes to LAPACK `pbsv` at the latent
+            dimensionalities a state-space model is normally fitted at.
             =#
             block_tridiagonal_solve_spd!(
                 pvec, neg_sub_v, neg_diag_v, neg_super_v, gvec, btd
@@ -970,7 +981,7 @@ function _grouped_estep_elbo_poisson!(
     T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:PoissonObservationModel{T}}
 }
     total = zero(T)
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         lds_c = state.cell_lds[c]
         suf_c = state.sufs[c]
         tfs_c = state.cell_tfs[c]
