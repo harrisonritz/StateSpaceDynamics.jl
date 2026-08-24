@@ -509,6 +509,55 @@ function gradient!(
     return grad
 end
 
+#=
+One regime's emission curvature, added into the diagonal Hessian blocks with
+its responsibilities `γₖ(t)` as the per-timestep weight.
+
+Gaussian: `-γₖ(t) · C'R⁻¹C` from the regime's cached template, an `O(D²)` axpy
+per timestep — the per-timestep kernel is already the cheap way to do it.
+
+Poisson: `-γₖ(t) · C' diag(λₜ) C`, which is `O(N·D²)` per timestep and is where
+a Poisson SLDS fit spends most of its time (`N` is the neuron count, and this
+runs per Newton step, per trial, per E-step, for every regime). Routed to the
+batched kernel, which forms the whole trial as one `gemm`.
+=#
+function _slds_emission_hessian!(
+    ws::SLDSSmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    cc::SmoothConstants{T},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    weights::AbstractVector{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    z::AbstractVector{T},
+    λ::AbstractVector{T},
+) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
+    obs_dim, latent_dim = size(lds.obs_model.C)
+    pb = poisson_batch!(ws, latent_dim, obs_dim, tsteps)
+    _poisson_emission_hessian!(ws.btd, pb, lds.obs_model, x, uy, tsteps, weights)
+    return nothing
+end
+
+function _slds_emission_hessian!(
+    ws::SLDSSmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    cc::SmoothConstants{T},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    weights::AbstractVector{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    z::AbstractVector{T},
+    λ::AbstractVector{T},
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    H_diag = ws.btd.H_diag
+    for t in 1:tsteps
+        observation_hessian!(H_diag[t], cc, z, λ, lds, x, y, t, weights[t], uy)
+    end
+    return nothing
+end
+
 """
     hessian!(ws, slds, x, y, w)
 
@@ -568,9 +617,8 @@ function hessian!(
         super_entry = cc.H_super_entry    # (Q^{-1}A)'
 
         if Tsteps == 1
-            α = w[k, 1]
-            @. H_diag[1] += α * neg_P0_inv
-            observation_hessian!(H_diag[1], cc, z, λ, lds_k, x, y, 1, α, uy)
+            @. H_diag[1] += w[k, 1] * neg_P0_inv
+            _slds_emission_hessian!(ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ)
             continue
         end
 
@@ -597,14 +645,8 @@ function hessian!(
         # - At t=T: current-role from factor at T weighted by w[k,T]
         @. H_diag[Tsteps] += w[k, Tsteps] * neg_Q_inv
 
-        #=
-        Emission curvature contributions, weighted by w[k,t]. Shared kernel;
-        dispatches on the observation model (Gaussian: cached -C'R⁻¹C,
-        Poisson: -C' diag(λ_t) C with λ_t = exp(C x_t + d)).
-        =#
-        for t in 1:Tsteps
-            observation_hessian!(H_diag[t], cc, z, λ, lds_k, x, y, t, w[k, t], uy)
-        end
+        # Emission curvature contributions, weighted by w[k,t].
+        _slds_emission_hessian!(ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ)
     end
 
     for t in 1:Tsteps
@@ -2337,6 +2379,7 @@ function _cell_slds_workspace(
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
         base.ll_tmp,                                       # shared, length T_max
+        nothing,                                           # batched Poisson scratch
     )
     refresh_slds_constants!(ws, slds_c)
     return ws

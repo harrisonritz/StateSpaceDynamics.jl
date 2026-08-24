@@ -137,6 +137,7 @@ using SSDTest
                 test_SLDS_poisson_count_validation()
                 test_SLDS_poisson_d_interpretation()
                 test_SLDS_gradient_weight_normalization_poisson()
+                test_SLDS_batched_poisson_hessian()
             end
 
             @testset "Tied parameters and posteriors" begin

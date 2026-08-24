@@ -2657,6 +2657,77 @@ function _distinct_gaussian_slds(K::Int, latent_dim::Int, obs_dim::Int)
     return SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=ldss)
 end
 
+function test_SLDS_batched_poisson_hessian(; rng=MersenneTwister(0x71F7))
+    @testset "batched SLDS Poisson emission Hessian" begin
+        #=
+        The SLDS `hessian!` forms each regime's emission curvature
+        `-γₖ(t)·C' diag(λₜ) C` for the whole trial as one gemm. That has to agree
+        with the per-timestep `observation_hessian!` kernel it replaced, which is
+        still the interface a new observation model implements — and the weights
+        have to land on the right timesteps, which a uniform `γ` would not catch.
+        =#
+        K, latent_dim, obs_dim, tsteps = 3, 4, 8, 12
+        slds = _distinct_poisson_slds(K, latent_dim, obs_dim)
+        x = 0.4 .* randn(rng, latent_dim, tsteps)
+        y = Float64.(rand(rng, 0:3, obs_dim, tsteps))
+        w = rand(rng, K, tsteps)
+        w ./= sum(w; dims=1)
+
+        ref = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+        StateSpaceDynamics.hessian!(ref, slds, x, y, w)
+        #=
+        Undo the batched emission block one regime at a time and put the
+        per-timestep kernel's back, so what is left is exactly the difference
+        between the two emission kernels.
+        =#
+        for k in 1:K, t in 1:tsteps
+            StateSpaceDynamics.observation_hessian!(
+                ref.btd.H_diag[t],
+                ref.consts[k],
+                ref.opt.dyt,
+                ref.opt.temp_dy,
+                slds.LDSs[k],
+                x,
+                y,
+                t,
+                -w[k, t],          # negated: removes the batched contribution
+                nothing,
+            )
+            StateSpaceDynamics.observation_hessian!(
+                ref.btd.H_diag[t],
+                ref.consts[k],
+                ref.opt.dyt,
+                ref.opt.temp_dy,
+                slds.LDSs[k],
+                x,
+                y,
+                t,
+                w[k, t],
+                nothing,
+            )
+        end
+
+        ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+        StateSpaceDynamics.hessian!(ws, slds, x, y, w)
+
+        scale = maximum(maximum(abs, H) for H in ref.btd.H_diag)
+        @test maximum(
+            maximum(abs, ref.btd.H_diag[t] .- ws.btd.H_diag[t]) for t in 1:tsteps
+        ) < 1e-10 * scale
+        # Only the diagonal blocks carry emission curvature.
+        @test all(ref.btd.H_sub[i] == ws.btd.H_sub[i] for i in 1:(tsteps - 1))
+        @test all(ref.btd.H_super[i] == ws.btd.H_super[i] for i in 1:(tsteps - 1))
+        @test all(issymmetric(Symmetric(H)) for H in ws.btd.H_diag)
+
+        # `Tsteps == 1` takes its own branch through the state blocks.
+        ws1 = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, 1)
+        StateSpaceDynamics.hessian!(ws1, slds, x[:, 1:1], y[:, 1:1], w[:, 1:1])
+        @test all(isfinite, ws1.btd.H_diag[1])
+        @test issymmetric(Symmetric(ws1.btd.H_diag[1]))
+    end
+    return nothing
+end
+
 function test_SLDS_tied_params_poisson(; rng=MersenneTwister(0x71ED))
     K, latent_dim, obs_dim = 2, 2, 4
 

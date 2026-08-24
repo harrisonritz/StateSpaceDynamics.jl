@@ -242,6 +242,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     typical bin widths is almost all of the data
   * A `PoissonBatchBuffers` field on `SmoothWorkspace` holds the scratch,
     allocated on first use so a Gaussian fit never pays for it
+- The SLDS emission Hessian uses the same batched Poisson kernel as the single
+  LDS. `hessian!` for an SLDS sums `-γₖ(t)·C' diag(λₜ) C` over regimes, which is
+  `O(K · N · D² · T)` and runs on every Newton step of every trial's smooth, on
+  every E-step — the dominant cost of a Poisson SLDS fit. The per-regime
+  responsibilities fold into the rates before the `gemm`, so the weighted
+  curvature costs what the unweighted one does: 12.0 ms → 0.63 ms per
+  `hessian!` call at `K = 2`, `obs_dim = 200`, `latent_dim = 16`, `T = 100`, and
+  1.26 s → 0.50 s per EM iteration on an 8-trial fit of that size. The
+  Gaussian path keeps the per-timestep kernel, whose curvature is a cached
+  `O(D²)` axpy per timestep and has nothing to batch
 - Together with the Newton M-step, a Poisson EM iteration on a 60-trial,
   200-neuron, 16-latent, 100-bin problem went from 5.4 s to 0.97 s, and the
   fraction of the iteration that runs in parallel rose from about half to
