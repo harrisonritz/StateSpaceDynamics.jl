@@ -318,6 +318,7 @@ using SSDTest
             @testset "SLDS fitting" begin
                 test_grouped_slds_fit()
                 test_grouped_slds_tied_params()
+                test_grouped_poisson_slds_fit()
                 test_grouped_slds_smooth()
                 test_tied_gls_regression()
                 test_grouped_pooled_regression_under_grouped_noise()

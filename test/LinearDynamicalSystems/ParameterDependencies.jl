@@ -660,6 +660,88 @@ function test_grouped_slds_tied_params()
     return nothing
 end
 
+"""`pd_slds`'s Poisson twin: same regimes and chain, an emission with no `R`."""
+function pd_poisson_slds(labels; K::Int=2)
+    ldss = map(1:K) do k
+        sm = pd_state_model()
+        sm.A .= k == 1 ? [0.95 0.05; -0.05 0.95] : [0.60 0.30; -0.30 0.60]
+        om = PoissonObservationModel([0.6 0.1; -0.2 0.5], [1.0, 0.8])
+        if labels !== nothing
+            om.depends_on = (C=labels, d=labels)
+        end
+        return LinearDynamicalSystem(;
+            state_model=sm,
+            obs_model=om,
+            latent_dim=PD_LATENT_DIM,
+            obs_dim=PD_OBS_DIM,
+            fit_bool=fill(true, 5),
+        )
+    end
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=ldss)
+end
+
+"""
+A grouped (`depends_on`) SLDS whose emission is Poisson.
+
+Every other grouped-SLDS test here is Gaussian, which is what let the M-step
+read `cell_slot[_G_R]` before branching on the emission type: a Poisson
+emission declares no `R` group, so its `cell_slot` is one entry shorter and
+that index runs off the end — a `BoundsError` out of the first M-step, on any
+such fit. Both the plain grouped fit and the tied one go through it.
+"""
+function test_grouped_poisson_slds_fit()
+    @testset "grouped SLDS with a Poisson emission" begin
+        rng = StableRNG(3030)
+        labels = vcat(fill(:s1, 3), fill(:s2, 3))
+
+        truth = pd_poisson_slds(labels)
+        for k in 1:2
+            group_parameter(truth.LDSs[k].obs_model, :C, :s2) .= [-0.4 0.7; 0.5 -0.3]
+            group_parameter(truth.LDSs[k].obs_model, :d, :s2) .= [0.2, 1.4]
+        end
+        _, _, y = rand(rng, truth, fill(35, length(labels)))
+
+        # Untied: one emission per (regime, session).
+        fitted = pd_poisson_slds(labels)
+        elbos = fit!(fitted, y; max_iter=4, progress=false, rng=StableRNG(31))
+        @test length(elbos) == 4
+        @test all(isfinite, elbos)
+        @test !(
+            group_parameter(fitted.LDSs[1].obs_model, :C, :s1) ≈
+            group_parameter(fitted.LDSs[1].obs_model, :C, :s2)
+        )
+
+        # x0/P0 stay tied across regimes even when grouped.
+        @test fitted.LDSs[2].state_model.x0 ≈ fitted.LDSs[1].state_model.x0
+        @test fitted.LDSs[2].state_model.P0 ≈ fitted.LDSs[1].state_model.P0
+
+        #=
+        Tied: the whole `[C d]` shared across regimes — the usual reading for
+        neural data, and the only tie a Poisson emission admits, since a partial
+        one has no sufficient-statistic form.
+        =#
+        tied = pd_poisson_slds(labels)
+        group_parameter(tied.LDSs[2].obs_model, :C, :s2) .= [0.9 0.1; -0.2 0.7]
+        elbos = fit!(
+            tied, y; max_iter=4, progress=false, rng=StableRNG(32), tied_params=(:C, :d)
+        )
+        @test all(isfinite, elbos)
+        om1, om2 = tied.LDSs[1].obs_model, tied.LDSs[2].obs_model
+        for label in (:s1, :s2)
+            @test group_parameter(om2, :C, label) ≈ group_parameter(om1, :C, label)
+            @test group_parameter(om2, :d, label) ≈ group_parameter(om1, :d, label)
+        end
+        # Tied across regimes, still split across sessions, dynamics still switching.
+        @test !(group_parameter(om1, :C, :s1) ≈ group_parameter(om1, :C, :s2))
+        @test !(tied.LDSs[2].state_model.A ≈ tied.LDSs[1].state_model.A)
+
+        post = smooth(tied, y; smoothing_iters=5, tol=0)
+        @test length(post.γ) == length(y)
+        @test isfinite(post.elbo)
+    end
+    return nothing
+end
+
 function test_tied_gls_regression()
     @testset "tied GLS regression" begin
         #=

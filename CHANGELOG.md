@@ -271,6 +271,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P0` now fails.
 
 ### Fixed
+- A grouped (`depends_on`) SLDS with a **Poisson** emission threw
+  `BoundsError` out of the first M-step, so no such fit could run at all. The
+  grouped SLDS M-step read `cell_slot[_G_R]` before branching on the emission
+  type, and `R` is a group only on the Gaussian side — `_group_names` gives a
+  Poisson emission `(:C,)` alone, so its `cell_slot` is one entry shorter and
+  that index is off the end. It is now read inside the Gaussian branch, which
+  is the only place its value was ever used. Every grouped-SLDS test was
+  Gaussian, which is what let it through; there is now a Poisson one covering
+  the plain grouped fit and the `tied_params = (:C, :d)` tie
 - A grouped (`depends_on`) fit that pooled a regression over units with
   *different* noise versions — e.g. `depends_on = (R = session,)` with one
   emission over all sessions — solved the ordinary pooled normal equations,

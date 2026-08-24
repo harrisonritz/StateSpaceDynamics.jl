@@ -2710,12 +2710,17 @@ function _mstep_grouped!(
     slots_ab = _grouped_unit_slots(grp.cell_slot[_G_AB], K, tie_dyn)
     slots_q = _grouped_unit_slots(grp.cell_slot[_G_Q], K, :Q in tied)
     slots_cd = _grouped_unit_slots(grp.cell_slot[_G_CD], K, tie_obs)
-    slots_r = _grouped_unit_slots(grp.cell_slot[_G_R], K, :R in tied)
 
     _grouped_update_A_b!(unit_lds, unit_suf, slots_ab, slots_q, sws, bufs)
     _grouped_update_Q!(unit_lds, unit_suf, slots_q, slots_ab, sws)
 
     if lds1.obs_model isa GaussianObservationModel{T}
+        #=
+        `R` is a group only on the Gaussian side: `_group_names` gives a Poisson
+        emission `(:C,)` alone, so `cell_slot` is one entry shorter there and
+        `_G_R` indexes past its end. Read inside the branch that uses it.
+        =#
+        slots_r = _grouped_unit_slots(grp.cell_slot[_G_R], K, :R in tied)
         _grouped_update_C_d!(
             unit_lds, unit_suf, slots_cd, slots_r, sws, bufs; unit_sws=unit_sws
         )
