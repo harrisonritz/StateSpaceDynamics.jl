@@ -1192,3 +1192,241 @@ function test_poisson_hessian_nondiag()
     @test norm(hess_num - hess) < 1e-8
     return nothing
 end
+
+function _batched_kernel_fixture(; rng=StableRNG(20260815), D=5, P=23, T=17, uy_dim=3)
+    A = 0.85 .* Matrix{Float64}(I, D, D) .+ 0.05 .* randn(rng, D, D)
+    Q = 0.05 .* Matrix{Float64}(I, D, D)
+    sm = GaussianStateModel(;
+        A=A, Q=Q, b=0.05 .* randn(rng, D), x0=zeros(D), P0=0.2 .* Matrix{Float64}(I, D, D)
+    )
+    om = PoissonObservationModel(;
+        C=0.3 .* randn(rng, P, D),
+        d=fill(-1.0, P),
+        D=uy_dim > 0 ? 0.1 .* randn(rng, P, uy_dim) : zeros(P, 0),
+    )
+    plds = LinearDynamicalSystem(sm, om)
+    x = 0.4 .* randn(rng, D, T)
+    v = uy_dim > 0 ? randn(rng, uy_dim, T) : zeros(0, T)
+    η = om.C * x .+ om.d .+ (uy_dim > 0 ? om.D * v : zeros(P, T))
+    y = Float64.(rand.(Ref(rng), Poisson.(exp.(clamp.(η, -20.0, 4.0)))))
+    # A plausible smoothed covariance per timestep: SPD, and varying with t.
+    p_smooth = Array{Float64,3}(undef, D, D, T)
+    for t in 1:T
+        M = 0.2 .* randn(rng, D, D)
+        p_smooth[:, :, t] = M * M' + 0.05I
+    end
+    return (; plds, x, y, v, p_smooth, D, P, T, uy_dim)
+end
+
+function test_poisson_batched_hessian_matches_kernel()
+    #=
+    The Poisson `hessian!` forms the emission curvature -C' diag(λ_t) C for the
+    whole trial as one gemm over the D(D+1)/2 distinct entries. That has to agree
+    with the per-timestep `observation_hessian!` kernel it replaced, which is
+    still the interface a new observation model implements.
+    =#
+    f = _batched_kernel_fixture()
+    plds, x, y, v = f.plds, f.x, f.y, f.v
+
+    ws = StateSpaceDynamics.SmoothWorkspace(Float64, f.D, f.P, f.T; uy_dim=f.uy_dim)
+    StateSpaceDynamics.compute_smooth_constants!(ws, plds)
+
+    # Reference: state blocks + the per-timestep emission kernel.
+    StateSpaceDynamics._state_hessian_blocks!(ws.btd, ws.consts, f.T)
+    for t in 1:(f.T)
+        StateSpaceDynamics.observation_hessian!(
+            ws.btd.H_diag[t],
+            ws.consts,
+            ws.elbo.rho_obs,
+            ws.elbo.h_obs,
+            plds,
+            x,
+            y,
+            t,
+            1.0,
+            v,
+        )
+    end
+    ref_diag = [copy(H) for H in ws.btd.H_diag]
+    ref_sub = [copy(H) for H in ws.btd.H_sub]
+
+    StateSpaceDynamics.hessian!(ws, plds, x, y, v)
+
+    scale = maximum(maximum(abs, H) for H in ref_diag)
+    @test maximum(maximum(abs, ref_diag[t] .- ws.btd.H_diag[t]) for t in 1:(f.T)) <
+        1e-10 * scale
+    # Only the diagonal blocks carry emission curvature.
+    @test all(ref_sub[i] == ws.btd.H_sub[i] for i in 1:(f.T - 1))
+    @test all(issymmetric(Symmetric(H)) for H in ws.btd.H_diag)
+    return nothing
+end
+
+function test_poisson_qobs_batched_matches_reference()
+    #=
+    `Q_obs!` batches the linear predictor and the variance correction
+    ρ_{i,t} = ½ cᵢ' P_t cᵢ. Check it against the textbook per-timestep form, with
+    and without observation inputs and per-timestep weights.
+    =#
+    for uy_dim in (0, 3)
+        f = _batched_kernel_fixture(; rng=StableRNG(20260816 + uy_dim), uy_dim=uy_dim)
+        plds, x, y, v, p_smooth = f.plds, f.x, f.y, f.v, f.p_smooth
+        C, d, Dm = plds.obs_model.C, plds.obs_model.d, plds.obs_model.D
+
+        ws = StateSpaceDynamics.SmoothWorkspace(Float64, f.D, f.P, f.T; uy_dim=f.uy_dim)
+        for weights in (nothing, rand(StableRNG(7), f.T))
+            expected = 0.0
+            for t in 1:(f.T)
+                wt = weights === nothing ? 1.0 : weights[t]
+                h = C * x[:, t] .+ d
+                uy_dim > 0 && (h .+= Dm * v[:, t])
+                ρ = [0.5 * dot(C[i, :], p_smooth[:, :, t] * C[i, :]) for i in 1:(f.P)]
+                lf = sum(loggamma.(y[:, t] .+ 1.0))
+                expected += wt * (dot(y[:, t], h) - sum(exp.(h .+ ρ)) - lf)
+            end
+            got = StateSpaceDynamics.Q_obs!(ws, plds, x, p_smooth, y, v; weights=weights)
+            @test isapprox(got, expected; rtol=1e-12)
+        end
+    end
+    return nothing
+end
+
+function test_poisson_log_factorial()
+    # The short-circuited log(n!) must be bitwise what `loggamma` returns, since
+    # it feeds the reported ELBO.
+    for n in 0:40
+        @test StateSpaceDynamics._log_factorial(Float64(n)) == loggamma(Float64(n) + 1)
+    end
+    # Non-integer counts (a weighted or rate-valued `y`) go the same way.
+    for y in (0.5, 3.25, 40.75)
+        @test StateSpaceDynamics._log_factorial(y) == loggamma(y + 1)
+    end
+    return nothing
+end
+
+function test_poisson_newton_mstep_matches_lbfgs(; rng=StableRNG(20260817))
+    #=
+    The emission M-step is row-separable and strictly convex, so the row-wise
+    Newton solver and the LBFGS reference maximise the same unique optimum. The
+    Newton solve should land at a stationary point and give up nothing to LBFGS
+    on the objective.
+    =#
+    D, P, T, N = 4, 18, 25, 6
+    for cd_prior in (0.0, 0.5)
+        sm = GaussianStateModel(;
+            A=0.9 .* Matrix{Float64}(I, D, D),
+            Q=0.05 .* Matrix{Float64}(I, D, D),
+            b=zeros(D),
+            x0=zeros(D),
+            P0=0.2 .* Matrix{Float64}(I, D, D),
+        )
+        om = PoissonObservationModel(;
+            C=0.3 .* randn(rng, P, D), d=fill(-1.0, P), D=zeros(P, 0)
+        )
+        cd_prior > 0 && (
+            om.CD_prior = MNPrior(;
+                M₀=zeros(P, D + 1), Λ=Matrix{Float64}(cd_prior * I, D + 1, D + 1)
+            )
+        )
+        plds = LinearDynamicalSystem(sm, om)
+        _, Y = rand(rng, plds, fill(T, N))
+
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(T, N))
+        pool = [
+            StateSpaceDynamics.SmoothWorkspace(Float64, D, P, T) for
+            _ in 1:Threads.maxthreadid()
+        ]
+        StateSpaceDynamics.smooth!(plds, tfs, Y, pool)
+
+        function total_Q(model)
+            ws = StateSpaceDynamics.SmoothWorkspace(Float64, D, P, T)
+            q = sum(
+                StateSpaceDynamics.Q_obs!(
+                    ws, model, tfs[k].x_smooth, tfs[k].p_smooth, Y[k]
+                ) for k in 1:N
+            )
+            if model.obs_model.CD_prior !== nothing
+                W = hcat(model.obs_model.C, model.obs_model.d)
+                dev = W .- model.obs_model.CD_prior.M₀
+                q -= 0.5 * sum(dev .* (dev * model.obs_model.CD_prior.Λ))
+            end
+            return q
+        end
+
+        newton = deepcopy(plds)
+        lbfgs = deepcopy(plds)
+        Q_start = total_Q(plds)
+        StateSpaceDynamics.update_observation_model!(newton, tfs, Y, pool)
+        StateSpaceDynamics._update_observation_model_lbfgs!(lbfgs, tfs, Y, pool)
+
+        Q_newton = total_Q(newton)
+        @test Q_newton ≥ Q_start
+        # Never worse than the reference solver, up to its own stopping slack.
+        @test Q_newton ≥ total_Q(lbfgs) - 1e-6 * max(1.0, abs(Q_newton))
+        @test isapprox(newton.obs_model.C, lbfgs.obs_model.C; atol=1e-2)
+        @test isapprox(newton.obs_model.d, lbfgs.obs_model.d; atol=1e-2)
+        @test all(isfinite, newton.obs_model.C)
+        @test all(isfinite, newton.obs_model.d)
+
+        # Stationarity: ∇(-Q) ≈ 0 at the Newton solution.
+        g = zeros(P * (D + 1))
+        StateSpaceDynamics.gradient_observation_model!(
+            g,
+            newton.obs_model.C,
+            newton.obs_model.d,
+            newton.obs_model.D,
+            tfs,
+            Y,
+            nothing,
+            pool,
+            nothing,
+        )
+        if cd_prior > 0
+            W = hcat(newton.obs_model.C, newton.obs_model.d)
+            gW = reshape(view(g, 1:(P * (D + 1))), P, D + 1)
+            gW .+= (W .- newton.obs_model.CD_prior.M₀) * newton.obs_model.CD_prior.Λ
+        end
+        @test maximum(abs, g) < 1e-4 * max(1.0, abs(Q_newton))
+    end
+    return nothing
+end
+
+function test_poisson_newton_mstep_zero_count_rows(; rng=StableRNG(20260818))
+    #=
+    `--unit-alignment union` pads a session with units it never recorded, so some
+    emission rows see nothing but zeros. Their optimum is d = -∞; the solver has
+    to walk them down without producing NaNs or holding up the rows that do
+    converge.
+    =#
+    D, P, T, N = 3, 10, 20, 5
+    sm = GaussianStateModel(;
+        A=0.9 .* Matrix{Float64}(I, D, D),
+        Q=0.05 .* Matrix{Float64}(I, D, D),
+        b=zeros(D),
+        x0=zeros(D),
+        P0=0.2 .* Matrix{Float64}(I, D, D),
+    )
+    om = PoissonObservationModel(;
+        C=0.3 .* randn(rng, P, D), d=fill(-1.0, P), D=zeros(P, 0)
+    )
+    plds = LinearDynamicalSystem(sm, om)
+    _, Y = rand(rng, plds, fill(T, N))
+    dead = [2, 7]
+    for k in 1:N
+        Y[k][dead, :] .= 0.0
+    end
+
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, fill(T, N))
+    pool = [
+        StateSpaceDynamics.SmoothWorkspace(Float64, D, P, T) for
+        _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(plds, tfs, Y, pool)
+    d_before = copy(plds.obs_model.d)
+    StateSpaceDynamics.update_observation_model!(plds, tfs, Y, pool)
+
+    @test all(isfinite, plds.obs_model.C)
+    @test all(isfinite, plds.obs_model.d)
+    # The silent rows' intercepts go down, not up, and stay finite.
+    @test all(plds.obs_model.d[dead] .< d_before[dead])
+    return nothing
+end

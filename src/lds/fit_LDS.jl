@@ -230,7 +230,7 @@ function smooth!(
     #=
     SPD path: smoother's negated Hessian is PSD at the MAP, and the
     sub/super blocks are transposes of each other (Hessian is
-    symmetric). At small `latent_dim` (≤ 8) this routes to LAPACK's
+    symmetric). Up to `latent_dim = 32` this routes to LAPACK's
     `pbsv` which is 30-60× faster than the general block-Thomas code.
     =#
     block_tridiagonal_solve_spd!(X0, neg_sub_v, neg_diag_v, neg_super_v, grad_vec, btd)

@@ -1334,7 +1334,7 @@ function _slds_trial_elbo(
     t2::Int,
     ux_trial::Union{Nothing,AbstractMatrix{T}},
     uy_trial::Union{Nothing,AbstractMatrix{T}},
-) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     K = length(slds.LDSs)
     Tsteps = t2 - t1 + 1
     w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps

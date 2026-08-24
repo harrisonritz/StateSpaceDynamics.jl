@@ -193,6 +193,35 @@ function gradient!(
     uy::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
+    _state_gradient!(grad, ws, lds, x, ux)
+
+    cc = ws.consts
+    obs_buf = ws.opt.dyt
+    tmp1 = ws.opt.tmp1
+    @views for t in 1:tsteps
+        observation_gradient!(tmp1, cc, obs_buf, lds, x, y, t, uy)
+        grad[:, t] .+= tmp1
+    end
+
+    return grad
+end
+
+"""
+    _state_gradient!(grad, ws, lds, x, ux)
+
+Write the state-side (prior + transition) half of the complete-data
+log-likelihood gradient into `grad` — identical for every observation model, so
+`gradient!` and its batched observation-model specialisations share it. Callers
+add the emission term afterwards.
+"""
+function _state_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    tsteps = size(x, 2)
 
     cc = ws.consts
     A_inv_Q = cc.A_inv_Q          # A'Q⁻¹
@@ -201,34 +230,29 @@ function gradient!(
 
     dxt = ws.opt.dxt
     dxt_next = ws.opt.dxt_next
-    obs_buf = ws.opt.dyt
-    tmp1 = ws.opt.tmp1
     tmp2 = ws.opt.tmp2
     tmp3 = ws.opt.tmp3
 
-    # First time step: emission + prior + outgoing factor at t = 2
-    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, 1, uy)
+    # First time step: prior + outgoing factor at t = 2
     @views dxt .= x[:, 1] .- lds.state_model.x0
     mul!(tmp3, neg_P0_inv, dxt)
     _transition_residual!(dxt_next, lds, x, 2, ux)
     mul!(tmp2, A_inv_Q, dxt_next)
-    @views grad[:, 1] .= tmp1 .+ tmp2 .+ tmp3
+    @views grad[:, 1] .= tmp2 .+ tmp3
 
-    # Middle steps: emission + incoming factor at t + outgoing factor at t + 1
+    # Middle steps: incoming factor at t + outgoing factor at t + 1
     @views for t in 2:(tsteps - 1)
-        observation_gradient!(tmp1, cc, obs_buf, lds, x, y, t, uy)
         _transition_residual!(dxt, lds, x, t, ux)
         mul!(tmp3, neg_Q_inv, dxt)
         _transition_residual!(dxt_next, lds, x, t + 1, ux)
         mul!(tmp2, A_inv_Q, dxt_next)
-        grad[:, t] .= tmp1 .+ tmp3 .+ tmp2
+        grad[:, t] .= tmp3 .+ tmp2
     end
 
-    # Last time step: emission + incoming factor at t = T
-    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, tsteps, uy)
+    # Last time step: incoming factor at t = T
     _transition_residual!(dxt, lds, x, tsteps, ux)
     mul!(tmp3, neg_Q_inv, dxt)
-    @views grad[:, tsteps] .= tmp1 .+ tmp3
+    @views grad[:, tsteps] .= tmp3
 
     return grad
 end
