@@ -111,6 +111,14 @@ using SSDTest
                 test_SLDS_estep_elbo_components()
                 test_SLDS_elbo_matches_LDS_marginal_K1()
                 test_SLDS_public_elbo()
+                test_SLDS_smooth_infer_basic()
+                test_SLDS_smooth_infer_shapes()
+                test_SLDS_smooth_infer_deterministic_and_modes()
+                test_SLDS_smooth_infer_K1()
+                test_SLDS_smooth_infer_recovers_distinct_regimes()
+                test_SLDS_smooth_infer_cov_and_elbo()
+                test_SLDS_loglikelihood_returns_elbo()
+                test_SLDS_fit_smoothing_iters()
                 test_SLDS_no_priors_zero_prior_logdensity()
                 test_SLDS_x0_niw_prior()
                 test_SLDS_joint_sample_reproduces_cross_covariance()
@@ -131,12 +139,20 @@ using SSDTest
                 test_SLDS_gradient_weight_normalization_poisson()
             end
 
-            @testset "Tied emissions and posteriors" begin
-                test_SLDS_tied_emissions_poisson()
-                test_SLDS_tied_emissions_gaussian()
-                test_SLDS_tied_emissions_respects_fit_bool()
-                test_SLDS_posterior_poisson()
-                test_SLDS_posterior_recovers_regimes()
+            @testset "Tied parameters and posteriors" begin
+                test_SLDS_tied_params_canonicalization()
+                test_SLDS_tied_params_poisson()
+                test_SLDS_tied_params_gaussian()
+                test_SLDS_tied_params_respects_fit_bool()
+                test_SLDS_tied_params_each_group()
+                test_SLDS_tied_params_elbo_monotone()
+                test_SLDS_tied_params_gls_path()
+                test_SLDS_tied_params_x0_P0_noop()
+                test_SLDS_tied_params_frozen_group()
+                test_SLDS_tied_params_partial_errors()
+                test_SLDS_tied_params_partial_prior()
+                test_SLDS_smooth_poisson()
+                test_SLDS_smooth_recovers_regimes()
             end
 
             @testset "Control inputs (ux/uy)" begin
@@ -295,8 +311,10 @@ using SSDTest
 
             @testset "SLDS fitting" begin
                 test_grouped_slds_fit()
-                test_grouped_slds_tied_emissions()
-                test_grouped_slds_posterior()
+                test_grouped_slds_tied_params()
+                test_grouped_slds_smooth()
+                test_tied_gls_regression()
+                test_grouped_pooled_regression_under_grouped_noise()
                 test_grouped_slds_requires_matching_labels()
             end
         end

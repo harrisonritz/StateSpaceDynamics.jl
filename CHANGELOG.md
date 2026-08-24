@@ -8,23 +8,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- `fit!(slds, y; tie_emissions=true)`: one emission shared by every regime.
-  `[C d D]` (and the Gaussian `R`) is then fitted once from the whole
-  trajectory and copied across regimes, so only `[A b B Q]` and the discrete
-  chain switch — the usual reading for neural data, where the recording does
-  not change when the dynamics do, and `K` times fewer emission parameters.
-  Valid because the emission term does not depend on the regime and
-  `Σₖ γₖ(t) = 1`, which collapses the summed per-regime weighted objectives to
-  the unit-weight one. Works with `depends_on`, where the tie is *within* a
-  group (each session keeps its own emission, shared by every regime), and
-  leaves a frozen emission (`fit_bool`) untouched. Default `false`, so existing
-  fits are unchanged
-- `posterior(slds, y; ux, uy, depends_on, max_iter, rng)`: the variational
-  posteriors of a fitted SLDS — `x_smooth`, `p_smooth`, the discrete
-  responsibilities `γ` and the ELBO trace — at fixed parameters. `fit!` runs the
-  same E-step but keeps its forward-backward storage private, so this is the way
-  to get `q(z)` (regime occupancy, a Viterbi-style `argmax` path, a rate
-  averaged over regimes) out of a model, on training or held-out data
+- `fit!(slds, y; tied_params=...)`: share any parameter group across every
+  regime instead of fitting one per regime. Takes a `Symbol` or a collection of
+  them, named the way `depends_on` and `fit_bool` name parameters — `[A b B]` is
+  fit as one regression so any of `:A`/`:b`/`:B` names the whole group, likewise
+  `:C`/`:d`/`:D` for `[C d D]`, with `:Q` and `:R` groups of their own.
+  `tied_params = (:C, :R)` is the usual reading for neural data, where the
+  recording does not change when the dynamics do (and `K` times fewer emission
+  parameters); `tied_params = (:A, :Q)` is the mirror image, one set of dynamics
+  with switching emissions. `:x0`/`:P0` are accepted and ignored, since an SLDS
+  ties its initial state across regimes unconditionally. Works with
+  `depends_on`, where the tie is *within* a group — each session keeps its own
+  version, shared by every regime — and leaves a frozen group (`fit_bool`)
+  untouched. Tied groups are broadcast before the first E-step, so no regime
+  ever infers `q(x)`/`q(z)` through a parameter the model does not have
+  * Tying a regression alongside its noise covariance (`(:C, :d, :D, :R)`,
+    `(:A, :b, :B, :Q)`) is the ordinary M-step on pooled statistics: the shared
+    term does not depend on the regime and `Σₖ γₖ(t) = 1`, so the summed
+    per-regime weighted objectives collapse to the unit-weight one. Tying only
+    the noise is equally cheap — each regime contributes its own residual
+    scatter and they are summed before the covariance is formed
+  * Tying only the regression (`(:C, :d, :D)` without `:R`) is exact but costs
+    more. The residual covariance no longer divides out of `∂/∂W`, so the output
+    rows couple and the shared fit becomes a generalized least-squares solve of
+    size `p·m` — `O((p·m)³)` against the pooled fit's `O(m³)`. The solver
+    (`_tied_gls_regression`) is written against a flat list of units and reduces
+    exactly to the pooled `mn_map` when the covariances agree, so it is
+    available to any future caller with the same shape
+  * Tying *part* of a regression (`:C` without `:d`) is exact too: each regime's
+    free columns are projected out of its statistics, the shared block is solved
+    by the same GLS over what remains, and the free columns come back by
+    back-substitution (`_partial_tied_regression`, Frisch–Waugh–Lovell). Two
+    cases have no such reduction and throw: a Poisson `[C d D]`, which is fitted
+    by LBFGS rather than from sufficient statistics, and a partial tie alongside
+    `depends_on`, which already splits the regression per group of trials. A
+    matrix-normal prior is split between the shared and free blocks when its
+    column precision `Λ` does not couple them (a diagonal `Λ` always qualifies),
+    and throws when it does
+- `smooth(slds, y; ux, uy, depends_on, smoothing_iters, tol, return_cov,
+  progress)`: the variational posteriors of a fitted SLDS at fixed parameters,
+  returned as one `NamedTuple` `(; x, γ, elbo, p)` — the continuous states
+  `q(x)`, the discrete responsibilities `γₜ(k) = q(zₜ = k)`, the ELBO at those
+  posteriors, and (opt-in via `return_cov`) the smoothed covariances. It
+  alternates forward-backward over the switching chain with the Laplace/Kalman
+  smoother over the continuous states (Ghahramani & Hinton, 1996) until `γ`
+  converges (`tol`) or `smoothing_iters` alternations are spent. Unlike the
+  single-Monte-Carlo-sample E-step `fit!` runs during learning, the coupling
+  here is deterministic — the discrete layer is scored at the smoothed
+  posterior mean — so the result is reproducible with no `rng` to pass. `fit!`
+  runs the same alternation but keeps its forward-backward storage private, so
+  this is the way to get `q(z)` (regime occupancy, a Viterbi-style `argmax`
+  path, a rate averaged over regimes) out of a model, on training or held-out
+  data
+- `fit!(slds, y; smoothing_iters=n)`: run `n` discrete↔continuous alternations
+  per E-step instead of one. The default of 1 is the standard vLEM update;
+  larger values hand the M-step a better-converged posterior at proportional
+  cost per iteration
 - Ancillary parameter dependencies: every
   `AbstractStateModel` and `AbstractObservationModel` now carries a
   `depends_on` field (default `nothing`). Setting it to a `NamedTuple` of
@@ -91,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- **Breaking:** parameter names no longer stand in for the group they are fitted
+  with. `depends_on = (C = session, R = session)` was shorthand for grouping the
+  whole `[C d D]` regression; it is now an error, and the members must be named
+  — `(C = session, d = session, D = session, R = session)`. `:A`/`:b`/`:B` the
+  same. A model with no observation input has no `D` to fit, so `(C, d)` is the
+  whole group there. The old spelling reads as a claim about `C` alone while
+  quietly fitting `d` and `D` per group as well, which is exactly the kind of
+  mistake the check now catches. `group_labels` / `group_parameter` /
+  `set_group_seeds!` are unaffected: they look a parameter up rather than
+  declaring anything, so an individual name is still what they want
 - **Breaking:** the previously exported (but unused) `Data` struct is now a
   private, validated container for multi-trial observations + `ux`/`uy` inputs.
   Public entry points (`fit!`, `smooth`, `loglikelihood`) accept plain arrays —
@@ -109,6 +158,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path and all three observation shapes on both the Gaussian and Poisson
   paths; multi-trial input returns per-trial vectors, matrix input returns
   matrices as before (#139)
+- **Breaking:** `elbo(slds, y)` is now deterministic. It infers `q(x)` and
+  `q(z)` by the same coordinate ascent as `smooth(slds, y)` and returns that
+  call's `elbo` field, rather than running one Monte-Carlo E-step off a joint
+  draw from `q(x)`. It no longer takes an `rng`, and takes `smoothing_iters` /
+  `tol` / `progress` instead; the value is a converged bound rather than one
+  matching `fit!`'s first noisy trace entry
+- **Breaking:** `loglikelihood(slds, y)` returns the ELBO instead of throwing.
+  The exact marginal `log p(y)` is still intractable for a switching model
+  (it needs a sum over all `K^T` regime sequences), so the returned value is a
+  variational lower bound — comparable across models fit to the same data, but
+  not a likelihood
 - **Breaking:** renamed the control-input arguments `latent_inputs`/`obs_inputs`
   to `ux`/`uy` across the public API (keywords on `fit!`/`rand`, positional on
   `smooth!`/`estep!`) (#139)
@@ -151,6 +211,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P0` now fails.
 
 ### Fixed
+- A grouped (`depends_on`) fit that pooled a regression over units with
+  *different* noise versions — e.g. `depends_on = (R = session,)` with one
+  emission over all sessions — solved the ordinary pooled normal equations,
+  which do not maximize the ELBO when the residual covariance is not shared.
+  Those cases now go through the generalized-least-squares solve described
+  under Added; a version whose units do share a covariance keeps the cheap
+  pooled path, which is the same estimator
+- The documentation build failed: `set_group_seeds!` is exported and carries a
+  docstring but was not in any `@docs` block, so Documenter raised both
+  `missing_docs` and the unresolved `@ref`s pointing at it
+- Multi-trial `rand(lds, tsteps_per_trial)` threw
+  `Attempted to capture and modify outer local variables` instead of sampling.
+  The per-trial parameter vectors were assigned from two branches of an `if`
+  and then captured by the `tforeach` sampling closure, so Julia boxed them and
+  OhMyThreads rejected the closure outright. They are now built in a helper, so
+  each name is assigned once
+- `fit!(slds, y; tie_emissions=true)` fitted the shared Gaussian emission from an
+  uninitialized workspace, usually throwing `PosDefException` from the Cholesky
+  in `_aggregate_td_suff_stats!` and otherwise returning nonsense. The
+  unit-weight aggregator seeds its buffers from the data-only constant blocks
+  (`Σ y y'`, `Σ y`, the observation count, the `uy` blocks), which only the
+  LDS/PLDS `fit!` entry points fill — the SLDS never reaches them, because its
+  own M-step goes through the weighted aggregator, which needs no constants.
+  Both the plain and the grouped tied-emission updates now fill them first
 - SLDS `forward_backward` could produce `NaN`s when a regime received ~no
   responsibility at trial starts: its initial-state effective count `init_n`
   underflowed toward zero, so `x0 = init_xy/init_n` and `P0 = S0/init_n` blew up

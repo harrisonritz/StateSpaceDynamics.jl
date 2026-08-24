@@ -457,7 +457,7 @@ function _grouped_smooth(
     cell_lds = _cell_ldss(lds, grp)
     cell_pools = _cell_sws_pools(lds, data, grp, cell_lds, sws_pool)
 
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         trials = grp.cell_trials[c]
         cell_data = _subset_data(data, trials)
         tfs = initialize_FilterSmooth(cell_lds[c], cell_data.tsteps)::TrialFilterSmooth{T}
@@ -518,6 +518,220 @@ function _distinct_by_slot(slots::AbstractVector{Int}, units::AbstractVector{Int
 end
 
 # ============================================================================
+# Shared regression under per-unit residual covariance
+# ============================================================================
+
+"""
+    _shared_noise(noise_slots, units) -> Bool
+
+Whether every unit in `units` also shares one residual-covariance version.
+Decides which estimator [`_grouped_update_A_b!`](@ref) /
+[`_grouped_update_C_d!`](@ref) reach for.
+"""
+function _shared_noise(noise_slots::AbstractVector{Int}, units::AbstractVector{Int})
+    length(units) == 1 && return true
+    s = noise_slots[units[1]]
+    return all(u -> noise_slots[u] == s, units)
+end
+
+"""
+    _tied_gls_regression(Szz, Szy, Σ, prior, Σ_prior) -> W
+
+Fit one regression matrix `W` (`p × m`) shared by several units whose residual
+covariances `Σ[u]` (`p × p`) differ. `Szz[u]` is the unit's `m × m` regressor
+Gram matrix and `Szy[u]` its `m × p` cross-product (the `*_xx` / `*_xy` blocks
+of a `SufficientStatistics`).
+
+Pooling the units' statistics and solving the ordinary normal equations
+maximizes the objective only when the units also share `Σ` — held fixed, it
+divides out of `∂/∂W`. When it does not, the output rows couple:
+
+```math
+Σᵤ Σᵤ⁻¹ (Szyᵤ' − W Szzᵤ) = 0
+```
+
+which vectorizes to the `(p·m)`-square system
+
+```math
+[Σᵤ (Szzᵤ ⊗ Σᵤ⁻¹)] vec(W) = vec(Σᵤ Σᵤ⁻¹ Szyᵤ')
+```
+
+(the leading `Σᵤ` of each side is the sum over units, not a covariance.)
+
+A matrix-normal `prior` on `W` contributes `Λ ⊗ Σ_prior⁻¹` on the left and
+`Σ_prior⁻¹ M₀ Λ` on the right, where `Σ_prior` is the covariance the prior's
+row scale refers to. Its row scale is a residual covariance, and there is no
+single one here, so the caller picks the representative it stores the fitted
+`W` on.
+
+With every `Σ[u]` equal this returns exactly [`mn_map`](@ref)'s answer — the
+common factor cancels from both sides — so the cheap pooled path is a special
+case of this one rather than a different estimator.
+
+Costs `O((p·m)³)` and `O((p·m)²)` memory. For a wide emission that dominates
+the whole M-step, so callers should reach for it only when the residual
+covariance genuinely is not shared.
+"""
+function _tied_gls_regression(
+    Szz::AbstractVector{<:AbstractMatrix{T}},
+    Szy::AbstractVector{<:AbstractMatrix{T}},
+    Σ::AbstractVector{<:AbstractMatrix{T}},
+    prior::Union{Nothing,MNPrior},
+    Σ_prior::AbstractMatrix{T},
+) where {T<:Real}
+    m = size(Szz[1], 1)
+    p = size(Szy[1], 2)
+
+    lhs = zeros(T, m * p, m * p)
+    rhs = zeros(T, p, m)
+    for u in eachindex(Szz)
+        Σinv = inv(cholesky(Symmetric(Σ[u])))
+        # vec(Σ⁻¹ W Szz) = (Szz ⊗ Σ⁻¹) vec(W), Szz symmetric.
+        lhs .+= kron(Szz[u], Σinv)
+        mul!(rhs, Σinv, transpose(Szy[u]), one(T), one(T))
+    end
+
+    if prior !== nothing
+        Σinv0 = inv(cholesky(Symmetric(Σ_prior)))
+        lhs .+= kron(prior.Λ, Σinv0)
+        mul!(rhs, Σinv0, prior.M₀ * prior.Λ, one(T), one(T))
+    end
+
+    return reshape(Symmetric(lhs) \ vec(rhs), p, m)
+end
+
+"""
+    _split_mn_prior(prior, tied, free, context) -> (prior_tied, prior_free)
+
+Split a matrix-normal prior on a regression across a column partition, for a
+regression whose `tied` columns are shared and whose `free` columns are not.
+
+The prior term is `−½ tr(Σ⁻¹ (W − M₀) Λ (W − M₀)')`, which separates into a
+tied part and a free part exactly when `Λ[tied, free]` is zero — true for the
+ridge and per-column priors that make up the common cases. When it is not, the
+prior ties the two blocks together and there is no split to make: that throws
+rather than quietly dropping the cross term.
+
+`nothing` in, `(nothing, nothing)` out.
+"""
+_split_mn_prior(::Nothing, ::AbstractVector{Int}, ::AbstractVector{Int}, ::AbstractString) =
+    (nothing, nothing)
+
+function _split_mn_prior(
+    prior::MNPrior,
+    tied::AbstractVector{Int},
+    free::AbstractVector{Int},
+    context::AbstractString,
+)
+    Λ = prior.Λ
+    coupling = @views maximum(abs, Λ[tied, free]; init=zero(eltype(Λ)))
+    iszero(coupling) || throw(
+        ArgumentError(
+            "$context: the matrix-normal prior on this regression has a column " *
+            "precision `Λ` that couples the tied columns to the free ones " *
+            "(`maximum(abs, Λ[tied, free]) = $coupling`), so the prior cannot be " *
+            "split between the shared block and the per-regime ones. Tie the whole " *
+            "regression, use a prior whose `Λ` is block-diagonal across the split " *
+            "(a diagonal `Λ` always is), or drop the prior.",
+        ),
+    )
+    return (
+        MNPrior(prior.M₀[:, tied], Λ[tied, tied]), MNPrior(prior.M₀[:, free], Λ[free, free])
+    )
+end
+
+"""
+    _partial_tied_regression(Szz, Szy, Σ, priors, tied, context) -> Vector{Matrix}
+
+Fit one regression per unit under a *column* tie: the `tied` columns of `W` are
+shared by every unit, the rest stay free. Returns each unit's full `p × m` `W`,
+with the shared columns identical across them.
+
+Sharing part of a regression is still a linear problem, and it reduces to the
+whole-regression one. Stationarity in a unit's free block gives
+
+```math
+Wᶠᵤ = (Szyᵤ[free,:]' − Wᵗ Szzᵤ[tied,free]') Szzᵤ[free,free]⁻¹
+```
+
+with the unit's own noise cancelling, since only that unit's term involves it.
+Substituting it into the shared block's condition leaves the same system
+[`_tied_gls_regression`](@ref) solves, over statistics with the free columns
+projected out — Frisch–Waugh–Lovell, once per unit:
+
+```math
+S̃zzᵤ = Szzᵤ[tied,tied] − Szzᵤ[tied,free] Szzᵤ[free,free]⁻¹ Szzᵤ[free,tied]
+```
+
+So the cheap pooled path, the whole-regression GLS and this one are the same
+estimator seen at three levels of sharing, and a partial tie costs one extra
+`|free|`-square solve per unit on top of the tied fit.
+
+A per-unit matrix-normal `prior` is folded into that unit's statistics for the
+free block and passed through for the shared one (from unit 1, the unit the
+shared value is stored on) — see [`_split_mn_prior`](@ref) for when that split
+is available.
+"""
+function _partial_tied_regression(
+    Szz::AbstractVector{<:AbstractMatrix{T}},
+    Szy::AbstractVector{<:AbstractMatrix{T}},
+    Σ::AbstractVector{<:AbstractMatrix{T}},
+    priors::AbstractVector,
+    tied::AbstractVector{Int},
+    context::AbstractString,
+) where {T<:Real}
+    m = size(Szz[1], 1)
+    U = length(Szz)
+    free = setdiff(1:m, tied)
+
+    # Whole-regression tie: no free block to project out.
+    if isempty(free)
+        W = _tied_gls_regression(Szz, Szy, Σ, priors[1], Σ[1])
+        return [copy(W) for _ in 1:U]
+    end
+
+    prior_tied = nothing
+    Sff = Vector{Matrix{T}}(undef, U)   # free Gram, prior-augmented
+    Sfy = Vector{Matrix{T}}(undef, U)   # free cross-product, prior-augmented
+    Sft = Vector{Matrix{T}}(undef, U)   # free × tied block
+    Szz_r = Vector{Matrix{T}}(undef, U)
+    Szy_r = Vector{Matrix{T}}(undef, U)
+
+    for u in 1:U
+        pt, pf = _split_mn_prior(priors[u], tied, free, context)
+        u == 1 && (prior_tied = pt)
+
+        Aff = Matrix(@view Szz[u][free, free])
+        Aft = Matrix(@view Szz[u][free, tied])
+        Att = Matrix(@view Szz[u][tied, tied])
+        Yf = Matrix(@view Szy[u][free, :])
+        Yt = Matrix(@view Szy[u][tied, :])
+        if pf !== nothing
+            Aff .+= pf.Λ
+            Yf .+= pf.Λ * transpose(pf.M₀)
+        end
+
+        Fchol = cholesky(Symmetric(Aff))
+        Szz_r[u] = Att - transpose(Aft) * (Fchol \ Aft)
+        Szy_r[u] = Yt - transpose(Aft) * (Fchol \ Yf)
+        Sff[u], Sfy[u], Sft[u] = Aff, Yf, Aft
+    end
+
+    W_tied = _tied_gls_regression(Szz_r, Szy_r, Σ, prior_tied, Σ[1])
+
+    p = size(W_tied, 1)
+    out = Vector{Matrix{T}}(undef, U)
+    for u in 1:U
+        W_free = (transpose(Sfy[u]) - W_tied * transpose(Sft[u])) / Symmetric(Sff[u])
+        W = Matrix{T}(undef, p, m)
+        W[:, tied] .= W_tied
+        W[:, free] .= W_free
+        out[u] = W
+    end
+    return out
+end
+
+# ============================================================================
 # Grouped parameter updates
 # ============================================================================
 
@@ -562,11 +776,26 @@ function _grouped_update_A_b!(
     ldss::AbstractVector,
     sufs::AbstractVector,
     slots::AbstractVector{Int},
+    slots_q::AbstractVector{Int},
     sws::SmoothWorkspace,
     bufs::GroupedSufBuffers,
 )
     for units in _units_by_slot(slots)
-        update_A_b!(ldss[units[1]], _pool_dyn!(bufs, sufs, units), sws)
+        lds = ldss[units[1]]
+        if _shared_noise(slots_q, units)
+            # One `Q` over these units ⇒ it divides out and pooled OLS is exact.
+            update_A_b!(lds, _pool_dyn!(bufs, sufs, units), sws)
+        else
+            lds.fit_bool[_G_AB] || continue
+            W = _tied_gls_regression(
+                [sufs[u].dyn_xx[].mat for u in units],
+                [sufs[u].dyn_xy for u in units],
+                [ldss[u].state_model.Q for u in units],
+                lds.state_model.AB_prior,
+                lds.state_model.Q,
+            )
+            _unpack_dyn_W!(lds, W)
+        end
     end
     return nothing
 end
@@ -607,14 +836,29 @@ function _grouped_update_C_d!(
     ldss::AbstractVector,
     sufs::AbstractVector,
     slots::AbstractVector{Int},
+    slots_r::AbstractVector{Int},
     sws::SmoothWorkspace,
     bufs::GroupedSufBuffers;
     unit_sws::Union{Nothing,AbstractVector}=nothing,
 )
     for units in _units_by_slot(slots)
-        update_C_d!(
-            ldss[units[1]], _pool_obs!(bufs, sufs, units), _unit_ws(unit_sws, sws, units[1])
-        )
+        lds = ldss[units[1]]
+        if _shared_noise(slots_r, units)
+            # One `R` over these units ⇒ it divides out and pooled OLS is exact.
+            update_C_d!(
+                lds, _pool_obs!(bufs, sufs, units), _unit_ws(unit_sws, sws, units[1])
+            )
+        else
+            lds.fit_bool[_G_CD] || continue
+            V = _tied_gls_regression(
+                [sufs[u].obs_xx[].mat for u in units],
+                [sufs[u].obs_xy for u in units],
+                [ldss[u].obs_model.R for u in units],
+                lds.obs_model.CD_prior,
+                lds.obs_model.R,
+            )
+            _unpack_obs_V!(lds, V)
+        end
     end
     return nothing
 end
@@ -662,7 +906,7 @@ function _grouped_state_mstep!(
 )
     _grouped_update_x0!(ldss, sufs, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, sufs, slots[_G_P0], slots[_G_X0], sws)
-    _grouped_update_A_b!(ldss, sufs, slots[_G_AB], sws, bufs)
+    _grouped_update_A_b!(ldss, sufs, slots[_G_AB], slots[_G_Q], sws, bufs)
     _grouped_update_Q!(ldss, sufs, slots[_G_Q], slots[_G_AB], sws)
     return nothing
 end
@@ -680,7 +924,9 @@ function _grouped_gaussian_obs_mstep!(
     bufs::GroupedSufBuffers;
     unit_sws::Union{Nothing,AbstractVector}=nothing,
 )
-    _grouped_update_C_d!(ldss, sufs, slots[_G_CD], sws, bufs; unit_sws=unit_sws)
+    _grouped_update_C_d!(
+        ldss, sufs, slots[_G_CD], slots[_G_R], sws, bufs; unit_sws=unit_sws
+    )
     _grouped_update_R!(ldss, sufs, slots[_G_R], slots[_G_CD], sws; unit_sws=unit_sws)
     return nothing
 end

@@ -19,7 +19,11 @@ are shared across regimes; the active regime `zₜ` selects which per-regime
 
     M-Step:         mstep!(slds, tfs, fb_storage, dl, y, sws; ux, uy)
 
-    Fit:            fit!(slds, y; ux, uy)
+    Fit:            fit!(slds, y; ux, uy, smoothing_iters)
+
+    Infer:          smooth(slds, y; ux, uy, smoothing_iters, tol)  # -> (; x, γ, elbo, p)
+
+    ELBO:           elbo(slds, y; ux, uy) == loglikelihood(slds, y; ux, uy)
 =============================================================================#
 
 """
@@ -297,16 +301,17 @@ function _sample_continuous_given_discrete!(
     # Initial state
     k1 = z_trial[1]
     x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
-    y_trial[:, 1] = rand.(
-        rng,
-        Poisson.(
-            exp.(
-                obs_params[k1].C * x_trial[:, 1] +
-                obs_params[k1].d +
-                obs_params[k1].D * uy_trial[:, 1],
+    y_trial[:, 1] =
+        rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params[k1].C * x_trial[:, 1] +
+                    obs_params[k1].d +
+                    obs_params[k1].D * uy_trial[:, 1],
+                ),
             ),
-        ),
-    )
+        )
 
     # Subsequent states
     for t in 2:tsteps
@@ -322,16 +327,17 @@ function _sample_continuous_given_discrete!(
             ),
         )
 
-        y_trial[:, t] = rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params[k_curr].C * x_trial[:, t] +
-                    obs_params[k_curr].d +
-                    obs_params[k_curr].D * uy_trial[:, t],
+        y_trial[:, t] =
+            rand.(
+                rng,
+                Poisson.(
+                    exp.(
+                        obs_params[k_curr].C * x_trial[:, t] +
+                        obs_params[k_curr].d +
+                        obs_params[k_curr].D * uy_trial[:, t],
+                    ),
                 ),
-            ),
-        )
+            )
     end
 end
 
@@ -717,7 +723,13 @@ function smooth!(
     return fs
 end
 
-# Public API wrapper
+"""
+    smooth(slds, y, w; ux=nothing, uy=nothing)
+
+Smooth a single trial under **given** discrete responsibilities `w` (`K × T`), without
+inferring them. Returns `(x_smooth, p_smooth)`. To infer the responsibilities as well,
+call [`smooth(slds, y)`](@ref) with no `w`.
+"""
 function smooth(
     slds::SLDS,
     y::AbstractMatrix{T},
@@ -735,25 +747,463 @@ function smooth(
 end
 
 """
-    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; rng, obs_seq, control_seq, seq_ends)
+    smooth(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
+           return_cov=false, progress=false, depends_on=nothing)
 
-E-step for SLDS using a single sample from the continuous posterior. Updates both
-variational posteriors in coordinate-ascent order:
+Infer the joint posterior of a **fitted** `SLDS` with the parameters held fixed: the
+continuous states `q(x)`, the discrete responsibilities `γₜ(k) = q(zₜ = k)`, and the
+ELBO at those posteriors.
 
-- Fills `dl.logL` (`K × sum(T_i)`) with per-state log-likelihoods from the continuous
-  trajectory sampled at the end of the previous smooth (`x_samples`, filled either by the
-  `fit!` warm-start or by the prior E-step iteration)
-- Updates the discrete posterior q(z) via forward-backward (HiddenMarkovModels.jl, one
-  storage covers all trials; HMMs.jl `@threads` across trials internally)
-- Updates the continuous posterior q(x) by running the Laplace/Newton smoother on each
-  trial with the freshly-updated discrete weights `γ`, filling `tfs[*].x_smooth`,
-  `tfs[*].p_smooth`, and `tfs[*].entropy`, and drawing the next joint posterior sample
-  into `x_samples[trial]` for the following iteration (an exact draw from q(x) via the
-  smoother's precision factors, see `block_tridiagonal_sample!`).
+Alternates forward-backward over the switching chain with the Laplace/Kalman smoother
+over the continuous states (Ghahramani & Hinton, 1996). Unlike the single-sample E-step
+`fit!` runs during learning, the coupling here is deterministic — the discrete layer is
+scored at the smoothed posterior mean, not at a draw from `q(x)` — so the result is
+reproducible.
 
-`x_samples` is thus read (to fill `dl.logL`) then overwritten (with the fresh draw) within
-each call. `obs_seq`/`control_seq` are the HMMs.jl placeholder sequences built in `fit!`
-(timestep indices / `nothing`s) — unrelated to the LDS control-input kwargs
+That plug-in is what makes `γ` reproducible, and it is what limits it: the mean is a
+shrunk version of the latent path, so regimes that differ *only* in their dynamics
+(`Aₖ`/`Qₖ`, with the emission shared) become hard to separate once the observation noise
+is large relative to the process noise. Regimes that differ in their emissions, or whose
+latent path the data pins down, are recovered sharply.
+
+`fit!` runs the same alternation but keeps its forward-backward storage private, so this
+is the way to read `q(z)` — a regime occupancy over time, a Viterbi-style `argmax` path,
+a rate averaged over regimes — out of a model, on the data it was fitted to or on
+held-out data.
+
+`y` takes the same three shapes as [`fit!`](@ref), and `ux` / `uy` the same shape family.
+
+# Keywords
+- `smoothing_iters::Int=100`: maximum discrete↔continuous alternations.
+- `tol::Real=1e-6`: stop once `max|Δγ| < tol`; `tol=0` runs exactly `smoothing_iters`
+  alternations with no stopping test.
+- `return_cov::Bool=false`: also return the smoothed covariances (`latent_dim² × T` per
+  trial — large, hence opt-in).
+- `progress::Bool=false`: show a progress bar.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  `depends_on` declared on the regimes for this call. A held-out set has its own trial
+  count, so it needs its own label vectors.
+
+# Returns
+A `NamedTuple` `(; x, γ, elbo, p)`. For a single-trial matrix `y`, `x` is
+`latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
+array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
+always a scalar, and `p` is `nothing` unless `return_cov=true`.
+
+Because a converged alternation is expensive, `smooth` returns everything it computed in
+one call — read its `elbo` field rather than calling [`elbo`](@ref) separately.
+"""
+function smooth(
+    slds::SLDS{T,S,O},
+    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    ux=nothing,
+    uy=nothing,
+    smoothing_iters::Int=100,
+    tol::Real=1e-6,
+    return_cov::Bool=false,
+    progress::Bool=false,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    #=
+    Same setup as `fit!`, minus the M-step workspaces: `Data` validates and
+    canonicalizes the observation / input shapes, the grouping resolves
+    `depends_on` into per-cell parameter views, and the discrete layer wraps the
+    (K × ΣT) log-likelihood matrix the forward-backward pass reads.
+    =#
+    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    y_seq = data.y
+    ux_seq = data.ux
+    uy_seq = data.uy
+
+    K = length(slds.LDSs)
+    tsteps_per_trial = data.tsteps
+    ntrials = length(y_seq)
+    seq_ends = cumsum(tsteps_per_trial)
+    total_T = last(seq_ends)
+    T_max = maximum(tsteps_per_trial)
+
+    grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
+    cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
+
+    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
+    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
+    fb_storage = _make_slds_fb_storage(dl, seq_ends)
+    obs_seq = collect(1:total_T)
+    control_seq = fill(nothing, total_T)
+    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
+    cell_ws = _slds_cell_workspaces(slds, cell_slds, slds_ws, T_max)
+
+    #=
+    No M-step runs, so the per-regime constants cached by the workspace stay
+    valid for every alternation. `x_samples === nothing` throughout: the discrete
+    layer is scored at the smoothed mean, so no draw from q(x) is ever needed.
+    =#
+    _slds_warmstart!(
+        slds,
+        cell_slds,
+        grp,
+        tfs,
+        y_seq,
+        nothing,
+        slds_ws,
+        tsteps_per_trial,
+        K;
+        ux=ux_seq,
+        uy=uy_seq,
+        cell_ws=cell_ws,
+    )
+
+    prog = if progress
+        Progress(smoothing_iters; desc="Smoothing SLDS...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
+
+    _, converged = _vem_alternate!(
+        slds,
+        cell_slds,
+        grp,
+        tfs,
+        fb_storage,
+        dl,
+        y_seq,
+        slds_ws;
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+        ux=ux_seq,
+        uy=uy_seq,
+        cell_ws=cell_ws,
+        smoothing_iters=smoothing_iters,
+        tol=T(tol),
+        prog=prog,
+    )
+    prog !== nothing && finish!(prog)
+
+    if tol > 0 && !converged
+        @warn "SLDS smoothing did not converge" smoothing_iters tol
+    end
+
+    total_elbo = if grp === nothing
+        elbo!(slds, tfs, fb_storage, y_seq, slds_ws; seq_ends=seq_ends, ux=ux_seq, uy=uy_seq)
+    else
+        _elbo_grouped!(
+            cell_slds::Vector,
+            grp::ParameterGrouping,
+            tfs,
+            fb_storage,
+            y_seq,
+            slds_ws;
+            seq_ends=seq_ends,
+            ux=ux_seq,
+            uy=uy_seq,
+            cell_ws=cell_ws,
+        )
+    end
+
+    γ_trials = Vector{Matrix{T}}(undef, ntrials)
+    x_trials = Vector{Matrix{T}}(undef, ntrials)
+    p_trials = return_cov ? Vector{Array{T,3}}(undef, ntrials) : nothing
+    for trial in 1:ntrials
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        γ_trials[trial] = Matrix{T}(view(fb_storage.γ, :, t1:t2))
+        x_trials[trial] = copy(tfs[trial].x_smooth)
+        return_cov && (p_trials[trial] = copy(tfs[trial].p_smooth))
+    end
+
+    return _collect_slds_smooth_output(x_trials, γ_trials, p_trials, total_elbo, y)
+end
+
+#=
+Public-shape return convention, mirroring `_collect_smooth_output` in fit_LDS.jl:
+matrix in → per-trial arrays out (single trial); vector / 3-D array in → vectors out.
+`y` is only inspected for its container type.
+=#
+function _collect_slds_smooth_output(x, γ, p, total_elbo, ::AbstractMatrix)
+    return (; x=x[1], γ=γ[1], elbo=total_elbo, p=(p === nothing ? nothing : p[1]))
+end
+
+function _collect_slds_smooth_output(x, γ, p, total_elbo, _)
+    return (; x=x, γ=γ, elbo=total_elbo, p=p)
+end
+
+"""
+    _slds_fill_logL!(slds, cell_slds, grp, dl, y, x_of, slds_ws; seq_ends, ux, uy, cell_ws)
+
+Fill `dl.logL` (`K × sum(T_i)`) with every regime's log-density of the current
+continuous trajectory. `x_of(trial)` supplies that trajectory: the smoothed mean
+for deterministic inference, a joint draw from `q(x)` for the Monte-Carlo E-step.
+
+When `grp === nothing` this is the plain per-trial loop; otherwise trials are
+visited cell by cell so the regime constants are refreshed once per cell.
+"""
+function _slds_fill_logL!(
+    slds::SLDS{T},
+    cell_slds::Union{Nothing,AbstractVector},
+    grp::Union{Nothing,ParameterGrouping},
+    dl::SLDSDiscreteLayer{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    x_of,
+    slds_ws::SLDSSmoothWorkspace{T};
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    cell_ws::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real}
+    K = length(slds.LDSs)
+
+    function fill_trial!(slds_t, ws_t, trial)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        x_src = x_of(trial)
+        y_trial = y[trial]
+        ux_trial = ux === nothing ? nothing : ux[trial]
+        uy_trial = uy === nothing ? nothing : uy[trial]
+        for k in 1:K
+            joint_loglikelihood!(
+                view(dl.logL, k, t1:t2),
+                ws_t,
+                ws_t.consts[k],
+                slds_t.LDSs[k],
+                x_src,
+                y_trial,
+                ux_trial,
+                uy_trial,
+            )
+        end
+        return nothing
+    end
+
+    if grp === nothing || cell_slds === nothing
+        for trial in eachindex(y)
+            fill_trial!(slds, slds_ws, trial)
+        end
+        return nothing
+    end
+
+    for c in 1:(grp.ncells)
+        slds_c = cell_slds[c]
+        ws_c = _slds_ws_for(cell_ws, slds_ws, c)
+        refresh_slds_constants!(ws_c, slds_c)
+        for trial in grp.cell_trials[c]
+            fill_trial!(slds_c, ws_c, trial)
+        end
+    end
+    return nothing
+end
+
+"""
+    _slds_smooth_all!(slds, cell_slds, grp, tfs, y, x_samples, slds_ws, w_of; ...)
+
+Run the Laplace/Newton smoother over every trial under the discrete weights
+`w_of(trial)` (`K × T_i`), filling `tfs[*].x_smooth`, `tfs[*].p_smooth`, and
+`tfs[*].entropy`. `x_samples === nothing` skips the joint draw (the
+deterministic path); otherwise the next draw from `q(x)` lands in
+`x_samples[trial]`.
+
+When `grp === nothing` this is the plain per-trial loop; otherwise trials are
+visited cell by cell so the regime constants are refreshed once per cell.
+"""
+function _slds_smooth_all!(
+    slds::SLDS{T},
+    cell_slds::Union{Nothing,AbstractVector},
+    grp::Union{Nothing,ParameterGrouping},
+    tfs::TrialFilterSmooth{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
+    slds_ws::SLDSSmoothWorkspace{T},
+    w_of;
+    rng::AbstractRNG=Random.default_rng(),
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    cell_ws::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real}
+    if grp === nothing || cell_slds === nothing
+        for trial in eachindex(y)
+            smooth!(
+                slds,
+                tfs[trial],
+                y[trial],
+                w_of(trial);
+                ws=slds_ws,
+                x_sample=(x_samples === nothing ? nothing : x_samples[trial]),
+                rng=rng,
+                ux=(ux === nothing ? nothing : ux[trial]),
+                uy=(uy === nothing ? nothing : uy[trial]),
+            )
+        end
+        return nothing
+    end
+
+    for c in 1:(grp.ncells)
+        _slds_smooth_cell!(
+            cell_slds,
+            grp,
+            c,
+            tfs,
+            y,
+            x_samples,
+            slds_ws,
+            w_of;
+            rng=rng,
+            ux=ux,
+            uy=uy,
+            cell_ws=cell_ws,
+        )
+    end
+    return nothing
+end
+
+"""
+    _vem_alternate!(slds, cell_slds, grp, tfs, fb_storage, dl, y, slds_ws; smoothing_iters, tol, x_samples, ...)
+
+Run up to `smoothing_iters` discrete↔continuous alternations of the structured-
+variational E-step. One alternation is:
+
+1. fill `dl.logL` (`K × sum(T_i)`) with per-regime log-likelihoods of the current
+   continuous trajectory,
+2. refresh `q(z) = γ` by forward-backward over the switching chain (HMMs.jl threads
+   across trials), and
+3. refresh `q(x)` by re-running the Laplace/Newton smoother on each trial under the new
+   `γ`, filling `tfs[*].x_smooth`, `tfs[*].p_smooth`, and `tfs[*].entropy`.
+
+`x_samples` selects how step 1 reads the continuous trajectory, and is the only
+difference between the two callers:
+
+- `x_samples === nothing` — plug in the smoothed mean `E_q[x]`. Deterministic and
+  reproducible; used by [`smooth`](@ref) for post-fit inference.
+- `x_samples !== nothing` — plug in a joint draw from `q(x)`, and draw the next one in
+  step 3. This is the vLEM Monte-Carlo E-step used by [`fit!`](@ref); `x_samples` is
+  read then overwritten within each alternation.
+
+`grp` / `cell_slds` carry an ancillary-dependency (`depends_on`) grouping; both
+`nothing` keeps every step on the ungrouped code path.
+
+`tol` selects the stopping rule. `tol == 0` runs exactly `smoothing_iters`
+alternations; `tol > 0` stops early once `max|Δγ| < tol`.
+
+Returns `(iters, converged)`.
+"""
+function _vem_alternate!(
+    slds::SLDS{T},
+    cell_slds::Union{Nothing,AbstractVector},
+    grp::Union{Nothing,ParameterGrouping},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    dl::SLDSDiscreteLayer{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    slds_ws::SLDSSmoothWorkspace{T};
+    obs_seq::AbstractVector,
+    control_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    smoothing_iters::Int,
+    tol::T=zero(T),
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    rng::AbstractRNG=Random.default_rng(),
+    prog=nothing,
+) where {T<:Real}
+    smoothing_iters >= 1 ||
+        throw(ArgumentError("smoothing_iters must be ≥ 1, got $smoothing_iters"))
+
+    K = length(slds.LDSs)
+
+    # Deterministic path scores the smoothed mean; sampled path a draw from q(x).
+    function x_of(trial)
+        return x_samples === nothing ? tfs[trial].x_smooth : x_samples[trial]
+    end
+
+    function w_of(trial)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        return view(fb_storage.γ, :, t1:t2)
+    end
+
+    # Previous-iteration γ snapshot; only allocated when there is a stopping test.
+    γ_prev = tol > 0 ? fill(T(Inf), K, last(seq_ends)) : nothing
+    converged = false
+    iters = 0
+
+    for iter in 1:smoothing_iters
+        iters = iter
+
+        # (1) Score the current continuous trajectory under each regime.
+        _slds_fill_logL!(
+            slds,
+            cell_slds,
+            grp,
+            dl,
+            y,
+            x_of,
+            slds_ws;
+            seq_ends=seq_ends,
+            ux=ux,
+            uy=uy,
+            cell_ws=cell_ws,
+        )
+
+        # (2) Update q(z): single batched forward-backward across all trials.
+        HMMs.forward_backward!(
+            fb_storage,
+            dl,
+            obs_seq,
+            control_seq;
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+
+        #=
+        (3) Update q(x) under the fresh γ, drawing the next sample on the way
+        out. Overwriting `x_samples` here is fine — step (1) already used the
+        previous draw.
+        =#
+        _slds_smooth_all!(
+            slds,
+            cell_slds,
+            grp,
+            tfs,
+            y,
+            x_samples,
+            slds_ws,
+            w_of;
+            rng=rng,
+            ux=ux,
+            uy=uy,
+            cell_ws=cell_ws,
+        )
+
+        prog !== nothing && next!(prog)
+
+        if γ_prev !== nothing
+            if iter > 1
+                Δγ = zero(T)
+                @inbounds for i in eachindex(fb_storage.γ)
+                    d = abs(fb_storage.γ[i] - γ_prev[i])
+                    d > Δγ && (Δγ = d)
+                end
+                if Δγ < tol
+                    converged = true
+                    break
+                end
+            end
+            copyto!(γ_prev, fb_storage.γ)
+        end
+    end
+
+    return iters, converged
+end
+
+"""
+    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; rng, obs_seq, control_seq, seq_ends, smoothing_iters=1)
+
+Monte-Carlo E-step for the SLDS: `smoothing_iters` coordinate-ascent alternations of
+[`_vem_alternate!`](@ref), each scoring the discrete layer against a joint draw from
+`q(x)` and drawing the next one. `smoothing_iters = 1` is the standard vLEM E-step;
+larger values hand the M-step a better-converged posterior at proportional cost.
+
+`x_samples` is read (to fill `dl.logL`) then overwritten (with the fresh draw) within
+each alternation. `obs_seq`/`control_seq` are the HMMs.jl placeholder sequences built in
+`fit!` (timestep indices / `nothing`s) — unrelated to the LDS control-input kwargs
 `ux`/`uy`. The latter, when supplied, are per-trial vectors of input matrices
 (`ux[trial]` is `(ux_dim, T_trial)`, `uy[trial]` is `(uy_dim, T_trial)`); they
 feed the per-regime `Bₖ u` / `Dₖ v` terms of every trial's smoother and
@@ -773,58 +1223,26 @@ function estep!(
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    smoothing_iters::Int=1,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    ntrials = length(y)
-    K = length(slds.LDSs)
-
-    # Fill per-trial slices of dl.logL from the previously-sampled trajectory.
-    for trial in 1:ntrials
-        t1, t2 = HMMs.seq_limits(seq_ends, trial)
-        y_trial = y[trial]
-        x_sample = x_samples[trial]
-        ux_trial = ux === nothing ? nothing : ux[trial]
-        uy_trial = uy === nothing ? nothing : uy[trial]
-        for k in 1:K
-            ll_view = view(dl.logL, k, t1:t2)
-            joint_loglikelihood!(
-                ll_view,
-                slds_ws,
-                slds_ws.consts[k],
-                slds.LDSs[k],
-                x_sample,
-                y_trial,
-                ux_trial,
-                uy_trial,
-            )
-        end
-    end
-
-    # Update q(z): single batched forward-backward (HMMs.jl threads across trials).
-    HMMs.forward_backward!(
-        fb_storage, dl, obs_seq, control_seq; seq_ends=seq_ends, transition_marginals=true
+    _vem_alternate!(
+        slds,
+        nothing,
+        nothing,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        slds_ws;
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        smoothing_iters=smoothing_iters,
+        x_samples=x_samples,
+        rng=rng,
     )
-
-    #=
-    Update q(x): re-smooth each trial with the new weights γ, and draw the next
-    sample into x_samples[trial] on the way out. Overwriting x_samples here is
-    fine — the fill loop above already used the previous draw.
-    =#
-    for trial in 1:ntrials
-        t1, t2 = HMMs.seq_limits(seq_ends, trial)
-        w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
-        smooth!(
-            slds,
-            tfs[trial],
-            y[trial],
-            w;
-            ws=slds_ws,
-            x_sample=x_samples[trial],
-            rng=rng,
-            ux=(ux === nothing ? nothing : ux[trial]),
-            uy=(uy === nothing ? nothing : uy[trial]),
-        )
-    end
-
     return nothing
 end
 
@@ -924,8 +1342,15 @@ function _slds_trial_elbo(
     trial_elbo = zero(T)
     x_smooth_trial = fs.x_smooth
 
-    # Per-regime log-density scratch, built once rather than per regime.
-    ll = view(slds_ws.ll_tmp, 1:Tsteps)
+    #=
+    Per-regime log-density scratch, built once rather than per regime. The
+    `::AbstractVector{T}` is what keeps JET quiet: analysed at the unspecialized
+    signature, `T` is only known to be `<:Real`, so `view` over the workspace
+    field widens to a union carrying an `Any`-eltype branch, and no
+    `joint_loglikelihood!` method matches that. Asserting the element type drops
+    the branch; it always held.
+    =#
+    ll = view(slds_ws.ll_tmp, 1:Tsteps)::AbstractVector{T}
 
     # E_q[log p(y, x | z)], plug-in at the posterior mean, weighted by γ.
     for k in 1:K
@@ -1064,167 +1489,288 @@ function elbo!(
 end
 
 """
-    elbo(slds, y; ux=nothing, uy=nothing, rng=Random.default_rng())
+    elbo(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
+         progress=false, depends_on=nothing)
 
-Evidence lower bound of an `SLDS` at the current parameters (allocating
-convenience wrapper around the workspace-based [`elbo!`](@ref)): warm-starts
-the continuous posterior with uniform discrete weights, runs one variational
-E-step (forward-backward for `q(z)`, Laplace smoothing for `q(x)`), and
-evaluates the ELBO at the resulting posteriors.
+Evidence lower bound of an `SLDS` at the current parameters — the `elbo` field of
+[`smooth`](@ref)`(slds, y)`, which infers `q(x)` and `q(z)` by deterministic
+coordinate ascent before evaluating the bound. Deterministic and reproducible.
 
-The E-step consumes a joint sample from `q(x)` to build the discrete-layer
-log-likelihoods, so the returned value is **stochastic** — pass `rng` for
-reproducibility. This matches the first entry of the ELBO trace returned by
-`fit!` when given the same `rng`.
+Accepts the same observation and input forms as [`smooth`](@ref), and the same
+`smoothing_iters` / `tol` controls over the alternation. Returns a scalar.
 
-# Arguments
-- `y`: observations — a `(obs_dim, T)` matrix, a `(obs_dim, T, ntrials)`
-  array, or a `Vector{<:AbstractMatrix}` of per-trial `(obs_dim, T_i)`
-  matrices (ragged lengths allowed).
-- `ux` / `uy`: optional control inputs in the same shape family as `y`
-  (`nothing` when the regimes carry no `B` / `D`). See [`fit!`](@ref).
-- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
-  `depends_on` declared on the models for this call (see the ancillary parameter
-  dependency docs). Needed when this dataset's trial count differs from the one
-  the labels on the model were written for.
-
-Returns a scalar.
+If you also want the posteriors that produced it, call [`smooth`](@ref) once and read
+its `elbo` field rather than paying for the alternation twice.
 """
 function elbo(
     slds::SLDS{T,S,O},
     y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
     ux=nothing,
     uy=nothing,
-    rng::AbstractRNG=Random.default_rng(),
+    smoothing_iters::Int=100,
+    tol::Real=1e-6,
+    progress::Bool=false,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    # `Data` centralizes shape validation and canonicalizes the three
-    # observation/input forms (regime dims are uniform, so validating against
-    # LDSs[1] covers all regimes). Absent ux/uy become zero-row matrices.
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
-    y_seq = data.y
-    ux_seq = data.ux
-    uy_seq = data.uy
-
-    K = length(slds.LDSs)
-    ntrials = length(y_seq)
-    seq_ends = cumsum(data.tsteps)
-    total_T = last(seq_ends)
-    T_max = maximum(data.tsteps)
-
-    grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
-    cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
-
-    tfs = initialize_FilterSmooth(slds.LDSs[1], data.tsteps)::TrialFilterSmooth{T}
-    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
-    fb_storage = _make_slds_fb_storage(dl, seq_ends)
-    obs_seq = collect(1:total_T)
-    control_seq = fill(nothing, total_T)
-    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
-    #=
-    Per-cell workspaces for a stitching fit; `nothing` when ungrouped, and the
-    base workspace itself when every session has the same channel count.
-    =#
-    cell_ws = _slds_cell_workspaces(slds, cell_slds, slds_ws, T_max)
-    x_samples = [Matrix{T}(undef, slds.LDSs[1].latent_dim, Ti) for Ti in data.tsteps]
-
-    # Warm-start q(x) with uniform weights, drawing the sample the E-step's
-    # discrete update consumes (mirrors the fit! warm-start).
-    _slds_warmstart!(
+    return smooth(
         slds,
-        cell_slds,
-        grp,
-        tfs,
-        y_seq,
-        x_samples,
-        slds_ws,
-        data.tsteps,
-        K;
-        rng=rng,
-        ux=ux_seq,
-        uy=uy_seq,
-        cell_ws=cell_ws,
-    )
+        y;
+        ux=ux,
+        uy=uy,
+        smoothing_iters=smoothing_iters,
+        tol=tol,
+        return_cov=false,
+        progress=progress,
+        depends_on=depends_on,
+    ).elbo
+end
 
-    if grp !== nothing
-        #=
-        Narrow the `Union{Nothing,...}` locals so the grouped helpers below are
-        called at their declared argument types.
-        =#
-        grouping = grp::ParameterGrouping
-        cells = cell_slds::Vector
-        _estep_grouped!(
-            cells,
-            grouping,
-            tfs,
-            fb_storage,
-            dl,
-            y_seq,
-            x_samples,
-            slds_ws;
-            rng=rng,
-            obs_seq=obs_seq,
-            control_seq=control_seq,
-            seq_ends=seq_ends,
-            ux=ux_seq,
-            uy=uy_seq,
-            cell_ws=cell_ws,
-        )
-        return _elbo_grouped!(
-            cells,
-            grouping,
-            tfs,
-            fb_storage,
-            y_seq,
-            slds_ws;
-            seq_ends=seq_ends,
-            ux=ux_seq,
-            uy=uy_seq,
-            cell_ws=cell_ws,
+"""
+    loglikelihood(slds, y; kwargs...)
+
+Variational lower bound on the marginal log-likelihood of an `SLDS`, i.e.
+[`elbo`](@ref)`(slds, y)`.
+
+The exact marginal `log p(y)` is intractable for a switching model — it requires
+summing over all `K^T` discrete regime sequences — so this returns the ELBO instead.
+Values are comparable across models fit to the same data, but are lower bounds, not
+likelihoods. Accepts the same keywords as [`elbo`](@ref).
+"""
+function StatsAPI.loglikelihood(slds::SLDS, y; kwargs...)
+    return elbo(slds, y; kwargs...)
+end
+
+"""
+    _tie_slots(tied::Bool, n) -> Vector{Int}
+
+Slot vector over `n` units for one parameter group: every unit on slot 1 when
+the group is tied, one slot each when it is not. Feeding these to the grouped
+updates (`_grouped_update_A_b!` and friends) is what makes "tied across
+regimes" and "free per regime" the same code path.
+"""
+_tie_slots(tied::Bool, n::Int) = tied ? ones(Int, n) : collect(1:n)
+
+"""
+    _validate_tied_params(lds, tied, grouped)
+
+Reject the `tied_params` combinations the M-step has no estimator for.
+
+A partial tie — some but not all columns of `[A b B]` or `[C d D]` — is fitted
+by residualizing the free columns out and solving the shared block by
+generalized least squares (`_partial_tied_regression`). That needs the group to
+*be* a least-squares regression fitted from one set of sufficient statistics per
+regime, which rules out two cases:
+
+- a **Poisson** emission, whose `[C d D]` has no sufficient-statistic form and
+  is fitted by LBFGS; and
+- a fit that also groups trials with `depends_on`, where a regime's regression
+  is several versions across cells rather than one, and a partial tie would have
+  to partition columns and cells at once.
+
+Both are fine with the whole regression tied.
+"""
+function _validate_tied_params(
+    lds::LinearDynamicalSystem, tied::AbstractVector{Symbol}, grouped::Bool
+)
+    isempty(tied) && return nothing
+    D = lds.latent_dim
+    dyn = _tied_dyn_cols(tied, D, lds.ux_dim)
+    obs = _tied_obs_cols(tied, D, lds.uy_dim)
+    partial_dyn = !isempty(dyn) && length(dyn) < D + 1 + lds.ux_dim
+    partial_obs = !isempty(obs) && length(obs) < D + 1 + lds.uy_dim
+
+    if partial_obs && lds.obs_model isa PoissonObservationModel
+        throw(
+            ArgumentError(
+                "tied_params: a Poisson emission's `[C d D]` is fitted by LBFGS, not " *
+                "from sufficient statistics, so there is no way to share part of it " *
+                "across regimes. Tie $(_join_names(_group_members(lds.obs_model, :C))) " *
+                "together, or none of them.",
+            ),
         )
     end
 
-    estep!(
-        slds,
-        tfs,
-        fb_storage,
-        dl,
-        y_seq,
-        x_samples,
-        slds_ws;
-        rng=rng,
-        obs_seq=obs_seq,
-        control_seq=control_seq,
-        seq_ends=seq_ends,
-        ux=ux_seq,
-        uy=uy_seq,
-    )
-
-    return elbo!(
-        slds, tfs, fb_storage, y_seq, slds_ws; seq_ends=seq_ends, ux=ux_seq, uy=uy_seq
-    )
+    if grouped && (partial_dyn || partial_obs)
+        which = partial_dyn ? "`[A b B]`" : "`[C d D]`"
+        throw(
+            ArgumentError(
+                "tied_params: sharing part of $which across regimes is not supported " *
+                "alongside `depends_on`, which already splits that regression into one " *
+                "version per group of trials. Tie the whole regression, or drop " *
+                "`depends_on`.",
+            ),
+        )
+    end
+    return nothing
 end
 
 """
-    loglikelihood(slds, y)
+    _broadcast_tied_params!(slds, tied)
 
-Marginal (observed-data) log-likelihood for an SLDS — **not implemented**.
+Copy `LDSs[1]`'s tied parameters into every other regime.
 
-The marginal `log p(y)` requires summing over all `K^T` discrete regime
-sequences (the switching model has no closed-form filter). Use
-[`elbo`](@ref)`(slds, y)` for a variational lower bound on `log p(y)`, or the
-ELBO trace returned by `fit!`.
+The updates fit a shared value on the first regime that uses it, and an `SLDS`'s
+regimes hold separate arrays rather than aliasing one (unlike the `depends_on`
+variants, which share by reference), so the fitted value has to be copied out.
+Copies by *column* for the stacked regressions, so a partial tie moves only the
+shared columns and leaves each regime's free ones alone. Honours `fit_bool`: a
+frozen group is left exactly as the caller set it, per regime.
 """
-function StatsAPI.loglikelihood(slds::SLDS, y)
-    return error(
-        "marginal loglikelihood is not implemented for the SLDS (marginalizing the " *
-        "discrete regime sequence requires summing over K^T paths). Use " *
-        "elbo(slds, y) for a variational lower bound, or the ELBO trace from fit!.",
-    )
+function _broadcast_tied_params!(
+    slds::SLDS{T}, tied::AbstractVector{Symbol}
+) where {T<:Real}
+    isempty(tied) && return nothing
+    src = slds.LDSs[1]
+    D, p = src.latent_dim, src.obs_dim
+    dyn_cols = _tied_dyn_cols(tied, D, src.ux_dim)
+    obs_cols = _tied_obs_cols(tied, D, src.uy_dim)
+
+    W_src = Matrix{T}(undef, D, D + 1 + src.ux_dim)
+    W_dst = similar(W_src)
+    V_src = Matrix{T}(undef, p, D + 1 + src.uy_dim)
+    V_dst = similar(V_src)
+    isempty(dyn_cols) || _pack_dyn_W!(W_src, src)
+    isempty(obs_cols) || _pack_obs_V!(V_src, src)
+
+    for k in 2:length(slds.LDSs)
+        dst = slds.LDSs[k]
+        if !isempty(dyn_cols) && dst.fit_bool[_G_AB]
+            _pack_dyn_W!(W_dst, dst)
+            @views W_dst[:, dyn_cols] .= W_src[:, dyn_cols]
+            _unpack_dyn_W!(dst, W_dst)
+        end
+        if :Q in tied && dst.fit_bool[_G_Q]
+            copyto!(dst.state_model.Q, src.state_model.Q)
+        end
+        if !isempty(obs_cols) && dst.fit_bool[_G_CD]
+            _pack_obs_V!(V_dst, dst)
+            @views V_dst[:, obs_cols] .= V_src[:, obs_cols]
+            _unpack_obs_V!(dst, V_dst)
+        end
+        if :R in tied && dst.fit_bool[_G_R]
+            copyto!(dst.obs_model.R, src.obs_model.R)
+        end
+    end
+    return nothing
 end
 
 """
-    mstep!(slds, tfs, fb_storage, y, sws; obs_seq, seq_ends, ux=nothing, uy=nothing)
+    _tied_poisson_emission!(slds, tfs, data, sws, weights, tied)
+
+Poisson emission M-step for an `SLDS`. Non-conjugate, so it is one LBFGS solve
+per distinct `[C d D]`: `K` of them at the regimes' own responsibilities, or a
+single unit-weight one when `[C d D]` is tied whole — summing the per-regime weighted
+objectives collapses to the unit-weight one, because the emission term does not
+depend on `k` and `Σₖ γₖ(t) = 1`.
+"""
+function _tied_poisson_emission!(
+    slds::SLDS{T},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws::SmoothWorkspace{T},
+    weights_of,
+    tie_emission::Bool,
+) where {T<:Real}
+    if tie_emission
+        update_observation_model!(slds.LDSs[1], tfs, data.y, [sws], nothing; uy=data.uy)
+        return nothing
+    end
+    for k in eachindex(slds.LDSs)
+        update_observation_model!(
+            slds.LDSs[k], tfs, data.y, [sws], weights_of(k); uy=data.uy
+        )
+    end
+    return nothing
+end
+
+#=
+Which stacked regression an update is for. The two differ only in which blocks
+of the sufficient statistics, which noise covariance and which prior they read,
+so the tie logic is written once and dispatched on these.
+=#
+struct _DynBlock end
+struct _ObsBlock end
+
+_block_stats(::_DynBlock, suf) = (suf.dyn_xx[].mat, suf.dyn_xy)
+_block_stats(::_ObsBlock, suf) = (suf.obs_xx[].mat, suf.obs_xy)
+
+_block_noise(::_DynBlock, lds) = lds.state_model.Q
+_block_noise(::_ObsBlock, lds) = lds.obs_model.R
+
+_block_prior(::_DynBlock, lds) = lds.state_model.AB_prior
+_block_prior(::_ObsBlock, lds) = lds.obs_model.CD_prior
+
+_block_group(::_DynBlock) = _G_AB
+_block_group(::_ObsBlock) = _G_CD
+
+_block_width(::_DynBlock, lds) = lds.latent_dim + 1 + lds.ux_dim
+_block_width(::_ObsBlock, lds) = lds.latent_dim + 1 + lds.uy_dim
+
+_block_write!(::_DynBlock, lds, W) = _unpack_dyn_W!(lds, W)
+_block_write!(::_ObsBlock, lds, W) = _unpack_obs_V!(lds, W)
+
+function _block_grouped_update!(::_DynBlock, ldss, sufs, slots, noise_slots, sws, bufs)
+    return _grouped_update_A_b!(ldss, sufs, slots, noise_slots, sws, bufs)
+end
+
+function _block_grouped_update!(::_ObsBlock, ldss, sufs, slots, noise_slots, sws, bufs)
+    return _grouped_update_C_d!(ldss, sufs, slots, noise_slots, sws, bufs)
+end
+
+"""
+    _slds_update_regression!(block, slds, sufs, tied_cols, noise_slots, sws, bufs, K)
+        -> Vector{Int}
+
+Fit one stacked regression across the regimes and return its slot vector — which
+regimes ended up sharing a value, for the covariance update that follows.
+
+Free or shared whole, the fit is the grouped update the `depends_on` path uses,
+which picks the pooled or the generalized-least-squares estimator from whether
+the regimes also share the covariance. A partial tie goes to
+[`_partial_tied_regression`](@ref), which writes every regime's stacked matrix
+directly — so its slots are all distinct: the regimes agree on the tied columns
+and differ everywhere else.
+"""
+function _slds_update_regression!(
+    block,
+    slds::SLDS{T},
+    sufs::AbstractVector,
+    tied_cols::AbstractVector{Int},
+    noise_slots::AbstractVector{Int},
+    sws::SmoothWorkspace{T},
+    bufs::GroupedSufBuffers{T},
+    K::Int,
+) where {T<:Real}
+    lds1 = slds.LDSs[1]
+
+    if isempty(tied_cols) || length(tied_cols) == _block_width(block, lds1)
+        slots = _tie_slots(!isempty(tied_cols), K)
+        _block_grouped_update!(block, slds.LDSs, sufs, slots, noise_slots, sws, bufs)
+        return slots
+    end
+
+    slots = collect(1:K)
+    lds1.fit_bool[_block_group(block)] || return slots
+
+    stats = [_block_stats(block, sufs[k]) for k in 1:K]
+    Ws = _partial_tied_regression(
+        [st[1] for st in stats],
+        [st[2] for st in stats],
+        [_block_noise(block, slds.LDSs[k]) for k in 1:K],
+        [_block_prior(block, slds.LDSs[k]) for k in 1:K],
+        tied_cols,
+        "tied_params",
+    )
+    for k in 1:K
+        slds.LDSs[k].fit_bool[_block_group(block)] &&
+            _block_write!(block, slds.LDSs[k], Ws[k])
+    end
+    return slots
+end
+
+"""
+    mstep!(slds, tfs, fb_storage, dl, y, sws; obs_seq, seq_ends, ux=nothing, uy=nothing,
+           tied=Symbol[])
 
 M-step for SLDS.
 
@@ -1241,6 +1787,12 @@ M-step for SLDS.
 aggregator folds `Bₖ u` / `Dₖ v` into the regression targets so `Bₖ` (Gaussian
 and Poisson dynamics) and `Dₖ` (Gaussian emission, and Poisson emission via the
 LBFGS routine) are re-estimated alongside `Aₖ` / `Cₖ`.
+
+`tied` names the parameter groups (canonical `:A` / `:Q` / `:C` / `:R`, from
+`tied_params`) that every regime shares. Each becomes a one-slot group over the
+`K` regimes and goes through the same `_grouped_update_*!` helpers the
+`depends_on` path uses, then `_broadcast_tied_params!` copies the fitted value
+into the other regimes. `x0`/`P0` are tied unconditionally, below.
 """
 function mstep!(
     slds::SLDS{T,S,O},
@@ -1253,7 +1805,7 @@ function mstep!(
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    tie_emissions::Bool=false,
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
     ntrials = length(y)
@@ -1268,140 +1820,83 @@ function mstep!(
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
 
-    # One reusable SufficientStatistics; overwritten per regime by the
-    # weighted aggregator.
-    suf = _initialize_td_sufficient_statistics(T, slds.LDSs[1], data.tsteps)
+    function weights_of(k)
+        return [
+            begin
+                t1, t2 = HMMs.seq_limits(seq_ends, trial)
+                view(fb_storage.γ, k, t1:t2)
+            end for trial in 1:ntrials
+        ]
+    end
+
+    #=
+    One γ-weighted sufficient statistic per regime, all built before any update
+    runs: a tied group is fitted from several regimes at once, and `Q` / `R`
+    read the regression that was just written, so the updates cannot be
+    interleaved with the aggregation the way a fully per-regime M-step can.
+    =#
+    sufs = [_initialize_td_sufficient_statistics(T, slds.LDSs[1], data.tsteps) for _ in 1:K]
+    for k in 1:K
+        _aggregate_td_suff_stats_weighted!(
+            sufs[k], tfs, slds.LDSs[k], data, weights_of(k), sws
+        )
+    end
+
+    lds1 = slds.LDSs[1]
+    D = lds1.latent_dim
+    dyn_cols = _tied_dyn_cols(tied, D, lds1.ux_dim)
+    obs_cols = _tied_obs_cols(tied, D, lds1.uy_dim)
+
+    slots_q = _tie_slots(:Q in tied, K)
+    slots_r = _tie_slots(:R in tied, K)
+    bufs = GroupedSufBuffers(T, lds1, data.tsteps)
+
+    #=
+    `[A b B]` then `Q`, `[C d D]` then `R`: the covariance updates read the
+    regression that was just written. The returned slots also tell those updates
+    how many distinct regressions there are, so a partial tie counts as `K` of
+    them — every regime's stacked matrix differs, in its free columns.
+    =#
+    slots_ab = _slds_update_regression!(
+        _DynBlock(), slds, sufs, dyn_cols, slots_q, sws, bufs, K
+    )
+    _grouped_update_Q!(slds.LDSs, sufs, slots_q, slots_ab, sws)
+
+    if lds1.obs_model isa GaussianObservationModel{T}
+        slots_cd = _slds_update_regression!(
+            _ObsBlock(), slds, sufs, obs_cols, slots_r, sws, bufs, K
+        )
+        _grouped_update_R!(slds.LDSs, sufs, slots_r, slots_cd, sws)
+    elseif lds1.obs_model isa PoissonObservationModel{T}
+        _tied_poisson_emission!(
+            slds, tfs, data, sws, weights_of, length(obs_cols) == D + 1 + lds1.uy_dim
+        )
+    else
+        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
+    end
+
+    _broadcast_tied_params!(slds, tied)
 
     #=
     x0/P0 are tied across modes. Since the smoother gives one q(x) per trial
     and Σₖ γₖ(t=1) = 1, the pooled unit-weight init stats are exactly the sum
-    over modes of the per-mode init stats the aggregator already computes —
-    so accumulate them across the loop instead of recomputing.
+    over modes of the per-mode init stats the aggregator already computed.
     =#
     D = slds.LDSs[1].latent_dim
+    suf = sufs[1]
     init_xy = zeros(T, 1, D)
     init_yy = zeros(T, D, D)
-
-    weights = Vector{AbstractVector{T}}(undef, ntrials)
+    init_n = zero(T)
     for k in 1:K
-        lds_k = slds.LDSs[k]
-        for trial in 1:ntrials
-            t1, t2 = HMMs.seq_limits(seq_ends, trial)
-            weights[trial] = view(fb_storage.γ, k, t1:t2)
-        end
-
-        _aggregate_td_suff_stats_weighted!(suf, tfs, lds_k, data, weights, sws)
-        init_xy .+= suf.init_xy
-        init_yy .+= suf.init_yy[]
-
-        # Per-regime updates cover only dynamics + emissions (init is tied, and
-        # so is the emission under `tie_emissions`, fitted once below).
-        if lds_k.obs_model isa GaussianObservationModel{T}
-            update_A_b!(lds_k, suf, sws)
-            update_Q!(lds_k, suf, sws)
-            if !tie_emissions
-                update_C_d!(lds_k, suf, sws)
-                update_R!(lds_k, suf, sws)
-            end
-        elseif lds_k.obs_model isa PoissonObservationModel{T}
-            update_A_b!(lds_k, suf, sws)
-            update_Q!(lds_k, suf, sws)
-            # Single sws wrapped as a pool of one; maybe thread in future
-            if !tie_emissions
-                update_observation_model!(lds_k, tfs, y, [sws], weights; uy=data.uy)
-            end
-        else
-            throw(ArgumentError("Unsupported observation model $(typeof(lds_k.obs_model))"))
-        end
+        init_xy .+= sufs[k].init_xy
+        init_yy .+= sufs[k].init_yy[]
+        init_n += T(sufs[k].init_n)
     end
-
-    tie_emissions && _update_tied_emission!(slds, tfs, data, sws)
-
-    # Fit the single shared x0/P0 from the pooled stats, then broadcast.
     copyto!(suf.init_xy, init_xy)
-    copyto!(suf.init_yy[], init_yy)
-    suf.init_n = T(ntrials)
+    suf.init_yy[] = init_yy
+    suf.init_n = init_n
     _update_shared_initial_state!(slds, suf, sws)
 
-    return nothing
-end
-
-"""
-    _update_tied_emission!(slds, tfs, data, sws)
-
-Fit the one emission every regime shares and copy it into all of them.
-
-Under `tie_emissions` only the dynamics switch, so `[C d D]` (and `R`) is fitted
-from the whole trajectory rather than from regime `k`'s share of it. Summing the
-per-regime weighted emission objectives over `k` collapses to the unit-weight
-one — the emission term does not depend on `k` and `Σₖ γₖ(t) = 1` — so the tied
-update is exactly the ordinary LDS emission M-step, run once on `LDSs[1]` and
-broadcast to the rest.
-"""
-function _update_tied_emission!(
-    slds::SLDS{T,S,O}, tfs::TrialFilterSmooth{T}, data::Data{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    lds1 = slds.LDSs[1]
-    if lds1.obs_model isa GaussianObservationModel{T}
-        #=
-        The conjugate updates read the emission block of the sufficient
-        statistics, which the unit-weight aggregator fills; the dynamics blocks
-        it also fills are simply not read here.
-        =#
-        suf = _initialize_td_sufficient_statistics(T, lds1, data.tsteps)
-        _aggregate_td_suff_stats!(suf, tfs, lds1, data, sws)
-        update_C_d!(lds1, suf, sws)
-        update_R!(lds1, suf, sws)
-    elseif lds1.obs_model isa PoissonObservationModel{T}
-        # `nothing` weights are the unit weights the tie collapses to.
-        update_observation_model!(lds1, tfs, data.y, [sws], nothing; uy=data.uy)
-    else
-        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
-    end
-    _broadcast_emission!(slds)
-    return nothing
-end
-
-"""
-    _broadcast_emission!(slds)
-
-Copy `LDSs[1]`'s emission into every other regime, honouring `fit_bool`: a
-frozen emission is left as the caller set it, per regime.
-"""
-function _broadcast_emission!(slds::SLDS)
-    lds1 = slds.LDSs[1]
-    for k in 2:length(slds.LDSs)
-        _copy_emission!(slds.LDSs[k], lds1)
-    end
-    return nothing
-end
-
-"""
-    _copy_emission!(dst, src)
-
-Overwrite `dst`'s emission parameters with `src`'s. Split by observation model
-so the Gaussian noise covariance travels with the emission it belongs to, and
-so `fit_bool` is indexed within its own layout (length 5 for Poisson).
-"""
-function _copy_emission!(
-    dst::LinearDynamicalSystem{T,S,O}, src::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:AbstractStateModel{T},O<:PoissonObservationModel{T}}
-    dst.fit_bool[_G_CD] || return nothing
-    copyto!(dst.obs_model.C, src.obs_model.C)
-    copyto!(dst.obs_model.d, src.obs_model.d)
-    copyto!(dst.obs_model.D, src.obs_model.D)
-    return nothing
-end
-
-function _copy_emission!(
-    dst::LinearDynamicalSystem{T,S,O}, src::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
-    if dst.fit_bool[_G_CD]
-        copyto!(dst.obs_model.C, src.obs_model.C)
-        copyto!(dst.obs_model.d, src.obs_model.d)
-        copyto!(dst.obs_model.D, src.obs_model.D)
-    end
-    dst.fit_bool[_G_R] && copyto!(dst.obs_model.R, src.obs_model.R)
     return nothing
 end
 
@@ -1427,12 +1922,16 @@ function _update_shared_initial_state!(
 end
 
 """
-    fit!(slds::SLDS, y; ux=nothing, uy=nothing, max_iter=50, progress=true)
+    fit!(slds::SLDS, y; ux=nothing, uy=nothing, max_iter=50, smoothing_iters=1, progress=true)
 
 Fit SLDS using variational Laplace EM. Runs for exactly `max_iter` iterations
 (no early-stopping criterion: the E-step's posterior sampling makes the ELBO
 trace noisy across iterations, so a tolerance check on successive differences
 would fire spuriously). Returns the per-iteration ELBO trace.
+
+Each E-step runs `smoothing_iters` discrete↔continuous alternations before the
+M-step. The default of 1 is the standard vLEM update; larger values hand the
+M-step a better-converged posterior at proportional cost per iteration.
 
 `y` is a single trial `(obs_dim × T)` matrix, a `(obs_dim, T, ntrials)` array,
 or a vector of per-trial matrices (ragged `T_i` allowed). Internally a single
@@ -1450,14 +1949,34 @@ Pass `depends_on` (a `NamedTuple` of per-trial label vectors) to override the
 must declare the same labels — the grouping of trials is a property of the data
 — and `x0`/`P0` stay tied across regimes as usual.
 
-Pass `tie_emissions=true` to give every regime one shared emission — `[C d D]`
-(and `R`) fitted once from the whole trajectory and copied across regimes, so
-only `[A b B Q]` and the discrete chain switch. This is the usual setup for
-neural data, where the recording does not change when the dynamics do; it also
-divides the emission's parameter count by `K`. Combined with `depends_on` the
-tie is *within* a session: each group keeps its own emission, shared by every
-regime. The emission is tied before the first E-step, and a frozen emission
-(`fit_bool`) is left exactly as the caller set it.
+Pass `tied_params` — a `Symbol` or a collection of them — to share parameters
+across regimes instead of fitting one per regime. Names are the literal
+parameter names `depends_on` and `fit_bool` use, and each means itself: `:C` is
+`C`, not `[C d D]`. `tied_params = (:C, :d, :D, :R)` is the usual setup for
+neural data — the recording does not change when the dynamics do, so only
+`[A b B Q]` and the discrete chain switch, and the emission's parameter count is
+divided by `K`. `tied_params = (:A, :b, :B, :Q)` is the mirror image: one set of
+dynamics, switching emissions.
+
+`:x0` / `:P0` are accepted and ignored — an SLDS ties its initial state across
+regimes unconditionally. Combined with `depends_on` the tie is *within* a group:
+each session keeps its own version, shared by every regime. Tied parameters are
+broadcast before the first E-step, so no regime ever infers `q(x)` / `q(z)`
+through a value the model does not have, and a frozen group (`fit_bool`) is left
+exactly as the caller set it.
+
+`[A b B]` and `[C d D]` are each fitted as one regression, so how much of one
+you tie decides the cost. Tying it together with its covariance is the ordinary
+pooled M-step (`O(m³)`), and so is tying a covariance on its own. Tying a
+regression while its covariance still switches makes the shared fit a
+generalized least-squares problem coupling the output rows (`O((p·m)³)`), and
+tying only *part* of one adds a Frisch–Waugh projection in front of that. Both
+are exact; tie the covariance alongside its regression when you can.
+
+A partial tie has no reduction for a Poisson `[C d D]`, which is fitted by
+LBFGS rather than from sufficient statistics, or alongside `depends_on`, which
+already splits the regression per group of trials — those throw rather than
+guess.
 """
 function fit!(
     slds::SLDS{T,S,O},
@@ -1465,11 +1984,15 @@ function fit!(
     ux=nothing,
     uy=nothing,
     max_iter::Int=50,
+    smoothing_iters::Int=1,
     progress::Bool=true,
     rng::AbstractRNG=Random.default_rng(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
-    tie_emissions::Bool=false,
+    tied_params=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    tied = _resolve_tied_params(
+        slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
+    )
     #=
     `Data` centralizes shape validation and canonicalizes the three
     observation/input forms (regime dims are uniform, so validating against
@@ -1496,6 +2019,7 @@ function fit!(
     =#
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
+    _validate_tied_params(slds.LDSs[1], tied, grp !== nothing)
 
     # Continuous-state smoother storage (per-trial sized).
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
@@ -1537,18 +2061,17 @@ function fit!(
     x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
 
     #=
-    Tie the emission before the first E-step rather than only after the first
-    M-step, so no regime ever infers `q(x)` / `q(z)` through an emission the
-    model does not have. Regimes seeded from one warm start already agree, and
-    this makes that a property of the fit instead of an accident of the caller.
+    Broadcast the tied groups before the first E-step rather than only after the
+    first M-step, so no regime ever infers `q(x)` / `q(z)` through a parameter
+    the model does not have. Regimes seeded from one warm start already agree,
+    and this makes that a property of the fit instead of an accident of the
+    caller.
     =#
-    if tie_emissions
-        if cell_slds === nothing
-            _broadcast_emission!(slds)
-        else
-            for slds_c in cell_slds
-                _broadcast_emission!(slds_c)
-            end
+    if cell_slds === nothing
+        _broadcast_tied_params!(slds, tied)
+    else
+        for slds_c in cell_slds
+            _broadcast_tied_params!(slds_c, tied)
         end
     end
 
@@ -1599,6 +2122,7 @@ function fit!(
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
+                smoothing_iters=smoothing_iters,
             )
 
             # Compute the ELBO at the current posteriors.
@@ -1625,7 +2149,7 @@ function fit!(
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
-                tie_emissions=tie_emissions,
+                tied=tied,
             )
             refresh_slds_constants!(slds_ws, slds)
         else
@@ -1647,6 +2171,7 @@ function fit!(
                 ux=ux_seq,
                 uy=uy_seq,
                 cell_ws=cell_ws,
+                smoothing_iters=smoothing_iters,
             )
 
             elbos[iter] = _elbo_grouped!(
@@ -1673,7 +2198,7 @@ function fit!(
                 obs_seq=obs_seq,
                 seq_ends=seq_ends,
                 cell_sws=cell_mstep_sws,
-                tie_emissions=tie_emissions,
+                tied=tied,
             )
         end
 
@@ -1684,166 +2209,6 @@ function fit!(
         finish!(prog)
     end
     return elbos
-end
-
-"""
-    posterior(slds, y; ux=nothing, uy=nothing, max_iter=10, rng, depends_on=nothing)
-
-Variational posteriors of a **fitted** SLDS on `y`, without touching its
-parameters: the continuous state `q(x)` and the discrete state `q(z)`.
-
-Returns a NamedTuple
-
-- `x_smooth`: per-trial posterior means, `(latent_dim, T_i)`
-- `p_smooth`: per-trial posterior covariances, `(latent_dim, latent_dim, T_i)`
-- `γ`: per-trial discrete posteriors, `(K, T_i)`, columns summing to 1
-- `elbos`: the ELBO after each E-step
-
-`fit!` runs the same E-step but keeps its forward-backward storage private, so
-this is the way to get `q(z)` — a regime occupancy over time, a Viterbi-style
-`argmax` path, a rate averaged over regimes — out of a model, on the data it was
-fitted to or on held-out data.
-
-`y` takes the same three shapes as `fit!`, `ux` / `uy` the same shape family,
-and `depends_on` overrides the regimes' stored labels (a held-out set has its
-own trial count, so it needs its own label vector).
-
-The E-step is coordinate ascent between `q(x)` and `q(z)`, and the discrete
-update reads a *sample* from `q(x)`, so `γ` carries some Monte-Carlo noise:
-`max_iter` iterations are run and the last one returned. Ten is plenty for a
-fitted model, whose posteriors start near their fixed point; pass `rng` to make
-the draw reproducible.
-"""
-function posterior(
-    slds::SLDS{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
-    ux=nothing,
-    uy=nothing,
-    max_iter::Int=10,
-    rng::AbstractRNG=Random.default_rng(),
-    depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    max_iter >= 1 || throw(ArgumentError("max_iter must be at least 1"))
-
-    #=
-    Same setup as `fit!`, minus the M-step workspaces: `Data` validates and
-    canonicalizes the observation / input shapes, the grouping resolves
-    `depends_on` into per-cell parameter views, and the discrete layer wraps the
-    (K × ΣT) log-likelihood matrix the forward-backward pass reads.
-    =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
-    y_seq = data.y
-    ux_seq = data.ux
-    uy_seq = data.uy
-
-    K = length(slds.LDSs)
-    latent_dim = slds.LDSs[1].latent_dim
-    tsteps_per_trial = data.tsteps
-    ntrials = length(y_seq)
-    seq_ends = cumsum(tsteps_per_trial)
-    total_T = last(seq_ends)
-    T_max = maximum(tsteps_per_trial)
-
-    grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
-    cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
-
-    tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
-    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
-    fb_storage = _make_slds_fb_storage(dl, seq_ends)
-    obs_seq = collect(1:total_T)
-    control_seq = fill(nothing, total_T)
-
-    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
-    cell_ws = _slds_cell_workspaces(slds, cell_slds, slds_ws, T_max)
-    x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
-
-    _slds_warmstart!(
-        slds,
-        cell_slds,
-        grp,
-        tfs,
-        y_seq,
-        x_samples,
-        slds_ws,
-        tsteps_per_trial,
-        K;
-        rng=rng,
-        ux=ux_seq,
-        uy=uy_seq,
-        cell_ws=cell_ws,
-    )
-
-    elbos = Vector{T}(undef, max_iter)
-    for iter in 1:max_iter
-        if grp === nothing
-            estep!(
-                slds,
-                tfs,
-                fb_storage,
-                dl,
-                y_seq,
-                x_samples,
-                slds_ws;
-                rng=rng,
-                obs_seq=obs_seq,
-                control_seq=control_seq,
-                seq_ends=seq_ends,
-                ux=ux_seq,
-                uy=uy_seq,
-            )
-            elbos[iter] = elbo!(
-                slds,
-                tfs,
-                fb_storage,
-                y_seq,
-                slds_ws;
-                seq_ends=seq_ends,
-                ux=ux_seq,
-                uy=uy_seq,
-            )
-        else
-            grouping = grp::ParameterGrouping
-            cells = cell_slds::Vector
-            _estep_grouped!(
-                cells,
-                grouping,
-                tfs,
-                fb_storage,
-                dl,
-                y_seq,
-                x_samples,
-                slds_ws;
-                rng=rng,
-                obs_seq=obs_seq,
-                control_seq=control_seq,
-                seq_ends=seq_ends,
-                ux=ux_seq,
-                uy=uy_seq,
-                cell_ws=cell_ws,
-            )
-            elbos[iter] = _elbo_grouped!(
-                cells,
-                grouping,
-                tfs,
-                fb_storage,
-                y_seq,
-                slds_ws;
-                seq_ends=seq_ends,
-                ux=ux_seq,
-                uy=uy_seq,
-                cell_ws=cell_ws,
-            )
-        end
-    end
-
-    x_smooth = [tfs[n].x_smooth for n in 1:ntrials]
-    p_smooth = [tfs[n].p_smooth for n in 1:ntrials]
-    γ = Vector{Matrix{T}}(undef, ntrials)
-    for n in 1:ntrials
-        t1, t2 = HMMs.seq_limits(seq_ends, n)
-        γ[n] = Matrix{T}(view(fb_storage.γ, :, t1:t2))
-    end
-    return (x_smooth=x_smooth, p_smooth=p_smooth, γ=γ, elbos=elbos)
 end
 
 # ============================================================================
@@ -1860,10 +2225,10 @@ end
 """
     _slds_warmstart!(slds, cell_slds, grp, tfs, y, x_samples, slds_ws, tsteps, K; ...)
 
-Smooth every trial once with uniform discrete weights, drawing the first
-posterior sample the E-step's discrete update consumes. When `grp === nothing`
-this is the plain per-trial loop; otherwise trials are visited cell by cell so
-the regime constants are refreshed once per cell.
+Smooth every trial once with uniform discrete weights `γ ≡ 1/K`, so the first
+discrete update has a continuous trajectory to score. `x_samples` receives the
+first posterior draw the Monte-Carlo E-step consumes; pass `nothing` for the
+deterministic path of [`smooth`](@ref), which scores the smoothed mean instead.
 """
 function _slds_warmstart!(
     slds::SLDS{T},
@@ -1871,7 +2236,7 @@ function _slds_warmstart!(
     grp::Union{Nothing,ParameterGrouping},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    x_samples::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     slds_ws::SLDSSmoothWorkspace{T},
     tsteps::AbstractVector{Int},
     K::Int;
@@ -1884,39 +2249,20 @@ function _slds_warmstart!(
         return fill(one(T) / K, K, tsteps[trial])
     end
 
-    if grp === nothing || cell_slds === nothing
-        for trial in eachindex(y)
-            smooth!(
-                slds,
-                tfs[trial],
-                y[trial],
-                w_of(trial);
-                ws=slds_ws,
-                x_sample=x_samples[trial],
-                rng=rng,
-                ux=(ux === nothing ? nothing : ux[trial]),
-                uy=(uy === nothing ? nothing : uy[trial]),
-            )
-        end
-        return nothing
-    end
-
-    for c in 1:grp.ncells
-        _slds_smooth_cell!(
-            cell_slds,
-            grp,
-            c,
-            tfs,
-            y,
-            x_samples,
-            slds_ws,
-            w_of;
-            rng=rng,
-            ux=ux,
-            uy=uy,
-            cell_ws=cell_ws,
-        )
-    end
+    _slds_smooth_all!(
+        slds,
+        cell_slds,
+        grp,
+        tfs,
+        y,
+        x_samples,
+        slds_ws,
+        w_of;
+        rng=rng,
+        ux=ux,
+        uy=uy,
+        cell_ws=cell_ws,
+    )
     return nothing
 end
 
@@ -1964,7 +2310,7 @@ function _slds_cell_sldss(
     K = length(slds.LDSs)
     return [
         SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, [_cell_lds(slds.LDSs[k], grp, c) for k in 1:K])
-        for c in 1:grp.ncells
+        for c in 1:(grp.ncells)
     ]
 end
 
@@ -2061,7 +2407,7 @@ function _slds_smooth_cell!(
     cell::Int,
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    x_samples::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     slds_ws::SLDSSmoothWorkspace{T},
     w_of;
     rng::AbstractRNG=Random.default_rng(),
@@ -2079,7 +2425,7 @@ function _slds_smooth_cell!(
             y[trial],
             w_of(trial);
             ws=ws_c,
-            x_sample=x_samples[trial],
+            x_sample=(x_samples === nothing ? nothing : x_samples[trial]),
             rng=rng,
             ux=(ux === nothing ? nothing : ux[trial]),
             uy=(uy === nothing ? nothing : uy[trial]),
@@ -2091,10 +2437,10 @@ end
 """
     _estep_grouped!(cell_slds, grp, tfs, fb_storage, dl, y, x_samples, slds_ws; ...)
 
-Grouped SLDS E-step. Same three moves as `estep!` — fill `dl.logL` from the
-previous posterior sample, run forward-backward, re-smooth `q(x)` — but each
-pass iterates cells so the regime constants are refreshed once per cell. The
-forward-backward call stays global: the discrete chain is shared by all trials.
+Grouped SLDS E-step: `smoothing_iters` alternations of [`_vem_alternate!`](@ref)
+with the cell views in play, so each pass over the trials refreshes the regime
+constants once per cell. The forward-backward call stays global — the discrete
+chain is shared by all trials.
 """
 function _estep_grouped!(
     cell_slds::AbstractVector,
@@ -2112,56 +2458,32 @@ function _estep_grouped!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     cell_ws::Union{Nothing,AbstractVector}=nothing,
+    smoothing_iters::Int=1,
 ) where {T<:Real}
-    K = length(cell_slds[1].LDSs)
-
-    for c in 1:grp.ncells
-        slds_c = cell_slds[c]
-        ws_c = _slds_ws_for(cell_ws, slds_ws, c)
-        refresh_slds_constants!(ws_c, slds_c)
-        for trial in grp.cell_trials[c]
-            t1, t2 = HMMs.seq_limits(seq_ends, trial)
-            for k in 1:K
-                joint_loglikelihood!(
-                    view(dl.logL, k, t1:t2),
-                    ws_c,
-                    ws_c.consts[k],
-                    slds_c.LDSs[k],
-                    x_samples[trial],
-                    y[trial],
-                    (ux === nothing ? nothing : ux[trial]),
-                    (uy === nothing ? nothing : uy[trial]),
-                )
-            end
-        end
-    end
-
-    HMMs.forward_backward!(
-        fb_storage, dl, obs_seq, control_seq; seq_ends=seq_ends, transition_marginals=true
+    #=
+    Cell 1 stands in for the parent only where `_vem_alternate!` needs a regime
+    count and the ungrouped fall-through; every parameter read goes through
+    `cell_slds` because `grp` is non-`nothing`.
+    =#
+    _vem_alternate!(
+        cell_slds[1],
+        cell_slds,
+        grp,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        slds_ws;
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        cell_ws=cell_ws,
+        smoothing_iters=smoothing_iters,
+        x_samples=x_samples,
+        rng=rng,
     )
-
-    function w_of(trial)
-        t1, t2 = HMMs.seq_limits(seq_ends, trial)
-        return view(fb_storage.γ, :, t1:t2)
-    end
-
-    for c in 1:grp.ncells
-        _slds_smooth_cell!(
-            cell_slds,
-            grp,
-            c,
-            tfs,
-            y,
-            x_samples,
-            slds_ws,
-            w_of;
-            rng=rng,
-            ux=ux,
-            uy=uy,
-            cell_ws=cell_ws,
-        )
-    end
-
     return nothing
 end
 
@@ -2178,7 +2500,7 @@ function _grouped_slds_prior_logdensity(
     K = length(cell_slds[1].LDSs)
     total = zero(T)
     for k in 1:K
-        ldss = [cell_slds[c].LDSs[k] for c in 1:grp.ncells]
+        ldss = [cell_slds[c].LDSs[k] for c in 1:(grp.ncells)]
         total += _grouped_state_prior_logdensity(ldss, grp.cell_slot, T)
         if ldss[1].obs_model isa GaussianObservationModel
             total += _grouped_gaussian_obs_prior_logdensity(ldss, grp.cell_slot, T)
@@ -2208,7 +2530,7 @@ function _elbo_grouped!(
     cell_ws::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     total_elbo = zero(T)
-    for c in 1:grp.ncells
+    for c in 1:(grp.ncells)
         slds_c = cell_slds[c]
         ws_c = _slds_ws_for(cell_ws, slds_ws, c)
         refresh_slds_constants!(ws_c, slds_c)
@@ -2254,23 +2576,26 @@ function _broadcast_initial_state!(
 end
 
 """
-    _mstep_grouped!(cell_slds, grp, tfs, fb_storage, dl, data, sws; obs_seq, seq_ends)
+    _mstep_grouped!(cell_slds, grp, tfs, fb_storage, dl, data, sws; obs_seq, seq_ends,
+                    tied=Symbol[])
 
 Grouped SLDS M-step.
 
 The discrete layer and the trial partition are shared, so the work is one
-γ-weighted sufficient statistic per (regime, cell). Dynamics and emissions are
-per regime, so they are pooled across the cells that share a version *within* a
-regime; `x0`/`P0` are tied across regimes, so they are pooled across every
-(regime, cell) unit that shares a version.
+γ-weighted sufficient statistic per (regime, cell). Every parameter update then
+runs over that flat unit list, driven by a slot vector per group:
 
-Units are laid out regime-major, which makes the first unit of any parameter
-version belong to regime 1 — the update writes there and
-`_broadcast_initial_state!` restores the tie.
+- a group that is neither grouped nor tied gets one slot per unit — the plain
+  per-(regime, cell) fit;
+- `depends_on` makes cells sharing a version share a slot *within* a regime;
+- naming the group in `tied_params` drops the regime out of the slot, so the
+  cells' versions are shared across regimes as well. A tied `[C d D]` is then a
+  property of the cell alone: each session keeps its own emission, shared by
+  every regime, which is the usual reading for neural data.
 
-With `tie_emissions` the emission is a property of the cell rather than of the
-(regime, cell) pair: each `[C d D]` version is fitted once from the unit-weight
-statistics of the cells sharing it and copied across regimes.
+Units are laid out regime-major, so the first unit of any version belongs to
+regime 1; the update writes there and the broadcasters restore the tie. `x0`/`P0`
+are tied across regimes unconditionally.
 """
 function _mstep_grouped!(
     cell_slds::AbstractVector,
@@ -2283,7 +2608,7 @@ function _mstep_grouped!(
     obs_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     cell_sws::Union{Nothing,AbstractVector}=nothing,
-    tie_emissions::Bool=false,
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
     ncells = grp.ncells
@@ -2312,76 +2637,85 @@ function _mstep_grouped!(
         for k in 1:K for c in 1:ncells
     ]
 
-    for k in 1:K
-        for c in 1:ncells
-            u = (k - 1) * ncells + c
-            weights = [γ_view(k, n) for n in grp.cell_trials[c]]
-            _aggregate_td_suff_stats_weighted!(
-                unit_suf[u],
-                cell_tfs[c],
-                unit_lds[u],
-                cell_data[c],
-                weights,
-                _unit_ws(cell_sws, sws, c),
-            )
-        end
-
-        rows = ((k - 1) * ncells + 1):(k * ncells)
-        ldss_k = view(unit_lds, rows)
-        sufs_k = view(unit_suf, rows)
-
-        _grouped_update_A_b!(ldss_k, sufs_k, grp.cell_slot[_G_AB], sws, bufs)
-        _grouped_update_Q!(ldss_k, sufs_k, grp.cell_slot[_G_Q], grp.cell_slot[_G_AB], sws)
-
-        #=
-        The emission is per (regime, cell) by default; under `tie_emissions`
-        it belongs to the cell alone and is fitted once, after this loop.
-        =#
-        if !tie_emissions
-            if lds1.obs_model isa GaussianObservationModel{T}
-                _grouped_update_C_d!(
-                    ldss_k, sufs_k, grp.cell_slot[_G_CD], sws, bufs; unit_sws=cell_sws
-                )
-                _grouped_update_R!(
-                    ldss_k,
-                    sufs_k,
-                    grp.cell_slot[_G_R],
-                    grp.cell_slot[_G_CD],
-                    sws;
-                    unit_sws=cell_sws,
-                )
-            elseif lds1.obs_model isa PoissonObservationModel{T}
-                # Non-conjugate: one LBFGS solve per `[C d D]` version, over the
-                # γ-weighted trials of every cell sharing that version.
-                for units in _units_by_slot(grp.cell_slot[_G_CD])
-                    trials = Int[]
-                    for c in units
-                        append!(trials, grp.cell_trials[c])
-                    end
-                    sort!(trials)
-                    update_observation_model!(
-                        ldss_k[units[1]],
-                        TrialFilterSmooth([tfs[n] for n in trials]),
-                        data.y[trials],
-                        [_unit_ws(cell_sws, sws, units[1])],
-                        [γ_view(k, n) for n in trials];
-                        uy=data.uy[trials],
-                    )
-                end
-            else
-                throw(
-                    ArgumentError(
-                        "Unsupported observation model $(typeof(lds1.obs_model))"
-                    ),
-                )
-            end
-        end
+    for k in 1:K, c in 1:ncells
+        u = (k - 1) * ncells + c
+        _aggregate_td_suff_stats_weighted!(
+            unit_suf[u],
+            cell_tfs[c],
+            unit_lds[u],
+            cell_data[c],
+            [γ_view(k, n) for n in grp.cell_trials[c]],
+            _unit_ws(cell_sws, sws, c),
+        )
     end
 
-    if tie_emissions
-        _update_tied_emission_grouped!(
-            cell_slds, grp, tfs, cell_tfs, data, cell_data, sws, K; cell_sws=cell_sws
+    #=
+    A cell's workspace, indexed by flat unit: `repeat` tiles the per-cell vector
+    once per regime, so unit `(k-1)·ncells + c` lands on cell `c`'s entry.
+    =#
+    unit_sws = cell_sws === nothing ? nothing : repeat(cell_sws, K)
+
+    #=
+    A stacked regression is either shared whole across regimes or not at all
+    here: `_validate_tied_params` rejects a partial tie alongside `depends_on`,
+    which already splits the regression into one version per group of trials.
+    =#
+    D = lds1.latent_dim
+    tie_dyn = length(_tied_dyn_cols(tied, D, lds1.ux_dim)) == D + 1 + lds1.ux_dim
+    tie_obs = length(_tied_obs_cols(tied, D, lds1.uy_dim)) == D + 1 + lds1.uy_dim
+
+    slots_ab = _grouped_unit_slots(grp.cell_slot[_G_AB], K, tie_dyn)
+    slots_q = _grouped_unit_slots(grp.cell_slot[_G_Q], K, :Q in tied)
+    slots_cd = _grouped_unit_slots(grp.cell_slot[_G_CD], K, tie_obs)
+    slots_r = _grouped_unit_slots(grp.cell_slot[_G_R], K, :R in tied)
+
+    _grouped_update_A_b!(unit_lds, unit_suf, slots_ab, slots_q, sws, bufs)
+    _grouped_update_Q!(unit_lds, unit_suf, slots_q, slots_ab, sws)
+
+    if lds1.obs_model isa GaussianObservationModel{T}
+        _grouped_update_C_d!(
+            unit_lds, unit_suf, slots_cd, slots_r, sws, bufs; unit_sws=unit_sws
         )
+        _grouped_update_R!(unit_lds, unit_suf, slots_r, slots_cd, sws; unit_sws=unit_sws)
+    elseif lds1.obs_model isa PoissonObservationModel{T}
+        #=
+        Non-conjugate: one LBFGS solve per `[C d D]` version, over the trials of
+        every (regime, cell) unit sharing it. A version tied across regimes sees
+        each of its trials once per regime, and `Σₖ γₖ(t) = 1`, so its weights
+        collapse to the unit weights `nothing`.
+        =#
+        for units in _units_by_slot(slots_cd)
+            trials = Int[]
+            weights = Vector{SubArray{T,1}}()
+            for u in units
+                k, c = fldmod1(u, ncells)
+                for n in grp.cell_trials[c]
+                    push!(trials, n)
+                    push!(weights, γ_view(k, n))
+                end
+            end
+            order = sortperm(trials)
+            unit_weights = _spans_all_regimes(units, ncells, K) ? nothing : weights[order]
+            update_observation_model!(
+                unit_lds[units[1]],
+                TrialFilterSmooth([tfs[n] for n in trials[order]]),
+                data.y[trials[order]],
+                [_unit_ws(unit_sws, sws, units[1])],
+                unit_weights;
+                uy=data.uy[trials[order]],
+            )
+        end
+    else
+        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
+    end
+
+    #=
+    Cells sharing a version share its arrays, so copying per cell is idempotent;
+    doing it per cell rather than per version keeps this correct for any slot
+    layout.
+    =#
+    for slds_c in cell_slds
+        _broadcast_tied_params!(slds_c, tied)
     end
 
     #=
@@ -2400,84 +2734,30 @@ function _mstep_grouped!(
 end
 
 """
-    _update_tied_emission_grouped!(cell_slds, grp, tfs, cell_tfs, data, cell_data, sws, K;
-                                   cell_sws)
+    _grouped_unit_slots(cell_slot, K, tied) -> Vector{Int}
 
-Grouped counterpart of [`_update_tied_emission!`](@ref): one emission per
-`[C d D]` version, fitted from the unit-weight statistics of the cells sharing
-that version and copied into every regime.
+Slot vector over the `K · ncells` regime-major units for one parameter group,
+from the group's per-cell slots.
 
-The cells are the trial groups `depends_on` declares — one per session in a
-stitching fit — so this leaves each session its own emission and ties only
-across the regimes, which is the whole point of the option: the recording does
-not change when the dynamics do.
+Untied, a regime's cells get slots of their own, so no version is shared across
+regimes. Tied, the cell's slot is used as-is and the same version spans every
+regime — which is what makes a tied group a property of the cell rather than of
+the (regime, cell) pair.
 """
-function _update_tied_emission_grouped!(
-    cell_slds::AbstractVector,
-    grp::ParameterGrouping,
-    tfs::TrialFilterSmooth{T},
-    cell_tfs::AbstractVector,
-    data::Data{T},
-    cell_data::AbstractVector,
-    sws::SmoothWorkspace{T},
-    K::Int;
-    cell_sws::Union{Nothing,AbstractVector}=nothing,
-) where {T<:Real}
-    ncells = grp.ncells
-    # Regime 1's cells hold the arrays every other regime is copied from.
-    ldss_1 = [cell_slds[c].LDSs[1] for c in 1:ncells]
-    lds1 = ldss_1[1]
+function _grouped_unit_slots(cell_slot::AbstractVector{Int}, K::Int, tied::Bool)
+    tied && return repeat(cell_slot, K)
+    stride = maximum(cell_slot)
+    return [(k - 1) * stride + s for k in 1:K for s in cell_slot]
+end
 
-    if lds1.obs_model isa GaussianObservationModel{T}
-        sufs_1 = [
-            _initialize_td_sufficient_statistics(T, ldss_1[c], cell_data[c].tsteps) for
-            c in 1:ncells
-        ]
-        for c in 1:ncells
-            _aggregate_td_suff_stats!(
-                sufs_1[c], cell_tfs[c], ldss_1[c], cell_data[c], _unit_ws(cell_sws, sws, c)
-            )
-        end
-        bufs = GroupedSufBuffers(T, lds1, data.tsteps)
-        _grouped_update_C_d!(
-            ldss_1, sufs_1, grp.cell_slot[_G_CD], sws, bufs; unit_sws=cell_sws
-        )
-        _grouped_update_R!(
-            ldss_1,
-            sufs_1,
-            grp.cell_slot[_G_R],
-            grp.cell_slot[_G_CD],
-            sws;
-            unit_sws=cell_sws,
-        )
-    elseif lds1.obs_model isa PoissonObservationModel{T}
-        for units in _units_by_slot(grp.cell_slot[_G_CD])
-            trials = Int[]
-            for c in units
-                append!(trials, grp.cell_trials[c])
-            end
-            sort!(trials)
-            # `nothing` weights: the unit weights the tie over regimes collapses to.
-            update_observation_model!(
-                ldss_1[units[1]],
-                TrialFilterSmooth([tfs[n] for n in trials]),
-                data.y[trials],
-                [_unit_ws(cell_sws, sws, units[1])],
-                nothing;
-                uy=data.uy[trials],
-            )
-        end
-    else
-        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
-    end
+"""
+    _spans_all_regimes(units, ncells, K) -> Bool
 
-    #=
-    Cells sharing a `[C d D]` version share its arrays, so copying per cell is
-    idempotent; doing it per cell rather than per version keeps this correct for
-    any slot layout.
-    =#
-    for c in 1:ncells, k in 2:K
-        _copy_emission!(cell_slds[c].LDSs[k], cell_slds[c].LDSs[1])
-    end
-    return nothing
+Whether the flat regime-major `units` cover every regime for each cell they
+touch — i.e. the version is tied across regimes, so `Σₖ γₖ(t) = 1` collapses its
+responsibilities to unit weights.
+"""
+function _spans_all_regimes(units::AbstractVector{Int}, ncells::Int, K::Int)
+    cells = unique(mod1.(units, ncells))
+    return length(units) == K * length(cells)
 end

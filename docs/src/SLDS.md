@@ -91,6 +91,10 @@ The sampling process follows the generative model:
 fit!(slds::SLDS{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}; max_iter::Int=50, progress::Bool=true) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
 ```
 
+Each E-step runs `smoothing_iters` discrete↔continuous alternations before the M-step.
+The default of 1 is the standard vLEM update; larger values hand the M-step a
+better-converged posterior at proportional cost per iteration.
+
 ## The vLEM Algorithm
 
 The vLEM algorithm maximizes the **Evidence Lower Bound (ELBO)** instead of the intractable marginal likelihood. The key insight is to use a structured variational approximation that factorizes as:
@@ -150,44 +154,111 @@ Using weighted sufficient statistics from the smoothed posteriors:
 
 The weights are given by the discrete posterior probabilities ``\gamma_t(k)``.
 
-## Tying the emission across regimes
+## Tying parameters across regimes
 
-By default every regime carries its own emission, so `C_k`, `d_k`, `D_k` (and
-`R_k`) are fitted from that regime's share of the data. Pass
-`tie_emissions=true` to `fit!` for the other common reading of a switching
-model: the system's *dynamics* switch while the measurement does not.
-
-```julia
-elbos = fit!(slds, y; ux=ux, uy=uy, max_iter=50, tie_emissions=true)
-```
-
-The tied update is the ordinary LDS emission M-step. Summing the per-regime
-weighted objectives over `k` collapses to the unit-weight one, because the
-emission term does not depend on `k` and ``\sum_k \gamma_t(k) = 1`` — so
-`[C d D]` is fitted once from the whole trajectory and copied into every regime
-(before the first E-step as well, so no regime ever infers through an emission
-the model does not have). Combined with `depends_on` the tie is *within* a
-group: each session keeps its own emission, shared by every regime. A frozen
-emission (`fit_bool`) is left exactly as the caller set it.
-
-This is the usual setup for neural recordings, where the array does not change
-when the animal's dynamics do, and it divides the emission's parameter count —
-usually the bulk of the model — by `K`.
-
-## Reading the posteriors back out
-
-`fit!` returns the ELBO trace; `posterior` returns the variational posteriors
-themselves, at fixed parameters, on the fitted data or on held-out data:
-
-```@docs
-posterior
-```
+By default every parameter is fitted per regime, from that regime's share of the
+data. Pass `tied_params` to `fit!` to share one across all of them instead. Names
+are literal parameter names, the same ones `depends_on` and `fit_bool` use, and
+each means itself: `:C` is `C`, not `[C d D]`.
 
 ```julia
-post = posterior(fitted, y; ux=ux, uy=uy)
+# The system's dynamics switch; the measurement does not.
+elbos = fit!(slds, y; ux=ux, uy=uy, max_iter=50, tied_params=(:C, :d, :D, :R))
+
+# The mirror image: one set of dynamics, switching emissions.
+elbos = fit!(slds, y; max_iter=50, tied_params=(:A, :b, :B, :Q))
+```
+
+Tying the emission is the usual setup for neural recordings, where the array does
+not change when the animal's dynamics do; it also divides the emission's parameter
+count — usually the bulk of the model — by `K`.
+
+A tied parameter is fitted once and copied into every regime, before the first
+E-step as well, so no regime ever infers `q(x)`/`q(z)` through a value the model
+does not have. Combined with `depends_on` the tie is *within* a group: each
+session keeps its own version, shared by every regime. A frozen group
+(`fit_bool`) is left exactly as the caller set it. `:x0` and `:P0` are accepted
+and ignored — an SLDS ties its initial state across regimes unconditionally.
+
+### What the tied update costs
+
+`[A b B]` and `[C d D]` are each fitted as one regression, so how much of one you
+tie decides which estimator runs.
+
+| Tied | Estimator | Cost |
+|:-----|:----------|:-----|
+| the regression **and** its covariance — `(:C, :d, :D, :R)` | ordinary M-step on pooled statistics | `O(m³)` |
+| the covariance alone — `:Q`, `:R` | per-regime residual scatters, summed | `O(m³)` |
+| the regression alone — `(:C, :d, :D)` without `:R` | generalized least squares | `O((p·m)³)` |
+| **part** of a regression — `:C` without `:d` | the free columns projected out, then the same GLS | `O((p·m′)³)` |
+
+The first is cheap because the shared term does not depend on `k` and
+``\sum_k \gamma_t(k) = 1``, so the summed per-regime weighted objectives collapse
+to the unit-weight one. The second is cheap for the same reason from the other
+side: each regime contributes its own residual scatter and they are summed before
+the covariance is formed.
+
+The third is not. With the covariance still switching it no longer divides out of
+``\partial/\partial W``, and the output rows couple:
+
+```math
+\sum_k \Sigma_k^{-1}\big(S_{zy,k}^\top - W S_{zz,k}\big) = 0
+```
+
+That is a generalized-least-squares problem of size ``p \cdot m``, which for a
+wide emission dominates the M-step. Tie the covariance alongside its regression
+when you can.
+
+The fourth — a *partial* tie, some columns of a regression shared and the rest
+free — is the third with a Frisch–Waugh step in front: each regime's free columns
+are projected out of its statistics, the shared block is solved as above over what
+remains, and the free columns are recovered by back-substitution. Exact, and it
+costs one extra solve per regime. Two cases have no such reduction and throw
+instead of guessing: a Poisson `[C d D]`, which is fitted by LBFGS rather than
+from sufficient statistics, and a partial tie alongside `depends_on`, which
+already splits the regression into one version per group of trials.
+
+A matrix-normal prior on a partially tied regression is split between the shared
+block and the free ones, which is available exactly when its column precision
+``\Lambda`` does not couple the two. A diagonal ``\Lambda`` always qualifies; one
+that does not throws rather than dropping the cross term.
+
+## Post-fit inference
+
+`fit!` returns the ELBO trace; [`smooth`](@ref) returns the posteriors themselves. Once
+an SLDS has been fit, `smooth` infers the full posterior for a dataset with the
+parameters held fixed: the continuous states ``q(x)``, the discrete-state
+responsibilities ``\gamma_t(k) = q(z_t = k) \approx p(z_t = k \mid y_{1:T})``, and the
+ELBO at those posteriors. It alternates the forward-backward pass over the discrete
+chain with the Kalman/Laplace smoother over the continuous states, following the classic
+coordinate-ascent scheme of Ghahramani & Hinton (1996), stopping once ``\gamma``
+converges (`tol`) or after `smoothing_iters` alternations.
+
+Unlike the single-Monte-Carlo-sample E-step that `fit!` uses during learning, the
+coupling here is deterministic — the discrete-layer log-likelihoods are evaluated at the
+smoothed posterior mean — so the result is reproducible.
+
+Because a converged alternation is expensive, `smooth` returns everything it computed in
+one `NamedTuple`; read its `elbo` field rather than calling [`elbo`](@ref) separately.
+
+```@docs; canonical = false
+smooth(slds::SLDS{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+```
+
+```julia
+post = smooth(fitted, y; ux=ux, uy=uy)
 occupancy = post.γ[trial]                    # K × T, columns summing to 1
 path = [argmax(view(occupancy, :, t)) for t in axes(occupancy, 2)]
+bound = post.elbo                            # scalar ELBO at these posteriors
 ```
+
+Pass `depends_on` when reading posteriors for a held-out set whose trial count differs
+from the one the regimes' stored labels were written for.
+
+[`loglikelihood`](@ref) and [`elbo`](@ref) both return that same ELBO. The exact
+marginal ``\log p(y)`` is intractable for a switching model — it requires summing over
+all ``K^T`` regime sequences — so `loglikelihood(slds, y)` reports the variational lower
+bound.
 
 ## Evidence Lower Bound (ELBO)
 
