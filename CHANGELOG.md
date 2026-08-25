@@ -8,6 +8,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- `fit!(slds, y; tied_params=...)`: share any parameter group across every
+  regime instead of fitting one per regime. Takes a `Symbol` or a collection of
+  them, named the way `depends_on` and `fit_bool` name parameters — `[A b B]` is
+  fit as one regression so any of `:A`/`:b`/`:B` names the whole group, likewise
+  `:C`/`:d`/`:D` for `[C d D]`, with `:Q` and `:R` groups of their own.
+  `tied_params = (:C, :R)` is the usual reading for neural data, where the
+  recording does not change when the dynamics do (and `K` times fewer emission
+  parameters); `tied_params = (:A, :Q)` is the mirror image, one set of dynamics
+  with switching emissions. `:x0`/`:P0` are accepted and ignored, since an SLDS
+  ties its initial state across regimes unconditionally. Works with
+  `depends_on`, where the tie is *within* a group — each session keeps its own
+  version, shared by every regime — and leaves a frozen group (`fit_bool`)
+  untouched. Tied groups are broadcast before the first E-step, so no regime
+  ever infers `q(x)`/`q(z)` through a parameter the model does not have
+  * Tying a regression alongside its noise covariance (`(:C, :d, :D, :R)`,
+    `(:A, :b, :B, :Q)`) is the ordinary M-step on pooled statistics: the shared
+    term does not depend on the regime and `Σₖ γₖ(t) = 1`, so the summed
+    per-regime weighted objectives collapse to the unit-weight one. Tying only
+    the noise is equally cheap — each regime contributes its own residual
+    scatter and they are summed before the covariance is formed
+  * Tying only the regression (`(:C, :d, :D)` without `:R`) is exact but costs
+    more. The residual covariance no longer divides out of `∂/∂W`, so the output
+    rows couple and the shared fit becomes a generalized least-squares solve of
+    size `p·m` — `O((p·m)³)` against the pooled fit's `O(m³)`. The solver
+    (`_tied_gls_regression`) is written against a flat list of units and reduces
+    exactly to the pooled `mn_map` when the covariances agree, so it is
+    available to any future caller with the same shape
+  * Tying *part* of a regression (`:C` without `:d`) is exact too: each regime's
+    free columns are projected out of its statistics, the shared block is solved
+    by the same GLS over what remains, and the free columns come back by
+    back-substitution (`_partial_tied_regression`, Frisch–Waugh–Lovell). Two
+    cases have no such reduction and throw: a Poisson `[C d D]`, which is fitted
+    by LBFGS rather than from sufficient statistics, and a partial tie alongside
+    `depends_on`, which already splits the regression per group of trials. A
+    matrix-normal prior is split between the shared and free blocks when its
+    column precision `Λ` does not couple them (a diagonal `Λ` always qualifies),
+    and throws when it does
+- `smooth(slds, y; ux, uy, depends_on, smoothing_iters, tol, return_cov,
+  progress)`: the variational posteriors of a fitted SLDS at fixed parameters,
+  returned as one `NamedTuple` `(; x, γ, elbo, p)` — the continuous states
+  `q(x)`, the discrete responsibilities `γₜ(k) = q(zₜ = k)`, the ELBO at those
+  posteriors, and (opt-in via `return_cov`) the smoothed covariances. It
+  alternates forward-backward over the switching chain with the Laplace/Kalman
+  smoother over the continuous states (Ghahramani & Hinton, 1996) until `γ`
+  converges (`tol`) or `smoothing_iters` alternations are spent. Unlike the
+  single-Monte-Carlo-sample E-step `fit!` runs during learning, the coupling
+  here is deterministic — the discrete layer is scored at the smoothed
+  posterior mean — so the result is reproducible with no `rng` to pass. `fit!`
+  runs the same alternation but keeps its forward-backward storage private, so
+  this is the way to get `q(z)` (regime occupancy, a Viterbi-style `argmax`
+  path, a rate averaged over regimes) out of a model, on training or held-out
+  data
+- `fit!(slds, y; smoothing_iters=n)`: run `n` discrete↔continuous alternations
+  per E-step instead of one. The default of 1 is the standard vLEM update;
+  larger values hand the M-step a better-converged posterior at proportional
+  cost per iteration
 - Ancillary parameter dependencies: every
   `AbstractStateModel` and `AbstractObservationModel` now carries a
   `depends_on` field (default `nothing`). Setting it to a `NamedTuple` of
@@ -74,6 +130,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- **Breaking:** parameter names no longer stand in for the group they are fitted
+  with. `depends_on = (C = session, R = session)` was shorthand for grouping the
+  whole `[C d D]` regression; it is now an error, and the members must be named
+  — `(C = session, d = session, D = session, R = session)`. `:A`/`:b`/`:B` the
+  same. A model with no observation input has no `D` to fit, so `(C, d)` is the
+  whole group there. The old spelling reads as a claim about `C` alone while
+  quietly fitting `d` and `D` per group as well, which is exactly the kind of
+  mistake the check now catches. `group_labels` / `group_parameter` /
+  `set_group_seeds!` are unaffected: they look a parameter up rather than
+  declaring anything, so an individual name is still what they want
 - **Poisson emission M-step now solves each neuron's parameters separately by
   Newton**, replacing the single LBFGS over all `obs_dim × (latent_dim + 1 +
   uy_dim)` parameters at once. The Q-function separates over the rows of
@@ -98,32 +164,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and 1.1× at 32, only losing by 48 — the old cutoff left the whole useful
   latent-dimensionality range on the slower path
 
-### Performance
-- `block_tridiagonal_inverse_logdet!` replaces its second (UL) sweep and the
-  per-block factorisation that followed with the Kalman-smoother covariance
-  recursion `Σᵢ₋₁,ᵢ₋₁ = Mᵢ₋₁⁻¹ - Dᵢ Σᵢ,ᵢ₋₁` read off the forward sweep's
-  cached Cholesky factors — one factorisation per block where there were
-  three. ~1.65× on the kernel, which is `O(T · D³)` and runs once per trial
-  per E-step, so it dominates a fit at larger latent dimensionality (8.9 ms →
-  5.4 ms per trial at `latent_dim = 32`, `T = 100`)
-- The Poisson emission kernels are batched over a whole trial instead of
-  looping over timesteps:
-  * `hessian!` forms `C' diag(λₜ) C` for every `t` as one `gemm` over the
-    `D(D+1)/2` distinct entries of the symmetric block, which also halves the
-    arithmetic (12.2 ms → 0.4 ms per trial at `obs_dim = 200`, `latent_dim =
-    16`, `T = 100`)
-  * `Q_obs!` forms the linear predictor and the variance correction
-    `ρᵢₜ = ½ cᵢ' Pₜ cᵢ` the same way (3.1 ms → 0.5 ms at the same size), and
-    short-circuits the `log Γ(y+1)` normaliser at counts of 0 and 1, which at
-    typical bin widths is almost all of the data
-  * A `PoissonBatchBuffers` field on `SmoothWorkspace` holds the scratch,
-    allocated on first use so a Gaussian fit never pays for it
-- Together with the Newton M-step, a Poisson EM iteration on a 60-trial,
-  200-neuron, 16-latent, 100-bin problem went from 5.4 s to 0.97 s, and the
-  fraction of the iteration that runs in parallel rose from about half to
-  nearly all of it — the previous LBFGS objective was evaluated on a single
-  thread while only its gradient was chunked across the workspace pool
-
 - **Breaking:** the previously exported (but unused) `Data` struct is now a
   private, validated container for multi-trial observations + `ux`/`uy` inputs.
   Public entry points (`fit!`, `smooth`, `loglikelihood`) accept plain arrays —
@@ -142,6 +182,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path and all three observation shapes on both the Gaussian and Poisson
   paths; multi-trial input returns per-trial vectors, matrix input returns
   matrices as before (#139)
+- **Breaking:** `elbo(slds, y)` is now deterministic. It infers `q(x)` and
+  `q(z)` by the same coordinate ascent as `smooth(slds, y)` and returns that
+  call's `elbo` field, rather than running one Monte-Carlo E-step off a joint
+  draw from `q(x)`. It no longer takes an `rng`, and takes `smoothing_iters` /
+  `tol` / `progress` instead; the value is a converged bound rather than one
+  matching `fit!`'s first noisy trace entry
+- **Breaking:** `loglikelihood(slds, y)` returns the ELBO instead of throwing.
+  The exact marginal `log p(y)` is still intractable for a switching model
+  (it needs a sum over all `K^T` regime sequences), so the returned value is a
+  variational lower bound — comparable across models fit to the same data, but
+  not a likelihood
 - **Breaking:** renamed the control-input arguments `latent_inputs`/`obs_inputs`
   to `ux`/`uy` across the public API (keywords on `fit!`/`rand`, positional on
   `smooth!`/`estep!`) (#139)
@@ -171,6 +222,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sequences — previously inputs were silently ignored, giving a wrong
   likelihood
 
+### Performance
+- `block_tridiagonal_inverse_logdet!` replaces its second (UL) sweep and the
+  per-block factorisation that followed with the Kalman-smoother covariance
+  recursion `Σᵢ₋₁,ᵢ₋₁ = Mᵢ₋₁⁻¹ - Dᵢ Σᵢ,ᵢ₋₁` read off the forward sweep's
+  cached Cholesky factors — one factorisation per block where there were
+  three. ~1.65× on the kernel, which is `O(T · D³)` and runs once per trial
+  per E-step, so it dominates a fit at larger latent dimensionality (8.9 ms →
+  5.4 ms per trial at `latent_dim = 32`, `T = 100`)
+- The Poisson emission kernels are batched over a whole trial instead of
+  looping over timesteps:
+  * `hessian!` forms `C' diag(λₜ) C` for every `t` as one `gemm` over the
+    `D(D+1)/2` distinct entries of the symmetric block, which also halves the
+    arithmetic (12.2 ms → 0.4 ms per trial at `obs_dim = 200`, `latent_dim =
+    16`, `T = 100`)
+  * `Q_obs!` forms the linear predictor and the variance correction
+    `ρᵢₜ = ½ cᵢ' Pₜ cᵢ` the same way (3.1 ms → 0.5 ms at the same size), and
+    short-circuits the `log Γ(y+1)` normaliser at counts of 0 and 1, which at
+    typical bin widths is almost all of the data
+  * A `PoissonBatchBuffers` field on `SmoothWorkspace` holds the scratch,
+    allocated on first use so a Gaussian fit never pays for it
+- The SLDS emission Hessian uses the same batched Poisson kernel as the single
+  LDS. `hessian!` for an SLDS sums `-γₖ(t)·C' diag(λₜ) C` over regimes, which is
+  `O(K · N · D² · T)` and runs on every Newton step of every trial's smooth, on
+  every E-step — the dominant cost of a Poisson SLDS fit. The per-regime
+  responsibilities fold into the rates before the `gemm`, so the weighted
+  curvature costs what the unweighted one does: 12.0 ms → 0.63 ms per
+  `hessian!` call at `K = 2`, `obs_dim = 200`, `latent_dim = 16`, `T = 100`, and
+  1.26 s → 0.50 s per EM iteration on an 8-trial fit of that size. The
+  Gaussian path keeps the per-timestep kernel, whose curvature is a cached
+  `O(D²)` axpy per timestep and has nothing to batch
+- Together with the Newton M-step, a Poisson EM iteration on a 60-trial,
+  200-neuron, 16-latent, 100-bin problem went from 5.4 s to 0.97 s, and the
+  fraction of the iteration that runs in parallel rose from about half to
+  nearly all of it — the previous LBFGS objective was evaluated on a single
+  thread while only its gradient was chunked across the workspace pool
+
 ### Removed
 - Stale one-off profiling scripts under `benchmark/profiling/` (#144)
 - The retired information-form Kalman/RTS smoother EM machinery
@@ -184,11 +271,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P0` now fails.
 
 ### Fixed
-- Multi-trial `rand(rng, lds, tsteps_per_trial)` threw `Attempted to capture and
-  modify outer local variables` under OhMyThreads: its `tforeach` closure shared
-  the `state_params` / `obs_params` bindings, which are assigned in both arms of
-  the `depends_on` branch above it and are therefore boxed. Bound through a
-  `let`, as the SLDS E-step already does
+- A grouped (`depends_on`) SLDS with a **Poisson** emission threw
+  `BoundsError` out of the first M-step, so no such fit could run at all. The
+  grouped SLDS M-step read `cell_slot[_G_R]` before branching on the emission
+  type, and `R` is a group only on the Gaussian side — `_group_names` gives a
+  Poisson emission `(:C,)` alone, so its `cell_slot` is one entry shorter and
+  that index is off the end. It is now read inside the Gaussian branch, which
+  is the only place its value was ever used. Every grouped-SLDS test was
+  Gaussian, which is what let it through; there is now a Poisson one covering
+  the plain grouped fit and the `tied_params = (:C, :d)` tie
+- A grouped (`depends_on`) fit that pooled a regression over units with
+  *different* noise versions — e.g. `depends_on = (R = session,)` with one
+  emission over all sessions — solved the ordinary pooled normal equations,
+  which do not maximize the ELBO when the residual covariance is not shared.
+  Those cases now go through the generalized-least-squares solve described
+  under Added; a version whose units do share a covariance keeps the cheap
+  pooled path, which is the same estimator
+- The documentation build failed: `set_group_seeds!` is exported and carries a
+  docstring but was not in any `@docs` block, so Documenter raised both
+  `missing_docs` and the unresolved `@ref`s pointing at it
+- Multi-trial `rand(lds, tsteps_per_trial)` threw
+  `Attempted to capture and modify outer local variables` instead of sampling.
+  The per-trial parameter vectors were assigned from two branches of an `if`
+  and then captured by the `tforeach` sampling closure, so Julia boxed them and
+  OhMyThreads rejected the closure outright. They are now built in a helper, so
+  each name is assigned once
+- `fit!(slds, y; tie_emissions=true)` fitted the shared Gaussian emission from an
+  uninitialized workspace, usually throwing `PosDefException` from the Cholesky
+  in `_aggregate_td_suff_stats!` and otherwise returning nonsense. The
+  unit-weight aggregator seeds its buffers from the data-only constant blocks
+  (`Σ y y'`, `Σ y`, the observation count, the `uy` blocks), which only the
+  LDS/PLDS `fit!` entry points fill — the SLDS never reaches them, because its
+  own M-step goes through the weighted aggregator, which needs no constants.
+  Both the plain and the grouped tied-emission updates now fill them first
 - SLDS `forward_backward` could produce `NaN`s when a regime received ~no
   responsibility at trial starts: its initial-state effective count `init_n`
   underflowed toward zero, so `x0 = init_xy/init_n` and `P0 = S0/init_n` blew up

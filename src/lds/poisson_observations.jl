@@ -288,42 +288,43 @@ function _poisson_pack_cov!(
 end
 
 """
-    hessian!(sws, plds, x, y[, uy])
+    _poisson_emission_hessian!(btd, pb, obs_model, x, uy, tsteps, weights)
 
-Poisson specialisation of the generic `hessian!`: the state-side blocks are
-unchanged, but the emission curvature `-C' diag(λ_t) C` for every timestep is
-formed as a single `gemm` over the `nsym = D(D+1)/2` distinct entries rather
-than a `tsteps`-long loop of `latent_dim² · obs_dim` scalar reductions.
+Subtract the Poisson emission curvature `wₜ · C' diag(λₜ) C` from every diagonal
+Hessian block, forming the whole trial in one `gemm` over the
+`nsym = D(D+1)/2` distinct entries of the symmetric block rather than a
+`tsteps`-long loop of `latent_dim² · obs_dim` scalar reductions.
+
+`weights` is `nothing` for a single LDS and the regime's responsibilities
+`γₖ(t)` for one regime of an SLDS — folded into the rates before the `gemm`, so
+the weighted curvature costs the same as the unweighted one. Accumulates, so an
+SLDS sums regimes by calling this once per regime.
 
 Bit-for-bit this is a different summation order than the per-timestep kernel,
 so results agree to rounding rather than exactly; the arithmetic, and the
 `observation_hessian!` contract, are otherwise identical.
 """
-function hessian!(
-    sws::SmoothWorkspace{T},
-    lds::LinearDynamicalSystem{T,S,O},
+function _poisson_emission_hessian!(
+    btd::BlockTridiagonalWorkspace{T},
+    pb::PoissonBatchBuffers{T},
+    obs_model::PoissonObservationModel{T},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
-    uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    tsteps = size(y, 2)
-    btd = sws.btd
-    cc = sws.consts
-    C = lds.obs_model.C
-    obs_dim, latent_dim = size(C)
-
-    _state_hessian_blocks!(btd, cc, tsteps)
-
-    pb = poisson_batch!(sws, latent_dim, obs_dim, tsteps)
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    weights::Union{Nothing,AbstractVector{T}},
+) where {T<:Real}
+    C = obs_model.C
+    obs_dim = size(C, 1)
     nsym = length(pb.sym_i)
 
     # λ[:, t] = exp(C x_t + d + D v_t) — the emission curvature's only
-    # dependence on the current iterate.
-    Lam = _poisson_linear_predictor!(pb, C, lds.obs_model.d, lds.obs_model.D, x, uy, tsteps)
+    # dependence on the current iterate — scaled by the timestep's weight.
+    Lam = _poisson_linear_predictor!(pb, C, obs_model.d, obs_model.D, x, uy, tsteps)
     @inbounds for t in 1:tsteps
+        wt = weights === nothing ? one(T) : weights[t]
         col = view(Lam, :, t)
         @simd for i in 1:obs_dim
-            col[i] = exp(col[i])
+            col[i] = wt * exp(col[i])
         end
     end
 
@@ -341,6 +342,30 @@ function hessian!(
             i == j || (Ht[j, i] -= v)
         end
     end
+    return nothing
+end
+
+"""
+    hessian!(sws, plds, x, y[, uy])
+
+Poisson specialisation of the generic `hessian!`: the state-side blocks are
+unchanged, and the emission curvature goes through the batched
+[`_poisson_emission_hessian!`](@ref).
+"""
+function hessian!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(y, 2)
+    obs_dim, latent_dim = size(lds.obs_model.C)
+
+    _state_hessian_blocks!(sws.btd, sws.consts, tsteps)
+
+    pb = poisson_batch!(sws, latent_dim, obs_dim, tsteps)
+    _poisson_emission_hessian!(sws.btd, pb, lds.obs_model, x, uy, tsteps, nothing)
 
     return nothing
 end

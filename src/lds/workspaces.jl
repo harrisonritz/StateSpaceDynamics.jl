@@ -542,36 +542,6 @@ mutable struct SmoothWorkspace{T<:Real}
 end
 
 """
-    poisson_batch!(sws, latent_dim, obs_dim, tsteps) -> PoissonBatchBuffers
-
-The workspace's batched Poisson scratch, grown on demand. Allocated on first
-use rather than in the constructor: a Gaussian fit never calls a Poisson kernel,
-and the buffers are O(obs_dim · tsteps), which is the largest single block a
-workspace holds.
-
-Reallocates only when the request exceeds what is already there, so within a
-fit this is one allocation on the first Newton step and a field read after.
-"""
-function poisson_batch!(
-    sws::SmoothWorkspace{T}, latent_dim::Int, obs_dim::Int, tsteps::Int
-) where {T<:Real}
-    pb = sws.poisson
-    if pb === nothing ||
-        pb.latent_dim != latent_dim ||
-        pb.obs_dim < obs_dim ||
-        pb.tsteps < tsteps
-        pb = PoissonBatchBuffers(
-            T,
-            latent_dim,
-            pb === nothing ? obs_dim : max(obs_dim, pb.obs_dim),
-            pb === nothing ? tsteps : max(tsteps, pb.tsteps),
-        )
-        sws.poisson = pb
-    end
-    return pb
-end
-
-"""
     SmoothWorkspace(::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int;
                     ux_dim=0, uy_dim=0, ntrials=1)
 
@@ -815,12 +785,16 @@ Workspace for SLDS smoothing that matches the LDS backend shape:
   single-LDS and SLDS paths use one set of field paths
 - `ll_tmp`: per-component log-likelihood scratch; the weighted accumulation
   across components needs a second `tsteps` buffer beside `opt.ll_vec`
+- `poisson`: batched Poisson scratch, allocated on first use exactly as
+  `SmoothWorkspace`'s is. One buffer serves every regime — the emission
+  curvature is formed and scattered one regime at a time.
 """
-struct SLDSSmoothWorkspace{T<:Real}
-    btd::BlockTridiagonalWorkspace{T}
-    consts::Vector{SmoothConstants{T}}
-    opt::NewtonBuffers{T}
-    ll_tmp::Vector{T}   # per-component scratch (length tsteps)
+mutable struct SLDSSmoothWorkspace{T<:Real}
+    const btd::BlockTridiagonalWorkspace{T}
+    const consts::Vector{SmoothConstants{T}}
+    const opt::NewtonBuffers{T}
+    const ll_tmp::Vector{T}   # per-component scratch (length tsteps)
+    poisson::Union{Nothing,PoissonBatchBuffers{T}}
 end
 
 function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
@@ -833,6 +807,7 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
         zeros(T, tsteps),                # ll_tmp
+        nothing,                         # batched Poisson scratch, on first use
     )
 
     # Cache constants once
@@ -851,6 +826,39 @@ function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
         compute_smooth_constants!(ws.consts[k], slds.LDSs[k])
     end
     return nothing
+end
+
+"""
+    poisson_batch!(sws, latent_dim, obs_dim, tsteps) -> PoissonBatchBuffers
+
+The workspace's batched Poisson scratch, grown on demand. Allocated on first
+use rather than in the constructor: a Gaussian fit never calls a Poisson kernel,
+and the buffers are O(obs_dim · tsteps), which is the largest single block a
+workspace holds. Serves the single-LDS and the SLDS workspaces alike.
+
+Reallocates only when the request exceeds what is already there, so within a
+fit this is one allocation on the first Newton step and a field read after.
+"""
+function poisson_batch!(
+    sws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    latent_dim::Int,
+    obs_dim::Int,
+    tsteps::Int,
+) where {T<:Real}
+    pb = sws.poisson
+    if pb === nothing ||
+        pb.latent_dim != latent_dim ||
+        pb.obs_dim < obs_dim ||
+        pb.tsteps < tsteps
+        pb = PoissonBatchBuffers(
+            T,
+            latent_dim,
+            pb === nothing ? obs_dim : max(obs_dim, pb.obs_dim),
+            pb === nothing ? tsteps : max(tsteps, pb.tsteps),
+        )
+        sws.poisson = pb
+    end
+    return pb
 end
 
 # =============================================================================

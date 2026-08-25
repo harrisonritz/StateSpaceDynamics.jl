@@ -147,6 +147,34 @@ function Random.rand(
     return x, y
 end
 
+#=
+Per-trial `(state_params, obs_params)` for a multi-trial draw. Ungrouped, every
+trial points at the same two NamedTuples (which themselves reference the model's
+arrays); grouped, a trial points at its cell's. Either way the sampler is one
+code path.
+=#
+function _per_trial_sample_params(lds::LinearDynamicalSystem, ::Nothing, ntrials::Int)
+    return (
+        fill(_extract_state_params(lds.state_model), ntrials),
+        fill(_extract_obs_params(lds.obs_model), ntrials),
+    )
+end
+
+function _per_trial_sample_params(
+    lds::LinearDynamicalSystem, grp::ParameterGrouping, ntrials::Int
+)
+    cell_state = [
+        _extract_state_params(_cell_lds(lds, grp, c).state_model) for c in 1:(grp.ncells)
+    ]
+    cell_obs = [
+        _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:(grp.ncells)
+    ]
+    return (
+        [cell_state[grp.trial_cell[n]] for n in 1:ntrials],
+        [cell_obs[grp.trial_cell[n]] for n in 1:ntrials],
+    )
+end
+
 function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
@@ -159,24 +187,11 @@ function Random.rand(
     grp = parameter_grouping(lds, ntrials; depends_on=depends_on)
 
     #=
-    Per-trial parameter sets. Ungrouped, every trial points at the same two
-    NamedTuples (which themselves reference the model's arrays); grouped, a
-    trial points at its cell's. Either way the sampler below is one code path.
+    Per-trial parameter sets, built in a helper so each name is assigned exactly
+    once here: the sampling loop below captures them in a closure, and a local
+    written from two branches of an `if` is boxed, which OhMyThreads rejects.
     =#
-    if grp === nothing
-        state_params = fill(_extract_state_params(lds.state_model), ntrials)
-        obs_params = fill(_extract_obs_params(lds.obs_model), ntrials)
-    else
-        cell_state = [
-            _extract_state_params(_cell_lds(lds, grp, c).state_model) for
-            c in 1:(grp.ncells)
-        ]
-        cell_obs = [
-            _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:(grp.ncells)
-        ]
-        state_params = [cell_state[grp.trial_cell[n]] for n in 1:ntrials]
-        obs_params = [cell_obs[grp.trial_cell[n]] for n in 1:ntrials]
-    end
+    state_params, obs_params = _per_trial_sample_params(lds, grp, ntrials)
 
     x = Vector{Matrix{T}}(undef, ntrials)
     y = Vector{Matrix{T}}(undef, ntrials)
@@ -210,29 +225,22 @@ function Random.rand(
     chunksize = cld(ntrials, ntasks)
     task_rngs = [MersenneTwister(rand(rng, UInt64)) for _ in 1:ntasks]
 
-    #=
-    `state_params` / `obs_params` are assigned in both arms of the grouping
-    branch above, so sharing those bindings with the closure would box them,
-    which OhMyThreads rejects (same idiom as `fit_SLDS.jl`'s parallel E-step).
-    =#
-    let state_params = state_params, obs_params = obs_params
-        tforeach(1:ntasks) do i
-            lo = (i - 1) * chunksize + 1
-            hi = min(i * chunksize, ntrials)
-            lo > hi && return nothing
-            trng = task_rngs[i]
-            for trial in lo:hi
-                _sample_trial!(
-                    trng,
-                    x[trial],
-                    y[trial],
-                    state_params[trial],
-                    obs_params[trial],
-                    lds.obs_model,
-                    ux_seq[trial],
-                    uy_seq[trial],
-                )
-            end
+    tforeach(1:ntasks) do i
+        lo = (i - 1) * chunksize + 1
+        hi = min(i * chunksize, ntrials)
+        lo > hi && return nothing
+        trng = task_rngs[i]
+        for trial in lo:hi
+            _sample_trial!(
+                trng,
+                x[trial],
+                y[trial],
+                state_params[trial],
+                obs_params[trial],
+                lds.obs_model,
+                ux_seq[trial],
+                uy_seq[trial],
+            )
         end
     end
 
