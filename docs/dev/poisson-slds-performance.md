@@ -5,6 +5,12 @@ for the Gaussian (LDS) and Poisson (PLDS) single-regime cases.
 
 Branch: `claude/poisson-slds-parallel-ab6v7p`
 
+> **Status: A-E below are implemented on this branch.** This document is the diagnosis
+> that motivated them and is kept as the record of the "before" state; every measurement
+> in it is of the code as it stood at commit `16fd8bb`. See
+> [Implementation notes](#implementation-notes) at the end for what shipped and the
+> reproducibility contract that came with it.
+
 ## Summary
 
 Two separate things are going on, and only one of them is threading. At a realistic problem size (`N=150, T=500, 32 trials, K=3`) PLDS goes 5.02 s → 2.55 s on four
@@ -286,3 +292,95 @@ These change which of A-E is worth doing first, and how B should be built.
    for post-fit inference? They share `_slds_smooth_all!` and `_slds_fill_logL!`, so B covers
    all of them, but `smooth` allocates its own workspace at `fit_SLDS.jl:875` and would need
    the same treatment.
+
+
+## Implementation notes
+
+What shipped, against the proposals above.
+
+### A — the SLDS reaches the Poisson kernels now
+
+`_slds_trial_loglikelihood!` (`fit_SLDS.jl`) splits a regime's per-timestep log-density
+into an emission half and a state half. The emission half dispatches on the observation
+model: the Poisson method forms `η = C x + d + D v` for the whole trial in one `gemm` and
+takes the `Σ log(y!)` normalizer precomputed, exactly as `fit_PLDS.jl`'s own
+`joint_loglikelihood!` does; every other model keeps the per-timestep kernel. The
+normalizer is built once per trial at fit entry (`_slds_lognorm_all`) and threaded through
+`_slds_smooth_all!` into `smooth!`'s `ϕ!`, so the Newton line search never recomputes it.
+
+`_slds_emission_gradient!` does the same for the gradient: the weighted residual
+`γₖ(t)(yₜ − λₜ)` overwrites the linear predictor in place and `C'` applied to the whole
+block accumulates straight into `grad`, replacing `tsteps` BLAS-2 pairs per regime.
+
+Both are checked against the per-timestep kernels they replaced
+(`test_SLDS_batched_poisson_loglikelihood`, `test_SLDS_batched_poisson_gradient`).
+
+### B — a workspace pool and a fixed work partition
+
+`SLDSWorkspacePool` holds one `SLDSSmoothWorkspace` per task slot. A stitching fit whose
+cells differ in width gets per-`(slot, cell)` workspaces built on first use; chunks are
+contiguous in cell-major trial order, so a slot touches only the one or two cells its
+chunk spans and the lazy build stays at roughly `ntasks` extra workspaces rather than
+`ntasks × ncells`.
+
+`SLDSTrialPlan` is the partition itself — trials in cell-major visit order plus the chunk
+bounds — built once per fit so the slot a trial lands on never moves. `_slds_fill_logL!`,
+`_slds_smooth_all!`, `_slds_trial_elbos` and the warm start all run over it with
+`tforeach`, indexed by chunk position, refreshing the regime constants once per cell a
+chunk spans.
+
+`npool` (on both `fit!` and `smooth`) caps the slots, and with them the memory: each slot
+is `O(D²·T)` block-tridiagonal storage plus `O(N·T)` Poisson scratch. `npool = 1` runs
+every pass sequentially.
+
+### B2 — `rng_mode`
+
+`:trial` (default) seeds a per-trial generator from the master `rng` and the trial index,
+so the draw a trial receives is a function of the seed alone. `:global` pre-draws the
+standard normals serially in trial order — the stream the sequential smoother consumed —
+and hands each trial its slice; the pass still runs in parallel. `smooth!` grew a `noise`
+kwarg to serve the second.
+
+### C — the emission M-step's task count
+
+`update_observation_model!`'s pool only ever supplied a task count; the per-chunk scratch
+is its own freshly built `PoissonMStepBuffers`. It now takes `ntasks` directly (defaulting
+to the pool length, so the LDS callers are unchanged), and the SLDS passes the thread
+budget instead of the one-element pool that pinned it to a single task.
+
+### D — the M-step's regime axis
+
+The `K` (ungrouped) or `K · ncells` (grouped) weighted sufficient-statistic aggregations
+write into disjoint outputs and use their workspace purely as scratch, so they run across
+a pool of them. This is the axis that still helps when `ntrials < nthreads`. The `k` loops
+inside `gradient!` / `hessian!` / `joint_loglikelihood!` were left sequential on purpose —
+they accumulate into shared buffers, for a `K` that is typically 2-5.
+
+### E — per-iteration allocations
+
+`Data`, the per-regime sufficient statistics, `GroupedSufBuffers` and the grouped
+per-cell data/`tfs` slices are built once in `fit!` and passed into the M-step;
+`_update_shared_initial_state!` takes a scratch model allocated once instead of
+`deepcopy`ing a whole sub-model every iteration.
+
+### Reproducibility contract
+
+- **Thread count never changes a fit.** Every per-trial result — `x_smooth`, `p_smooth`,
+  the responsibilities, `dl.logL` — is written by exactly one trial, so those are
+  bit-identical however the chunks are scheduled. The ELBO is accumulated per trial and
+  summed in trial order, which makes it exactly `npool`-invariant too (this is why
+  `_slds_trial_elbos` returns per-trial values rather than the cheaper per-chunk
+  partials).
+- **`npool` moves one summation order.** The Poisson emission M-step reduces its curvature
+  and gradient over chunks, so a different chunk count is a different order — measured at
+  ~1e-11 relative after tens of EM iterations. A Gaussian emission has no such reduction
+  and is exact across `npool`. Pin `npool` alongside `rng` to reproduce a fit exactly.
+
+### Left undone
+
+- The grouped M-step still rebuilds `unit_suf` (one sufficient statistic per
+  `(regime, cell)`) each iteration; the ungrouped path's `sufs` are hoisted.
+- `_aggregate_td_suff_stats_weighted!` remains a sequential per-trial loop *within* one
+  regime — it is parallel across regimes only. Making it trial-parallel needs per-chunk
+  accumulators and a reduction, which is worth doing if profiling puts the grouped M-step
+  above the smoother.
