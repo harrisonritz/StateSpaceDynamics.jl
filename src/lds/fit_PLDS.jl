@@ -77,6 +77,20 @@ end
 _poisson_lognorm_all(::LinearDynamicalSystem, ::AbstractVector) = nothing
 
 """
+    _poisson_lognorm_one(lds, y) -> Vector or nothing
+
+One trial's `lognorm_t`, or `nothing` for a non-Poisson emission. The
+single-trial counterpart of [`_poisson_lognorm_all`](@ref).
+"""
+function _poisson_lognorm_one(
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractMatrix{T}
+) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
+    return _poisson_lognorm_t(y)
+end
+
+_poisson_lognorm_one(::LinearDynamicalSystem, ::AbstractMatrix) = nothing
+
+"""
     joint_loglikelihood!(ws, plds, x, y[, lognorm_t, ux, uy])
 
 Per-timestep complete-data log-likelihood of a Poisson LDS, written into

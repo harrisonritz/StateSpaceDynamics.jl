@@ -403,8 +403,9 @@ The Poisson `Σᵢ log(y!)` normalizer for one trial / for every trial, or
 observation-model type, so `LDSs[1]` decides which it is; and the normalizer
 depends only on the counts, so one vector per trial serves every regime.
 """
-_slds_lognorm_for(slds::SLDS, y::AbstractMatrix) =
-    _poisson_lognorm_all(slds.LDSs[1], [y]) === nothing ? nothing : _poisson_lognorm_t(y)
+function _slds_lognorm_for(slds::SLDS, y::AbstractMatrix)
+    return _poisson_lognorm_one(slds.LDSs[1], y)
+end
 
 function _slds_lognorm_all(slds::SLDS, y::AbstractVector{<:AbstractMatrix})
     return _poisson_lognorm_all(slds.LDSs[1], y)
@@ -2802,7 +2803,14 @@ function fit!(
     else
         nothing
     end
-    mstep_bufs = GroupedSufBuffers(T, slds.LDSs[1], tsteps_per_trial)
+    #=
+    Built from cell 1's sub-model on the grouped path, not the parent's: under
+    stitching the cells differ in channel count, and this is the model the
+    grouped M-step sizes its default statistics from.
+    =#
+    mstep_bufs = GroupedSufBuffers(
+        T, grp === nothing ? slds.LDSs[1] : cell_slds[1].LDSs[1], tsteps_per_trial
+    )
     init_scratch = deepcopy(slds.LDSs[1])
     # Per-cell slices of the data and smoother storage, fixed by the partition.
     cell_views = if grp === nothing
