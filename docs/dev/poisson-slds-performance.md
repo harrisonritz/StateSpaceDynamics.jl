@@ -7,7 +7,8 @@ Branch: `claude/poisson-slds-parallel-ab6v7p`
 
 ## Summary
 
-Two separate things are going on, and only one of them is threading:
+Two separate things are going on, and only one of them is threading. At a realistic problem size (`N=150, T=500, 32 trials, K=3`) PLDS goes 5.02 s → 2.55 s on four
+threads while the Poisson SLDS goes 27.9 s → 26.46 s. The two causes:
 
 1. **`fit_SLDS.jl` never builds a workspace pool.** `fit!` allocates exactly one
    `SLDSSmoothWorkspace` and threads it through every per-trial loop, which forces those
@@ -38,8 +39,17 @@ Julia-level task parallelism is what is being measured.
 | P-SLDS | 1.904 s  | 1.992 s   | 2.060 s   |
 
 The Poisson SLDS gets *slower* as threads are added — there is no parallel work to
-distribute, only scheduler overhead. (This problem size is small enough that PLDS's own
-parallel gain is within noise; see the larger case below.)
+distribute, only scheduler overhead. This problem size is small enough that PLDS's own
+parallel gain is within noise, so here is a realistic one — `K=3, D=6, N=150, T=500,
+ntrials=32`, 5 EM iterations:
+
+| model  | 1 thread | 4 threads | speedup |
+|--------|----------|-----------|---------|
+| PLDS   | 5.02 s   | 2.55 s    | 1.97x   |
+| P-SLDS | 27.9 s   | 26.46 s   | 1.05x   |
+
+PLDS very nearly doubles on four threads. The Poisson SLDS gains 5%, and the gap between them
+widens from 5.6x to 10.4x purely because one of them scales and the other does not.
 
 A sampling profile of `fit!(::SLDS)` with a Poisson emission, 20 iterations, 4 threads:
 
