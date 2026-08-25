@@ -363,6 +363,31 @@ per-cell data/`tfs` slices are built once in `fit!` and passed into the M-step;
 `_update_shared_initial_state!` takes a scratch model allocated once instead of
 `deepcopy`ing a whole sub-model every iteration.
 
+### Measured
+
+At the reported production shape, scaled down to a trial count that fits a
+CI-sized box — `K=3, D=10, N=150, T=100`, 300 trials, 5 EM iterations, on 4 vCPU
+with `BLAS.set_num_threads(1)` (`docs/dev/slds_workload_benchmark.jl`):
+
+| | 1 thread | 4 threads |
+|---|---|---|
+| before (`16fd8bb`) | 90.2 s | 89.6 s |
+| after, `npool=1`   | 63.4 s | 65.5 s |
+| after, `npool=4`   | —      | **22.0 s** |
+
+Two separate gains, as the diagnosis predicted:
+
+- **1.42× with no threads at all** (90.2 → 63.4 s), from A and E — the batched
+  Poisson kernels and the precomputed `log(y!)`. This is the part that also helps
+  a single-trial fit, or a cluster job pinned to one core.
+- **2.88× on top of that from four cores** (63.4 → 22.0 s), 72% parallel
+  efficiency where before there was none at all (the "before" row is flat, and
+  was slightly *worse* with threads on the smaller case).
+
+Together **4.07× on four cores**, and the parallel half keeps scaling: a 16-core
+node should land near the `K × PLDS / nthreads` figure the diagnosis set as the
+realistic ceiling.
+
 ### Reproducibility contract
 
 - **Thread count never changes a fit.** Every per-trial result — `x_smooth`, `p_smooth`,
