@@ -1345,9 +1345,9 @@ function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
             end
         elseif om isa PoissonObservationModel{T}
             if om.CD_prior !== nothing
-                W_cd = Matrix{T}(undef, lds.obs_dim, D + 1)
-                @views W_cd[:, 1:D] .= om.C
-                @views W_cd[:, D + 1] .= om.d
+                # `[C d D]`, the full regression the prior is stated over: with
+                # emission inputs the `D` block is part of it.
+                W_cd = _pack_obs_V!(Matrix{T}(undef, lds.obs_dim, D + 1 + lds.uy_dim), lds)
                 Wm = W_cd .- om.CD_prior.M₀
                 prior_term -= T(0.5) * sum(Wm .* (Wm * om.CD_prior.Λ))
             end

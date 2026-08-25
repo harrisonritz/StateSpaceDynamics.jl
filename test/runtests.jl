@@ -164,6 +164,7 @@ using SSDTest
                 test_SLDS_hessian_numerical_with_inputs_poisson()
                 test_SLDS_fit_with_inputs_gaussian()
                 test_SLDS_fit_with_inputs_poisson()
+                test_SLDS_poisson_cd_prior_with_inputs()
             end
         end
 
@@ -361,6 +362,13 @@ using SSDTest
                 test_stitching_slds_shapes()
                 test_slds_cell_workspace_sharing()
                 test_stitching_slds_fit()
+            end
+
+            @testset "CD_prior" begin
+                test_slot_prior_cycles_nonzero_mean()
+                test_stitching_slot_priors_match_width()
+                test_stitching_fit_with_cd_prior()
+                test_stitching_poisson_slds_cd_prior()
             end
         end
     end

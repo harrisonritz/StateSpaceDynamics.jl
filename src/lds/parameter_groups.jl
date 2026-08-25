@@ -755,6 +755,34 @@ function _seed_slot_R(
     return out
 end
 
+"""
+    _slot_obs_prior(prior, p) -> MNPrior or nothing
+
+The `[C d D]` prior one observation slot gets. `M₀` carries one row per channel,
+so a slot whose channel count differs from the template's needs its own copy of
+the prior: sharing the template's would broadcast a `p₀`-row `M₀` against this
+slot's `p`-row `[C d D]` in the emission M-step and in the ELBO's prior term,
+which is a `DimensionMismatch` under stitching whenever the sessions disagree on
+how many units they saw.
+
+Rows are cycled, exactly as `_seed_slot_C` cycles the template's loadings: like
+`C` itself, `M₀` is stated in the template's channel order and nothing here knows
+which of this slot's channels is which. For the ridge that motivates the prior
+(`M₀ = 0`) every row is the same one, so the shrinkage target is untouched.
+"""
+_slot_obs_prior(::Nothing, ::Int) = nothing
+
+function _slot_obs_prior(prior::MNPrior, p::Int)
+    M₀ = prior.M₀
+    nrows = size(M₀, 1)
+    nrows == p && return prior
+    M = similar(M₀, p, size(M₀, 2))
+    for r in 1:p
+        M[r, :] .= @view M₀[mod1(r, nrows), :]
+    end
+    return MNPrior(; M₀=M, Λ=prior.Λ)
+end
+
 #=
 A rebuild is skipped only when the cached variants already have the shapes this
 dataset asks for; otherwise re-fitting the same model against a dataset with
@@ -839,6 +867,7 @@ function _build_variants!(
         _seed_slot_R(om.R, j, _slot_dim_R(spec_R, j, p0, seeds_R[j]), spec_R, seeds_R[j])
         for j in 1:(dep.nslots[2])
     ]
+    CD_priors = [_slot_obs_prior(om.CD_prior, dims_C[i]) for i in 1:(dep.nslots[1])]
 
     variants = Vector{GaussianObservationModel{T,M,V}}(undef, ncells)
     for cell in 1:ncells
@@ -849,7 +878,7 @@ function _build_variants!(
             d=ds[s[1]],
             D=Ds[s[1]],
             R_prior=om.R_prior,
-            CD_prior=om.CD_prior,
+            CD_prior=CD_priors[s[1]],
         )
     end
     om.variants = variants
@@ -876,12 +905,13 @@ function _build_variants!(
     Cs = [_seed_slot_C(om.C, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
     ds = [_seed_slot_d(om.d, i, dims_C[i], spec_C, seeds_C[i]) for i in 1:(dep.nslots[1])]
     Ds = [_seed_slot_D(om.D, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
+    CD_priors = [_slot_obs_prior(om.CD_prior, dims_C[i]) for i in 1:(dep.nslots[1])]
 
     variants = Vector{PoissonObservationModel{T,M,V}}(undef, ncells)
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
         variants[cell] = PoissonObservationModel{T,M,V}(;
-            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=om.CD_prior
+            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=CD_priors[s[1]]
         )
     end
     om.variants = variants

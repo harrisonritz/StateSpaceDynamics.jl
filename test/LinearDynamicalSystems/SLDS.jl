@@ -3429,3 +3429,35 @@ function test_SLDS_fit_with_inputs_poisson(; rng=MersenneTwister(0xC0FFEE))
     @test all(all(isfinite, l.state_model.B) for l in fit_slds.LDSs)
     @test all(all(isfinite, l.obs_model.D) for l in fit_slds.LDSs)
 end
+
+"""
+The `[C d D]` prior on a Poisson SLDS is stated over the whole regression, so
+the ELBO's prior term has to pack the `D` block too. Packing only `[C d]` made
+`W_cd` narrower than `M₀` and the fit died on the first ELBO.
+"""
+function test_SLDS_poisson_cd_prior_with_inputs(; rng=MersenneTwister(0xBEEF))
+    K, D, N, ux_dim, uy_dim = 2, 2, 4, 2, 2
+    tsteps, ntrials, max_iter = 20, 3, 4
+    width = D + 1 + uy_dim
+
+    lds = [_make_poisson_input_lds(D, N, ux_dim, uy_dim; seed=k) for k in 1:K]
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=lds)
+
+    ux = [randn(rng, ux_dim, tsteps) for _ in 1:ntrials]
+    uy = [randn(rng, uy_dim, tsteps) for _ in 1:ntrials]
+    _, _, y = rand(rng, slds, fill(tsteps, ntrials); ux=ux, uy=uy)
+
+    fit_lds = [_make_poisson_input_lds(D, N, ux_dim, uy_dim; seed=200 + k) for k in 1:K]
+    for l in fit_lds
+        l.obs_model.CD_prior = SSD.MNPrior(;
+            M₀=zeros(N, width), Λ=Matrix{Float64}(1e-3I, width, width)
+        )
+    end
+    fit_slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fit_lds)
+
+    @test isfinite(SSD._slds_prior_logdensity(fit_slds))
+    elbos = fit!(fit_slds, y; ux=ux, uy=uy, max_iter=max_iter, progress=false)
+    @test length(elbos) == max_iter
+    @test all(isfinite, elbos)
+    return nothing
+end

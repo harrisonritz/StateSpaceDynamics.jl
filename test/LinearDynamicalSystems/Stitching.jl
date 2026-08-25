@@ -517,3 +517,149 @@ function test_group_seeds_start_a_stitched_fit_higher()
     @test first(seeded_elbos) > first(plain_elbos)
     return nothing
 end
+
+#=============================================================================
+`CD_prior` under stitching
+
+The matrix-normal prior on `[C d D]` carries one row of `M₀` per channel, so a
+slot whose session saw a different number of units than the template needs its
+own copy. Sharing the template's broadcast a `p₀`-row `M₀` against a `p`-row
+`[C d D]` in both the emission M-step and the ELBO's prior term.
+=============================================================================#
+
+"""A ridge (`M₀ = 0`) prior on `[C d D]` for a `p`-channel template."""
+function st_cd_prior(p::Int, λ::Float64=1e-3; uy_dim::Int=0)
+    width = ST_LATENT_DIM + 1 + uy_dim
+    return SSD.MNPrior(; M₀=zeros(p, width), Λ=Matrix{Float64}(λ * I, width, width))
+end
+
+"""
+Every variant's `M₀` has as many rows as that slot's `[C d D]`.
+"""
+function test_stitching_slot_priors_match_width()
+    y, session, p1, p2 = st_two_session_data()
+    lds = st_grouped_lds(p1)
+    lds.obs_model.depends_on = (C=session, d=session, R=session)
+    lds.obs_model.CD_prior = st_cd_prior(p1)
+
+    grp = SSD.parameter_grouping(lds, length(y); y=y)
+    variants = lds.obs_model.variants
+    occupied = unique(grp.cell_obs)
+    @test sort([size(variants[i].C, 1) for i in occupied]) == sort([p1, p2])
+    for i in occupied
+        v = variants[i]
+        @test size(v.CD_prior.M₀) == (size(v.C, 1), ST_LATENT_DIM + 1)
+        @test v.CD_prior.Λ === lds.obs_model.CD_prior.Λ  # column precision is shared
+    end
+
+    # The template-width slot keeps the prior object it was given.
+    template = only(i for i in occupied if size(variants[i].C, 1) == p1)
+    @test variants[template].CD_prior === lds.obs_model.CD_prior
+    return nothing
+end
+
+"""
+A stitched Gaussian fit with a `[C d D]` prior runs and stays finite.
+"""
+function test_stitching_fit_with_cd_prior()
+    y, session, p1, _ = st_two_session_data()
+    lds = st_grouped_lds(p1)
+    lds.obs_model.depends_on = (C=session, d=session, R=session)
+    lds.obs_model.CD_prior = st_cd_prior(p1)
+
+    elbos = fit!(lds, y; max_iter=4, progress=false)
+    @test all(isfinite, elbos)
+    @test pd_is_monotone(elbos)
+    return nothing
+end
+
+#=
+The reported failure was a Poisson stitched SLDS: `--cd-prior` on a dataset
+whose sessions saw different unit counts died in the grouped ELBO's prior term.
+=#
+
+function st_poisson_lds(p::Int; seed::Int=0)
+    rng = StableRNG(1234 + seed)
+    om = PoissonObservationModel(;
+        C=0.5 .* randn(rng, p, ST_LATENT_DIM), d=fill(-0.5, p), D=zeros(p, 0)
+    )
+    # Poisson fits five parameter blocks, not the Gaussian six.
+    return LinearDynamicalSystem(;
+        state_model=pd_state_model(),
+        obs_model=om,
+        latent_dim=ST_LATENT_DIM,
+        obs_dim=p,
+        fit_bool=fill(true, 5),
+    )
+end
+
+function st_poisson_slds(labels; p_template::Int=3, K::Int=2, prior=false)
+    ldss = map(1:K) do k
+        lds = st_poisson_lds(p_template; seed=10 + k)
+        lds.state_model.A .= k == 1 ? [0.95 0.05; -0.05 0.95] : [0.60 0.30; -0.30 0.60]
+        if labels !== nothing
+            lds.obs_model.depends_on = (C=labels, d=labels)
+            prior && (lds.obs_model.CD_prior = st_cd_prior(p_template, 1e-4))
+        end
+        return lds
+    end
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=ldss)
+end
+
+function st_poisson_slds_data(; p1::Int=3, p2::Int=5, ntrials::Int=3, tsteps::Int=30)
+    labels = vcat(fill(:s1, ntrials), fill(:s2, ntrials))
+    _, _, y1 = rand(
+        StableRNG(41), st_poisson_slds(nothing; p_template=p1), fill(tsteps, ntrials)
+    )
+    _, _, y2 = rand(
+        StableRNG(42), st_poisson_slds(nothing; p_template=p2), fill(tsteps, ntrials)
+    )
+    return vcat(y1, y2), labels, p1, p2
+end
+
+"""
+End-to-end stitched Poisson SLDS with a `[C d D]` prior: the grouped ELBO's
+prior term sees each session's own `M₀`.
+"""
+function test_stitching_poisson_slds_cd_prior()
+    y, labels, p1, p2 = st_poisson_slds_data()
+    slds = st_poisson_slds(labels; p_template=p1, prior=true)
+
+    elbos = fit!(slds, y; max_iter=4, progress=false, rng=StableRNG(99))
+    @test length(elbos) == 4
+    @test all(isfinite, elbos)
+
+    grp = SSD._slds_parameter_grouping(slds, length(y); y=y)
+    occupied = unique(grp.cell_obs)
+    for k in 1:2
+        om = slds.LDSs[k].obs_model
+        @test sort([size(om.variants[i].C, 1) for i in occupied]) == sort([p1, p2])
+        for i in occupied
+            v = om.variants[i]
+            @test size(v.CD_prior.M₀, 1) == size(v.C, 1)
+            @test all(isfinite, v.C)
+        end
+    end
+    return nothing
+end
+
+"""
+`M₀` rows follow the template's channel order, so a prior that shrinks toward
+something other than zero reaches a wider slot by the same row-cycling
+`_seed_slot_C` uses for `C` itself.
+"""
+function test_slot_prior_cycles_nonzero_mean()
+    M₀ = Float64[1 2 3; 4 5 6]
+    prior = SSD.MNPrior(; M₀=M₀, Λ=Matrix{Float64}(I, 3, 3))
+
+    @test SSD._slot_obs_prior(prior, 2) === prior
+    @test SSD._slot_obs_prior(nothing, 5) === nothing
+
+    wide = SSD._slot_obs_prior(prior, 5)
+    @test wide.M₀ == M₀[[1, 2, 1, 2, 1], :]
+    @test wide.Λ === prior.Λ
+
+    narrow = SSD._slot_obs_prior(prior, 1)
+    @test narrow.M₀ == M₀[[1], :]
+    return nothing
+end
