@@ -1268,6 +1268,21 @@ function _slds_workspace_pool(
 end
 
 """
+    _slds_solo_pool(ws) -> SLDSWorkspacePool
+
+Wrap one caller-supplied workspace as a single-slot pool. Backs the
+single-workspace entry points, which run every trial on that one workspace.
+"""
+function _slds_solo_pool(ws::SLDSSmoothWorkspace{T}) where {T<:Real}
+    return SLDSWorkspacePool{T}(
+        [ws],
+        Vector{Vector{Union{Nothing,SLDSSmoothWorkspace{T}}}}(),
+        true,
+        length(ws.opt.ll_vec),
+    )
+end
+
+"""
     _slds_pool_ws(pool, slot, cell, cell_slds) -> SLDSSmoothWorkspace
 
 The workspace slot `slot` should use for `cell`. Allocates it on first use for
@@ -1796,6 +1811,54 @@ function estep!(
     return nothing
 end
 
+"""
+    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; ...)
+
+Single-workspace E-step: the caller owns one `SLDSSmoothWorkspace` rather than
+a pool, so every trial runs on it sequentially. Equivalent to the pooled form
+with `npool = 1`, and the form to reach for when driving the E-step by hand.
+"""
+function estep!(
+    slds::SLDS{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    dl::SLDSDiscreteLayer{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::AbstractVector{<:AbstractMatrix{T}},
+    slds_ws::SLDSSmoothWorkspace{T};
+    rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+    obs_seq::AbstractVector,
+    control_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
+    smoothing_iters::Int=1,
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    return estep!(
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        _slds_solo_pool(slds_ws),
+        _slds_trial_plan(nothing, length(y), 1);
+        rng=rng,
+        rng_mode=rng_mode,
+        noise_bufs=noise_bufs,
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        lognorm=lognorm,
+        smoothing_iters=smoothing_iters,
+    )
+end
+
 # tr(A·B) without forming the product: Σ_ij A[i,j]·B[j,i].
 @inline function _tr_prod(A::AbstractMatrix, B::AbstractMatrix)
     acc = zero(promote_type(eltype(A), eltype(B)))
@@ -2025,6 +2088,38 @@ function elbo!(
         slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
     )
     return sum(per_trial) + _slds_prior_logdensity(slds)
+end
+
+"""
+    elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends, ux, uy)
+
+Single-workspace ELBO: as above with the trials run sequentially on one
+workspace. Returns the same number the pooled form does — the per-trial
+contributions are summed in trial order either way.
+"""
+function elbo!(
+    slds::SLDS{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    y::AbstractVector{<:AbstractMatrix{T}},
+    slds_ws::SLDSSmoothWorkspace{T};
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    return elbo!(
+        slds,
+        tfs,
+        fb_storage,
+        y,
+        _slds_solo_pool(slds_ws),
+        _slds_trial_plan(nothing, length(y), 1);
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        lognorm=lognorm,
+    )
 end
 
 """
@@ -2817,9 +2912,12 @@ function fit!(
         nothing
     else
         (
-        [_subset_data(data, grp.cell_trials[c]) for c in 1:(grp.ncells)],
-        [TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for c in 1:(grp.ncells)],
-    )
+            [_subset_data(data, grp.cell_trials[c]) for c in 1:(grp.ncells)],
+            [
+                TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for
+                c in 1:(grp.ncells)
+            ],
+        )
     end
     x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
     # Pre-drawn standard normals, only when `:global` reproducibility is asked for.
