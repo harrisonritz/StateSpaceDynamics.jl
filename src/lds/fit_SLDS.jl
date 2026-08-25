@@ -1556,19 +1556,23 @@ end
 _slds_noise_buffers(::Nothing) = nothing
 
 """
-    _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs, tfs, pass) -> (rng_of, noise_of)
+    _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs) -> (rng_of, noise_of)
 
 Resolve one alternation's draw source into the two callbacks
 [`_slds_smooth_all!`](@ref) takes. Both are cheap closures over per-trial data;
 neither touches shared mutable state inside a task.
+
+Called once per alternation, and each call consumes exactly one draw from
+`rng` — a seed in `:trial` mode, the whole noise stream in `:global`. That is
+what keeps `smoothing_iters = n` identical to `n` successive
+`smoothing_iters = 1` calls: either way the k-th alternation is the k-th draw
+off the master generator.
 """
 function _slds_draw_sources(
     rng::AbstractRNG,
     rng_mode::Symbol,
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}},
-    tfs::TrialFilterSmooth{T},
-    pass::Int,
 ) where {T<:Real}
     if x_samples === nothing
         # Deterministic path: no draws at all.
@@ -1593,12 +1597,14 @@ function _slds_draw_sources(
         throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
 
     #=
-    One seed per pass, taken from the master generator on this thread, then
-    mixed with the trial index. Draw-per-trial rather than draw-per-task, so
-    the sample a trial gets does not move when the chunk layout does.
+    One seed per alternation, taken from the master generator on this thread,
+    then mixed with the trial index. Per trial rather than per task, so the
+    sample a trial gets does not move when the chunk layout does — and *only*
+    the trial index, so that the alternation's identity comes from which draw
+    off `rng` produced its seed, not from its position within a call.
     =#
     pass_seed = rand(rng, UInt64)
-    return (trial -> Random.Xoshiro(hash((pass_seed, pass, trial)))), (_ -> nothing)
+    return (trial -> Random.Xoshiro(hash((pass_seed, trial)))), (_ -> nothing)
 end
 
 """
@@ -1709,9 +1715,7 @@ function _vem_alternate!(
         out. Overwriting `x_samples` here is fine — step (1) already used the
         previous draw.
         =#
-        rng_of, noise_of = _slds_draw_sources(
-            rng, rng_mode, x_samples, noise_bufs, tfs, iter
-        )
+        rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
         _slds_smooth_all!(
             slds,
             cell_slds,
@@ -3141,8 +3145,8 @@ function _slds_warmstart!(
         return fill(one(T) / K, K, tsteps[trial])
     end
 
-    # Pass 0 of the draw sequence: the warm start's sample precedes iteration 1's.
-    rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs, tfs, 0)
+    # The warm start's draw is simply the first one off `rng`.
+    rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
 
     _slds_smooth_all!(
         slds,

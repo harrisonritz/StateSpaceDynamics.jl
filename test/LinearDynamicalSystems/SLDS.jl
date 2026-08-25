@@ -3636,6 +3636,33 @@ function test_SLDS_rng_modes()
     @test g1 ≈ g4 rtol = 1e-8
     @test all(isfinite, g1)
 
+    #=
+    Each alternation consumes exactly one draw off `rng`, so `smoothing_iters`
+    is a clean repetition: `n` alternations in one call land where `n` calls of
+    one alternation do. (`test_SLDS_fit_smoothing_iters` checks this on the
+    E-step directly; this pins it end to end, where a per-call pass index mixed
+    into the seed would silently break it.)
+    =#
+    a = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=1,
+    )
+    b = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=3,
+    )
+    @test a ≈ b rtol = 1e-8
+
     # The two modes consume the master generator differently, so they are
     # different fits — both valid.
     t1 = fit!(
