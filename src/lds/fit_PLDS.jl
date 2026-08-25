@@ -33,6 +33,19 @@ Poisson LDS
 =============================================================================#
 
 """
+    _poisson_lognorm_at(y, t)
+
+One timestep of the Poisson emission normalizer, `Σᵢ log(y[i,t]!)`.
+"""
+@inline function _poisson_lognorm_at(y::AbstractMatrix{T}, t::Int) where {T<:Real}
+    acc = zero(T)
+    @inbounds for i in axes(y, 1)
+        acc += _log_factorial(y[i, t])
+    end
+    return acc
+end
+
+"""
     _poisson_lognorm_t(y)
 
 Per-timestep Poisson emission normalizer `lognorm_t[t] = Σᵢ log(y[i,t]!)`;
@@ -43,14 +56,25 @@ function _poisson_lognorm_t(y::AbstractMatrix{T}) where {T<:Real}
     tsteps = size(y, 2)
     out = Vector{T}(undef, tsteps)
     @inbounds for t in 1:tsteps
-        acc = zero(T)
-        for i in axes(y, 1)
-            acc += _log_factorial(y[i, t])
-        end
-        out[t] = acc
+        out[t] = _poisson_lognorm_at(y, t)
     end
     return out
 end
+
+"""
+    _poisson_lognorm_all(y)
+
+One `lognorm_t` vector per trial, or `nothing` when the emission is not Poisson.
+Built once at fit entry and threaded through the smoother, so the `log(y!)`
+constant is never recomputed inside a Newton line search.
+"""
+function _poisson_lognorm_all(
+    lds::LinearDynamicalSystem{T,S,O}, y::AbstractVector{<:AbstractMatrix{T}}
+) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
+    return [_poisson_lognorm_t(yt) for yt in y]
+end
+
+_poisson_lognorm_all(::LinearDynamicalSystem, ::AbstractVector) = nothing
 
 """
     joint_loglikelihood!(ws, plds, x, y[, lognorm_t, ux, uy])
