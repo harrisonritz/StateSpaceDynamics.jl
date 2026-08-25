@@ -3524,14 +3524,25 @@ function test_SLDS_batched_poisson_gradient(; rng=MersenneTwister(0x11C))
     for k in 1:K
         batched = zeros(D, tsteps)
         SSD._slds_emission_gradient!(
-            batched, ws, ws.consts[k], slds.LDSs[k], x, y, view(w, k, :), nothing, tsteps,
-            zeros(D), zeros(N),
+            batched,
+            ws,
+            ws.consts[k],
+            slds.LDSs[k],
+            x,
+            y,
+            view(w, k, :),
+            nothing,
+            tsteps,
+            zeros(D),
+            zeros(N),
         )
 
         ref = zeros(D, tsteps)
         tmp, buf = zeros(D), zeros(N)
         for t in 1:tsteps
-            SSD.observation_gradient!(tmp, ws.consts[k], buf, slds.LDSs[k], x, y, t, nothing)
+            SSD.observation_gradient!(
+                tmp, ws.consts[k], buf, slds.LDSs[k], x, y, t, nothing
+            )
             @views ref[:, t] .+= w[k, t] .* tmp
         end
         @test batched ≈ ref rtol = 1e-12
@@ -3575,11 +3586,14 @@ function test_SLDS_fit_reproducibility()
         MersenneTwister(0x5A3), _distinct_gaussian_slds(K, D, N), fill(tsteps, ntrials)
     )
 
-    trace(mk, y; kw...) =
-        fit!(mk(), y; max_iter=5, progress=false, rng=MersenneTwister(3), kw...)
+    function trace(mk, y; kw...)
+        return fit!(mk(), y; max_iter=5, progress=false, rng=MersenneTwister(3), kw...)
+    end
 
-    for (mk, y) in ((() -> _distinct_poisson_slds(K, D, N), yP),
-                    (() -> _distinct_gaussian_slds(K, D, N), yG))
+    for (mk, y) in (
+        (() -> _distinct_poisson_slds(K, D, N), yP),
+        (() -> _distinct_gaussian_slds(K, D, N), yG),
+    )
         # Same npool, twice: bit-identical.
         @test trace(mk, y; npool=4) == trace(mk, y; npool=4)
         # Across npool: equal to rounding.
@@ -3601,17 +3615,38 @@ function test_SLDS_rng_modes()
     model() = _distinct_poisson_slds(K, D, N)
     _, _, y = rand(MersenneTwister(0x5A4), model(), fill(tsteps, ntrials))
 
-    g1 = fit!(model(), y; max_iter=4, progress=false, rng=MersenneTwister(9),
-              npool=1, rng_mode=:global)
-    g4 = fit!(model(), y; max_iter=4, progress=false, rng=MersenneTwister(9),
-              npool=4, rng_mode=:global)
+    g1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:global,
+    )
+    g4 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=4,
+        rng_mode=:global,
+    )
     @test g1 ≈ g4 rtol = 1e-8
     @test all(isfinite, g1)
 
     # The two modes consume the master generator differently, so they are
     # different fits — both valid.
-    t1 = fit!(model(), y; max_iter=4, progress=false, rng=MersenneTwister(9),
-              npool=1, rng_mode=:trial)
+    t1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:trial,
+    )
     @test all(isfinite, t1)
 
     @test_throws ArgumentError fit!(

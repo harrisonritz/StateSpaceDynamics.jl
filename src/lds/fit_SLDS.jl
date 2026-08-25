@@ -404,11 +404,11 @@ observation-model type, so `LDSs[1]` decides which it is; and the normalizer
 depends only on the counts, so one vector per trial serves every regime.
 """
 _slds_lognorm_for(slds::SLDS, y::AbstractMatrix) =
-    _poisson_lognorm_all(slds.LDSs[1], [y]) === nothing ? nothing :
-    _poisson_lognorm_t(y)
+    _poisson_lognorm_all(slds.LDSs[1], [y]) === nothing ? nothing : _poisson_lognorm_t(y)
 
-_slds_lognorm_all(slds::SLDS, y::AbstractVector{<:AbstractMatrix}) =
-    _poisson_lognorm_all(slds.LDSs[1], y)
+function _slds_lognorm_all(slds::SLDS, y::AbstractVector{<:AbstractMatrix})
+    return _poisson_lognorm_all(slds.LDSs[1], y)
+end
 
 #=
 One regime's emission log-density over a whole trial, written into `out`.
@@ -1573,9 +1573,8 @@ function _slds_draw_sources(
         return (_ -> rng), (trial -> noise_bufs[trial])
     end
 
-    rng_mode === :trial || throw(
-        ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))")
-    )
+    rng_mode === :trial ||
+        throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
 
     #=
     One seed per pass, taken from the master generator on this thread, then
@@ -2466,10 +2465,11 @@ function mstep!(
     read the regression that was just written, so the updates cannot be
     interleaved with the aggregation the way a fully per-regime M-step can.
     =#
-    sf =
-        sufs === nothing ?
-        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], dat.tsteps) for _ in 1:K] :
+    sf = if sufs === nothing
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], dat.tsteps) for _ in 1:K]
+    else
         sufs
+    end
     #=
     The `K` aggregations write into disjoint `sufs[k]` and read `tfs` / `data`
     only, so they run in parallel — each on its own workspace, since the
@@ -2702,9 +2702,8 @@ function fit!(
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    rng_mode in (:trial, :global) || throw(
-        ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))")
-    )
+    rng_mode in (:trial, :global) ||
+        throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
     )
@@ -2798,24 +2797,22 @@ function fit!(
     grouped regression buffers each M-step was pure overhead. `init_scratch`
     replaces a per-iteration `deepcopy` of a whole sub-model.
     =#
-    mstep_sufs =
-        grp === nothing ?
-        [
-            _initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial) for
-            _ in 1:K
-        ] : nothing
+    mstep_sufs = if grp === nothing
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial) for _ in 1:K]
+    else
+        nothing
+    end
     mstep_bufs = GroupedSufBuffers(T, slds.LDSs[1], tsteps_per_trial)
     init_scratch = deepcopy(slds.LDSs[1])
     # Per-cell slices of the data and smoother storage, fixed by the partition.
-    cell_views =
-        grp === nothing ? nothing :
+    cell_views = if grp === nothing
+        nothing
+    else
         (
-            [_subset_data(data, grp.cell_trials[c]) for c in 1:(grp.ncells)],
-            [
-                TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for
-                c in 1:(grp.ncells)
-            ],
-        )
+        [_subset_data(data, grp.cell_trials[c]) for c in 1:(grp.ncells)],
+        [TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for c in 1:(grp.ncells)],
+    )
+    end
     x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
     # Pre-drawn standard normals, only when `:global` reproducibility is asked for.
     noise_bufs = rng_mode === :global ? _slds_noise_buffers(x_samples) : nothing
@@ -3150,12 +3147,7 @@ function _slds_mstep_pool(slds::SLDS{T}, T_max::Int, ntasks::Int) where {T<:Real
     n = max(1, ntasks)
     return [
         SmoothWorkspace(
-            T,
-            lds1.latent_dim,
-            lds1.obs_dim,
-            T_max;
-            ux_dim=lds1.ux_dim,
-            uy_dim=lds1.uy_dim,
+            T, lds1.latent_dim, lds1.obs_dim, T_max; ux_dim=lds1.ux_dim, uy_dim=lds1.uy_dim
         ) for _ in 1:n
     ]
 end
@@ -3220,7 +3212,6 @@ function _slds_cell_mstep_workspaces(
         ) for sc in cell_slds
     ]
 end
-
 
 """
     _estep_grouped!(cell_slds, grp, tfs, fb_storage, dl, y, x_samples, slds_ws; ...)
