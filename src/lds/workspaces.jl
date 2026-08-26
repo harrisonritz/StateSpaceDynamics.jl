@@ -785,6 +785,9 @@ Workspace for SLDS smoothing that matches the LDS backend shape:
   single-LDS and SLDS paths use one set of field paths
 - `ll_tmp`: per-component log-likelihood scratch; the weighted accumulation
   across components needs a second `tsteps` buffer beside `opt.ll_vec`
+- `H_obs`: one regime's un-weighted emission curvature at a single timestep
+  (`latent_dim × latent_dim`), which the weighted [`hessian!`](@ref) never
+  needs to isolate — it scatters straight into `btd.H_diag`
 - `poisson`: batched Poisson scratch, allocated on first use exactly as
   `SmoothWorkspace`'s is. One buffer serves every regime — the emission
   curvature is formed and scattered one regime at a time.
@@ -794,6 +797,7 @@ mutable struct SLDSSmoothWorkspace{T<:Real}
     const consts::Vector{SmoothConstants{T}}
     const opt::NewtonBuffers{T}
     const ll_tmp::Vector{T}   # per-component scratch (length tsteps)
+    const H_obs::Matrix{T}    # one regime's emission curvature at one t
     poisson::Union{Nothing,PoissonBatchBuffers{T}}
 end
 
@@ -807,6 +811,7 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
         zeros(T, tsteps),                # ll_tmp
+        zeros(T, latent_dim, latent_dim), # H_obs
         nothing,                         # batched Poisson scratch, on first use
     )
 

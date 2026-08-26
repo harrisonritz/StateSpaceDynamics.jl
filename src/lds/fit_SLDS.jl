@@ -301,17 +301,16 @@ function _sample_continuous_given_discrete!(
     # Initial state
     k1 = z_trial[1]
     x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
-    y_trial[:, 1] =
-        rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params[k1].C * x_trial[:, 1] +
-                    obs_params[k1].d +
-                    obs_params[k1].D * uy_trial[:, 1],
-                ),
+    y_trial[:, 1] = rand.(
+        rng,
+        Poisson.(
+            exp.(
+                obs_params[k1].C * x_trial[:, 1] +
+                obs_params[k1].d +
+                obs_params[k1].D * uy_trial[:, 1],
             ),
-        )
+        ),
+    )
 
     # Subsequent states
     for t in 2:tsteps
@@ -327,17 +326,16 @@ function _sample_continuous_given_discrete!(
             ),
         )
 
-        y_trial[:, t] =
-            rand.(
-                rng,
-                Poisson.(
-                    exp.(
-                        obs_params[k_curr].C * x_trial[:, t] +
-                        obs_params[k_curr].d +
-                        obs_params[k_curr].D * uy_trial[:, t],
-                    ),
+        y_trial[:, t] = rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params[k_curr].C * x_trial[:, t] +
+                    obs_params[k_curr].d +
+                    obs_params[k_curr].D * uy_trial[:, t],
                 ),
-            )
+            ),
+        )
     end
 end
 
@@ -550,6 +548,73 @@ function joint_loglikelihood!(
     end
 
     return view(ll_vec, 1:Tsteps)
+end
+
+"""
+    _add_cov_correction!(ll, ws, cc, lds_k, x, y, fs[, uy])
+
+Add the second-order term that turns a plug-in per-timestep log-likelihood into
+`E_q(x)[log p_k(y_t, x_t | x_{t-1})]`, in place on `ll`.
+
+For a factor Hessian `H^{(k,t)}` and smoothed covariance `Σ`, the correction is
+`½ tr(H^{(k,t)} Σ)`. Summing it against `γ` reproduces the covariance term
+in [`elbo!`](@ref). The expansion is exact for Gaussian emissions and
+second-order for Poisson emissions.
+
+Uses the same factor-at-`t` convention as `joint_loglikelihood!` and `hessian!`:
+`ll[t]` covers the emission at `t` plus the dynamics factor coupling
+`(x_{t-1}, x_t)`, or the prior at `t == 1`. The covariances in `fs` must
+correspond to `x`.
+
+Overwrites `ws.H_obs` and the emission scratch in `ws.opt`.
+"""
+function _add_cov_correction!(
+    ll::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds_k::LinearDynamicalSystem{T},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    fs::FilterSmooth{T},
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real}
+    Tsteps = size(y, 2)
+
+    # Cached state-model templates for regime k, matching `hessian!`.
+    neg_Q_inv = cc.xt_given_xt_1     # -Q⁻¹
+    neg_AtQinvA = cc.xt1_given_xt    # -A'Q⁻¹A
+    neg_P0_inv = cc.x_t              # -P0⁻¹
+    sub_entry = cc.H_sub_entry       #  Q⁻¹A
+    super_entry = cc.H_super_entry   # (Q⁻¹A)'
+
+    H_obs = ws.H_obs
+    # Poisson curvature uses both scratch vectors; Gaussian ignores them.
+    z = ws.opt.dyt
+    λ = ws.opt.temp_dy
+
+    @views for t in 1:Tsteps
+        Σ_tt = fs.p_smooth[:, :, t]
+
+        # Use unit weight to get this regime's emission curvature alone.
+        fill!(H_obs, zero(T))
+        observation_hessian!(H_obs, cc, z, λ, lds_k, x, y, t, one(T), uy)
+        corr = _tr_prod(H_obs, Σ_tt)
+
+        if t == 1
+            corr += _tr_prod(neg_P0_inv, Σ_tt)
+        else
+            # Sum both cross-covariance traces; do not assume exact block symmetry.
+            Σ_ttm1 = fs.p_smooth_tt1[:, :, t]  # Cov(x_t, x_{t-1})
+            corr += _tr_prod(neg_Q_inv, Σ_tt)
+            corr += _tr_prod(neg_AtQinvA, fs.p_smooth[:, :, t - 1])
+            corr += _tr_prod(super_entry, Σ_ttm1)
+            corr += _tr_prod(sub_entry, transpose(Σ_ttm1))
+        end
+
+        ll[t] += T(0.5) * corr
+    end
+
+    return ll
 end
 
 """
@@ -1367,11 +1432,21 @@ function _slds_trial_plan(grp::Union{Nothing,ParameterGrouping}, ntrials::Int, n
 end
 
 """
-    _slds_fill_logL!(slds, cell_slds, grp, dl, y, x_of, pool, plan; seq_ends, ux, uy, lognorm)
+    _slds_fill_logL!(slds, cell_slds, grp, dl, y, x_of, pool, plan; seq_ends, ux, uy, lognorm, tfs)
 
 Fill `dl.logL` (`K × sum(T_i)`) with every regime's log-density of the current
 continuous trajectory. `x_of(trial)` supplies that trajectory: the smoothed mean
 for deterministic inference, a joint draw from `q(x)` for the Monte-Carlo E-step.
+
+The discrete update wants `E_q(x)[log p_k(y_t, x_t | x_{t-1})]`, and the two
+trajectories reach it differently. A draw from `q(x)` carries the posterior
+spread already, so its plug-in score is unbiased for that expectation. The
+smoothed mean does not: scoring at `E_q[x]` drops the curvature term and biases
+every regime's log-density by its own `½ tr(H^{(k,t)} Σ)`. Pass `tfs` on that
+path — the trial's `p_smooth` / `p_smooth_tt1` must match the `x` that `x_of`
+returns — and [`_add_cov_correction!`](@ref) puts the term back, per regime and
+per timestep, before forward-backward normalizes across `k`. `tfs === nothing`
+is the sampled path and skips the correction.
 
 Chunks run in parallel over `pool`. Each trial writes only `dl.logL[:, t1:t2]`,
 and the chunks are disjoint in trials, so the result is identical to the
@@ -1393,6 +1468,7 @@ function _slds_fill_logL!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    tfs::Union{Nothing,TrialFilterSmooth{T}}=nothing,
 ) where {T<:Real}
     K = length(slds.LDSs)
     grouped = grp !== nothing && cell_slds !== nothing
@@ -1428,8 +1504,9 @@ function _slds_fill_logL!(
             uy_trial = uy === nothing ? nothing : uy[trial]
             ln_trial = lognorm === nothing ? nothing : lognorm[trial]
             for k in 1:K
+                ll_k = view(dl.logL, k, t1:t2)::AbstractVector{T}
                 _slds_trial_loglikelihood!(
-                    view(dl.logL, k, t1:t2)::AbstractVector{T},
+                    ll_k,
                     ws_t,
                     ws_t.consts[k],
                     slds_t.LDSs[k],
@@ -1439,6 +1516,18 @@ function _slds_fill_logL!(
                     uy_trial,
                     ln_trial,
                 )
+                if tfs !== nothing
+                    _add_cov_correction!(
+                        ll_k,
+                        ws_t,
+                        ws_t.consts[k],
+                        slds_t.LDSs[k],
+                        x_src,
+                        y_trial,
+                        tfs[trial],
+                        uy_trial,
+                    )
+                end
             end
         end
         return nothing
@@ -1623,8 +1712,10 @@ variational E-step. One alternation is:
 `x_samples` selects how step 1 reads the continuous trajectory, and is the only
 difference between the two callers:
 
-- `x_samples === nothing` — plug in the smoothed mean `E_q[x]`. Deterministic and
-  reproducible; used by [`smooth`](@ref) for post-fit inference.
+- `x_samples === nothing` — plug in the smoothed mean `E_q[x]`, with the
+  `½ tr(H^{(k,t)} Σ)` correction of [`_add_cov_correction!`](@ref) added back so
+  step 1 still scores `E_q(x)[log p_k]` rather than the biased plug-in.
+  Deterministic and reproducible; used by [`smooth`](@ref) for post-fit inference.
 - `x_samples !== nothing` — plug in a joint draw from `q(x)`, and draw the next one in
   step 3. This is the vLEM Monte-Carlo E-step used by [`fit!`](@ref); `x_samples` is
   read then overwritten within each alternation.
@@ -1684,7 +1775,12 @@ function _vem_alternate!(
     for iter in 1:smoothing_iters
         iters = iter
 
-        # (1) Score the current continuous trajectory under each regime.
+        #=
+        (1) Score the current continuous trajectory under each regime. The
+        deterministic path plugs in the smoothed mean, so it also needs the
+        `½ tr(H Σ)` term that turns that plug-in into E_q(x)[·]; the sampled
+        path gets the spread from the draw itself and passes `tfs = nothing`.
+        =#
         _slds_fill_logL!(
             slds,
             cell_slds,
@@ -1698,6 +1794,7 @@ function _vem_alternate!(
             ux=ux,
             uy=uy,
             lognorm=lognorm,
+            tfs=(x_samples === nothing ? tfs : nothing),
         )
 
         # (2) Update q(z): single batched forward-backward across all trials.
@@ -1999,10 +2096,10 @@ function _slds_trial_elbo(
     H_sub = slds_ws.btd.H_sub
     H_super = slds_ws.btd.H_super
     for t in 1:Tsteps
-        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth, :, :, t))
+        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth,:,:,t))
     end
     for t in 2:Tsteps
-        Σ_ttm1 = view(fs.p_smooth_tt1, :, :, t)  # Cov(x_t, x_{t-1})
+        Σ_ttm1 = view(fs.p_smooth_tt1,:,:,t)  # Cov(x_t, x_{t-1})
         trial_elbo += T(0.5) * _tr_prod(H_super[t - 1], Σ_ttm1)
         trial_elbo += T(0.5) * _tr_prod(H_sub[t - 1], transpose(Σ_ttm1))
     end
@@ -3219,9 +3316,10 @@ end
     _cell_slds_workspace(base, slds_c, tsteps) -> SLDSSmoothWorkspace
 
 One cell's SLDS workspace for a stitching fit. Reuses `base`'s
-block-tridiagonal storage and per-timestep log-density scratch — the O(D²·T)
-and O(T) parts, neither of which depends on `obs_dim` — and allocates fresh
-per-regime constants and Newton buffers at this cell's channel count.
+block-tridiagonal storage, per-timestep log-density scratch, and emission-
+curvature scratch — the parts sized by `latent_dim` and `tsteps` alone, none of
+which depends on `obs_dim` — and allocates fresh per-regime constants and Newton
+buffers at this cell's channel count.
 
 Safe for the same reason the LDS side is: cells run one at a time, and a cell's
 Hessian blocks are consumed before the next cell overwrites them.
@@ -3238,6 +3336,7 @@ function _cell_slds_workspace(
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
         base.ll_tmp,                                       # shared, length T_max
+        base.H_obs,                                        # shared, latent_dim square
         nothing,                                           # batched Poisson scratch
     )
     refresh_slds_constants!(ws, slds_c)
