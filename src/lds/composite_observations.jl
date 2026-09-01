@@ -427,6 +427,43 @@ function set_depends_on!(c::CompositeObservationModel, spec::Union{Nothing,Named
     return c
 end
 
+"""
+    group_labels(composite, name)
+    group_parameter(composite, name, label)
+
+The public `depends_on` accessors, spelled with the member as a suffix:
+
+```julia
+group_labels(obs, :C_kin)                 # [:session_a, :session_b]
+group_parameter(obs, :C_kin, :session_a)  # that session's kinematics loadings
+```
+
+Both split the suffix and delegate to the member that owns the parameter, which
+is also where its `variants` live.
+"""
+function group_labels(c::CompositeObservationModel, name::Symbol)
+    param, key = _split_obs_param(c, name)
+    return group_labels(_models(c)[key], param)
+end
+
+function group_parameter(c::CompositeObservationModel, name::Symbol, label)
+    param, key = _split_obs_param(c, name)
+    return group_parameter(_models(c)[key], param, label)
+end
+
+function _split_obs_param(c::CompositeObservationModel, name::Symbol)
+    models = _models(c)
+    split = _split_obs_name(name, models)
+    split === nothing && throw(
+        ArgumentError(
+            "`:$name` does not name a parameter of any member of this composite " *
+            "observation model. Use the member as a suffix, e.g. " *
+            "`:C_$(first(keys(models)))`; members are $(_key_list(models)).",
+        ),
+    )
+    return split
+end
+
 # ============================================================================
 # Sampling glue
 # ============================================================================
@@ -988,12 +1025,40 @@ equal-length fast path still applies — the covariance is computed once and
 shared across trials — so this only costs a composite the BLAS-2-to-BLAS-3
 promotion of the per-trial mean pass, not the shared-covariance saving.
 """
-_batched_ntrials(::LinearDynamicalSystem, ntrials::Int) = ntrials
+_batched_ntrials(lds::LinearDynamicalSystem, ntrials::Int) =
+    _supports_batched(lds) ? ntrials : 1
 
-function _batched_ntrials(
-    ::LinearDynamicalSystem{T,S,O}, ::Int
+"""
+    _supports_batched(lds) -> Bool
+
+Whether the BLAS-3 batched mean pass applies to this model. False for a
+composite emission — see [`_batched_ntrials`](@ref) for why, and for what it
+does and does not cost.
+"""
+_supports_batched(::LinearDynamicalSystem) = true
+
+function _supports_batched(
+    ::LinearDynamicalSystem{T,S,O}
 ) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
-    return 1
+    return false
+end
+
+"""
+    _cell_obs_shape(lds)
+
+The observation-side widths a workspace for this model must be built at. For a
+composite it is the per-member `(obs_dim, uy_dim)` pairs, since those are what
+the sub-workspaces are shaped by — the parent's own widths are zero either way.
+
+Used to decide whether the cells of a grouped fit can share one workspace pool
+or need their own: under stitching each session has its own channel counts.
+"""
+_cell_obs_shape(lds::LinearDynamicalSystem) = (lds.obs_dim, lds.uy_dim)
+
+function _cell_obs_shape(
+    lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return map(m -> (_obs_dim(m), _uy_dim(m)), values(_models(lds.obs_model)))
 end
 
 """
@@ -1213,6 +1278,30 @@ function _member_q_obs(
 end
 
 """
+    _composite_q_obs_total(lds, suf, tfs, data, sws_pool) -> T
+
+Emission Q-term of a composite, summed over members by whichever route each
+member supports. Used by the non-quadratic ELBO and by its grouped counterpart,
+which evaluates the same quantity one cell at a time.
+"""
+function _composite_q_obs_total(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::NamedTuple,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    pools = _member_pools(sws_pool, lds)
+    total = zero(T)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        total += _member_q_obs(views[key], suf[key], tfs, datas[key], pools[i])
+    end
+    return total
+end
+
+"""
     elbo!(lds, suf::NamedTuple, tfs, data, sws_pool)
 
 Total ELBO of a composite emission with a non-Gaussian member. Mirrors the
@@ -1234,13 +1323,7 @@ function elbo!(
 
     compute_smooth_constants!(sws_pool[1], lds)
     total = Q_state!(sws_pool[1], lds, _state_suf(suf))
-
-    views = _obs_views(lds)
-    datas = _member_datas(data)
-    pools = _member_pools(sws_pool, lds)
-    for (i, key) in enumerate(_obs_keys(lds.obs_model))
-        total += _member_q_obs(views[key], suf[key], tfs, datas[key], pools[i])
-    end
+    total += _composite_q_obs_total(lds, suf, tfs, data, sws_pool)
 
     total += _state_prior_logdensity(lds, sws_pool[1])
     total += _obs_prior_logdensity(lds, sws_pool[1])

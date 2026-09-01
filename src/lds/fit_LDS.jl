@@ -131,7 +131,7 @@ function smooth(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = _smooth_data(lds, data)
     return _collect_smooth_output(tfs, y)
@@ -148,7 +148,7 @@ function _smooth_data(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), maximum(data.tsteps)) for
         _ in 1:npool
@@ -753,14 +753,14 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(lds, data)
         state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
         return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
     end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
             T,
@@ -843,7 +843,7 @@ function fit!(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
         lds, data, grp; max_iter=max_iter, tol=tol, progress=progress
     )
@@ -868,10 +868,7 @@ function _grouped_estep_elbo_gaussian!(
     state::GroupedFitState{T,L},
     grp::ParameterGrouping,
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {
-    T<:Real,
-    L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:GaussianObservationModel{T}},
-}
+) where {T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:QuadraticEmission{T}}}
     total = zero(T)
     for c in 1:(grp.ncells)
         lds_c = state.cell_lds[c]
@@ -885,14 +882,16 @@ function _grouped_estep_elbo_gaussian!(
         recompute explicitly rather than rely on which chunk ran last.
         =#
         compute_smooth_constants!(cell_pool[1], lds_c)
-        total += Q_state!(cell_pool[1], lds_c, suf_c)
+        total += Q_state!(cell_pool[1], lds_c, _state_suf(suf_c))
         total += Q_obs!(cell_pool[1], lds_c, suf_c)
         for fs in state.cell_tfs[c].FilterSmooths
             total += fs.entropy
         end
     end
     total += _grouped_state_prior_logdensity(state.cell_lds, grp.cell_slot, T)
-    total += _grouped_gaussian_obs_prior_logdensity(state.cell_lds, grp.cell_slot, T)
+    total += _grouped_obs_prior_logdensity(
+        state.cell_lds[1], state.cell_lds, grp.cell_slot, T
+    )
     return total
 end
 
@@ -911,7 +910,7 @@ function _fit_tridiag_grouped!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(lds, data)
     state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
     #=
@@ -932,15 +931,14 @@ function _fit_tridiag_grouped!(
         elbos[iter] = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
 
         _grouped_state_mstep!(
-            state.cell_lds, state.sufs, grp.cell_slot, sws_pool[1], state.bufs
-        )
-        _grouped_gaussian_obs_mstep!(
             state.cell_lds,
-            state.sufs,
+            _state_sufs(state.sufs),
             grp.cell_slot,
             sws_pool[1],
-            state.bufs;
-            unit_sws=cell_ws1,
+            _state_bufs(state.bufs),
+        )
+        _grouped_obs_mstep!(
+            lds, state.cell_lds, state.sufs, grp.cell_slot, cell_ws1, state.bufs
         )
 
         prog !== nothing && next!(prog)
@@ -973,7 +971,7 @@ function _fit_tridiag!(
     smoother aliases them to shared storage on every E-step, so per-trial
     allocations of `(D, D, T)` are pure waste at large `N`.
     =#
-    ntrials_total = length(data.y)
+    ntrials_total = length(data.tsteps)
     cov_alias = ntrials_total > 1 && all(t -> t == tsteps_per_trial[1], tsteps_per_trial)
     tfs = initialize_FilterSmooth(
         lds, tsteps_per_trial; cov_alias=cov_alias
@@ -1209,7 +1207,7 @@ function StatsAPI.loglikelihood(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
 
     #=
     The filter's covariance pass depends only on the parameters and the trial

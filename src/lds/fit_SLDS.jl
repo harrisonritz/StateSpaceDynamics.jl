@@ -3496,11 +3496,7 @@ function _grouped_slds_prior_logdensity(
     for k in 1:K
         ldss = [cell_slds[c].LDSs[k] for c in 1:(grp.ncells)]
         total += _grouped_state_prior_logdensity(ldss, grp.cell_slot, T)
-        if ldss[1].obs_model isa GaussianObservationModel
-            total += _grouped_gaussian_obs_prior_logdensity(ldss, grp.cell_slot, T)
-        else
-            total += _grouped_poisson_obs_prior_logdensity(ldss, grp.cell_slot, T)
-        end
+        total += _grouped_obs_prior_logdensity(ldss[1], ldss, grp.cell_slot, T)
     end
     return total
 end

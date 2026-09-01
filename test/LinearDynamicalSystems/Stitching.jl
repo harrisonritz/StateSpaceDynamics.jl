@@ -73,10 +73,10 @@ function test_stitching_variant_shapes()
     two-session model with both `:C` and `:R` varying stores four entries. Only
     the combinations an actual cell uses are meaningful; the cross terms pair
     one session's `C` with another's `R` and are never reached, since
-    `_cell_lds` indexes `grp.cell_obs`.
+    `_cell_lds` indexes `grp.cell_obs` (one entry per observation model).
     =#
     variants = lds.obs_model.variants
-    occupied = unique(grp.cell_obs)
+    occupied = unique(grp.cell_obs[1])
     @test length(occupied) == 2
     widths = sort([size(variants[i].C, 1) for i in occupied])
     @test widths == sort([p1, p2])
@@ -221,7 +221,7 @@ function test_stitching_fit_runs_and_improves()
 
     grp = SSD.parameter_grouping(lds, length(y); y=y)
     variants = lds.obs_model.variants
-    occupied = unique(grp.cell_obs)
+    occupied = unique(grp.cell_obs[1])
     @test sort([size(variants[i].C, 1) for i in occupied]) == sort([p1, p2])
     for i in occupied
         v = variants[i]
@@ -369,7 +369,7 @@ function test_stitching_slds_fit()
     @test all(isfinite, elbos)
 
     grp = SSD._slds_parameter_grouping(slds, length(y); y=y)
-    occupied = unique(grp.cell_obs)
+    occupied = unique(grp.cell_obs[1])
     for k in 1:2
         om = slds.LDSs[k].obs_model
         widths = sort([size(om.variants[i].C, 1) for i in occupied])
@@ -570,7 +570,7 @@ function test_stitching_slot_priors_match_width()
 
     grp = SSD.parameter_grouping(lds, length(y); y=y)
     variants = lds.obs_model.variants
-    occupied = unique(grp.cell_obs)
+    occupied = unique(grp.cell_obs[1])
     @test sort([size(variants[i].C, 1) for i in occupied]) == sort([p1, p2])
     for i in occupied
         v = variants[i]
@@ -656,7 +656,7 @@ function test_stitching_poisson_slds_cd_prior()
     @test all(isfinite, elbos)
 
     grp = SSD._slds_parameter_grouping(slds, length(y); y=y)
-    occupied = unique(grp.cell_obs)
+    occupied = unique(grp.cell_obs[1])
     for k in 1:2
         om = slds.LDSs[k].obs_model
         @test sort([size(om.variants[i].C, 1) for i in occupied]) == sort([p1, p2])

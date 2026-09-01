@@ -821,7 +821,7 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(plds, data)
         state = _grouped_fit_state(plds, data, grp, sws_pool)
@@ -830,7 +830,7 @@ function elbo(
         )
     end
     tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
             T,
@@ -882,12 +882,12 @@ function smooth(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(plds, data, grp, y)
     tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
     # Cap the pool at the trial count — workspaces beyond ntrials are never
     # touched and each carries O(D²·T) of block-tridiagonal storage.
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
             T,
@@ -947,7 +947,7 @@ function fit!(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
-    grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
+    grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
         plds,
         data,
@@ -1031,7 +1031,7 @@ function _grouped_estep_elbo_poisson!(
     max_iter::Int=20,
     tol::T=T(1e-6),
 ) where {
-    T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:PoissonObservationModel{T}}
+    T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:NonQuadraticEmission{T}}
 }
     total = zero(T)
     for c in 1:(grp.ncells)
@@ -1044,15 +1044,43 @@ function _grouped_estep_elbo_poisson!(
         )
 
         compute_smooth_constants!(cell_pool[1], lds_c)
-        total += Q_state!(cell_pool[1], lds_c, suf_c)
-        total += _poisson_q_obs_total(lds_c, tfs_c, state.cell_data[c], cell_pool)
+        total += Q_state!(cell_pool[1], lds_c, _state_suf(suf_c))
+        total += _grouped_cell_q_obs(lds_c, suf_c, tfs_c, state.cell_data[c], cell_pool)
         for fs in tfs_c.FilterSmooths
             total += fs.entropy
         end
     end
     total += _grouped_state_prior_logdensity(state.cell_lds, grp.cell_slot, T)
-    total += _grouped_poisson_obs_prior_logdensity(state.cell_lds, grp.cell_slot, T)
+    total += _grouped_obs_prior_logdensity(
+        state.cell_lds[1], state.cell_lds, grp.cell_slot, T
+    )
     return total
+end
+
+"""
+    _grouped_cell_q_obs(lds_c, suf_c, tfs_c, data_c, cell_pool) -> T
+
+One cell's emission Q-term on the Laplace path: the per-trial Poisson Q for a
+single emission, and the sum over members for a composite.
+"""
+function _grouped_cell_q_obs(
+    lds_c::LinearDynamicalSystem{T,S,O},
+    ::SufficientStatistics{T},
+    tfs_c::TrialFilterSmooth{T},
+    data_c::Data{T},
+    cell_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    return _poisson_q_obs_total(lds_c, tfs_c, data_c, cell_pool)
+end
+
+function _grouped_cell_q_obs(
+    lds_c::LinearDynamicalSystem{T,S,O},
+    suf_c::NamedTuple,
+    tfs_c::TrialFilterSmooth{T},
+    data_c::Data{T},
+    cell_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    return _composite_q_obs_total(lds_c, suf_c, tfs_c, data_c, cell_pool)
 end
 
 """
@@ -1063,12 +1091,110 @@ the trials of every cell that shares that version, so a `[C d D]` shared across
 cells is still fit from all of their data.
 """
 function _grouped_update_observation_model!(
+    state::GroupedFitState{T,L},
+    grp::ParameterGrouping,
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {
+    T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:PoissonObservationModel{T}}
+}
+    ord = _obs_slot_ordinals(state.cell_lds[1].obs_model)[1]
+    _grouped_poisson_emission!(
+        state, grp, data.y, data.uy, sws_pool, grp.cell_slot[ord[1]], nothing
+    )
+    return nothing
+end
+
+#=
+A composite on the Laplace path updates each member by whichever route that
+member supports: the conjugate regression and IW update for a Gaussian member,
+the row-wise Newton solve over pooled trials for a Poisson one. The Gaussian
+members are exactly the grouped update the all-Gaussian path runs, so nothing is
+duplicated for them.
+=#
+function _grouped_update_observation_model!(
+    state::GroupedFitState{T,L},
+    grp::ParameterGrouping,
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {
+    T<:Real,
+    L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:CompositeObservationModel{T}},
+}
+    om = state.cell_lds[1].obs_model
+    ords = _obs_slot_ordinals(om)
+    cell_ws1 = [p[1] for p in state.cell_sws]
+    for (m, key) in enumerate(_obs_keys(om))
+        _grouped_member_obs_mstep!(
+            _models(om)[key], state, grp, data, sws_pool, cell_ws1, key, m, ords[m]
+        )
+    end
+    return nothing
+end
+
+function _grouped_member_obs_mstep!(
+    ::GaussianObservationModel,
+    state::GroupedFitState{T},
+    grp::ParameterGrouping,
+    ::Data{T},
+    ::Vector{SmoothWorkspace{T}},
+    cell_ws1::AbstractVector,
+    key::Symbol,
+    m::Int,
+    ord::UnitRange{Int},
+) where {T<:Real}
+    views = _member_unit_views(state.cell_lds, key)
+    member_sws = _member_unit_sws(cell_ws1, state.cell_lds, m)
+    _grouped_gaussian_obs_mstep!(
+        views,
+        [s[key] for s in state.sufs],
+        grp.cell_slot[ord[1]],
+        grp.cell_slot[ord[2]],
+        member_sws[1],
+        state.bufs[key];
+        unit_sws=member_sws,
+    )
+    return nothing
+end
+
+function _grouped_member_obs_mstep!(
+    ::PoissonObservationModel,
     state::GroupedFitState{T},
     grp::ParameterGrouping,
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
+    ::AbstractVector,
+    key::Symbol,
+    m::Int,
+    ord::UnitRange{Int},
 ) where {T<:Real}
-    for units in _units_by_slot(grp.cell_slot[_G_CD])
+    _grouped_poisson_emission!(
+        state, grp, data.y[key], data.uy[key], sws_pool, grp.cell_slot[ord[1]], (key, m)
+    )
+    return nothing
+end
+
+"""
+    _grouped_poisson_emission!(state, grp, y, uy, sws_pool, slots_cd, member)
+
+One LBFGS/Newton emission solve per version of a Poisson `[C d D]`, over the
+trials of every cell that shares that version — so a `[C d D]` shared across
+cells is still fitted from all of their data.
+
+`member` is `nothing` for a single Poisson emission, or `(key, m)` to run the
+same solve for one member of a composite, on that member's views and
+sub-workspaces.
+"""
+function _grouped_poisson_emission!(
+    state::GroupedFitState{T},
+    grp::ParameterGrouping,
+    y::AbstractVector{<:AbstractMatrix{T}},
+    uy::AbstractVector{<:AbstractMatrix{T}},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    slots_cd::AbstractVector{Int},
+    member::Union{Nothing,Tuple{Symbol,Int}},
+) where {T<:Real}
+    for units in _units_by_slot(slots_cd)
         trials = Int[]
         for c in units
             append!(trials, grp.cell_trials[c])
@@ -1078,9 +1204,19 @@ function _grouped_update_observation_model!(
 
         # solve using the pooled workspace for each cell
         cell_pool = _prepare_cell!(sws_pool, state, units[1])
-        update_observation_model!(
-            state.cell_lds[units[1]], tfs, data.y[trials], cell_pool; uy=data.uy[trials]
-        )
+        lds_u = state.cell_lds[units[1]]
+        if member === nothing
+            update_observation_model!(lds_u, tfs, y[trials], cell_pool; uy=uy[trials])
+        else
+            key, m = member
+            update_observation_model!(
+                _obs_view(lds_u, key),
+                tfs,
+                y[trials],
+                _member_pools(cell_pool, lds_u)[m];
+                uy=uy[trials],
+            )
+        end
     end
     return nothing
 end
@@ -1102,7 +1238,7 @@ function _fit_plds_grouped!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
     state = _grouped_fit_state(plds, data, grp, sws_pool)
     elbos = Vector{T}(undef, max_iter)
@@ -1124,7 +1260,11 @@ function _fit_plds_grouped!(
         )
 
         _grouped_state_mstep!(
-            state.cell_lds, state.sufs, grp.cell_slot, sws_pool[1], state.bufs
+            state.cell_lds,
+            _state_sufs(state.sufs),
+            grp.cell_slot,
+            sws_pool[1],
+            _state_bufs(state.bufs),
         )
         _grouped_update_observation_model!(state, grp, data, sws_pool)
 

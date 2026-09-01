@@ -999,6 +999,90 @@ end
 # Trial partition
 # ============================================================================
 
+#=============================================================================
+Observation-side resolution, member by member
+
+`_resolve_dependence` on a composite gives the *flattened*, key-suffixed view —
+one list of parameter groups whose order matches the `fit_bool` layout, which is
+what `ParameterGrouping` is built from. Variants, per-slot shapes and data-derived
+seeds, though, belong to the member that owns the parameters, so those are
+resolved per member. The helpers below relate the two: `_obs_group_ranges` says
+which flattened groups belong to which member, and everything else is indexed by
+member.
+
+A single observation model is the one-member case throughout, so both go down
+the same path.
+=============================================================================#
+
+"""
+    _obs_member_deps(obs_model) -> Vector{ParameterDependence}
+
+Each observation model's own resolved `depends_on`: one entry for a single
+model, one per member for a composite.
+"""
+_obs_member_deps(om::AbstractObservationModel) = [_resolve_dependence(om)]
+
+function _obs_member_deps(c::CompositeObservationModel)
+    return ParameterDependence[_resolve_dependence(m) for m in values(_models(c))]
+end
+
+"""
+    _obs_group_ranges(obs_model) -> Vector{UnitRange{Int}}
+
+Which flattened observation-group indices belong to each member.
+"""
+_obs_group_ranges(om::AbstractObservationModel) = [1:length(_group_names(om))]
+
+function _obs_group_ranges(c::CompositeObservationModel)
+    ranges = UnitRange{Int}[]
+    offset = 0
+    for m in values(_models(c))
+        n = length(_group_names(m))
+        push!(ranges, (offset + 1):(offset + n))
+        offset += n
+    end
+    return ranges
+end
+
+"""
+    _build_obs_variants!(obs_model, deps, ranges, labels_o, ntrials, y)
+
+Populate every observation model's `variants`, each against its own
+observations — which is what lets one member be stitched across sessions of
+differing channel counts while another is not.
+"""
+function _build_obs_variants!(
+    om::AbstractObservationModel,
+    deps::AbstractVector{ParameterDependence},
+    ::AbstractVector{UnitRange{Int}},
+    labels_o::AbstractVector,
+    ntrials::Int,
+    y,
+)
+    spec_C, spec_R = _obs_slot_specs(om, deps[1], labels_o, ntrials, y)
+    _build_variants!(om, deps[1], spec_C, spec_R)
+    return nothing
+end
+
+function _build_obs_variants!(
+    c::CompositeObservationModel,
+    deps::AbstractVector{ParameterDependence},
+    ranges::AbstractVector{UnitRange{Int}},
+    labels_o::AbstractVector,
+    ntrials::Int,
+    y,
+)
+    models = _models(c)
+    for (m, key) in enumerate(keys(models))
+        y_m = y === nothing ? nothing : y[key]
+        spec_C, spec_R = _obs_slot_specs(
+            models[key], deps[m], labels_o[ranges[m]], ntrials, y_m
+        )
+        _build_variants!(models[key], deps[m], spec_C, spec_R)
+    end
+    return nothing
+end
+
 """
     ParameterGrouping
 
@@ -1010,8 +1094,10 @@ with the per-cell parameter lookups the grouped E/M-steps need.
 - `ncells`: number of occupied cells
 - `trial_cell`: cell index of each trial
 - `cell_trials`: trial indices of each cell
-- `cell_state` / `cell_obs`: index into the state / observation model's
-  `variants` vector for each cell
+- `cell_state`: index into the state model's `variants` vector for each cell
+- `cell_obs[m][cell]`: index into observation model `m`'s `variants` vector. A
+  single emission has one entry; a composite has one per member, since members
+  are grouped independently
 - `nslots[g]`: number of distinct versions of parameter group `g`
 - `cell_slot[g][cell]`: which version of group `g` a cell uses
 - `slot_labels[g][slot]`: the user's label for that version (`nothing` when the
@@ -1023,7 +1109,7 @@ struct ParameterGrouping
     trial_cell::Vector{Int}
     cell_trials::Vector{Vector{Int}}
     cell_state::Vector{Int}
-    cell_obs::Vector{Int}
+    cell_obs::Vector{Vector{Int}}
     nslots::Vector{Int}
     cell_slot::Vector{Vector{Int}}
     slot_labels::Vector{Vector{Any}}
@@ -1141,14 +1227,23 @@ function parameter_grouping(
     stitching dataset fixes each slot's `obs_dim` from the trials assigned to
     it. `y === nothing`, or a dataset whose trials all have the template's
     channel count, reproduces the previous shapes exactly.
+
+    A composite emission is resolved member by member: `dep_o` is the flattened,
+    key-suffixed view used for `names` / `cell_slot` / `fit_bool` ordinals, while
+    each member keeps its own `ParameterDependence` and its own `variants`, built
+    against its own observations. `_obs_group_ranges` says which flattened groups
+    belong to which member; for a single observation model there is one member
+    and one range covering everything, so both cases are one code path.
     =#
     labels_o = [trial_labels[ngroups_s + g] for g in 1:ngroups_o]
-    spec_C, spec_R = _obs_slot_specs(om, dep_o, labels_o, ntrials, y)
-    _build_variants!(om, dep_o, spec_C, spec_R)
+    member_deps = _obs_member_deps(om)
+    ranges = _obs_group_ranges(om)
+    _build_obs_variants!(om, member_deps, ranges, labels_o, ntrials, y)
 
     # Per-trial slot indices, then the per-trial variant index of each sub-model.
+    nmembers = length(member_deps)
     state_idx = Vector{Int}(undef, ntrials)
-    obs_idx = Vector{Int}(undef, ntrials)
+    obs_idx = [Vector{Int}(undef, ntrials) for _ in 1:nmembers]
     s_slots = Vector{Int}(undef, ngroups_s)
     o_slots = Vector{Int}(undef, ngroups_o)
     for n in 1:ntrials
@@ -1160,25 +1255,29 @@ function parameter_grouping(
             o_slots[g] = dep_o.varies[g] ? _slot_of(dep_o, g, trial_labels[gg][n]) : 1
         end
         state_idx[n] = _variant_index(dep_s.nslots, s_slots)
-        obs_idx[n] = _variant_index(dep_o.nslots, o_slots)
+        for m in 1:nmembers
+            obs_idx[m][n] = _variant_index(member_deps[m].nslots, view(o_slots, ranges[m]))
+        end
     end
 
     # Occupied cells, in order of first appearance.
     trial_cell = Vector{Int}(undef, ntrials)
     cell_state = Int[]
-    cell_obs = Int[]
+    cell_obs = [Int[] for _ in 1:nmembers]
     cell_trials = Vector{Int}[]
     for n in 1:ntrials
         cell = 0
         for c in eachindex(cell_state)
-            if cell_state[c] == state_idx[n] && cell_obs[c] == obs_idx[n]
-                cell = c
-                break
-            end
+            cell_state[c] == state_idx[n] || continue
+            all(m -> cell_obs[m][c] == obs_idx[m][n], 1:nmembers) || continue
+            cell = c
+            break
         end
         if cell == 0
             push!(cell_state, state_idx[n])
-            push!(cell_obs, obs_idx[n])
+            for m in 1:nmembers
+                push!(cell_obs[m], obs_idx[m][n])
+            end
             push!(cell_trials, Int[])
             cell = length(cell_state)
         end
@@ -1190,12 +1289,14 @@ function parameter_grouping(
     cell_slot = [Vector{Int}(undef, ncells) for _ in 1:ngroups]
     for c in 1:ncells
         cs = _variant_slots(dep_s.nslots, cell_state[c])
-        co = _variant_slots(dep_o.nslots, cell_obs[c])
         for g in 1:ngroups_s
             cell_slot[g][c] = cs[g]
         end
-        for g in 1:ngroups_o
-            cell_slot[ngroups_s + g][c] = co[g]
+        for m in 1:nmembers
+            co = _variant_slots(member_deps[m].nslots, cell_obs[m][c])
+            for (i, g) in enumerate(ranges[m])
+                cell_slot[ngroups_s + g][c] = co[i]
+            end
         end
     end
 
@@ -1318,15 +1419,56 @@ function _cell_lds(
     lds::LinearDynamicalSystem{T,S,O}, grp::ParameterGrouping, cell::Int
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
     sm = (lds.state_model.variants::Vector{S})[grp.cell_state[cell]]
-    om = (lds.obs_model.variants::Vector{O})[grp.cell_obs[cell]]
+    om = _cell_obs_model(lds.obs_model, grp, cell)::O
     #=
     The cell's `obs_dim` comes from its own emission, not from the parent: under
     stitching each session contributes a different number of channels, and the
     parent's `obs_dim` is only the template's.
     =#
     return LinearDynamicalSystem{T,S,O}(
-        sm, om, lds.latent_dim, size(om.C, 1), lds.ux_dim, lds.uy_dim, lds.fit_bool
+        sm, om, lds.latent_dim, _obs_dim(om), lds.ux_dim, lds.uy_dim, lds.fit_bool
     )
+end
+
+"""
+    _cell_obs_model(obs_model, grp, cell)
+
+The observation model one cell is governed by: the parameter version indexed by
+`grp.cell_obs`. A composite is rebuilt from its members' versions — two small
+struct allocations, with every parameter array shared by reference.
+"""
+function _cell_obs_model(om::AbstractObservationModel, grp::ParameterGrouping, cell::Int)
+    return _variant(om, grp.cell_obs[1][cell])
+end
+
+function _cell_obs_model(
+    om::CompositeObservationModel{T,QUAD,NT}, grp::ParameterGrouping, cell::Int
+) where {T,QUAD,NT}
+    models = _models(om)
+    sub = NamedTuple{keys(models)}(
+        ntuple(m -> _variant(models[m], grp.cell_obs[m][cell]), Val(fieldcount(NT)))
+    )
+    # Inner constructor: the members are this model's own variants, so the key
+    # and element-type checks the outer one runs are already satisfied.
+    return CompositeObservationModel{T,QUAD,NT}(sub)
+end
+
+"""
+    _variant(obs_model, slot)
+
+One parameter version of an observation model, from the `variants` vector
+`_build_variants!` populated.
+"""
+@inline function _variant(
+    om::GaussianObservationModel{T,M,V}, slot::Int
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    return (om.variants::Vector{GaussianObservationModel{T,M,V}})[slot]
+end
+
+@inline function _variant(
+    om::PoissonObservationModel{T,M,V}, slot::Int
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    return (om.variants::Vector{PoissonObservationModel{T,M,V}})[slot]
 end
 
 """
@@ -1347,8 +1489,17 @@ The sub-`Data` holding only `trials`, sharing the per-trial matrices by
 reference (nothing is copied).
 """
 function _subset_data(data::Data, trials::AbstractVector{Int})
-    return Data(data.y[trials], data.ux[trials], data.uy[trials], data.tsteps[trials])
+    return Data(
+        _subset_obs(data.y, trials),
+        data.ux[trials],
+        _subset_obs(data.uy, trials),
+        data.tsteps[trials],
+    )
 end
+
+# A composite emission's `y` / `uy` are NamedTuples of per-member sequences.
+_subset_obs(v::AbstractVector, trials::AbstractVector{Int}) = v[trials]
+_subset_obs(nt::NamedTuple, trials::AbstractVector{Int}) = map(v -> v[trials], nt)
 
 # ============================================================================
 # Public accessors

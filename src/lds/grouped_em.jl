@@ -150,6 +150,11 @@ end
 The data-only aggregator constants (`Σ y y'`, the bias/`uy` blocks of `obs_xx`
 and `obs_xy`, the bias/`ux` blocks of `dyn_xx`) for one cell.
 
+The emission-side blocks are held one per observation model — a single emission
+is the one-element case — because a composite's live on its per-member
+sub-workspaces, which is also where they are restored to. `dyn_xx` is shared:
+it depends only on `ux`.
+
 A grouped fit shares a single `SmoothWorkspace` pool across cells — the O(D²·T)
 block-tridiagonal and shared-covariance storage is the expensive part and is
 safe to reuse, because a cell's smoothed covariances are consumed by its own
@@ -158,10 +163,14 @@ per-cell and must survive between iterations, so they are cached here (all of
 them are small: no `tsteps` dimension) and copied back in before each cell's
 aggregation instead of being recomputed every E-step.
 """
-struct CellConstBlocks{T<:Real}
+struct ObsConstBlocks{T<:Real}
     obs_yy::Matrix{T}
     obs_xy::Matrix{T}
     obs_xx::Matrix{T}
+end
+
+struct CellConstBlocks{T<:Real}
+    obs::Vector{ObsConstBlocks{T}}
     dyn_xx::Matrix{T}
 end
 
@@ -174,26 +183,53 @@ function _cache_const_blocks!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T}, data::Data{T}
 ) where {T<:Real}
     _td_init_const_blocks!(sws, lds, data)
+    #=
+    Both blocks come from the workspaces the aggregation actually reads. For a
+    composite that is the sub-workspaces — the parent has no emission buffers,
+    and its `dyn_xx_const` is never filled, so snapshotting it here would restore
+    a zero dynamics block and leave `dyn_xx` singular.
+    =#
+    blocks = _const_block_workspaces(sws, lds)
     return CellConstBlocks{T}(
-        copy(sws.agg.obs_yy_const),
-        copy(sws.agg.obs_xy_const),
-        copy(sws.agg.obs_xx_const),
-        copy(sws.agg.dyn_xx_const),
+        [_snapshot_obs_consts(w) for w in blocks], copy(first(blocks).agg.dyn_xx_const)
+    )
+end
+
+#=
+Where a model's emission-side aggregator constants live: on the workspace itself
+for a single emission, and on the per-member sub-workspaces for a composite
+(whose parent has no emission buffers at all).
+=#
+_const_block_workspaces(sws::SmoothWorkspace, ::LinearDynamicalSystem) = (sws,)
+
+function _const_block_workspaces(
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return _obs_workspaces!(sws, lds)
+end
+
+function _snapshot_obs_consts(sws::SmoothWorkspace{T}) where {T<:Real}
+    return ObsConstBlocks{T}(
+        copy(sws.agg.obs_yy_const), copy(sws.agg.obs_xy_const), copy(sws.agg.obs_xx_const)
     )
 end
 
 """
-    _restore_const_blocks!(sws, blocks)
+    _restore_const_blocks!(sws, lds, blocks)
 
-Copy a cell's cached aggregator constants back into the shared workspace.
+Copy a cell's cached aggregator constants back into the shared workspace — into
+each member's sub-workspace for a composite emission, which is where the
+per-member aggregation reads them.
 """
 function _restore_const_blocks!(
-    sws::SmoothWorkspace{T}, blocks::CellConstBlocks{T}
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T}, blocks::CellConstBlocks{T}
 ) where {T<:Real}
-    copyto!(sws.agg.obs_yy_const, blocks.obs_yy)
-    copyto!(sws.agg.obs_xy_const, blocks.obs_xy)
-    copyto!(sws.agg.obs_xx_const, blocks.obs_xx)
-    copyto!(sws.agg.dyn_xx_const, blocks.dyn_xx)
+    for (w, b) in zip(_const_block_workspaces(sws, lds), blocks.obs)
+        copyto!(w.agg.obs_yy_const, b.obs_yy)
+        copyto!(w.agg.obs_xy_const, b.obs_xy)
+        copyto!(w.agg.obs_xx_const, b.obs_xx)
+        copyto!(w.agg.dyn_xx_const, blocks.dyn_xx)
+    end
     return sws
 end
 
@@ -207,17 +243,25 @@ batched mean-pass buffers.
 
 `tfs_all` holds the same `FilterSmooth` objects as `cell_tfs`, in original trial
 order, for the callers that need results per trial rather than per cell.
+
+`sufs[cell]` is a `SufficientStatistics` for a single observation model, and a
+`NamedTuple` of one per member for a composite (see `_state_suf`).
+
+`bufs` is a [`GroupedSufBuffers`](@ref) for a single observation model, and a
+`NamedTuple` of them — one per member, each shaped by that member's own widths —
+for a composite. The state-side pooling reads any of them (see
+[`_state_bufs`](@ref)).
 """
-struct GroupedFitState{T<:Real,L,DT}
+struct GroupedFitState{T<:Real,L,DT,B,SF}
     cell_lds::Vector{L}
     cell_data::Vector{DT}
     cell_tfs::Vector{TrialFilterSmooth{T}}
     tfs_all::TrialFilterSmooth{T}
-    sufs::Vector{SufficientStatistics{T}}
+    sufs::Vector{SF}
     cell_consts::Vector{CellConstBlocks{T}}
     cell_batched::Vector{Union{Nothing,BatchedBuffers{T}}}
     cell_sws::Vector{Vector{SmoothWorkspace{T}}}
-    bufs::GroupedSufBuffers{T}
+    bufs::B
 end
 
 """
@@ -236,7 +280,7 @@ function _grouped_fit_state(
     batched::Bool=false,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
     ncells = grp.ncells
-    ntrials = length(data.y)
+    ntrials = length(data.tsteps)
     cell_lds = _cell_ldss(lds, grp)
     cell_data = [_subset_data(data, grp.cell_trials[c]) for c in 1:ncells]
 
@@ -255,7 +299,7 @@ function _grouped_fit_state(
         for (i, n) in enumerate(trials)
             fs_all[n] = initialize_FilterSmooth(lds, tsteps[i]; cov_alias=alias)
         end
-        cell_batched[c] = if batched && equal_len
+        cell_batched[c] = if batched && equal_len && _supports_batched(lds)
             #=
             The cell's own channel count, not the parent's: these buffers hold
             that cell's `y`, which under stitching is one session's channels.
@@ -302,7 +346,7 @@ function _grouped_fit_state(
         cell_consts,
         cell_batched,
         cell_sws,
-        GroupedSufBuffers(T, lds, data.tsteps),
+        _grouped_suf_buffers(lds, data.tsteps),
     )
 end
 
@@ -378,7 +422,14 @@ function _cell_sws_pools(
     cell_lds::AbstractVector,
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {T<:Real}
-    all(c -> cell_lds[c].obs_dim == lds.obs_dim, 1:(grp.ncells)) &&
+    #=
+    Comparing the *shape* rather than `obs_dim` alone is what makes this correct
+    for a composite: its parent workspace carries no emission buffers, so every
+    cell's `obs_dim` is zero and the widths that actually differ are the
+    members'.
+    =#
+    parent_shape = _cell_obs_shape(lds)
+    all(c -> _cell_obs_shape(cell_lds[c]) == parent_shape, 1:(grp.ncells)) &&
         return [sws_pool for _ in 1:(grp.ncells)]
 
     T_max = maximum(data.tsteps)
@@ -387,10 +438,10 @@ function _cell_sws_pools(
             _cell_workspace(
                 base,
                 lds.latent_dim,
-                cell_lds[c].obs_dim,
+                _ws_obs_dim(cell_lds[c]),
                 T_max;
                 ux_dim=lds.ux_dim,
-                uy_dim=lds.uy_dim,
+                uy_dim=_ws_uy_dim(cell_lds[c]),
             ) for base in sws_pool
         ] for c in 1:(grp.ncells)
     ]
@@ -409,7 +460,7 @@ function _prepare_cell!(
 ) where {T<:Real}
     pool = state.cell_sws[cell]
     pool[1].batched = state.cell_batched[cell]
-    _restore_const_blocks!(pool[1], state.cell_consts[cell])
+    _restore_const_blocks!(pool[1], state.cell_lds[cell], state.cell_consts[cell])
     return pool
 end
 
@@ -427,18 +478,32 @@ sessions and there are dozens of them.
 """
 function _grouped_sws_pool(lds::LinearDynamicalSystem{T}, data::Data{T}) where {T<:Real}
     T_max = maximum(data.tsteps)
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     #=
     Sized at the widest session, not at the parent's `obs_dim`: under stitching
     each cell has its own channel count and the parent's is only the template's.
-    Cells narrower than the maximum use the leading rows and columns.
+    Cells narrower than the maximum use the leading rows and columns. A composite
+    parent carries no emission buffers at all, so its width is zero and each
+    cell's members are sized on their own sub-workspaces.
     =#
-    obs_max = maximum(size(yt, 1) for yt in data.y)
+    obs_max = _pool_obs_width(lds, data)
     return [
         SmoothWorkspace(
-            T, lds.latent_dim, obs_max, T_max; ux_dim=lds.ux_dim, uy_dim=lds.uy_dim
+            T, lds.latent_dim, obs_max, T_max; ux_dim=lds.ux_dim, uy_dim=_ws_uy_dim(lds)
         ) for _ in 1:npool
     ]
+end
+
+#=
+Widest emission the shared pool has to accommodate: the widest session for a
+single observation model, and nothing at all for a composite.
+=#
+_pool_obs_width(::LinearDynamicalSystem, data::Data) = maximum(size(yt, 1) for yt in data.y)
+
+function _pool_obs_width(
+    ::LinearDynamicalSystem{T,S,O}, ::Data
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return 0
 end
 
 """
@@ -452,7 +517,7 @@ shared covariance cache, which the next cell overwrites.
 function _grouped_smooth(
     lds::LinearDynamicalSystem{T}, data::Data{T}, grp::ParameterGrouping, y
 ) where {T<:Real}
-    ntrials = length(data.y)
+    ntrials = length(data.tsteps)
     xs = Vector{Matrix{T}}(undef, ntrials)
     Ps = Vector{Array{T,3}}(undef, ntrials)
     sws_pool = _grouped_sws_pool(lds, data)
@@ -476,6 +541,11 @@ end
 # Public-shape return convention, matching `_collect_smooth_output`.
 _grouped_smooth_output(xs, Ps, ::AbstractMatrix) = (xs[1], Ps[1])
 _grouped_smooth_output(xs, Ps, _) = (xs, Ps)
+# A composite's members all have the same container shape, so any of them says
+# whether this was a single-trial or a multi-trial call.
+function _grouped_smooth_output(xs, Ps, y::NamedTuple)
+    return _grouped_smooth_output(xs, Ps, first(values(y)))
+end
 
 """
     _units_by_slot(slots) -> Vector{Vector{Int}}
@@ -892,6 +962,193 @@ function _grouped_update_R!(
     return nothing
 end
 
+#=============================================================================
+Single emission vs composite
+
+Everything below this point is written against a flat list of *units* (a cell for
+an LDS, a (regime, cell) pair for an SLDS) and, per parameter group, the slot
+each unit uses. A composite emission fans that out one member at a time: the
+member's per-unit views, its per-unit sufficient-statistics block, its
+sub-workspaces, and the slice of `cell_slot` holding its own groups. What each
+member then runs is the ordinary single-emission grouped update.
+=============================================================================#
+
+"""
+    _obs_slot_ordinals(obs_model) -> Vector{UnitRange{Int}}
+
+Where each observation model's parameter groups sit in `cell_slot` (and in
+`fit_bool`): after the four state groups, in member order.
+"""
+_obs_slot_ordinals(om::AbstractObservationModel) = [r .+ 4 for r in _obs_group_ranges(om)]
+
+"""
+    _state_sufs(sufs) -> Vector
+
+The per-unit state-side sufficient statistics. Identity for a single emission;
+for a composite it picks any member's block, since the state blocks agree.
+"""
+_state_sufs(sufs::AbstractVector) = [_state_suf(s) for s in sufs]
+
+"""
+    _state_bufs(bufs) -> GroupedSufBuffers
+
+The pooling scratch the state-side updates use. A composite's members all carry
+correctly shaped state blocks, so any of them serves.
+"""
+_state_bufs(bufs::GroupedSufBuffers) = bufs
+_state_bufs(bufs::NamedTuple) = first(values(bufs))
+
+function _grouped_suf_buffers(lds::LinearDynamicalSystem{T}, tsteps) where {T<:Real}
+    return GroupedSufBuffers(T, lds, tsteps)
+end
+
+function _grouped_suf_buffers(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return map(v -> GroupedSufBuffers(T, v, tsteps), _obs_views(lds))
+end
+
+"""
+    _member_unit_views(unit_ldss, key) -> Vector{LinearDynamicalSystem}
+
+One member's view of every unit, so the single-emission grouped updates can run
+over it unchanged.
+"""
+_member_unit_views(unit_ldss::AbstractVector, key::Symbol) =
+    [_obs_view(u, key) for u in unit_ldss]
+
+"""
+    _member_unit_sws(unit_sws, unit_ldss, m) -> Vector{SmoothWorkspace}
+
+Member `m`'s sub-workspace from each unit's workspace. `[C d D]` and `R` are
+shaped by the member's channel count, so a grouped emission update needs the
+member's own scratch, not the parent's.
+"""
+function _member_unit_sws(unit_sws::AbstractVector, unit_ldss::AbstractVector, m::Int)
+    return [_obs_workspaces!(unit_sws[u], unit_ldss[u])[m] for u in eachindex(unit_ldss)]
+end
+
+"""
+    _grouped_obs_prior_logdensity(lds, unit_ldss, cell_slot, T) -> T
+
+`log p(θ)` for the emission parameters of a grouped model, summed over a
+composite's members.
+"""
+function _grouped_obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O},
+    unit_ldss::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    ::Type{T},
+) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
+    ord = _obs_slot_ordinals(lds.obs_model)[1]
+    return _grouped_gaussian_obs_prior_logdensity(
+        unit_ldss, cell_slot[ord[1]], cell_slot[ord[2]], T
+    )
+end
+
+function _grouped_obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O},
+    unit_ldss::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    ::Type{T},
+) where {T<:Real,S<:AbstractStateModel{T},O<:PoissonObservationModel{T}}
+    ord = _obs_slot_ordinals(lds.obs_model)[1]
+    return _grouped_poisson_obs_prior_logdensity(unit_ldss, cell_slot[ord[1]], T)
+end
+
+function _grouped_obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O},
+    unit_ldss::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    ::Type{T},
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    ords = _obs_slot_ordinals(lds.obs_model)
+    total = zero(T)
+    for (m, key) in enumerate(_obs_keys(lds.obs_model))
+        total += _member_obs_prior_logdensity(
+            _member_unit_views(unit_ldss, key), cell_slot, ords[m], T
+        )
+    end
+    return total
+end
+
+function _member_obs_prior_logdensity(
+    views::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
+    cell_slot::AbstractVector{Vector{Int}},
+    ord::UnitRange{Int},
+    ::Type{T},
+) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
+    return _grouped_gaussian_obs_prior_logdensity(
+        views, cell_slot[ord[1]], cell_slot[ord[2]], T
+    )
+end
+
+function _member_obs_prior_logdensity(
+    views::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
+    cell_slot::AbstractVector{Vector{Int}},
+    ord::UnitRange{Int},
+    ::Type{T},
+) where {T<:Real,S<:AbstractStateModel{T},O<:PoissonObservationModel{T}}
+    return _grouped_poisson_obs_prior_logdensity(views, cell_slot[ord[1]], T)
+end
+
+"""
+    _grouped_obs_mstep!(lds, unit_ldss, sufs, cell_slot, unit_sws, bufs)
+
+The conjugate emission M-step of a grouped model, per observation model.
+`unit_sws` holds each unit's *parent* workspace; a composite member's updates run
+on the sub-workspace taken out of it.
+
+Defined for the emissions with a closed-form update — a Poisson emission's
+grouped M-step needs the smoother output and goes through
+`_grouped_update_observation_model!` instead.
+"""
+function _grouped_obs_mstep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    unit_ldss::AbstractVector,
+    sufs::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    unit_sws::AbstractVector,
+    bufs,
+) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
+    ord = _obs_slot_ordinals(lds.obs_model)[1]
+    _grouped_gaussian_obs_mstep!(
+        unit_ldss,
+        sufs,
+        cell_slot[ord[1]],
+        cell_slot[ord[2]],
+        unit_sws[1],
+        _state_bufs(bufs);
+        unit_sws=unit_sws,
+    )
+    return nothing
+end
+
+function _grouped_obs_mstep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    unit_ldss::AbstractVector,
+    sufs::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    unit_sws::AbstractVector,
+    bufs::NamedTuple,
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T,true}}
+    ords = _obs_slot_ordinals(lds.obs_model)
+    for (m, key) in enumerate(_obs_keys(lds.obs_model))
+        views = _member_unit_views(unit_ldss, key)
+        member_sws = _member_unit_sws(unit_sws, unit_ldss, m)
+        _grouped_gaussian_obs_mstep!(
+            views,
+            [s[key] for s in sufs],
+            cell_slot[ords[m][1]],
+            cell_slot[ords[m][2]],
+            member_sws[1],
+            bufs[key];
+            unit_sws=member_sws,
+        )
+    end
+    return nothing
+end
+
 """
     _grouped_state_mstep!(ldss, sufs, slots, sws, bufs)
 
@@ -914,22 +1171,25 @@ function _grouped_state_mstep!(
 end
 
 """
-    _grouped_gaussian_obs_mstep!(ldss, sufs, slots, sws, bufs)
+    _grouped_gaussian_obs_mstep!(ldss, sufs, slots_cd, slots_r, sws, bufs)
 
 The two Gaussian emission updates (`[C d D]`, `R`) over a flat unit list.
+
+The two slot vectors are passed directly rather than looked up in the full
+`cell_slot` by fixed ordinal, so a member of a composite emission can hand over
+its own — its groups sit wherever its member falls in the `fit_bool` layout.
 """
 function _grouped_gaussian_obs_mstep!(
     ldss::AbstractVector,
     sufs::AbstractVector,
-    slots::AbstractVector{Vector{Int}},
+    slots_cd::AbstractVector{Int},
+    slots_r::AbstractVector{Int},
     sws::SmoothWorkspace,
     bufs::GroupedSufBuffers;
     unit_sws::Union{Nothing,AbstractVector}=nothing,
 )
-    _grouped_update_C_d!(
-        ldss, sufs, slots[_G_CD], slots[_G_R], sws, bufs; unit_sws=unit_sws
-    )
-    _grouped_update_R!(ldss, sufs, slots[_G_R], slots[_G_CD], sws; unit_sws=unit_sws)
+    _grouped_update_C_d!(ldss, sufs, slots_cd, slots_r, sws, bufs; unit_sws=unit_sws)
+    _grouped_update_R!(ldss, sufs, slots_r, slots_cd, sws; unit_sws=unit_sws)
     return nothing
 end
 
@@ -1004,19 +1264,22 @@ function _grouped_state_prior_logdensity(
 end
 
 """
-    _grouped_gaussian_obs_prior_logdensity(ldss, slots)
+    _grouped_gaussian_obs_prior_logdensity(ldss, slots_cd, slots_r)
 
 `log p(θ)` for the Gaussian emission parameters of a grouped model.
 """
 function _grouped_gaussian_obs_prior_logdensity(
-    ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}
+    ldss::AbstractVector,
+    slots_cd::AbstractVector{Int},
+    slots_r::AbstractVector{Int},
+    ::Type{T},
 ) where {T<:Real}
     total = zero(T)
-    for u in _slot_representatives(slots[_G_R])
+    for u in _slot_representatives(slots_r)
         om = ldss[u].obs_model
         om.R_prior === nothing || (total += iw_logprior_term(om.R, om.R_prior))
     end
-    for u in _pair_slot_representatives(slots[_G_CD], slots[_G_R])
+    for u in _pair_slot_representatives(slots_cd, slots_r)
         lds = ldss[u]
         om = lds.obs_model
         om.CD_prior === nothing && continue
@@ -1028,17 +1291,17 @@ function _grouped_gaussian_obs_prior_logdensity(
 end
 
 """
-    _grouped_poisson_obs_prior_logdensity(ldss, slots)
+    _grouped_poisson_obs_prior_logdensity(ldss, slots_cd)
 
 `log p(θ)` for the Poisson emission parameters of a grouped model. Poisson has
 no observation-noise covariance, so the MN prior on `[C d D]` contributes the
 bare quadratic that the LBFGS emission objective penalizes, once per version.
 """
 function _grouped_poisson_obs_prior_logdensity(
-    ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}
+    ldss::AbstractVector, slots_cd::AbstractVector{Int}, ::Type{T}
 ) where {T<:Real}
     total = zero(T)
-    for u in _slot_representatives(slots[_G_CD])
+    for u in _slot_representatives(slots_cd)
         lds = ldss[u]
         om = lds.obs_model
         om.CD_prior === nothing && continue
