@@ -10,6 +10,7 @@ DocMeta.setdocmeta!(StateSpaceDynamics, :DocTestSetup, :(using StateSpaceDynamic
 tutorials = [
     ("GaussianLDS.jl", "gaussian_latent_dynamics_example"),
     ("PoissonLDS.jl", "poisson_latent_dynamics_example"),
+    ("MultiObservationLDS.jl", "multi_observation_example"),
     ("LDSModelSelection.jl", "lds_model_selection_example"),
     ("LDSIdentifiability.jl", "lds_identifiability_example"),
     ("SLDS.jl", "switching_linear_dynamical_system_example"),
@@ -48,6 +49,7 @@ makedocs(;
         "Tutorials" => [
             "Gaussian LDS Example" => "tutorials/gaussian_latent_dynamics_example.md",
             "Poisson LDS Example" => "tutorials/poisson_latent_dynamics_example.md",
+            "Multiple Observation Models" => "tutorials/multi_observation_example.md",
             "LDS Model Selection Example" => "tutorials/lds_model_selection_example.md",
             "Non-Identifiability in LDS Models" => "tutorials/lds_identifiability_example.md",
             "Probabilistic PCA Example" => "tutorials/Probabilistic_PCA_example.md",

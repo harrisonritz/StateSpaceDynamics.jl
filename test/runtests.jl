@@ -335,6 +335,45 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/MultiObservation.jl")
+        @testset "Multiple observation models" begin
+            @testset "Construction" begin
+                test_multiobs_construction()
+                test_multiobs_validation()
+                test_multiobs_show()
+            end
+
+            @testset "Equivalences" begin
+                test_multiobs_matches_stacked()
+                test_multiobs_one_em_step_matches_stacked()
+                test_multiobs_single_member_matches_bare()
+            end
+
+            @testset "Mixed emission types" begin
+                test_multiobs_mixed_kernels()
+                test_multiobs_mixed_fit()
+            end
+
+            @testset "Per-member fit_bool, priors and depends_on" begin
+                test_multiobs_fit_bool_per_member()
+                test_multiobs_priors_per_member()
+                test_multiobs_depends_on()
+                test_multiobs_stitching()
+            end
+
+            @testset "Inputs and sampling" begin
+                test_multiobs_observation_inputs()
+                test_multiobs_sampling()
+            end
+
+            @testset "SLDS" begin
+                test_multiobs_slds_validation()
+                test_multiobs_slds_fit()
+                test_multiobs_slds_tied_params()
+                test_multiobs_slds_depends_on()
+            end
+        end
+
         include("LinearDynamicalSystems/Stitching.jl")
         @testset "Stitching (per-session obs_dim)" begin
             @testset "Shapes and validation" begin

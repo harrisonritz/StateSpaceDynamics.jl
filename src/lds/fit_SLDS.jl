@@ -236,7 +236,7 @@ function _sample_continuous_given_discrete!(
     obs_params,
     obs_model_type::GaussianObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = length(z_trial)
 
@@ -292,7 +292,7 @@ function _sample_continuous_given_discrete!(
     obs_params,
     obs_model_type::PoissonObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = length(z_trial)
 
@@ -1669,10 +1669,7 @@ end
 Per-trial standard-normal buffers for `rng_mode = :global`, sized at each
 trial's `latent_dim · T_i`. `nothing` when the caller takes no draws.
 """
-function _slds_noise_buffers(
-    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}
-) where {T<:Real}
-    x_samples === nothing && return nothing
+function _slds_noise_buffers(x_samples::AbstractVector{<:AbstractMatrix{T}}) where {T<:Real}
     return [Vector{T}(undef, length(xs)) for xs in x_samples]
 end
 
@@ -1691,17 +1688,17 @@ what keeps `smoothing_iters = n` identical to `n` successive
 `smoothing_iters = 1` calls: either way the k-th alternation is the k-th draw
 off the master generator.
 """
+# Deterministic path: no draws at all.
+function _slds_draw_sources(rng::AbstractRNG, ::Symbol, ::Nothing, ::Any)
+    return (_ -> rng), (_ -> nothing)
+end
+
 function _slds_draw_sources(
     rng::AbstractRNG,
     rng_mode::Symbol,
-    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
-    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}},
-) where {T<:Real}
-    if x_samples === nothing
-        # Deterministic path: no draws at all.
-        return (_ -> rng), (_ -> nothing)
-    end
-
+    ::AbstractVector{<:AbstractMatrix},
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector}},
+)
     if rng_mode === :global
         noise_bufs === nothing && throw(
             ArgumentError(

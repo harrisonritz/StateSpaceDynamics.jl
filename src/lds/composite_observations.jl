@@ -1577,7 +1577,14 @@ function _slds_emission_loglik!(
     lognorm_t::Union{Nothing,NamedTuple},
     obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
 ) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
-    scratch = obs_scratch::Vector{ObsScratch{T}}
+    obs_scratch === nothing && throw(
+        ArgumentError(
+            "this SLDS workspace carries no per-member emission scratch, so it was not " *
+            "built for a composite emission; construct it with " *
+            "`SLDSSmoothWorkspace(T, slds, tsteps)` from the SLDS being smoothed",
+        ),
+    )
+    scratch = obs_scratch
     @inbounds for t in 1:tsteps
         out[t] = zero(T)
     end
@@ -1615,7 +1622,14 @@ function _slds_emission_gradient!(
     ::AbstractVector{T},
     obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
 ) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
-    scratch = obs_scratch::Vector{ObsScratch{T}}
+    obs_scratch === nothing && throw(
+        ArgumentError(
+            "this SLDS workspace carries no per-member emission scratch, so it was not " *
+            "built for a composite emission; construct it with " *
+            "`SLDSSmoothWorkspace(T, slds, tsteps)` from the SLDS being smoothed",
+        ),
+    )
+    scratch = obs_scratch
     for (i, om) in enumerate(values(_models(lds.obs_model)))
         sc = scratch[i]
         _accumulate_member_gradient!(
@@ -1648,7 +1662,14 @@ function _slds_emission_hessian!(
     ::AbstractVector{T},
     obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
 ) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
-    scratch = obs_scratch::Vector{ObsScratch{T}}
+    obs_scratch === nothing && throw(
+        ArgumentError(
+            "this SLDS workspace carries no per-member emission scratch, so it was not " *
+            "built for a composite emission; construct it with " *
+            "`SLDSSmoothWorkspace(T, slds, tsteps)` from the SLDS being smoothed",
+        ),
+    )
+    scratch = obs_scratch
     for (i, om) in enumerate(values(_models(lds.obs_model)))
         sc = scratch[i]
         _accumulate_member_hessian!(
@@ -1745,13 +1766,13 @@ first — with several emissions there is no one interleaving to pick.
 function _sample_continuous_given_discrete!(
     rng,
     x_trial,
-    y_trial::NamedTuple,
+    y_trial,
     z_trial,
     state_params,
     obs_params,
     obs_model::CompositeObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::NamedTuple,
+    uy_trial,
 )
     tsteps = length(z_trial)
 

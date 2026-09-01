@@ -8,7 +8,7 @@ function _sample_trial!(
     obs_params,
     obs_model::GaussianObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = size(x_trial, 2)
 
@@ -53,7 +53,7 @@ function _sample_trial!(
     obs_params,
     obs_model::PoissonObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = size(x_trial, 2)
 
@@ -108,12 +108,12 @@ is why the single-model path is left exactly as it was.
 function _sample_trial!(
     rng,
     x_trial,
-    y_trial::NamedTuple,
+    y_trial,
     state_params,
     obs_params::NamedTuple,
     obs_model::CompositeObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::NamedTuple,
+    uy_trial,
 )
     tsteps = size(x_trial, 2)
 

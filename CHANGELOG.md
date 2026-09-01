@@ -8,6 +8,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Several observation models on one latent state. Hand `LinearDynamicalSystem` a
+  `NamedTuple` of observation models instead of one and they all read out the
+  same latent process, with observations supplied under the same keys:
+
+  ```julia
+  lds = LinearDynamicalSystem(state_model,
+                              (kin = GaussianObservationModel(C, R, d),
+                               spk = PoissonObservationModel(C, d)))
+  fit!(lds, (kin = Ykin, spk = Yspk); uy = (kin = Vkin, spk = Vspk))
+  ```
+
+  The members are conditionally independent given the latent path, so every
+  emission quantity — log-density, gradient, curvature, Q-term, prior — is a sum
+  over them, and each member keeps its own channel count, priors, `depends_on`,
+  `group_seeds` and `fit_bool` flags. Any number of members, all of one type or
+  mixed. Works for `LinearDynamicalSystem` and `SLDS`.
+  * A member is reached by its key and a member's parameter by the key-suffixed
+    name — `obs.kin`, `obs.kin.C`, `obs.C_kin`. That suffixed spelling is what
+    `depends_on` (`(C_kin = session, d_kin = session, R_kin = session)`),
+    `tied_params` (`(:C_spk, :d_spk)`), `fit_bool` and `group_parameter` use,
+    so one emission can be per-session, or frozen, or tied across SLDS regimes,
+    while another is not
+  * `fit_bool` becomes `[x0, P0, A&b&B, Q]` followed by one block per
+    observation model (`[C&d&D, R]` for a Gaussian emission, `[C&d&D]` for a
+    Poisson one). It also accepts a keyword form that lowers to that layout —
+    `fit_bool = (x0=true, …, kin=(C=true, R=false), spk=(C=true,))` — which
+    avoids counting positions by hand. Single-emission layouts (length 5 / 6)
+    are unchanged
+  * Which smoother runs follows from the members' types, at compile time: an
+    all-Gaussian composite has an emission curvature that does not depend on the
+    latent path, so it takes the single-Newton-step smoother with its
+    equal-length shared-covariance fast path, while any non-Gaussian member
+    routes to the iterative Laplace smoother. Verified against the equivalent
+    stacked single-emission model (`C = [C₁; C₂]`, `R = blockdiag(R₁, R₂)`):
+    identical smoothed means and covariances, ELBO and marginal log-likelihood,
+    and identical parameters after one EM step
+  * What the composite buys over that stacked form is a block-diagonal `R` that
+    stays block-diagonal, per-member `obs_dim` (so one member can be stitched
+    across sessions of differing channel counts while another is not), and
+    members that need not be Gaussian at all
+  * `rand` returns observations as a `NamedTuple`; `loglikelihood` is available
+    for an all-Gaussian composite and errors for a mixed one, as it does for a
+    Poisson LDS
+  * Known gap: the BLAS-3 batched mean pass does not apply to a composite — it
+    stacks one observation tensor against one `C`/`d`/`D`, which a composite does
+    not have. The equal-length fast path still computes the covariance once and
+    shares it, so this costs the promotion of the mean pass from BLAS-2 to
+    BLAS-3, not the shared-covariance saving
+
 - `fit!(slds, y; tied_params=...)`: share any parameter group across every
   regime instead of fitting one per regime. Takes a `Symbol` or a collection of
   them, named the way `depends_on` and `fit_bool` name parameters — `[A b B]` is
@@ -130,6 +179,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- The emission kernels `observation_loglikelihood!`, `observation_gradient!` and
+  `observation_hessian!` take the observation model rather than the enclosing
+  `LinearDynamicalSystem`, which is what lets a composite emission call them once
+  per member. They are unexported internals; no public API changed.
+- `ParameterGrouping.cell_obs` is now one variant-index vector per observation
+  model rather than a single one. Also internal.
 - **Breaking:** parameter names no longer stand in for the group they are fitted
   with. `depends_on = (C = session, R = session)` was shorthand for grouping the
   whole `[C d D]` regression; it is now an error, and the members must be named

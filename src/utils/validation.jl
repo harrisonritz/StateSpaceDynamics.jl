@@ -467,7 +467,6 @@ function validate_SLDS(slds::SLDS)
     obs_dim = slds.LDSs[1].obs_dim
     ux_dim = slds.LDSs[1].ux_dim
     uy_dim = slds.LDSs[1].uy_dim
-    obs_keys = _obs_keys(slds.LDSs[1].obs_model)
 
     for (i, lds) in enumerate(slds.LDSs)
         if lds.latent_dim != latent_dim
@@ -488,19 +487,11 @@ function validate_SLDS(slds::SLDS)
         end
 
         #=
-        A composite emission must have the same members in the same order in
-        every regime: one `Data` serves them all, and the regimes' emissions are
-        indexed positionally throughout the E- and M-steps.
+        A composite emission needs no key check here: `SLDS.LDSs` is a
+        `Vector{LinearDynamicalSystem{T,S,O}}` with one concrete `O`, and the
+        member names and order are part of the composite's type — so regimes
+        that disagree cannot be put in the same `SLDS` at all.
         =#
-        if _obs_keys(lds.obs_model) != obs_keys
-            throw(
-                ArgumentError(
-                    "LDS[$i] has observation models $(_key_list(_obs_keys(lds.obs_model))) " *
-                    "but LDS[1] has $(_key_list(obs_keys)); every regime must carry the " *
-                    "same observation models, in the same order",
-                ),
-            )
-        end
 
         # This will throw if invalid
         validate_LDS(lds)

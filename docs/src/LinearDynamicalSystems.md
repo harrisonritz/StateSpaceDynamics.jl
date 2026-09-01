@@ -79,6 +79,52 @@ Where ``d`` is a bias term.
 PoissonObservationModel
 ```
 
+## Several observation models at once
+
+One latent process can be measured in more than one way — spike counts *and*
+kinematics, say. Hand `LinearDynamicalSystem` a `NamedTuple` of observation
+models instead of one and they all read out the same latent state, with the
+observations supplied under the same keys:
+
+```julia
+lds = LinearDynamicalSystem(
+    state_model,
+    (kin = GaussianObservationModel(C_kin, R_kin, d_kin),
+     spk = PoissonObservationModel(C_spk, d_spk)),
+)
+
+fit!(lds, (kin = Ykin, spk = Yspk); uy = (kin = Vkin, spk = Vspk))
+```
+
+The members are conditionally independent given the latent path, so
+`log p(y | x) = Σₘ log p(yₘ | x)` and every emission term is a sum over them.
+Each keeps its own channel count, priors, `depends_on`, `group_seeds` and
+`fit_bool` flags; they may be all of one type or mixed.
+
+A member is reached by its key, and a member's parameter by the key-suffixed
+name:
+
+```julia
+lds.obs_model.kin      # the GaussianObservationModel
+lds.obs_model.kin.C
+lds.obs_model.C_kin    # the same array
+```
+
+That suffixed spelling is what the rest of the API uses, so one emission can be
+estimated per session, or frozen, while another is not:
+
+```julia
+set_depends_on!(lds.obs_model, (C_kin = session, d_kin = session, R_kin = session))
+group_parameter(lds.obs_model, :C_kin, :session_a)
+
+LinearDynamicalSystem(state_model, obs; fit_bool = (spk = (C = false,),))
+fit!(slds, y; tied_params = (:C_spk, :d_spk))    # share one readout across regimes
+```
+
+See [`CompositeObservationModel`](@ref) and the
+[multiple observation models tutorial](tutorials/multi_observation_example.md).
+
+
 ## Sampling from Linear Dynamical Systems
 
 You can generate synthetic data from fitted LDS models. Pass a scalar
@@ -171,7 +217,7 @@ Given the latent structure of state-space models, we must rely on either the Exp
     These issues affect **parameter interpretability** but not **predictive performance**; be cautious when interpreting individual entries of ``A``, ``C``, or ``Q``.
 
 ```@docs
-fit!(lds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:StateSpaceDynamics.QuadraticEmission{T}}
 ```
 
 ## Inverse-Wishart Priors on Covariances (MAP)

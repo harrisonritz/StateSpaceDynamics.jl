@@ -17,6 +17,7 @@ SLDS
 GaussianStateModel
 GaussianObservationModel
 PoissonObservationModel
+CompositeObservationModel
 ```
 
 ```@docs
@@ -45,6 +46,7 @@ x0_mean_prior
 group_labels
 group_parameter
 set_group_seeds!
+set_depends_on!
 ```
 
 ## Sampling
@@ -62,12 +64,12 @@ Random.rand(rng::AbstractRNG, ppca::ProbabilisticPCA, n::Int)
 
 ```@docs; canonical = false
 smooth
-fit!(lds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-fit!(slds::SLDS{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}; max_iter::Int=50, progress::Bool=true) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:StateSpaceDynamics.QuadraticEmission{T}}
+fit!(slds::SLDS{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple}; max_iter::Int=50, progress::Bool=true) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
 ```
 
 ```@docs
-fit!(plds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}}) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+fit!(plds::LinearDynamicalSystem{T,S,O}, y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple}) where {T<:Real,S<:GaussianStateModel{T},O<:StateSpaceDynamics.NonQuadraticEmission{T}}
 fit!(ppca::ProbabilisticPCA, X::AbstractMatrix{T}, max_iters::Int=100, tol::Float64=1e-6) where {T<:Real}
 ```
 
