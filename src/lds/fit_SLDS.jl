@@ -73,12 +73,11 @@ function Random.rand(
     slds::SLDS{T,S,O},
     tsteps::Integer;
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
-    obs_dim = lds1.obs_dim
     Ti = Int(tsteps)
 
     ux_trial = _check_ux(ux, lds1.ux_dim, Ti, "ux", T)
@@ -86,7 +85,7 @@ function Random.rand(
 
     z = Vector{Int}(undef, Ti)
     x = Matrix{T}(undef, latent_dim, Ti)
-    y = Matrix{T}(undef, obs_dim, Ti)
+    y = _alloc_obs(lds1, Ti)
 
     if depends_on === nothing && _has_parameter_dependence(lds1)
         _single_trial_group_error("slds")
@@ -123,12 +122,11 @@ function Random.rand(
     slds::SLDS{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
-    obs_dim = lds1.obs_dim
     ntrials = length(tsteps_per_trial)
 
     ux_seq = _normalize_multitrial_ux(ux, lds1.ux_dim, tsteps_per_trial, T, "ux")
@@ -136,7 +134,7 @@ function Random.rand(
 
     z = Vector{Vector{Int}}(undef, ntrials)
     x = Vector{Matrix{T}}(undef, ntrials)
-    y = Vector{Matrix{T}}(undef, ntrials)
+    y = Vector{typeof(_alloc_obs(lds1, 1))}(undef, ntrials)
 
     #=
     Per-trial, per-regime parameter sets: one entry per trial, each a vector
@@ -164,7 +162,7 @@ function Random.rand(
         Ti = Int(tsteps_per_trial[trial])
         z[trial] = Vector{Int}(undef, Ti)
         x[trial] = Matrix{T}(undef, latent_dim, Ti)
-        y[trial] = Matrix{T}(undef, obs_dim, Ti)
+        y[trial] = _alloc_obs(lds1, Ti)
         _sample_slds_trial!(
             rng,
             z[trial],
@@ -176,7 +174,7 @@ function Random.rand(
             obs_of[trial],
             lds1.obs_model,
             ux_seq[trial],
-            uy_seq[trial],
+            _trial(uy_seq, trial),
         )
     end
 
@@ -203,7 +201,7 @@ function _sample_slds_trial!(
     obs_params,
     obs_model_type,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = length(z_trial)
     K = size(A, 1)
@@ -301,16 +299,17 @@ function _sample_continuous_given_discrete!(
     # Initial state
     k1 = z_trial[1]
     x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
-    y_trial[:, 1] = rand.(
-        rng,
-        Poisson.(
-            exp.(
-                obs_params[k1].C * x_trial[:, 1] +
-                obs_params[k1].d +
-                obs_params[k1].D * uy_trial[:, 1],
+    y_trial[:, 1] =
+        rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params[k1].C * x_trial[:, 1] +
+                    obs_params[k1].d +
+                    obs_params[k1].D * uy_trial[:, 1],
+                ),
             ),
-        ),
-    )
+        )
 
     # Subsequent states
     for t in 2:tsteps
@@ -326,16 +325,17 @@ function _sample_continuous_given_discrete!(
             ),
         )
 
-        y_trial[:, t] = rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params[k_curr].C * x_trial[:, t] +
-                    obs_params[k_curr].d +
-                    obs_params[k_curr].D * uy_trial[:, t],
+        y_trial[:, t] =
+            rand.(
+                rng,
+                Poisson.(
+                    exp.(
+                        obs_params[k_curr].C * x_trial[:, t] +
+                        obs_params[k_curr].d +
+                        obs_params[k_curr].D * uy_trial[:, t],
+                    ),
                 ),
-            ),
-        )
+            )
     end
 end
 
@@ -401,12 +401,18 @@ The Poisson `Σᵢ log(y!)` normalizer for one trial / for every trial, or
 observation-model type, so `LDSs[1]` decides which it is; and the normalizer
 depends only on the counts, so one vector per trial serves every regime.
 """
-function _slds_lognorm_for(slds::SLDS, y::AbstractMatrix)
+function _slds_lognorm_for(slds::SLDS, y)
     return _poisson_lognorm_one(slds.LDSs[1], y)
 end
 
 function _slds_lognorm_all(slds::SLDS, y::AbstractVector{<:AbstractMatrix})
     return _poisson_lognorm_all(slds.LDSs[1], y)
+end
+
+# A composite emission's hoisted normalizers are per member, so the whole
+# dataset's are per trial then per member.
+function _slds_lognorm_all(slds::SLDS, y::NamedTuple)
+    return [_slds_lognorm_for(slds, _trial(y, n)) for n in 1:_ntrials(y)]
 end
 
 #=
@@ -432,6 +438,7 @@ function _slds_emission_loglik!(
     uy::Union{Nothing,AbstractMatrix},
     tsteps::Int,
     lognorm_t::Union{Nothing,AbstractVector{T}},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
     om = lds.obs_model
     obs_dim, latent_dim = size(om.C)
@@ -455,6 +462,7 @@ function _slds_emission_loglik!(
     uy::Union{Nothing,AbstractMatrix},
     tsteps::Int,
     ::Union{Nothing,AbstractVector{T}},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     z = ws.opt.temp_dy
     λ = ws.opt.temp_solve_R
@@ -481,15 +489,16 @@ function _slds_trial_loglikelihood!(
     cc::SmoothConstants{T},
     lds::LinearDynamicalSystem{T,S,O},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     ux::Union{Nothing,AbstractMatrix}=nothing,
-    uy::Union{Nothing,AbstractMatrix}=nothing,
-    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
+    obs_scratch::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    tsteps = size(y, 2)
+    tsteps = _ntsteps(y)
     @assert length(ll) == tsteps
 
-    _slds_emission_loglik!(ll, ws, cc, lds, x, y, uy, tsteps, lognorm_t)
+    _slds_emission_loglik!(ll, ws, cc, lds, x, y, uy, tsteps, lognorm_t, obs_scratch)
 
     dx = ws.opt.temp_dx
     tmp = ws.opt.temp_solve_Q
@@ -517,13 +526,13 @@ function joint_loglikelihood!(
     ws::SLDSSmoothWorkspace{T},
     slds::SLDS{T},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T},   # K × T responsibilities/weights
     ux::Union{Nothing,AbstractMatrix}=nothing,
-    uy::Union{Nothing,AbstractMatrix}=nothing,
-    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
 ) where {T<:Real}
-    Tsteps = size(y, 2)
+    Tsteps = _ntsteps(y)
 
     # Workspace ll_vec may be sized for a longer trial; only touch the active prefix.
     ll_vec = ws.opt.ll_vec
@@ -541,6 +550,7 @@ function joint_loglikelihood!(
             ux,
             uy,
             lognorm_t,
+            _regime_obs(ws, k),
         )
         for t in 1:Tsteps
             ll_vec[t] += w[k, t] * ws.ll_tmp[t]
@@ -574,11 +584,12 @@ function _add_cov_correction!(
     cc::SmoothConstants{T},
     lds_k::LinearDynamicalSystem{T},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     fs::FilterSmooth{T},
-    uy::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
+    obs_scratch::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real}
-    Tsteps = size(y, 2)
+    Tsteps = _ntsteps(y)
 
     # Cached state-model templates for regime k, matching `hessian!`.
     neg_Q_inv = cc.xt_given_xt_1     # -Q⁻¹
@@ -597,7 +608,7 @@ function _add_cov_correction!(
 
         # Use unit weight to get this regime's emission curvature alone.
         fill!(H_obs, zero(T))
-        observation_hessian!(H_obs, cc, z, λ, lds_k.obs_model, x, y, t, one(T), uy)
+        _emission_curvature_at!(H_obs, ws, cc, lds_k, x, y, t, uy, obs_scratch)
         corr = _tr_prod(H_obs, Σ_tt)
 
         if t == 1
@@ -630,10 +641,10 @@ function gradient!(
     ws::SLDSSmoothWorkspace{T},
     slds::SLDS{T},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
-    uy::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
 ) where {T<:Real}
     latent_dim, Tsteps = size(x)
     K = length(slds.LDSs)
@@ -660,7 +671,18 @@ function gradient!(
 
         # Emission half, for every timestep at once where the model allows it.
         _slds_emission_gradient!(
-            grad, ws, cc, lds_k, x, y, view(w, k, :), uy, Tsteps, tmp1, obs_buf
+            grad,
+            ws,
+            cc,
+            lds_k,
+            x,
+            y,
+            view(w, k, :),
+            uy,
+            Tsteps,
+            tmp1,
+            obs_buf,
+            _regime_obs(ws, k),
         )
 
         # t = 1: prior, weighted by w[k,1]
@@ -720,6 +742,7 @@ function _slds_emission_gradient!(
     tsteps::Int,
     ::AbstractVector{T},
     ::AbstractVector{T},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
     om = lds.obs_model
     obs_dim, latent_dim = size(om.C)
@@ -752,6 +775,7 @@ function _slds_emission_gradient!(
     tsteps::Int,
     tmp::AbstractVector{T},
     obs_buf::AbstractVector{T},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     @inbounds for t in 1:tsteps
         observation_gradient!(tmp, cc, obs_buf, lds.obs_model, x, y, t, uy)
@@ -786,6 +810,7 @@ function _slds_emission_hessian!(
     tsteps::Int,
     z::AbstractVector{T},
     λ::AbstractVector{T},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
     obs_dim, latent_dim = size(lds.obs_model.C)
     pb = poisson_batch!(ws, latent_dim, obs_dim, tsteps)
@@ -804,6 +829,7 @@ function _slds_emission_hessian!(
     tsteps::Int,
     z::AbstractVector{T},
     λ::AbstractVector{T},
+    ::Union{Nothing,Vector{ObsScratch{T}}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     H_diag = ws.btd.H_diag
     for t in 1:tsteps
@@ -835,9 +861,9 @@ function hessian!(
     ws::SLDSSmoothWorkspace{T},
     slds::SLDS{T},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T},
-    uy::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
 ) where {T<:Real}
     Tsteps = size(x, 2)
     K = length(slds.LDSs)
@@ -872,7 +898,9 @@ function hessian!(
 
         if Tsteps == 1
             @. H_diag[1] += w[k, 1] * neg_P0_inv
-            _slds_emission_hessian!(ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ)
+            _slds_emission_hessian!(
+                ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ, _regime_obs(ws, k)
+            )
             continue
         end
 
@@ -900,7 +928,9 @@ function hessian!(
         @. H_diag[Tsteps] += w[k, Tsteps] * neg_Q_inv
 
         # Emission curvature contributions, weighted by w[k,t].
-        _slds_emission_hessian!(ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ)
+        _slds_emission_hessian!(
+            ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ, _regime_obs(ws, k)
+        )
     end
 
     for t in 1:Tsteps
@@ -913,7 +943,7 @@ end
 function smooth!(
     slds::SLDS{T},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T};
     ws::Union{Nothing,SLDSSmoothWorkspace{T}}=nothing,
     max_iter::Int=20,
@@ -923,11 +953,11 @@ function smooth!(
     rng::AbstractRNG=Random.default_rng(),
     noise::Union{Nothing,AbstractVector{T}}=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
-    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
-    tsteps = size(y, 2)
+    tsteps = _ntsteps(y)
     n_active = latent_dim * tsteps
 
     ws === nothing && (ws = SLDSSmoothWorkspace(T, slds, tsteps))
@@ -1049,13 +1079,13 @@ call [`smooth(slds, y)`](@ref) with no `w`.
 """
 function smooth(
     slds::SLDS,
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T};
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
 ) where {T<:Real}
     lds1 = slds.LDSs[1]
-    tsteps = size(y, 2)
+    tsteps = _ntsteps(y)
     ux_m = _check_ux(ux, lds1.ux_dim, tsteps, "ux", T)
     uy_m = _check_uy(uy, lds1.uy_dim, tsteps, lds1.obs_model)
     fs = initialize_FilterSmooth(lds1, tsteps)::FilterSmooth{T}
@@ -1116,7 +1146,9 @@ one call — read its `elbo` field rather than calling [`elbo`](@ref) separately
 """
 function smooth(
     slds::SLDS{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -1139,7 +1171,7 @@ function smooth(
 
     K = length(slds.LDSs)
     tsteps_per_trial = data.tsteps
-    ntrials = length(y_seq)
+    ntrials = length(tsteps_per_trial)
     seq_ends = cumsum(tsteps_per_trial)
     total_T = last(seq_ends)
     T_max = maximum(tsteps_per_trial)
@@ -1460,13 +1492,13 @@ function _slds_fill_logL!(
     cell_slds::Union{Nothing,AbstractVector},
     grp::Union{Nothing,ParameterGrouping},
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_of,
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tfs::Union{Nothing,TrialFilterSmooth{T}}=nothing,
 ) where {T<:Real}
@@ -1499,9 +1531,9 @@ function _slds_fill_logL!(
 
             t1, t2 = HMMs.seq_limits(seq_ends, trial)
             x_src = x_of(trial)
-            y_trial = y[trial]
+            y_trial = _trial(y, trial)
             ux_trial = ux === nothing ? nothing : ux[trial]
-            uy_trial = uy === nothing ? nothing : uy[trial]
+            uy_trial = uy === nothing ? nothing : _trial(uy, trial)
             ln_trial = lognorm === nothing ? nothing : lognorm[trial]
             for k in 1:K
                 ll_k = view(dl.logL, k, t1:t2)::AbstractVector{T}
@@ -1515,6 +1547,7 @@ function _slds_fill_logL!(
                     ux_trial,
                     uy_trial,
                     ln_trial,
+                    _regime_obs(ws_t, k),
                 )
                 if tfs !== nothing
                     _add_cov_correction!(
@@ -1526,6 +1559,7 @@ function _slds_fill_logL!(
                         y_trial,
                         tfs[trial],
                         uy_trial,
+                        _regime_obs(ws_t, k),
                     )
                 end
             end
@@ -1559,7 +1593,7 @@ function _slds_smooth_all!(
     cell_slds::Union{Nothing,AbstractVector},
     grp::Union{Nothing,ParameterGrouping},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan,
@@ -1567,7 +1601,7 @@ function _slds_smooth_all!(
     rng_of=_ -> Random.default_rng(),
     noise_of=_ -> nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     grouped = grp !== nothing && cell_slds !== nothing
@@ -1594,14 +1628,14 @@ function _slds_smooth_all!(
             smooth!(
                 slds_t,
                 tfs[trial],
-                y[trial],
+                _trial(y, trial),
                 w_of(trial);
                 ws=ws_t,
                 x_sample=(x_samples === nothing ? nothing : x_samples[trial]),
                 rng=rng_of(trial),
                 noise=noise_of(trial),
                 ux=(ux === nothing ? nothing : ux[trial]),
-                uy=(uy === nothing ? nothing : uy[trial]),
+                uy=(uy === nothing ? nothing : _trial(uy, trial)),
                 lognorm_t=(lognorm === nothing ? nothing : lognorm[trial]),
             )
         end
@@ -1735,14 +1769,14 @@ function _vem_alternate!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int,
     tol::T=zero(T),
@@ -1872,7 +1906,7 @@ function estep!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_samples::AbstractVector{<:AbstractMatrix{T}},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
@@ -1883,7 +1917,7 @@ function estep!(
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
@@ -1924,7 +1958,7 @@ function estep!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_samples::AbstractVector{<:AbstractMatrix{T}},
     slds_ws::SLDSSmoothWorkspace{T};
     rng::AbstractRNG=Random.default_rng(),
@@ -1934,7 +1968,7 @@ function estep!(
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
     smoothing_iters::Int=1,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
@@ -1946,7 +1980,7 @@ function estep!(
         y,
         x_samples,
         _slds_solo_pool(slds_ws),
-        _slds_trial_plan(nothing, length(y), 1);
+        _slds_trial_plan(nothing, _ntrials(y), 1);
         rng=rng,
         rng_mode=rng_mode,
         noise_bufs=noise_bufs,
@@ -1972,58 +2006,20 @@ end
 """
     _slds_prior_logdensity(slds)
 
-Sum of the per-regime parameter log-prior contributions (IW on `Q`/`P0`/`R`,
-MN on `[A b B]`/`[C d D]`, and the MN-only `[C d]` term for Poisson emissions,
-matching the PLDS LBFGS objective). Zero when no priors are set. Needed so the
-ELBO tracks the same MAP objective the M-step optimizes; without it the
-displayed ELBO can appear non-monotone under priors.
+Sum of the per-regime parameter log-prior contributions, via the shared
+[`_state_prior_logdensity`](@ref) and [`_obs_prior_logdensity`](@ref): IW on
+`Q`/`P0`/`R`, MN on `[A b B]`/`[C d D]`, and the MN-only `[C d D]` term for
+Poisson emissions that matches their M-step objective. A composite emission sums
+over its members. Zero when no priors are set.
+
+Needed so the ELBO tracks the same MAP objective the M-step optimizes; without it
+the displayed ELBO can appear non-monotone under priors.
 """
 function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
     prior_term = zero(T)
     for lds in slds.LDSs
-        sm = lds.state_model
-        om = lds.obs_model
-        D = lds.latent_dim
-
-        if sm.Q_prior !== nothing
-            prior_term += iw_logprior_term(sm.Q, sm.Q_prior)
-        end
-        if sm.P0_prior !== nothing
-            prior_term += iw_logprior_term(sm.P0, sm.P0_prior)
-        end
-        if sm.x0_prior !== nothing
-            prior_term += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
-        end
-        if sm.AB_prior !== nothing
-            ux_dim = lds.ux_dim
-            W_ab = Matrix{T}(undef, D, D + 1 + ux_dim)
-            @views W_ab[:, 1:D] .= sm.A
-            @views W_ab[:, D + 1] .= sm.b
-            ux_dim > 0 && (@views W_ab[:, (D + 2):end] .= sm.B)
-            prior_term += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
-        end
-
-        if om isa GaussianObservationModel{T}
-            if om.R_prior !== nothing
-                prior_term += iw_logprior_term(om.R, om.R_prior)
-            end
-            if om.CD_prior !== nothing
-                uy_dim = lds.uy_dim
-                W_cd = Matrix{T}(undef, lds.obs_dim, D + 1 + uy_dim)
-                @views W_cd[:, 1:D] .= om.C
-                @views W_cd[:, D + 1] .= om.d
-                uy_dim > 0 && (@views W_cd[:, (D + 2):end] .= om.D)
-                prior_term += mn_logprior_term(W_cd, om.R, om.CD_prior)
-            end
-        elseif om isa PoissonObservationModel{T}
-            if om.CD_prior !== nothing
-                # `[C d D]`, the full regression the prior is stated over: with
-                # emission inputs the `D` block is part of it.
-                W_cd = _pack_obs_V!(Matrix{T}(undef, lds.obs_dim, D + 1 + lds.uy_dim), lds)
-                Wm = W_cd .- om.CD_prior.M₀
-                prior_term -= T(0.5) * sum(Wm .* (Wm * om.CD_prior.Λ))
-            end
-        end
+        prior_term += _state_prior_logdensity(lds, nothing)
+        prior_term += _obs_prior_logdensity(lds, nothing)
     end
     return prior_term
 end
@@ -2042,13 +2038,13 @@ function _slds_trial_elbo(
     slds::SLDS{T,S,O},
     fs::FilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
-    y_trial::AbstractMatrix{T},
+    y_trial::Union{AbstractMatrix{T},NamedTuple},
     slds_ws::SLDSSmoothWorkspace{T},
     t1::Int,
     t2::Int,
     ux_trial::Union{Nothing,AbstractMatrix{T}},
-    uy_trial::Union{Nothing,AbstractMatrix{T}},
-    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
+    uy_trial::Union{Nothing,AbstractMatrix{T},NamedTuple},
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     K = length(slds.LDSs)
     Tsteps = t2 - t1 + 1
@@ -2079,6 +2075,7 @@ function _slds_trial_elbo(
             ux_trial,
             uy_trial,
             lognorm_t,
+            _regime_obs(slds_ws, k),
         )
         for t in 1:Tsteps
             trial_elbo += w[k, t] * ll[t]
@@ -2096,10 +2093,10 @@ function _slds_trial_elbo(
     H_sub = slds_ws.btd.H_sub
     H_super = slds_ws.btd.H_super
     for t in 1:Tsteps
-        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth,:,:,t))
+        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth, :, :, t))
     end
     for t in 2:Tsteps
-        Σ_ttm1 = view(fs.p_smooth_tt1,:,:,t)  # Cov(x_t, x_{t-1})
+        Σ_ttm1 = view(fs.p_smooth_tt1, :, :, t)  # Cov(x_t, x_{t-1})
         trial_elbo += T(0.5) * _tr_prod(H_super[t - 1], Σ_ttm1)
         trial_elbo += T(0.5) * _tr_prod(H_sub[t - 1], transpose(Σ_ttm1))
     end
@@ -2177,12 +2174,12 @@ function elbo!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     per_trial = _slds_trial_elbos(
@@ -2202,11 +2199,11 @@ function elbo!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     slds_ws::SLDSSmoothWorkspace{T};
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return elbo!(
@@ -2215,7 +2212,7 @@ function elbo!(
         fb_storage,
         y,
         _slds_solo_pool(slds_ws),
-        _slds_trial_plan(nothing, length(y), 1);
+        _slds_trial_plan(nothing, _ntrials(y), 1);
         seq_ends=seq_ends,
         ux=ux,
         uy=uy,
@@ -2242,15 +2239,15 @@ function _slds_trial_elbos(
     grp::Union{Nothing,ParameterGrouping},
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
-    per_trial = zeros(T, length(y))
+    per_trial = zeros(T, _ntrials(y))
     grouped = grp !== nothing && cell_slds !== nothing
 
     tforeach(1:_plan_ntasks(plan)) do slot
@@ -2277,12 +2274,12 @@ function _slds_trial_elbos(
                 slds_t,
                 tfs[trial],
                 fb_storage,
-                y[trial],
+                _trial(y, trial),
                 ws_t,
                 t1,
                 t2,
                 ux === nothing ? nothing : ux[trial],
-                uy === nothing ? nothing : uy[trial],
+                uy === nothing ? nothing : _trial(uy, trial),
                 lognorm === nothing ? nothing : lognorm[trial],
             )
         end
@@ -2308,7 +2305,9 @@ its `elbo` field rather than paying for the alternation twice.
 """
 function elbo(
     slds::SLDS{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -2425,16 +2424,12 @@ function _broadcast_tied_params!(
 ) where {T<:Real}
     isempty(tied) && return nothing
     src = slds.LDSs[1]
-    D, p = src.latent_dim, src.obs_dim
+    D = src.latent_dim
     dyn_cols = _tied_dyn_cols(tied, D, src.ux_dim)
-    obs_cols = _tied_obs_cols(tied, D, src.uy_dim)
 
     W_src = Matrix{T}(undef, D, D + 1 + src.ux_dim)
     W_dst = similar(W_src)
-    V_src = Matrix{T}(undef, p, D + 1 + src.uy_dim)
-    V_dst = similar(V_src)
     isempty(dyn_cols) || _pack_dyn_W!(W_src, src)
-    isempty(obs_cols) || _pack_obs_V!(V_src, src)
 
     for k in 2:length(slds.LDSs)
         dst = slds.LDSs[k]
@@ -2446,12 +2441,56 @@ function _broadcast_tied_params!(
         if :Q in tied && dst.fit_bool[_G_Q]
             copyto!(dst.state_model.Q, src.state_model.Q)
         end
+    end
+
+    _broadcast_tied_obs!(src.obs_model, slds, tied)
+    return nothing
+end
+
+#=
+The emission half, per observation model. A composite runs it once per member,
+on that member's per-regime views and its own suffixed names, so a tie may name
+one emission and leave the others free.
+=#
+function _broadcast_tied_obs!(
+    ::AbstractObservationModel, slds::SLDS{T}, tied::AbstractVector{Symbol}
+) where {T<:Real}
+    _broadcast_tied_obs_group!(slds.LDSs, tied, nothing)
+    return nothing
+end
+
+function _broadcast_tied_obs!(
+    om::CompositeObservationModel, slds::SLDS{T}, tied::AbstractVector{Symbol}
+) where {T<:Real}
+    for key in _obs_keys(om)
+        _broadcast_tied_obs_group!([_obs_view(lds, key) for lds in slds.LDSs], tied, key)
+    end
+    return nothing
+end
+
+function _broadcast_tied_obs_group!(
+    ldss::AbstractVector, tied::AbstractVector{Symbol}, key::Union{Nothing,Symbol}
+)
+    src = ldss[1]
+    T = eltype(src.obs_model.C)
+    D, p = src.latent_dim, src.obs_dim
+    obs_cols = _tied_obs_cols(tied, D, src.uy_dim, key)
+    tie_R = _tied_name(:R, key) in tied
+
+    (isempty(obs_cols) && !tie_R) && return nothing
+
+    V_src = Matrix{T}(undef, p, D + 1 + src.uy_dim)
+    V_dst = similar(V_src)
+    isempty(obs_cols) || _pack_obs_V!(V_src, src)
+
+    for k in 2:length(ldss)
+        dst = ldss[k]
         if !isempty(obs_cols) && dst.fit_bool[_G_CD]
             _pack_obs_V!(V_dst, dst)
             @views V_dst[:, obs_cols] .= V_src[:, obs_cols]
             _unpack_obs_V!(dst, V_dst)
         end
-        if :R in tied && dst.fit_bool[_G_R]
+        if tie_R && length(dst.fit_bool) >= _G_R && dst.fit_bool[_G_R]
             copyto!(dst.obs_model.R, src.obs_model.R)
         end
     end
@@ -2473,18 +2512,17 @@ one-element pool an SLDS has to hand pinned every solve to a single task, which
 is what left the emission M-step serial while the PLDS one ran chunked.
 """
 function _tied_poisson_emission!(
-    slds::SLDS{T},
+    ldss::AbstractVector,
     tfs::TrialFilterSmooth{T},
-    data::Data{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    uy::AbstractVector{<:AbstractMatrix{T}},
     sws::SmoothWorkspace{T},
     weights_of,
     tie_emission::Bool;
     ntasks::Int=1,
 ) where {T<:Real}
     if tie_emission
-        update_observation_model!(
-            slds.LDSs[1], tfs, data.y, [sws], nothing; uy=data.uy, ntasks=ntasks
-        )
+        update_observation_model!(ldss[1], tfs, y, [sws], nothing; uy=uy, ntasks=ntasks)
         return nothing
     end
     #=
@@ -2494,9 +2532,9 @@ function _tied_poisson_emission!(
     this is for, so chunking trials fills the threads and chunking regimes on
     top would only fragment them.
     =#
-    for k in eachindex(slds.LDSs)
+    for k in eachindex(ldss)
         update_observation_model!(
-            slds.LDSs[k], tfs, data.y, [sws], weights_of(k); uy=data.uy, ntasks=ntasks
+            ldss[k], tfs, y, [sws], weights_of(k); uy=uy, ntasks=ntasks
         )
     end
     return nothing
@@ -2552,7 +2590,7 @@ and differ everywhere else.
 """
 function _slds_update_regression!(
     block,
-    slds::SLDS{T},
+    ldss::AbstractVector,
     sufs::AbstractVector,
     tied_cols::AbstractVector{Int},
     noise_slots::AbstractVector{Int},
@@ -2560,11 +2598,11 @@ function _slds_update_regression!(
     bufs::GroupedSufBuffers{T},
     K::Int,
 ) where {T<:Real}
-    lds1 = slds.LDSs[1]
+    lds1 = ldss[1]
 
     if isempty(tied_cols) || length(tied_cols) == _block_width(block, lds1)
         slots = _tie_slots(!isempty(tied_cols), K)
-        _block_grouped_update!(block, slds.LDSs, sufs, slots, noise_slots, sws, bufs)
+        _block_grouped_update!(block, ldss, sufs, slots, noise_slots, sws, bufs)
         return slots
     end
 
@@ -2575,14 +2613,13 @@ function _slds_update_regression!(
     Ws = _partial_tied_regression(
         [st[1] for st in stats],
         [st[2] for st in stats],
-        [_block_noise(block, slds.LDSs[k]) for k in 1:K],
-        [_block_prior(block, slds.LDSs[k]) for k in 1:K],
+        [_block_noise(block, ldss[k]) for k in 1:K],
+        [_block_prior(block, ldss[k]) for k in 1:K],
         tied_cols,
         "tied_params",
     )
     for k in 1:K
-        slds.LDSs[k].fit_bool[_block_group(block)] &&
-            _block_write!(block, slds.LDSs[k], Ws[k])
+        ldss[k].fit_bool[_block_group(block)] && _block_write!(block, ldss[k], Ws[k])
     end
     return slots
 end
@@ -2618,22 +2655,22 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     sws::SmoothWorkspace{T};
     obs_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
     sws_pool::Vector{SmoothWorkspace{T}}=[sws],
     ntasks::Int=1,
     data::Union{Nothing,Data{T}}=nothing,
     sufs::Union{Nothing,AbstractVector}=nothing,
-    bufs::Union{Nothing,GroupedSufBuffers{T}}=nothing,
+    bufs::Union{Nothing,GroupedSufBuffers{T},NamedTuple}=nothing,
     init_scratch::Union{Nothing,LinearDynamicalSystem}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
-    ntrials = length(y)
+    ntrials = _ntrials(y)
 
     # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
     StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
@@ -2697,11 +2734,14 @@ function mstep!(
     lds1 = slds.LDSs[1]
     D = lds1.latent_dim
     dyn_cols = _tied_dyn_cols(tied, D, lds1.ux_dim)
-    obs_cols = _tied_obs_cols(tied, D, lds1.uy_dim)
 
     slots_q = _tie_slots(:Q in tied, K)
-    slots_r = _tie_slots(:R in tied, K)
-    bf = bufs === nothing ? GroupedSufBuffers(T, lds1, dat.tsteps) : bufs
+    #=
+    The state-side updates read the state blocks, which for a composite emission
+    are carried (identically) on every member's statistics.
+    =#
+    sf_state = _state_sufs(sf)
+    bf = bufs === nothing ? _grouped_suf_buffers(lds1, dat.tsteps) : bufs
 
     #=
     `[A b B]` then `Q`, `[C d D]` then `R`: the covariance updates read the
@@ -2710,28 +2750,13 @@ function mstep!(
     them — every regime's stacked matrix differs, in its free columns.
     =#
     slots_ab = _slds_update_regression!(
-        _DynBlock(), slds, sf, dyn_cols, slots_q, sws, bf, K
+        _DynBlock(), slds.LDSs, sf_state, dyn_cols, slots_q, sws, _state_bufs(bf), K
     )
-    _grouped_update_Q!(slds.LDSs, sf, slots_q, slots_ab, sws)
+    _grouped_update_Q!(slds.LDSs, sf_state, slots_q, slots_ab, sws)
 
-    if lds1.obs_model isa GaussianObservationModel{T}
-        slots_cd = _slds_update_regression!(
-            _ObsBlock(), slds, sf, obs_cols, slots_r, sws, bf, K
-        )
-        _grouped_update_R!(slds.LDSs, sf, slots_r, slots_cd, sws)
-    elseif lds1.obs_model isa PoissonObservationModel{T}
-        _tied_poisson_emission!(
-            slds,
-            tfs,
-            dat,
-            sws,
-            weights_of,
-            length(obs_cols) == D + 1 + lds1.uy_dim;
-            ntasks=ntasks,
-        )
-    else
-        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
-    end
+    _slds_obs_mstep!(
+        lds1.obs_model, slds, sf, tfs, dat, tied, sws, bf, K, weights_of; ntasks=ntasks
+    )
 
     _broadcast_tied_params!(slds, tied)
 
@@ -2741,20 +2766,178 @@ function mstep!(
     over modes of the per-mode init stats the aggregator already computed.
     =#
     D = slds.LDSs[1].latent_dim
-    suf = sf[1]
+    suf = sf_state[1]
     init_xy = zeros(T, 1, D)
     init_yy = zeros(T, D, D)
     init_n = zero(T)
     for k in 1:K
-        init_xy .+= sf[k].init_xy
-        init_yy .+= sf[k].init_yy[]
-        init_n += T(sf[k].init_n)
+        init_xy .+= sf_state[k].init_xy
+        init_yy .+= sf_state[k].init_yy[]
+        init_n += T(sf_state[k].init_n)
     end
     copyto!(suf.init_xy, init_xy)
     suf.init_yy[] = init_yy
     suf.init_n = init_n
     _update_shared_initial_state!(slds, suf, sws; scratch=init_scratch)
 
+    return nothing
+end
+
+"""
+    _slds_obs_mstep!(obs_model, slds, sf, tfs, data, tied, sws, bufs, K, weights_of; ntasks)
+
+The emission half of the SLDS M-step, dispatched on the observation model.
+
+A Gaussian emission is the conjugate regression plus the IW update for `R`; a
+Poisson one is the non-conjugate Newton solve. A composite runs whichever of
+those each member calls for, on that member's per-regime views, statistics,
+sub-workspaces and `tied_params` names — so one emission can be tied across
+regimes while another is fitted per regime.
+"""
+function _slds_obs_mstep!(
+    ::GaussianObservationModel,
+    slds::SLDS{T},
+    sf::AbstractVector,
+    ::TrialFilterSmooth{T},
+    ::Data{T},
+    tied::AbstractVector{Symbol},
+    sws::SmoothWorkspace{T},
+    bufs,
+    K::Int,
+    weights_of;
+    ntasks::Int=1,
+) where {T<:Real}
+    _slds_gaussian_obs_mstep!(slds.LDSs, sf, tied, nothing, sws, _state_bufs(bufs), K)
+    return nothing
+end
+
+function _slds_obs_mstep!(
+    ::PoissonObservationModel,
+    slds::SLDS{T},
+    ::AbstractVector,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    tied::AbstractVector{Symbol},
+    sws::SmoothWorkspace{T},
+    ::Any,
+    ::Int,
+    weights_of;
+    ntasks::Int=1,
+) where {T<:Real}
+    lds1 = slds.LDSs[1]
+    obs_cols = _tied_obs_cols(tied, lds1.latent_dim, lds1.uy_dim)
+    _tied_poisson_emission!(
+        slds.LDSs,
+        tfs,
+        data.y,
+        data.uy,
+        sws,
+        weights_of,
+        length(obs_cols) == lds1.latent_dim + 1 + lds1.uy_dim;
+        ntasks=ntasks,
+    )
+    return nothing
+end
+
+function _slds_obs_mstep!(
+    om::CompositeObservationModel,
+    slds::SLDS{T},
+    sf::AbstractVector,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    tied::AbstractVector{Symbol},
+    sws::SmoothWorkspace{T},
+    bufs::NamedTuple,
+    K::Int,
+    weights_of;
+    ntasks::Int=1,
+) where {T<:Real}
+    subs = _obs_workspaces!(sws, slds.LDSs[1])
+    datas = _member_datas(data)
+    for (m, key) in enumerate(_obs_keys(om))
+        views = [_obs_view(lds, key) for lds in slds.LDSs]
+        _slds_member_obs_mstep!(
+            _models(om)[key],
+            views,
+            [s[key] for s in sf],
+            tfs,
+            datas[key],
+            tied,
+            key,
+            subs[m],
+            bufs[key],
+            K,
+            weights_of;
+            ntasks=ntasks,
+        )
+    end
+    return nothing
+end
+
+function _slds_member_obs_mstep!(
+    ::GaussianObservationModel,
+    views::AbstractVector,
+    sufs::AbstractVector,
+    ::TrialFilterSmooth{T},
+    ::Data{T},
+    tied::AbstractVector{Symbol},
+    key::Symbol,
+    sws::SmoothWorkspace{T},
+    bufs::GroupedSufBuffers{T},
+    K::Int,
+    weights_of;
+    ntasks::Int=1,
+) where {T<:Real}
+    _slds_gaussian_obs_mstep!(views, sufs, tied, key, sws, bufs, K)
+    return nothing
+end
+
+function _slds_member_obs_mstep!(
+    ::PoissonObservationModel,
+    views::AbstractVector,
+    ::AbstractVector,
+    tfs::TrialFilterSmooth{T},
+    data_m::Data{T},
+    tied::AbstractVector{Symbol},
+    key::Symbol,
+    sws::SmoothWorkspace{T},
+    ::GroupedSufBuffers{T},
+    ::Int,
+    weights_of;
+    ntasks::Int=1,
+) where {T<:Real}
+    lds1 = views[1]
+    obs_cols = _tied_obs_cols(tied, lds1.latent_dim, lds1.uy_dim, key)
+    _tied_poisson_emission!(
+        views,
+        tfs,
+        data_m.y,
+        data_m.uy,
+        sws,
+        weights_of,
+        length(obs_cols) == lds1.latent_dim + 1 + lds1.uy_dim;
+        ntasks=ntasks,
+    )
+    return nothing
+end
+
+# `[C d D]` then `R`, over one observation model's per-regime views.
+function _slds_gaussian_obs_mstep!(
+    ldss::AbstractVector,
+    sufs::AbstractVector,
+    tied::AbstractVector{Symbol},
+    key::Union{Nothing,Symbol},
+    sws::SmoothWorkspace{T},
+    bufs::GroupedSufBuffers{T},
+    K::Int,
+) where {T<:Real}
+    lds1 = ldss[1]
+    obs_cols = _tied_obs_cols(tied, lds1.latent_dim, lds1.uy_dim, key)
+    slots_r = _tie_slots(_tied_name(:R, key) in tied, K)
+    slots_cd = _slds_update_regression!(
+        _ObsBlock(), ldss, sufs, obs_cols, slots_r, sws, bufs, K
+    )
+    _grouped_update_R!(ldss, sufs, slots_r, slots_cd, sws)
     return nothing
 end
 
@@ -2887,7 +3070,9 @@ the default for the best throughput on whatever machine is running.
 """
 function fit!(
     slds::SLDS{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     max_iter::Int=50,
@@ -2916,10 +3101,10 @@ function fit!(
 
     K = length(slds.LDSs)
     latent_dim = slds.LDSs[1].latent_dim
-    obs_dim = slds.LDSs[1].obs_dim
+    obs_dim = _ws_obs_dim(slds.LDSs[1])
 
     tsteps_per_trial = data.tsteps
-    ntrials = length(y_seq)
+    ntrials = length(tsteps_per_trial)
     seq_ends = cumsum(tsteps_per_trial)
     total_T = last(seq_ends)
     T_max = maximum(tsteps_per_trial)
@@ -3004,9 +3189,7 @@ function fit!(
     stitching the cells differ in channel count, and this is the model the
     grouped M-step sizes its default statistics from.
     =#
-    mstep_bufs = GroupedSufBuffers(
-        T, grp === nothing ? slds.LDSs[1] : cell_slds[1].LDSs[1], tsteps_per_trial
-    )
+    mstep_bufs = _grouped_suf_buffers(slds.LDSs[1], data.tsteps)
     init_scratch = deepcopy(slds.LDSs[1])
     # Per-cell slices of the data and smoother storage, fixed by the partition.
     cell_views = if grp === nothing
@@ -3225,7 +3408,7 @@ function _slds_warmstart!(
     cell_slds::Union{Nothing,AbstractVector},
     grp::Union{Nothing,ParameterGrouping},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan,
@@ -3235,7 +3418,7 @@ function _slds_warmstart!(
     rng_mode::Symbol=:trial,
     noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     function w_of(trial)
@@ -3329,7 +3512,7 @@ function _cell_slds_workspace(
 ) where {T<:Real}
     lds1 = slds_c.LDSs[1]
     latent_dim = lds1.latent_dim
-    obs_dim = lds1.obs_dim
+    obs_dim = _ws_obs_dim(lds1)
     K = length(slds_c.LDSs)
     ws = SLDSSmoothWorkspace{T}(
         base.btd,                                          # shared O(D²·T)
@@ -3338,6 +3521,7 @@ function _cell_slds_workspace(
         base.ll_tmp,                                       # shared, length T_max
         base.H_obs,                                        # shared, latent_dim square
         nothing,                                           # batched Poisson scratch
+        _slds_obs_scratch(T, slds_c),                      # per-member emission scratch
     )
     refresh_slds_constants!(ws, slds_c)
     return ws
@@ -3356,7 +3540,12 @@ function _slds_mstep_pool(slds::SLDS{T}, T_max::Int, ntasks::Int) where {T<:Real
     n = max(1, ntasks)
     return [
         SmoothWorkspace(
-            T, lds1.latent_dim, lds1.obs_dim, T_max; ux_dim=lds1.ux_dim, uy_dim=lds1.uy_dim
+            T,
+            lds1.latent_dim,
+            _ws_obs_dim(lds1),
+            T_max;
+            ux_dim=lds1.ux_dim,
+            uy_dim=_ws_uy_dim(lds1),
         ) for _ in 1:n
     ]
 end
@@ -3436,7 +3625,7 @@ function _estep_grouped!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     x_samples::AbstractVector{<:AbstractMatrix{T}},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
@@ -3447,7 +3636,7 @@ function _estep_grouped!(
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
 ) where {T<:Real}
@@ -3512,12 +3701,12 @@ function _elbo_grouped!(
     grp::ParameterGrouping,
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     per_trial = _slds_trial_elbos(
@@ -3597,7 +3786,7 @@ function _mstep_grouped!(
     sws_pool::Vector{SmoothWorkspace{T}}=[sws],
     cell_sws_pools::Union{Nothing,AbstractVector}=nothing,
     ntasks::Int=1,
-    bufs::Union{Nothing,GroupedSufBuffers{T}}=nothing,
+    bufs::Union{Nothing,GroupedSufBuffers{T},NamedTuple}=nothing,
     cell_views::Union{Nothing,Tuple{<:AbstractVector,<:AbstractVector}}=nothing,
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
@@ -3621,7 +3810,7 @@ function _mstep_grouped!(
     else
         cell_views
     end
-    bf = bufs === nothing ? GroupedSufBuffers(T, lds1, data.tsteps) : bufs
+    bf = bufs === nothing ? _grouped_suf_buffers(lds1, data.tsteps) : bufs
 
     function γ_view(k, trial)
         t1, t2 = HMMs.seq_limits(seq_ends, trial)
@@ -3680,58 +3869,35 @@ function _mstep_grouped!(
     =#
     D = lds1.latent_dim
     tie_dyn = length(_tied_dyn_cols(tied, D, lds1.ux_dim)) == D + 1 + lds1.ux_dim
-    tie_obs = length(_tied_obs_cols(tied, D, lds1.uy_dim)) == D + 1 + lds1.uy_dim
 
     slots_ab = _grouped_unit_slots(grp.cell_slot[_G_AB], K, tie_dyn)
     slots_q = _grouped_unit_slots(grp.cell_slot[_G_Q], K, :Q in tied)
-    slots_cd = _grouped_unit_slots(grp.cell_slot[_G_CD], K, tie_obs)
+    # The emission's slots are per observation model; `_grouped_slds_obs_mstep!`
+    # takes them from `grp.cell_slot` at each model's own ordinals.
+    slots_cd = nothing
 
-    _grouped_update_A_b!(unit_lds, unit_suf, slots_ab, slots_q, sws, bf)
-    _grouped_update_Q!(unit_lds, unit_suf, slots_q, slots_ab, sws)
+    _grouped_update_A_b!(
+        unit_lds, _state_sufs(unit_suf), slots_ab, slots_q, sws, _state_bufs(bf)
+    )
+    _grouped_update_Q!(unit_lds, _state_sufs(unit_suf), slots_q, slots_ab, sws)
 
-    if lds1.obs_model isa GaussianObservationModel{T}
-        #=
-        `R` is a group only on the Gaussian side: `_group_names` gives a Poisson
-        emission `(:C,)` alone, so `cell_slot` is one entry shorter there and
-        `_G_R` indexes past its end. Read inside the branch that uses it.
-        =#
-        slots_r = _grouped_unit_slots(grp.cell_slot[_G_R], K, :R in tied)
-        _grouped_update_C_d!(
-            unit_lds, unit_suf, slots_cd, slots_r, sws, bf; unit_sws=unit_sws
-        )
-        _grouped_update_R!(unit_lds, unit_suf, slots_r, slots_cd, sws; unit_sws=unit_sws)
-    elseif lds1.obs_model isa PoissonObservationModel{T}
-        #=
-        Non-conjugate: one LBFGS solve per `[C d D]` version, over the trials of
-        every (regime, cell) unit sharing it. A version tied across regimes sees
-        each of its trials once per regime, and `Σₖ γₖ(t) = 1`, so its weights
-        collapse to the unit weights `nothing`.
-        =#
-        for units in _units_by_slot(slots_cd)
-            trials = Int[]
-            weights = Vector{SubArray{T,1}}()
-            for u in units
-                k, c = fldmod1(u, ncells)
-                for n in grp.cell_trials[c]
-                    push!(trials, n)
-                    push!(weights, γ_view(k, n))
-                end
-            end
-            order = sortperm(trials)
-            unit_weights = _spans_all_regimes(units, ncells, K) ? nothing : weights[order]
-            update_observation_model!(
-                unit_lds[units[1]],
-                TrialFilterSmooth([tfs[n] for n in trials[order]]),
-                data.y[trials[order]],
-                [_unit_ws(unit_sws, sws, units[1])],
-                unit_weights;
-                uy=data.uy[trials[order]],
-                ntasks=ntasks,
-            )
-        end
-    else
-        throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
-    end
+    _grouped_slds_obs_mstep!(
+        lds1.obs_model,
+        unit_lds,
+        unit_suf,
+        grp,
+        K,
+        ncells,
+        tied,
+        sws,
+        bf,
+        unit_sws,
+        data,
+        tfs,
+        γ_view,
+        slots_cd,
+        ntasks,
+    )
 
     #=
     Cells sharing a version share its arrays, so copying per cell is idempotent;
@@ -3749,9 +3915,9 @@ function _mstep_grouped!(
     =#
     slots_x0 = repeat(grp.cell_slot[_G_X0], K)
     slots_P0 = repeat(grp.cell_slot[_G_P0], K)
-    _grouped_update_x0!(unit_lds, unit_suf, slots_x0, bf)
+    _grouped_update_x0!(unit_lds, _state_sufs(unit_suf), slots_x0, _state_bufs(bf))
     _broadcast_initial_state!(cell_slds, K, lds1.fit_bool[_G_X0], false)
-    _grouped_update_P0!(unit_lds, unit_suf, slots_P0, slots_x0, sws)
+    _grouped_update_P0!(unit_lds, _state_sufs(unit_suf), slots_P0, slots_x0, sws)
     _broadcast_initial_state!(cell_slds, K, false, lds1.fit_bool[_G_P0])
 
     return nothing
@@ -3784,4 +3950,180 @@ responsibilities to unit weights.
 function _spans_all_regimes(units::AbstractVector{Int}, ncells::Int, K::Int)
     cells = unique(mod1.(units, ncells))
     return length(units) == K * length(cells)
+end
+
+"""
+    _grouped_slds_obs_mstep!(obs_model, unit_lds, unit_suf, grp, K, ncells, tied, sws,
+                             bufs, unit_sws, data, tfs, γ_view, slots_cd, ntasks)
+
+The emission half of the grouped SLDS M-step, over the flat list of
+`(regime, cell)` units.
+
+Gaussian: the conjugate regression and IW update for `R`. Poisson: one
+non-conjugate solve per `[C d D]` version, over the trials of every unit sharing
+it — a version tied across regimes sees each of its trials once per regime and
+`Σₖ γₖ(t) = 1`, so its weights collapse to the unit weights. A composite runs
+whichever each member calls for, on that member's views, statistics,
+sub-workspaces and slot vectors.
+"""
+function _grouped_slds_obs_mstep!(
+    om::AbstractObservationModel,
+    unit_lds::AbstractVector,
+    unit_suf::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    ncells::Int,
+    tied::AbstractVector{Symbol},
+    sws::SmoothWorkspace{T},
+    bufs,
+    unit_sws,
+    data::Data{T},
+    tfs::TrialFilterSmooth{T},
+    γ_view,
+    ::Any,
+    ntasks::Int,
+) where {T<:Real}
+    ord = _obs_slot_ordinals(om)[1]
+    _grouped_slds_member_obs_mstep!(
+        om,
+        unit_lds,
+        unit_suf,
+        grp,
+        K,
+        ncells,
+        tied,
+        nothing,
+        ord,
+        sws,
+        _state_bufs(bufs),
+        unit_sws,
+        data.y,
+        data.uy,
+        tfs,
+        γ_view,
+        ntasks,
+    )
+    return nothing
+end
+
+function _grouped_slds_obs_mstep!(
+    om::CompositeObservationModel,
+    unit_lds::AbstractVector,
+    unit_suf::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    ncells::Int,
+    tied::AbstractVector{Symbol},
+    sws::SmoothWorkspace{T},
+    bufs::NamedTuple,
+    unit_sws,
+    data::Data{T},
+    tfs::TrialFilterSmooth{T},
+    γ_view,
+    ::Any,
+    ntasks::Int,
+) where {T<:Real}
+    ords = _obs_slot_ordinals(om)
+    for (m, key) in enumerate(_obs_keys(om))
+        member_sws =
+            unit_sws === nothing ? nothing : _member_unit_sws(unit_sws, unit_lds, m)
+        _grouped_slds_member_obs_mstep!(
+            _models(om)[key],
+            _member_unit_views(unit_lds, key),
+            [s[key] for s in unit_suf],
+            grp,
+            K,
+            ncells,
+            tied,
+            key,
+            ords[m],
+            member_sws === nothing ? _obs_workspaces!(sws, unit_lds[1])[m] : member_sws[1],
+            bufs[key],
+            member_sws,
+            data.y[key],
+            data.uy[key],
+            tfs,
+            γ_view,
+            ntasks,
+        )
+    end
+    return nothing
+end
+
+function _grouped_slds_member_obs_mstep!(
+    ::GaussianObservationModel,
+    ldss::AbstractVector,
+    sufs::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    ::Int,
+    tied::AbstractVector{Symbol},
+    key::Union{Nothing,Symbol},
+    ord::UnitRange{Int},
+    sws::SmoothWorkspace{T},
+    bufs::GroupedSufBuffers{T},
+    unit_sws,
+    ::AbstractVector,
+    ::AbstractVector,
+    ::TrialFilterSmooth{T},
+    ::Any,
+    ::Int,
+) where {T<:Real}
+    lds1 = ldss[1]
+    D = lds1.latent_dim
+    tie_obs = length(_tied_obs_cols(tied, D, lds1.uy_dim, key)) == D + 1 + lds1.uy_dim
+    slots_cd = _grouped_unit_slots(grp.cell_slot[ord[1]], K, tie_obs)
+    slots_r = _grouped_unit_slots(grp.cell_slot[ord[2]], K, _tied_name(:R, key) in tied)
+    _grouped_update_C_d!(ldss, sufs, slots_cd, slots_r, sws, bufs; unit_sws=unit_sws)
+    _grouped_update_R!(ldss, sufs, slots_r, slots_cd, sws; unit_sws=unit_sws)
+    return nothing
+end
+
+function _grouped_slds_member_obs_mstep!(
+    ::PoissonObservationModel,
+    ldss::AbstractVector,
+    ::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    ncells::Int,
+    tied::AbstractVector{Symbol},
+    key::Union{Nothing,Symbol},
+    ord::UnitRange{Int},
+    sws::SmoothWorkspace{T},
+    ::GroupedSufBuffers{T},
+    unit_sws,
+    y::AbstractVector{<:AbstractMatrix{T}},
+    uy::AbstractVector{<:AbstractMatrix{T}},
+    tfs::TrialFilterSmooth{T},
+    γ_view,
+    ntasks::Int,
+) where {T<:Real}
+    lds1 = ldss[1]
+    D = lds1.latent_dim
+    tie_obs = length(_tied_obs_cols(tied, D, lds1.uy_dim, key)) == D + 1 + lds1.uy_dim
+    slots_cd = _grouped_unit_slots(grp.cell_slot[ord[1]], K, tie_obs)
+
+    for units in _units_by_slot(slots_cd)
+        trials = Int[]
+        weights = Vector{SubArray{T,1}}()
+        for u in units
+            k, c = fldmod1(u, ncells)
+            for n in grp.cell_trials[c]
+                push!(trials, n)
+                push!(weights, γ_view(k, n))
+            end
+        end
+        order = sortperm(trials)
+        unit_weights = _spans_all_regimes(units, ncells, K) ? nothing : weights[order]
+        update_observation_model!(
+            ldss[units[1]],
+            TrialFilterSmooth([tfs[n] for n in trials[order]]),
+            y[trials[order]],
+            [_unit_ws(unit_sws, sws, units[1])],
+            unit_weights;
+            uy=uy[trials[order]],
+            ntasks=ntasks,
+        )
+    end
+    return nothing
 end

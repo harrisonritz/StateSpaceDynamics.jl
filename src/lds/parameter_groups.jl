@@ -315,13 +315,27 @@ function _tied_dyn_cols(tied::AbstractVector{Symbol}, D::Int, ux_dim::Int)
     return sort!(cols)
 end
 
-function _tied_obs_cols(tied::AbstractVector{Symbol}, D::Int, uy_dim::Int)
+function _tied_obs_cols(
+    tied::AbstractVector{Symbol}, D::Int, uy_dim::Int, key::Union{Nothing,Symbol}=nothing
+)
+    # A composite's members are named with the member as a suffix, so `key`
+    # selects which member's `:C`/`:d`/`:D` these columns are about.
+    named(p::Symbol) = key === nothing ? p : _suffixed(p, key)
     cols = Int[]
-    :C in tied && append!(cols, 1:D)
-    :d in tied && push!(cols, D + 1)
-    (:D in tied && uy_dim > 0) && append!(cols, (D + 2):(D + 1 + uy_dim))
+    named(:C) in tied && append!(cols, 1:D)
+    named(:d) in tied && push!(cols, D + 1)
+    (named(:D) in tied && uy_dim > 0) && append!(cols, (D + 2):(D + 1 + uy_dim))
     return sort!(cols)
 end
+
+"""
+    _tied_name(param, key) -> Symbol
+
+How one observation parameter is spelled in `tied_params`: bare for a single
+emission, member-suffixed for a composite.
+"""
+_tied_name(param::Symbol, ::Nothing) = param
+_tied_name(param::Symbol, key::Symbol) = _suffixed(param, key)
 
 """
     ParameterDependence

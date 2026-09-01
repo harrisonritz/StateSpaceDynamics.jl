@@ -104,15 +104,16 @@ the penalty the emission M-step objective carries, which is what keeps the
 reported ELBO monotone under the prior. The `Λ`-only and `logdet Λ` constants are
 absorbed into the ELBO's additive constant, as they are on the Gaussian side.
 
-`sws.reg.CD` is used as scratch for the stacked `[C d D]`.
+`sws` supplies the scratch for the stacked `[C d D]`; pass `nothing` to allocate
+it.
 """
 function _obs_prior_logdensity(
-    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     prior = lds.obs_model.CD_prior
     prior === nothing && return zero(T)
 
-    W_cd = view(sws.reg.CD, :, 1:(lds.latent_dim + 1 + lds.uy_dim))
+    W_cd = _obs_pack_scratch(lds, sws)
     _pack_obs_V!(W_cd, lds)
     Wm = W_cd .- prior.M₀
     return -T(0.5) * sum(Wm .* (Wm * prior.Λ))

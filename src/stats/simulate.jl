@@ -144,33 +144,27 @@ composite sampler uses this; the single-model samplers keep their interleaved
 recursion.
 """
 function _sample_obs!(
-    rng, y, obs_params, ::GaussianObservationModel, x::AbstractMatrix, uy::AbstractMatrix
+    rng, y, obs_params, om::AbstractObservationModel, x::AbstractMatrix, uy::AbstractMatrix
 )
-    for t in axes(x, 2)
-        y[:, t] = rand(
-            rng,
-            MvNormal(
-                obs_params.C * x[:, t] + obs_params.d + obs_params.D * uy[:, t],
-                obs_params.R,
-            ),
-        )
+    @views for t in axes(x, 2)
+        y[:, t] = _draw_obs(rng, om, obs_params, x[:, t], uy[:, t])
     end
     return nothing
 end
 
-function _sample_obs!(
-    rng, y, obs_params, ::PoissonObservationModel, x::AbstractMatrix, uy::AbstractMatrix
-)
-    for t in axes(x, 2)
-        y[:, t] =
-            rand.(
-                rng,
-                Poisson.(
-                    exp.(obs_params.C * x[:, t] + obs_params.d + obs_params.D * uy[:, t],),
-                ),
-            )
-    end
-    return nothing
+"""
+    _draw_obs(rng, obs_model, params, x_t, uy_t)
+
+One observation drawn from an emission at a given latent state. Split out so the
+composite samplers — which walk members, and for an SLDS also regimes — do not
+each need their own copy of the two distributions.
+"""
+function _draw_obs(rng, ::GaussianObservationModel, p, x_t, uy_t)
+    return rand(rng, MvNormal(p.C * x_t + p.d + p.D * uy_t, p.R))
+end
+
+function _draw_obs(rng, ::PoissonObservationModel, p, x_t, uy_t)
+    return rand.(rng, Poisson.(exp.(p.C * x_t + p.d + p.D * uy_t)))
 end
 
 """

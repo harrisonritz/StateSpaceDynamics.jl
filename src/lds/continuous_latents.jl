@@ -604,10 +604,12 @@ the IW posterior-scale modification together maximize the MAP objective, so an
 ELBO that dropped the MN quadratic piece could appear non-monotone across EM
 iterations even though nothing was wrong.
 
-`sws.reg.AB` is used as scratch for the stacked `[A b B]`.
+`sws` supplies the scratch for the stacked `[A b B]`; pass `nothing` to allocate
+it, which is what callers with no workspace in hand (the SLDS's per-regime prior
+sum) do.
 """
 function _state_prior_logdensity(
-    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     total = zero(T)
@@ -618,12 +620,36 @@ function _state_prior_logdensity(
         total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
     end
     if sm.AB_prior !== nothing
-        W_ab = view(sws.reg.AB, :, 1:(lds.latent_dim + 1 + lds.ux_dim))
+        W_ab = _dyn_pack_scratch(lds, sws)
         _pack_dyn_W!(W_ab, lds)
         total += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
     end
 
     return total
+end
+
+"""
+    _dyn_pack_scratch(lds, sws)
+    _obs_pack_scratch(lds, sws)
+
+A `(latent_dim × dyn_reg_dim)` / `(obs_dim × obs_reg_dim)` matrix to pack a
+stacked regression into: a view of the workspace's regression buffer, or a fresh
+allocation when there is no workspace.
+"""
+function _dyn_pack_scratch(lds::LinearDynamicalSystem{T}, sws::SmoothWorkspace{T}) where {T}
+    return view(sws.reg.AB, :, 1:(lds.latent_dim + 1 + lds.ux_dim))
+end
+
+function _dyn_pack_scratch(lds::LinearDynamicalSystem{T}, ::Nothing) where {T}
+    return Matrix{T}(undef, lds.latent_dim, lds.latent_dim + 1 + lds.ux_dim)
+end
+
+function _obs_pack_scratch(lds::LinearDynamicalSystem{T}, sws::SmoothWorkspace{T}) where {T}
+    return view(sws.reg.CD, :, 1:(lds.latent_dim + 1 + lds.uy_dim))
+end
+
+function _obs_pack_scratch(lds::LinearDynamicalSystem{T}, ::Nothing) where {T}
+    return Matrix{T}(undef, lds.obs_dim, lds.latent_dim + 1 + lds.uy_dim)
 end
 
 function update_initial_state_mean!(

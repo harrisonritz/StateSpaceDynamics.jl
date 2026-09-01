@@ -780,6 +780,30 @@ function _copy_smooth_constants!(
 end
 
 """
+    ObsScratch{T}
+
+One observation model's cached constants and emission-sized scratch, for a
+regime of an SLDS whose emission is a [`CompositeObservationModel`](@ref).
+
+The single-LDS path gets the same thing from a per-member sub-`SmoothWorkspace`;
+an SLDS cannot, because a sub-workspace carries block-tridiagonal storage and
+there would be one per regime *and* member. Only the emission half is ever
+needed — the state constants are the regime's, on `SLDSSmoothWorkspace.consts[k]`
+— so this holds exactly that.
+"""
+struct ObsScratch{T<:Real}
+    consts::SmoothConstants{T}
+    buf1::Vector{T}
+    buf2::Vector{T}
+end
+
+function ObsScratch(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
+    return ObsScratch{T}(
+        SmoothConstants(T, latent_dim, obs_dim), zeros(T, obs_dim), zeros(T, obs_dim)
+    )
+end
+
+"""
     SLDSSmoothWorkspace{T}
 
 Workspace for SLDS smoothing that matches the LDS backend shape:
@@ -795,7 +819,11 @@ Workspace for SLDS smoothing that matches the LDS backend shape:
   needs to isolate — it scatters straight into `btd.H_diag`
 - `poisson`: batched Poisson scratch, allocated on first use exactly as
   `SmoothWorkspace`'s is. One buffer serves every regime — the emission
-  curvature is formed and scattered one regime at a time.
+  curvature is formed and scattered one regime at a time, and each kernel takes
+  leading views, so one buffer grown to the widest emission also serves every
+  member of a composite.
+- `obs`: per-regime, per-member [`ObsScratch`](@ref) for a composite emission,
+  or `nothing` for a single one.
 """
 mutable struct SLDSSmoothWorkspace{T<:Real}
     const btd::BlockTridiagonalWorkspace{T}
@@ -804,11 +832,35 @@ mutable struct SLDSSmoothWorkspace{T<:Real}
     const ll_tmp::Vector{T}   # per-component scratch (length tsteps)
     const H_obs::Matrix{T}    # one regime's emission curvature at one t
     poisson::Union{Nothing,PoissonBatchBuffers{T}}
+    const obs::Union{Nothing,Vector{Vector{ObsScratch{T}}}}  # [regime][member]
+end
+
+"""
+    _slds_obs_scratch(::Type{T}, slds) -> Vector{Vector{ObsScratch{T}}} or nothing
+
+Per-regime, per-member emission scratch for an SLDS with a composite emission;
+`nothing` when every regime has a single observation model.
+"""
+_slds_obs_scratch(::Type{T}, ::SLDS) where {T<:Real} = nothing
+
+function _slds_obs_scratch(
+    ::Type{T}, slds::SLDS{T0,S,O}
+) where {T<:Real,T0<:Real,S<:AbstractStateModel,O<:CompositeObservationModel}
+    latent_dim = slds.LDSs[1].latent_dim
+    return [
+        [ObsScratch(T, latent_dim, _obs_dim(m)) for m in values(_models(lds.obs_model))] for
+        lds in slds.LDSs
+    ]
 end
 
 function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
-    obs_dim = slds.LDSs[1].obs_dim
+    #=
+    A composite emission keeps everything `obs_dim`-shaped on the per-member
+    scratch below, so the regime-level buffers are built at width zero — the
+    same split the single-LDS workspace makes.
+    =#
+    obs_dim = _ws_obs_dim(slds.LDSs[1])
     K = length(slds.LDSs)
 
     ws = SLDSSmoothWorkspace{T}(
@@ -818,6 +870,7 @@ function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
         zeros(T, tsteps),                # ll_tmp
         zeros(T, latent_dim, latent_dim), # H_obs
         nothing,                         # batched Poisson scratch, on first use
+        _slds_obs_scratch(T, slds),      # per-regime, per-member emission scratch
     )
 
     # Cache constants once
@@ -832,11 +885,30 @@ Must be called before the next E-step so that Cholesky factors, Hessian template
 reflect the current Q, R, A, P0.
 """
 function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
+    obs = ws.obs
     for k in eachindex(slds.LDSs)
-        compute_smooth_constants!(ws.consts[k], slds.LDSs[k])
+        if obs === nothing
+            compute_smooth_constants!(ws.consts[k], slds.LDSs[k])
+        else
+            lds_k = slds.LDSs[k]
+            _compute_composite_constants!(
+                ws.consts[k],
+                [sc.consts for sc in obs[k]],
+                lds_k.state_model,
+                lds_k.obs_model,
+            )
+        end
     end
     return nothing
 end
+
+"""
+    _regime_obs(ws, k)
+
+Regime `k`'s per-member emission scratch, or `nothing` for a single emission.
+"""
+@inline _regime_obs(ws::SLDSSmoothWorkspace, k::Int) =
+    ws.obs === nothing ? nothing : ws.obs[k]
 
 """
     poisson_batch!(sws, latent_dim, obs_dim, tsteps) -> PoissonBatchBuffers

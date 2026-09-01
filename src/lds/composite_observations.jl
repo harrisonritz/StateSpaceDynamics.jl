@@ -157,23 +157,43 @@ function compute_smooth_constants!(
     ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = _obs_workspaces!(ws, lds)
-    cc = ws.consts
+    _compute_composite_constants!(
+        ws.consts, [sub.consts for sub in subs], lds.state_model, lds.obs_model
+    )
+    return nothing
+end
 
-    _compute_state_constants!(cc, lds.state_model)
+"""
+    _compute_composite_constants!(cc, member_ccs, state_model, obs_model)
+
+Cache a composite emission's constants: the state half on `cc`, each member's
+emission half on its own `member_ccs[i]`, and the two aggregate slots the shared
+Hessian assembly reads.
+
+Shared by the single-LDS workspace (whose members live on sub-workspaces) and by
+an SLDS's per-regime refresh (whose members live on [`ObsScratch`](@ref)).
+"""
+function _compute_composite_constants!(
+    cc::SmoothConstants{WT},
+    member_ccs::AbstractVector{SmoothConstants{WT}},
+    sm::GaussianStateModel{T},
+    om::CompositeObservationModel{T},
+) where {WT<:Real,T<:Real}
+    _compute_state_constants!(cc, sm)
 
     #=
     No aggregate `C'R⁻¹` exists — the gradient needs each member's own residual —
-    so the parent's slot is cleared and the per-member ones live on the subs.
+    so the parent's slot is cleared and the per-member ones stay per member.
     =#
     fill!(cc.C_inv_R, zero(WT))
     fill!(cc.yt_given_xt, zero(WT))
     cR = zero(WT)
 
-    for (i, om) in enumerate(values(_models(lds.obs_model)))
-        sub_cc = subs[i].consts
-        _compute_obs_constants!(sub_cc, om)
-        cc.yt_given_xt .+= sub_cc.yt_given_xt
-        cR += sub_cc.cR
+    for (i, m) in enumerate(values(_models(om)))
+        member_cc = member_ccs[i]
+        _compute_obs_constants!(member_cc, m)
+        cc.yt_given_xt .+= member_cc.yt_given_xt
+        cR += member_cc.cR
     end
     cc.cR = cR
 
@@ -488,6 +508,12 @@ end
 # time. Iterating members outside the timestep loop means the one dynamic
 # dispatch per member per call is paid once rather than once per timestep, and
 # everything behind the `_accumulate_member_*!` barrier is concretely typed.
+#
+# The accumulators take their scratch as explicit pieces rather than a
+# workspace, and an optional per-timestep weight. That is what lets the single
+# LDS (unweighted, scratch from a sub-`SmoothWorkspace`) and the SLDS (weighted
+# by a regime's responsibilities `γₖ(t)`, scratch from an `ObsScratch`) share one
+# implementation.
 # ============================================================================
 
 # One member's slice of a per-trial observation / input bundle. `nothing`
@@ -495,6 +521,9 @@ end
 # everywhere else.
 @inline _member_at(::Nothing, ::Int) = nothing
 @inline _member_at(bundle::NamedTuple, i::Int) = bundle[i]
+
+@inline _weight_at(::Nothing, ::Int, ::Type{T}) where {T} = one(T)
+@inline _weight_at(w::AbstractVector, t::Int, ::Type{T}) where {T} = @inbounds T(w[t])
 
 """
     joint_loglikelihood!(ll, ws, cc, lds, x, y::NamedTuple[, ux, uy, lognorms])
@@ -527,29 +556,55 @@ function joint_loglikelihood!(
 
     subs = _obs_workspaces!(ws, lds)
     for (i, om) in enumerate(values(_models(lds.obs_model)))
+        sub = subs[i]
         _accumulate_member_loglikelihood!(
-            ll, subs[i], om, x, y[i], _member_at(uy, i), tsteps, _member_at(lognorms, i)
+            ll,
+            sub,
+            sub.consts,
+            sub.opt.temp_dy,
+            sub.opt.temp_solve_R,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            _member_at(lognorms, i),
+            nothing,
         )
     end
 
     return ll
 end
 
+"""
+    _accumulate_member_loglikelihood!(ll, pb_ws, cc, b1, b2, om, x, y, uy, tsteps,
+                                      lognorm, weights)
+
+Add one observation model's per-timestep emission log-density to `ll`, scaled by
+`weights[t]` when given.
+
+`pb_ws` owns the batched Poisson scratch (see [`poisson_batch!`](@ref)); `cc`,
+`b1` and `b2` are that member's cached constants and two `obs_dim` scratch
+vectors.
+"""
 function _accumulate_member_loglikelihood!(
     ll::AbstractVector{T},
-    sub::SmoothWorkspace{T},
+    ::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    cc::SmoothConstants{T},
+    b1::AbstractVector{T},
+    b2::AbstractVector{T},
     om::AbstractObservationModel,
     x::AbstractMatrix{T},
     y_m::AbstractMatrix,
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
     ::Union{Nothing,AbstractVector},
+    weights::Union{Nothing,AbstractVector},
 ) where {T<:Real}
-    cc = sub.consts
-    b1 = sub.opt.temp_dy
-    b2 = sub.opt.temp_solve_R
     @inbounds for t in 1:tsteps
-        ll[t] += observation_loglikelihood!(cc, b1, b2, om, x, y_m, t, uy_m)
+        ll[t] +=
+            _weight_at(weights, t, T) *
+            observation_loglikelihood!(cc, b1, b2, om, x, y_m, t, uy_m)
     end
     return ll
 end
@@ -563,21 +618,25 @@ re-summed over every neuron and bin at every objective evaluation, which is what
 =#
 function _accumulate_member_loglikelihood!(
     ll::AbstractVector{T},
-    sub::SmoothWorkspace{T},
+    pb_ws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    ::SmoothConstants{T},
+    ::AbstractVector{T},
+    ::AbstractVector{T},
     om::PoissonObservationModel{T},
     x::AbstractMatrix{T},
     y_m::AbstractMatrix{T},
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
     lognorm::Union{Nothing,AbstractVector},
+    weights::Union{Nothing,AbstractVector},
 ) where {T<:Real}
     obs_dim, latent_dim = size(om.C)
-    pb = poisson_batch!(sub, latent_dim, obs_dim, tsteps)
+    pb = poisson_batch!(pb_ws, latent_dim, obs_dim, tsteps)
     Eta = _poisson_linear_predictor!(pb, om.C, om.d, om.D, x, uy_m, tsteps)
     @inbounds @views for t in 1:tsteps
         η = Eta[:, t]
         norm_t = lognorm === nothing ? _poisson_lognorm_at(y_m, t) : lognorm[t]
-        ll[t] += dot(y_m[:, t], η) - sum(exp, η) - norm_t
+        ll[t] += _weight_at(weights, t, T) * (dot(y_m[:, t], η) - sum(exp, η) - norm_t)
     end
     return ll
 end
@@ -604,7 +663,20 @@ function gradient!(
 
     subs = _obs_workspaces!(ws, lds)
     for (i, om) in enumerate(values(_models(lds.obs_model)))
-        _accumulate_member_gradient!(grad, subs[i], om, x, y[i], _member_at(uy, i), tsteps)
+        sub = subs[i]
+        _accumulate_member_gradient!(
+            grad,
+            sub,
+            sub.consts,
+            sub.opt.dyt,
+            sub.opt.tmp1,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            nothing,
+        )
     end
 
     return grad
@@ -622,22 +694,69 @@ function gradient!(
     return gradient!(grad, ws, lds, x, y, ux, uy)
 end
 
+"""
+    _accumulate_member_gradient!(grad, pb_ws, cc, obs_buf, tmp, om, x, y, uy,
+                                 tsteps, weights)
+
+Add one observation model's `∂ log p(yₜ|xₜ)/∂xₜ` to `grad` for a whole trial,
+scaled by `weights[t]` when given.
+"""
 function _accumulate_member_gradient!(
     grad::AbstractMatrix{T},
-    sub::SmoothWorkspace{T},
+    ::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    cc::SmoothConstants{T},
+    obs_buf::AbstractVector{T},
+    tmp::AbstractVector{T},
     om::AbstractObservationModel,
     x::AbstractMatrix{T},
     y_m::AbstractMatrix,
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
+    weights::Union{Nothing,AbstractVector},
 ) where {T<:Real}
-    cc = sub.consts
-    obs_buf = sub.opt.dyt
-    tmp1 = sub.opt.tmp1
-    @views for t in 1:tsteps
-        observation_gradient!(tmp1, cc, obs_buf, om, x, y_m, t, uy_m)
-        grad[:, t] .+= tmp1
+    @inbounds for t in 1:tsteps
+        observation_gradient!(tmp, cc, obs_buf, om, x, y_m, t, uy_m)
+        α = _weight_at(weights, t, T)
+        @simd for i in eachindex(tmp)
+            grad[i, t] += α * tmp[i]
+        end
     end
+    return grad
+end
+
+#=
+`Cₘ'(yₜ − λₜ)` for the whole trial as two `gemm`s rather than a `tsteps`-long
+loop of BLAS-2 calls, with the weights folded into the residual before the
+second — which is where a spike-train fit spends most of its emission time.
+=#
+function _accumulate_member_gradient!(
+    grad::AbstractMatrix{T},
+    pb_ws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    ::SmoothConstants{T},
+    ::AbstractVector{T},
+    ::AbstractVector{T},
+    om::PoissonObservationModel{T},
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix{T},
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    weights::Union{Nothing,AbstractVector},
+) where {T<:Real}
+    obs_dim, latent_dim = size(om.C)
+    pb = poisson_batch!(pb_ws, latent_dim, obs_dim, tsteps)
+    Eta = _poisson_linear_predictor!(pb, om.C, om.d, om.D, x, uy_m, tsteps)
+
+    # Overwrite η in place with the (weighted) residual w(t)·(yₜ − exp(ηₜ)).
+    @inbounds for t in 1:tsteps
+        wt = _weight_at(weights, t, T)
+        col = view(Eta, :, t)
+        yt = view(y_m, :, t)
+        @simd for i in 1:obs_dim
+            col[i] = wt * (yt[i] - exp(col[i]))
+        end
+    end
+
+    mul!(view(grad, :, 1:tsteps), transpose(om.C), Eta, one(T), one(T))
     return grad
 end
 
@@ -680,50 +799,73 @@ function hessian!(
 
     subs = _obs_workspaces!(sws, lds)
     for (i, om) in enumerate(values(_models(lds.obs_model)))
+        sub = subs[i]
         _accumulate_member_hessian!(
-            sws.btd, subs[i], om, x, y[i], _member_at(uy, i), tsteps
+            sws.btd,
+            sub,
+            sub.consts,
+            sub.elbo.rho_obs,
+            sub.elbo.h_obs,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            nothing,
         )
     end
 
     return nothing
 end
 
+"""
+    _accumulate_member_hessian!(btd, pb_ws, cc, b1, b2, om, x, y, uy, tsteps, weights)
+
+Add one observation model's emission curvature to the diagonal Hessian blocks,
+scaled by `weights[t]` when given.
+"""
 function _accumulate_member_hessian!(
     btd::BlockTridiagonalWorkspace{T},
-    sub::SmoothWorkspace{T},
+    ::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    cc::SmoothConstants{T},
+    b1::AbstractVector{T},
+    b2::AbstractVector{T},
     om::AbstractObservationModel,
     x::AbstractMatrix{T},
     y_m::AbstractMatrix,
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
+    weights::Union{Nothing,AbstractVector},
 ) where {T<:Real}
-    cc = sub.consts
-    b1 = sub.elbo.rho_obs
-    b2 = sub.elbo.h_obs
     for t in 1:tsteps
-        observation_hessian!(btd.H_diag[t], cc, b1, b2, om, x, y_m, t, one(T), uy_m)
+        observation_hessian!(
+            btd.H_diag[t], cc, b1, b2, om, x, y_m, t, _weight_at(weights, t, T), uy_m
+        )
     end
     return nothing
 end
 
 #=
 A Poisson member routes to the batched emission curvature — the same `gemm`
-whole-trial form the single-model Poisson `hessian!` uses, which is where a
-spike-train fit spends most of its time. Accumulates into the diagonal blocks,
-so members compose.
+whole-trial form the single-model Poisson `hessian!` uses. Accumulates into the
+diagonal blocks, so members (and, for an SLDS, regimes) compose.
 =#
 function _accumulate_member_hessian!(
     btd::BlockTridiagonalWorkspace{T},
-    sub::SmoothWorkspace{T},
+    pb_ws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    ::SmoothConstants{T},
+    ::AbstractVector{T},
+    ::AbstractVector{T},
     om::PoissonObservationModel{T},
     x::AbstractMatrix{T},
     y_m::AbstractMatrix,
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
+    weights::Union{Nothing,AbstractVector},
 ) where {T<:Real}
     obs_dim, latent_dim = size(om.C)
-    pb = poisson_batch!(sub, latent_dim, obs_dim, tsteps)
-    _poisson_emission_hessian!(btd, pb, om, x, uy_m, tsteps, nothing)
+    pb = poisson_batch!(pb_ws, latent_dim, obs_dim, tsteps)
+    _poisson_emission_hessian!(btd, pb, om, x, uy_m, tsteps, weights)
     return nothing
 end
 
@@ -824,7 +966,8 @@ end
 # Recomputing them per member costs an O(N·T·D²) pass that the emission pass
 # (O(N·T·pₘ·D), with pₘ the channel count) dominates. Paying that buys back the
 # whole aggregator unchanged, cov-cache fast path and all, rather than a second
-# split-out copy of one of the subtlest functions in the package.
+# split-out copy of one of the subtlest functions in the package. The same
+# applies to the γ-weighted aggregator an SLDS uses.
 # ============================================================================
 
 """
@@ -871,6 +1014,25 @@ function _aggregate_td_suff_stats!(
     return suf
 end
 
+function _aggregate_td_suff_stats_weighted!(
+    suf::NamedTuple,
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    weights::AbstractVector{<:AbstractVector{T}},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        _aggregate_td_suff_stats_weighted!(
+            suf[key], tfs, views[key], datas[key], weights, subs[i]
+        )
+    end
+    return suf
+end
+
 # ============================================================================
 # E-step Q-term, M-step and ELBO
 # ============================================================================
@@ -905,13 +1067,13 @@ end
 each evaluated against that member's parameters and sub-workspace scratch.
 """
 function _obs_prior_logdensity(
-    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
-    subs = _obs_workspaces!(sws, lds)
+    subs = sws === nothing ? nothing : _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     total = zero(T)
     for (i, key) in enumerate(_obs_keys(lds.obs_model))
-        total += _obs_prior_logdensity(views[key], subs[i])
+        total += _obs_prior_logdensity(views[key], subs === nothing ? nothing : subs[i])
     end
     return total
 end
@@ -1215,9 +1377,11 @@ function _emission_lognorm(
     lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple
 ) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     models = _models(lds.obs_model)
-    return NamedTuple{keys(models)}(
-        map(key -> _member_lognorm(models[key], y[key]), keys(models))
-    )
+    norms = map(key -> _member_lognorm(models[key], y[key]), keys(models))
+    # Nothing to hoist when no member has a normalizer (every member Gaussian);
+    # `nothing` then travels the same way a single Gaussian emission's does.
+    all(isnothing, norms) && return nothing
+    return NamedTuple{keys(models)}(norms)
 end
 
 _member_lognorm(::AbstractObservationModel, ::AbstractMatrix) = nothing
@@ -1387,6 +1551,233 @@ function mstep!(
     pools = _member_pools(sws_pool, lds)
     for (i, key) in enumerate(_obs_keys(lds.obs_model))
         _member_obs_mstep!(views[key], suf[key], tfs, datas[key], pools[i])
+    end
+    return nothing
+end
+
+# ============================================================================
+# SLDS emission kernels
+#
+# One regime of an SLDS reaches the same per-member accumulators the single-LDS
+# path uses, with that regime's responsibilities `γₖ(t)` as the per-timestep
+# weight and its scratch coming from `ObsScratch` rather than a
+# sub-`SmoothWorkspace`. Contributions accumulate, so members compose within a
+# regime exactly as regimes compose within a trial.
+# ============================================================================
+
+function _slds_emission_loglik!(
+    out::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    ::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    uy::Union{Nothing,NamedTuple},
+    tsteps::Int,
+    lognorm_t::Union{Nothing,NamedTuple},
+    obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
+) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
+    scratch = obs_scratch::Vector{ObsScratch{T}}
+    @inbounds for t in 1:tsteps
+        out[t] = zero(T)
+    end
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        sc = scratch[i]
+        _accumulate_member_loglikelihood!(
+            out,
+            ws,
+            sc.consts,
+            sc.buf1,
+            sc.buf2,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            _member_at(lognorm_t, i),
+            nothing,
+        )
+    end
+    return out
+end
+
+function _slds_emission_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    ::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    weights::AbstractVector{T},
+    uy::Union{Nothing,NamedTuple},
+    tsteps::Int,
+    tmp::AbstractVector{T},
+    ::AbstractVector{T},
+    obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
+) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
+    scratch = obs_scratch::Vector{ObsScratch{T}}
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        sc = scratch[i]
+        _accumulate_member_gradient!(
+            grad,
+            ws,
+            sc.consts,
+            sc.buf1,
+            tmp,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            weights,
+        )
+    end
+    return nothing
+end
+
+function _slds_emission_hessian!(
+    ws::SLDSSmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    ::SmoothConstants{T},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    weights::AbstractVector{T},
+    uy::Union{Nothing,NamedTuple},
+    tsteps::Int,
+    ::AbstractVector{T},
+    ::AbstractVector{T},
+    obs_scratch::Union{Nothing,Vector{ObsScratch{T}}},
+) where {T<:Real,S<:AbstractStateModel,O<:CompositeObservationModel{T}}
+    scratch = obs_scratch::Vector{ObsScratch{T}}
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        sc = scratch[i]
+        _accumulate_member_hessian!(
+            ws.btd,
+            ws,
+            sc.consts,
+            sc.buf1,
+            sc.buf2,
+            om,
+            x,
+            y[i],
+            _member_at(uy, i),
+            tsteps,
+            weights,
+        )
+    end
+    return nothing
+end
+
+"""
+    _emission_curvature_at!(H_obs, ws, cc, lds_k, x, y, t, uy, obs_scratch)
+
+One regime's *unweighted* emission curvature at a single timestep, written into
+`H_obs` (which the caller has zeroed). Used by the ELBO's `½ tr(H Σ)` covariance
+correction, which needs the regime's curvature in isolation.
+
+Summed over members for a composite emission.
+"""
+function _emission_curvature_at!(
+    H_obs::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds_k::LinearDynamicalSystem{T},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    t::Int,
+    uy::Union{Nothing,AbstractMatrix},
+    ::Nothing,
+) where {T<:Real}
+    observation_hessian!(
+        H_obs, cc, ws.opt.dyt, ws.opt.temp_dy, lds_k.obs_model, x, y, t, one(T), uy
+    )
+    return H_obs
+end
+
+function _emission_curvature_at!(
+    H_obs::AbstractMatrix{T},
+    ::SLDSSmoothWorkspace{T},
+    ::SmoothConstants{T},
+    lds_k::LinearDynamicalSystem{T},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    t::Int,
+    uy::Union{Nothing,NamedTuple},
+    obs_scratch::Vector{ObsScratch{T}},
+) where {T<:Real}
+    for (i, om) in enumerate(values(_models(lds_k.obs_model)))
+        sc = obs_scratch[i]
+        observation_hessian!(
+            H_obs, sc.consts, sc.buf1, sc.buf2, om, x, y[i], t, one(T), _member_at(uy, i)
+        )
+    end
+    return H_obs
+end
+
+"""
+    _ntrials(y) -> Int
+
+Number of trials in a multi-trial observation container, whether that is a
+vector of per-trial matrices or a `NamedTuple` of them (the members all see the
+same trials).
+"""
+_ntrials(y::AbstractVector{<:AbstractMatrix}) = length(y)
+_ntrials(y::NamedTuple) = length(first(values(y)))
+
+"""
+    _poisson_lognorm_one(lds, y::NamedTuple)
+
+Per-member hoisted normalizers for a composite emission — the same thing
+[`_emission_lognorm`](@ref) returns, reached through the name the SLDS path uses.
+"""
+function _poisson_lognorm_one(
+    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return _emission_lognorm(lds, y)
+end
+
+#=
+An SLDS whose emission is a composite: the latent path switches regime per
+timestep, so each member's observations are drawn from whichever regime's
+parameters `zₜ` selects. As on the single-LDS path the path is drawn in full
+first — with several emissions there is no one interleaving to pick.
+=#
+function _sample_continuous_given_discrete!(
+    rng,
+    x_trial,
+    y_trial::NamedTuple,
+    z_trial,
+    state_params,
+    obs_params,
+    obs_model::CompositeObservationModel,
+    ux_trial::AbstractMatrix,
+    uy_trial::NamedTuple,
+)
+    tsteps = length(z_trial)
+
+    k1 = z_trial[1]
+    x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
+    for t in 2:tsteps
+        k = z_trial[t]
+        x_trial[:, t] = rand(
+            rng,
+            MvNormal(
+                state_params[k].A * x_trial[:, t - 1] +
+                state_params[k].b +
+                state_params[k].B * ux_trial[:, t - 1],
+                state_params[k].Q,
+            ),
+        )
+    end
+
+    for (i, m) in enumerate(values(_models(obs_model)))
+        y_m = y_trial[i]
+        uy_m = uy_trial[i]
+        @views for t in 1:tsteps
+            y_m[:, t] = _draw_obs(
+                rng, m, obs_params[z_trial[t]][i], x_trial[:, t], uy_m[:, t]
+            )
+        end
     end
     return nothing
 end

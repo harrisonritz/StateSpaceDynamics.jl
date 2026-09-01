@@ -308,18 +308,18 @@ Inverse-Wishart term for `R` and the matrix-normal term for the stacked
 MN term belongs in the ELBO rather than only in the M-step.
 
 Called once per observation model, so a composite emission sums it over its
-members — each with its own priors and its own sub-workspace scratch.
-`sws.reg.CD` is used as scratch for the stacked `[C d D]`.
+members — each with its own priors and its own sub-workspace scratch. `sws`
+supplies the scratch for the stacked `[C d D]`; pass `nothing` to allocate it.
 """
 function _obs_prior_logdensity(
-    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     om = lds.obs_model
     total = zero(T)
 
     om.R_prior === nothing || (total += iw_logprior_term(om.R, om.R_prior))
     if om.CD_prior !== nothing
-        W_cd = view(sws.reg.CD, :, 1:(lds.latent_dim + 1 + lds.uy_dim))
+        W_cd = _obs_pack_scratch(lds, sws)
         _pack_obs_V!(W_cd, lds)
         total += mn_logprior_term(W_cd, om.R, om.CD_prior)
     end
