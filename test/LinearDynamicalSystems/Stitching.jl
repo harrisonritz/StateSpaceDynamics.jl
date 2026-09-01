@@ -306,8 +306,8 @@ function test_stitching_slds_shapes()
 end
 
 """
-The per-cell SLDS workspace shares the expensive storage and sizes the rest to
-the cell; an equal-width model gets the base workspace itself.
+A slot's per-cell workspace shares that slot's expensive storage and sizes the
+rest to the cell; an equal-width model reuses the slot's own workspace.
 """
 function test_slds_cell_workspace_sharing()
     y, labels, p1, p2 = st_slds_two_session_data()
@@ -315,19 +315,45 @@ function test_slds_cell_workspace_sharing()
     grp = SSD._slds_parameter_grouping(slds, length(y); y=y)
     cells = SSD._slds_cell_sldss(slds, grp)
 
-    base = SSD.SLDSSmoothWorkspace(Float64, slds, 30)
-    ws = SSD._slds_cell_workspaces(slds, cells, base, 30)
-    @test ws !== nothing
-    for (c, w) in enumerate(ws)
-        @test w.btd === base.btd          # shared O(D²·T)
-        @test w.ll_tmp === base.ll_tmp    # shared O(T)
-        p = cells[c].LDSs[1].obs_dim
-        @test all(cc -> size(cc.tmp_RC, 1) == p, w.consts)
+    pool = SSD._slds_workspace_pool(slds, cells, 30, length(y); npool=2)
+    @test !pool.uniform                      # the two sessions differ in width
+    for slot in 1:2, c in 1:length(cells)
+        w = SSD._slds_pool_ws(pool, slot, c, cells)
+        @test w.btd === pool.slots[slot].btd        # shared O(D²·T), per slot
+        @test w.ll_tmp === pool.slots[slot].ll_tmp  # shared O(T), per slot
+        @test all(cc -> size(cc.tmp_RC, 1) == cells[c].LDSs[1].obs_dim, w.consts)
     end
+    # Slots never share a cell workspace — that is what makes chunks independent.
+    @test SSD._slds_pool_ws(pool, 1, 1, cells) !== SSD._slds_pool_ws(pool, 2, 1, cells)
+    # Built once and cached, not rebuilt per pass.
+    @test SSD._slds_pool_ws(pool, 1, 1, cells) === SSD._slds_pool_ws(pool, 1, 1, cells)
 
-    # Equal widths: the base workspace is handed back unchanged.
-    uniform = SSD._slds_cell_workspaces(slds, [cells[1], cells[1]], base, 30)
-    @test all(w -> w === base, uniform)
+    # Equal widths: the slot's own workspace is handed back unchanged.
+    uni = SSD._slds_workspace_pool(slds, [cells[1], cells[1]], 30, length(y); npool=2)
+    @test uni.uniform
+    @test SSD._slds_pool_ws(uni, 2, 1, [cells[1], cells[1]]) === uni.slots[2]
+    return nothing
+end
+
+"""
+Trials are partitioned across slots, in cell-major order, with every trial
+landing in exactly one chunk.
+"""
+function test_slds_trial_plan_partitions_by_cell()
+    y, labels, _, _ = st_slds_two_session_data()
+    slds = st_slds(labels)
+    grp = SSD._slds_parameter_grouping(slds, length(y); y=y)
+
+    for npool in (1, 2, 3, 8)
+        plan = SSD._slds_trial_plan(grp, length(y), npool)
+        covered = Int[]
+        for slot in 1:SSD._plan_ntasks(plan)
+            append!(covered, plan.order[plan.bounds[slot]:(plan.bounds[slot + 1] - 1)])
+        end
+        @test sort(covered) == 1:length(y)          # every trial, exactly once
+        @test issorted(plan.cell_of)                # cell-major visit order
+        @test length(plan.order) == length(y)
+    end
     return nothing
 end
 

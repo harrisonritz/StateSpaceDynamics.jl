@@ -325,6 +325,14 @@ using SSDTest
                 test_grouped_pooled_regression_under_grouped_noise()
                 test_grouped_slds_requires_matching_labels()
             end
+
+            @testset "Trial-parallel execution" begin
+                test_SLDS_batched_poisson_loglikelihood()
+                test_SLDS_batched_poisson_gradient()
+                test_SLDS_smooth_npool_invariant()
+                test_SLDS_fit_reproducibility()
+                test_SLDS_rng_modes()
+            end
         end
 
         include("LinearDynamicalSystems/Stitching.jl")
@@ -361,6 +369,7 @@ using SSDTest
             @testset "SLDS" begin
                 test_stitching_slds_shapes()
                 test_slds_cell_workspace_sharing()
+                test_slds_trial_plan_partitions_by_cell()
                 test_stitching_slds_fit()
             end
 

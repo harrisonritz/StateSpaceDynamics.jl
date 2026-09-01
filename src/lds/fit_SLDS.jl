@@ -15,7 +15,7 @@ are shared across regimes; the active regime `zₜ` selects which per-regime
 
     Smooth:         smooth!(slds, fs, y, w; x_sample, rng, ux, uy)  # optional joint draw
 
-    E-Step:         estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; ux, uy)
+    E-Step:         estep!(slds, tfs, fb_storage, dl, y, x_samples, pool, plan; ux, uy)
 
     M-Step:         mstep!(slds, tfs, fb_storage, dl, y, sws; ux, uy)
 
@@ -301,17 +301,16 @@ function _sample_continuous_given_discrete!(
     # Initial state
     k1 = z_trial[1]
     x_trial[:, 1] = rand(rng, MvNormal(state_params[k1].x0, state_params[k1].P0))
-    y_trial[:, 1] =
-        rand.(
-            rng,
-            Poisson.(
-                exp.(
-                    obs_params[k1].C * x_trial[:, 1] +
-                    obs_params[k1].d +
-                    obs_params[k1].D * uy_trial[:, 1],
-                ),
+    y_trial[:, 1] = rand.(
+        rng,
+        Poisson.(
+            exp.(
+                obs_params[k1].C * x_trial[:, 1] +
+                obs_params[k1].d +
+                obs_params[k1].D * uy_trial[:, 1],
             ),
-        )
+        ),
+    )
 
     # Subsequent states
     for t in 2:tsteps
@@ -327,17 +326,16 @@ function _sample_continuous_given_discrete!(
             ),
         )
 
-        y_trial[:, t] =
-            rand.(
-                rng,
-                Poisson.(
-                    exp.(
-                        obs_params[k_curr].C * x_trial[:, t] +
-                        obs_params[k_curr].d +
-                        obs_params[k_curr].D * uy_trial[:, t],
-                    ),
+        y_trial[:, t] = rand.(
+            rng,
+            Poisson.(
+                exp.(
+                    obs_params[k_curr].C * x_trial[:, t] +
+                    obs_params[k_curr].d +
+                    obs_params[k_curr].D * uy_trial[:, t],
                 ),
-            )
+            ),
+        )
     end
 end
 
@@ -395,11 +393,125 @@ function StatsAPI.fit!(
 end
 
 """
-    joint_loglikelihood!(ws, slds, x, y, w[, ux, uy])
+    _slds_lognorm_for(slds, y)      -> Vector or nothing
+    _slds_lognorm_all(slds, y)      -> Vector{Vector} or nothing
+
+The Poisson `Σᵢ log(y!)` normalizer for one trial / for every trial, or
+`nothing` when the emission is Gaussian. All regimes of an SLDS share an
+observation-model type, so `LDSs[1]` decides which it is; and the normalizer
+depends only on the counts, so one vector per trial serves every regime.
+"""
+function _slds_lognorm_for(slds::SLDS, y::AbstractMatrix)
+    return _poisson_lognorm_one(slds.LDSs[1], y)
+end
+
+function _slds_lognorm_all(slds::SLDS, y::AbstractVector{<:AbstractMatrix})
+    return _poisson_lognorm_all(slds.LDSs[1], y)
+end
+
+#=
+One regime's emission log-density over a whole trial, written into `out`.
+
+Poisson: `y_t·η_t - Σ exp(η_t) - Σᵢ log(y_{i,t}!)` with `η = C x + d + D v`
+formed for the trial in a single `gemm`, and the `log(y!)` normalizer supplied
+precomputed — it is constant in the latents, so recomputing it inside the
+Newton line search (which is what the generic per-timestep kernel does) is pure
+waste. This is the same arithmetic `fit_PLDS.jl`'s `joint_loglikelihood!` uses;
+the SLDS could not reach that method because it dispatches on `SmoothWorkspace`.
+
+Generic: the per-timestep `observation_loglikelihood!` kernel, unchanged. A
+Gaussian emission has no data-only normalizer, so `lognorm_t` is `nothing`.
+=#
+function _slds_emission_loglik!(
+    out::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    ::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    lognorm_t::Union{Nothing,AbstractVector{T}},
+) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
+    om = lds.obs_model
+    obs_dim, latent_dim = size(om.C)
+    pb = poisson_batch!(ws, latent_dim, obs_dim, tsteps)
+    Eta = _poisson_linear_predictor!(pb, om.C, om.d, om.D, x, uy, tsteps)
+    @inbounds @views for t in 1:tsteps
+        η = Eta[:, t]
+        norm_t = lognorm_t === nothing ? _poisson_lognorm_at(y, t) : lognorm_t[t]
+        out[t] = dot(y[:, t], η) - sum(exp, η) - norm_t
+    end
+    return out
+end
+
+function _slds_emission_loglik!(
+    out::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    ::Union{Nothing,AbstractVector{T}},
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    z = ws.opt.temp_dy
+    λ = ws.opt.temp_solve_R
+    @inbounds for t in 1:tsteps
+        out[t] = observation_loglikelihood!(cc, z, λ, lds, x, y, t, uy)
+    end
+    return out
+end
+
+"""
+    _slds_trial_loglikelihood!(ll, ws, cc, lds, x, y, ux, uy, lognorm_t)
+
+One regime's per-timestep complete-data log-density for a whole trial. Splits
+into the emission half (batched where the observation model allows it) and the
+state half, which is the same per-timestep recursion for every model.
+
+Equivalent to the generic `joint_loglikelihood!` in `continuous_latents.jl`; it
+exists so the Poisson emission can take the batched path and be handed its
+precomputed normalizer.
+"""
+function _slds_trial_loglikelihood!(
+    ll::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    tsteps = size(y, 2)
+    @assert length(ll) == tsteps
+
+    _slds_emission_loglik!(ll, ws, cc, lds, x, y, uy, tsteps, lognorm_t)
+
+    dx = ws.opt.temp_dx
+    tmp = ws.opt.temp_solve_Q
+    @inbounds for t in 1:tsteps
+        ll[t] += state_loglikelihood!(cc, dx, tmp, lds, x, t, ux)
+    end
+
+    return ll
+end
+
+"""
+    joint_loglikelihood!(ws, slds, x, y, w[, ux, uy, lognorm_t])
 
 Compute weighted complete-data log-likelihood for SLDS.
 Returns vector of per-timestep log-likelihoods. `ux` / `uy` are the per-trial
 control-input matrices (`nothing` or zero-row skips the `Bₖ u` / `Dₖ v` terms).
+
+`lognorm_t` is the trial's Poisson `Σᵢ log(y!)` normalizer (see
+[`_poisson_lognorm_t`](@ref)), constant in the latents and so worth computing
+once per trial rather than once per Newton line-search evaluation; `nothing`
+recomputes it, which is only what the single-trial convenience entry points do.
+Ignored by a Gaussian emission.
 """
 function joint_loglikelihood!(
     ws::SLDSSmoothWorkspace{T},
@@ -409,6 +521,7 @@ function joint_loglikelihood!(
     w::AbstractMatrix{T},   # K × T responsibilities/weights
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real}
     Tsteps = size(y, 2)
 
@@ -418,8 +531,16 @@ function joint_loglikelihood!(
 
     K = length(slds.LDSs)
     for k in 1:K
-        joint_loglikelihood!(
-            view(ws.ll_tmp, 1:Tsteps), ws, ws.consts[k], slds.LDSs[k], x, y, ux, uy
+        _slds_trial_loglikelihood!(
+            view(ws.ll_tmp, 1:Tsteps),
+            ws,
+            ws.consts[k],
+            slds.LDSs[k],
+            x,
+            y,
+            ux,
+            uy,
+            lognorm_t,
         )
         for t in 1:Tsteps
             ll_vec[t] += w[k, t] * ws.ll_tmp[t]
@@ -427,6 +548,73 @@ function joint_loglikelihood!(
     end
 
     return view(ll_vec, 1:Tsteps)
+end
+
+"""
+    _add_cov_correction!(ll, ws, cc, lds_k, x, y, fs[, uy])
+
+Add the second-order term that turns a plug-in per-timestep log-likelihood into
+`E_q(x)[log p_k(y_t, x_t | x_{t-1})]`, in place on `ll`.
+
+For a factor Hessian `H^{(k,t)}` and smoothed covariance `Σ`, the correction is
+`½ tr(H^{(k,t)} Σ)`. Summing it against `γ` reproduces the covariance term
+in [`elbo!`](@ref). The expansion is exact for Gaussian emissions and
+second-order for Poisson emissions.
+
+Uses the same factor-at-`t` convention as `joint_loglikelihood!` and `hessian!`:
+`ll[t]` covers the emission at `t` plus the dynamics factor coupling
+`(x_{t-1}, x_t)`, or the prior at `t == 1`. The covariances in `fs` must
+correspond to `x`.
+
+Overwrites `ws.H_obs` and the emission scratch in `ws.opt`.
+"""
+function _add_cov_correction!(
+    ll::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds_k::LinearDynamicalSystem{T},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    fs::FilterSmooth{T},
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real}
+    Tsteps = size(y, 2)
+
+    # Cached state-model templates for regime k, matching `hessian!`.
+    neg_Q_inv = cc.xt_given_xt_1     # -Q⁻¹
+    neg_AtQinvA = cc.xt1_given_xt    # -A'Q⁻¹A
+    neg_P0_inv = cc.x_t              # -P0⁻¹
+    sub_entry = cc.H_sub_entry       #  Q⁻¹A
+    super_entry = cc.H_super_entry   # (Q⁻¹A)'
+
+    H_obs = ws.H_obs
+    # Poisson curvature uses both scratch vectors; Gaussian ignores them.
+    z = ws.opt.dyt
+    λ = ws.opt.temp_dy
+
+    @views for t in 1:Tsteps
+        Σ_tt = fs.p_smooth[:, :, t]
+
+        # Use unit weight to get this regime's emission curvature alone.
+        fill!(H_obs, zero(T))
+        observation_hessian!(H_obs, cc, z, λ, lds_k, x, y, t, one(T), uy)
+        corr = _tr_prod(H_obs, Σ_tt)
+
+        if t == 1
+            corr += _tr_prod(neg_P0_inv, Σ_tt)
+        else
+            # Sum both cross-covariance traces; do not assume exact block symmetry.
+            Σ_ttm1 = fs.p_smooth_tt1[:, :, t]  # Cov(x_t, x_{t-1})
+            corr += _tr_prod(neg_Q_inv, Σ_tt)
+            corr += _tr_prod(neg_AtQinvA, fs.p_smooth[:, :, t - 1])
+            corr += _tr_prod(super_entry, Σ_ttm1)
+            corr += _tr_prod(sub_entry, transpose(Σ_ttm1))
+        end
+
+        ll[t] += T(0.5) * corr
+    end
+
+    return ll
 end
 
 """
@@ -470,12 +658,15 @@ function gradient!(
         neg_Q_inv = cc.xt_given_xt_1  # -Q^{-1}
         neg_P0_inv = cc.x_t           # -P0^{-1}
 
-        # t = 1: emission + prior, both weighted by w[k,1]
-        observation_gradient!(tmp1, cc, obs_buf, lds_k, x, y, 1, uy)
+        # Emission half, for every timestep at once where the model allows it.
+        _slds_emission_gradient!(
+            grad, ws, cc, lds_k, x, y, view(w, k, :), uy, Tsteps, tmp1, obs_buf
+        )
+
+        # t = 1: prior, weighted by w[k,1]
         @. dxt = x[:, 1] - x0
         mul!(tmp3, neg_P0_inv, dxt)
-        α = w[k, 1]
-        @. grad[:, 1] += α * (tmp1 + tmp3)
+        @. grad[:, 1] += w[k, 1] * tmp3
 
         Tsteps == 1 && continue
 
@@ -484,29 +675,92 @@ function gradient!(
         mul!(tmp2, A_inv_Q, dxt_next)
         @. grad[:, 1] += w[k, 2] * tmp2
 
-        # 2 .. T-1: emission + incoming factor at t (w[k,t]),
-        # outgoing factor at t+1 (w[k,t+1])
+        # 2 .. T-1: incoming factor at t (w[k,t]), outgoing factor at t+1 (w[k,t+1])
         for t in 2:(Tsteps - 1)
-            observation_gradient!(tmp1, cc, obs_buf, lds_k, x, y, t, uy)
             _transition_residual!(dxt, lds_k, x, t, ux)
             mul!(tmp3, neg_Q_inv, dxt)
-            α = w[k, t]
-            @. grad[:, t] += α * (tmp1 + tmp3)
+            @. grad[:, t] += w[k, t] * tmp3
 
             _transition_residual!(dxt_next, lds_k, x, t + 1, ux)
             mul!(tmp2, A_inv_Q, dxt_next)
             @. grad[:, t] += w[k, t + 1] * tmp2
         end
 
-        # t = T: emission + incoming factor at T, weighted by w[k,T]
-        observation_gradient!(tmp1, cc, obs_buf, lds_k, x, y, Tsteps, uy)
+        # t = T: incoming factor at T, weighted by w[k,T]
         _transition_residual!(dxt, lds_k, x, Tsteps, ux)
         mul!(tmp3, neg_Q_inv, dxt)
-        α = w[k, Tsteps]
-        @. grad[:, Tsteps] += α * (tmp1 + tmp3)
+        @. grad[:, Tsteps] += w[k, Tsteps] * tmp3
     end
 
     return grad
+end
+
+#=
+One regime's emission gradient `γₖ(t)·∂ log p(yₜ|xₜ)/∂xₜ`, accumulated into
+`grad` for the whole trial.
+
+Poisson: `γₖ(t)·C'(yₜ − λₜ)`. The linear predictor is one `gemm`, the weighted
+residual overwrites it in place, and `C'` applied to the whole residual block is
+a second `gemm` accumulating straight into `grad` — replacing `tsteps` BLAS-2
+pairs per regime. Same trick as the batched emission Hessian, and like it, a
+different summation order than the per-timestep kernel: results agree to
+rounding, not bit-for-bit.
+
+Generic: the per-timestep `observation_gradient!` kernel, unchanged.
+=#
+function _slds_emission_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    ::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    weights::AbstractVector{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    ::AbstractVector{T},
+    ::AbstractVector{T},
+) where {T<:Real,S<:AbstractStateModel,O<:PoissonObservationModel{T}}
+    om = lds.obs_model
+    obs_dim, latent_dim = size(om.C)
+    pb = poisson_batch!(ws, latent_dim, obs_dim, tsteps)
+    Eta = _poisson_linear_predictor!(pb, om.C, om.d, om.D, x, uy, tsteps)
+
+    # Overwrite η in place with the weighted residual γₖ(t)·(yₜ − exp(ηₜ)).
+    @inbounds for t in 1:tsteps
+        wt = weights[t]
+        col = view(Eta, :, t)
+        yt = view(y, :, t)
+        @simd for i in 1:obs_dim
+            col[i] = wt * (yt[i] - exp(col[i]))
+        end
+    end
+
+    mul!(view(grad, :, 1:tsteps), transpose(om.C), Eta, one(T), one(T))
+    return nothing
+end
+
+function _slds_emission_gradient!(
+    grad::AbstractMatrix{T},
+    ::SLDSSmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    weights::AbstractVector{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    tmp::AbstractVector{T},
+    obs_buf::AbstractVector{T},
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    @inbounds for t in 1:tsteps
+        observation_gradient!(tmp, cc, obs_buf, lds, x, y, t, uy)
+        α = weights[t]
+        @simd for i in eachindex(tmp)
+            grad[i, t] += α * tmp[i]
+        end
+    end
+    return nothing
 end
 
 #=
@@ -667,8 +921,10 @@ function smooth!(
     linesearch::Union{Nothing,AbstractLineSearch}=BackTrackingLS{T}(),
     x_sample::Union{Nothing,AbstractMatrix{T}}=nothing,
     rng::AbstractRNG=Random.default_rng(),
+    noise::Union{Nothing,AbstractVector{T}}=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
     tsteps = size(y, 2)
@@ -676,6 +932,14 @@ function smooth!(
 
     ws === nothing && (ws = SLDSSmoothWorkspace(T, slds, tsteps))
     btd = ws.btd
+
+    #=
+    The Poisson `-Σ log(y!)` normalizer is constant in `x`, so the Newton line
+    search must not recompute it. Callers that smooth many trials build it once
+    each at fit entry; the single-trial entry points land here with `nothing`
+    and pay for it once, not once per line-search evaluation.
+    =#
+    ln = lognorm_t === nothing ? _slds_lognorm_for(slds, y) : lognorm_t
 
     x = fs.x_smooth
 
@@ -695,7 +959,7 @@ function smooth!(
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
     ϕ!() = begin
-        ll = joint_loglikelihood!(ws, slds, x, y, w, ux, uy)
+        ll = joint_loglikelihood!(ws, slds, x, y, w, ux, uy, ln)
         return sum(ll)
     end
 
@@ -753,7 +1017,18 @@ function smooth!(
     =#
     if x_sample !== nothing
         z = view(ws.opt.X0, 1:n_active)
-        randn!(rng, z)
+        #=
+        `noise` lets the caller supply the standard normals instead of drawing
+        them here. A multi-trial pass runs in parallel, so a shared `rng` would
+        be both a data race and schedule-dependent; the caller either pre-draws
+        the stream serially (preserving global-RNG semantics) or hands each
+        trial its own generator.
+        =#
+        if noise === nothing
+            randn!(rng, z)
+        else
+            copyto!(z, noise)
+        end
         block_tridiagonal_sample!(z, btd, tsteps)
         @views x_sample .= fs.x_smooth .+ reshape(z, latent_dim, tsteps)
     end
@@ -822,6 +1097,10 @@ held-out data.
 - `return_cov::Bool=false`: also return the smoothed covariances (`latent_dim² × T` per
   trial — large, hence opt-in).
 - `progress::Bool=false`: show a progress bar.
+- `npool::Int`: task slots for the trial-parallel passes, one per thread by default
+  (capped at the trial count). Each slot costs `O(D²·T)` block-tridiagonal storage plus
+  `O(N·T)` Poisson scratch; lower it to trade throughput for memory. `npool=1` runs
+  every pass sequentially.
 - `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
   `depends_on` declared on the regimes for this call. A held-out set has its own trial
   count, so it needs its own label vectors.
@@ -844,6 +1123,7 @@ function smooth(
     tol::Real=1e-6,
     return_cov::Bool=false,
     progress::Bool=false,
+    npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     #=
@@ -872,8 +1152,9 @@ function smooth(
     fb_storage = _make_slds_fb_storage(dl, seq_ends)
     obs_seq = collect(1:total_T)
     control_seq = fill(nothing, total_T)
-    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
-    cell_ws = _slds_cell_workspaces(slds, cell_slds, slds_ws, T_max)
+    pool = _slds_workspace_pool(slds, cell_slds, T_max, ntrials; npool=npool)
+    plan = _slds_trial_plan(grp, ntrials, length(pool.slots))
+    lognorm = _slds_lognorm_all(slds, y_seq)
 
     #=
     No M-step runs, so the per-regime constants cached by the workspace stay
@@ -887,12 +1168,13 @@ function smooth(
         tfs,
         y_seq,
         nothing,
-        slds_ws,
+        pool,
+        plan,
         tsteps_per_trial,
         K;
         ux=ux_seq,
         uy=uy_seq,
-        cell_ws=cell_ws,
+        lognorm=lognorm,
     )
 
     prog = if progress
@@ -909,13 +1191,14 @@ function smooth(
         fb_storage,
         dl,
         y_seq,
-        slds_ws;
+        pool,
+        plan;
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
         ux=ux_seq,
         uy=uy_seq,
-        cell_ws=cell_ws,
+        lognorm=lognorm,
         smoothing_iters=smoothing_iters,
         tol=T(tol),
         prog=prog,
@@ -927,7 +1210,18 @@ function smooth(
     end
 
     total_elbo = if grp === nothing
-        elbo!(slds, tfs, fb_storage, y_seq, slds_ws; seq_ends=seq_ends, ux=ux_seq, uy=uy_seq)
+        elbo!(
+            slds,
+            tfs,
+            fb_storage,
+            y_seq,
+            pool,
+            plan;
+            seq_ends=seq_ends,
+            ux=ux_seq,
+            uy=uy_seq,
+            lognorm=lognorm,
+        )
     else
         _elbo_grouped!(
             cell_slds::Vector,
@@ -935,11 +1229,12 @@ function smooth(
             tfs,
             fb_storage,
             y_seq,
-            slds_ws;
+            pool,
+            plan;
             seq_ends=seq_ends,
             ux=ux_seq,
             uy=uy_seq,
-            cell_ws=cell_ws,
+            lognorm=lognorm,
         )
     end
 
@@ -969,15 +1264,196 @@ function _collect_slds_smooth_output(x, γ, p, total_elbo, _)
     return (; x=x, γ=γ, elbo=total_elbo, p=p)
 end
 
+# ============================================================================
+# Trial-parallel execution: workspace pool + work partition
+#
+# Every per-trial pass in this file used to thread one `SLDSSmoothWorkspace`
+# through a sequential loop, which is what kept an SLDS fit on a single thread
+# while `fit_LDS.jl` / `fit_PLDS.jl` chunked their trials across a pool. The
+# pool below is the SLDS counterpart: `ntasks == length(slots)` chunks, each
+# chunk owning one slot for the whole pass, addressed by chunk position rather
+# than `threadid()` (see https://julialang.org/blog/2023/07/PSA-dont-use-threadid/).
+# ============================================================================
+
 """
-    _slds_fill_logL!(slds, cell_slds, grp, dl, y, x_of, slds_ws; seq_ends, ux, uy, cell_ws)
+    SLDSWorkspacePool{T}
+
+One `SLDSSmoothWorkspace` per task slot, plus the per-cell workspaces a
+stitching fit needs.
+
+`uniform` records that every cell has the parent's `obs_dim` — which is every
+fit that is not stitching sessions of differing width — and then a slot's own
+workspace serves all its cells and nothing extra is allocated.
+
+Otherwise `cells[slot][c]` holds the workspace slot `slot` uses for cell `c`,
+built on first use. Chunks are contiguous in cell-major trial order, so a slot
+touches only the one or two cells its chunk spans: the lazy build keeps the
+allocation at roughly `ntasks` cell workspaces rather than `ntasks × ncells`.
+"""
+struct SLDSWorkspacePool{T<:Real}
+    slots::Vector{SLDSSmoothWorkspace{T}}
+    cells::Vector{Vector{Union{Nothing,SLDSSmoothWorkspace{T}}}}
+    uniform::Bool
+    tsteps::Int
+end
+
+"""
+    _slds_workspace_pool(slds, cell_slds, T_max, ntrials; npool) -> SLDSWorkspacePool
+
+Build the pool. `npool` defaults to one slot per thread, capped at the trial
+count — a fit with fewer trials than threads cannot use the extra slots, and
+each slot costs `O(D²·T)` block-tridiagonal storage plus `O(N·T)` Poisson
+scratch, so allocating them would be pure waste.
+"""
+function _slds_workspace_pool(
+    slds::SLDS{T},
+    cell_slds::Union{Nothing,AbstractVector},
+    T_max::Int,
+    ntrials::Int;
+    npool::Int=Threads.maxthreadid(),
+) where {T<:Real}
+    # A fit with fewer trials than threads cannot use the extra slots.
+    n = max(1, min(npool, max(ntrials, 1)))
+    slots = [SLDSSmoothWorkspace(T, slds, T_max) for _ in 1:n]
+
+    if cell_slds === nothing
+        return SLDSWorkspacePool{T}(
+            slots, Vector{Vector{Union{Nothing,SLDSSmoothWorkspace{T}}}}(), true, T_max
+        )
+    end
+
+    p0 = slds.LDSs[1].obs_dim
+    uniform = all(sc -> sc.LDSs[1].obs_dim == p0, cell_slds)
+    ncells = length(cell_slds)
+    cells = [
+        Vector{Union{Nothing,SLDSSmoothWorkspace{T}}}(nothing, uniform ? 0 : ncells) for
+        _ in 1:n
+    ]
+    return SLDSWorkspacePool{T}(slots, cells, uniform, T_max)
+end
+
+"""
+    _slds_solo_pool(ws) -> SLDSWorkspacePool
+
+Wrap one caller-supplied workspace as a single-slot pool. Backs the
+single-workspace entry points, which run every trial on that one workspace.
+"""
+function _slds_solo_pool(ws::SLDSSmoothWorkspace{T}) where {T<:Real}
+    return SLDSWorkspacePool{T}(
+        [ws],
+        Vector{Vector{Union{Nothing,SLDSSmoothWorkspace{T}}}}(),
+        true,
+        length(ws.opt.ll_vec),
+    )
+end
+
+"""
+    _slds_pool_ws(pool, slot, cell, cell_slds) -> SLDSSmoothWorkspace
+
+The workspace slot `slot` should use for `cell`. Allocates it on first use for
+a ragged-width stitching fit; otherwise hands back the slot's own workspace.
+"""
+function _slds_pool_ws(
+    pool::SLDSWorkspacePool{T},
+    slot::Int,
+    cell::Int,
+    cell_slds::Union{Nothing,AbstractVector},
+) where {T<:Real}
+    (pool.uniform || cell_slds === nothing) && return pool.slots[slot]
+    existing = pool.cells[slot][cell]
+    existing !== nothing && return existing::SLDSSmoothWorkspace{T}
+    fresh = _cell_slds_workspace(pool.slots[slot], cell_slds[cell], pool.tsteps)
+    pool.cells[slot][cell] = fresh
+    return fresh
+end
+
+"""
+    refresh_slds_pool!(pool, slds)
+
+Refresh the cached regime constants on **every** slot after an M-step. The
+ungrouped passes read constants without refreshing them, so missing a slot here
+would have that slot smooth against the previous iteration's parameters.
+A grouped pass refreshes per cell as it goes and does not need this.
+"""
+function refresh_slds_pool!(pool::SLDSWorkspacePool, slds::SLDS)
+    for ws in pool.slots
+        refresh_slds_constants!(ws, slds)
+    end
+    return nothing
+end
+
+"""
+    SLDSTrialPlan
+
+The fixed partition of trials into `ntasks` chunks that every parallel pass
+reuses.
+
+`order` lists the trials in visit order — cell-major when grouped, so a chunk
+walks whole cells and the regime constants are refreshed once per cell it
+spans, exactly as the sequential cell loop did. `cell_of` is the matching cell
+index. `bounds` holds `ntasks + 1` offsets into `order`.
+
+Fixed for the whole fit, so the slot a trial lands on never changes: the
+per-slot lazy cell workspaces are built once, and the reduction order of any
+chunked accumulation is deterministic.
+"""
+struct SLDSTrialPlan
+    order::Vector{Int}
+    cell_of::Vector{Int}
+    bounds::Vector{Int}
+end
+
+_plan_ntasks(plan::SLDSTrialPlan) = length(plan.bounds) - 1
+
+function _slds_trial_plan(grp::Union{Nothing,ParameterGrouping}, ntrials::Int, npool::Int)
+    if grp === nothing
+        order = collect(1:ntrials)
+        cell_of = ones(Int, ntrials)
+    else
+        order = Int[]
+        cell_of = Int[]
+        sizehint!(order, ntrials)
+        sizehint!(cell_of, ntrials)
+        for c in 1:(grp.ncells), trial in grp.cell_trials[c]
+            push!(order, trial)
+            push!(cell_of, c)
+        end
+    end
+
+    n = length(order)
+    tasks = max(1, min(npool, max(n, 1)))
+    chunk = cld(max(n, 1), tasks)
+    bounds = Vector{Int}(undef, tasks + 1)
+    for i in 1:tasks
+        bounds[i] = min((i - 1) * chunk + 1, n + 1)
+    end
+    bounds[tasks + 1] = n + 1
+    return SLDSTrialPlan(order, cell_of, bounds)
+end
+
+"""
+    _slds_fill_logL!(slds, cell_slds, grp, dl, y, x_of, pool, plan; seq_ends, ux, uy, lognorm, tfs)
 
 Fill `dl.logL` (`K × sum(T_i)`) with every regime's log-density of the current
 continuous trajectory. `x_of(trial)` supplies that trajectory: the smoothed mean
 for deterministic inference, a joint draw from `q(x)` for the Monte-Carlo E-step.
 
-When `grp === nothing` this is the plain per-trial loop; otherwise trials are
-visited cell by cell so the regime constants are refreshed once per cell.
+The discrete update wants `E_q(x)[log p_k(y_t, x_t | x_{t-1})]`, and the two
+trajectories reach it differently. A draw from `q(x)` carries the posterior
+spread already, so its plug-in score is unbiased for that expectation. The
+smoothed mean does not: scoring at `E_q[x]` drops the curvature term and biases
+every regime's log-density by its own `½ tr(H^{(k,t)} Σ)`. Pass `tfs` on that
+path — the trial's `p_smooth` / `p_smooth_tt1` must match the `x` that `x_of`
+returns — and [`_add_cov_correction!`](@ref) puts the term back, per regime and
+per timestep, before forward-backward normalizes across `k`. `tfs === nothing`
+is the sampled path and skips the correction.
+
+Chunks run in parallel over `pool`. Each trial writes only `dl.logL[:, t1:t2]`,
+and the chunks are disjoint in trials, so the result is identical to the
+sequential pass — this is a pure partition of the writes, not a reduction.
+
+When `grp` is set, trials are visited cell by cell within a chunk so the regime
+constants are refreshed once per cell the chunk spans.
 """
 function _slds_fill_logL!(
     slds::SLDS{T},
@@ -986,55 +1462,81 @@ function _slds_fill_logL!(
     dl::SLDSDiscreteLayer{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     x_of,
-    slds_ws::SLDSSmoothWorkspace{T};
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
+    tfs::Union{Nothing,TrialFilterSmooth{T}}=nothing,
 ) where {T<:Real}
     K = length(slds.LDSs)
+    grouped = grp !== nothing && cell_slds !== nothing
 
-    function fill_trial!(slds_t, ws_t, trial)
-        t1, t2 = HMMs.seq_limits(seq_ends, trial)
-        x_src = x_of(trial)
-        y_trial = y[trial]
-        ux_trial = ux === nothing ? nothing : ux[trial]
-        uy_trial = uy === nothing ? nothing : uy[trial]
-        for k in 1:K
-            joint_loglikelihood!(
-                view(dl.logL, k, t1:t2),
-                ws_t,
-                ws_t.consts[k],
-                slds_t.LDSs[k],
-                x_src,
-                y_trial,
-                ux_trial,
-                uy_trial,
-            )
+    tforeach(1:_plan_ntasks(plan)) do slot
+        #=
+        `local`: these names are also bound in the sequential helpers of this
+        file, and sharing a binding with the enclosing scope boxes it, which
+        OhMyThreads rejects.
+        =#
+        local lo, hi, cur_cell, ws_t, slds_t
+        lo = plan.bounds[slot]
+        hi = plan.bounds[slot + 1] - 1
+        lo > hi && return nothing
+
+        cur_cell = 0
+        ws_t = pool.slots[slot]
+        slds_t = slds
+
+        for idx in lo:hi
+            trial = plan.order[idx]
+            if grouped && plan.cell_of[idx] != cur_cell
+                cur_cell = plan.cell_of[idx]
+                slds_t = cell_slds[cur_cell]
+                ws_t = _slds_pool_ws(pool, slot, cur_cell, cell_slds)
+                refresh_slds_constants!(ws_t, slds_t)
+            end
+
+            t1, t2 = HMMs.seq_limits(seq_ends, trial)
+            x_src = x_of(trial)
+            y_trial = y[trial]
+            ux_trial = ux === nothing ? nothing : ux[trial]
+            uy_trial = uy === nothing ? nothing : uy[trial]
+            ln_trial = lognorm === nothing ? nothing : lognorm[trial]
+            for k in 1:K
+                ll_k = view(dl.logL, k, t1:t2)::AbstractVector{T}
+                _slds_trial_loglikelihood!(
+                    ll_k,
+                    ws_t,
+                    ws_t.consts[k],
+                    slds_t.LDSs[k],
+                    x_src,
+                    y_trial,
+                    ux_trial,
+                    uy_trial,
+                    ln_trial,
+                )
+                if tfs !== nothing
+                    _add_cov_correction!(
+                        ll_k,
+                        ws_t,
+                        ws_t.consts[k],
+                        slds_t.LDSs[k],
+                        x_src,
+                        y_trial,
+                        tfs[trial],
+                        uy_trial,
+                    )
+                end
+            end
         end
         return nothing
-    end
-
-    if grp === nothing || cell_slds === nothing
-        for trial in eachindex(y)
-            fill_trial!(slds, slds_ws, trial)
-        end
-        return nothing
-    end
-
-    for c in 1:(grp.ncells)
-        slds_c = cell_slds[c]
-        ws_c = _slds_ws_for(cell_ws, slds_ws, c)
-        refresh_slds_constants!(ws_c, slds_c)
-        for trial in grp.cell_trials[c]
-            fill_trial!(slds_c, ws_c, trial)
-        end
     end
     return nothing
 end
 
 """
-    _slds_smooth_all!(slds, cell_slds, grp, tfs, y, x_samples, slds_ws, w_of; ...)
+    _slds_smooth_all!(slds, cell_slds, grp, tfs, y, x_samples, pool, plan, w_of; ...)
 
 Run the Laplace/Newton smoother over every trial under the discrete weights
 `w_of(trial)` (`K × T_i`), filling `tfs[*].x_smooth`, `tfs[*].p_smooth`, and
@@ -1042,8 +1544,15 @@ Run the Laplace/Newton smoother over every trial under the discrete weights
 deterministic path); otherwise the next draw from `q(x)` lands in
 `x_samples[trial]`.
 
-When `grp === nothing` this is the plain per-trial loop; otherwise trials are
-visited cell by cell so the regime constants are refreshed once per cell.
+Chunks run in parallel over `pool`. A trial writes only its own `tfs[trial]`
+and `x_samples[trial]`, so the smoothed output does not depend on how the
+chunks were scheduled.
+
+`noise_of(trial)` returns the standard-normal vector the trial's joint draw
+should consume, or `nothing` to have the trial draw its own from
+`rng_of(trial)`. Between them these are the two reproducibility modes: a
+pre-drawn stream keeps the global-RNG semantics under parallelism, a per-trial
+generator makes the draw independent of both scheduling and thread count.
 """
 function _slds_smooth_all!(
     slds::SLDS{T},
@@ -1052,51 +1561,143 @@ function _slds_smooth_all!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
-    slds_ws::SLDSSmoothWorkspace{T},
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan,
     w_of;
-    rng::AbstractRNG=Random.default_rng(),
+    rng_of=_ -> Random.default_rng(),
+    noise_of=_ -> nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
-    if grp === nothing || cell_slds === nothing
-        for trial in eachindex(y)
+    grouped = grp !== nothing && cell_slds !== nothing
+
+    tforeach(1:_plan_ntasks(plan)) do slot
+        local lo, hi, cur_cell, ws_t, slds_t
+        lo = plan.bounds[slot]
+        hi = plan.bounds[slot + 1] - 1
+        lo > hi && return nothing
+
+        cur_cell = 0
+        ws_t = pool.slots[slot]
+        slds_t = slds
+
+        for idx in lo:hi
+            trial = plan.order[idx]
+            if grouped && plan.cell_of[idx] != cur_cell
+                cur_cell = plan.cell_of[idx]
+                slds_t = cell_slds[cur_cell]
+                ws_t = _slds_pool_ws(pool, slot, cur_cell, cell_slds)
+                refresh_slds_constants!(ws_t, slds_t)
+            end
+
             smooth!(
-                slds,
+                slds_t,
                 tfs[trial],
                 y[trial],
                 w_of(trial);
-                ws=slds_ws,
+                ws=ws_t,
                 x_sample=(x_samples === nothing ? nothing : x_samples[trial]),
-                rng=rng,
+                rng=rng_of(trial),
+                noise=noise_of(trial),
                 ux=(ux === nothing ? nothing : ux[trial]),
                 uy=(uy === nothing ? nothing : uy[trial]),
+                lognorm_t=(lognorm === nothing ? nothing : lognorm[trial]),
             )
         end
         return nothing
     end
-
-    for c in 1:(grp.ncells)
-        _slds_smooth_cell!(
-            cell_slds,
-            grp,
-            c,
-            tfs,
-            y,
-            x_samples,
-            slds_ws,
-            w_of;
-            rng=rng,
-            ux=ux,
-            uy=uy,
-            cell_ws=cell_ws,
-        )
-    end
     return nothing
 end
 
+# ============================================================================
+# Reproducibility of the E-step's posterior draws under trial parallelism
+#
+# The Monte-Carlo E-step draws one joint sample per trial. Sequentially those
+# draws came off a single generator in trial order; run in parallel that is
+# both a data race and schedule-dependent, so the draw has to be re-sourced.
+# Two modes, because the two things a user wants here are in tension:
+#
+#   :trial  — each trial gets its own generator, seeded from the master `rng`
+#             and the trial index. The draw a trial receives is then a function
+#             of the master seed alone: identical across thread counts, across
+#             chunk layouts, and across serial vs. parallel. This is the default.
+#
+#   :global — the standard normals are drawn from the master `rng` serially, in
+#             trial order, before the pass; each trial consumes its own slice.
+#             That reproduces the exact stream the sequential smoother consumed,
+#             for going back to an existing fit, and still runs in parallel.
+# ============================================================================
+
 """
-    _vem_alternate!(slds, cell_slds, grp, tfs, fb_storage, dl, y, slds_ws; smoothing_iters, tol, x_samples, ...)
+    _slds_noise_buffers(x_samples) -> Vector{Vector} or nothing
+
+Per-trial standard-normal buffers for `rng_mode = :global`, sized at each
+trial's `latent_dim · T_i`. `nothing` when the caller takes no draws.
+"""
+function _slds_noise_buffers(
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}
+) where {T<:Real}
+    x_samples === nothing && return nothing
+    return [Vector{T}(undef, length(xs)) for xs in x_samples]
+end
+
+_slds_noise_buffers(::Nothing) = nothing
+
+"""
+    _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs) -> (rng_of, noise_of)
+
+Resolve one alternation's draw source into the two callbacks
+[`_slds_smooth_all!`](@ref) takes. Both are cheap closures over per-trial data;
+neither touches shared mutable state inside a task.
+
+Called once per alternation, and each call consumes exactly one draw from
+`rng` — a seed in `:trial` mode, the whole noise stream in `:global`. That is
+what keeps `smoothing_iters = n` identical to `n` successive
+`smoothing_iters = 1` calls: either way the k-th alternation is the k-th draw
+off the master generator.
+"""
+function _slds_draw_sources(
+    rng::AbstractRNG,
+    rng_mode::Symbol,
+    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}},
+) where {T<:Real}
+    if x_samples === nothing
+        # Deterministic path: no draws at all.
+        return (_ -> rng), (_ -> nothing)
+    end
+
+    if rng_mode === :global
+        noise_bufs === nothing && throw(
+            ArgumentError(
+                "rng_mode = :global needs the pre-drawn noise buffers; " *
+                "this is a caller bug, not a user-facing one",
+            ),
+        )
+        # Serial pre-draw, in trial order — the sequential smoother's stream.
+        for trial in eachindex(noise_bufs)
+            randn!(rng, noise_bufs[trial])
+        end
+        return (_ -> rng), (trial -> noise_bufs[trial])
+    end
+
+    rng_mode === :trial ||
+        throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
+
+    #=
+    One seed per alternation, taken from the master generator on this thread,
+    then mixed with the trial index. Per trial rather than per task, so the
+    sample a trial gets does not move when the chunk layout does — and *only*
+    the trial index, so that the alternation's identity comes from which draw
+    off `rng` produced its seed, not from its position within a call.
+    =#
+    pass_seed = rand(rng, UInt64)
+    return (trial -> Random.Xoshiro(hash((pass_seed, trial)))), (_ -> nothing)
+end
+
+"""
+    _vem_alternate!(slds, cell_slds, grp, tfs, fb_storage, dl, y, pool, plan; smoothing_iters, tol, x_samples, ...)
 
 Run up to `smoothing_iters` discrete↔continuous alternations of the structured-
 variational E-step. One alternation is:
@@ -1111,8 +1712,10 @@ variational E-step. One alternation is:
 `x_samples` selects how step 1 reads the continuous trajectory, and is the only
 difference between the two callers:
 
-- `x_samples === nothing` — plug in the smoothed mean `E_q[x]`. Deterministic and
-  reproducible; used by [`smooth`](@ref) for post-fit inference.
+- `x_samples === nothing` — plug in the smoothed mean `E_q[x]`, with the
+  `½ tr(H^{(k,t)} Σ)` correction of [`_add_cov_correction!`](@ref) added back so
+  step 1 still scores `E_q(x)[log p_k]` rather than the biased plug-in.
+  Deterministic and reproducible; used by [`smooth`](@ref) for post-fit inference.
 - `x_samples !== nothing` — plug in a joint draw from `q(x)`, and draw the next one in
   step 3. This is the vLEM Monte-Carlo E-step used by [`fit!`](@ref); `x_samples` is
   read then overwritten within each alternation.
@@ -1133,17 +1736,20 @@ function _vem_alternate!(
     fb_storage::HMMs.ForwardBackwardStorage,
     dl::SLDSDiscreteLayer{T},
     y::AbstractVector{<:AbstractMatrix{T}},
-    slds_ws::SLDSSmoothWorkspace{T};
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int,
     tol::T=zero(T),
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     prog=nothing,
 ) where {T<:Real}
     smoothing_iters >= 1 ||
@@ -1169,7 +1775,12 @@ function _vem_alternate!(
     for iter in 1:smoothing_iters
         iters = iter
 
-        # (1) Score the current continuous trajectory under each regime.
+        #=
+        (1) Score the current continuous trajectory under each regime. The
+        deterministic path plugs in the smoothed mean, so it also needs the
+        `½ tr(H Σ)` term that turns that plug-in into E_q(x)[·]; the sampled
+        path gets the spread from the draw itself and passes `tfs = nothing`.
+        =#
         _slds_fill_logL!(
             slds,
             cell_slds,
@@ -1177,11 +1788,13 @@ function _vem_alternate!(
             dl,
             y,
             x_of,
-            slds_ws;
+            pool,
+            plan;
             seq_ends=seq_ends,
             ux=ux,
             uy=uy,
-            cell_ws=cell_ws,
+            lognorm=lognorm,
+            tfs=(x_samples === nothing ? tfs : nothing),
         )
 
         # (2) Update q(z): single batched forward-backward across all trials.
@@ -1199,6 +1812,7 @@ function _vem_alternate!(
         out. Overwriting `x_samples` here is fine — step (1) already used the
         previous draw.
         =#
+        rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
         _slds_smooth_all!(
             slds,
             cell_slds,
@@ -1206,12 +1820,14 @@ function _vem_alternate!(
             tfs,
             y,
             x_samples,
-            slds_ws,
+            pool,
+            plan,
             w_of;
-            rng=rng,
+            rng_of=rng_of,
+            noise_of=noise_of,
             ux=ux,
             uy=uy,
-            cell_ws=cell_ws,
+            lognorm=lognorm,
         )
 
         prog !== nothing && next!(prog)
@@ -1236,7 +1852,7 @@ function _vem_alternate!(
 end
 
 """
-    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; rng, obs_seq, control_seq, seq_ends, smoothing_iters=1)
+    estep!(slds, tfs, fb_storage, dl, y, x_samples, pool, plan; rng, obs_seq, control_seq, seq_ends, smoothing_iters=1)
 
 Monte-Carlo E-step for the SLDS: `smoothing_iters` coordinate-ascent alternations of
 [`_vem_alternate!`](@ref), each scoring the discrete layer against a joint draw from
@@ -1258,13 +1874,17 @@ function estep!(
     dl::SLDSDiscreteLayer{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     x_samples::AbstractVector{<:AbstractMatrix{T}},
-    slds_ws::SLDSSmoothWorkspace{T};
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
     rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     _vem_alternate!(
@@ -1275,17 +1895,69 @@ function estep!(
         fb_storage,
         dl,
         y,
-        slds_ws;
+        pool,
+        plan;
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
         ux=ux,
         uy=uy,
+        lognorm=lognorm,
         smoothing_iters=smoothing_iters,
         x_samples=x_samples,
         rng=rng,
+        rng_mode=rng_mode,
+        noise_bufs=noise_bufs,
     )
     return nothing
+end
+
+"""
+    estep!(slds, tfs, fb_storage, dl, y, x_samples, slds_ws; ...)
+
+Single-workspace E-step: the caller owns one `SLDSSmoothWorkspace` rather than
+a pool, so every trial runs on it sequentially. Equivalent to the pooled form
+with `npool = 1`, and the form to reach for when driving the E-step by hand.
+"""
+function estep!(
+    slds::SLDS{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    dl::SLDSDiscreteLayer{T},
+    y::AbstractVector{<:AbstractMatrix{T}},
+    x_samples::AbstractVector{<:AbstractMatrix{T}},
+    slds_ws::SLDSSmoothWorkspace{T};
+    rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+    obs_seq::AbstractVector,
+    control_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
+    smoothing_iters::Int=1,
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    return estep!(
+        slds,
+        tfs,
+        fb_storage,
+        dl,
+        y,
+        x_samples,
+        _slds_solo_pool(slds_ws),
+        _slds_trial_plan(nothing, length(y), 1);
+        rng=rng,
+        rng_mode=rng_mode,
+        noise_bufs=noise_bufs,
+        obs_seq=obs_seq,
+        control_seq=control_seq,
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        lognorm=lognorm,
+        smoothing_iters=smoothing_iters,
+    )
 end
 
 # tr(A·B) without forming the product: Σ_ij A[i,j]·B[j,i].
@@ -1357,7 +2029,7 @@ function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
 end
 
 """
-    _slds_trial_elbo(slds, fs, fb_storage, y_trial, slds_ws, t1, t2, ux_trial, uy_trial)
+    _slds_trial_elbo(slds, fs, fb_storage, y_trial, slds_ws, t1, t2, ux_trial, uy_trial, lognorm_t)
 
 One trial's contribution to the SLDS ELBO (everything except the parameter
 log-prior). Split out of `elbo!` so a caller can evaluate a trial against a
@@ -1376,6 +2048,7 @@ function _slds_trial_elbo(
     t2::Int,
     ux_trial::Union{Nothing,AbstractMatrix{T}},
     uy_trial::Union{Nothing,AbstractMatrix{T}},
+    lognorm_t::Union{Nothing,AbstractVector{T}}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     K = length(slds.LDSs)
     Tsteps = t2 - t1 + 1
@@ -1396,7 +2069,7 @@ function _slds_trial_elbo(
 
     # E_q[log p(y, x | z)], plug-in at the posterior mean, weighted by γ.
     for k in 1:K
-        joint_loglikelihood!(
+        _slds_trial_loglikelihood!(
             ll,
             slds_ws,
             slds_ws.consts[k],
@@ -1405,6 +2078,7 @@ function _slds_trial_elbo(
             y_trial,
             ux_trial,
             uy_trial,
+            lognorm_t,
         )
         for t in 1:Tsteps
             trial_elbo += w[k, t] * ll[t]
@@ -1422,10 +2096,10 @@ function _slds_trial_elbo(
     H_sub = slds_ws.btd.H_sub
     H_super = slds_ws.btd.H_super
     for t in 1:Tsteps
-        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth, :, :, t))
+        trial_elbo += T(0.5) * _tr_prod(H_diag[t], view(fs.p_smooth,:,:,t))
     end
     for t in 2:Tsteps
-        Σ_ttm1 = view(fs.p_smooth_tt1, :, :, t)  # Cov(x_t, x_{t-1})
+        Σ_ttm1 = view(fs.p_smooth_tt1,:,:,t)  # Cov(x_t, x_{t-1})
         trial_elbo += T(0.5) * _tr_prod(H_super[t - 1], Σ_ttm1)
         trial_elbo += T(0.5) * _tr_prod(H_sub[t - 1], transpose(Σ_ttm1))
     end
@@ -1471,7 +2145,7 @@ function _slds_trial_elbo(
 end
 
 """
-    elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends)
+    elbo!(slds, tfs, fb_storage, y, pool, plan; seq_ends)
 
 Evidence lower bound for the SLDS at the current variational posteriors —
 q(x) the per-trial joint Gaussian from the Laplace smoother, q(z) the
@@ -1504,30 +2178,118 @@ function elbo!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     y::AbstractVector{<:AbstractMatrix{T}},
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    per_trial = _slds_trial_elbos(
+        slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
+    )
+    return sum(per_trial) + _slds_prior_logdensity(slds)
+end
+
+"""
+    elbo!(slds, tfs, fb_storage, y, slds_ws; seq_ends, ux, uy)
+
+Single-workspace ELBO: as above with the trials run sequentially on one
+workspace. Returns the same number the pooled form does — the per-trial
+contributions are summed in trial order either way.
+"""
+function elbo!(
+    slds::SLDS{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    y::AbstractVector{<:AbstractMatrix{T}},
     slds_ws::SLDSSmoothWorkspace{T};
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    total_elbo = zero(T)
-    ntrials = length(y)
+    return elbo!(
+        slds,
+        tfs,
+        fb_storage,
+        y,
+        _slds_solo_pool(slds_ws),
+        _slds_trial_plan(nothing, length(y), 1);
+        seq_ends=seq_ends,
+        ux=ux,
+        uy=uy,
+        lognorm=lognorm,
+    )
+end
 
-    for trial in 1:ntrials
-        t1, t2 = HMMs.seq_limits(seq_ends, trial)
-        total_elbo += _slds_trial_elbo(
-            slds,
-            tfs[trial],
-            fb_storage,
-            y[trial],
-            slds_ws,
-            t1,
-            t2,
-            ux === nothing ? nothing : ux[trial],
-            uy === nothing ? nothing : uy[trial],
-        )
+"""
+    _slds_trial_elbos(slds, cell_slds, grp, tfs, fb_storage, y, pool, plan; ...)
+
+Every trial's ELBO contribution, computed in parallel and returned **per trial**.
+Shared by the ungrouped and grouped ELBOs, which differ only in which parameter
+set each trial is scored against.
+
+Per trial rather than per chunk deliberately: the caller then sums in trial
+order, so the total is the same number whatever `npool` is. Chunk partials would
+have been cheaper by one vector, but would have made the ELBO depend on the
+chunk layout at rounding level, and the ELBO is a number users compare across
+runs. `ntrials` extra floats is not a cost worth that.
+"""
+function _slds_trial_elbos(
+    slds::SLDS{T},
+    cell_slds::Union{Nothing,AbstractVector},
+    grp::Union{Nothing,ParameterGrouping},
+    tfs::TrialFilterSmooth{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    y::AbstractVector{<:AbstractMatrix{T}},
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
+    seq_ends::AbstractVector{Int},
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real}
+    per_trial = zeros(T, length(y))
+    grouped = grp !== nothing && cell_slds !== nothing
+
+    tforeach(1:_plan_ntasks(plan)) do slot
+        local lo, hi, cur_cell, ws_t, slds_t
+        lo = plan.bounds[slot]
+        hi = plan.bounds[slot + 1] - 1
+        lo > hi && return nothing
+
+        cur_cell = 0
+        ws_t = pool.slots[slot]
+        slds_t = slds
+
+        for idx in lo:hi
+            trial = plan.order[idx]
+            if grouped && plan.cell_of[idx] != cur_cell
+                cur_cell = plan.cell_of[idx]
+                slds_t = cell_slds[cur_cell]
+                ws_t = _slds_pool_ws(pool, slot, cur_cell, cell_slds)
+                refresh_slds_constants!(ws_t, slds_t)
+            end
+
+            t1, t2 = HMMs.seq_limits(seq_ends, trial)
+            per_trial[trial] = _slds_trial_elbo(
+                slds_t,
+                tfs[trial],
+                fb_storage,
+                y[trial],
+                ws_t,
+                t1,
+                t2,
+                ux === nothing ? nothing : ux[trial],
+                uy === nothing ? nothing : uy[trial],
+                lognorm === nothing ? nothing : lognorm[trial],
+            )
+        end
+        return nothing
     end
 
-    return total_elbo + _slds_prior_logdensity(slds)
+    return per_trial
 end
 
 """
@@ -1697,13 +2459,18 @@ function _broadcast_tied_params!(
 end
 
 """
-    _tied_poisson_emission!(slds, tfs, data, sws, weights, tied)
+    _tied_poisson_emission!(slds, tfs, data, sws, weights_of, tied; ntasks)
 
-Poisson emission M-step for an `SLDS`. Non-conjugate, so it is one LBFGS solve
+Poisson emission M-step for an `SLDS`. Non-conjugate, so it is one Newton solve
 per distinct `[C d D]`: `K` of them at the regimes' own responsibilities, or a
 single unit-weight one when `[C d D]` is tied whole — summing the per-regime weighted
 objectives collapses to the unit-weight one, because the emission term does not
 depend on `k` and `Σₖ γₖ(t) = 1`.
+
+`ntasks` is how many chunks each solve splits its trials into. The solver keeps
+its own per-chunk scratch, so one workspace still serves; without this the
+one-element pool an SLDS has to hand pinned every solve to a single task, which
+is what left the emission M-step serial while the PLDS one ran chunked.
 """
 function _tied_poisson_emission!(
     slds::SLDS{T},
@@ -1711,15 +2478,25 @@ function _tied_poisson_emission!(
     data::Data{T},
     sws::SmoothWorkspace{T},
     weights_of,
-    tie_emission::Bool,
+    tie_emission::Bool;
+    ntasks::Int=1,
 ) where {T<:Real}
     if tie_emission
-        update_observation_model!(slds.LDSs[1], tfs, data.y, [sws], nothing; uy=data.uy)
+        update_observation_model!(
+            slds.LDSs[1], tfs, data.y, [sws], nothing; uy=data.uy, ntasks=ntasks
+        )
         return nothing
     end
+    #=
+    The `K` solves write into disjoint `slds.LDSs[k].obs_model` arrays and read
+    only `tfs` / `data`, so they are independent. They stay sequential here and
+    each parallelises over its own trials instead: `ntrials ≫ K` in every fit
+    this is for, so chunking trials fills the threads and chunking regimes on
+    top would only fragment them.
+    =#
     for k in eachindex(slds.LDSs)
         update_observation_model!(
-            slds.LDSs[k], tfs, data.y, [sws], weights_of(k); uy=data.uy
+            slds.LDSs[k], tfs, data.y, [sws], weights_of(k); uy=data.uy, ntasks=ntasks
         )
     end
     return nothing
@@ -1848,6 +2625,12 @@ function mstep!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
+    sws_pool::Vector{SmoothWorkspace{T}}=[sws],
+    ntasks::Int=1,
+    data::Union{Nothing,Data{T}}=nothing,
+    sufs::Union{Nothing,AbstractVector}=nothing,
+    bufs::Union{Nothing,GroupedSufBuffers{T}}=nothing,
+    init_scratch::Union{Nothing,LinearDynamicalSystem}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
     ntrials = length(y)
@@ -1858,9 +2641,11 @@ function mstep!(
     #=
     `Data` canonicalizes absent ux/uy to zero-row matrices and validates the
     supplied ones. All regimes share the same input dims (enforced by
-    `validate_SLDS`), so one `Data` serves every `lds_k`.
+    `validate_SLDS`), so one `Data` serves every `lds_k`. `fit!` builds it once
+    at entry and passes it in — the shapes cannot change between iterations, so
+    re-validating every trial each M-step is pure overhead.
     =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    dat = data === nothing ? Data(slds.LDSs[1], y; ux=ux, uy=uy) : data
 
     function weights_of(k)
         return [
@@ -1877,11 +2662,36 @@ function mstep!(
     read the regression that was just written, so the updates cannot be
     interleaved with the aggregation the way a fully per-regime M-step can.
     =#
-    sufs = [_initialize_td_sufficient_statistics(T, slds.LDSs[1], data.tsteps) for _ in 1:K]
-    for k in 1:K
-        _aggregate_td_suff_stats_weighted!(
-            sufs[k], tfs, slds.LDSs[k], data, weights_of(k), sws
-        )
+    sf = if sufs === nothing
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], dat.tsteps) for _ in 1:K]
+    else
+        sufs
+    end
+    #=
+    The `K` aggregations write into disjoint `sufs[k]` and read `tfs` / `data`
+    only, so they run in parallel — each on its own workspace, since the
+    aggregator uses `sws` as scratch before copying the result out. `weights_of`
+    is called inside the task so each regime's view vector is built there rather
+    than K times up front.
+
+    This is the axis that stays useful when `ntrials < nthreads`: the weighted
+    aggregator has no per-trial parallelism of its own, so without this it is K
+    sequential passes over every trial.
+    =#
+    let n = max(1, min(K, length(sws_pool)))
+        chunk = cld(K, n)
+        tforeach(1:n) do i
+            local lo, hi
+            lo = (i - 1) * chunk + 1
+            hi = min(i * chunk, K)
+            lo > hi && return nothing
+            for k in lo:hi
+                _aggregate_td_suff_stats_weighted!(
+                    sf[k], tfs, slds.LDSs[k], dat, weights_of(k), sws_pool[i]
+                )
+            end
+            return nothing
+        end
     end
 
     lds1 = slds.LDSs[1]
@@ -1891,7 +2701,7 @@ function mstep!(
 
     slots_q = _tie_slots(:Q in tied, K)
     slots_r = _tie_slots(:R in tied, K)
-    bufs = GroupedSufBuffers(T, lds1, data.tsteps)
+    bf = bufs === nothing ? GroupedSufBuffers(T, lds1, dat.tsteps) : bufs
 
     #=
     `[A b B]` then `Q`, `[C d D]` then `R`: the covariance updates read the
@@ -1900,18 +2710,24 @@ function mstep!(
     them — every regime's stacked matrix differs, in its free columns.
     =#
     slots_ab = _slds_update_regression!(
-        _DynBlock(), slds, sufs, dyn_cols, slots_q, sws, bufs, K
+        _DynBlock(), slds, sf, dyn_cols, slots_q, sws, bf, K
     )
-    _grouped_update_Q!(slds.LDSs, sufs, slots_q, slots_ab, sws)
+    _grouped_update_Q!(slds.LDSs, sf, slots_q, slots_ab, sws)
 
     if lds1.obs_model isa GaussianObservationModel{T}
         slots_cd = _slds_update_regression!(
-            _ObsBlock(), slds, sufs, obs_cols, slots_r, sws, bufs, K
+            _ObsBlock(), slds, sf, obs_cols, slots_r, sws, bf, K
         )
-        _grouped_update_R!(slds.LDSs, sufs, slots_r, slots_cd, sws)
+        _grouped_update_R!(slds.LDSs, sf, slots_r, slots_cd, sws)
     elseif lds1.obs_model isa PoissonObservationModel{T}
         _tied_poisson_emission!(
-            slds, tfs, data, sws, weights_of, length(obs_cols) == D + 1 + lds1.uy_dim
+            slds,
+            tfs,
+            dat,
+            sws,
+            weights_of,
+            length(obs_cols) == D + 1 + lds1.uy_dim;
+            ntasks=ntasks,
         )
     else
         throw(ArgumentError("Unsupported observation model $(typeof(lds1.obs_model))"))
@@ -1925,34 +2741,50 @@ function mstep!(
     over modes of the per-mode init stats the aggregator already computed.
     =#
     D = slds.LDSs[1].latent_dim
-    suf = sufs[1]
+    suf = sf[1]
     init_xy = zeros(T, 1, D)
     init_yy = zeros(T, D, D)
     init_n = zero(T)
     for k in 1:K
-        init_xy .+= sufs[k].init_xy
-        init_yy .+= sufs[k].init_yy[]
-        init_n += T(sufs[k].init_n)
+        init_xy .+= sf[k].init_xy
+        init_yy .+= sf[k].init_yy[]
+        init_n += T(sf[k].init_n)
     end
     copyto!(suf.init_xy, init_xy)
     suf.init_yy[] = init_yy
     suf.init_n = init_n
-    _update_shared_initial_state!(slds, suf, sws)
+    _update_shared_initial_state!(slds, suf, sws; scratch=init_scratch)
 
     return nothing
 end
 
 """
-    _update_shared_initial_state!(slds, suf, sws)
+    _update_shared_initial_state!(slds, suf, sws; scratch=nothing)
 
 Fit the single initial-state distribution `N(x0, P0)` shared by all SLDS modes
 from the pooled init stats in `suf` (see `mstep!`) and copy it into every
 `state_model`.
+
+The update routines write through an `LinearDynamicalSystem`, so this needs one
+to write into that is not a regime. `scratch` supplies it; `fit!` allocates it
+once at entry rather than `deepcopy`ing a whole sub-model — priors, emission
+matrices and all — on every EM iteration.
 """
 function _update_shared_initial_state!(
-    slds::SLDS{T}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
+    slds::SLDS{T},
+    suf::SufficientStatistics{T},
+    sws::SmoothWorkspace{T};
+    scratch::Union{Nothing,LinearDynamicalSystem}=nothing,
 ) where {T<:Real}
-    lds1 = deepcopy(slds.LDSs[1])
+    lds1 = scratch === nothing ? deepcopy(slds.LDSs[1]) : scratch
+    #=
+    Only `x0` / `P0` are read back out, but the covariance update's scatter
+    reads `x0`, so the scratch must start from the current regime's values.
+    =#
+    if scratch !== nothing
+        copyto!(lds1.state_model.x0, slds.LDSs[1].state_model.x0)
+        copyto!(lds1.state_model.P0, slds.LDSs[1].state_model.P0)
+    end
     update_initial_state_mean!(lds1, suf)
     update_initial_state_covariance!(lds1, suf, sws)
     fit_x0, fit_P0 = lds1.fit_bool[1], lds1.fit_bool[2]
@@ -2019,6 +2851,39 @@ A partial tie has no reduction for a Poisson `[C d D]`, which is fitted by
 LBFGS rather than from sufficient statistics, or alongside `depends_on`, which
 already splits the regression per group of trials — those throw rather than
 guess.
+
+# Parallelism and reproducibility
+
+Every per-trial pass — the smoother, the discrete layer's log-likelihood fill,
+and the ELBO — runs its trials in chunks across a pool of `npool` workspaces,
+one per thread by default and capped at the trial count. A chunk owns its slot
+for the whole pass, so nothing is shared between concurrently running trials.
+
+`npool` also sets the memory: each slot holds `O(D²·T)` block-tridiagonal
+storage and, for a Poisson emission, `O(N·T)` batched scratch. Lower it to trade
+throughput for memory; `npool = 1` runs every pass sequentially.
+
+`rng_mode` decides how the E-step's per-trial posterior draw is sourced, which
+is the only place parallelism could change results:
+
+- `:trial` (default) gives each trial its own generator, seeded from `rng` and
+  the trial index. The draw a trial receives is then a function of `rng` alone —
+  identical across thread counts, across `npool`, and between the parallel and
+  sequential paths.
+- `:global` draws the standard normals from `rng` serially in trial order before
+  each pass, reproducing the exact stream the sequential smoother consumed. Use
+  it to return to an existing fit; the pass itself still runs in parallel.
+
+What is guaranteed, in either mode: **the fit does not depend on the thread
+count**. Every per-trial result — `x_smooth`, `p_smooth`, the responsibilities,
+`dl.logL` — is written by exactly one trial, so those are bit-identical however
+the chunks are scheduled, and the ELBO is summed in trial order so it is too.
+
+What `npool` does change, at rounding level: the Poisson emission M-step sums
+its curvature and gradient over chunks, so a different chunk count is a
+different summation order. The effect is ~1e-11 relative after tens of EM
+iterations. Pin `npool` alongside `rng` to reproduce a fit exactly; leave it at
+the default for the best throughput on whatever machine is running.
 """
 function fit!(
     slds::SLDS{T,S,O},
@@ -2029,9 +2894,13 @@ function fit!(
     smoothing_iters::Int=1,
     progress::Bool=true,
     rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    rng_mode in (:trial, :global) ||
+        throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
     )
@@ -2087,12 +2956,19 @@ function fit!(
         ux_dim=slds.LDSs[1].ux_dim,
         uy_dim=slds.LDSs[1].uy_dim,
     )
-    slds_ws = SLDSSmoothWorkspace(T, slds, T_max)
     #=
-    Per-cell workspaces for a stitching fit; `nothing` when ungrouped, and the
-    base workspace itself when every session has the same channel count.
+    One SLDS workspace per task slot (plus the per-cell workspaces a ragged
+    stitching fit needs), and the fixed chunking of trials over them that every
+    per-trial pass reuses.
     =#
-    cell_ws = _slds_cell_workspaces(slds, cell_slds, slds_ws, T_max)
+    pool = _slds_workspace_pool(slds, cell_slds, T_max, ntrials; npool=npool)
+    plan = _slds_trial_plan(grp, ntrials, length(pool.slots))
+    #=
+    The Poisson `-Σ log(y!)` normalizer, once per trial. Constant in the
+    latents, so the Newton line search must never recompute it; `nothing` for a
+    Gaussian emission, which has no data-only normalizer.
+    =#
+    lognorm = _slds_lognorm_all(slds, y_seq)
     #=
     The M-step's regression buffers are shaped by `obs_dim` too, so a stitching
     fit needs one per cell. `_cell_workspace` shares the block-tridiagonal and
@@ -2100,7 +2976,53 @@ function fit!(
     path for every fit whose cells have the parent's width.
     =#
     cell_mstep_sws = _slds_cell_mstep_workspaces(slds, cell_slds, sws, T_max)
+    #=
+    M-step scratch. `mstep_tasks` is capped at the number of aggregations there
+    are to run — `K` ungrouped, `K · ncells` grouped — because that is the only
+    axis these workspaces parallelise; the emission solve chunks its own trials
+    and takes `ntasks` instead, which is the thread budget.
+    =#
+    mstep_units = grp === nothing ? K : K * grp.ncells
+    mstep_tasks = max(1, min(npool, mstep_units))
+    sws_pool = _slds_mstep_pool(slds, T_max, mstep_tasks)
+    sws_pool[1] = sws
+    cell_mstep_pools = _slds_cell_mstep_pools(slds, cell_slds, sws_pool, T_max)
+    #=
+    M-step objects that depend only on shapes, hoisted out of the EM loop: the
+    trial shapes cannot change between iterations, so rebuilding `Data` (which
+    re-validates every trial), the per-regime sufficient statistics and the
+    grouped regression buffers each M-step was pure overhead. `init_scratch`
+    replaces a per-iteration `deepcopy` of a whole sub-model.
+    =#
+    mstep_sufs = if grp === nothing
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial) for _ in 1:K]
+    else
+        nothing
+    end
+    #=
+    Built from cell 1's sub-model on the grouped path, not the parent's: under
+    stitching the cells differ in channel count, and this is the model the
+    grouped M-step sizes its default statistics from.
+    =#
+    mstep_bufs = GroupedSufBuffers(
+        T, grp === nothing ? slds.LDSs[1] : cell_slds[1].LDSs[1], tsteps_per_trial
+    )
+    init_scratch = deepcopy(slds.LDSs[1])
+    # Per-cell slices of the data and smoother storage, fixed by the partition.
+    cell_views = if grp === nothing
+        nothing
+    else
+        (
+            [_subset_data(data, grp.cell_trials[c]) for c in 1:(grp.ncells)],
+            [
+                TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for
+                c in 1:(grp.ncells)
+            ],
+        )
+    end
     x_samples = [Matrix{T}(undef, latent_dim, Ti) for Ti in tsteps_per_trial]
+    # Pre-drawn standard normals, only when `:global` reproducibility is asked for.
+    noise_bufs = rng_mode === :global ? _slds_noise_buffers(x_samples) : nothing
 
     #=
     Broadcast the tied groups before the first E-step rather than only after the
@@ -2135,13 +3057,16 @@ function fit!(
         tfs,
         y_seq,
         x_samples,
-        slds_ws,
+        pool,
+        plan,
         tsteps_per_trial,
         K;
         rng=rng,
+        rng_mode=rng_mode,
+        noise_bufs=noise_bufs,
         ux=ux_seq,
         uy=uy_seq,
-        cell_ws=cell_ws,
+        lognorm=lognorm,
     )
 
     for iter in 1:max_iter
@@ -2157,13 +3082,17 @@ function fit!(
                 dl,
                 y_seq,
                 x_samples,
-                slds_ws;
+                pool,
+                plan;
                 rng=rng,
+                rng_mode=rng_mode,
+                noise_bufs=noise_bufs,
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
+                lognorm=lognorm,
                 smoothing_iters=smoothing_iters,
             )
 
@@ -2173,10 +3102,12 @@ function fit!(
                 tfs,
                 fb_storage,
                 y_seq,
-                slds_ws;
+                pool,
+                plan;
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
+                lognorm=lognorm,
             )
 
             # M-step: update discrete and continuous parameters.
@@ -2192,8 +3123,16 @@ function fit!(
                 ux=ux_seq,
                 uy=uy_seq,
                 tied=tied,
+                sws_pool=sws_pool,
+                ntasks=npool,
+                data=data,
+                sufs=mstep_sufs,
+                bufs=mstep_bufs,
+                init_scratch=init_scratch,
             )
-            refresh_slds_constants!(slds_ws, slds)
+            # Every slot, not just the first: the ungrouped passes read the
+            # cached constants without refreshing them.
+            refresh_slds_pool!(pool, slds)
         else
             grouping = grp::ParameterGrouping
             cells = cell_slds::Vector
@@ -2205,14 +3144,17 @@ function fit!(
                 dl,
                 y_seq,
                 x_samples,
-                slds_ws;
+                pool,
+                plan;
                 rng=rng,
+                rng_mode=rng_mode,
+                noise_bufs=noise_bufs,
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
-                cell_ws=cell_ws,
+                lognorm=lognorm,
                 smoothing_iters=smoothing_iters,
             )
 
@@ -2222,11 +3164,12 @@ function fit!(
                 tfs,
                 fb_storage,
                 y_seq,
-                slds_ws;
+                pool,
+                plan;
                 seq_ends=seq_ends,
                 ux=ux_seq,
                 uy=uy_seq,
-                cell_ws=cell_ws,
+                lognorm=lognorm,
             )
 
             _mstep_grouped!(
@@ -2241,6 +3184,11 @@ function fit!(
                 seq_ends=seq_ends,
                 cell_sws=cell_mstep_sws,
                 tied=tied,
+                sws_pool=sws_pool,
+                cell_sws_pools=cell_mstep_pools,
+                ntasks=npool,
+                bufs=mstep_bufs,
+                cell_views=cell_views,
             )
         end
 
@@ -2265,7 +3213,7 @@ end
 # ============================================================================
 
 """
-    _slds_warmstart!(slds, cell_slds, grp, tfs, y, x_samples, slds_ws, tsteps, K; ...)
+    _slds_warmstart!(slds, cell_slds, grp, tfs, y, x_samples, pool, plan, tsteps, K; ...)
 
 Smooth every trial once with uniform discrete weights `γ ≡ 1/K`, so the first
 discrete update has a continuous trajectory to score. `x_samples` receives the
@@ -2279,17 +3227,23 @@ function _slds_warmstart!(
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
-    slds_ws::SLDSSmoothWorkspace{T},
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan,
     tsteps::AbstractVector{Int},
     K::Int;
     rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     function w_of(trial)
         return fill(one(T) / K, K, tsteps[trial])
     end
+
+    # The warm start's draw is simply the first one off `rng`.
+    rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
 
     _slds_smooth_all!(
         slds,
@@ -2298,12 +3252,14 @@ function _slds_warmstart!(
         tfs,
         y,
         x_samples,
-        slds_ws,
+        pool,
+        plan,
         w_of;
-        rng=rng,
+        rng_of=rng_of,
+        noise_of=noise_of,
         ux=ux,
         uy=uy,
-        cell_ws=cell_ws,
+        lognorm=lognorm,
     )
     return nothing
 end
@@ -2360,9 +3316,10 @@ end
     _cell_slds_workspace(base, slds_c, tsteps) -> SLDSSmoothWorkspace
 
 One cell's SLDS workspace for a stitching fit. Reuses `base`'s
-block-tridiagonal storage and per-timestep log-density scratch — the O(D²·T)
-and O(T) parts, neither of which depends on `obs_dim` — and allocates fresh
-per-regime constants and Newton buffers at this cell's channel count.
+block-tridiagonal storage, per-timestep log-density scratch, and emission-
+curvature scratch — the parts sized by `latent_dim` and `tsteps` alone, none of
+which depends on `obs_dim` — and allocates fresh per-regime constants and Newton
+buffers at this cell's channel count.
 
 Safe for the same reason the LDS side is: cells run one at a time, and a cell's
 Hessian blocks are consumed before the next cell overwrites them.
@@ -2379,6 +3336,7 @@ function _cell_slds_workspace(
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
         base.ll_tmp,                                       # shared, length T_max
+        base.H_obs,                                        # shared, latent_dim square
         nothing,                                           # batched Poisson scratch
     )
     refresh_slds_constants!(ws, slds_c)
@@ -2386,27 +3344,53 @@ function _cell_slds_workspace(
 end
 
 """
-    _slds_cell_workspaces(slds, cell_slds, base, tsteps) -> Vector or nothing
+    _slds_mstep_pool(slds, T_max, ntasks) -> Vector{SmoothWorkspace}
 
-One workspace per cell. When every cell has the parent's `obs_dim` — which
-includes every SLDS fit that is not stitching sessions of differing width —
-each entry is `base` itself, so nothing extra is allocated and the previous
-code path is what runs.
+Scratch workspaces for the M-step's parallel axes: the `K` (or `K · ncells`)
+weighted sufficient-statistic aggregations, which use a workspace as scratch and
+so need one each. Capped at the number of aggregations there are to run — more
+slots than units would allocate storage nothing writes to.
 """
-function _slds_cell_workspaces(
+function _slds_mstep_pool(slds::SLDS{T}, T_max::Int, ntasks::Int) where {T<:Real}
+    lds1 = slds.LDSs[1]
+    n = max(1, ntasks)
+    return [
+        SmoothWorkspace(
+            T, lds1.latent_dim, lds1.obs_dim, T_max; ux_dim=lds1.ux_dim, uy_dim=lds1.uy_dim
+        ) for _ in 1:n
+    ]
+end
+
+"""
+    _slds_cell_mstep_pools(slds, cell_slds, sws_pool, tsteps) -> Vector or nothing
+
+One M-step workspace pool per cell, parallel to `sws_pool`, so a unit
+aggregation running on task `i` for cell `c` gets scratch at that cell's channel
+width. `nothing` when every cell has the parent's width, which keeps the
+uniform fit on `sws_pool` itself.
+"""
+function _slds_cell_mstep_pools(
     slds::SLDS,
     cell_slds::Union{Nothing,AbstractVector},
-    base::SLDSSmoothWorkspace{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
     tsteps::Int,
 ) where {T<:Real}
     cell_slds === nothing && return nothing
-    p0 = slds.LDSs[1].obs_dim
-    all(sc -> sc.LDSs[1].obs_dim == p0, cell_slds) && return [base for _ in cell_slds]
-    return [_cell_slds_workspace(base, sc, tsteps) for sc in cell_slds]
+    lds1 = slds.LDSs[1]
+    all(sc -> sc.LDSs[1].obs_dim == lds1.obs_dim, cell_slds) && return nothing
+    return [
+        [
+            _cell_workspace(
+                base,
+                lds1.latent_dim,
+                sc.LDSs[1].obs_dim,
+                tsteps;
+                ux_dim=lds1.ux_dim,
+                uy_dim=lds1.uy_dim,
+            ) for base in sws_pool
+        ] for sc in cell_slds
+    ]
 end
-
-_slds_ws_for(::Nothing, base::SLDSSmoothWorkspace, ::Int) = base
-_slds_ws_for(cell_ws::AbstractVector, ::SLDSSmoothWorkspace, c::Int) = cell_ws[c]
 
 """
     _slds_cell_mstep_workspaces(slds, cell_slds, base, tsteps) -> Vector or nothing
@@ -2439,45 +3423,6 @@ function _slds_cell_mstep_workspaces(
 end
 
 """
-    _slds_smooth_cell!(cell_slds, grp, cell, tfs, y, x_samples, slds_ws, w_of; rng, ux, uy)
-
-Smooth every trial of one cell after refreshing the workspace's regime constants
-for that cell's parameters. `w_of(trial)` supplies the `K × T` responsibilities.
-"""
-function _slds_smooth_cell!(
-    cell_slds::AbstractVector,
-    grp::ParameterGrouping,
-    cell::Int,
-    tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-    x_samples::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
-    slds_ws::SLDSSmoothWorkspace{T},
-    w_of;
-    rng::AbstractRNG=Random.default_rng(),
-    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
-) where {T<:Real}
-    slds_c = cell_slds[cell]
-    ws_c = _slds_ws_for(cell_ws, slds_ws, cell)
-    refresh_slds_constants!(ws_c, slds_c)
-    for trial in grp.cell_trials[cell]
-        smooth!(
-            slds_c,
-            tfs[trial],
-            y[trial],
-            w_of(trial);
-            ws=ws_c,
-            x_sample=(x_samples === nothing ? nothing : x_samples[trial]),
-            rng=rng,
-            ux=(ux === nothing ? nothing : ux[trial]),
-            uy=(uy === nothing ? nothing : uy[trial]),
-        )
-    end
-    return nothing
-end
-
-"""
     _estep_grouped!(cell_slds, grp, tfs, fb_storage, dl, y, x_samples, slds_ws; ...)
 
 Grouped SLDS E-step: `smoothing_iters` alternations of [`_vem_alternate!`](@ref)
@@ -2493,14 +3438,17 @@ function _estep_grouped!(
     dl::SLDSDiscreteLayer{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     x_samples::AbstractVector{<:AbstractMatrix{T}},
-    slds_ws::SLDSSmoothWorkspace{T};
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
     rng::AbstractRNG=Random.default_rng(),
+    rng_mode::Symbol=:trial,
+    noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
 ) where {T<:Real}
     #=
@@ -2516,16 +3464,19 @@ function _estep_grouped!(
         fb_storage,
         dl,
         y,
-        slds_ws;
+        pool,
+        plan;
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
         ux=ux,
         uy=uy,
-        cell_ws=cell_ws,
+        lognorm=lognorm,
         smoothing_iters=smoothing_iters,
         x_samples=x_samples,
         rng=rng,
+        rng_mode=rng_mode,
+        noise_bufs=noise_bufs,
     )
     return nothing
 end
@@ -2566,33 +3517,28 @@ function _elbo_grouped!(
     tfs::TrialFilterSmooth{T},
     fb_storage::HMMs.ForwardBackwardStorage,
     y::AbstractVector{<:AbstractMatrix{T}},
-    slds_ws::SLDSSmoothWorkspace{T};
+    pool::SLDSWorkspacePool{T},
+    plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    cell_ws::Union{Nothing,AbstractVector}=nothing,
+    lognorm::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
-    total_elbo = zero(T)
-    for c in 1:(grp.ncells)
-        slds_c = cell_slds[c]
-        ws_c = _slds_ws_for(cell_ws, slds_ws, c)
-        refresh_slds_constants!(ws_c, slds_c)
-        for trial in grp.cell_trials[c]
-            t1, t2 = HMMs.seq_limits(seq_ends, trial)
-            total_elbo += _slds_trial_elbo(
-                slds_c,
-                tfs[trial],
-                fb_storage,
-                y[trial],
-                ws_c,
-                t1,
-                t2,
-                (ux === nothing ? nothing : ux[trial]),
-                (uy === nothing ? nothing : uy[trial]),
-            )
-        end
-    end
-    return total_elbo + _grouped_slds_prior_logdensity(cell_slds, grp, T)
+    per_trial = _slds_trial_elbos(
+        cell_slds[1],
+        cell_slds,
+        grp,
+        tfs,
+        fb_storage,
+        y,
+        pool,
+        plan;
+        seq_ends,
+        ux,
+        uy,
+        lognorm,
+    )
+    return sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T)
 end
 
 """
@@ -2652,6 +3598,11 @@ function _mstep_grouped!(
     seq_ends::AbstractVector{Int},
     cell_sws::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
+    sws_pool::Vector{SmoothWorkspace{T}}=[sws],
+    cell_sws_pools::Union{Nothing,AbstractVector}=nothing,
+    ntasks::Int=1,
+    bufs::Union{Nothing,GroupedSufBuffers{T}}=nothing,
+    cell_views::Union{Nothing,Tuple{<:AbstractVector,<:AbstractVector}}=nothing,
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
     ncells = grp.ncells
@@ -2660,9 +3611,21 @@ function _mstep_grouped!(
     # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
     StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
 
-    cell_data = [_subset_data(data, grp.cell_trials[c]) for c in 1:ncells]
-    cell_tfs = [TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for c in 1:ncells]
-    bufs = GroupedSufBuffers(T, lds1, data.tsteps)
+    #=
+    Per-cell slices of the data and the smoother storage. They depend only on
+    the trial partition, which is fixed for the fit, so `fit!` builds them once
+    and passes them in; rebuilding them each M-step re-sliced every trial for
+    nothing.
+    =#
+    cell_data, cell_tfs = if cell_views === nothing
+        (
+            [_subset_data(data, grp.cell_trials[c]) for c in 1:ncells],
+            [TrialFilterSmooth([tfs[n] for n in grp.cell_trials[c]]) for c in 1:ncells],
+        )
+    else
+        cell_views
+    end
+    bf = bufs === nothing ? GroupedSufBuffers(T, lds1, data.tsteps) : bufs
 
     function γ_view(k, trial)
         t1, t2 = HMMs.seq_limits(seq_ends, trial)
@@ -2680,16 +3643,32 @@ function _mstep_grouped!(
         for k in 1:K for c in 1:ncells
     ]
 
-    for k in 1:K, c in 1:ncells
-        u = (k - 1) * ncells + c
-        _aggregate_td_suff_stats_weighted!(
-            unit_suf[u],
-            cell_tfs[c],
-            unit_lds[u],
-            cell_data[c],
-            [γ_view(k, n) for n in grp.cell_trials[c]],
-            _unit_ws(cell_sws, sws, c),
-        )
+    #=
+    The `K · ncells` unit aggregations write into disjoint `unit_suf[u]`, so
+    they run in parallel across `sws_pool` — each task on its own scratch
+    workspace, at the cell's own channel width when the fit stitches sessions of
+    differing width.
+    =#
+    let nunits = K * ncells, n = max(1, min(K * ncells, length(sws_pool)))
+        chunk = cld(nunits, n)
+        tforeach(1:n) do i
+            local lo, hi
+            lo = (i - 1) * chunk + 1
+            hi = min(i * chunk, nunits)
+            lo > hi && return nothing
+            for u in lo:hi
+                k, c = fldmod1(u, ncells)
+                _aggregate_td_suff_stats_weighted!(
+                    unit_suf[u],
+                    cell_tfs[c],
+                    unit_lds[u],
+                    cell_data[c],
+                    [γ_view(k, n2) for n2 in grp.cell_trials[c]],
+                    cell_sws_pools === nothing ? sws_pool[i] : cell_sws_pools[c][i],
+                )
+            end
+            return nothing
+        end
     end
 
     #=
@@ -2711,7 +3690,7 @@ function _mstep_grouped!(
     slots_q = _grouped_unit_slots(grp.cell_slot[_G_Q], K, :Q in tied)
     slots_cd = _grouped_unit_slots(grp.cell_slot[_G_CD], K, tie_obs)
 
-    _grouped_update_A_b!(unit_lds, unit_suf, slots_ab, slots_q, sws, bufs)
+    _grouped_update_A_b!(unit_lds, unit_suf, slots_ab, slots_q, sws, bf)
     _grouped_update_Q!(unit_lds, unit_suf, slots_q, slots_ab, sws)
 
     if lds1.obs_model isa GaussianObservationModel{T}
@@ -2722,7 +3701,7 @@ function _mstep_grouped!(
         =#
         slots_r = _grouped_unit_slots(grp.cell_slot[_G_R], K, :R in tied)
         _grouped_update_C_d!(
-            unit_lds, unit_suf, slots_cd, slots_r, sws, bufs; unit_sws=unit_sws
+            unit_lds, unit_suf, slots_cd, slots_r, sws, bf; unit_sws=unit_sws
         )
         _grouped_update_R!(unit_lds, unit_suf, slots_r, slots_cd, sws; unit_sws=unit_sws)
     elseif lds1.obs_model isa PoissonObservationModel{T}
@@ -2751,6 +3730,7 @@ function _mstep_grouped!(
                 [_unit_ws(unit_sws, sws, units[1])],
                 unit_weights;
                 uy=data.uy[trials[order]],
+                ntasks=ntasks,
             )
         end
     else
@@ -2773,7 +3753,7 @@ function _mstep_grouped!(
     =#
     slots_x0 = repeat(grp.cell_slot[_G_X0], K)
     slots_P0 = repeat(grp.cell_slot[_G_P0], K)
-    _grouped_update_x0!(unit_lds, unit_suf, slots_x0, bufs)
+    _grouped_update_x0!(unit_lds, unit_suf, slots_x0, bf)
     _broadcast_initial_state!(cell_slds, K, lds1.fit_bool[_G_X0], false)
     _grouped_update_P0!(unit_lds, unit_suf, slots_P0, slots_x0, sws)
     _broadcast_initial_state!(cell_slds, K, false, lds1.fit_bool[_G_P0])

@@ -457,7 +457,7 @@ function _poisson_newton_direction!(
 end
 
 """
-    update_observation_model!(plds, tfs, y, sws_pool, w; uy=nothing)
+    update_observation_model!(plds, tfs, y, sws_pool, w; uy=nothing, ntasks=length(sws_pool))
 
 Update the Poisson emission `[C d D]` by row-wise Newton on the exact Q-function
 (see the header of this file for why the rows separate and what the curvature
@@ -465,10 +465,17 @@ is). `uy` is the per-trial vector of observation-input matrices, `w` the
 per-trial timestep weights the SLDS path supplies; both may be `nothing`.
 
 Each Newton step takes one curvature pass over the trials plus one line-search
-pass per trial step length tried, both chunked across `sws_pool`. Every row gets
+pass per trial step length tried, both chunked. Every row gets
 its own backtracked step, so a neuron whose problem is badly scaled cannot hold
 back the rest, and a row stops being solved for once a full Newton step promises
 it less than `tol · |Q|` — the same units the caller's ELBO tolerance is in.
+
+The chunk count comes from `ntasks`, which defaults to the pool length because
+that is how many workspaces an LDS caller has to hand. The solver's own
+per-chunk scratch is the freshly built `PoissonMStepBuffers` below, not the
+pool, so a caller that owns one workspace but wants the pass parallel — the
+SLDS, whose emission solve is per regime — passes `ntasks` directly instead of
+padding a pool it has no other use for.
 """
 function update_observation_model!(
     plds::LinearDynamicalSystem{T,S,O},
@@ -479,6 +486,7 @@ function update_observation_model!(
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     max_iter::Int=50,
     tol::Real=1e-12,
+    ntasks::Int=length(sws_pool),
 ) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
     plds.fit_bool[5] || return nothing
 
@@ -503,17 +511,17 @@ function update_observation_model!(
     @views W[:, latent_dim + 1] .= plds.obs_model.d
     uy_dim > 0 && (@views W[:, (latent_dim + 2):reg_dim] .= plds.obs_model.D)
 
-    ntasks = max(1, min(ntrials, length(sws_pool)))
-    chunk_size = max(1, cld(ntrials, ntasks))
+    tasks = max(1, min(ntrials, ntasks))
+    chunk_size = max(1, cld(ntrials, tasks))
     chunks = collect(partition(1:ntrials, chunk_size))
-    ntasks = length(chunks)
+    tasks = length(chunks)
 
     curv_bufs = [
-        PoissonMStepBuffers(T, latent_dim, obs_dim, uy_dim, tsteps_max) for _ in 1:ntasks
+        PoissonMStepBuffers(T, latent_dim, obs_dim, uy_dim, tsteps_max) for _ in 1:tasks
     ]
     ls_bufs = [
         PoissonMStepBuffers(T, latent_dim, obs_dim, uy_dim, tsteps_max; curvature=false) for
-        _ in 1:ntasks
+        _ in 1:tasks
     ]
 
     Δ = zeros(T, reg_dim, obs_dim)
@@ -533,7 +541,7 @@ function update_observation_model!(
         _poisson_mstep_pass!(curv_bufs, chunks, W, tfs, y, uy, w, true, solving)
         # Reduce onto chunk 1's accumulators, in chunk order, so the result does
         # not depend on how the chunks were scheduled.
-        for c in 2:ntasks
+        for c in 2:tasks
             Hc = curv_bufs[c].H
             gc = curv_bufs[c].grad
             @inbounds @simd for i in eachindex(H)

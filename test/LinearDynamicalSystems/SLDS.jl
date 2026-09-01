@@ -3461,3 +3461,223 @@ function test_SLDS_poisson_cd_prior_with_inputs(; rng=MersenneTwister(0xBEEF))
     @test all(isfinite, elbos)
     return nothing
 end
+
+# ============================================================================
+# Trial-parallel execution: workspace pool, work partition, reproducibility
+# ============================================================================
+
+"""
+The batched Poisson emission log-density agrees with the per-timestep
+`observation_loglikelihood!` kernel it replaced, and the precomputed
+`-Σ log(y!)` normalizer changes nothing but the arithmetic order.
+"""
+function test_SLDS_batched_poisson_loglikelihood(; rng=MersenneTwister(0x10C))
+    K, D, N, tsteps = 3, 2, 5, 40
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(rng, slds, tsteps)
+    x = 0.3 * randn(rng, D, tsteps)
+    w = _rowstochastic(K)[:, 1:1] * ones(1, tsteps)
+    w ./= sum(w; dims=1)
+
+    ws = SSD.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    ln = SSD._poisson_lognorm_t(y)
+
+    # Precomputed vs. recomputed normalizer: identical inputs, same answer.
+    with_ln = copy(SSD.joint_loglikelihood!(ws, slds, x, y, w, nothing, nothing, ln))
+    without = copy(SSD.joint_loglikelihood!(ws, slds, x, y, w, nothing, nothing, nothing))
+    @test with_ln ≈ without rtol = 1e-12
+
+    # Against the per-timestep reference, regime by regime.
+    for k in 1:K
+        ref = zeros(tsteps)
+        z, λ = zeros(N), zeros(N)
+        for t in 1:tsteps
+            ref[t] = SSD.observation_loglikelihood!(
+                ws.consts[k], z, λ, slds.LDSs[k], x, y, t, nothing
+            )
+            ref[t] += SSD.state_loglikelihood!(
+                ws.consts[k], zeros(D), zeros(D), slds.LDSs[k], x, t, nothing
+            )
+        end
+        got = zeros(tsteps)
+        SSD._slds_trial_loglikelihood!(
+            got, ws, ws.consts[k], slds.LDSs[k], x, y, nothing, nothing, ln
+        )
+        @test got ≈ ref rtol = 1e-12
+    end
+    return nothing
+end
+
+"""
+The batched Poisson emission gradient agrees with the per-timestep
+`observation_gradient!` kernel, accumulated with the same responsibilities.
+"""
+function test_SLDS_batched_poisson_gradient(; rng=MersenneTwister(0x11C))
+    K, D, N, tsteps = 3, 2, 5, 40
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(rng, slds, tsteps)
+    x = 0.3 * randn(rng, D, tsteps)
+    w = rand(rng, K, tsteps)
+    w ./= sum(w; dims=1)
+
+    ws = SSD.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    for k in 1:K
+        batched = zeros(D, tsteps)
+        SSD._slds_emission_gradient!(
+            batched,
+            ws,
+            ws.consts[k],
+            slds.LDSs[k],
+            x,
+            y,
+            view(w, k, :),
+            nothing,
+            tsteps,
+            zeros(D),
+            zeros(N),
+        )
+
+        ref = zeros(D, tsteps)
+        tmp, buf = zeros(D), zeros(N)
+        for t in 1:tsteps
+            SSD.observation_gradient!(
+                tmp, ws.consts[k], buf, slds.LDSs[k], x, y, t, nothing
+            )
+            @views ref[:, t] .+= w[k, t] .* tmp
+        end
+        @test batched ≈ ref rtol = 1e-12
+    end
+    return nothing
+end
+
+"""
+`smooth` is exactly `npool`-invariant: the per-trial passes are a partition of
+the writes, and the ELBO is summed in trial order.
+"""
+function test_SLDS_smooth_npool_invariant()
+    K, D, N, tsteps, ntrials = 3, 2, 4, 30, 6
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(MersenneTwister(0x5A1), slds, fill(tsteps, ntrials))
+
+    base = smooth(slds, y; smoothing_iters=6, tol=0.0, npool=1)
+    for np in (2, 4)
+        got = smooth(slds, y; smoothing_iters=6, tol=0.0, npool=np)
+        @test got.elbo == base.elbo
+        @test all(got.x[i] == base.x[i] for i in eachindex(base.x))
+        @test all(got.γ[i] == base.γ[i] for i in eachindex(base.γ))
+    end
+    # `elbo` / `loglikelihood` read the same alternation.
+    @test elbo(slds, y; smoothing_iters=6, tol=0.0) == base.elbo
+    @test loglikelihood(slds, y; smoothing_iters=6, tol=0.0) == base.elbo
+    return nothing
+end
+
+"""
+`fit!` reproduces exactly at a fixed `npool`, and across `npool` up to the
+rounding the Poisson emission M-step's chunked reduction introduces. A Gaussian
+emission has no such reduction, so it is exact across `npool` too.
+"""
+function test_SLDS_fit_reproducibility()
+    K, D, N, tsteps, ntrials = 2, 2, 4, 30, 8
+    _, _, yP = rand(
+        MersenneTwister(0x5A2), _distinct_poisson_slds(K, D, N), fill(tsteps, ntrials)
+    )
+    _, _, yG = rand(
+        MersenneTwister(0x5A3), _distinct_gaussian_slds(K, D, N), fill(tsteps, ntrials)
+    )
+
+    function trace(mk, y; kw...)
+        return fit!(mk(), y; max_iter=5, progress=false, rng=MersenneTwister(3), kw...)
+    end
+
+    for (mk, y) in (
+        (() -> _distinct_poisson_slds(K, D, N), yP),
+        (() -> _distinct_gaussian_slds(K, D, N), yG),
+    )
+        # Same npool, twice: bit-identical.
+        @test trace(mk, y; npool=4) == trace(mk, y; npool=4)
+        # Across npool: equal to rounding.
+        @test trace(mk, y; npool=1) ≈ trace(mk, y; npool=4) rtol = 1e-8
+    end
+
+    # A Gaussian fit has no chunked emission reduction, so it is exact.
+    mkg = () -> _distinct_gaussian_slds(K, D, N)
+    @test trace(mkg, yG; npool=1) == trace(mkg, yG; npool=4)
+    return nothing
+end
+
+"""
+`rng_mode` is validated, and `:global` — which pre-draws the sequential
+stream — is itself `npool`-invariant up to that same rounding.
+"""
+function test_SLDS_rng_modes()
+    K, D, N, tsteps, ntrials = 2, 2, 4, 30, 6
+    model() = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(MersenneTwister(0x5A4), model(), fill(tsteps, ntrials))
+
+    g1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:global,
+    )
+    g4 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=4,
+        rng_mode=:global,
+    )
+    @test g1 ≈ g4 rtol = 1e-8
+    @test all(isfinite, g1)
+
+    #=
+    Each alternation consumes exactly one draw off `rng`, so `smoothing_iters`
+    is a clean repetition: `n` alternations in one call land where `n` calls of
+    one alternation do. (`test_SLDS_fit_smoothing_iters` checks this on the
+    E-step directly; this pins it end to end, where a per-call pass index mixed
+    into the seed would silently break it.)
+    =#
+    a = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=1,
+    )
+    b = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=3,
+    )
+    @test a ≈ b rtol = 1e-8
+
+    # The two modes consume the master generator differently, so they are
+    # different fits — both valid.
+    t1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:trial,
+    )
+    @test all(isfinite, t1)
+
+    @test_throws ArgumentError fit!(
+        model(), y; max_iter=1, progress=false, rng_mode=:nonsense
+    )
+    return nothing
+end

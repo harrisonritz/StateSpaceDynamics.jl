@@ -269,6 +269,9 @@ function _validate_obs_model(
     =#
     if any(x -> abs(x) > 50, obs_model.d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
         max_val = maximum(abs.(obs_model.d))
+        println("WARNING: high d")
+        println("\nd:\n $(obs_model.d)")
+        println("\nD:\n $(obs_model.D)")
         throw(
             NumericalStabilityError(
                 "d vector",
