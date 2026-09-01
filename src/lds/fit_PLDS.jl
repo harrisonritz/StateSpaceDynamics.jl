@@ -91,6 +91,38 @@ end
 _poisson_lognorm_one(::LinearDynamicalSystem, ::AbstractMatrix) = nothing
 
 """
+    _emission_lognorm(lds, y)
+
+The emission's data-only log-normalizer for one trial, hoisted out of the Newton
+line search where it would otherwise be recomputed at every objective
+evaluation.
+
+`Σᵢ log(y!)` for a Poisson emission, and a `NamedTuple` of per-member
+normalizers for a composite (`nothing` for a member that has none — a Gaussian
+emission folds its normalizer into `cR`).
+"""
+_emission_lognorm(::LinearDynamicalSystem, y::AbstractMatrix) = _poisson_lognorm_t(y)
+
+"""
+    _joint_loglikelihood_total(sws, lds, x, y, lognorm, ux, uy) -> T
+
+Total complete-data log-likelihood `log p(x, y)` at one latent path: the Newton
+smoother's line-search objective. Dispatched so a composite emission can reach
+its own per-member kernel with each member's precomputed normalizer.
+"""
+function _joint_loglikelihood_total(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    lognorm::AbstractVector{<:Real},
+    ux::Union{Nothing,AbstractMatrix},
+    uy::Union{Nothing,AbstractMatrix},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    return sum(joint_loglikelihood!(sws, lds, x, y, lognorm, ux, uy))
+end
+
+"""
     joint_loglikelihood!(ws, plds, x, y[, lognorm_t, ux, uy])
 
 Per-timestep complete-data log-likelihood of a Poisson LDS, written into
@@ -412,7 +444,7 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws = sws_pool[1]
     update_initial_state_mean!(plds, suf)
     update_initial_state_covariance!(plds, suf, sws)
@@ -511,14 +543,14 @@ are required (unlike Gaussian LDS which converges in one step).
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
-    uy::AbstractMatrix{T};
+    uy::Union{AbstractMatrix{T},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
     btd = sws.btd
 
@@ -546,10 +578,14 @@ function smooth!(
     g = grad_active
     p = reshape(X0, D, tsteps)
 
-    # The line-search objective is the exact complete-data log-likelihood;
-    # hoisting the data-only normalizer makes that free per evaluation.
-    lognorm_t = _poisson_lognorm_t(y)
-    ϕ!() = sum(joint_loglikelihood!(sws, lds, x, y, lognorm_t, ux, uy))
+    #=
+    The line-search objective is the exact complete-data log-likelihood;
+    hoisting the data-only normalizer makes that free per evaluation. Both are
+    dispatched so a composite emission can hand each member its own normalizer
+    (`nothing` for the members that have none).
+    =#
+    lognorm_t = _emission_lognorm(lds, y)
+    ϕ!() = _joint_loglikelihood_total(sws, lds, x, y, lognorm_t, ux, uy)
 
     compute_grad! = (gcur, xcur) -> begin
         gradient!(gcur, sws, lds, xcur, y, ux, uy)
@@ -612,13 +648,13 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    ux = zeros(T, 0, size(y, 2))
-    uy = zeros(T, 0, size(y, 2))
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    ux = zeros(T, 0, _ntsteps(y))
+    uy = _zero_uy(lds, _ntsteps(y))
     return smooth!(lds, fs, y, sws, ux, uy; max_iter=max_iter, tol=tol)
 end
 
@@ -637,14 +673,23 @@ function smooth!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     y = data.y
     ux = data.ux
     uy = data.uy
-    ntrials = length(y)
+    ntrials = length(data.tsteps)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1], ux[1], uy[1]; max_iter=max_iter, tol=tol)
+        smooth!(
+            lds,
+            tfs[1],
+            _trial(y, 1),
+            sws_pool[1],
+            ux[1],
+            _trial(uy, 1);
+            max_iter=max_iter,
+            tol=tol,
+        )
         return tfs
     end
 
@@ -660,10 +705,10 @@ function smooth!(
             smooth!(
                 lds,
                 tfs[trial],
-                y[trial],
+                _trial(y, trial),
                 sws,
                 ux[trial],
-                uy[trial];
+                _trial(uy, trial);
                 max_iter=max_iter,
                 tol=tol,
             )
@@ -678,11 +723,11 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     return smooth!(lds, tfs, Data(lds, y), sws_pool; max_iter=max_iter, tol=tol)
 end
 
@@ -694,15 +739,20 @@ Convenience method that creates a workspace pool sized at `max(T_i)`.
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}};
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    T_max = maximum(size(yt, 2) for yt in y)
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    T_max = maximum(_trial_lengths(y))
     npool = Threads.maxthreadid()
     sws_pool = [
         SmoothWorkspace(
-            T, lds.latent_dim, lds.obs_dim, T_max; ux_dim=lds.ux_dim, uy_dim=lds.uy_dim
+            T,
+            lds.latent_dim,
+            _ws_obs_dim(lds),
+            T_max;
+            ux_dim=lds.ux_dim,
+            uy_dim=_ws_uy_dim(lds),
         ) for _ in 1:npool
     ]
     return smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
@@ -717,13 +767,13 @@ statistics into `suf` from each trial's smoother output (`x_smooth`,
 """
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
+    suf::Union{SufficientStatistics{T},NamedTuple},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
 
     # smooth each trial
     smooth!(lds, tfs, data, sws_pool; max_iter=max_iter, tol=tol)
@@ -761,13 +811,15 @@ Returns a scalar.
 """
 function elbo(
     plds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -783,10 +835,10 @@ function elbo(
         SmoothWorkspace(
             T,
             plds.latent_dim,
-            plds.obs_dim,
+            _ws_obs_dim(plds),
             maximum(data.tsteps);
             ux_dim=plds.ux_dim,
-            uy_dim=plds.uy_dim,
+            uy_dim=_ws_uy_dim(plds),
         ) for _ in 1:npool
     ]
     suf = _initialize_td_sufficient_statistics(T, plds, data.tsteps)
@@ -822,11 +874,13 @@ For multi-trial `y`: `Vector`s of the above, one entry per trial.
 """
 function smooth(
     plds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(plds, data, grp, y)
@@ -838,10 +892,10 @@ function smooth(
         SmoothWorkspace(
             T,
             plds.latent_dim,
-            plds.obs_dim,
+            _ws_obs_dim(plds),
             maximum(data.tsteps);
             ux_dim=plds.ux_dim,
-            uy_dim=plds.uy_dim,
+            uy_dim=_ws_uy_dim(plds),
         ) for _ in 1:npool
     ]
     smooth!(plds, tfs, data, sws_pool)
@@ -880,7 +934,9 @@ Fit a Poisson LDS via Laplace-EM.
 """
 function fit!(
     plds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     max_iter::Int=100,
@@ -889,7 +945,7 @@ function fit!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.y); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
@@ -909,7 +965,12 @@ function fit!(
     npool = Threads.maxthreadid()
     sws_pool = [
         SmoothWorkspace(
-            T, plds.latent_dim, plds.obs_dim, T_max; ux_dim=plds.ux_dim, uy_dim=plds.uy_dim
+            T,
+            plds.latent_dim,
+            _ws_obs_dim(plds),
+            T_max;
+            ux_dim=plds.ux_dim,
+            uy_dim=_ws_uy_dim(plds),
         ) for _ in 1:npool
     ]
 

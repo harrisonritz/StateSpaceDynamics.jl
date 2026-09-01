@@ -100,15 +100,15 @@ Rebuilt when a member's width or the workspace's trial length no longer fits,
 which is what makes a workspace safe to reuse across the cells of a grouped fit.
 """
 function _obs_workspaces!(
-    ws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
+) where {WT<:Real,T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     models = _models(lds.obs_model)
     tsteps = length(ws.opt.ll_vec)
     subs = ws.obs
     if subs !== nothing && _obs_workspaces_fit(subs, lds, tsteps)
         return subs
     end
-    fresh = SmoothWorkspace{T}[
+    fresh = SmoothWorkspace{WT}[
         _cell_workspace(
             ws, lds.latent_dim, _obs_dim(m), tsteps; ux_dim=lds.ux_dim, uy_dim=_uy_dim(m)
         ) for m in values(models)
@@ -121,8 +121,8 @@ end
 # length need. `obs_temp` is (p, p) and `CD` is (p, D + 1 + uy_dim), so between
 # them they pin every observation-side width.
 function _obs_workspaces_fit(
-    subs::Vector{SmoothWorkspace{T}}, lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
-) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    subs::Vector{SmoothWorkspace{WT}}, lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
+) where {WT<:Real,T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     models = _models(lds.obs_model)
     length(subs) == length(models) || return false
     for (i, m) in enumerate(values(models))
@@ -460,13 +460,14 @@ end
 @inline _member_at(bundle::NamedTuple, i::Int) = bundle[i]
 
 """
-    joint_loglikelihood!(ll, ws, cc, lds, x, y::NamedTuple[, ux, uy])
+    joint_loglikelihood!(ll, ws, cc, lds, x, y::NamedTuple[, ux, uy, lognorms])
 
 Per-timestep complete-data log-likelihood for a composite emission:
 `ll[t] = Σₘ log p(yₘ,ₜ | xₜ) + log p(xₜ | xₜ₋₁)`.
 
 `y` (and `uy`, when given) are `NamedTuple`s of this trial's per-member
-matrices, keyed as the composite is.
+matrices, keyed as the composite is. `lognorms` optionally carries each
+member's precomputed data-only normalizer (see [`_emission_lognorm`](@ref)).
 """
 function joint_loglikelihood!(
     ll::AbstractVector{T},
@@ -477,6 +478,7 @@ function joint_loglikelihood!(
     y::NamedTuple,
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,NamedTuple}=nothing,
+    lognorms::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:CompositeObservationModel{T0}}
     tsteps = size(x, 2)
     @assert length(ll) == tsteps
@@ -489,7 +491,7 @@ function joint_loglikelihood!(
     subs = _obs_workspaces!(ws, lds)
     for (i, om) in enumerate(values(_models(lds.obs_model)))
         _accumulate_member_loglikelihood!(
-            ll, subs[i], om, x, y[i], _member_at(uy, i), tsteps
+            ll, subs[i], om, x, y[i], _member_at(uy, i), tsteps, _member_at(lognorms, i)
         )
     end
 
@@ -504,12 +506,41 @@ function _accumulate_member_loglikelihood!(
     y_m::AbstractMatrix,
     uy_m::Union{Nothing,AbstractMatrix},
     tsteps::Int,
+    ::Union{Nothing,AbstractVector},
 ) where {T<:Real}
     cc = sub.consts
     b1 = sub.opt.temp_dy
     b2 = sub.opt.temp_solve_R
     @inbounds for t in 1:tsteps
         ll[t] += observation_loglikelihood!(cc, b1, b2, om, x, y_m, t, uy_m)
+    end
+    return ll
+end
+
+#=
+A Poisson member takes the batched route: `η = C·x + d + D·v` for the whole
+trial as one `gemm`, and the data-only `Σᵢ log(y!)` normalizer supplied
+precomputed. Inside a Newton line search that normalizer would otherwise be
+re-summed over every neuron and bin at every objective evaluation, which is what
+`_emission_lognorm` hoists out.
+=#
+function _accumulate_member_loglikelihood!(
+    ll::AbstractVector{T},
+    sub::SmoothWorkspace{T},
+    om::PoissonObservationModel{T},
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix{T},
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    lognorm::Union{Nothing,AbstractVector},
+) where {T<:Real}
+    obs_dim, latent_dim = size(om.C)
+    pb = poisson_batch!(sub, latent_dim, obs_dim, tsteps)
+    Eta = _poisson_linear_predictor!(pb, om.C, om.d, om.D, x, uy_m, tsteps)
+    @inbounds @views for t in 1:tsteps
+        η = Eta[:, t]
+        norm_t = lognorm === nothing ? _poisson_lognorm_at(y_m, t) : lognorm[t]
+        ll[t] += dot(y_m[:, t], η) - sum(exp, η) - norm_t
     end
     return ll
 end
@@ -985,7 +1016,8 @@ function joint_loglikelihood(
     WT = promote_type(T, XT, mapreduce(eltype, promote_type, values(y)))
     ws = SmoothWorkspace(WT, lds.latent_dim, 0, tsteps)
     compute_smooth_constants!(ws, lds)
-    return joint_loglikelihood!(ws, lds, x, y, ux, uy)
+    ll = view(ws.opt.ll_vec, 1:tsteps)
+    return joint_loglikelihood!(ll, ws, ws.consts, lds, x, y, ux, uy)
 end
 
 # ============================================================================
@@ -1096,4 +1128,182 @@ function StatsAPI.loglikelihood(
         "Poisson LDS). Use `elbo` for a lower bound, or `joint_loglikelihood` for the " *
         "complete-data log-likelihood at a given latent path.",
     )
+end
+
+# ============================================================================
+# Non-quadratic composites: the Laplace path
+#
+# A composite with a non-Gaussian member has an emission curvature that depends
+# on the latent path, so it goes through the iterative-Newton driver in
+# `fit_PLDS.jl`. That driver is emission-agnostic apart from two hooks — the
+# hoisted log-normalizer and the line-search objective — which dispatch here.
+# ============================================================================
+
+"""
+    _emission_lognorm(lds, y::NamedTuple) -> NamedTuple
+
+Each member's data-only log-normalizer for one trial, or `nothing` for a member
+that has none. A Gaussian emission folds its normalizer into `cR`, so only the
+Poisson members contribute anything to hoist.
+"""
+function _emission_lognorm(
+    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    models = _models(lds.obs_model)
+    return NamedTuple{keys(models)}(
+        map(key -> _member_lognorm(models[key], y[key]), keys(models))
+    )
+end
+
+_member_lognorm(::AbstractObservationModel, ::AbstractMatrix) = nothing
+_member_lognorm(::PoissonObservationModel, y_m::AbstractMatrix) = _poisson_lognorm_t(y_m)
+
+function _joint_loglikelihood_total(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    lognorms::NamedTuple,
+    ux::Union{Nothing,AbstractMatrix},
+    uy::Union{Nothing,NamedTuple},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    ll = view(sws.opt.ll_vec, 1:_ntsteps(y))
+    joint_loglikelihood!(ll, sws, sws.consts, lds, x, y, ux, uy, lognorms)
+    return sum(ll)
+end
+
+"""
+    _member_pools(sws_pool, lds) -> Vector{Vector{SmoothWorkspace}}
+
+Transpose the pool: `_member_pools(pool, lds)[m]` is member `m`'s sub-workspace
+from every workspace in `pool`, which is the pool shape the per-trial parallel
+routines (`_poisson_q_obs_total`, `update_observation_model!`) expect.
+"""
+function _member_pools(
+    sws_pool::Vector{SmoothWorkspace{T}}, lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    per_ws = [_obs_workspaces!(ws, lds) for ws in sws_pool]
+    nmembers = length(first(per_ws))
+    return [SmoothWorkspace{T}[subs[m] for subs in per_ws] for m in 1:nmembers]
+end
+
+#=
+One member's emission Q-term. A Gaussian member has a sufficient-statistic form
+and reads it straight off its own `suf`; a Poisson member is irreducibly
+non-conjugate and stays the per-trial loop, chunked over its slice of the pool.
+=#
+function _member_q_obs(
+    view_m::LinearDynamicalSystem{T,S,O},
+    suf_m::SufficientStatistics{T},
+    ::TrialFilterSmooth{T},
+    ::Data{T},
+    pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    return Q_obs!(pool[1], view_m, suf_m)
+end
+
+function _member_q_obs(
+    view_m::LinearDynamicalSystem{T,S,O},
+    ::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    data_m::Data{T},
+    pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    return _poisson_q_obs_total(view_m, tfs, data_m, pool)
+end
+
+"""
+    elbo!(lds, suf::NamedTuple, tfs, data, sws_pool)
+
+Total ELBO of a composite emission with a non-Gaussian member. Mirrors the
+Poisson LDS split: the state Q-term from the aggregated sufficient statistics,
+each member's emission Q-term by whichever route that member supports, the
+state and per-member log-priors, and the posterior entropy from the smoother.
+"""
+function elbo!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::NamedTuple,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+    total_entropy = zero(T)
+    for fs in tfs.FilterSmooths
+        total_entropy += fs.entropy
+    end
+
+    compute_smooth_constants!(sws_pool[1], lds)
+    total = Q_state!(sws_pool[1], lds, _state_suf(suf))
+
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    pools = _member_pools(sws_pool, lds)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        total += _member_q_obs(views[key], suf[key], tfs, datas[key], pools[i])
+    end
+
+    total += _state_prior_logdensity(lds, sws_pool[1])
+    total += _obs_prior_logdensity(lds, sws_pool[1])
+
+    return total + total_entropy
+end
+
+#=
+One member's emission M-step. Gaussian: the conjugate regression and IW update
+from its sufficient statistics. Poisson: the row-wise Newton solver over that
+member's trials. Both are the ordinary single-observation routines, reached
+through the member's view so they write back to the member's own parameters and
+respect its own `fit_bool` flags.
+=#
+function _member_obs_mstep!(
+    view_m::LinearDynamicalSystem{T,S,O},
+    suf_m::SufficientStatistics{T},
+    ::TrialFilterSmooth{T},
+    ::Data{T},
+    pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    update_C_d!(view_m, suf_m, pool[1])
+    update_R!(view_m, suf_m, pool[1])
+    return nothing
+end
+
+function _member_obs_mstep!(
+    view_m::LinearDynamicalSystem{T,S,O},
+    ::SufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    data_m::Data{T},
+    pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    update_observation_model!(view_m, tfs, data_m.y, pool; uy=data_m.uy)
+    return nothing
+end
+
+"""
+    mstep!(lds, suf::NamedTuple, tfs, data, sws_pool)
+
+M-step for a composite emission with a non-Gaussian member: the four state
+updates once from any member's (identical) state blocks, then each member's own
+emission update.
+"""
+function mstep!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::NamedTuple,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+    sws = sws_pool[1]
+    state = _state_suf(suf)
+    update_initial_state_mean!(lds, state)
+    update_initial_state_covariance!(lds, state, sws)
+    update_A_b!(lds, state, sws)
+    update_Q!(lds, state, sws)
+
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    pools = _member_pools(sws_pool, lds)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        _member_obs_mstep!(views[key], suf[key], tfs, datas[key], pools[i])
+    end
+    return nothing
 end
