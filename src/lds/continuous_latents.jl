@@ -2,13 +2,13 @@
 Continuous (Linear Gaussian) latents
 
     Log-Likelihood kernels: state_loglikelihood!(cc, dxt, tmp, lds, x, t[, ux])
-                            observation_loglikelihood!(cc, b1, b2, lds, x, y, t[, uy])
+                            observation_loglikelihood!(cc, b1, b2, om, x, y, t[, uy])
                             joint_loglikelihood!(ll, ws, cc, lds, x, y[, ux, uy])
 
-    Gradient kernels:       observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    Gradient kernels:       observation_gradient!(out, cc, buf, om, x, y, t[, uy])
                             gradient!(grad, ws, lds, x, y[, ux, uy])
 
-    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
+    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, om, x, y, t[, α])
                             hessian!(sws, lds, x, y)
 
     E-Step: Q_state!(sws, lds, suf)
@@ -90,12 +90,14 @@ function state_loglikelihood!(
 end
 
 """
-    observation_loglikelihood!(cc, buf1, buf2, lds, x, y, t[, uy])
+    observation_loglikelihood!(cc, buf1, buf2, obs_model, x, y, t[, uy])
 
 Emission-model contribution `log p(y_t | x_t)` to the complete-data
-log-likelihood at timestep `t`. Dispatches on the observation model type `O`
-(via `lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs
-into `joint_loglikelihood!` by adding a method here.
+log-likelihood at timestep `t`. Dispatches on the observation model, which is
+passed directly rather than through the enclosing `LinearDynamicalSystem` — that
+is what lets a [`CompositeObservationModel`](@ref) call the same kernel once per
+member. A custom observation model plugs into `joint_loglikelihood!` by adding a
+method here.
 
 - `cc`: a [`SmoothConstants`](@ref) with Cholesky factors / normalizers
   (unused by models whose emission term needs no covariance, e.g. Poisson).
@@ -140,7 +142,7 @@ function joint_loglikelihood!(
 
     for t in 1:tsteps
         ll_t = observation_loglikelihood!(
-            cc, opt.temp_dy, opt.temp_solve_R, lds, x, y, t, uy
+            cc, opt.temp_dy, opt.temp_solve_R, lds.obs_model, x, y, t, uy
         )
         ll_t += state_loglikelihood!(cc, opt.temp_dx, opt.temp_solve_Q, lds, x, t, ux)
         ll[t] = ll_t
@@ -150,13 +152,12 @@ function joint_loglikelihood!(
 end
 
 """
-    observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    observation_gradient!(out, cc, buf, obs_model, x, y, t[, uy])
 
 Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
-(length `latent_dim`). Dispatches on the observation model type `O` (via
-`lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs into
-`gradient!` (both the single-LDS and the SLDS weighted form) by adding a
-method here.
+(length `latent_dim`). Dispatches on the observation model, passed directly; a
+custom observation model plugs into `gradient!` (both the single-LDS and the
+SLDS weighted form) by adding a method here.
 
 - `cc`: a [`SmoothConstants`](@ref) with Cholesky-derived terms (Gaussian
   uses the cached `C_inv_R = C'R⁻¹`; models without a covariance ignore it).
@@ -199,7 +200,7 @@ function gradient!(
     obs_buf = ws.opt.dyt
     tmp1 = ws.opt.tmp1
     @views for t in 1:tsteps
-        observation_gradient!(tmp1, cc, obs_buf, lds, x, y, t, uy)
+        observation_gradient!(tmp1, cc, obs_buf, lds.obs_model, x, y, t, uy)
         grad[:, t] .+= tmp1
     end
 
@@ -270,7 +271,7 @@ function gradient!(
 end
 
 """
-    observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
+    observation_hessian!(out, cc, buf1, buf2, obs_model, x, y, t[, α])
 
 Emission-model contribution `∂² log p(y_t | x_t) / ∂x_t²` **accumulated** into
 `out` (`latent_dim × latent_dim`) with weight `α`: `out .+= α .* hess_t`. The
@@ -278,9 +279,8 @@ add-with-weight semantics let the same kernel serve both the single-LDS
 `hessian!` (α = 1, `out` pre-filled with the state-side block) and the SLDS
 `hessian!` (α = w[k,t], accumulating across mixture components).
 
-Dispatches on the observation model type `O` (via
-`lds::LinearDynamicalSystem{T,S,O}`) — the curvature companion to
-`observation_gradient!`: a custom observation model plugs into both `hessian!`
+Dispatches on the observation model, passed directly — the curvature companion
+to `observation_gradient!`: a custom observation model plugs into both `hessian!`
 forms by adding a method here, without touching the shared state-side Hessian
 blocks.
 
@@ -362,7 +362,16 @@ function hessian!(
     _state_hessian_blocks!(btd, cc, tsteps)
     for t in 1:tsteps
         observation_hessian!(
-            btd.H_diag[t], cc, sws.elbo.rho_obs, sws.elbo.h_obs, lds, x, y, t, one(T), uy
+            btd.H_diag[t],
+            cc,
+            sws.elbo.rho_obs,
+            sws.elbo.h_obs,
+            lds.obs_model,
+            x,
+            y,
+            t,
+            one(T),
+            uy,
         )
     end
 
@@ -581,6 +590,40 @@ function Q_state!(
     Q_val += T(-0.5) * (const_trans + T(dyn_n) * log_det_Q + tr(S_trans))
 
     return Q_val
+end
+
+"""
+    _state_prior_logdensity(lds, sws) -> T
+
+`log p(θ)` for the state-side parameters at their current values: the
+Inverse-Wishart terms for `Q` and `P0`, and the matrix-normal terms for `x0`
+(paired with `P0`) and the stacked dynamics `[A b B]` (paired with `Q`).
+
+The MN terms matter for more than reporting. The M-step's `mn_map` update and
+the IW posterior-scale modification together maximize the MAP objective, so an
+ELBO that dropped the MN quadratic piece could appear non-monotone across EM
+iterations even though nothing was wrong.
+
+`sws.reg.AB` is used as scratch for the stacked `[A b B]`.
+"""
+function _state_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    total = zero(T)
+
+    sm.Q_prior === nothing || (total += iw_logprior_term(sm.Q, sm.Q_prior))
+    sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    if sm.x0_prior !== nothing
+        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+    end
+    if sm.AB_prior !== nothing
+        W_ab = view(sws.reg.AB, :, 1:(lds.latent_dim + 1 + lds.ux_dim))
+        _pack_dyn_W!(W_ab, lds)
+        total += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
+    end
+
+    return total
 end
 
 function update_initial_state_mean!(

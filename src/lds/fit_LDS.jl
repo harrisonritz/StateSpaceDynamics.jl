@@ -701,53 +701,7 @@ function elbo!(
     total_entropy::T,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
     Q_total = Q_state!(sws, lds, suf) + Q_obs!(sws, lds, suf)
-
-    prior_term = zero(T)
-    if lds.state_model.Q_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.Q, lds.state_model.Q_prior)
-    end
-    if lds.state_model.P0_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.P0, lds.state_model.P0_prior)
-    end
-    if lds.state_model.x0_prior !== nothing
-        prior_term += mn_logprior_term(
-            reshape(lds.state_model.x0, :, 1), lds.state_model.P0, lds.state_model.x0_prior
-        )
-    end
-    if lds.obs_model.R_prior !== nothing
-        prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
-    end
-
-    #=
-    MN-prior log-prior contributions for [A b B] (dynamics) and [C d D] (obs).
-    Required for ELBO monotonicity under MN priors — the M-step's `mn_map`
-    update + the IW posterior scale modification together maximize the
-    MAP objective, but without this term the displayed ELBO drops the
-    MN-quadratic piece and can appear non-monotone.
-    =#
-    if lds.state_model.AB_prior !== nothing
-        D = lds.latent_dim
-        ux_dim = lds.ux_dim
-        W_ab = view(sws.reg.AB, :, 1:(D + 1 + ux_dim))
-        copyto!(view(W_ab, :, 1:D), lds.state_model.A)
-        copyto!(view(W_ab, :, D + 1), lds.state_model.b)
-        if ux_dim > 0
-            copyto!(view(W_ab, :, (D + 2):(D + 1 + ux_dim)), lds.state_model.B)
-        end
-        prior_term += mn_logprior_term(W_ab, lds.state_model.Q, lds.state_model.AB_prior)
-    end
-    if lds.obs_model.CD_prior !== nothing
-        D = lds.latent_dim
-        uy_dim = lds.uy_dim
-        W_cd = view(sws.reg.CD, :, 1:(D + 1 + uy_dim))
-        copyto!(view(W_cd, :, 1:D), lds.obs_model.C)
-        copyto!(view(W_cd, :, D + 1), lds.obs_model.d)
-        if uy_dim > 0
-            copyto!(view(W_cd, :, (D + 2):(D + 1 + uy_dim)), lds.obs_model.D)
-        end
-        prior_term += mn_logprior_term(W_cd, lds.obs_model.R, lds.obs_model.CD_prior)
-    end
-
+    prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
     return Q_total + prior_term + total_entropy
 end
 

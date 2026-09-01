@@ -535,6 +535,35 @@ function _composite_depends_on(c::CompositeObservationModel)
 end
 
 """
+    QuadraticEmission{T}
+    NonQuadraticEmission{T}
+
+The two smoother regimes, as unions over observation-model types.
+
+A **quadratic** emission has a curvature that does not depend on the latent
+path, so the complete-data log-likelihood is quadratic in `x`: the Newton
+smoother reaches the mode in one step, and the block-tridiagonal Hessian — hence
+the smoothed covariance — depends only on the parameters and the trial length.
+That is what the Gaussian LDS driver in `fit_LDS.jl` exploits, sharing one
+covariance across equal-length trials and running the mean pass batched.
+
+A **non-quadratic** emission (Poisson, or any composite containing one) needs the
+iterative Laplace smoother in `fit_PLDS.jl`, and its Hessian is rebuilt at every
+Newton step.
+
+Both drivers dispatch on these unions rather than on the concrete model types, so
+a composite lands in the right one automatically: its `QUAD` type parameter is
+the `AND` over its members (see [`_emission_is_quadratic`](@ref)).
+"""
+const QuadraticEmission{T} = Union{
+    GaussianObservationModel{T},CompositeObservationModel{T,true}
+}
+
+const NonQuadraticEmission{T} = Union{
+    PoissonObservationModel{T},CompositeObservationModel{T,false}
+}
+
+"""
     LinearDynamicalSystem{T<:Real, S<:AbstractStateModel{T}, O<:AbstractObservationModel{T}}
 
 Represents a unified Linear Dynamical System with customizable state and observation models.

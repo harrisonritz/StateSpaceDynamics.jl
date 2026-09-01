@@ -459,7 +459,7 @@ function _slds_emission_loglik!(
     z = ws.opt.temp_dy
     λ = ws.opt.temp_solve_R
     @inbounds for t in 1:tsteps
-        out[t] = observation_loglikelihood!(cc, z, λ, lds, x, y, t, uy)
+        out[t] = observation_loglikelihood!(cc, z, λ, lds.obs_model, x, y, t, uy)
     end
     return out
 end
@@ -597,7 +597,7 @@ function _add_cov_correction!(
 
         # Use unit weight to get this regime's emission curvature alone.
         fill!(H_obs, zero(T))
-        observation_hessian!(H_obs, cc, z, λ, lds_k, x, y, t, one(T), uy)
+        observation_hessian!(H_obs, cc, z, λ, lds_k.obs_model, x, y, t, one(T), uy)
         corr = _tr_prod(H_obs, Σ_tt)
 
         if t == 1
@@ -754,7 +754,7 @@ function _slds_emission_gradient!(
     obs_buf::AbstractVector{T},
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     @inbounds for t in 1:tsteps
-        observation_gradient!(tmp, cc, obs_buf, lds, x, y, t, uy)
+        observation_gradient!(tmp, cc, obs_buf, lds.obs_model, x, y, t, uy)
         α = weights[t]
         @simd for i in eachindex(tmp)
             grad[i, t] += α * tmp[i]
@@ -807,7 +807,7 @@ function _slds_emission_hessian!(
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     H_diag = ws.btd.H_diag
     for t in 1:tsteps
-        observation_hessian!(H_diag[t], cc, z, λ, lds, x, y, t, weights[t], uy)
+        observation_hessian!(H_diag[t], cc, z, λ, lds.obs_model, x, y, t, weights[t], uy)
     end
     return nothing
 end

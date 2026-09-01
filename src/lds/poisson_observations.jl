@@ -1,9 +1,9 @@
 #=============================================================================
 Poisson Observations
 
-    Emission kernels: observation_loglikelihood!(cc, z, λ, lds, x, y, t[, uy])
-                      observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
-                      observation_hessian!(out, cc, z, λ, lds, x, y, t[, α])
+    Emission kernels: observation_loglikelihood!(cc, z, λ, om, x, y, t[, uy])
+                      observation_gradient!(out, cc, buf, om, x, y, t[, uy])
+                      observation_hessian!(out, cc, z, λ, om, x, y, t[, α])
 
     E-Step: Q_obs!(sws, lds, suf)
 
@@ -371,7 +371,7 @@ function hessian!(
 end
 
 """
-    observation_loglikelihood!(cc, z, λ, lds, x, y, t[, uy])
+    observation_loglikelihood!(cc, z, λ, obs_model, x, y, t[, uy])
 
 Poisson emission term: with rate `λ = exp(Cx_t + d + D v_t)`,
 `log p(y_t|x_t) = y⋅log(λ) - sum(λ) - sum(log(y!))`. `z` and `λ` are `obs_dim`
@@ -383,19 +383,19 @@ function observation_loglikelihood!(
     ::SmoothConstants{T},
     z::AbstractVector{T},
     λ::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
 
     # z = Cx + d (+ D v) ; λ = exp(z)
     @views mul!(z, C, x[:, t])
     if uy !== nothing
-        @views mul!(z, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(z, om.D, uy[:, t], one(T), one(T))
     end
     z .+= d
     @. λ = exp(z)
@@ -406,7 +406,7 @@ function observation_loglikelihood!(
 end
 
 """
-    observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    observation_gradient!(out, cc, buf, obs_model, x, y, t[, uy])
 
 Poisson emission gradient w.r.t. the latent `x_t`: `out = C'(y_t - λ_t)` with
 `λ_t = exp(Cx_t + d + D v_t)`. The `D v_t` term is constant in `x_t`, so it
@@ -417,24 +417,24 @@ function observation_gradient!(
     out::AbstractVector{T},
     ::SmoothConstants{T},
     buf::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
     @views mul!(buf, C, x[:, t])
     if uy !== nothing
-        @views mul!(buf, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(buf, om.D, uy[:, t], one(T), one(T))
     end
     @views buf .= y[:, t] .- exp.(buf .+ d)
     return mul!(out, C', buf)
 end
 
 """
-    observation_hessian!(out, cc, z, λ, lds, x, y, t[, α, uy])
+    observation_hessian!(out, cc, z, λ, obs_model, x, y, t[, α, uy])
 
 Poisson emission curvature: `out .+= α .* (-C' diag(λ_t) C)` with
 `λ_t = exp(C x_t + d + D v_t)` — independent of `y` for the canonical log link.
@@ -447,20 +447,20 @@ function observation_hessian!(
     ::SmoothConstants{T},
     z::AbstractVector{T},
     λ::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     α::T=one(T),
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
     obs_dim, latent_dim = size(C)
 
     @views mul!(z, C, x[:, t])
     if uy !== nothing
-        @views mul!(z, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(z, om.D, uy[:, t], one(T), one(T))
     end
     @. λ = exp(z + d)
 

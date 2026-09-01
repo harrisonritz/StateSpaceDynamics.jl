@@ -417,3 +417,219 @@ function _extract_obs_params(om::CompositeObservationModel)
     models = _models(om)
     return NamedTuple{keys(models)}(map(_extract_obs_params, values(models)))
 end
+
+# ============================================================================
+# Latent-inference kernels
+#
+# The emission is a sum over members, so each of the three kernels below runs
+# the state half once and then adds one member's whole-trial contribution at a
+# time. Iterating members outside the timestep loop means the one dynamic
+# dispatch per member per call is paid once rather than once per timestep, and
+# everything behind the `_accumulate_member_*!` barrier is concretely typed.
+# ============================================================================
+
+# One member's slice of a per-trial observation / input bundle. `nothing`
+# propagates, which is how "this model takes no observation inputs" is spelled
+# everywhere else.
+@inline _member_at(::Nothing, ::Int) = nothing
+@inline _member_at(bundle::NamedTuple, i::Int) = bundle[i]
+
+"""
+    joint_loglikelihood!(ll, ws, cc, lds, x, y::NamedTuple[, ux, uy])
+
+Per-timestep complete-data log-likelihood for a composite emission:
+`ll[t] = Σₘ log p(yₘ,ₜ | xₜ) + log p(xₜ | xₜ₋₁)`.
+
+`y` (and `uy`, when given) are `NamedTuple`s of this trial's per-member
+matrices, keyed as the composite is.
+"""
+function joint_loglikelihood!(
+    ll::AbstractVector{T},
+    ws::SmoothWorkspace{T},
+    cc::SmoothConstants{T},
+    lds::LinearDynamicalSystem{T0,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:CompositeObservationModel{T0}}
+    tsteps = size(x, 2)
+    @assert length(ll) == tsteps
+
+    opt = ws.opt
+    @inbounds for t in 1:tsteps
+        ll[t] = state_loglikelihood!(cc, opt.temp_dx, opt.temp_solve_Q, lds, x, t, ux)
+    end
+
+    subs = _obs_workspaces!(ws, lds)
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        _accumulate_member_loglikelihood!(
+            ll, subs[i], om, x, y[i], _member_at(uy, i), tsteps
+        )
+    end
+
+    return ll
+end
+
+function _accumulate_member_loglikelihood!(
+    ll::AbstractVector{T},
+    sub::SmoothWorkspace{T},
+    om::AbstractObservationModel,
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix,
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+) where {T<:Real}
+    cc = sub.consts
+    b1 = sub.opt.temp_dy
+    b2 = sub.opt.temp_solve_R
+    @inbounds for t in 1:tsteps
+        ll[t] += observation_loglikelihood!(cc, b1, b2, om, x, y_m, t, uy_m)
+    end
+    return ll
+end
+
+"""
+    gradient!(grad, ws, lds, x, y::NamedTuple[, ux, uy])
+    gradient!(ws, lds, x, y::NamedTuple[, ux, uy])
+
+Gradient of the complete-data log-likelihood w.r.t. the latent path for a
+composite emission: the shared state half from `_state_gradient!`, then each
+member's `Σₜ Cₘ'Rₘ⁻¹ rₘ,ₜ`-style term added on top.
+"""
+function gradient!(
+    grad::AbstractMatrix{T},
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    tsteps = size(x, 2)
+    _state_gradient!(grad, ws, lds, x, ux)
+
+    subs = _obs_workspaces!(ws, lds)
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        _accumulate_member_gradient!(grad, subs[i], om, x, y[i], _member_at(uy, i), tsteps)
+    end
+
+    return grad
+end
+
+function gradient!(
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    grad = view(ws.opt.grad_buf, :, 1:size(x, 2))
+    return gradient!(grad, ws, lds, x, y, ux, uy)
+end
+
+function _accumulate_member_gradient!(
+    grad::AbstractMatrix{T},
+    sub::SmoothWorkspace{T},
+    om::AbstractObservationModel,
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix,
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+) where {T<:Real}
+    cc = sub.consts
+    obs_buf = sub.opt.dyt
+    tmp1 = sub.opt.tmp1
+    @views for t in 1:tsteps
+        observation_gradient!(tmp1, cc, obs_buf, om, x, y_m, t, uy_m)
+        grad[:, t] .+= tmp1
+    end
+    return grad
+end
+
+"""
+    hessian!(sws, lds, x, y::NamedTuple[, uy])
+
+Block-tridiagonal Hessian of the complete-data log-likelihood for a composite
+emission.
+
+When every member is Gaussian the summed emission curvature `Σₘ -Cₘ'Rₘ⁻¹Cₘ` is
+constant in `x` and already cached on `sws.consts.yt_given_xt` by
+`compute_smooth_constants!`, so this is exactly the single-model assembly — one
+axpy per timestep, no member loop at all.
+"""
+function hessian!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    _fill_hessian_blocks!(sws, size(x, 2))
+    return nothing
+end
+
+#=
+With a non-quadratic member present the curvature depends on the iterate, so it
+is rebuilt per member per Newton step. A Gaussian member still contributes its
+cached constant template; only the members that need to look at `x` do.
+=#
+function hessian!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::NamedTuple,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+    tsteps = size(x, 2)
+    _state_hessian_blocks!(sws.btd, sws.consts, tsteps)
+
+    subs = _obs_workspaces!(sws, lds)
+    for (i, om) in enumerate(values(_models(lds.obs_model)))
+        _accumulate_member_hessian!(
+            sws.btd, subs[i], om, x, y[i], _member_at(uy, i), tsteps
+        )
+    end
+
+    return nothing
+end
+
+function _accumulate_member_hessian!(
+    btd::BlockTridiagonalWorkspace{T},
+    sub::SmoothWorkspace{T},
+    om::AbstractObservationModel,
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix,
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+) where {T<:Real}
+    cc = sub.consts
+    b1 = sub.elbo.rho_obs
+    b2 = sub.elbo.h_obs
+    for t in 1:tsteps
+        observation_hessian!(btd.H_diag[t], cc, b1, b2, om, x, y_m, t, one(T), uy_m)
+    end
+    return nothing
+end
+
+#=
+A Poisson member routes to the batched emission curvature — the same `gemm`
+whole-trial form the single-model Poisson `hessian!` uses, which is where a
+spike-train fit spends most of its time. Accumulates into the diagonal blocks,
+so members compose.
+=#
+function _accumulate_member_hessian!(
+    btd::BlockTridiagonalWorkspace{T},
+    sub::SmoothWorkspace{T},
+    om::PoissonObservationModel{T},
+    x::AbstractMatrix{T},
+    y_m::AbstractMatrix,
+    uy_m::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+) where {T<:Real}
+    obs_dim, latent_dim = size(om.C)
+    pb = poisson_batch!(sub, latent_dim, obs_dim, tsteps)
+    _poisson_emission_hessian!(btd, pb, om, x, uy_m, tsteps, nothing)
+    return nothing
+end
