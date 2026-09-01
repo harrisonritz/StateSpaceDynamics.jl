@@ -721,10 +721,16 @@ function _lower_fit_bool(om::AbstractObservationModel, spec::NamedTuple)
     return fb
 end
 
-function _apply_obs_fit_bool!(fb::Vector{Bool}, om::AbstractObservationModel, spec)
-    r = _obs_fit_range(om)
-    haskey(spec, :C) && (fb[first(r)] = spec[:C])
-    length(r) > 1 && haskey(spec, :R) && (fb[first(r) + 1] = spec[:R])
+#=
+Every write goes through a *slice* of the parent vector — `_write_obs_fit_bool!`
+below indexes relative to one observation model's own block — so the single-model
+and composite cases share one writer and neither needs to know where in
+`fit_bool` it landed.
+=#
+function _apply_obs_fit_bool!(
+    fb::Vector{Bool}, om::AbstractObservationModel, spec::NamedTuple
+)
+    _write_obs_fit_bool!(view(fb, _obs_fit_range(om)), om, spec)
     return fb
 end
 
@@ -738,7 +744,7 @@ function _apply_obs_fit_bool!(
 )
     models = _models(c)
     for key in keys(models)
-        r = _obs_fit_range(c, key)
+        slice = view(fb, _obs_fit_range(c, key))
         nested = get(spec, key, nothing)
         if nested !== nothing
             nested isa NamedTuple || throw(
@@ -747,23 +753,28 @@ function _apply_obs_fit_bool!(
                     "groups, e.g. `(C = true, R = false)`; got a $(typeof(nested))",
                 ),
             )
-            _apply_obs_fit_bool!(view(fb, r), models[key], nested)
+            _write_obs_fit_bool!(slice, models[key], nested)
         end
-        haskey(spec, _suffixed(:C, key)) && (fb[first(r)] = spec[_suffixed(:C, key)])
-        length(r) > 1 &&
+        haskey(spec, _suffixed(:C, key)) && (slice[1] = spec[_suffixed(:C, key)])
+        length(slice) > 1 &&
             haskey(spec, _suffixed(:R, key)) &&
-            (fb[first(r) + 1] = spec[_suffixed(:R, key)])
+            (slice[2] = spec[_suffixed(:R, key)])
     end
     return fb
 end
 
-# Nested form writes through a length-1/2 view of the parent vector.
-function _apply_obs_fit_bool!(
-    fb::AbstractVector{Bool}, om::AbstractObservationModel, spec::NamedTuple
+"""
+    _write_obs_fit_bool!(slice, obs_model, spec)
+
+Write one observation model's flags into its own block of `fit_bool`, indexed
+relative to that block: `[C&d&D]` first and, for a Gaussian emission, `R` second.
+"""
+function _write_obs_fit_bool!(
+    slice::AbstractVector{Bool}, ::AbstractObservationModel, spec::NamedTuple
 )
-    haskey(spec, :C) && (fb[1] = spec[:C])
-    length(fb) > 1 && haskey(spec, :R) && (fb[2] = spec[:R])
-    return fb
+    haskey(spec, :C) && (slice[1] = spec[:C])
+    length(slice) > 1 && haskey(spec, :R) && (slice[2] = spec[:R])
+    return slice
 end
 
 """

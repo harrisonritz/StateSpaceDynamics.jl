@@ -93,6 +93,32 @@ bitwise what the plain call would have given.
 end
 
 """
+    _obs_prior_logdensity(lds, sws) -> T
+
+`log p(θ)` for a Poisson emission's parameters: the matrix-normal term on the
+stacked `[C d D]`.
+
+Unlike the Gaussian counterpart there is no noise covariance to pair the MN
+prior with, so this is the bare quadratic `-½ tr((W - M₀) Λ (W - M₀)')` — exactly
+the penalty the emission M-step objective carries, which is what keeps the
+reported ELBO monotone under the prior. The `Λ`-only and `logdet Λ` constants are
+absorbed into the ELBO's additive constant, as they are on the Gaussian side.
+
+`sws.reg.CD` is used as scratch for the stacked `[C d D]`.
+"""
+function _obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+    prior = lds.obs_model.CD_prior
+    prior === nothing && return zero(T)
+
+    W_cd = view(sws.reg.CD, :, 1:(lds.latent_dim + 1 + lds.uy_dim))
+    _pack_obs_V!(W_cd, lds)
+    Wm = W_cd .- prior.M₀
+    return -T(0.5) * sum(Wm .* (Wm * prior.Λ))
+end
+
+"""
     _update_observation_model_lbfgs!(plds, tfs, y, sws_pool, w; uy=nothing)
 
 Update the observation model parameters `[C d D]` of a PLDS model via LBFGS over

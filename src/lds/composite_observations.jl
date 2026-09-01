@@ -309,11 +309,7 @@ composite model would fall through to the single-observation constructor and
 fail somewhere deep in `_normalize_multitrial_uy`, and a NamedTuple handed to a
 single-observation model would be a bare `MethodError`.
 =#
-function Data(
-    lds::LinearDynamicalSystem{T,S,O},
-    ::Union{AbstractMatrix,AbstractArray{<:Any,3},AbstractVector{<:AbstractMatrix}};
-    kwargs...,
-) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+function _composite_needs_namedtuple(lds::LinearDynamicalSystem)
     return throw(
         ArgumentError(
             "this model has several observation models, so observations must be a " *
@@ -322,6 +318,35 @@ function Data(
             "$(_key_list(_models(lds.obs_model))).",
         ),
     )
+end
+
+# One guard per shape the single-observation constructor accepts, so each is
+# strictly more specific than the method it shadows.
+function Data(
+    lds::LinearDynamicalSystem{T,S,O},
+    ::AbstractMatrix{T};
+    ux::Union{Nothing,AbstractMatrix{T}}=nothing,
+    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return _composite_needs_namedtuple(lds)
+end
+
+function Data(
+    lds::LinearDynamicalSystem{T,S,O},
+    ::AbstractArray{T,3};
+    ux::Union{Nothing,AbstractArray{T,3}}=nothing,
+    uy::Union{Nothing,AbstractArray{T,3}}=nothing,
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return _composite_needs_namedtuple(lds)
+end
+
+function Data(
+    lds::LinearDynamicalSystem{T,S,O},
+    ::AbstractVector{<:AbstractMatrix{T}};
+    ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return _composite_needs_namedtuple(lds)
 end
 
 function Data(
@@ -632,4 +657,443 @@ function _accumulate_member_hessian!(
     pb = poisson_batch!(sub, latent_dim, obs_dim, tsteps)
     _poisson_emission_hessian!(btd, pb, om, x, uy_m, tsteps, nothing)
     return nothing
+end
+
+# ============================================================================
+# Shapes shared by the fit drivers
+#
+# The drivers in `fit_LDS.jl` / `fit_PLDS.jl` are written against a single
+# observation model. These few accessors are what let the same code serve a
+# composite: they read the one number or slice the driver actually needs,
+# rather than assuming `y` is a matrix and `lds.obs_dim` sizes the buffers.
+# ============================================================================
+
+"""
+    _ws_obs_dim(lds) -> Int
+    _ws_uy_dim(lds) -> Int
+
+Observation widths a `SmoothWorkspace` for `lds` should be sized at.
+
+For a single observation model these are the model's own. For a composite they
+are **zero**: the parent workspace does only state-side work, and every
+emission-shaped buffer lives on a per-member sub-workspace instead. That is what
+keeps a composite fit from allocating the `(Σₘ pₘ)²` buffers a naive stacking
+would need.
+"""
+_ws_obs_dim(lds::LinearDynamicalSystem) = lds.obs_dim
+_ws_uy_dim(lds::LinearDynamicalSystem) = lds.uy_dim
+
+function _ws_obs_dim(
+    ::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return 0
+end
+
+function _ws_uy_dim(
+    ::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return 0
+end
+
+"""
+    _ntsteps(y) -> Int
+
+Trial length of one trial's observations, whether that is a single matrix or a
+`NamedTuple` of per-member matrices (every member sees the same latent path, so
+any member gives the answer).
+"""
+_ntsteps(y::AbstractMatrix) = size(y, 2)
+_ntsteps(y::NamedTuple) = size(first(values(y)), 2)
+
+"""
+    _trial(y, n)
+
+Trial `n` of a `Data` field: the trial's matrix for a single observation model,
+or a `NamedTuple` of the members' matrices for a composite.
+"""
+_trial(y::AbstractVector{<:AbstractMatrix}, n::Int) = y[n]
+_trial(y::NamedTuple, n::Int) = map(v -> v[n], y)
+
+"""
+    _zero_uy(lds, tsteps)
+
+The "no observation inputs" value for one trial, shaped for this model: a
+`0 × tsteps` matrix, or a `NamedTuple` of them for a composite.
+"""
+_zero_uy(::LinearDynamicalSystem{T}, tsteps::Int) where {T<:Real} = zeros(T, 0, tsteps)
+
+function _zero_uy(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    ks = _obs_keys(lds.obs_model)
+    return NamedTuple{ks}(map(_ -> zeros(T, 0, tsteps), ks))
+end
+
+"""
+    _member_datas(data) -> NamedTuple of Data
+
+One single-observation `Data` per member: that member's observations and
+observation inputs, sharing the dynamics inputs and trial lengths by reference.
+
+These are what let the per-member M-step, Q-term and sufficient-statistics
+aggregation be the ordinary single-observation routines — a member's view plus
+its own `Data` is indistinguishable from a single-emission model.
+"""
+function _member_datas(data::Data)
+    ks = keys(data.y)
+    return NamedTuple{ks}(map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps), ks))
+end
+
+# ============================================================================
+# Sufficient statistics
+#
+# One `SufficientStatistics` per member, each carrying that member's emission
+# blocks *and* a copy of the shared state blocks. The state blocks come out
+# bitwise identical across members — they depend only on the smoother output and
+# `ux`, neither of which varies by member — so the state M-step may read any
+# member's, which `_state_suf` picks.
+#
+# Recomputing them per member costs an O(N·T·D²) pass that the emission pass
+# (O(N·T·pₘ·D), with pₘ the channel count) dominates. Paying that buys back the
+# whole aggregator unchanged, cov-cache fast path and all, rather than a second
+# split-out copy of one of the subtlest functions in the package.
+# ============================================================================
+
+"""
+    _state_suf(suf)
+
+The sufficient-statistics block the state-side M-step and `Q_state!` should
+read: the single one, or any member's (they agree).
+"""
+_state_suf(suf::SufficientStatistics) = suf
+_state_suf(suf::NamedTuple) = first(values(suf))
+
+function _initialize_td_sufficient_statistics(
+    ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    views = _obs_views(lds)
+    return map(v -> _initialize_td_sufficient_statistics(T, v, tsteps_per_trial), views)
+end
+
+function _td_init_const_blocks!(
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        _td_init_const_blocks!(subs[i], views[key], datas[key])
+    end
+    return nothing
+end
+
+function _aggregate_td_suff_stats!(
+    suf::NamedTuple,
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    datas = _member_datas(data)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        _aggregate_td_suff_stats!(suf[key], tfs, views[key], datas[key], subs[i])
+    end
+    return suf
+end
+
+# ============================================================================
+# E-step Q-term, M-step and ELBO
+# ============================================================================
+
+"""
+    Q_obs!(sws, lds, suf::NamedTuple)
+
+Emission Q-term of a composite: the sum over members, each evaluated by the
+ordinary single-observation `Q_obs!` on that member's view, sufficient
+statistics and sub-workspace.
+
+Defined for an all-Gaussian composite, where every member has a
+sufficient-statistic form. A composite containing a Poisson member goes through
+the per-trial path in `fit_PLDS.jl` instead.
+"""
+function Q_obs!(
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::NamedTuple
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    total = zero(T)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        total += Q_obs!(subs[i], views[key], suf[key])
+    end
+    return total
+end
+
+"""
+    _obs_prior_logdensity(lds, sws) -> T
+
+`log p(θ)` for a composite emission: the sum of its members' own prior terms,
+each evaluated against that member's parameters and sub-workspace scratch.
+"""
+function _obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    total = zero(T)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        total += _obs_prior_logdensity(views[key], subs[i])
+    end
+    return total
+end
+
+"""
+    mstep!(lds, suf::NamedTuple, sws)
+
+M-step for an all-Gaussian composite: the four state updates once from any
+member's (identical) state blocks, then each member's `[C d D]` and `R` from its
+own statistics. Each member's `fit_bool` flags travel with its view, so freezing
+one emission leaves the others free.
+"""
+function mstep!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::NamedTuple, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    state = _state_suf(suf)
+    update_initial_state_mean!(lds, state)
+    update_initial_state_covariance!(lds, state, sws)
+    update_A_b!(lds, state, sws)
+    update_Q!(lds, state, sws)
+
+    subs = _obs_workspaces!(sws, lds)
+    views = _obs_views(lds)
+    for (i, key) in enumerate(_obs_keys(lds.obs_model))
+        update_C_d!(views[key], suf[key], subs[i])
+        update_R!(views[key], suf[key], subs[i])
+    end
+    return nothing
+end
+
+"""
+    elbo!(lds, suf::NamedTuple, sws, total_entropy)
+
+Total ELBO of an all-Gaussian composite from the aggregated sufficient
+statistics: the shared state Q-term, the summed emission Q-terms, the state and
+per-member emission log-priors, and the posterior entropy.
+"""
+function elbo!(
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::NamedTuple,
+    sws::SmoothWorkspace{T},
+    total_entropy::T,
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    Q_total = Q_state!(sws, lds, _state_suf(suf)) + Q_obs!(sws, lds, suf)
+    prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
+    return Q_total + prior_term + total_entropy
+end
+
+#=
+Public-shape return convention for `smooth` under a composite emission: the
+member entries all have the same container shape, so any of them decides
+whether this was a single-trial (matrix) or multi-trial call.
+=#
+function _collect_smooth_output(tfs::TrialFilterSmooth, y::NamedTuple)
+    return _collect_smooth_output(tfs, first(values(y)))
+end
+
+"""
+    _mirror_smooth_constants!(sws, source_sws, lds)
+
+Copy the cached smoothing constants from one workspace to another, so a
+per-task workspace on the equal-length fast path can reuse the Cholesky
+factorizations `_precompute_shared_cov!` already did on the designated
+workspace.
+
+For a composite emission the members' constants have to travel too: the summed
+curvature on the parent is enough to assemble the Hessian, but the gradient
+needs each member's own `Cₘ'Rₘ⁻¹`, which lives on that member's sub-workspace.
+"""
+function _mirror_smooth_constants!(
+    sws::SmoothWorkspace{T}, source_sws::SmoothWorkspace{T}, ::LinearDynamicalSystem{T}
+) where {T<:Real}
+    _copy_smooth_constants!(sws.consts, source_sws.consts)
+    return nothing
+end
+
+function _mirror_smooth_constants!(
+    sws::SmoothWorkspace{T},
+    source_sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    _copy_smooth_constants!(sws.consts, source_sws.consts)
+    src = source_sws.obs
+    src === nothing && return nothing
+    dst = _obs_workspaces!(sws, lds)
+    for i in eachindex(dst)
+        _copy_smooth_constants!(dst[i].consts, src[i].consts)
+    end
+    return nothing
+end
+
+"""
+    _trial_lengths(y) -> Vector{Int}
+
+Per-trial timestep counts of a multi-trial observation container, whether that
+is a vector of matrices or a `NamedTuple` of them.
+"""
+_trial_lengths(y::AbstractVector{<:AbstractMatrix}) = Int[size(yt, 2) for yt in y]
+_trial_lengths(y::NamedTuple) = _trial_lengths(first(values(y)))
+
+"""
+    _batched_ntrials(lds, ntrials) -> Int
+
+The `ntrials` a fit's designated workspace should be built with, which decides
+whether it carries the BLAS-3 mean-pass buffers.
+
+A composite emission gets `1`, i.e. no batched buffers. The batched mean pass
+stacks one `(p, T, N)` observation tensor and one `C`/`d`/`D`, which a composite
+does not have; it would need per-member tensors and a per-member pass. The
+equal-length fast path still applies — the covariance is computed once and
+shared across trials — so this only costs a composite the BLAS-2-to-BLAS-3
+promotion of the per-trial mean pass, not the shared-covariance saving.
+"""
+_batched_ntrials(::LinearDynamicalSystem, ntrials::Int) = ntrials
+
+function _batched_ntrials(
+    ::LinearDynamicalSystem{T,S,O}, ::Int
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    return 1
+end
+
+"""
+    joint_loglikelihood(lds, x, y::NamedTuple[, ux, uy])
+
+Complete-data log-likelihood `log p(x, y)` of a composite emission at the given
+latent path, summed over timesteps. Allocating convenience wrapper; the
+element type is promoted across the latent path and every member's
+observations, so a `Float32` iterate against `Float64` data works as it does for
+a single observation model.
+"""
+function joint_loglikelihood(
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{XT},
+    y::NamedTuple,
+    ux::Union{Nothing,AbstractMatrix}=nothing,
+    uy::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,XT<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+    tsteps = _ntsteps(y)
+    WT = promote_type(T, XT, mapreduce(eltype, promote_type, values(y)))
+    ws = SmoothWorkspace(WT, lds.latent_dim, 0, tsteps)
+    compute_smooth_constants!(ws, lds)
+    return joint_loglikelihood!(ws, lds, x, y, ux, uy)
+end
+
+# ============================================================================
+# Marginal log-likelihood
+#
+# The Kalman filter's innovation covariance `S_t = C P_t C' + R` is dense
+# whatever the emission's block structure, so unlike the E-step there is nothing
+# to gain from keeping the members apart here. An all-Gaussian composite is
+# therefore evaluated by building the equivalent single-emission model once —
+# `C = [C₁; C₂; …]`, `d = [d₁; d₂; …]`, `R = blockdiag(R₁, R₂, …)`,
+# `D = blockdiag(D₁, D₂, …)` — and running the existing filter on it.
+# ============================================================================
+
+"""
+    _stacked_gaussian_lds(lds) -> LinearDynamicalSystem
+
+The single-emission model equivalent to an all-Gaussian composite: members
+stacked down the channel axis, with `R` and `D` block-diagonal so the members
+stay conditionally independent given the latent path.
+
+Built fresh (the parameters are copied, not shared), so it is a read-only
+snapshot — fitting through it would produce a full `R` rather than the composite's
+block-diagonal one.
+"""
+function _stacked_gaussian_lds(
+    lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    models = _models(lds.obs_model)
+    D = lds.latent_dim
+    p = lds.obs_dim
+    uy = lds.uy_dim
+
+    C = zeros(T, p, D)
+    d = zeros(T, p)
+    Dm = zeros(T, p, uy)
+    R = zeros(T, p, p)
+
+    row = 0
+    col = 0
+    for m in values(models)
+        pm = _obs_dim(m)
+        um = _uy_dim(m)
+        rows = (row + 1):(row + pm)
+        copyto!(view(C, rows, :), m.C)
+        copyto!(view(d, rows), m.d)
+        copyto!(view(R, rows, rows), m.R)
+        um > 0 && copyto!(view(Dm, rows, (col + 1):(col + um)), m.D)
+        row += pm
+        col += um
+    end
+
+    om = GaussianObservationModel{T,Matrix{T},Vector{T}}(; C=C, R=R, d=d, D=Dm)
+    return LinearDynamicalSystem{T,S,typeof(om)}(
+        lds.state_model, om, D, p, lds.ux_dim, uy, fill(true, 6)
+    )
+end
+
+# Per-trial `vcat` of the members' observations / observation inputs, matching
+# the row order `_stacked_gaussian_lds` stacks the parameters in.
+function _stack_trials(bundle::NamedTuple, ntrials::Int)
+    return [reduce(vcat, (v[n] for v in values(bundle))) for n in 1:ntrials]
+end
+
+"""
+    loglikelihood(lds, y::NamedTuple; ux=nothing, uy=nothing)
+
+Marginal (observed-data) log-likelihood of an all-Gaussian composite emission,
+with the latent states integrated out. Equal to the value the equivalent stacked
+single-emission model gives (see [`_stacked_gaussian_lds`](@ref)), which is what
+it is computed from.
+
+A composite containing a non-Gaussian member has no tractable marginal, exactly
+as a Poisson LDS does not; use `elbo` for a lower bound.
+
+Returns the **total** log-likelihood over every member, trial and timestep.
+"""
+function StatsAPI.loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::NamedTuple;
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
+    data = Data(lds, y; ux=ux, uy=uy)
+    ntrials = length(data.tsteps)
+
+    grp = parameter_grouping(lds, ntrials; depends_on=depends_on, y=data.y)
+    grp === nothing || throw(
+        ArgumentError(
+            "marginal loglikelihood of a composite emission whose parameters depend on " *
+            "an ancillary variable is not implemented; score each group separately, or " *
+            "use `elbo`, which handles grouped models.",
+        ),
+    )
+
+    stacked = _stacked_gaussian_lds(lds)
+    ys = _stack_trials(data.y, ntrials)
+    uys = lds.uy_dim > 0 ? _stack_trials(data.uy, ntrials) : nothing
+    return loglikelihood(stacked, ys; ux=data.ux, uy=uys)
+end
+
+function StatsAPI.loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM}, y::NamedTuple; kwargs...
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:CompositeObservationModel{T,false}}
+    return error(
+        "marginal loglikelihood is not implemented for a composite emission with a " *
+        "non-Gaussian member (the marginal log p(y) is intractable, as it is for the " *
+        "Poisson LDS). Use `elbo` for a lower bound, or `joint_loglikelihood` for the " *
+        "complete-data log-likelihood at a given latent path.",
+    )
 end

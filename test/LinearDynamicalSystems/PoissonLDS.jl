@@ -1239,7 +1239,7 @@ function test_poisson_batched_hessian_matches_kernel()
             ws.consts,
             ws.elbo.rho_obs,
             ws.elbo.h_obs,
-            plds,
+            plds.obs_model,
             x,
             y,
             t,

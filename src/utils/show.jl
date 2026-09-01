@@ -125,6 +125,45 @@ function Base.show(io::IO, pom::PoissonObservationModel; gap="")
     return nothing
 end
 
+#=
+Human-readable names for the `fit_bool` slots, in order. The compound entries
+"A (and b, B)" / "C (and d, D)" reflect that each row is fit jointly as one
+regression — the bias and user-input columns are not gated independently. A
+composite emission prefixes each member's slots with the member name.
+=#
+_obs_fit_labels(::GaussianObservationModel) = ["C (and d, D)", "R"]
+_obs_fit_labels(::PoissonObservationModel) = ["C, d"]
+
+function _obs_fit_labels(c::CompositeObservationModel)
+    labels = String[]
+    for key in _obs_keys(c)
+        for label in _obs_fit_labels(_models(c)[key])
+            push!(labels, "$key: $label")
+        end
+    end
+    return labels
+end
+
+function _fit_bool_labels(lds::LinearDynamicalSystem)
+    state = if lds.obs_model isa PoissonObservationModel
+        ["x0", "P0", "A (and b)", "Q"]
+    else
+        ["x0", "P0", "A (and b, B)", "Q"]
+    end
+    return vcat(state, _obs_fit_labels(lds.obs_model))
+end
+
+function Base.show(io::IO, com::CompositeObservationModel; gap="")
+    models = _models(com)
+    println(io, gap, "Composite Observation Model ($(length(models)) models):")
+    println(io, gap, "-------------------------------------------")
+    for key in keys(models)
+        println(io, gap, " [$key]")
+        Base.show(io, models[key]; gap=gap * "  ")
+    end
+    return nothing
+end
+
 function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, "Linear Dynamical System:")
     println(io, gap, "------------------------")
@@ -133,18 +172,7 @@ function Base.show(io::IO, lds::LinearDynamicalSystem; gap="")
     println(io, gap, " Parameters to update:")
     println(io, gap, " ---------------------")
 
-    if lds.obs_model isa PoissonObservationModel
-        # C and d are either both updated or neither
-        prms = ["x0", "P0", "A (and b)", "Q", "C, d"][lds.fit_bool[1:5]]
-    else
-        #=
-        Gaussian path (length 6). The compound
-        entries "A (and b, B)" / "C (and d, D)" reflect that each row is
-        fit jointly as one regression — the bias and user-input columns
-        are not gated independently.
-        =#
-        prms = ["x0", "P0", "A (and b, B)", "Q", "C (and d, D)", "R"][lds.fit_bool[1:6]]
-    end
+    prms = _fit_bool_labels(lds)[lds.fit_bool]
 
     println(io, gap, "  $(join(prms, ", "))")
     return nothing

@@ -467,9 +467,10 @@ Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 * observation-side Q-term per-trial via the existing Poisson `Q_obs!`,
   which is irreducibly non-conjugate (no aggregator equivalent),
 * posterior entropy from `tfs[trial].entropy` (filled by `smooth!`),
-* `IWPrior` log-prior contributions on `Q` and `P0`, the MN log-prior trace
-  term on the dynamics `[A b B]` (full `Q⁻¹` form, mirroring the Gaussian path),
-  and the MN log-prior trace term on `[C d]` to match the LBFGS objective.
+* the parameter log-priors, via the shared [`_state_prior_logdensity`](@ref)
+  and the Poisson [`_obs_prior_logdensity`](@ref) — the same terms the Gaussian
+  path uses on the state side, and the bare MN quadratic on `[C d D]` that
+  matches the emission M-step objective.
 """
 function elbo!(
     plds::LinearDynamicalSystem{T,S,O},
@@ -487,56 +488,9 @@ function elbo!(
     Q_state_total = Q_state!(sws_pool[1], plds, suf)
     Q_obs_total = _poisson_q_obs_total(plds, tfs, data, sws_pool)
 
-    prior_term = zero(T)
-    if plds.state_model.Q_prior !== nothing
-        prior_term += iw_logprior_term(plds.state_model.Q, plds.state_model.Q_prior)
-    end
-    if plds.state_model.P0_prior !== nothing
-        prior_term += iw_logprior_term(plds.state_model.P0, plds.state_model.P0_prior)
-    end
-    if plds.state_model.x0_prior !== nothing
-        prior_term += mn_logprior_term(
-            reshape(plds.state_model.x0, :, 1),
-            plds.state_model.P0,
-            plds.state_model.x0_prior,
-        )
-    end
-
-    #=
-    MN log-prior trace term on the dynamics [A b B]. The state model is Gaussian
-    with noise Q, so this is the full -½ tr(Q⁻¹ (W-M₀) Λ (W-M₀)') form (identical
-    to the Gaussian path). Required for ELBO monotonicity.
-    =#
-    if plds.state_model.AB_prior !== nothing
-        D = plds.latent_dim
-        ux_dim = plds.ux_dim
-        W_ab = Matrix{T}(undef, D, D + 1 + ux_dim)
-        @views W_ab[:, 1:D] .= plds.state_model.A
-        @views W_ab[:, D + 1] .= plds.state_model.b
-        if ux_dim > 0
-            @views W_ab[:, (D + 2):(D + 1 + ux_dim)] .= plds.state_model.B
-        end
-        prior_term += mn_logprior_term(W_ab, plds.state_model.Q, plds.state_model.AB_prior)
-    end
-
-    #=
-    MN log-prior on [C d D]. Λ-only and Λ-logdet constants are absorbed into the
-    additive ELBO constant.
-    =#
-    if plds.obs_model.CD_prior !== nothing
-        D = plds.latent_dim
-        uy_dim = plds.uy_dim
-        reg_dim = D + 1 + uy_dim
-        W_cd = Matrix{T}(undef, plds.obs_dim, reg_dim)
-        @views W_cd[:, 1:D] .= plds.obs_model.C
-        @views W_cd[:, D + 1] .= plds.obs_model.d
-        if uy_dim > 0
-            @views W_cd[:, (D + 2):reg_dim] .= plds.obs_model.D
-        end
-        prior = plds.obs_model.CD_prior
-        Wm = W_cd .- prior.M₀
-        prior_term -= T(0.5) * sum(Wm .* (Wm * prior.Λ))
-    end
+    prior_term =
+        _state_prior_logdensity(plds, sws_pool[1]) +
+        _obs_prior_logdensity(plds, sws_pool[1])
 
     return Q_state_total + Q_obs_total + prior_term + total_entropy
 end

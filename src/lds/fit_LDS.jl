@@ -55,11 +55,11 @@ function joint_loglikelihood!(
     ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T0,S,O},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T0},
+    y::Union{AbstractMatrix{T0},NamedTuple},
     ux::Union{Nothing,AbstractMatrix{T0}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T0}}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
-    ll_vec = view(ws.opt.ll_vec, 1:size(y, 2))
+    uy::Union{Nothing,AbstractMatrix{T0},NamedTuple}=nothing,
+) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:QuadraticEmission{T0}}
+    ll_vec = view(ws.opt.ll_vec, 1:_ntsteps(y))
     return joint_loglikelihood!(ll_vec, ws, ws.consts, lds, x, y, ux, uy)
 end
 
@@ -123,11 +123,13 @@ For multi-trial `y`: `Vector`s of the above, one entry per trial.
 """
 function smooth(
     lds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -144,11 +146,11 @@ one carries O(D²·T) of block-tridiagonal storage.
 =#
 function _smooth_data(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     npool = min(Threads.maxthreadid(), length(data.y))
     sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, maximum(data.tsteps)) for
+        SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), maximum(data.tsteps)) for
         _ in 1:npool
     ]
     smooth!(lds, tfs, data, sws_pool)
@@ -191,12 +193,12 @@ exploiting the block tridiagonal structure of the Hessian for efficient solving.
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
-    uy::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
+    uy::Union{AbstractMatrix{T},NamedTuple},
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
     btd = sws.btd
 
@@ -255,12 +257,12 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps = _ntsteps(y)
     ux = zeros(T, 0, tsteps)
-    uy = zeros(T, 0, tsteps)
+    uy = _zero_uy(lds, tsteps)
     return smooth!(lds, fs, y, sws, ux, uy)
 end
 
@@ -284,14 +286,14 @@ function smooth!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     y = data.y
     ux = data.ux
     uy = data.uy
-    ntrials = length(y)
+    ntrials = length(data.tsteps)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1], ux[1], uy[1])
+        smooth!(lds, tfs[1], _trial(y, 1), sws_pool[1], ux[1], _trial(uy, 1))
         return tfs
     end
 
@@ -302,8 +304,8 @@ function smooth!(
     `p_smooth` / `p_smooth_tt1` to the shared storage, then do gradient-and-
     solve per trial in parallel.
     =#
-    T1 = size(y[1], 2)
-    all_equal = all(yt -> size(yt, 2) == T1, y)
+    T1 = data.tsteps[1]
+    all_equal = all(==(T1), data.tsteps)
 
     if all_equal
         #=
@@ -346,7 +348,13 @@ function smooth!(
                 sws = sws_pool[i]
                 for trial in lo:hi
                     _smooth_mean_only!(
-                        lds, tfs[trial], y[trial], sws, ux[trial], uy[trial], source_sws
+                        lds,
+                        tfs[trial],
+                        _trial(y, trial),
+                        sws,
+                        ux[trial],
+                        _trial(uy, trial),
+                        source_sws,
                     )
                 end
             end
@@ -365,7 +373,9 @@ function smooth!(
             lo > hi && return nothing
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws, ux[trial], uy[trial])
+                smooth!(
+                    lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial)
+                )
             end
         end
     end
@@ -384,7 +394,7 @@ identical for every trial because it depends only on the covariances.
 """
 function _precompute_shared_cov!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     D = lds.latent_dim
     btd = sws.btd
     # Hoist `p_smooth_shared` with a concrete eltype so the `Symmetrize!`
@@ -430,7 +440,8 @@ Per-trial Newton step that **assumes**:
 Per-task workspaces copy the constants from `source_sws` (cheap fixed-size
 `copyto!`s) instead of redoing the Cholesky factorizations. When `sws ===
 source_sws` (the task running on the designated workspace), even the copy
-is skipped.
+is skipped. Under a composite emission each member's constants are mirrored
+too — see [`_mirror_smooth_constants!`](@ref).
 
 Computes the gradient (per-trial), then runs `block_tridiagonal_backsubst!`
 against the shared LU cache. No `lu!` and no Cholesky calls happen here —
@@ -439,13 +450,13 @@ those are amortized across all equal-length trials in a single E-step.
 function _smooth_mean_only!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
-    uy::AbstractMatrix{T},
+    uy::Union{AbstractMatrix{T},NamedTuple},
     source_sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
 
     #=
@@ -454,7 +465,7 @@ function _smooth_mean_only!(
     task workspace. No-op when `sws === source_sws`.
     =#
     if sws !== source_sws
-        _copy_smooth_constants!(sws.consts, source_sws.consts)
+        _mirror_smooth_constants!(sws, source_sws, lds)
     end
 
     shared_btd = source_sws.btd
@@ -653,9 +664,9 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y)
     return smooth!(lds, tfs, data, sws_pool)
 end
@@ -672,11 +683,11 @@ Gaussian emission update now reads `fs.x_smooth` directly.
 """
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
+    suf::Union{SufficientStatistics{T},NamedTuple},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
 
     # smooth each trial
     smooth!(lds, tfs, data, sws_pool)
@@ -734,11 +745,13 @@ Returns a scalar.
 """
 function elbo(
     lds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -752,10 +765,10 @@ function elbo(
         SmoothWorkspace(
             T,
             lds.latent_dim,
-            lds.obs_dim,
+            _ws_obs_dim(lds),
             maximum(data.tsteps);
             ux_dim=lds.ux_dim,
-            uy_dim=lds.uy_dim,
+            uy_dim=_ws_uy_dim(lds),
         ) for _ in 1:npool
     ]
     suf = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -819,14 +832,16 @@ Returns a `Vector{T}` of ELBO values, one per iteration.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
-    y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.y); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
@@ -947,7 +962,7 @@ function _fit_tridiag!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
     elbos = Vector{T}(undef, max_iter)
@@ -965,7 +980,7 @@ function _fit_tridiag!(
     )::TrialFilterSmooth{T}
 
     ux_dim = lds.ux_dim
-    uy_dim = lds.uy_dim
+    uy_dim = _ws_uy_dim(lds)
     #=
     Only `sws_pool[1]` needs the batched mean-pass buffers (used by the
     equal-length cov-cache fast path); the other workspaces back the
@@ -976,15 +991,15 @@ function _fit_tridiag!(
     sws_pool[1] = SmoothWorkspace(
         T,
         lds.latent_dim,
-        lds.obs_dim,
+        _ws_obs_dim(lds),
         T_max;
         ux_dim=ux_dim,
         uy_dim=uy_dim,
-        ntrials=ntrials_total,
+        ntrials=_batched_ntrials(lds, ntrials_total),
     )
     for i in 2:pool_size
         sws_pool[i] = SmoothWorkspace(
-            T, lds.latent_dim, lds.obs_dim, T_max; ux_dim=ux_dim, uy_dim=uy_dim
+            T, lds.latent_dim, _ws_obs_dim(lds), T_max; ux_dim=ux_dim, uy_dim=uy_dim
         )
     end
 
@@ -1032,11 +1047,13 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    T_max = maximum(size(yt, 2) for yt in y)
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
+) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
+    T_max = maximum(_trial_lengths(y))
     npool = Threads.maxthreadid()
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for _ in 1:npool]
+    sws_pool = [
+        SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), T_max) for _ in 1:npool
+    ]
     return smooth!(lds, tfs, y, sws_pool)
 end
 

@@ -2686,7 +2686,7 @@ function test_SLDS_batched_poisson_hessian(; rng=MersenneTwister(0x71F7))
                 ref.consts[k],
                 ref.opt.dyt,
                 ref.opt.temp_dy,
-                slds.LDSs[k],
+                slds.LDSs[k].obs_model,
                 x,
                 y,
                 t,
@@ -2698,7 +2698,7 @@ function test_SLDS_batched_poisson_hessian(; rng=MersenneTwister(0x71F7))
                 ref.consts[k],
                 ref.opt.dyt,
                 ref.opt.temp_dy,
-                slds.LDSs[k],
+                slds.LDSs[k].obs_model,
                 x,
                 y,
                 t,
@@ -3493,7 +3493,7 @@ function test_SLDS_batched_poisson_loglikelihood(; rng=MersenneTwister(0x10C))
         z, λ = zeros(N), zeros(N)
         for t in 1:tsteps
             ref[t] = SSD.observation_loglikelihood!(
-                ws.consts[k], z, λ, slds.LDSs[k], x, y, t, nothing
+                ws.consts[k], z, λ, slds.LDSs[k].obs_model, x, y, t, nothing
             )
             ref[t] += SSD.state_loglikelihood!(
                 ws.consts[k], zeros(D), zeros(D), slds.LDSs[k], x, t, nothing
@@ -3541,7 +3541,7 @@ function test_SLDS_batched_poisson_gradient(; rng=MersenneTwister(0x11C))
         tmp, buf = zeros(D), zeros(N)
         for t in 1:tsteps
             SSD.observation_gradient!(
-                tmp, ws.consts[k], buf, slds.LDSs[k], x, y, t, nothing
+                tmp, ws.consts[k], buf, slds.LDSs[k].obs_model, x, y, t, nothing
             )
             @views ref[:, t] .+= w[k, t] .* tmp
         end

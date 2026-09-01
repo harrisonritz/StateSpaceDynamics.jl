@@ -97,6 +97,100 @@ function _sample_trial!(
     end
 end
 
+#=
+Composite emission. The single-model samplers above interleave the two
+recursions (x₁, y₁, x₂, y₂, …); with several emissions there is no one
+interleaving to pick, so the latent path is drawn in full and each member's
+observations are then drawn from it. Both orders give the same distribution —
+`y_m,t` depends only on `x_t` — but not the same draws from a given seed, which
+is why the single-model path is left exactly as it was.
+=#
+function _sample_trial!(
+    rng,
+    x_trial,
+    y_trial::NamedTuple,
+    state_params,
+    obs_params::NamedTuple,
+    obs_model::CompositeObservationModel,
+    ux_trial::AbstractMatrix,
+    uy_trial::NamedTuple,
+)
+    tsteps = size(x_trial, 2)
+
+    x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
+    for t in 2:tsteps
+        x_trial[:, t] = rand(
+            rng,
+            MvNormal(
+                state_params.A * x_trial[:, t - 1] +
+                state_params.b +
+                state_params.B * ux_trial[:, t - 1],
+                state_params.Q,
+            ),
+        )
+    end
+
+    for (i, m) in enumerate(values(_models(obs_model)))
+        _sample_obs!(rng, y_trial[i], obs_params[i], m, x_trial, uy_trial[i])
+    end
+    return nothing
+end
+
+"""
+    _sample_obs!(rng, y, obs_params, obs_model, x, uy)
+
+Draw one member's observations from an already-sampled latent path. Only the
+composite sampler uses this; the single-model samplers keep their interleaved
+recursion.
+"""
+function _sample_obs!(
+    rng, y, obs_params, ::GaussianObservationModel, x::AbstractMatrix, uy::AbstractMatrix
+)
+    for t in axes(x, 2)
+        y[:, t] = rand(
+            rng,
+            MvNormal(
+                obs_params.C * x[:, t] + obs_params.d + obs_params.D * uy[:, t],
+                obs_params.R,
+            ),
+        )
+    end
+    return nothing
+end
+
+function _sample_obs!(
+    rng, y, obs_params, ::PoissonObservationModel, x::AbstractMatrix, uy::AbstractMatrix
+)
+    for t in axes(x, 2)
+        y[:, t] =
+            rand.(
+                rng,
+                Poisson.(
+                    exp.(obs_params.C * x[:, t] + obs_params.d + obs_params.D * uy[:, t],),
+                ),
+            )
+    end
+    return nothing
+end
+
+"""
+    _alloc_obs(lds, tsteps) -> Matrix or NamedTuple of Matrix
+
+Uninitialized per-trial observation storage shaped for this model's emission.
+"""
+function _alloc_obs(lds::LinearDynamicalSystem{T}, tsteps::Int) where {T<:Real}
+    return Matrix{T}(undef, lds.obs_dim, tsteps)
+end
+
+function _alloc_obs(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    models = _models(lds.obs_model)
+    return NamedTuple{keys(models)}(
+        map(m -> Matrix{T}(undef, _obs_dim(m), tsteps), values(models))
+    )
+end
+
 """
     Random.rand([rng,] lds, tsteps::Integer; ux=nothing, uy=nothing)
     Random.rand([rng,] lds, tsteps_per_trial::AbstractVector{<:Integer};
@@ -142,7 +236,7 @@ function Random.rand(
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     x = Matrix{T}(undef, lds.latent_dim, Ti)
-    y = Matrix{T}(undef, lds.obs_dim, Ti)
+    y = _alloc_obs(lds, Ti)
     _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, ux_trial, uy_trial)
     return x, y
 end
@@ -194,14 +288,18 @@ function Random.rand(
     state_params, obs_params = _per_trial_sample_params(lds, grp, ntrials)
 
     x = Vector{Matrix{T}}(undef, ntrials)
-    y = Vector{Matrix{T}}(undef, ntrials)
+    y = Vector{typeof(_alloc_obs(lds, 1))}(undef, ntrials)
     for i in 1:ntrials
         Ti = Int(tsteps_per_trial[i])
         x[i] = Matrix{T}(undef, lds.latent_dim, Ti)
-        y[i] = Matrix{T}(undef, lds.obs_dim, Ti)
+        y[i] = _alloc_obs(lds, Ti)
     end
 
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps_per_trial, T, "ux")
+    #=
+    Under a composite emission `uy_seq` is a NamedTuple of per-member sequences,
+    so a trial is taken out of it with `_trial` rather than by indexing.
+    =#
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps_per_trial, T, lds.obs_model)
 
     # `MersenneTwister` (and most RNG types) is not thread-safe, so sharing
@@ -216,7 +314,7 @@ function Random.rand(
             obs_params[1],
             lds.obs_model,
             ux_seq[1],
-            uy_seq[1],
+            _trial(uy_seq, 1),
         )
         return x, y
     end
@@ -239,7 +337,7 @@ function Random.rand(
                 obs_params[trial],
                 lds.obs_model,
                 ux_seq[trial],
-                uy_seq[trial],
+                _trial(uy_seq, trial),
             )
         end
     end

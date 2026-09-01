@@ -572,6 +572,43 @@ end
     return _check_ux(cs, expected_dim, tsteps, "uy", T)
 end
 
+#=
+A composite emission takes one input sequence per member, so the canonicalized
+value is a NamedTuple of matrices rather than one matrix. A bare input is the
+shorthand for "these covariates feed every readout" and is checked against each
+member's own `D`; `_member_uy` picks a member's entry apart.
+=#
+@inline function _check_uy(
+    cs, ::Int, tsteps::Int, om::CompositeObservationModel{T}
+) where {T}
+    models = _models(om)
+    return NamedTuple{keys(models)}(
+        map(
+            key ->
+                _check_uy(_member_uy(cs, key), _uy_dim(models[key]), tsteps, models[key]),
+            keys(models),
+        ),
+    )
+end
+
+@inline function _normalize_multitrial_uy(
+    cs, ::Int, tsteps_per_trial, ::Type{T}, om::CompositeObservationModel
+) where {T<:Real}
+    models = _models(om)
+    return NamedTuple{keys(models)}(
+        map(
+            key -> _normalize_multitrial_ux(
+                _member_uy(cs, key),
+                _uy_dim(models[key]),
+                tsteps_per_trial,
+                T,
+                "uy[:$key]",
+            ),
+            keys(models),
+        ),
+    )
+end
+
 function _normalize_multitrial_ux(
     cs::Nothing, expected_dim::Int, tsteps_per_trial, ::Type{T}, name::AbstractString
 ) where {T<:Real}
