@@ -127,6 +127,83 @@ function _valid_param_names(::PoissonObservationModel)
     return ":C, :d, :D (a Poisson emission has no noise covariance)"
 end
 
+#=============================================================================
+Composite emissions
+
+A member's parameters keep their own names; the composite spells them with the
+member appended (`:C_kin`), which is the same spelling `fit_bool` and
+`tied_params` use. Every helper below therefore splits the suffix, delegates to
+the member, and re-suffixes whatever comes back — so `_resolve_dependence`,
+`_build_variants!` and `ParameterGrouping` see a flat list of parameter groups
+and need no notion of members at all.
+
+The resulting group order — every member's groups in the composite's key order,
+after the four state groups — is exactly the `fit_bool` layout, which is what
+lets the grouped M-step index `cell_slot` and `fit_bool` with one ordinal.
+=============================================================================#
+
+function _group_names(c::CompositeObservationModel)
+    names = Symbol[]
+    for key in _obs_keys(c)
+        for g in _group_names(_models(c)[key])
+            push!(names, _suffixed(g, key))
+        end
+    end
+    return Tuple(names)
+end
+
+function _param_group(c::CompositeObservationModel, name::Symbol)
+    split = _split_obs_name(name, _models(c))
+    split === nothing && return nothing
+    group = _param_group(_models(c)[split[2]], split[1])
+    group === nothing && return nothing
+    return _suffixed(group, split[2])
+end
+
+function _group_members(c::CompositeObservationModel, group::Symbol)
+    split = _split_obs_name(group, _models(c))
+    split === nothing && return (group,)
+    key = split[2]
+    return map(m -> _suffixed(m, key), _group_members(_models(c)[key], split[1]))
+end
+
+function _valid_param_names(c::CompositeObservationModel)
+    models = _models(c)
+    parts = String[]
+    for key in keys(models)
+        names = join(
+            (":" * String(_suffixed(n, key)) for n in _all_param_names(models[key])), ", "
+        )
+        push!(parts, "on `:$key`, $names")
+    end
+    return join(parts, "; ")
+end
+
+"""
+    _all_param_names(obs_model) -> Tuple{Vararg{Symbol}}
+
+Every parameter name `depends_on` accepts for a single observation model. Used
+only to build the composite's error message, where each is shown suffixed.
+"""
+_all_param_names(::GaussianObservationModel) = (:C, :d, :D, :R)
+_all_param_names(::PoissonObservationModel) = (:C, :d, :D)
+
+#=
+`group_seeds` is stored on the member that owns the parameters, so seeding goes
+through the member rather than the composite. Spelled out rather than left to
+the immutable-struct `setproperty!` error, which would say nothing useful.
+=#
+function set_group_seeds!(c::CompositeObservationModel, ::Union{Nothing,AbstractDict})
+    return throw(
+        ArgumentError(
+            "set_group_seeds! takes the observation model that owns the parameters, not " *
+            "the composite: the seed keys are group labels and the values name that " *
+            "model's own parameters. Call it on a member, e.g. " *
+            "`set_group_seeds!(obs.$(first(_obs_keys(c))), seeds)`.",
+        ),
+    )
+end
+
 function _param_group_checked(model::DependentModel, name::Symbol)
     group = _param_group(model, name)
     group === nothing && throw(

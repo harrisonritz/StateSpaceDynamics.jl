@@ -49,6 +49,7 @@ include("lds/continuous_latents.jl")                # state-model Q-term + state
 include("lds/gaussian_observations.jl")
 include("lds/poisson_observations.jl")
 include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
+include("lds/composite_observations.jl")            # several emissions on one latent state
 
 # Grouped (`depends_on`) M-step + ELBO machinery, shared by LDS / PLDS / SLDS.
 include("lds/grouped_em.jl")
@@ -67,11 +68,12 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
 export AbstractStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
+export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior
 export CovUpdateCache
 
 # Ancillary parameter dependencies (`depends_on`)
-export group_labels, group_parameter, set_group_seeds!
+export group_labels, group_parameter, set_group_seeds!, set_depends_on!
 
 # Utilities
 export block_tridgm

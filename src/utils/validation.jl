@@ -284,6 +284,48 @@ function _validate_obs_model(
 end
 
 """
+    _validate_obs_model(obs_model::CompositeObservationModel, obs_dim, latent_dim)
+
+Validate every member of a composite emission against its own channel count.
+`obs_dim` is the composite's total and is checked against the members' sum; each
+member is then handed its own width, so a per-member shape error names the
+member it came from.
+
+# Throws
+- `DimensionMismatchError`: if the members' widths do not sum to `obs_dim`, or a
+  member's own parameters are inconsistent
+- whatever the member's validator throws, with the member named
+"""
+function _validate_obs_model(
+    obs_model::CompositeObservationModel{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    models = _models(obs_model)
+    total = 0
+    for (key, m) in pairs(models)
+        p = _obs_dim(m)
+        try
+            _validate_obs_model(m, p, latent_dim)
+        catch err
+            err isa Exception || rethrow()
+            throw(
+                ArgumentError(
+                    "observation model `:$key` is invalid: " * sprint(showerror, err)
+                ),
+            )
+        end
+        total += p
+    end
+
+    if total != obs_dim
+        throw(
+            DimensionMismatchError("composite obs_dim (sum over members)", total, obs_dim)
+        )
+    end
+
+    return nothing
+end
+
+"""
     validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
 
 Validate that all parameters in a LinearDynamicalSystem are dimensionally consistent
@@ -335,17 +377,18 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     _resolve_dependence(lds.obs_model)
 
     #=
-    Check fit_bool length. The Gaussian path uses length 6 — the regression
-    M-step fits A&b&B and C&d&D jointly.
+    Check fit_bool length: four state groups, then one block per observation
+    model (`[C d D]`, plus `R` when that model is Gaussian). Length 6 for a
+    Gaussian LDS, 5 for a Poisson one, `4 + Σₘ blocks` for a composite.
     =#
-    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    expected_fit_length = 4 + _obs_nblocks(lds.obs_model)
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end
 
     # Check consistency between inferred and stored dimensions
     inferred_latent = size(lds.state_model.A, 1)
-    inferred_obs = size(lds.obs_model.C, 1)
+    inferred_obs = _obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent
         throw(
@@ -358,7 +401,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     if lds.obs_dim != inferred_obs
         throw(
             DimensionMismatchError(
-                "obs_dim (stored vs inferred from C)", inferred_obs, lds.obs_dim
+                "obs_dim (stored vs inferred from the emission)", inferred_obs, lds.obs_dim
             ),
         )
     end

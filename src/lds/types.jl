@@ -42,14 +42,15 @@ construct a `Data` via the validating constructor, which is the single
 shape/dimension validation site. Everything downstream of a `Data` may
 assume consistent, model-compatible shapes.
 
+For a [`CompositeObservationModel`](@ref), `y` and `uy` are instead
+`NamedTuple`s keyed by observation model, each value being that model's own
+vector of per-trial matrices. `ux` and `tsteps` are shared, so every state-side
+consumer of a `Data` is identical in both cases — which is why `YV` and `UYV`
+carry no bound.
+
 See also [`Data(lds, y; ux, uy)`](@ref), the validating constructor (below).
 """
-struct Data{
-    T<:Real,
-    YV<:AbstractVector{<:AbstractMatrix{T}},
-    UXV<:AbstractVector{<:AbstractMatrix{T}},
-    UYV<:AbstractVector{<:AbstractMatrix{T}},
-}
+struct Data{T<:Real,YV,UXV<:AbstractVector{<:AbstractMatrix{T}},UYV}
     y::YV
     ux::UXV
     uy::UYV
@@ -267,6 +268,272 @@ function PoissonObservationModel(
     )
 end
 
+# ============================================================================
+# Composite (multi-model) observations
+# ============================================================================
+
+"""
+    _key_list(names) -> String
+
+`":kin, :spk"` — a list of symbols rendered for an error message. Accepts the
+member keys of a composite (via its `NamedTuple` of models) or a plain tuple of
+names.
+"""
+_key_list(names::Tuple{Vararg{Symbol}}) = join((":" * String(n) for n in names), ", ")
+_key_list(models::NamedTuple) = _key_list(keys(models))
+
+"""
+    _emission_is_quadratic(obs_model) -> Bool
+
+Whether an observation model's log-density is quadratic in the latent state.
+
+`true` means the emission's curvature `∂² log p(y|x) / ∂x²` does not depend on
+`x`, so the Newton smoother converges in a single step and the block-tridiagonal
+Hessian — hence the smoothed covariance — is data-independent. That is what lets
+`smooth!` share one covariance across equal-length trials and run the batched
+BLAS-3 mean pass. `false` (Poisson) requires the iterative Laplace smoother.
+
+The composite's value is the `AND` over its members, carried in its `QUAD` type
+parameter so the choice of smoother is a compile-time dispatch.
+"""
+_emission_is_quadratic(::GaussianObservationModel) = true
+_emission_is_quadratic(::PoissonObservationModel) = false
+
+# Unrolled over the (heterogeneous, statically-sized) tuple of members so the
+# result is a compile-time constant.
+_all_quadratic(::Tuple{}) = true
+function _all_quadratic(models::Tuple)
+    return _emission_is_quadratic(first(models)) && _all_quadratic(Base.tail(models))
+end
+
+"""
+    CompositeObservationModel{T<:Real,QUAD,NT<:NamedTuple} <: AbstractObservationModel{T}
+
+Several observation models reading out one shared latent state. Build one by
+handing a `NamedTuple` of observation models to `LinearDynamicalSystem`:
+
+```julia
+lds = LinearDynamicalSystem(
+    state_model,
+    (kin = GaussianObservationModel(C_kin, R_kin, d_kin),
+     spk = PoissonObservationModel(C_spk, d_spk)),
+)
+```
+
+The members are conditionally independent given the latent path, so
+`log p(y | x) = Σ_m log p(y_m | x)` and every emission term (log-density,
+gradient, curvature, Q-term, prior) is a sum over members. The dynamics
+`[A b B]`, `Q` and the initial state `x0`, `P0` are shared.
+
+Observations and observation inputs are supplied under the same keys:
+
+```julia
+fit!(lds, (kin = Ykin, spk = Yspk); uy = (kin = Vkin, spk = Vspk))
+```
+
+# Fields
+- `models::NT`: the member observation models, keyed by name. Each is an
+    ordinary [`GaussianObservationModel`](@ref) / [`PoissonObservationModel`](@ref)
+    and keeps its own `obs_dim`, `D`/`uy_dim`, priors, `depends_on`,
+    `group_seeds` and `variants` — nothing about a member changes by being put
+    in a composite.
+
+# Type parameters
+- `QUAD::Bool`: `true` when every member is quadratic in the latent state (see
+    [`_emission_is_quadratic`](@ref)). Encoded in the type so the single-step
+    versus iterative smoother is chosen by dispatch rather than at run time.
+
+# Parameter access
+A member is reached by its key, and a member's parameter by the key-suffixed
+name — the same spelling `depends_on`, `fit_bool` and `tied_params` use:
+
+```julia
+obs.kin         # the GaussianObservationModel
+obs.kin.C       # its emission matrix
+obs.C_kin       # the same array
+```
+
+Keys may not be observation-parameter names (`:C`, `:d`, `:D`, `:R`) or the
+field name `:models`, since either would make the suffixed spelling ambiguous.
+
+See also [`set_depends_on!`](@ref).
+"""
+struct CompositeObservationModel{T<:Real,QUAD,NT<:NamedTuple} <: AbstractObservationModel{T}
+    models::NT
+end
+
+# Internal accessor. `getproperty` is overloaded below, so every internal read
+# of the member tuple goes through `getfield` to stay on the fast path.
+@inline _models(c::CompositeObservationModel) = getfield(c, :models)
+
+"""
+    _obs_keys(model) -> Tuple{Vararg{Symbol}}
+
+The observation-model keys of a model: the composite's member names, or `()`
+for a single observation model (which has no keys — its parameters are named
+without a suffix).
+"""
+@inline _obs_keys(c::CompositeObservationModel) = keys(_models(c))
+@inline _obs_keys(::AbstractObservationModel) = ()
+
+@inline function _emission_is_quadratic(::CompositeObservationModel{T,QUAD}) where {T,QUAD}
+    return QUAD
+end
+
+_obs_eltype(::AbstractObservationModel{T}) where {T<:Real} = T
+
+#=
+Names a member key may not take. `:models` is the struct's own field, and an
+observation-parameter name would make `obs.C_kin` ambiguous the moment a member
+were called `:C` (is it `models.C.kin`, or `models.kin.C`?).
+=#
+const _RESERVED_OBS_KEYS = (:models, :C, :d, :D, :R, :depends_on, :group_seeds, :variants)
+
+"""
+    CompositeObservationModel(models::NamedTuple)
+
+Bundle several observation models into one. Called for you by
+`LinearDynamicalSystem(state_model, models::NamedTuple)`; use it directly only
+when you want the composite on its own.
+
+# Throws
+- `ArgumentError` on an empty `NamedTuple`, a member that is not an
+  `AbstractObservationModel`, a reserved key name, or members with different
+  element types.
+"""
+function CompositeObservationModel(models::NamedTuple)
+    isempty(models) && throw(
+        ArgumentError(
+            "a composite observation model needs at least one member; got an empty " *
+            "NamedTuple. Pass the observation model on its own for the single-emission " *
+            "case.",
+        ),
+    )
+    for (key, m) in pairs(models)
+        m isa AbstractObservationModel || throw(
+            ArgumentError(
+                "observation model `:$key` is a $(typeof(m)); every member of a " *
+                "composite must be an AbstractObservationModel",
+            ),
+        )
+        key in _RESERVED_OBS_KEYS && throw(
+            ArgumentError(
+                "`:$key` cannot name an observation model: it collides with an " *
+                "observation-parameter name or with the composite's own field, which " *
+                "would make the suffixed spelling `C_$key` ambiguous. Reserved names " *
+                "are $(_key_list(_RESERVED_OBS_KEYS)).",
+            ),
+        )
+    end
+
+    T = _obs_eltype(first(values(models)))
+    for (key, m) in pairs(models)
+        _obs_eltype(m) === T || throw(
+            ArgumentError(
+                "observation model `:$key` has element type $(_obs_eltype(m)) but " *
+                "`:$(first(keys(models)))` has $T; every member of a composite must " *
+                "share one element type",
+            ),
+        )
+    end
+
+    quad = _all_quadratic(values(models))
+    return CompositeObservationModel{T,quad,typeof(models)}(models)
+end
+
+#=
+`c.kin` (a member), `c.C_kin` (a member's parameter) and `c.depends_on` (the
+assembled suffixed declaration). Everything else falls through to `getfield`, so
+`c.models` still works.
+
+The suffix split resolves against the actual member keys rather than by
+splitting on the last `_`, so a member may be called `:eye_pos` without its
+parameters becoming unreachable. The longest matching key wins, which makes the
+split unambiguous even when one key is a suffix of another.
+=#
+function Base.getproperty(c::CompositeObservationModel, name::Symbol)
+    name === :models && return getfield(c, :models)
+    models = getfield(c, :models)
+    haskey(models, name) && return models[name]
+    name === :depends_on && return _composite_depends_on(c)
+    split = _split_obs_name(name, models)
+    split === nothing && throw(
+        ArgumentError(
+            "`$name` is not a member or parameter of this composite observation " *
+            "model. Members are $(_key_list(models)); " *
+            "a member's parameter is named with the member as a suffix, e.g. " *
+            "`C_$(first(keys(models)))`.",
+        ),
+    )
+    return getproperty(models[split[2]], split[1])
+end
+
+function Base.propertynames(c::CompositeObservationModel, private::Bool=false)
+    models = getfield(c, :models)
+    names = Symbol[:models, :depends_on]
+    for key in keys(models)
+        push!(names, key)
+        for param in propertynames(models[key])
+            push!(names, _suffixed(param, key))
+        end
+    end
+    return Tuple(names)
+end
+
+"""
+    _suffixed(param, key) -> Symbol
+
+A member's parameter name in the composite's flat spelling: `(:C, :kin)` →
+`:C_kin`. The inverse is [`_split_obs_name`](@ref).
+"""
+@inline _suffixed(param::Symbol, key::Symbol) = Symbol(param, :_, key)
+
+"""
+    _split_obs_name(name, models) -> Tuple{Symbol,Symbol} or nothing
+
+Split a flat parameter name into `(parameter, member_key)`, or `nothing` when it
+names no member's parameter. The longest matching key wins, so keys that are
+suffixes of one another still resolve.
+"""
+function _split_obs_name(name::Symbol, models::NamedTuple)
+    s = String(name)
+    best = nothing
+    best_len = 0
+    for key in keys(models)
+        suffix = "_" * String(key)
+        endswith(s, suffix) || continue
+        length(suffix) < length(s) || continue
+        length(suffix) > best_len || continue
+        param = Symbol(s[1:(end - length(suffix))])
+        hasproperty(models[key], param) || continue
+        best = (param, key)
+        best_len = length(suffix)
+    end
+    return best
+end
+
+"""
+    _composite_depends_on(c) -> NamedTuple or nothing
+
+The composite's `depends_on` assembled from its members: each member's own
+declaration with the member key appended to every parameter name. `nothing` when
+no member declares one, which is what keeps `parameter_grouping` on the
+ungrouped path.
+"""
+function _composite_depends_on(c::CompositeObservationModel)
+    models = getfield(c, :models)
+    entries = Pair{Symbol,Any}[]
+    for key in keys(models)
+        spec = models[key].depends_on
+        spec === nothing && continue
+        for param in keys(spec)
+            push!(entries, _suffixed(param, key) => getproperty(spec, param))
+        end
+    end
+    isempty(entries) && return nothing
+    return NamedTuple(entries)
+end
+
 """
     LinearDynamicalSystem{T<:Real, S<:AbstractStateModel{T}, O<:AbstractObservationModel{T}}
 
@@ -281,9 +548,23 @@ Represents a unified Linear Dynamical System with customizable state and observa
 - `ux_dim::Int`: Dimension of the dynamics input `ux` (0 when `B` is absent)
 - `uy_dim::Int`: Dimension of the observation input `uy` (0 when `D` is absent)
 - `fit_bool::Vector{Bool}`: Vector indicating which parameters to fit during optimization.
-    Length 6 for the Gaussian path (`[x0, P0, A&b&B, Q, C&d&D, R]`); the M-step
-    regression fits each row jointly. Length 5 for the Poisson path
-    (`[x0, P0, A&b, Q, C&d]`).
+    The first four entries are the state side, `[x0, P0, A&b&B, Q]`; the rest are
+    the observation side, one block per observation model in order — `[C&d&D, R]`
+    for a Gaussian emission and `[C&d&D]` for a Poisson one. The M-step fits each
+    regression jointly, which is why `A`, `b`, `B` share a slot (and `C`, `d`, `D`
+    theirs). So the length is 6 for a Gaussian LDS, 5 for a Poisson one, and
+    `4 + \u03a3\u2098 blocks` for a [`CompositeObservationModel`](@ref).
+
+    The constructor also accepts the keyword form and lowers it, which avoids
+    counting positions by hand:
+
+    ```julia
+    fit_bool = (x0=true, P0=true, A=true, Q=true, C=true, R=false)
+    fit_bool = (x0=true, P0=true, A=true, Q=true,          # composite
+                kin=(C=true, R=false), spk=(C=true,))
+    ```
+
+    Omitted names default to `true`.
 """
 Base.@kwdef struct LinearDynamicalSystem{
     T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}
@@ -297,42 +578,216 @@ Base.@kwdef struct LinearDynamicalSystem{
     fit_bool::Vector{Bool}
 end
 
+#=
+Observation-side shapes and `fit_bool` layout. Each helper has a single-model
+method reading the model's own arrays and a composite method summing over
+members, so the constructor below is one code path for both.
+=#
+
+"""
+    _obs_dim(obs_model) -> Int
+
+Total number of observed channels: `size(C, 1)` for a single observation model,
+the sum over members for a composite.
+"""
+_obs_dim(om::AbstractObservationModel) = size(om.C, 1)
+_obs_dim(c::CompositeObservationModel) = sum(_obs_dim, values(_models(c)))
+
+"""
+    _uy_dim(obs_model) -> Int
+
+Total observation-input dimension: `size(D, 2)`, summed over a composite's
+members. Each member keeps its own `D` and its own input sequence, so this total
+is only the model-level summary — buffer sizing on the composite path uses each
+member's own width via [`_obs_views`](@ref).
+"""
+function _uy_dim(om::AbstractObservationModel)
+    return hasproperty(om, :D) && !isnothing(om.D) ? size(om.D, 2) : 0
+end
+_uy_dim(c::CompositeObservationModel) = sum(_uy_dim, values(_models(c)))
+
+"""
+    _obs_nblocks(obs_model) -> Int
+
+How many `fit_bool` slots an observation model occupies: 2 for a Gaussian
+emission (`[C&d&D]` and `R`), 1 for a Poisson one (no noise covariance), and the
+sum over members for a composite.
+"""
+_obs_nblocks(::GaussianObservationModel) = 2
+_obs_nblocks(::PoissonObservationModel) = 1
+_obs_nblocks(c::CompositeObservationModel) = sum(_obs_nblocks, values(_models(c)))
+
+"""
+    _obs_fit_range(obs_model) -> UnitRange{Int}
+    _obs_fit_range(composite, key) -> UnitRange{Int}
+
+The slice of `fit_bool` holding one observation model's flags. The state side
+always occupies `1:4`, so a single model's slice starts at 5 and a composite
+member's starts after every member declared before it.
+"""
+_obs_fit_range(om::AbstractObservationModel) = 5:(4 + _obs_nblocks(om))
+
+function _obs_fit_range(c::CompositeObservationModel, key::Symbol)
+    models = _models(c)
+    offset = 4
+    for k in keys(models)
+        n = _obs_nblocks(models[k])
+        k === key && return (offset + 1):(offset + n)
+        offset += n
+    end
+    return throw(
+        ArgumentError(
+            "`:$key` is not an observation model of this composite; members are " *
+            "$(_key_list(models))",
+        ),
+    )
+end
+
+"""
+    _default_fit_bool(obs_model) -> Vector{Bool}
+
+All-`true` `fit_bool` of the right length for this observation model.
+"""
+_default_fit_bool(om::AbstractObservationModel) = fill(true, 4 + _obs_nblocks(om))
+
+# Names the keyword `fit_bool` form accepts, for the error message on a typo.
+function _fit_bool_keys(om::AbstractObservationModel)
+    return (:x0, :P0, :A, :Q, :C, :R)[1:(4 + _obs_nblocks(om))]
+end
+
+function _fit_bool_keys(c::CompositeObservationModel)
+    models = _models(c)
+    names = Symbol[:x0, :P0, :A, :Q]
+    for key in keys(models)
+        push!(names, key)
+        for param in (:C, :R)[1:_obs_nblocks(models[key])]
+            push!(names, _suffixed(param, key))
+        end
+    end
+    return Tuple(names)
+end
+
+"""
+    _lower_fit_bool(obs_model, spec::NamedTuple) -> Vector{Bool}
+
+Lower the keyword `fit_bool` form to the positional vector. Omitted names stay
+`true`; an unknown name is an error rather than a silent no-op, since a typo
+there would quietly fit a parameter the caller meant to freeze.
+"""
+function _lower_fit_bool(om::AbstractObservationModel, spec::NamedTuple)
+    valid = _fit_bool_keys(om)
+    for key in keys(spec)
+        key in valid || throw(
+            ArgumentError(
+                "fit_bool: `:$key` is not a parameter group of this model; valid names " *
+                "are $(_key_list(valid))",
+            ),
+        )
+    end
+    fb = _default_fit_bool(om)
+    for (i, name) in enumerate((:x0, :P0, :A, :Q))
+        haskey(spec, name) && (fb[i] = spec[name])
+    end
+    _apply_obs_fit_bool!(fb, om, spec)
+    return fb
+end
+
+function _apply_obs_fit_bool!(fb::Vector{Bool}, om::AbstractObservationModel, spec)
+    r = _obs_fit_range(om)
+    haskey(spec, :C) && (fb[first(r)] = spec[:C])
+    length(r) > 1 && haskey(spec, :R) && (fb[first(r) + 1] = spec[:R])
+    return fb
+end
+
+#=
+A composite member is named either by nesting (`kin = (C = true, R = false)`) or
+by the flat suffixed spelling (`C_kin = true`). Both are accepted; the flat form
+is applied second so it wins if a caller somehow gives both.
+=#
+function _apply_obs_fit_bool!(
+    fb::Vector{Bool}, c::CompositeObservationModel, spec::NamedTuple
+)
+    models = _models(c)
+    for key in keys(models)
+        r = _obs_fit_range(c, key)
+        nested = get(spec, key, nothing)
+        if nested !== nothing
+            nested isa NamedTuple || throw(
+                ArgumentError(
+                    "fit_bool[:$key] must be a NamedTuple of that model's parameter " *
+                    "groups, e.g. `(C = true, R = false)`; got a $(typeof(nested))",
+                ),
+            )
+            _apply_obs_fit_bool!(view(fb, r), models[key], nested)
+        end
+        haskey(spec, _suffixed(:C, key)) && (fb[first(r)] = spec[_suffixed(:C, key)])
+        length(r) > 1 &&
+            haskey(spec, _suffixed(:R, key)) &&
+            (fb[first(r) + 1] = spec[_suffixed(:R, key)])
+    end
+    return fb
+end
+
+# Nested form writes through a length-1/2 view of the parent vector.
+function _apply_obs_fit_bool!(
+    fb::AbstractVector{Bool}, om::AbstractObservationModel, spec::NamedTuple
+)
+    haskey(spec, :C) && (fb[1] = spec[:C])
+    length(fb) > 1 && haskey(spec, :R) && (fb[2] = spec[:R])
+    return fb
+end
+
+"""
+    LinearDynamicalSystem(state_model, obs_model; fit_bool=nothing)
+    LinearDynamicalSystem(state_model, obs_models::NamedTuple; fit_bool=nothing)
+
+Build a linear dynamical system from a state model and either a single
+observation model or a `NamedTuple` of them (wrapped into a
+[`CompositeObservationModel`](@ref)). Dimensions are inferred from the parameter
+matrices and the result is validated before it is returned.
+
+`fit_bool` accepts the positional vector or the keyword form described under the
+type's `fit_bool` field; omitted, every parameter is fitted.
+"""
 function LinearDynamicalSystem(
-    state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},Nothing}=nothing
+    state_model::S, obs_model::O; fit_bool::Union{Vector{Bool},NamedTuple,Nothing}=nothing
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
     # Infer dimensions from matrices
     latent_dim = size(state_model.A, 1)
-    obs_dim = size(obs_model.C, 1)
+    obs_dim = _obs_dim(obs_model)
     ux_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
         size(state_model.B, 2)
     else
         0
     end
-    uy_dim =
-        hasproperty(obs_model, :D) && !isnothing(obs_model.D) ? size(obs_model.D, 2) : 0
+    uy_dim = _uy_dim(obs_model)
 
-    # Set default fit_bool based on observation model type. The M-step fits
-    # [A b B] and [C d D] as joint regressions, so the Gaussian layout is length 6.
-    if fit_bool === nothing
-        if obs_model isa PoissonObservationModel
-            # Poisson: [x0, P0, A&b, Q, C&d] (5 parameters)
-            fit_bool = [true, true, true, true, true]
-        else
-            # Gaussian (BTD): [x0, P0, A&b&B, Q, C&d&D, R] (6 parameters)
-            fit_bool = [true, true, true, true, true, true]
-        end
+    fb = if fit_bool === nothing
+        _default_fit_bool(obs_model)
+    elseif fit_bool isa NamedTuple
+        _lower_fit_bool(obs_model, fit_bool)
+    else
+        fit_bool
     end
 
     # Create the LDS
     lds = LinearDynamicalSystem{T,S,O}(
-        state_model, obs_model, latent_dim, obs_dim, ux_dim, uy_dim, fit_bool
+        state_model, obs_model, latent_dim, obs_dim, ux_dim, uy_dim, fb
     )
 
     # Validate the constructed LDS (throws on error)
     validate_LDS(lds)
 
     return lds
+end
+
+function LinearDynamicalSystem(
+    state_model::AbstractStateModel, obs_models::NamedTuple; kwargs...
+)
+    return LinearDynamicalSystem(
+        state_model, CompositeObservationModel(obs_models); kwargs...
+    )
 end
 
 """

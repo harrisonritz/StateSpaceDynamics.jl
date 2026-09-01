@@ -524,9 +524,14 @@ concern:
   multi-trial equal-length fit carries one)
 - `poisson`: batched Poisson emission scratch, or `nothing` until the first
   Poisson kernel asks for it (see [`poisson_batch!`](@ref))
+- `obs`: one sub-workspace per member of a [`CompositeObservationModel`](@ref),
+  in the composite's key order, or `nothing` for a single observation model.
+  Attached by [`_attach_obs_workspaces!`](@ref); see there for what is shared.
+  Held as a `Vector` rather than a `NamedTuple` so the element type stays
+  concrete — the composite's own type parameter already carries the keys.
 
-Every field except `batched` and `poisson` is `const`. `batched` is reassignable so a grouped
-fit (see `parameter_groups.jl`) can swap in the buffers sized for the group of
+Every field except `batched`, `poisson` and `obs` is `const`. `batched` is reassignable so a
+grouped fit (see `parameter_groups.jl`) can swap in the buffers sized for the group of
 trials it is about to smooth, while sharing the expensive O(D²·T) storage — the
 block-tridiagonal workspace and the shared-covariance cache — across all groups.
 """
@@ -539,6 +544,7 @@ mutable struct SmoothWorkspace{T<:Real}
     const agg::TDAggBuffers{T}
     batched::Union{Nothing,BatchedBuffers{T}}
     poisson::Union{Nothing,PoissonBatchBuffers{T}}
+    obs::Union{Nothing,Vector{SmoothWorkspace{T}}}
 end
 
 """
@@ -581,7 +587,120 @@ function SmoothWorkspace(
         TDAggBuffers(T, latent_dim, obs_dim, tsteps; ux_dim=ux_dim, uy_dim=uy_dim),         # Buffers for TD sufficient-statistics aggregator + shared smoothed-covariance storage
         batched,
         nothing,                                                                            # batched Poisson scratch, allocated on first use
+        nothing,                                                                            # per-observation-model sub-workspaces, attached for a composite
     )
+end
+
+"""
+    _compute_state_constants!(cc, state_model)
+
+Fill the state half of a [`SmoothConstants`](@ref) — everything derived from
+`A`, `Q` and `P0`. Shared by every observation model, since none of it depends
+on the emission.
+"""
+function _compute_state_constants!(
+    cc::SmoothConstants{WT}, sm::GaussianStateModel{T}
+) where {WT<:Real,T<:Real}
+    A = sm.A
+    Q = sm.Q
+    P0 = sm.P0
+    latent_dim = size(A, 1)
+
+    #=
+    Rewrap covariances as PDMats — each PDMat caches its own Cholesky
+    factor internally and is consumed downstream via `cc.X_PD.chol.U`
+    for triangular solves and `logdet(cc.X_PD)` for the normalizer.
+
+    When `WT === T` (the hot path) `convert(Matrix{WT}, M)` returns `M`
+    unchanged — no copy, no alloc. When the constants eltype differs
+    (e.g. `ForwardDiff.Dual` for autodiff `loglikelihood`), constructing
+    the PDMat directly with `WT`-typed factors avoids the
+    `convert(::Type{PDMat{WT}}, ::PDMat{T})` fallback that requires a
+    single-arg `Cholesky{WT}(::Cholesky{T})` method — present in
+    Julia 1.12 but not Julia 1.10's stdlib `LinearAlgebra`.
+    =#
+    Q_w = convert(Matrix{WT}, Q)
+    P0_w = convert(Matrix{WT}, P0)
+    cc.Q_PD = PDMat(Symmetrize!(Q_w))
+    cc.P0_PD = PDMat(Symmetrize!(P0_w))
+    Qchol = cc.Q_PD.chol
+    P0chol = cc.P0_PD.chol
+
+    # tmp_QA = Q^{-1} A
+    copyto!(cc.tmp_QA, A)
+    ldiv!(Qchol, cc.tmp_QA)
+    copyto!(cc.A_inv_Q, cc.tmp_QA')
+
+    # Hessian block templates for the state model
+    copyto!(cc.H_sub_entry, cc.tmp_QA)          # Q^{-1} A
+    copyto!(cc.H_super_entry, cc.tmp_QA')       # (Q^{-1} A)'
+
+    # xt_given_xt_1 = -Q^{-1}
+    copyto!(cc.xt_given_xt_1, cc.I_mat)
+    ldiv!(Qchol, cc.xt_given_xt_1)
+    cc.xt_given_xt_1 .*= -one(T)
+
+    # xt1_given_xt = -A' * (Q^{-1} A)
+    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
+    cc.xt1_given_xt .*= -one(T)
+
+    # x_t = -P0^{-1}
+    copyto!(cc.x_t, cc.I_mat)
+    ldiv!(P0chol, cc.x_t)
+    cc.x_t .*= -one(T)
+
+    # Log-likelihood normalizers (consumed by the likelihood kernels)
+    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
+    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
+
+    return nothing
+end
+
+"""
+    _compute_obs_constants!(cc, obs_model)
+
+Fill the emission half of a [`SmoothConstants`](@ref).
+
+Gaussian: the `R` Cholesky, the derived `C'R⁻¹` and `-C'R⁻¹C` templates, and the
+`-0.5(p·log 2π + logdet R)` normalizer.
+
+Poisson: nothing to cache — the emission terms depend on `x` — so the Gaussian
+slots are zeroed and `cR` set to zero, which also stops a stale value surviving
+an observation-model switch on a reused workspace. `R_PD` keeps its identity
+placeholder.
+"""
+function _compute_obs_constants!(
+    cc::SmoothConstants{WT}, om::GaussianObservationModel{T}
+) where {WT<:Real,T<:Real}
+    C = om.C
+    R = om.R
+    obs_dim = size(C, 1)
+
+    R_w = convert(Matrix{WT}, R)     # see `_compute_state_constants!` for the rationale
+    cc.R_PD = PDMat(Symmetrize!(R_w))
+    Rchol = cc.R_PD.chol
+
+    # tmp_RC = R^{-1} C
+    copyto!(cc.tmp_RC, C)
+    ldiv!(Rchol, cc.tmp_RC)
+    copyto!(cc.C_inv_R, cc.tmp_RC')
+
+    # yt_given_xt = -C' * (R^{-1} C)
+    mul!(cc.yt_given_xt, C', cc.tmp_RC)
+    cc.yt_given_xt .*= -one(T)
+
+    cc.cR = -WT(0.5) * (WT(obs_dim) * log(WT(2π)) + logdet(cc.R_PD))
+
+    return nothing
+end
+
+function _compute_obs_constants!(
+    cc::SmoothConstants{WT}, ::PoissonObservationModel{T}
+) where {WT<:Real,T<:Real}
+    fill!(cc.yt_given_xt, zero(WT))
+    fill!(cc.C_inv_R, zero(WT))
+    cc.cR = zero(WT)
+    return nothing
 end
 
 """
@@ -604,130 +723,16 @@ The `SmoothWorkspace` form forwards to the workspace's embedded
 function compute_smooth_constants!(
     cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
-    P0 = lds.state_model.P0
-    C = lds.obs_model.C
-    R = lds.obs_model.R
-
-    #=
-    Rewrap covariances as PDMats — each PDMat caches its own Cholesky
-    factor internally and is consumed downstream via `cc.X_PD.chol.U`
-    for triangular solves and `logdet(cc.X_PD)` for the normalizer.
-
-    When `WT === T` (the hot path) `convert(Matrix{WT}, M)` returns `M`
-    unchanged — no copy, no alloc. When the constants eltype differs
-    (e.g. `ForwardDiff.Dual` for autodiff `loglikelihood`), constructing
-    the PDMat directly with `WT`-typed factors avoids the
-    `convert(::Type{PDMat{WT}}, ::PDMat{T})` fallback that requires a
-    single-arg `Cholesky{WT}(::Cholesky{T})` method — present in
-    Julia 1.12 but not Julia 1.10's stdlib `LinearAlgebra`.
-    =#
-    R_w = convert(Matrix{WT}, R)
-    Q_w = convert(Matrix{WT}, Q)
-    P0_w = convert(Matrix{WT}, P0)
-    cc.R_PD = PDMat(Symmetrize!(R_w))
-    cc.Q_PD = PDMat(Symmetrize!(Q_w))
-    cc.P0_PD = PDMat(Symmetrize!(P0_w))
-    Rchol = cc.R_PD.chol
-    Qchol = cc.Q_PD.chol
-    P0chol = cc.P0_PD.chol
-
-    # tmp_RC = R^{-1} C
-    copyto!(cc.tmp_RC, C)
-    ldiv!(Rchol, cc.tmp_RC)
-    copyto!(cc.C_inv_R, cc.tmp_RC')
-
-    # tmp_QA = Q^{-1} A
-    copyto!(cc.tmp_QA, A)
-    ldiv!(Qchol, cc.tmp_QA)
-    copyto!(cc.A_inv_Q, cc.tmp_QA')
-    copyto!(cc.H_sub_entry, cc.tmp_QA)
-    copyto!(cc.H_super_entry, cc.tmp_QA')
-
-    # yt_given_xt = -C' * (R^{-1} C)
-    mul!(cc.yt_given_xt, C', cc.tmp_RC)
-    cc.yt_given_xt .*= -one(T)
-
-    # xt_given_xt_1 = -Q^{-1}
-    copyto!(cc.xt_given_xt_1, cc.I_mat)
-    ldiv!(Qchol, cc.xt_given_xt_1)
-    cc.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q^{-1} A)
-    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
-    cc.xt1_given_xt .*= -one(T)
-
-    # x_t = -P0^{-1}
-    copyto!(cc.x_t, cc.I_mat)
-    ldiv!(P0chol, cc.x_t)
-    cc.x_t .*= -one(T)
-
-    # Log-likelihood normalizers (consumed by the likelihood kernels)
-    latent_dim = lds.latent_dim
-    obs_dim = lds.obs_dim
-    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
-    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
-    cc.cR = -WT(0.5) * (WT(obs_dim) * log(WT(2π)) + logdet(cc.R_PD))
-
+    _compute_state_constants!(cc, lds.state_model)
+    _compute_obs_constants!(cc, lds.obs_model)
     return nothing
 end
 
 function compute_smooth_constants!(
     cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
 ) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
-    P0 = lds.state_model.P0
-
-    #=
-    Wrap state-side covariances as PDMats (the Poisson emission has no
-    covariance, so R_PD stays on its identity placeholder). See the
-    Gaussian overload for the `convert` rationale: it's a no-op when
-    `WT === T` and avoids a Julia 1.10 `Cholesky` convert-method gap
-    when `WT !== T` (ForwardDiff path).
-    =#
-    Q_w = convert(Matrix{WT}, Q)
-    P0_w = convert(Matrix{WT}, P0)
-    cc.Q_PD = PDMat(Symmetrize!(Q_w))
-    cc.P0_PD = PDMat(Symmetrize!(P0_w))
-    Q_chol = cc.Q_PD.chol
-    P0_chol = cc.P0_PD.chol
-
-    # Gradient terms: A_inv_Q = (Q_chol \ A)'
-    copyto!(cc.tmp_QA, A)
-    ldiv!(Q_chol, cc.tmp_QA)
-    copyto!(cc.A_inv_Q, cc.tmp_QA')
-
-    # Hessian block templates for state model
-    copyto!(cc.H_sub_entry, cc.tmp_QA)          # Q_chol \ A
-    copyto!(cc.H_super_entry, cc.tmp_QA')       # (Q_chol \ A)'
-
-    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
-    copyto!(cc.xt_given_xt_1, cc.I_mat)
-    ldiv!(Q_chol, cc.xt_given_xt_1)
-    cc.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q_chol \ A)
-    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
-    cc.xt1_given_xt .*= -one(T)
-
-    # x_t = -(P0_chol \ I) = -P0^{-1}
-    copyto!(cc.x_t, cc.I_mat)
-    ldiv!(P0_chol, cc.x_t)
-    cc.x_t .*= -one(T)
-
-    # Emission-side templates are x-dependent for Poisson; zero the cached
-    # Gaussian ones so no stale values survive an observation-model switch.
-    fill!(cc.yt_given_xt, zero(WT))
-    fill!(cc.C_inv_R, zero(WT))
-
-    # Log-likelihood normalizers. No R term for Poisson observations.
-    latent_dim = lds.latent_dim
-    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
-    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
-    cc.cR = zero(WT)
-
+    _compute_state_constants!(cc, lds.state_model)
+    _compute_obs_constants!(cc, lds.obs_model)
     return nothing
 end
 

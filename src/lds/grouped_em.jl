@@ -356,6 +356,7 @@ function _cell_workspace(
         agg,
         nothing,                                   # set by `_prepare_cell!`
         nothing,                                   # batched Poisson scratch, allocated on first use
+        nothing,                                   # per-observation-model sub-workspaces
     )
 end
 
