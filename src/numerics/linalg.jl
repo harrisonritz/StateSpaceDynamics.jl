@@ -171,3 +171,65 @@ function random_rotation_matrix(n::Int, rng::AbstractRNG=Random.default_rng())
 
     return Matrix(Q)
 end
+
+"""
+    pd_gram(A; name="gram") -> PDMat
+
+`PDMat` for a Gram / scatter matrix that is positive **semi**-definite by
+construction — a weighted sum of outer products plus smoother covariances, as
+built by the sufficient-statistic aggregators. Takes ownership of `A`.
+
+A plain `PDMat(A)` throws `PosDefException` the moment such a sum is only
+semi-definite, which it legitimately can be:
+
+  * a regression column that is constant over the rows carrying weight. Under
+    an SLDS the M-step Gram for regime `k` is weighted by `γₖ(t)`, so a `ux`
+    regressor locked to a task epoch (a go-cue step, say) is collinear with the
+    stacked bias column for any regime whose occupancy sits on one side of that
+    epoch boundary — exactly singular, not merely ill-conditioned;
+  * a regime, group or session that has collapsed to negligible weight, whose
+    blocks are then all ~0.
+
+Neither is a reason to lose the fit: the null direction carries no signal
+(`v'·XY ≈ 0` whenever `v` is in the null space of `XX`), so a ridge just pins
+the unidentified coefficient near zero and leaves the identified ones alone.
+The ridge escalates from `1e-10·max|diag|` until the factorisation succeeds and
+warns when it fires, since a *structural* collinearity is worth fixing in the
+design rather than absorbing here.
+"""
+function pd_gram(A::Matrix{T}; name::AbstractString="gram") where {T<:Real}
+    fac = copy(A)                       # cholesky! destroys its argument
+    F = cholesky!(Symmetric(fac, :U); check=false)
+    issuccess(F) && return PDMat(A, F)
+
+    scale = zero(T)
+    @inbounds for i in axes(A, 1)
+        scale = max(scale, abs(A[i, i]))
+    end
+    scale = scale > zero(T) ? scale : one(T)
+
+    ridge = T(1e-10) * scale
+    #=
+    Ten decades from 1e-10 to 1e-1 of the diagonal scale. A matrix still not
+    factorisable at a ridge of 0.1·max|diag| is not a rank-deficient Gram, it
+    is a corrupted one (a NaN, or a negative weight), and the PosDefException
+    is then the honest outcome.
+    =#
+    for _ in 1:10
+        @inbounds for i in axes(A, 1)
+            A[i, i] += ridge
+        end
+        copyto!(fac, A)
+        F = cholesky!(Symmetric(fac, :U); check=false)
+        if issuccess(F)
+            @warn "rank-deficient $name in the M-step; ridged to keep the fit alive. \
+                   A `ux`/`uy` column that is constant within a regime (an epoch-locked \
+                   step is the usual culprit) is collinear with the bias column and \
+                   should be dropped from the design." ridge relative = ridge / scale maxlog =
+                5
+            return PDMat(A, F)
+        end
+        ridge *= T(10)
+    end
+    return PDMat(A)                     # let PDMats throw the real exception
+end

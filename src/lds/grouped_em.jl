@@ -119,7 +119,7 @@ function _pool_dyn!(
     end
     suf.dyn_n = n
     Symmetrize!(XX)
-    suf.dyn_xx[] = PDMat(copy(XX))
+    suf.dyn_xx[] = pd_gram(copy(XX); name="grouped dynamics Gram [x b ux]")
     return suf
 end
 
@@ -140,7 +140,7 @@ function _pool_obs!(
     end
     suf.obs_n = n
     Symmetrize!(XX)
-    suf.obs_xx[] = PDMat(copy(XX))
+    suf.obs_xx[] = pd_gram(copy(XX); name="grouped emission Gram [x d uy]")
     return suf
 end
 
