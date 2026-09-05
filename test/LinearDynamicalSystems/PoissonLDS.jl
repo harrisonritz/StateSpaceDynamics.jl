@@ -1232,7 +1232,7 @@ function test_poisson_batched_hessian_matches_kernel()
     StateSpaceDynamics.compute_smooth_constants!(ws, plds)
 
     # Reference: state blocks + the per-timestep emission kernel.
-    StateSpaceDynamics._state_hessian_blocks!(ws.btd, ws.consts, f.T)
+    StateSpaceDynamics._state_hessian_blocks!(ws.btd, ws.consts, plds.state_model, f.T)
     for t in 1:(f.T)
         StateSpaceDynamics.observation_hessian!(
             ws.btd.H_diag[t],
