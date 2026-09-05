@@ -220,11 +220,34 @@ schedule* instead (`terminal = false`, and give the final transitions their own
 
 ## Identifiability
 
-`(λ, S, Q) → (cλ, c⁻¹S, cQ)` leaves the state dynamics unchanged: this is the
-classical inverse-optimal-control scale invariance (scaling a cost does not
-change the policy). The product `S·Q` is identified, `S` and `Q` separately are
-not. Use [`rescale_costate!`](@ref) to put a fit in a canonical scale before
-comparing runs.
+`(λ, S, Q) → (cλ, c⁻¹S, cQ)` leaves the state dynamics unchanged for any nonzero
+`c`: this is the classical inverse-optimal-control scale invariance (scaling a
+cost does not change the policy), and it fixes neither the scale nor the sign.
+The product `S·Q` is identified, `S` and `Q` separately are not. Use
+[`rescale_costate!`](@ref) to put a fit in a canonical scale before comparing
+runs.
+
+Beyond that invariance there is a sharper caveat worth knowing before reading a
+fitted cost as *the* cost. An **exactly optimal** agent has `λ_t = P_t x_t` — the
+costate is a deterministic function of the state — so its innovation in the mixed
+coordinates is
+
+```math
+\varepsilon_t = \begin{bmatrix} I + S P_{t+1} \\ -A^\top P_{t+1}\end{bmatrix} w_t,
+```
+
+*rank `n` and time-varying* through the Riccati sweep, while this model's `Σ` is
+full rank and constant. Fitting such trajectories is therefore a projection onto
+the model rather than estimation within it, and the maximum-likelihood cost need
+not be the generating one — measurably so, and not because the optimizer failed:
+EM started *at* the generating parameters converges to the same other optimum.
+On data the model itself generates, EM recovers the cost to a few percent.
+
+What sharpens identification, in rough order of effect: letting the emission read
+the costate (`observe_costate = true`), a terminal condition, behaviour that is
+noisily rather than exactly optimal, a cost that changes within the trial, and
+more trials. This is the well-known ill-posedness of inverse optimal control,
+not an artifact of the parameterization.
 
 # Fields
 - `A::M`: `n × n` plant dynamics. Invertible.
@@ -984,11 +1007,13 @@ useful horizon.
   the mixed-coordinate innovation. That is genuine plant noise: the optimal
   policy is unchanged by it (certainty equivalence), so the costate still tracks
   `P x + g` exactly.
-- `costate_slack = 0`: standard deviation of extra noise added to `λ`, i.e. how
-  far from exactly optimal the behavior is. Zero means a perfectly optimal
-  agent, whose trajectories sit on a measure-zero set of the model — fitting
-  those drives `Σ`'s costate block to singularity, so give a small positive
-  value when generating data to fit.
+- `costate_slack = 0`: standard deviation of the perturbation `ν_t` on the
+  agent's costate — how far from exactly optimal the behavior is. The agent
+  *acts* on the perturbed costate (`u_t = −R⁻¹Bᵀλ_{t+1}`), so the slack moves
+  the state too, which is what makes it visible to an emission that reads only
+  the state. Zero means a perfectly optimal agent, whose trajectories sit on a
+  measure-zero set of the model: give a positive value when generating data to
+  fit back.
 - `ux`: exogenous input sequence (`ux_dim × tsteps`), when the model has one.
 
 Note what this implies about the model: the exactly-optimal trajectory has a
@@ -1028,18 +1053,26 @@ function simulate_lqr(
     Σx = Matrix(Symmetrize!(Matrix{T}(view(sm.Σ, 1:n, 1:n))))
     noise = MvNormal(zeros(T, n), Σx)
     slack = T(costate_slack)
+    #=
+    Costate slack has to be drawn ahead of the forward pass, because the agent
+    *acts* on its own perturbed costate: the control at step t is
+    `u_t = −R⁻¹Bᵀλ_{t+1}`, so `ν_{t+1}` moves `x_{t+1}`. Adding the perturbation
+    to λ after the fact instead would leave the state trajectory — and hence any
+    observation that does not read the costate — completely unaffected by it.
+    =#
+    ν = [slack > 0 ? slack .* randn(rng, T, n) : zeros(T, n) for _ in 1:Ti]
     vbuf = Vector{T}(undef, d)
     ux_mat = _ham_input_matrix(sm, ux, Ti)
     has_input = size(ux_mat, 1) > 0
 
     for t in 1:Ti
         @views z[1:n, t] .= x
-        @views z[(n + 1):d, t] .= P[t] * x .+ g[t]
-        slack > 0 && (@views z[(n + 1):d, t] .+= slack .* randn(rng, T, n))
+        @views z[(n + 1):d, t] .= P[t] * x .+ g[t] .+ ν[t]
         t == Ti && break
         copyto!(vbuf, sm.h)
         has_input && mul!(vbuf, sm.Bu, view(ux_mat, :, t), one(T), one(T))
-        @views rhs = A * x .+ vbuf[1:n] .- S * g[t + 1]
+        # (I + S P_{t+1}) x_{t+1} = A x_t + c_t − S(g_{t+1} + ν_{t+1}) + ε_t
+        @views rhs = A * x .+ vbuf[1:n] .- S * (g[t + 1] .+ ν[t + 1])
         process_noise && (rhs .+= rand(rng, noise))
         x = W[t + 1] * rhs
     end

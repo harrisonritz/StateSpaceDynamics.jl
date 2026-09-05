@@ -120,6 +120,16 @@ p1
 # The usual inverse-optimal-control setting is a **known plant and an unknown
 # cost** — freeze `A` and `S` and let EM estimate `Qc`. Freezing shrinks the
 # M-step problem rather than projecting its solution.
+#
+# Fit here to data the *model* generates, so that recovery is a well-posed
+# question; the section after this one is about what happens when the data comes
+# from an exactly-optimal agent instead.
+
+model_lds = LinearDynamicalSystem(
+    HamiltonianStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
+    GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
+)
+_, ys_model = rand(StableRNG(99), model_lds, fill(20, 120))
 
 init = HamiltonianStateModel(
     copy(A),
@@ -133,7 +143,7 @@ fit_lds = LinearDynamicalSystem(
     init,
     GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
 )
-elbos = fit!(fit_lds, ys; max_iter=150, tol=1e-10, progress=false)
+elbos = fit!(fit_lds, ys_model; max_iter=250, tol=1e-10, progress=false)
 
 plot(
     elbos;
@@ -153,6 +163,43 @@ rescale_costate!(init; target=:trace)
 
 println("true  Qc = ", round.(truth.Qc[1]; digits=3))
 println("fitted Qc = ", round.(init.Qc[1]; digits=3))
+
+# ## When the agent is *exactly* optimal
+#
+# The trajectories from `simulate_lqr` above are a harder case, and worth being
+# explicit about. An exactly-optimal agent has `λ_t = P_t x_t` — the costate is a
+# deterministic function of the state — so its innovation in the mixed
+# coordinates is
+#
+# ```math
+# \varepsilon_t = \begin{bmatrix} I + S P_{t+1} \\ -A^\top P_{t+1}\end{bmatrix} w_t,
+# ```
+#
+# which is **rank ``n`` and time-varying** through the Riccati sweep. The model's
+# ``\Sigma`` is full rank and constant — it has to be, since the smoother's
+# precision is otherwise undefined — so it contains that process only as a limit.
+# Fitting near-optimal trajectories is therefore a projection onto the model
+# rather than estimation within it, and the maximum-likelihood cost need not be
+# the generating one:
+
+fit_on_optimal = HamiltonianStateModel(
+    copy(A), copy(S), Matrix(0.4I, plant_dim, plant_dim), Matrix(0.05I, 4, 4);
+    P0=Matrix(0.2I, 4, 4), fit_flags=HamiltonianFitFlags(; A=false, S=false),
+)
+lds_opt = LinearDynamicalSystem(
+    fit_on_optimal,
+    GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
+)
+elbos_opt = fit!(lds_opt, ys; max_iter=150, tol=1e-10, progress=false)
+println("ELBO at the generating parameters: ", round(elbo(lds, ys); digits=1))
+println("ELBO the fit reaches:              ", round(elbos_opt[end]; digits=1))
+
+# The fit beats the truth, and it still does when EM is started *at* the truth —
+# so this is the model's projection, not a failure of the optimizer. It is the
+# classical ill-posedness of inverse optimal control showing up concretely. What
+# helps, in rough order: letting the emission read the costate
+# (`observe_costate=true`), a terminal condition, behaviour that is noisily rather
+# than exactly optimal, and more trials.
 
 # The structure survives fitting, which is the whole point:
 
@@ -227,6 +274,8 @@ println("Poisson ELBO: ", round(poisson_elbos[1]; digits=1), " -> ",
 using SSDTest  #src
 @test length(elbos) >= 2  #src
 @test minimum(diff(elbos)) > -1e-8  #src
+@test minimum(diff(elbos_opt)) > -1e-8  #src
+@test maximum(abs, init.Qc[1] .- truth.Qc[1]) / maximum(abs, truth.Qc[1]) < 0.3  #src
 @test symplectic_defect(init) < 1e-9  #src
 @test init.Qc[1] ≈ init.Qc[1]' atol = 1e-12  #src
 @test size(z_var) == (4, tsteps)  #src

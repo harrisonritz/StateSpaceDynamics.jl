@@ -1099,6 +1099,42 @@ function test_hamiltonian_priors_and_fit_bool()
     return nothing
 end
 
+function test_hamiltonian_ragged_with_schedule()
+    rng = StableRNG(50)
+    #=
+    Trials of unequal length under a schedule: the schedule is indexed by
+    within-trial timestep, so a short trial uses a prefix of it and its terminal
+    factor reads `schedule[T_n]` — the entry for *its own* last step, not the
+    longest trial's.
+    =#
+    tsteps = 18
+    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
+    lengths = [12, 18, 15]
+    ys = [randn(rng, lds.obs_dim, t) .* 0.4 for t in lengths]
+
+    els = fit!(lds, ys; max_iter=10, progress=false)
+    @test minimum(diff(els)) > -1e-8
+    @test all(isfinite, els)
+
+    # The per-regime transition counts must match the schedule, trial by trial.
+    hs, _, _, _ = ham_estep_stats(lds, ys)
+    expected = zeros(3)
+    for t_n in lengths, t in 1:(t_n - 1)
+        expected[SSD._regime(sm, t)] += 1
+    end
+    @test hs.nk ≈ expected
+    @test hs.term_n ≈ length(lengths)
+    @test sum(hs.nk) ≈ sum(lengths) - length(lengths)
+
+    xs, _ = smooth(lds, ys)
+    @test size.(xs, 2) == lengths
+
+    # A trial longer than the schedule is refused rather than read out of bounds.
+    too_long = [randn(rng, lds.obs_dim, tsteps + 1) .* 0.4]
+    @test_throws SSD.DimensionMismatchError elbo(lds, too_long)
+    return nothing
+end
+
 function test_hamiltonian_single_trial_and_edge_cases()
     rng = StableRNG(49)
     sm, lds = ham_fixture(rng; nregimes=1, tsteps=10)

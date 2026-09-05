@@ -407,6 +407,7 @@ using SSDTest
                 test_hamiltonian_masked_fit_matches_reduced_model()
                 test_hamiltonian_poisson_emission()
                 test_hamiltonian_composite_emission()
+                test_hamiltonian_ragged_with_schedule()
                 test_hamiltonian_sampling()
                 test_hamiltonian_simulate_lqr()
                 test_hamiltonian_show()
