@@ -112,6 +112,65 @@ function Base.showerror(io::IO, e::NumericalStabilityError)
 end
 
 """
+    _validate_state_model(state_model::HamiltonianStateModel{T}, latent_dim::Int) where T
+
+Validate a [`HamiltonianStateModel`](@ref): the LQR structure (`A` square and
+invertible, `S` and every `Qc` symmetric, a schedule that indexes real cost
+matrices), the shapes of the mixed-coordinate noise and bias against the doubled
+latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`.
+
+# Throws
+- `DimensionMismatchError`, `NotSymmetricError`, `NotPositiveDefiniteError`,
+  `NumericalStabilityError` (a singular plant), or `ArgumentError` (a bad
+  schedule, or a `depends_on` this model cannot honor)
+"""
+function _validate_state_model(
+    state_model::HamiltonianStateModel{T}, latent_dim::Int
+) where {T}
+    sm = state_model
+    n = size(sm.A, 1)
+    if latent_dim != 2n
+        throw(DimensionMismatchError("Hamiltonian latent_dim (2n)", 2n, latent_dim))
+    end
+
+    _check_hamiltonian_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+
+    sm.depends_on === nothing || throw(
+        ArgumentError(
+            "`depends_on` is not supported for a HamiltonianStateModel — its structural " *
+            "parameters are one joint estimate, not a per-group regression. Fit the " *
+            "groups as separate models.",
+        ),
+    )
+
+    for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
+        if size(Σ) != (dim, dim)
+            throw(DimensionMismatchError("Hamiltonian $name", (dim, dim), size(Σ)))
+        end
+        if !issymmetric(Σ)
+            throw(NotSymmetricError("Hamiltonian $name", maximum(abs.(Σ .- Σ'))))
+        end
+        if !isposdef(Σ)
+            throw(NotPositiveDefiniteError("Hamiltonian $name", minimum(eigvals(Σ))))
+        end
+    end
+
+    if length(sm.h) != 2n
+        throw(DimensionMismatchError("Hamiltonian h", 2n, length(sm.h)))
+    end
+    if length(sm.x0) != 2n
+        throw(DimensionMismatchError("Hamiltonian x0", 2n, length(sm.x0)))
+    end
+    if length(sm.hf) != n
+        throw(DimensionMismatchError("Hamiltonian hf", n, length(sm.hf)))
+    end
+    if size(sm.Bu, 1) != 2n
+        throw(DimensionMismatchError("Hamiltonian Bu rows", 2n, size(sm.Bu, 1)))
+    end
+    return nothing
+end
+
+"""
     _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where T
 
 Validate GaussianStateModel parameters. Throws exceptions on validation failure.
@@ -387,7 +446,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     end
 
     # Check consistency between inferred and stored dimensions
-    inferred_latent = size(lds.state_model.A, 1)
+    inferred_latent = _state_latent_dim(lds.state_model)
     inferred_obs = _obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent

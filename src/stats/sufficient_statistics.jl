@@ -61,7 +61,7 @@ the raw inputs, not on smoother output.
 """
 function _td_init_const_blocks!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -182,7 +182,21 @@ overwrites them each E-step.
 """
 function _initialize_td_sufficient_statistics(
     ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    return _base_td_sufficient_statistics(T, lds, tsteps_per_trial)
+end
+
+"""
+    _base_td_sufficient_statistics(T, lds, tsteps_per_trial) -> SufficientStatistics
+
+The plain-layout allocator, split out from the entry point above so a state
+model with its own statistics type (see `HamiltonianSufficientStatistics`) can
+still get the shared initial-state and emission blocks without reaching through
+`invoke`.
+"""
+function _base_td_sufficient_statistics(
+    ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
     ux_dim = lds.ux_dim
@@ -227,7 +241,7 @@ function _aggregate_td_suff_stats!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -433,7 +447,7 @@ function _aggregate_td_suff_stats_weighted!(
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy

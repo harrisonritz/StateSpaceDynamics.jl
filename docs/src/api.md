@@ -23,7 +23,31 @@ CompositeObservationModel
 ```@docs
 ProbabilisticPCA
 AbstractStateModel
+AbstractGaussianStateModel
 AbstractObservationModel
+```
+
+## Inverse LQR (Hamiltonian latents)
+
+A state model whose latent is the LQR state–costate pair and whose transition is
+constrained to the symplectic form a linear-quadratic control problem implies, so
+that fitting recovers the plant and the cost function directly.
+
+```@docs
+HamiltonianStateModel
+HamiltonianFitFlags
+cost_schedule
+refresh!
+lqr_parameters
+hamiltonian_matrix
+symplectic_matrix
+symplectic_form
+symplectic_defect
+riccati_solution
+lqr_riccati_sequence
+closed_loop_dynamics
+simulate_lqr
+rescale_costate!
 ```
 
 ## Priors

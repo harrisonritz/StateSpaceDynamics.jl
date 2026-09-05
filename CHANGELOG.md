@@ -8,6 +8,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Inverse LQR through Hamiltonian latents.** A new state model,
+  `HamiltonianStateModel`, whose latent state is the LQR state-costate pair
+  `z = [x; λ]` and whose transition is constrained to the symplectic form a
+  linear-quadratic control problem implies — so fitting the state-space model
+  *is* recovering the plant and the cost function the behaviour is optimal for.
+
+  ```julia
+  sm = HamiltonianStateModel(A, S, Qc, Σ)          # S = B R⁻¹ Bᵀ, Qc the state cost
+  lds = LinearDynamicalSystem(sm, GaussianObservationModel(C, R, d))
+  fit!(lds, y)
+  lqr_parameters(sm)                               # (A, S, Qc, schedule, terminal)
+  ```
+
+  The user-facing latent dimension doubles: `HamiltonianStateModel(A, ...)` with
+  an `n × n` plant gives a `2n`-dimensional latent. Everything else — Gaussian,
+  Poisson and composite emissions, single- and multi-trial, ragged and
+  equal-length fast paths, inputs, initial-state priors — works as it does for
+  any other state model, and the ordinary linear-Gaussian path is unchanged.
+
+  * **The M-step preserves the structure.** Estimation happens in the *mixed*
+    coordinates `[x_{t+1}; λ_t] = 𝓔_t [x_t; λ_{t+1}]`, where
+    `𝓔_t = [A −S; Q_t Aᵀ]` is linear in the free parameters — while the forward
+    symplectic transition `M_t` is rational in them. The rearrangement is free:
+    every moment of `(w, v)` is a block of the joint moment of `(z_t, z_{t+1})`
+    the smoother already returns, so the E-step is untouched. The change of
+    coordinates does carry a Jacobian, `log det Q^fwd = log det Σ − 2 log|det A|`,
+    and the profiled objective `½ log det R(θ) − log|det A|` is optimized by
+    L-BFGS with analytic gradients, accepted only when it improves — a
+    generalized M-step, so the ELBO never decreases.
+  * **Time-varying cost.** `Qc` holds `K` cost matrices and a per-timestep
+    `schedule` says which each timestep uses; `cost_schedule(T; terminal, onset)`
+    builds the common shapes (a running cost, a delay epoch, a terminal cost).
+    Only `M_t` varies across regimes — the noise map does not — so the extra cost
+    is `K` cached transitions.
+  * **Terminal condition.** Optional, as a soft pseudo-observation
+    `0 = λ_T − Q_{k_T} x_T − h_f + ε_f`. It is what removes the forward
+    transition's unstable directions, since a symplectic matrix has reciprocal
+    eigenvalue pairs.
+  * **The costate needs process noise**, and this is structural rather than
+    numerical: the forward covariance is `G Σ Gᵀ` with `G` invertible, so a
+    singular `Σ` leaves the smoother's precision undefined. `Σ` lives in the
+    mixed coordinates, which makes its blocks interpretable as plant process
+    noise and costate slack.
+  * **The emission does not read the costate** by default; `observe_costate=true`
+    opts in. The constraint is applied inside the emission M-step (a decoupled
+    Gram for a linear solve, a frozen block in the Poisson Newton system), not by
+    projecting afterwards.
+  * `simulate_lqr` rolls out the optimal trajectory via the backward Riccati
+    sweep and the closed-loop map — the way to generate ground truth, since the
+    model's own forward flow is unstable by construction.
+  * Utilities: `symplectic_matrix`, `hamiltonian_matrix`, `symplectic_defect`,
+    `riccati_solution`, `closed_loop_dynamics`, `lqr_parameters`,
+    `lqr_riccati_sequence`, and `rescale_costate!` for the classical
+    inverse-optimal-control scale invariance (the cost is identified only up to a
+    nonzero scalar).
+
+### Changed
+- `AbstractStateModel` gained an intermediate supertype,
+  `AbstractGaussianStateModel`, for state models with a linear-Gaussian
+  transition. `GaussianStateModel` and `HamiltonianStateModel` are its subtypes,
+  and the drivers, emission kernels, workspaces and aggregators now dispatch on
+  it rather than on `GaussianStateModel`. Existing behaviour is unchanged; a new
+  state model plugs in by supplying the state half of the log-density, gradient,
+  curvature, ELBO and M-step.
+
 - Several observation models on one latent state. Hand `LinearDynamicalSystem` a
   `NamedTuple` of observation models instead of one and they all read out the
   same latent process, with observations supplied under the same keys:

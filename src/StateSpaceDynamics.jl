@@ -33,6 +33,7 @@ include("stats/priors.jl")
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
+include("lds/hamiltonian_types.jl")                 # inverse-LQR state model + derived cache
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
 include("utils/show.jl")
 include("utils/validation.jl")
@@ -44,6 +45,7 @@ include("stats/simulate.jl")
 
 # latents models (LDS, PLDS, SLDS) + inference machinery (E-step).
 include("lds/continuous_latents.jl")                # state-model Q-term + state M-step
+include("lds/hamiltonian_latents.jl")               # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
@@ -59,6 +61,11 @@ include("lds/fit_LDS.jl")
 include("lds/fit_PLDS.jl")
 include("lds/fit_SLDS.jl")
 
+# Inverse-LQR M-step + driver glue. After the drivers, since it specialises
+# their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
+include("lds/hamiltonian_mstep.jl")
+include("lds/fit_hamiltonian.jl")
+
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
 export DimensionMismatchError, NotPositiveDefiniteError, NotSymmetricError
@@ -66,11 +73,17 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
-export AbstractStateModel, AbstractObservationModel
+export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior
 export CovUpdateCache
+
+# Inverse LQR (Hamiltonian latents)
+export HamiltonianStateModel, HamiltonianFitFlags, cost_schedule, refresh!
+export hamiltonian_matrix, symplectic_matrix, symplectic_form, symplectic_defect
+export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
+export simulate_lqr, lqr_riccati_sequence
 
 # Ancillary parameter dependencies (`depends_on`)
 export group_labels, group_parameter, set_group_seeds!, set_depends_on!

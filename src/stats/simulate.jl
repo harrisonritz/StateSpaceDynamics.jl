@@ -216,7 +216,7 @@ function Random.rand(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     if depends_on === nothing && _has_parameter_dependence(lds)
         _single_trial_group_error("lds")
     end
@@ -270,7 +270,7 @@ function Random.rand(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     ntrials = length(tsteps_per_trial)
     grp = parameter_grouping(lds, ntrials; depends_on=depends_on)
 

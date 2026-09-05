@@ -134,7 +134,7 @@ function joint_loglikelihood!(
     y::AbstractMatrix{T0},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:AbstractObservationModel{T0}}
+) where {T<:Real,T0<:Real,S<:AbstractGaussianStateModel{T0},O<:AbstractObservationModel{T0}}
     tsteps = size(y, 2)
     @assert length(ll) == tsteps
 
@@ -192,7 +192,7 @@ function gradient!(
     y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
     _state_gradient!(grad, ws, lds, x, ux)
 
@@ -265,7 +265,7 @@ function gradient!(
     y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     grad = view(ws.opt.grad_buf, :, 1:size(x, 2))
     return gradient!(grad, ws, lds, x, y, ux, uy)
 end
@@ -300,10 +300,14 @@ follow.
 function observation_hessian! end
 
 """
-    _state_hessian_blocks!(btd, cc, tsteps)
+    _state_hessian_blocks!(btd, cc, state_model, tsteps)
 
 Write the state-side (prior/transition) Hessian blocks — identical for every
-observation model — into `btd.H_diag` / `H_sub` / `H_super`:
+observation model — into `btd.H_diag` / `H_sub` / `H_super`. Dispatches on the
+state model, which is what lets a structured or time-varying transition
+([`HamiltonianStateModel`](@ref)) write per-timestep blocks; the
+[`GaussianStateModel`](@ref) method below ignores it and copies one cached
+template into every position:
 
 - `H_sub[i] = Q⁻¹A`, `H_super[i] = (Q⁻¹A)'` for all i
 - `H_diag[1] = -A'Q⁻¹A - P0⁻¹`
@@ -314,7 +318,9 @@ Overwrites the diagonal blocks — callers add the emission curvature
 afterwards via `observation_hessian!`. Requires `tsteps ≥ 2` (matching the
 Newton smoother's contract).
 """
-function _state_hessian_blocks!(btd, cc::SmoothConstants{T}, tsteps::Int) where {T<:Real}
+function _state_hessian_blocks!(
+    btd, cc::SmoothConstants{T}, ::GaussianStateModel, tsteps::Int
+) where {T<:Real}
     for i in 1:(tsteps - 1)
         copyto!(btd.H_sub[i], cc.H_sub_entry)
         copyto!(btd.H_super[i], cc.H_super_entry)
@@ -354,12 +360,12 @@ function hessian!(
     x::AbstractMatrix{T},
     y::AbstractMatrix{T},
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(y, 2)
     btd = sws.btd
     cc = sws.consts
 
-    _state_hessian_blocks!(btd, cc, tsteps)
+    _state_hessian_blocks!(btd, cc, lds.state_model, tsteps)
     for t in 1:tsteps
         observation_hessian!(
             btd.H_diag[t],
@@ -654,7 +660,7 @@ end
 
 function update_initial_state_mean!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[1] || return nothing
     x0 = lds.state_model.x0
     x0_prior = lds.state_model.x0_prior
@@ -686,7 +692,7 @@ from several models can sum their scatter — each contributing with *its own*
 """
 function _accumulate_init_scatter!(
     S0::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     x0 = lds.state_model.x0
     N = suf.init_n
@@ -721,7 +727,7 @@ contributes its own prior term.
 """
 function _accumulate_x0_prior_scatter!(
     S0::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     x0_prior = lds.state_model.x0_prior
     x0_prior === nothing && return S0
     D = lds.latent_dim
@@ -742,7 +748,7 @@ Turn an accumulated initial-state scatter into `P0`: MLE `S0 / N`, or the IW MAP
 """
 function _finalize_P0!(
     lds::LinearDynamicalSystem{T,S,O}, S0::AbstractMatrix{T}, N::T
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     if lds.state_model.P0_prior === nothing
         S0 ./= N
@@ -760,7 +766,7 @@ end
 
 function update_initial_state_covariance!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[2] || return nothing
 
     S0 = sws.reg.S0_sum                              # D × D scratch

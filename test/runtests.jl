@@ -374,6 +374,47 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/HamiltonianLDS.jl")
+        @testset "Hamiltonian (inverse-LQR) LDS" begin
+            @testset "Structure" begin
+                test_hamiltonian_structure()
+                test_hamiltonian_regimes_and_schedule()
+                test_hamiltonian_construction_errors()
+                test_hamiltonian_refresh_and_utilities()
+                test_hamiltonian_rescale_costate()
+            end
+
+            @testset "E-step" begin
+                test_hamiltonian_reduces_to_gaussian_lds()
+                test_hamiltonian_multitrial_equivalence()
+                test_hamiltonian_batched_gradient_matches_per_trial()
+                test_hamiltonian_gradient_and_hessian()
+                test_hamiltonian_elbo_matches_exact_marginal()
+                test_hamiltonian_sufficient_statistics()
+            end
+
+            @testset "M-step" begin
+                test_hamiltonian_mstep_objective_and_gradient()
+                test_hamiltonian_mstep_freezing()
+                test_hamiltonian_mstep_preserves_structure()
+                test_hamiltonian_em_monotone()
+                test_hamiltonian_noise_update_closed_form()
+                test_hamiltonian_recovers_parameters()
+            end
+
+            @testset "Emissions, sampling and printing" begin
+                test_hamiltonian_costate_readout_mask()
+                test_hamiltonian_masked_fit_matches_reduced_model()
+                test_hamiltonian_poisson_emission()
+                test_hamiltonian_composite_emission()
+                test_hamiltonian_sampling()
+                test_hamiltonian_simulate_lqr()
+                test_hamiltonian_show()
+                test_hamiltonian_priors_and_fit_bool()
+                test_hamiltonian_single_trial_and_edge_cases()
+            end
+        end
+
         include("LinearDynamicalSystems/Stitching.jl")
         @testset "Stitching (per-session obs_dim)" begin
             @testset "Shapes and validation" begin

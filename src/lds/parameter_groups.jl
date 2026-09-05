@@ -66,6 +66,13 @@ const _G_R = 6
 # Canonical group names, ordered to match `fit_bool`. State-model groups occupy
 # `fit_bool` slots 1:4 and observation-model groups slots 5:6 (5:5 for Poisson).
 _group_names(::GaussianStateModel) = (:x0, :P0, :A, :Q)
+#=
+A Hamiltonian state model declares no groupable parameters: its structural block
+is one joint nonlinear estimate, not a per-group regression, so a `depends_on`
+naming any of it is rejected rather than silently ignored. Fit groups as
+separate models instead.
+=#
+_group_names(::HamiltonianStateModel) = ()
 _group_names(::GaussianObservationModel) = (:C, :R)
 _group_names(::PoissonObservationModel) = (:C,)
 

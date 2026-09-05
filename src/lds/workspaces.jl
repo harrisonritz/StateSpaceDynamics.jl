@@ -720,17 +720,15 @@ Dispatches on the observation model type:
 The `SmoothWorkspace` form forwards to the workspace's embedded
 `SmoothConstants`.
 """
+#=
+One method for every (state model, single emission) pair: the two halves already
+dispatch on their own sub-model, so specialising here would only invite
+ambiguities as state and observation models multiply. A composite emission has
+its own method (`composite_observations.jl`), which is strictly more specific.
+=#
 function compute_smooth_constants!(
     cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    _compute_state_constants!(cc, lds.state_model)
-    _compute_obs_constants!(cc, lds.obs_model)
-    return nothing
-end
-
-function compute_smooth_constants!(
-    cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {WT<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     _compute_state_constants!(cc, lds.state_model)
     _compute_obs_constants!(cc, lds.obs_model)
     return nothing
@@ -738,7 +736,7 @@ end
 
 function compute_smooth_constants!(
     ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {WT<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     return compute_smooth_constants!(ws.consts, lds)
 end
 
@@ -966,7 +964,7 @@ Initialize a per-trial `FilterSmooth` buffer sized for `tsteps` timesteps.
 """
 function initialize_FilterSmooth(
     model::LinearDynamicalSystem{T,S,O}, tsteps::Int; cov_alias::Bool=false
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = model.latent_dim
     if cov_alias
         p_smooth = zeros(T, 0, 0, 0)
@@ -1008,7 +1006,7 @@ function initialize_FilterSmooth(
     model::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     cov_alias::Bool=false,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     # if tsteps_per_trial has varying lengths, we can't alias the cov caches to a shared zero-array
     if cov_alias && length(unique(tsteps_per_trial)) != 1
         throw(

@@ -42,7 +42,7 @@ function Q_obs!(
     y::AbstractMatrix{T},                         # obs_dim × T
     uy::Union{Nothing,AbstractMatrix}=nothing;    # obs inputs (uy_dim × T) or nothing
     weights::Union{Nothing,AbstractVector{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     C = plds.obs_model.C
     obs_dim, latent_dim = size(C)
     tsteps = size(y, 2)
@@ -109,7 +109,7 @@ it.
 """
 function _obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     prior = lds.obs_model.CD_prior
     prior === nothing && return zero(T)
 
@@ -137,7 +137,7 @@ function _update_observation_model_lbfgs!(
     sws_pool::Vector{SmoothWorkspace{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     plds.fit_bool[5] || return nothing
 
     sws = sws_pool[1]       # f(params) is sequential; one workspace suffices
@@ -385,11 +385,11 @@ function hessian!(
     x::AbstractMatrix{T},
     y::AbstractMatrix{T},
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     tsteps = size(y, 2)
     obs_dim, latent_dim = size(lds.obs_model.C)
 
-    _state_hessian_blocks!(sws.btd, sws.consts, tsteps)
+    _state_hessian_blocks!(sws.btd, sws.consts, lds.state_model, tsteps)
 
     pb = poisson_batch!(sws, latent_dim, obs_dim, tsteps)
     _poisson_emission_hessian!(sws.btd, pb, lds.obs_model, x, uy, tsteps, nothing)

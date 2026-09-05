@@ -155,7 +155,7 @@ and nothing that runs on a sub-workspace reads them.
 """
 function compute_smooth_constants!(
     ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {WT<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = _obs_workspaces!(ws, lds)
     _compute_composite_constants!(
         ws.consts, [sub.consts for sub in subs], lds.state_model, lds.obs_model
@@ -176,7 +176,7 @@ an SLDS's per-regime refresh (whose members live on [`ObsScratch`](@ref)).
 function _compute_composite_constants!(
     cc::SmoothConstants{WT},
     member_ccs::AbstractVector{SmoothConstants{WT}},
-    sm::GaussianStateModel{T},
+    sm::AbstractGaussianStateModel{T},
     om::CompositeObservationModel{T},
 ) where {WT<:Real,T<:Real}
     _compute_state_constants!(cc, sm)
@@ -545,7 +545,9 @@ function joint_loglikelihood!(
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,NamedTuple}=nothing,
     lognorms::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:CompositeObservationModel{T0}}
+) where {
+    T<:Real,T0<:Real,S<:AbstractGaussianStateModel{T0},O<:CompositeObservationModel{T0}
+}
     tsteps = size(x, 2)
     @assert length(ll) == tsteps
 
@@ -657,7 +659,7 @@ function gradient!(
     y::NamedTuple,
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     tsteps = size(x, 2)
     _state_gradient!(grad, ws, lds, x, ux)
 
@@ -689,7 +691,7 @@ function gradient!(
     y::NamedTuple,
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     grad = view(ws.opt.grad_buf, :, 1:size(x, 2))
     return gradient!(grad, ws, lds, x, y, ux, uy)
 end
@@ -777,8 +779,8 @@ function hessian!(
     x::AbstractMatrix{T},
     y::NamedTuple,
     uy::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
-    _fill_hessian_blocks!(sws, size(x, 2))
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+    _fill_hessian_blocks!(sws, lds.state_model, size(x, 2))
     return nothing
 end
 
@@ -793,9 +795,9 @@ function hessian!(
     x::AbstractMatrix{T},
     y::NamedTuple,
     uy::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     tsteps = size(x, 2)
-    _state_hessian_blocks!(sws.btd, sws.consts, tsteps)
+    _state_hessian_blocks!(sws.btd, sws.consts, lds.state_model, tsteps)
 
     subs = _obs_workspaces!(sws, lds)
     for (i, om) in enumerate(values(_models(lds.obs_model)))
@@ -981,14 +983,14 @@ _state_suf(suf::NamedTuple) = first(values(suf))
 
 function _initialize_td_sufficient_statistics(
     ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     views = _obs_views(lds)
     return map(v -> _initialize_td_sufficient_statistics(T, v, tsteps_per_trial), views)
 end
 
 function _td_init_const_blocks!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     datas = _member_datas(data)
@@ -1004,7 +1006,7 @@ function _aggregate_td_suff_stats!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     datas = _member_datas(data)
@@ -1021,7 +1023,7 @@ function _aggregate_td_suff_stats_weighted!(
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     datas = _member_datas(data)
@@ -1050,7 +1052,7 @@ the per-trial path in `fit_PLDS.jl` instead.
 """
 function Q_obs!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::NamedTuple
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,true}}
     subs = _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     total = zero(T)
@@ -1068,7 +1070,7 @@ each evaluated against that member's parameters and sub-workspace scratch.
 """
 function _obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     subs = sws === nothing ? nothing : _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     total = zero(T)
@@ -1088,7 +1090,7 @@ one emission leaves the others free.
 """
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O}, suf::NamedTuple, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,true}}
     state = _state_suf(suf)
     update_initial_state_mean!(lds, state)
     update_initial_state_covariance!(lds, state, sws)
@@ -1116,7 +1118,7 @@ function elbo!(
     suf::NamedTuple,
     sws::SmoothWorkspace{T},
     total_entropy::T,
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,true}}
     Q_total = Q_state!(sws, lds, _state_suf(suf)) + Q_obs!(sws, lds, suf)
     prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
     return Q_total + prior_term + total_entropy
@@ -1154,7 +1156,7 @@ function _mirror_smooth_constants!(
     sws::SmoothWorkspace{T},
     source_sws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     _copy_smooth_constants!(sws.consts, source_sws.consts)
     src = source_sws.obs
     src === nothing && return nothing
@@ -1238,7 +1240,7 @@ function joint_loglikelihood(
     y::NamedTuple,
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,XT<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,XT<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     tsteps = _ntsteps(y)
     WT = promote_type(T, XT, mapreduce(eltype, promote_type, values(y)))
     ws = SmoothWorkspace(WT, lds.latent_dim, 0, tsteps)
@@ -1271,7 +1273,7 @@ block-diagonal one.
 """
 function _stacked_gaussian_lds(
     lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,true}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,true}}
     models = _models(lds.obs_model)
     D = lds.latent_dim
     p = lds.obs_dim
@@ -1327,7 +1329,7 @@ function StatsAPI.loglikelihood(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,SM<:GaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
+) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
     data = Data(lds, y; ux=ux, uy=uy)
     ntrials = length(data.tsteps)
 
@@ -1348,7 +1350,7 @@ end
 
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,SM,OM}, y::NamedTuple; kwargs...
-) where {T<:Real,SM<:GaussianStateModel{T},OM<:CompositeObservationModel{T,false}}
+) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,false}}
     return error(
         "marginal loglikelihood is not implemented for a composite emission with a " *
         "non-Gaussian member (the marginal log p(y) is intractable, as it is for the " *
@@ -1395,7 +1397,7 @@ function _joint_loglikelihood_total(
     lognorms::NamedTuple,
     ux::Union{Nothing,AbstractMatrix},
     uy::Union{Nothing,NamedTuple},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     ll = view(sws.opt.ll_vec, 1:_ntsteps(y))
     joint_loglikelihood!(ll, sws, sws.consts, lds, x, y, ux, uy, lognorms)
     return sum(ll)
@@ -1410,7 +1412,7 @@ routines (`_poisson_q_obs_total`, `update_observation_model!`) expect.
 """
 function _member_pools(
     sws_pool::Vector{SmoothWorkspace{T}}, lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     per_ws = [_obs_workspaces!(ws, lds) for ws in sws_pool]
     nmembers = length(first(per_ws))
     return [SmoothWorkspace{T}[subs[m] for subs in per_ws] for m in 1:nmembers]
@@ -1427,7 +1429,7 @@ function _member_q_obs(
     ::TrialFilterSmooth{T},
     ::Data{T},
     pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     return Q_obs!(pool[1], view_m, suf_m)
 end
 
@@ -1437,7 +1439,7 @@ function _member_q_obs(
     tfs::TrialFilterSmooth{T},
     data_m::Data{T},
     pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     return _poisson_q_obs_total(view_m, tfs, data_m, pool)
 end
 
@@ -1454,7 +1456,7 @@ function _composite_q_obs_total(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     views = _obs_views(lds)
     datas = _member_datas(data)
     pools = _member_pools(sws_pool, lds)
@@ -1479,7 +1481,7 @@ function elbo!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     total_entropy = zero(T)
     for fs in tfs.FilterSmooths
         total_entropy += fs.entropy
@@ -1508,7 +1510,7 @@ function _member_obs_mstep!(
     ::TrialFilterSmooth{T},
     ::Data{T},
     pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     update_C_d!(view_m, suf_m, pool[1])
     update_R!(view_m, suf_m, pool[1])
     return nothing
@@ -1520,7 +1522,7 @@ function _member_obs_mstep!(
     tfs::TrialFilterSmooth{T},
     data_m::Data{T},
     pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     update_observation_model!(view_m, tfs, data_m.y, pool; uy=data_m.uy)
     return nothing
 end
@@ -1538,7 +1540,7 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T,false}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     sws = sws_pool[1]
     state = _state_suf(suf)
     update_initial_state_mean!(lds, state)

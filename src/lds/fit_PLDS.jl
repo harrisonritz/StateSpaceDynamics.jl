@@ -118,7 +118,7 @@ function _joint_loglikelihood_total(
     lognorm::AbstractVector{<:Real},
     ux::Union{Nothing,AbstractMatrix},
     uy::Union{Nothing,AbstractMatrix},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     return sum(joint_loglikelihood!(sws, lds, x, y, lognorm, ux, uy))
 end
 
@@ -148,7 +148,7 @@ function joint_loglikelihood!(
     lognorm_t::AbstractVector{<:Real}=_poisson_lognorm_t(y),
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,TM<:Real,S<:GaussianStateModel{TM},O<:PoissonObservationModel{TM}}
+) where {T<:Real,TM<:Real,S<:AbstractGaussianStateModel{TM},O<:PoissonObservationModel{TM}}
     tsteps = size(y, 2)
 
     C = plds.obs_model.C
@@ -191,7 +191,7 @@ Per-timestep complete-data log-likelihood of a Poisson LDS for a single trial
 """
 function joint_loglikelihood(
     plds::LinearDynamicalSystem{T,S,O}, x::AbstractMatrix{U}, y::AbstractMatrix{T}
-) where {U<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {U<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     R = promote_type(T, U)
     tsteps = size(y, 2)
 
@@ -212,7 +212,7 @@ function joint_loglikelihood(
     plds::LinearDynamicalSystem{T,S,O},
     x::AbstractVector{<:AbstractMatrix{<:Real}},
     y::AbstractVector{<:AbstractMatrix{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     ntrials = length(y)
     chunks = collect(partition(1:ntrials, max(1, cld(ntrials, Threads.nthreads()))))
     return tmapreduce(+, chunks) do chunk
@@ -236,7 +236,7 @@ trajectory `x`, or the ELBO returned by `fit!` as a lower bound on `log p(y)`.
 """
 function StatsAPI.loglikelihood(
     plds::LinearDynamicalSystem{T,S,O}, y
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     return error(
         "marginal loglikelihood is not implemented for the Poisson LDS (the marginal " *
         "log p(y) is intractable). Use joint_loglikelihood(plds, x, y) for the " *
@@ -444,7 +444,7 @@ function mstep!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws = sws_pool[1]
     update_initial_state_mean!(plds, suf)
     update_initial_state_covariance!(plds, suf, sws)
@@ -466,7 +466,7 @@ function _poisson_q_obs_total(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     y = data.y
     uy = data.uy
     ntrials = length(y)
@@ -510,7 +510,7 @@ function elbo!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     total_entropy = zero(T)
     for fs in tfs.FilterSmooths
         total_entropy += fs.entropy
@@ -549,7 +549,7 @@ function smooth!(
     uy::Union{AbstractMatrix{T},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
     btd = sws.btd
@@ -652,7 +652,7 @@ function smooth!(
     sws::SmoothWorkspace{T};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     ux = zeros(T, 0, _ntsteps(y))
     uy = _zero_uy(lds, _ntsteps(y))
     return smooth!(lds, fs, y, sws, ux, uy; max_iter=max_iter, tol=tol)
@@ -673,7 +673,7 @@ function smooth!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     y = data.y
     ux = data.ux
     uy = data.uy
@@ -727,7 +727,7 @@ function smooth!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     return smooth!(lds, tfs, Data(lds, y), sws_pool; max_iter=max_iter, tol=tol)
 end
 
@@ -742,7 +742,7 @@ function smooth!(
     y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(_trial_lengths(y))
     npool = Threads.maxthreadid()
     sws_pool = [
@@ -773,7 +773,7 @@ function estep!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
 
     # smooth each trial
     smooth!(lds, tfs, data, sws_pool; max_iter=max_iter, tol=tol)
@@ -819,7 +819,7 @@ function elbo(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -880,7 +880,7 @@ function smooth(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(plds, data, grp, y)
@@ -945,7 +945,7 @@ function fit!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
@@ -958,6 +958,35 @@ function fit!(
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
     )
+    return _fit_laplace!(
+        plds,
+        data;
+        max_iter=max_iter,
+        tol=tol,
+        progress=progress,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
+    )
+end
+
+"""
+    _fit_laplace!(plds, data; max_iter, tol, progress, newton_max_iter, newton_tol)
+
+The ungrouped Laplace-EM loop, split out from `fit!` so a state model with its
+own statistics type and entry-point preparation (see `fit_hamiltonian.jl`) can
+reuse it rather than restate it. Everything model-specific is behind the four
+hooks the loop calls: `_initialize_td_sufficient_statistics`, `estep!`,
+`elbo!` and `mstep!`.
+"""
+function _fit_laplace!(
+    plds::LinearDynamicalSystem{T,S,O},
+    data::Data{T};
+    max_iter::Int=100,
+    tol::Float64=1e-6,
+    progress=true,
+    newton_max_iter::Int=20,
+    newton_tol::Float64=1e-6,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
 
     tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
@@ -1069,7 +1098,7 @@ function _grouped_cell_q_obs(
     tfs_c::TrialFilterSmooth{T},
     data_c::Data{T},
     cell_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     return _poisson_q_obs_total(lds_c, tfs_c, data_c, cell_pool)
 end
 
@@ -1079,7 +1108,7 @@ function _grouped_cell_q_obs(
     tfs_c::TrialFilterSmooth{T},
     data_c::Data{T},
     cell_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     return _composite_q_obs_total(lds_c, suf_c, tfs_c, data_c, cell_pool)
 end
 
@@ -1238,7 +1267,7 @@ function _fit_plds_grouped!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
-) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
     state = _grouped_fit_state(plds, data, grp, sws_pool)
     elbos = Vector{T}(undef, max_iter)

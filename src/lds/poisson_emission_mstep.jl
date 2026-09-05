@@ -487,7 +487,7 @@ function update_observation_model!(
     max_iter::Int=50,
     tol::Real=1e-12,
     ntasks::Int=length(sws_pool),
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     plds.fit_bool[5] || return nothing
 
     obs_dim = plds.obs_dim
@@ -553,6 +553,14 @@ function update_observation_model!(
         end
         _reduce_fval!(fval, curv_bufs)
         _poisson_mstep_prior!(fval, grad, H, W, solving, prior)
+        #=
+        A state model may declare part of the latent state unreadable by the
+        emission (a Hamiltonian model's costate, unless `observe_costate`).
+        Freezing those coordinates in the Newton system — rather than projecting
+        afterwards — keeps this a properly constrained maximization, and so keeps
+        the emission M-step monotone. `nothing` for every other model.
+        =#
+        _freeze_masked_rows!(grad, H, _costate_range(plds))
 
         _poisson_newton_direction!(Δ, decrement, H, grad, solving)
 

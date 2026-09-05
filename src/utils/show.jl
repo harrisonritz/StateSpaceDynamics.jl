@@ -80,6 +80,70 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
     return nothing
 end
 
+function Base.show(io::IO, hsm::HamiltonianStateModel; gap="")
+    n = size(hsm.A, 1)
+    println(io, gap, "Hamiltonian (inverse-LQR) State Model:")
+    println(io, gap, "--------------------------------------")
+    println(io, gap, " Plant dim n = $n, latent dim 2n = $(2n)   [z = (x; λ)]")
+
+    small = n <= 4
+    println(io, gap, " LQR structure:")
+    if small
+        println(io, gap, "  A     = $(round.(hsm.A, sigdigits=3))")
+        println(io, gap, "  S     = $(round.(hsm.S, sigdigits=3))   [= B R⁻¹ Bᵀ]")
+        for (k, Q) in enumerate(hsm.Qc)
+            println(io, gap, "  Qc[$k] = $(round.(Q, sigdigits=3))")
+        end
+    else
+        println(io, gap, "  size(A)  = ($n, $n)")
+        println(io, gap, "  size(S)  = ($n, $n)   [= B R⁻¹ Bᵀ]")
+        println(io, gap, "  Qc       = $(length(hsm.Qc)) cost matrices of ($n, $n)")
+    end
+
+    println(io, gap, " Cost schedule:")
+    if isempty(hsm.schedule)
+        println(io, gap, "  (none) — one cost on every transition")
+    else
+        counts = [count(==(k), hsm.schedule) for k in 1:length(hsm.Qc)]
+        println(io, gap, "  $(length(hsm.schedule)) timesteps; per-regime counts = $counts")
+    end
+    println(io, gap, "  terminal factor: $(hsm.terminal)")
+
+    println(io, gap, " Noise (mixed coordinates on [x_{t+1}; λ_t]):")
+    println(io, gap, "  size(Σ)  = ($(size(hsm.Σ,1)), $(size(hsm.Σ,2)))")
+    hsm.terminal && println(io, gap, "  size(Σf) = ($(size(hsm.Σf,1)), $(size(hsm.Σf,2)))")
+
+    println(io, gap, " Initial state:")
+    println(io, gap, "  size(x0) = ($(length(hsm.x0)),)")
+    println(io, gap, "  size(P0) = ($(size(hsm.P0,1)), $(size(hsm.P0,2)))")
+    println(io, gap, " Dynamics input:")
+    println(io, gap, "  size(Bu) = ($(size(hsm.Bu,1)), $(size(hsm.Bu,2)))")
+
+    f = hsm.fit_flags
+    println(io, gap, " Fitting:")
+    println(
+        io,
+        gap,
+        "  free: " * join(
+            String[
+                s for (s, on) in (
+                    ("A", f.A),
+                    ("S", f.S),
+                    ("Qc", f.Qc),
+                    ("h", f.h),
+                    ("Bu", f.Bu),
+                    ("terminal", f.terminal && hsm.terminal),
+                ) if on
+            ],
+            ", ",
+        ),
+    )
+    println(io, gap, "  observe_costate = $(hsm.observe_costate)")
+    println(io, gap, "  symplectic defect = $(round(symplectic_defect(hsm), sigdigits=3))")
+
+    return nothing
+end
+
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     println(io, gap, "Gaussian Observation Model:")
     println(io, gap, "---------------------------")

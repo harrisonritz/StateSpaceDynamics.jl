@@ -13,6 +13,32 @@ See `src/lds/parameter_groups.jl` for the full description.
 abstract type AbstractStateModel{T<:Real} end
 
 """
+    AbstractGaussianStateModel{T<:Real} <: AbstractStateModel{T}
+
+Abstract supertype for latent-state models whose transition is **linear and
+Gaussian**, so that the complete-data log-density is quadratic in the latent
+path and the smoother's Hessian is block-tridiagonal.
+
+Every subtype exposes an initial state (`x0`, `P0`) and, for each timestep, an
+affine transition `x_{t+1} | x_t ~ N(A_t x_t + b_t + B_t u_t, Q_t)`. A subtype
+is free to *parameterize* those matrices however it likes — the transition may
+be structured ([`HamiltonianStateModel`](@ref) constrains it to be symplectic)
+and it may vary with `t`. What the subtype must supply is:
+
+- `_state_latent_dim(sm)` / `_state_ux_dim(sm)` — the dimensions the enclosing
+  [`LinearDynamicalSystem`](@ref) records
+- `state_loglikelihood!`, `_state_gradient!`, `_state_hessian_blocks!` — the
+  state half of the Newton smoother's objective, gradient and curvature
+- `Q_state!`, `_state_prior_logdensity` — the state half of the ELBO
+- `_state_mstep!` — the state half of the M-step
+
+Everything else — the emission kernels, the block-tridiagonal solver, the
+workspaces, and the EM drivers — is shared, which is why those dispatch on this
+supertype rather than on a concrete state model.
+"""
+abstract type AbstractGaussianStateModel{T<:Real} <: AbstractStateModel{T} end
+
+"""
     AbstractObservationModel{T<:Real}
 
 Abstract supertype for observation (emission) models of a
@@ -96,7 +122,7 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
 """
 Base.@kwdef mutable struct GaussianStateModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
-} <: AbstractStateModel{T}
+} <: AbstractGaussianStateModel{T}
     A::M
     Q::M
     b::V
@@ -614,6 +640,24 @@ members, so the constructor below is one code path for both.
 =#
 
 """
+    _state_latent_dim(state_model) -> Int
+
+Latent dimension the state model evolves. `size(A, 1)` for an ordinary
+[`GaussianStateModel`](@ref); a [`HamiltonianStateModel`](@ref) overrides it,
+since its `A` is the `n × n` plant while the latent state `[x; \u03bb]` is `2n`.
+"""
+_state_latent_dim(sm::AbstractStateModel) = size(sm.A, 1)
+
+"""
+    _state_ux_dim(state_model) -> Int
+
+Width of the dynamics-input matrix, or 0 when the model takes no inputs.
+"""
+function _state_ux_dim(sm::AbstractStateModel)
+    return hasproperty(sm, :B) && !isnothing(sm.B) ? size(sm.B, 2) : 0
+end
+
+"""
     _obs_dim(obs_model) -> Int
 
 Total number of observed channels: `size(C, 1)` for a single observation model,
@@ -794,13 +838,9 @@ function LinearDynamicalSystem(
 ) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
 
     # Infer dimensions from matrices
-    latent_dim = size(state_model.A, 1)
+    latent_dim = _state_latent_dim(state_model)
     obs_dim = _obs_dim(obs_model)
-    ux_dim = if hasproperty(state_model, :B) && !isnothing(state_model.B)
-        size(state_model.B, 2)
-    else
-        0
-    end
+    ux_dim = _state_ux_dim(state_model)
     uy_dim = _uy_dim(obs_model)
 
     fb = if fit_bool === nothing

@@ -25,7 +25,7 @@ function Q_obs!(
     E_zz::AbstractArray{T,3},
     y::AbstractMatrix{T},
     uy::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     obs_dim = lds.obs_dim
     tsteps = size(y, 2)
     C = lds.obs_model.C
@@ -82,7 +82,7 @@ function Q_obs!(
     E_z::AbstractMatrix{T},
     E_zz::AbstractArray{T,3},
     y::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     uy = zeros(T, 0, size(y, 2))
     return Q_obs!(ws, lds, E_z, E_zz, y, uy)
 end
@@ -96,7 +96,7 @@ per-timestep loop of the legacy `Q_obs!(sws, lds, E_z, E_zz, y, uy)`.
 """
 function Q_obs!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
     uy_dim = lds.uy_dim
@@ -135,7 +135,7 @@ end
 
 function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
     D = lds.latent_dim
     uy_dim = lds.uy_dim
@@ -168,7 +168,7 @@ solve for `V` themselves (see `_tied_gls_regression`).
 """
 function _unpack_obs_V!(
     lds::LinearDynamicalSystem{T,S,O}, V::AbstractMatrix{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     uy_dim = lds.uy_dim
     copyto!(lds.obs_model.C, view(V, :, 1:D))
@@ -187,7 +187,7 @@ Write the stacked emission regression `[C d D]` into `V`
 """
 function _pack_obs_V!(
     V::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     uy_dim = lds.uy_dim
     copyto!(view(V, :, 1:D), lds.obs_model.C)
@@ -214,7 +214,7 @@ function _accumulate_obs_scatter!(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     # sws.reg.CD is exactly (p × obs_reg_dim); no view needed.
     V = _pack_obs_V!(sws.reg.CD, lds)
 
@@ -253,7 +253,7 @@ posterior scale of `R`. One call per distinct `[C d D]`.
 """
 function _accumulate_cd_prior_scatter!(
     S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     CD_prior = lds.obs_model.CD_prior
     CD_prior === nothing && return S_res
     V = _pack_obs_V!(sws.reg.CD, lds)
@@ -270,7 +270,7 @@ Symmetrize an accumulated emission residual scatter and turn it into `R`: MLE
 """
 function _finalize_R!(
     lds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     p = lds.obs_dim
     for j in 2:p, i in 1:(j - 1)
         S_res[j, i] = S_res[i, j]
@@ -288,7 +288,7 @@ end
 
 function update_R!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[6] || return nothing
 
     S_res = sws.elbo.obs_work                  # p × p scratch
@@ -313,7 +313,7 @@ supplies the scratch for the stacked `[C d D]`; pass `nothing` to allocate it.
 """
 function _obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     om = lds.obs_model
     total = zero(T)
 
