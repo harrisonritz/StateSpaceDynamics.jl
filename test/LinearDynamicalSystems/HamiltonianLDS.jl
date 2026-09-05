@@ -82,8 +82,10 @@ function ham_reference_lds(lds)
         copy(sm.x0),
         Matrix(sm.P0),
     )
-    if size(sm.cache.Bfwd, 2) > 0
-        gsm.B = copy(sm.cache.Bfwd)
+    # The reference is only valid at one cost regime, so regime 1's forward input
+    # matrix is the whole story.
+    if size(sm.cache.Bfwd[1], 2) > 0
+        gsm.B = copy(sm.cache.Bfwd[1])
     end
     om = lds.obs_model
     gom = GaussianObservationModel(copy(om.C), copy(om.R), copy(om.d))
@@ -137,12 +139,15 @@ function ham_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     end
     h = grab(pk.ih, sm.h)
     Bu = m > 0 ? reshape(grab(pk.iB, vec(sm.Bu)), d, m) : zeros(V, d, 0)
+    Gr = m > 0 ? reshape(grab(pk.iG, vec(sm.Gref)), n, m) : zeros(V, n, 0)
     hf = grab(pk.ihf, sm.hf)
 
     R = V.(hs.Yv)
     for k in 1:K
         E = [A -Sm; Qs[k] transpose(A)]
-        Th = hcat(E, reshape(h, d, 1), Bu)
+        # Input block: B_u - [0; Q_k G_r], the tracking term tied to this cost.
+        Bk = m > 0 ? Bu - vcat(zeros(V, n, m), Qs[k] * Gr) : Bu
+        Th = hcat(E, reshape(h, d, 1), Bk)
         TX = Th * transpose(hs.Xv[k])
         R = R - TX - transpose(TX) + Th * hs.Zw[k] * transpose(Th)
     end
@@ -153,6 +158,7 @@ function ham_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     if sm.terminal
         kf = isempty(sm.schedule) ? 1 : sm.schedule[end]
         Psi = hcat(-Qs[kf], Matrix{V}(I, n, n), reshape(-hf, n, 1))
+        m > 0 && (Psi = hcat(Psi, Qs[kf] * Gr))
         Rf = Psi * V.(hs.Omega) * transpose(Psi)
         Rf = (Rf + transpose(Rf)) / 2
         obj += if profile
@@ -695,7 +701,7 @@ function test_hamiltonian_mstep_freezing()
     an empty structural problem.
     =#
     sm.fit_flags = HamiltonianFitFlags(;
-        A=false, S=false, Qc=false, h=false, Bu=false, terminal=false
+        A=false, S=false, Qc=false, h=false, Bu=false, Gref=false, terminal=false
     )
     @test SSD._HamPack(sm).np == 0
     before = deepcopy(sm.Qc)
@@ -755,11 +761,12 @@ function test_hamiltonian_noise_update_closed_form()
     sm, lds = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:5]
     hs, _, _, pool = ham_estep_stats(lds, ys)
-    ctx = SSD._ham_structure_mstep!(lds, hs)
-    SSD._ham_noise_mstep!(sm, ctx)
+    ctx = SSD._HamMStepCtx(hs, sm, true)
+    SSD._ham_structure_mstep!(ctx, true, sm.mstep_iters)
+    SSD._ham_noise_mstep!(ctx)
     # Σ = R/N and Σf = R_f/N_f exactly, which is what profiling them out assumed.
-    @test sm.Σ ≈ ctx.R ./ ctx.N atol = 1e-12
-    @test sm.Σf ≈ ctx.Rf ./ ctx.Nf atol = 1e-12
+    @test sm.Σ ≈ ctx.R[1] ./ ctx.N_q[1] atol = 1e-12
+    @test sm.Σf ≈ ctx.Rf[1] ./ ctx.Nf_q[1] atol = 1e-12
     @test isposdef(Symmetric(Matrix(sm.Σ)))
     return nothing
 end
@@ -1041,6 +1048,218 @@ function test_hamiltonian_simulate_lqr()
     sm1, _ = ham_fixture(rng; nregimes=1, tsteps=tsteps)
     P1, _, _ = lqr_riccati_sequence(sm1, 200)
     @test maximum(abs, P1[1] .- riccati_solution(sm1)) < 1e-8
+    return nothing
+end
+
+function test_hamiltonian_tracking_control()
+    rng = StableRNG(60)
+    n = 2
+    d = 2n
+    m = 2
+    tsteps = 25
+    A = [0.97 0.05; -0.04 0.95]
+    Sm = [0.20 0.02; 0.02 0.18]
+    Qcs = [[0.6 0.05; 0.05 0.5], [3.0 0.0; 0.0 2.5]]
+    Σ = Matrix(Diagonal(fill(0.01, d)))
+    sched = cost_schedule(tsteps; terminal=true)
+    Gref = Matrix(1.0I, n, m)          # the reference *is* the input
+    sm = HamiltonianStateModel(
+        A,
+        Sm,
+        Qcs,
+        Σ;
+        schedule=sched,
+        terminal=true,
+        Bu=zeros(d, m),
+        Gref=Gref,
+        Σf=Matrix(1e-6I, n, n),
+        P0=Matrix(0.2I, d, d),
+    )
+    target = [1.5, -0.8]
+    ux = repeat(target, 1, tsteps)
+    z = simulate_lqr(rng, sm, tsteps; process_noise=false, x1=zeros(n), ux=ux)
+
+    #=
+    The tracking rollout must satisfy the *inhomogeneous* Hamiltonian recursion
+    exactly, with the affine term `[d_t; −Q_t r_t]`. That the costate half
+    carries this regime's own cost is the whole point of `Gref`.
+    =#
+    for t in 1:(tsteps - 1)
+        k = SSD._regime(sm, t)
+        E = hamiltonian_matrix(sm, k)
+        w = [z[1:n, t]; z[(n + 1):d, t + 1]]
+        v = [z[1:n, t + 1]; z[(n + 1):d, t]]
+        affine = [zeros(n); -Qcs[k] * (Gref * ux[:, t])]
+        @test maximum(abs, E * w .+ affine .- v) < 1e-10
+    end
+    # And the tracking terminal condition λ_T = Q_f (x_T − r_T).
+    kT = sched[end]
+    @test maximum(abs, z[(n + 1):d, end] .- Qcs[kT] * (z[1:n, end] .- target)) < 1e-10
+
+    # A heavier terminal cost pulls the endpoint onto the target.
+    sm_heavy = HamiltonianStateModel(
+        A,
+        Sm,
+        [copy(Qcs[1]), 200.0 * Matrix(I, n, n)],
+        Σ;
+        schedule=sched,
+        terminal=true,
+        Bu=zeros(d, m),
+        Gref=copy(Gref),
+        Σf=Matrix(1e-6I, n, n),
+        P0=Matrix(0.2I, d, d),
+    )
+    z_heavy = simulate_lqr(rng, sm_heavy, tsteps; process_noise=false, x1=zeros(n), ux=ux)
+    @test norm(z_heavy[1:n, end] .- target) < norm(z[1:n, end] .- target) / 10
+
+    # With no reference the model is the regulation problem: the input cannot
+    # move the costate at all.
+    sm_reg = HamiltonianStateModel(
+        A,
+        Sm,
+        Qcs,
+        Σ;
+        schedule=sched,
+        terminal=true,
+        Bu=zeros(d, m),
+        Σf=Matrix(1e-6I, n, n),
+        P0=Matrix(0.2I, d, d),
+    )
+    @test all(iszero, sm_reg.Gref)
+    z_reg = simulate_lqr(rng, sm_reg, tsteps; process_noise=false, x1=zeros(n), ux=ux)
+    @test maximum(abs, z_reg) < 1e-12       # starts at 0, no reference to chase
+    return nothing
+end
+
+function test_hamiltonian_tracking_mstep()
+    rng = StableRNG(61)
+    n = 2
+    m = 2
+    tsteps = 16
+    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, ux_dim=m, onset=9)
+    sm.Gref .= randn(rng, n, m) .* 0.5
+    refresh!(sm)
+    ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
+    uxs = [randn(rng, m, tsteps) for _ in 1:4]
+    hs, _, _, _ = ham_estep_stats(lds, ys; ux=uxs)
+
+    #=
+    `Gref` enters the objective bilinearly with `Q_k` — through the input block
+    `−Q_k G_r` and again through the terminal factor's `+Q_f G_r` — so both
+    gradients get cross terms. Check them against the independent reference.
+    =#
+    for profile in (true, false)
+        ctx = SSD._HamMStepCtx(hs, sm, profile)
+        θ = zeros(ctx.pack.np)
+        SSD._ham_pack!(θ, ctx)
+        g = similar(θ)
+        f = SSD._ham_fg!(g, θ, ctx)
+        @test f ≈ ham_ref_objective(θ, hs, sm, profile) atol = 1e-8
+        gref = ForwardDiff.gradient(t -> ham_ref_objective(t, hs, sm, profile), θ)
+        @test maximum(abs, g .- gref) / max(1.0, maximum(abs, gref)) < 1e-8
+    end
+
+    # `Gref` is a packed block, and freezing it removes it from the problem.
+    full = SSD._HamPack(sm).np
+    sm.fit_flags = HamiltonianFitFlags(; Gref=false)
+    @test SSD._HamPack(sm).np == full - n * m
+    G0 = copy(sm.Gref)
+    els = fit!(lds, ys; ux=uxs, max_iter=6, progress=false)
+    @test sm.Gref == G0
+    @test minimum(diff(els)) > -1e-8
+
+    # Unfrozen, it moves and EM stays monotone.
+    sm.fit_flags = HamiltonianFitFlags()
+    els2 = fit!(lds, ys; ux=uxs, max_iter=10, progress=false)
+    @test sm.Gref != G0
+    @test minimum(diff(els2)) > -1e-8
+
+    # The ELBO still matches the exact Laplace normalizer with tracking on.
+    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ ham_exact_marginal(lds, ys[1]; ux=uxs[1]) atol =
+        1e-7
+    return nothing
+end
+
+function test_hamiltonian_depends_on()
+    rng = StableRNG(70)
+    tsteps = 16
+    ntrials = 12
+    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
+    session = repeat([1, 2]; inner=ntrials ÷ 2)
+    one_group = fill(1, ntrials)
+
+    #=
+    A grouping with a single group must reproduce the ungrouped fit exactly —
+    the sharpest check that the grouped path is the same estimator, since the
+    cells pool back into one unit.
+    =#
+    smA, ldsA = ham_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smA, (structure=one_group, noise=one_group))
+    ldsA2 = LinearDynamicalSystem(smA, ldsA.obs_model)
+    elsA = fit!(ldsA2, ys; max_iter=8, progress=false)
+    smB, ldsB = ham_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
+    elsB = fit!(ldsB, ys; max_iter=8, progress=false)
+    @test maximum(abs, elsA .- elsB) < 1e-8
+
+    # Stitching: one shared LQR structure, per-session emission.
+    smC, ldsC = ham_fixture(StableRNG(71); nregimes=1, tsteps=tsteps)
+    set_depends_on!(ldsC.obs_model, (C=session, d=session, D=session, R=session))
+    ldsC2 = LinearDynamicalSystem(smC, ldsC.obs_model)
+    elsC = fit!(ldsC2, ys; max_iter=10, progress=false)
+    @test minimum(diff(elsC)) > -1e-8
+    @test !(
+        group_parameter(ldsC2.obs_model, :C, 1) ≈ group_parameter(ldsC2.obs_model, :C, 2)
+    )
+    @test isfinite(elbo(ldsC2, ys))
+
+    #=
+    State-side grouping. `:structure` is one user-facing name for the whole
+    joint block, since its pieces move together; `:noise` likewise. Naming a
+    piece is rejected rather than silently taken for the block.
+    =#
+    for dep in (
+        (structure=session,),
+        (noise=session,),
+        (structure=session, noise=session),
+        (x0=session, P0=session),
+    )
+        smD, ldsD = ham_fixture(StableRNG(72); nregimes=2, terminal=true, tsteps=tsteps)
+        set_depends_on!(smD, dep)
+        ldsD2 = LinearDynamicalSystem(smD, ldsD.obs_model)
+        els = fit!(ldsD2, ys; max_iter=8, progress=false)
+        @test minimum(diff(els)) > -1e-8
+        @test all(isfinite, els)
+    end
+
+    #=
+    `set_depends_on!` only records the declaration; it is resolved — and so
+    rejected — when the model goes into a `LinearDynamicalSystem`.
+    =#
+    for bad in ((A=session,), (Qc=session,), (Σ=session,))
+        smE, ldsE = ham_fixture(StableRNG(73); nregimes=1, tsteps=tsteps)
+        set_depends_on!(smE, bad)
+        @test_throws ArgumentError LinearDynamicalSystem(smE, ldsE.obs_model)
+    end
+
+    # Grouped structure really does diverge, while a shared group stays shared.
+    smF, ldsF = ham_fixture(StableRNG(74); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smF, (structure=session,))
+    ldsF2 = LinearDynamicalSystem(smF, ldsF.obs_model)
+    fit!(ldsF2, ys; max_iter=10, progress=false)
+    g1 = group_parameter(smF, :structure, 1)
+    g2 = group_parameter(smF, :structure, 2)
+    @test !(g1.Qc[1] ≈ g2.Qc[1])
+    @test g1.Σ === g2.Σ                       # noise not grouped: shared by reference
+    @test group_labels(smF, :structure) == Any[1, 2]
+    for v in (g1, g2)
+        @test v.S ≈ transpose(v.S) atol = 1e-12
+        @test symplectic_defect(v) < 1e-9
+    end
+
+    xs, _ = smooth(ldsF2, ys)
+    @test length(xs) == ntrials
+    @test size(xs[1]) == (lds.latent_dim, tsteps)
     return nothing
 end
 

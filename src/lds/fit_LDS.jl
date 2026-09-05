@@ -876,7 +876,10 @@ function _grouped_estep_elbo_gaussian!(
     state::GroupedFitState{T,L},
     grp::ParameterGrouping,
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:QuadraticEmission{T}}}
+) where {
+    T<:Real,
+    L<:LinearDynamicalSystem{T,<:AbstractGaussianStateModel{T},<:QuadraticEmission{T}},
+}
     total = zero(T)
     for c in 1:(grp.ncells)
         lds_c = state.cell_lds[c]
@@ -946,7 +949,7 @@ function _fit_tridiag_grouped!(
             _state_bufs(state.bufs),
         )
         _grouped_obs_mstep!(
-            lds, state.cell_lds, state.sufs, grp.cell_slot, cell_ws1, state.bufs
+            lds, state.cell_lds, _obs_sufs(state.sufs), grp.cell_slot, cell_ws1, state.bufs
         )
 
         prog !== nothing && next!(prog)

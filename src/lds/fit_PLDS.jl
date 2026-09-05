@@ -1060,7 +1060,8 @@ function _grouped_estep_elbo_poisson!(
     max_iter::Int=20,
     tol::T=T(1e-6),
 ) where {
-    T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:NonQuadraticEmission{T}}
+    T<:Real,
+    L<:LinearDynamicalSystem{T,<:AbstractGaussianStateModel{T},<:NonQuadraticEmission{T}},
 }
     total = zero(T)
     for c in 1:(grp.ncells)
@@ -1125,7 +1126,10 @@ function _grouped_update_observation_model!(
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {
-    T<:Real,L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:PoissonObservationModel{T}}
+    T<:Real,
+    L<:LinearDynamicalSystem{
+        T,<:AbstractGaussianStateModel{T},<:PoissonObservationModel{T}
+    },
 }
     ord = _obs_slot_ordinals(state.cell_lds[1].obs_model)[1]
     _grouped_poisson_emission!(
@@ -1148,7 +1152,9 @@ function _grouped_update_observation_model!(
     sws_pool::Vector{SmoothWorkspace{T}},
 ) where {
     T<:Real,
-    L<:LinearDynamicalSystem{T,<:GaussianStateModel{T},<:CompositeObservationModel{T}},
+    L<:LinearDynamicalSystem{
+        T,<:AbstractGaussianStateModel{T},<:CompositeObservationModel{T}
+    },
 }
     om = state.cell_lds[1].obs_model
     ords = _obs_slot_ordinals(om)

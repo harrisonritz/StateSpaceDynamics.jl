@@ -13,7 +13,8 @@ The E-step kernels live in `hamiltonian_latents.jl` and the M-step in
 =============================================================================#
 
 """
-    HamiltonianFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, terminal=true)
+    HamiltonianFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
+                        terminal=true)
 
 Which structural parameters of a [`HamiltonianStateModel`](@ref) the M-step is
 free to move. Every flag defaults to `true`.
@@ -36,6 +37,7 @@ struct HamiltonianFitFlags
     Qc::Bool
     h::Bool
     Bu::Bool
+    Gref::Bool
     terminal::Bool
 end
 
@@ -45,9 +47,10 @@ function HamiltonianFitFlags(;
     Qc::Bool=true,
     h::Bool=true,
     Bu::Bool=true,
+    Gref::Bool=true,
     terminal::Bool=true,
 )
-    return HamiltonianFitFlags(A, S, Qc, h, Bu, terminal)
+    return HamiltonianFitFlags(A, S, Qc, h, Bu, Gref, terminal)
 end
 
 """
@@ -68,7 +71,11 @@ and `S` alone, so `Qfwd`, `bfwd` and `Bfwd` are shared by every regime.
 - `AinvT::Matrix{T}`, `logabsdetA::T`: `A⁻ᵀ` and `log|det A|` (the Jacobian term
     the M-step objective carries).
 - `Qfwd::DensePDMat{T}`: `G Σ Gᵀ`, the forward process-noise covariance.
-- `bfwd`, `Bfwd`: `G h` and `G Bu`.
+- `bfwd`, `Bfwd`: the forward bias `G h` and the forward input matrices
+    `G (B_u - [0; Q_k G_r])`, one per regime. Unlike the noise map, the input
+    matrix *is* regime-dependent whenever a reference is in play, because the
+    tracking term `-Q_k r_t` carries that regime's own cost.
+- `Ftrm`: `Q_{k_T} G_r`, the terminal factor's input block.
 - `negQinv`, `QinvM`, `MtQinv`, `negMtQinvM`, `cQ`: Cholesky-derived templates
     for the gradient and Hessian blocks, the per-regime ones indexed by regime.
 - `Sf_PD`, `Lf`, `negLtSL`, `LtSinv`, `cF`: the terminal factor's covariance,
@@ -84,7 +91,8 @@ mutable struct HamiltonianCache{T<:Real}
     logabsdetA::T
     Qfwd::DensePDMat{T}
     const bfwd::Vector{T}
-    const Bfwd::Matrix{T}
+    const Bfwd::Vector{Matrix{T}}
+    const Ftrm::Matrix{T}
     const negQinv::Matrix{T}
     const QinvM::Vector{Matrix{T}}
     const MtQinv::Vector{Matrix{T}}
@@ -107,7 +115,8 @@ function HamiltonianCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {
         zero(T),
         PDMat(Matrix{T}(I, d, d)),
         zeros(T, d),
-        zeros(T, d, ux_dim),
+        [zeros(T, d, ux_dim) for _ in 1:nregimes],
+        zeros(T, n, ux_dim),
         zeros(T, d, d),
         [zeros(T, d, d) for _ in 1:nregimes],
         [zeros(T, d, d) for _ in 1:nregimes],
@@ -191,6 +200,45 @@ the terminal factor. A running-plus-terminal cost is
 `HamiltonianCostSchedule(T; terminal=true)`; see [`cost_schedule`](@ref).
 An empty `schedule` means "regime 1 everywhere", which requires `K == 1`.
 
+## Tracking a reference
+
+For the tracking problem — cost `½(x_t - r_t)^\\top Q_t (x_t - r_t)` against a
+known reference `r_t`, with an optional known disturbance `d_t` — the same
+stationarity conditions give
+
+```math
+\\begin{bmatrix} x_{t+1} \\\\ \\lambda_t \\end{bmatrix}
+  = \\mathcal{E}_t \\begin{bmatrix} x_t \\\\ \\lambda_{t+1} \\end{bmatrix}
+  + \\begin{bmatrix} d_t \\\\ -Q_t r_t \\end{bmatrix},
+\\qquad \\lambda_T = Q_{k_T}(x_T - r_T).
+```
+
+So the affine term's costate half is **not free**: it is `-Q_t r_t`, tied to the
+same cost matrix that sits in the lower-left block of `\\mathcal{E}_t`, and it
+varies with the regime because `Q_t` does. A free, regime-shared `B_u` cannot
+represent that — it would fit a reduced-form input coupling unconstrained by,
+and so uninformative about, the cost.
+
+`Gref` supplies it. Writing `r_t = G_r u_t`, the mixed-coordinate input matrix
+for regime `k` is
+
+```math
+B_u - \\begin{bmatrix} 0 \\\\ Q_k G_r \\end{bmatrix},
+```
+
+and the terminal factor picks up `+ Q_{k_T} G_r u_T` in its residual — a reach is
+scored against where the target was, not against the origin.
+
+Pass the reference itself as the input (`ux_dim = n`) and `G_r` is a plain
+selection: freeze it at `I` with `HamiltonianFitFlags(; Gref = false)`. Pass task
+regressors instead (a target identity, say) and `G_r` is estimated, mapping them
+to the reference the agent was actually steering toward.
+
+With `K = 1` and no terminal factor, `B_u`'s costate rows and `-Q_1 G_r` both map
+the input into the costate and are not separately identified; freeze one. Several
+cost regimes, or a terminal factor, separate them.
+
+
 ## Terminal condition
 
 When `terminal` is set, `λ_T = Q_{k_T} x_T` enters as a **soft pseudo-observation**
@@ -217,6 +265,29 @@ self-consistency recovery check will not land on the generating parameters. When
 that matters, encode the terminal cost as the last *regime of the transition
 schedule* instead (`terminal = false`, and give the final transitions their own
 `Qc`): that model is a proper directed chain and recovers its own parameters.
+
+## Grouping (`depends_on`)
+
+Parameters may be estimated separately per group of trials, as on any other
+model. The state side offers four groups, matching the `fit_bool` slots:
+`:x0`, `:P0`, `:structure` (the whole joint block — `A`, `S`, every `Qc`, `h`,
+`Bu`, `Gref`, `hf`) and `:noise` (`Σ`, `Σf`).
+
+```julia
+set_depends_on!(state_model, (structure = condition,))      # cost per condition
+set_depends_on!(obs_model, (C = session, d = session,       # stitching: one shared
+                            D = session, R = session))      # plant, per-session readout
+```
+
+The structural block gets *one* name because its pieces are one joint estimate;
+freeze pieces within it with [`HamiltonianFitFlags`](@ref), which composes with
+grouping — a frozen parameter keeps its starting value in every group and so is
+effectively shared while the rest vary.
+
+Note what does *not* separate: groups sharing a noise version pool into that
+version's residual scatter, so a model whose cost varies by condition but whose
+noise does not is coupled across conditions and is fitted jointly, not condition
+by condition.
 
 ## Identifiability
 
@@ -259,8 +330,12 @@ not an artifact of the parameterization.
 - `Σ::M`: `2n × 2n` positive-definite mixed-coordinate innovation covariance.
 - `h::V`: `2n` mixed-coordinate bias. Its costate half is `−Q x*` for a
     tracking target `x*`.
-- `Bu::M`: `2n × ux_dim` mixed-coordinate input matrix (exogenous drift or a
-    time-varying target — *not* the LQR control, which has been eliminated).
+- `Bu::M`: `2n × ux_dim` mixed-coordinate input matrix — an exogenous drift or
+    disturbance, *not* the LQR control, which has been eliminated. Free and
+    shared across regimes.
+- `Gref::M`: `n × ux_dim` **reference map**, `r_t = G_r u_t`. See "Tracking"
+    below. All-zero (the default) means no reference and the model is the
+    regulation problem.
 - `Σf::M`, `hf::V`: terminal factor covariance (`n × n`) and offset (`n`).
 - `x0::V`, `P0::M`: prior on `z₁ = [x₁; λ₁]` (`2n`).
 - `observe_costate::Bool`: whether the emission may read the costate. `false`
@@ -290,6 +365,7 @@ mutable struct HamiltonianStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVec
     Σ::M
     h::V
     Bu::M
+    Gref::M
     Σf::M
     hf::V
     x0::V
@@ -476,6 +552,8 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
   `Qc[schedule[T]]`.
 - `Σf`, `hf`: terminal factor covariance and offset. Default `I` and `0`.
 - `h`, `Bu`: mixed-coordinate bias (`2n`) and input matrix (`2n × ux_dim`).
+- `Gref`: reference map (`n × ux_dim`), `r_t = Gref * u_t`. Default all-zero (no
+  reference). See "Tracking a reference" on the type.
 - `x0`, `P0`: prior on `z₁ = [x₁; λ₁]`. Default `0` and `I`.
 - `observe_costate::Bool = false`: let the emission read the costate.
 - `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`: see the type docstring.
@@ -494,6 +572,7 @@ function HamiltonianStateModel(
     hf::Union{Nothing,AbstractVector{T}}=nothing,
     h::Union{Nothing,AbstractVector{T}}=nothing,
     Bu::Union{Nothing,AbstractMatrix{T}}=nothing,
+    Gref::Union{Nothing,AbstractMatrix{T}}=nothing,
     x0::Union{Nothing,AbstractVector{T}}=nothing,
     P0::Union{Nothing,AbstractMatrix{T}}=nothing,
     observe_costate::Bool=false,
@@ -513,6 +592,12 @@ function HamiltonianStateModel(
 
     h_v = h === nothing ? zeros(T, d) : h
     Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
+    #=
+    `Gref` sizes itself off whatever input width the model has, so a model with
+    no reference is exactly the regulation problem and one with a reference need
+    only say what the reference is.
+    =#
+    Gref_m = Gref === nothing ? zeros(T, n, size(Bu_m, 2)) : Gref
     x0_v = x0 === nothing ? zeros(T, d) : x0
     P0_m = P0 === nothing ? Matrix{T}(I, d, d) : P0
     Σf_m = Σf === nothing ? Matrix{T}(I, n, n) : Σf
@@ -521,6 +606,15 @@ function HamiltonianStateModel(
     length(h_v) == d || throw(DimensionMismatchError("Hamiltonian h", d, length(h_v)))
     size(Bu_m, 1) == d ||
         throw(DimensionMismatchError("Hamiltonian Bu rows", d, size(Bu_m, 1)))
+    size(Gref_m, 1) == n ||
+        throw(DimensionMismatchError("Hamiltonian Gref rows", n, size(Gref_m, 1)))
+    size(Gref_m, 2) == size(Bu_m, 2) || throw(
+        DimensionMismatchError(
+            "Hamiltonian Gref columns (must match the input width)",
+            size(Bu_m, 2),
+            size(Gref_m, 2),
+        ),
+    )
     length(x0_v) == d || throw(DimensionMismatchError("Hamiltonian x0", d, length(x0_v)))
     size(P0_m) == (d, d) ||
         throw(DimensionMismatchError("Hamiltonian P0 rows", d, size(P0_m, 1)))
@@ -542,6 +636,7 @@ function HamiltonianStateModel(
         Σ,
         h_v,
         Bu_m,
+        Gref_m,
         Σf_m,
         hf_v,
         x0_v,
@@ -628,7 +723,21 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
     Qfwd = GS * transpose(G)
     c.Qfwd = PDMat(Symmetrize!(Qfwd))
     mul!(c.bfwd, G, sm.h)
-    size(c.Bfwd, 2) > 0 && mul!(c.Bfwd, G, sm.Bu)
+    #=
+    The forward input matrix is per-regime: the mixed-coordinate input block is
+    `B_u - [0; Q_k G_r]`, whose costate half carries the tracking term `-Q_k r_t`
+    and so varies with the regime's own cost. `G` itself does not — it depends on
+    `A` and `S` alone — which is why the noise and bias stay shared.
+    =#
+    m = size(sm.Bu, 2)
+    if m > 0
+        Bmix = Matrix{T}(undef, d, m)
+        for k in eachindex(sm.Qc)
+            copyto!(Bmix, sm.Bu)
+            @views mul!(Bmix[(n + 1):d, :], sm.Qc[k], sm.Gref, -one(T), one(T))
+            mul!(c.Bfwd[k], G, Bmix)
+        end
+    end
 
     Qchol = c.Qfwd.chol
     Imat = Matrix{T}(I, d, d)
@@ -649,6 +758,7 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
     Σf_w = Matrix{T}(sm.Σf)
     c.Sf_PD = PDMat(Symmetrize!(Σf_w))
     fill!(c.Lf, zero(T))
+    fill!(c.Ftrm, zero(T))
     if sm.terminal
         kf = isempty(sm.schedule) ? 1 : sm.schedule[end]
         @views begin
@@ -657,6 +767,8 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
                 c.Lf[i, n + i] = one(T)
             end
         end
+        # Terminal tracking: λ_T = Q_f (x_T - r_T), so the residual carries +Q_f G_r u_T.
+        size(c.Ftrm, 2) > 0 && mul!(c.Ftrm, sm.Qc[kf], sm.Gref)
     end
     copyto!(c.LtSinv, transpose(c.Lf))
     rdiv!(c.LtSinv, c.Sf_PD.chol)                # Λfᵀ Σf⁻¹  (d × n)
@@ -947,23 +1059,37 @@ function lqr_riccati_sequence(
     g = [zeros(T, n) for _ in 1:tsteps]
     W = [Matrix{T}(I, n, n) for _ in 1:tsteps]
 
-    if sm.terminal
-        copyto!(P[tsteps], sm.Qc[_regime(sm, tsteps)])
-        copyto!(g[tsteps], sm.hf)
-    end
-    W[tsteps] = (Imat + S * P[tsteps]) \ Imat
-
     #=
-    Affine term of transition t = `h + Bu u_t`, split into its state and costate
-    halves. Written into a preallocated vector rather than rebuilt, so the loop
-    below allocates nothing per step.
+    Normalize the input first: `_ham_input_matrix` is the single shape check, and
+    the terminal block below reads it too.
     =#
     vbuf = Vector{T}(undef, d)
     ux_mat = _ham_input_matrix(sm, ux, tsteps)
     has_input = size(ux_mat, 1) > 0
+
+    if sm.terminal
+        kT = _regime(sm, tsteps)
+        copyto!(P[tsteps], sm.Qc[kT])
+        copyto!(g[tsteps], sm.hf)
+        # Terminal reference: λ_T = Q_f(x_T − r_T) + h_f, so g_T = h_f − Q_f r_T.
+        if has_input
+            g[tsteps] .-= sm.Qc[kT] * (sm.Gref * view(ux_mat, :, tsteps))
+        end
+    end
+    W[tsteps] = (Imat + S * P[tsteps]) \ Imat
+    #=
+    Affine term of transition t: `h + B_u u_t − [0; Q_{k(t)} G_r u_t]`. The
+    tracking half carries this regime's own cost, which is why it needs `t`.
+    =#
     function affine!(t)
         copyto!(vbuf, sm.h)
-        has_input && mul!(vbuf, sm.Bu, view(ux_mat, :, t), one(T), one(T))
+        if has_input
+            u_t = view(ux_mat, :, t)
+            mul!(vbuf, sm.Bu, u_t, one(T), one(T))
+            mul!(
+                view(vbuf, (n + 1):d), sm.Qc[_regime(sm, t)], sm.Gref * u_t, -one(T), one(T)
+            )
+        end
         return (view(vbuf, 1:n), view(vbuf, (n + 1):d))
     end
 
@@ -1071,6 +1197,8 @@ function simulate_lqr(
         t == Ti && break
         copyto!(vbuf, sm.h)
         has_input && mul!(vbuf, sm.Bu, view(ux_mat, :, t), one(T), one(T))
+        # Only the *state* half of the affine term enters the forward map; the
+        # costate half is already folded into `g` by the backward sweep.
         # (I + S P_{t+1}) x_{t+1} = A x_t + c_t − S(g_{t+1} + ν_{t+1}) + ε_t
         @views rhs = A * x .+ vbuf[1:n] .- S * (g[t + 1] .+ ν[t + 1])
         process_noise && (rhs .+= rand(rng, noise))

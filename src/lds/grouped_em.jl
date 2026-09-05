@@ -50,8 +50,13 @@ function GroupedSufBuffers(
     D = lds.latent_dim
     dyn_reg_dim = D + 1 + lds.ux_dim
     obs_reg_dim = D + 1 + lds.uy_dim
+    #=
+    Pooling scratch, so it wants the plain block layout regardless of what the
+    state model's own statistics type is — a `HamiltonianSufficientStatistics`
+    wraps this layout rather than replacing it.
+    =#
     return GroupedSufBuffers{T}(
-        _initialize_td_sufficient_statistics(T, lds, tsteps_per_trial),
+        _base_td_sufficient_statistics(T, lds, tsteps_per_trial),
         zeros(T, D, D),
         zeros(T, dyn_reg_dim, dyn_reg_dim),
         zeros(T, obs_reg_dim, obs_reg_dim),
@@ -988,6 +993,17 @@ The per-unit state-side sufficient statistics. Identity for a single emission;
 for a composite it picks any member's block, since the state blocks agree.
 """
 _state_sufs(sufs::AbstractVector) = [_state_suf(s) for s in sufs]
+
+"""
+    _obs_suf(suf)
+    _obs_sufs(sufs)
+
+The emission-side sufficient statistics. Identity for the plain layout; a state
+model with its own statistics type (see `HamiltonianSufficientStatistics`) wraps
+that layout, and the emission updates want what is inside.
+"""
+_obs_suf(suf) = suf
+_obs_sufs(sufs::AbstractVector) = [_obs_suf(s) for s in sufs]
 
 """
     _state_bufs(bufs) -> GroupedSufBuffers

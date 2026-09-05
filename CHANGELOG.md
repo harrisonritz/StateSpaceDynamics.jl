@@ -58,6 +58,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   * `simulate_lqr` rolls out the optimal trajectory via the backward Riccati
     sweep and the closed-loop map — the way to generate ground truth, since the
     model's own forward flow is unstable by construction.
+  * **Reference / tracking control.** The tracking Lagrangian gives an affine
+    term `[d_t; -Q_t r_t]`, so the costate half of the input coupling is *not*
+    free: it is tied to the same cost matrix that sits in `𝓔_t`'s lower-left
+    block, and it varies with the regime because `Q_t` does. A free,
+    regime-shared `B_u` cannot represent that. `Gref` supplies it — writing
+    `r_t = G_r u_t`, regime `k`'s input matrix is `B_u - [0; Q_k G_r]` and the
+    terminal factor picks up `+Q_{k_T} G_r u_T`, so a reach is scored against
+    where the target was. Pass the reference as the input and freeze `G_r` at
+    `I`, or pass task regressors and estimate it.
+  * **`depends_on` grouping.** The state side offers four groups matching the
+    `fit_bool` slots: `:x0`, `:P0`, `:structure` (the whole joint block) and
+    `:noise`. Observation-side grouping with a shared plant — stitching sessions
+    — works too. Groups sharing a noise version pool into that version's
+    residual scatter, so grouped fits are joint rather than group-by-group, and
+    a single-group fit reproduces the ungrouped one exactly.
   * Utilities: `symplectic_matrix`, `hamiltonian_matrix`, `symplectic_defect`,
     `riccati_solution`, `closed_loop_dynamics`, `lqr_parameters`,
     `lqr_riccati_sequence`, and `rescale_costate!` for the classical

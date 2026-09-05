@@ -409,14 +409,12 @@ function fit!(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError(
-            "`depends_on` grouping is not supported for a HamiltonianStateModel; fit the " *
-            "groups as separate models",
-        ),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _fit_tridiag_grouped!(
+        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress
+    )
     return _fit_tridiag!(lds, data; max_iter=max_iter, tol=tol, progress=progress)
 end
 
@@ -436,11 +434,14 @@ function elbo(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    if grp !== nothing
+        sws_pool = _grouped_sws_pool(lds, data)
+        state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
+        return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
+    end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _ham_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -514,11 +515,10 @@ function smooth(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     smooth!(lds, tfs, data, _ham_sws_pool(lds, data))
     return _collect_smooth_output(tfs, y)
@@ -556,11 +556,10 @@ function smooth(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _ham_sws_pool(lds, data)
     smooth!(lds, tfs, data, sws_pool)
@@ -587,11 +586,19 @@ function fit!(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _fit_plds_grouped!(
+        lds,
+        data,
+        grp;
+        max_iter=max_iter,
+        tol=tol,
+        progress=progress,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
+    )
     return _fit_laplace!(
         lds,
         data;
@@ -621,17 +628,145 @@ function elbo(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    if grp !== nothing
+        sws_pool = _grouped_sws_pool(lds, data)
+        state = _grouped_fit_state(lds, data, grp, sws_pool; batched=false)
+        return _grouped_estep_elbo_poisson!(
+            state, grp, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
+        )
+    end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _ham_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
     _td_init_const_blocks!(sws_pool[1], lds, data)
     estep!(lds, hs, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return elbo!(lds, hs, tfs, data, sws_pool)
+end
+
+# ============================================================================
+# Ancillary parameter dependencies (`depends_on`)
+# ============================================================================
+
+_obs_suf(hs::HamiltonianSufficientStatistics) = hs.base
+
+"""
+    _state_suf(hs::HamiltonianSufficientStatistics) -> hs
+
+The block the state side reads. A Hamiltonian model's state statistics are the
+whole object — the per-regime blocks live alongside the shared initial-state and
+emission halves — so this is the identity, unlike the composite case where it
+picks one member's.
+"""
+_state_suf(hs::HamiltonianSufficientStatistics) = hs
+
+#=
+The emission side is entirely state-model-agnostic, so rather than teach it about
+`HamiltonianSufficientStatistics` these forward to the plain layout it wraps.
+Dispatch, not `getproperty` forwarding: the emission entry points dispatch *on*
+the statistics type, so unwrapping has to happen at the call boundary.
+=#
+function Q_obs!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T},
+    hs::HamiltonianSufficientStatistics{T},
+) where {T<:Real}
+    return Q_obs!(sws, lds, hs.base)
+end
+
+function _grouped_cell_q_obs(
+    lds::LinearDynamicalSystem{T},
+    hs::HamiltonianSufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real}
+    return _grouped_cell_q_obs(lds, hs.base, tfs, data, sws_pool)
+end
+
+"""
+    _grouped_state_mstep!(ldss, sufs, slots, sws, bufs)
+
+State M-step for a Hamiltonian model whose parameters depend on an ancillary
+variable.
+
+`x0` and `P0` reuse the shared grouped updates — they are ordinary pooled
+estimates. The structural and noise blocks go through one joint optimization
+over every parameter version at once, because they do not separate: cells
+sharing a noise version pool into that version's residual scatter, so a model
+whose cost varies by group but whose noise does not is coupled across groups.
+Cells sharing *both* versions are pooled up front, which is exact.
+"""
+function _grouped_state_mstep!(
+    ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
+    sufs::AbstractVector{<:HamiltonianSufficientStatistics{T}},
+    slots::AbstractVector{Vector{Int}},
+    sws::SmoothWorkspace{T},
+    bufs::GroupedSufBuffers,
+) where {T<:Real,S<:HamiltonianStateModel{T}}
+    base = [_state_suf(suf.base) for suf in sufs]
+    _grouped_update_x0!(ldss, base, slots[_G_X0], bufs)
+    _grouped_update_P0!(ldss, base, slots[_G_P0], slots[_G_X0], sws)
+
+    sms = _ham_slot_models(ldss, slots[_G_AB])
+    for (c, suf) in enumerate(sufs)
+        _fill_mixed_blocks!(suf, ldss[c].state_model)
+    end
+
+    lds1 = ldss[1]
+    ctx = _HamMStepCtx(sufs, sms, slots[_G_AB], slots[_G_Q], lds1.fit_bool[4])
+    _ham_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
+    lds1.fit_bool[4] && _ham_noise_mstep!(ctx)
+    for lds in ldss
+        refresh!(lds.state_model)
+    end
+    return nothing
+end
+
+"""
+    _ham_slot_models(ldss, ab_slots) -> Vector
+
+One representative state model per structural version. Any cell using that
+version will do: cells sharing a version share the arrays by reference, so
+writing through the representative updates them all.
+"""
+function _ham_slot_models(ldss::AbstractVector, ab_slots::AbstractVector{Int})
+    nab = maximum(ab_slots)
+    sms = Vector{typeof(ldss[1].state_model)}(undef, nab)
+    for (c, a) in enumerate(ab_slots)
+        isassigned(sms, a) || (sms[a] = ldss[c].state_model)
+    end
+    return sms
+end
+
+"""
+    _grouped_state_prior_logdensity(cell_ldss, cell_slot, T) contribution
+
+A Hamiltonian model carries only initial-state priors, so its grouped prior term
+is the `P0` and `x0` half of the Gaussian one — there is no Inverse-Wishart term
+on `Σ` (the M-step profiles it out) and no matrix-normal term on the structural
+block, whose entries are shared between `𝓔`'s blocks and so form no free
+regression matrix.
+"""
+function _grouped_state_prior_logdensity(
+    ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
+    cell_slot::AbstractVector{Vector{Int}},
+    ::Type{T},
+) where {T<:Real,S<:HamiltonianStateModel{T}}
+    total = zero(T)
+    for u in _slot_representatives(cell_slot[_G_P0])
+        sm = ldss[u].state_model
+        sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    end
+    for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
+        sm = ldss[u].state_model
+        if sm.x0_prior !== nothing
+            total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+        end
+    end
+    return total
 end
 
 # ============================================================================
@@ -667,8 +802,7 @@ function gradient_batched!(
     c = sm.cache
     x0 = sm.x0
     bf = c.bfwd
-    Bf = c.Bfwd
-    has_input = size(Bf, 2) > 0
+    has_input = lds.ux_dim > 0
     C = lds.obs_model.C
     d_obs = lds.obs_model.d
     D_obs = lds.obs_model.D
@@ -688,9 +822,10 @@ function gradient_batched!(
 
     # Transition residual into `dst` for the step t-1 → t, batched over trials.
     @inline function residual!(dst, t)
+        k = _regime(sm, t - 1)
         @views begin
-            mul!(dst, c.M[_regime(sm, t - 1)], x[:, t - 1, :])
-            has_input && mul!(dst, Bf, ux[:, t - 1, :], one(T), one(T))
+            mul!(dst, c.M[k], x[:, t - 1, :])
+            has_input && mul!(dst, c.Bfwd[k], ux[:, t - 1, :], one(T), one(T))
             dst .= x[:, t, :] .- dst .- bf
         end
         return dst
@@ -731,6 +866,7 @@ function gradient_batched!(
         @views begin
             rf = tmp2[1:n, :]
             mul!(rf, c.Lf, x[:, tsteps, :])
+            has_input && mul!(rf, c.Ftrm, ux[:, tsteps, :], one(T), one(T))
             rf .-= sm.hf
             mul!(grad[:, tsteps, :], c.LtSinv, rf, -one(T), one(T))
         end
@@ -776,13 +912,13 @@ function _sample_hamiltonian_path!(
     P0 = MvNormal(Vector{T}(sm.x0), Matrix(Symmetrize!(Matrix{T}(sm.P0))))
     Qd = MvNormal(zeros(T, size(z, 1)), Matrix(c.Qfwd))
     z[:, 1] = rand(rng, P0)
-    has_input = size(c.Bfwd, 2) > 0
+    has_input = size(ux, 1) > 0
     for t in 2:tsteps
         k = _regime(sm, t - 1)
         @views begin
             mul!(z[:, t], c.M[k], z[:, t - 1])
             z[:, t] .+= c.bfwd
-            has_input && mul!(z[:, t], c.Bfwd, ux[:, t - 1], one(T), one(T))
+            has_input && mul!(z[:, t], c.Bfwd[k], ux[:, t - 1], one(T), one(T))
             z[:, t] .+= rand(rng, Qd)
         end
     end

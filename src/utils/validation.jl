@@ -135,14 +135,6 @@ function _validate_state_model(
 
     _check_hamiltonian_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
 
-    sm.depends_on === nothing || throw(
-        ArgumentError(
-            "`depends_on` is not supported for a HamiltonianStateModel — its structural " *
-            "parameters are one joint estimate, not a per-group regression. Fit the " *
-            "groups as separate models.",
-        ),
-    )
-
     for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
         if size(Σ) != (dim, dim)
             throw(DimensionMismatchError("Hamiltonian $name", (dim, dim), size(Σ)))

@@ -117,7 +117,13 @@ function Base.show(io::IO, hsm::HamiltonianStateModel; gap="")
     println(io, gap, "  size(x0) = ($(length(hsm.x0)),)")
     println(io, gap, "  size(P0) = ($(size(hsm.P0,1)), $(size(hsm.P0,2)))")
     println(io, gap, " Dynamics input:")
-    println(io, gap, "  size(Bu) = ($(size(hsm.Bu,1)), $(size(hsm.Bu,2)))")
+    println(io, gap, "  size(Bu)   = ($(size(hsm.Bu,1)), $(size(hsm.Bu,2)))")
+    println(
+        io,
+        gap,
+        "  size(Gref) = ($(size(hsm.Gref,1)), $(size(hsm.Gref,2)))" *
+        (all(iszero, hsm.Gref) ? "   [no reference]" : "   [tracking]"),
+    )
 
     f = hsm.fit_flags
     println(io, gap, " Fitting:")
@@ -132,6 +138,7 @@ function Base.show(io::IO, hsm::HamiltonianStateModel; gap="")
                     ("Qc", f.Qc),
                     ("h", f.h),
                     ("Bu", f.Bu),
+                    ("Gref", f.Gref && size(hsm.Gref, 2) > 0),
                     ("terminal", f.terminal && hsm.terminal),
                 ) if on
             ],

@@ -63,24 +63,34 @@ Requires `t ≥ 2`.
 ) where {T<:Real,T0<:Real,S<:HamiltonianStateModel{T0},O<:AbstractObservationModel{T0}}
     sm = _ham(lds)
     c = sm.cache
-    @views mul!(out, c.M[_regime(sm, t - 1)], x[:, t - 1])
-    if ux !== nothing && size(c.Bfwd, 2) > 0
-        @views mul!(out, c.Bfwd, ux[:, t - 1], one(T), one(T))
+    k = _regime(sm, t - 1)
+    @views mul!(out, c.M[k], x[:, t - 1])
+    if ux !== nothing && size(c.Bfwd[k], 2) > 0
+        @views mul!(out, c.Bfwd[k], ux[:, t - 1], one(T), one(T))
     end
     @views out .= x[:, t] .- out .- c.bfwd
     return out
 end
 
 """
-    _terminal_residual!(out, sm, x)
+    _terminal_residual!(out, sm, x[, ux])
 
-`Λf z_T − h_f` (length `n`), the residual of the soft terminal condition
-`λ_T = Q_f x_T + h_f`. Only meaningful when `sm.terminal` is set.
+`Λf z_T + Q_f G_r u_T − h_f` (length `n`), the residual of the soft terminal
+condition `λ_T = Q_f (x_T − r_T) + h_f`. The input term is the terminal
+*reference*: a reach is scored against where the target was, not against the
+origin. Only meaningful when `sm.terminal` is set.
 """
 @inline function _terminal_residual!(
-    out::AbstractVector{T}, sm::HamiltonianStateModel, x::AbstractMatrix{T}
+    out::AbstractVector{T},
+    sm::HamiltonianStateModel,
+    x::AbstractMatrix{T},
+    ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
-    @views mul!(out, sm.cache.Lf, x[:, size(x, 2)])
+    tsteps = size(x, 2)
+    @views mul!(out, sm.cache.Lf, x[:, tsteps])
+    if ux !== nothing && size(sm.cache.Ftrm, 2) > 0
+        @views mul!(out, sm.cache.Ftrm, ux[:, tsteps], one(T), one(T))
+    end
     out .-= sm.hf
     return out
 end
@@ -125,7 +135,7 @@ function state_loglikelihood!(
     if sm.terminal && t == tsteps
         n = _plant_dim(sm)
         rf = view(tmp, 1:n)
-        _terminal_residual!(rf, sm, x)
+        _terminal_residual!(rf, sm, x, ux)
         _whiten!(c.Sf_PD.chol, rf)
         total += T(c.cF) - T(0.5) * sum(abs2, rf)
     end
@@ -187,7 +197,7 @@ function _state_gradient!(
     if sm.terminal
         n = _plant_dim(sm)
         rf = view(dxt, 1:n)
-        _terminal_residual!(rf, sm, x)
+        _terminal_residual!(rf, sm, x, ux)
         # −Λfᵀ Σf⁻¹ r, accumulated onto the last column.
         @views mul!(grad[:, tsteps], c.LtSinv, rf, -one(T), one(T))
     end

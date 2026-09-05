@@ -67,12 +67,15 @@ const _G_R = 6
 # `fit_bool` slots 1:4 and observation-model groups slots 5:6 (5:5 for Poisson).
 _group_names(::GaussianStateModel) = (:x0, :P0, :A, :Q)
 #=
-A Hamiltonian state model declares no groupable parameters: its structural block
-is one joint nonlinear estimate, not a per-group regression, so a `depends_on`
-naming any of it is rejected rather than silently ignored. Fit groups as
-separate models instead.
+A Hamiltonian state model groups on the same four slots the `fit_bool` layout
+uses — `[x0, P0, structure, noise]` — with `:A` naming the whole structural
+block (`A`, `S`, every `Qc`, `h`, `Bu`, `Gref`, `hf`) because that block is one
+joint estimate rather than a set of separable regressions. Freezing individual
+pieces through `HamiltonianFitFlags` still works alongside grouping: a frozen
+parameter is never updated, so every group keeps its starting value and the
+parameter is effectively shared.
 =#
-_group_names(::HamiltonianStateModel) = ()
+_group_names(::HamiltonianStateModel) = (:x0, :P0, :A, :Q)
 _group_names(::GaussianObservationModel) = (:C, :R)
 _group_names(::PoissonObservationModel) = (:C,)
 
@@ -93,6 +96,35 @@ function _param_group(::GaussianStateModel, name::Symbol)
     name in (:A, :b, :B) && return :A
     name in (:x0, :P0, :Q) && return name
     return nothing
+end
+
+#=
+The Hamiltonian model's structural block is one joint estimate — the plant, the
+costs and the affine and reference terms move together, so there is nothing to
+gain from naming them separately and a `depends_on` would have to list all seven.
+It gets one user-facing name, `:structure`, and the two noise matrices another,
+`:noise`; the canonical group names stay `:A` and `:Q` so the slot ordinals keep
+lining up with the `fit_bool` layout `[x0, P0, structure, noise]`.
+
+Use `HamiltonianFitFlags` to freeze pieces *within* the structural block; that
+composes with grouping, since a frozen parameter keeps its starting value in
+every group and so is effectively shared.
+=#
+function _param_group(::HamiltonianStateModel, name::Symbol)
+    name === :structure && return :A
+    name === :noise && return :Q
+    name in (:x0, :P0) && return name
+    return nothing
+end
+
+_valid_param_names(::HamiltonianStateModel) = ":x0, :P0, :structure, :noise"
+
+#=
+One member each: `:structure` and `:noise` *are* their groups, so a `depends_on`
+naming one is already whole.
+=#
+function _group_members(::HamiltonianStateModel, group::Symbol)
+    return group === :A ? (:structure,) : (group === :Q ? (:noise,) : (group,))
 end
 
 function _param_group(::GaussianObservationModel, name::Symbol)
@@ -940,6 +972,73 @@ function _build_variants!(
     return variants
 end
 
+"""
+    _build_variants!(sm::HamiltonianStateModel, dep)
+
+One model per parameter-group cell. Arrays for a group that does not vary are
+shared **by reference**, so an M-step write through any variant is visible from
+all of them — the same contract as the Gaussian state model.
+
+The derived cache is the exception: every variant gets its own, because it is a
+function of that variant's parameters (`M_k` depends on its `Qc`). Two variants
+that share every structural array simply end up with equal caches.
+"""
+function _build_variants!(
+    sm::HamiltonianStateModel{T,M,V}, dep::ParameterDependence
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    ncells = prod(dep.nslots)
+    existing = sm.variants
+    if existing !== nothing && length(existing) == ncells
+        return existing
+    end
+
+    x0s = _slot_arrays(sm.x0, dep.nslots[1])
+    P0s = _slot_arrays(sm.P0, dep.nslots[2])
+    # Slot 3 is the whole structural block; slot 4 the noise.
+    As = _slot_arrays(sm.A, dep.nslots[3])
+    Ss = _slot_arrays(sm.S, dep.nslots[3])
+    Qcs = [_slot_arrays(Q, dep.nslots[3]) for Q in sm.Qc]
+    hs = _slot_arrays(sm.h, dep.nslots[3])
+    Bus = _slot_arrays(sm.Bu, dep.nslots[3])
+    Grefs = _slot_arrays(sm.Gref, dep.nslots[3])
+    hfs = _slot_arrays(sm.hf, dep.nslots[3])
+    Σs = _slot_arrays(sm.Σ, dep.nslots[4])
+    Σfs = _slot_arrays(sm.Σf, dep.nslots[4])
+
+    n = size(sm.A, 1)
+    variants = Vector{HamiltonianStateModel{T,M,V}}(undef, ncells)
+    for cell in 1:ncells
+        s = _variant_slots(dep.nslots, cell)
+        v = HamiltonianStateModel{T,M,V}(
+            As[s[3]],
+            Ss[s[3]],
+            [Qcs[k][s[3]] for k in eachindex(sm.Qc)],
+            sm.schedule,
+            sm.terminal,
+            Σs[s[4]],
+            hs[s[3]],
+            Bus[s[3]],
+            Grefs[s[3]],
+            Σfs[s[4]],
+            hfs[s[3]],
+            x0s[s[1]],
+            P0s[s[2]],
+            sm.observe_costate,
+            sm.fit_flags,
+            sm.mstep_iters,
+            sm.P0_prior,
+            sm.x0_prior,
+            nothing,
+            nothing,
+            HamiltonianCache(T, n, length(sm.Qc), size(sm.Bu, 2)),
+        )
+        refresh!(v)
+        variants[cell] = v
+    end
+    sm.variants = variants
+    return variants
+end
+
 function _build_variants!(
     om::GaussianObservationModel{T,M,V},
     dep::ParameterDependence,
@@ -1573,5 +1672,20 @@ function group_parameter(model::DependentModel, name::Symbol, label)
     slots = fill(1, length(dep.nslots))
     slots[g] = _slot_of(dep, g, label)
     variants = _build_variants!(model, dep)
-    return getproperty(variants[_variant_index(dep.nslots, slots)], name)
+    return _group_readout(variants[_variant_index(dep.nslots, slots)], name)
+end
+
+"""
+    _group_readout(variant, name)
+
+What `group_parameter` hands back for one group of one variant. Normally the
+field of that name; a group whose user-facing name covers several fields — a
+[`HamiltonianStateModel`](@ref)'s `:structure` and `:noise` — returns the whole
+variant instead, so the caller reads `.A`, `.Qc`, `.Σ` off it.
+"""
+_group_readout(variant, name::Symbol) = getproperty(variant, name)
+
+function _group_readout(variant::HamiltonianStateModel, name::Symbol)
+    name in (:structure, :noise) && return variant
+    return getproperty(variant, name)
 end

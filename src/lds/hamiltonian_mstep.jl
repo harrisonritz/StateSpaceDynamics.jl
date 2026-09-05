@@ -55,8 +55,8 @@ path's `dyn_*` triple, over the regressor `[z_t; 1; u_t]`:
 - `yy[k]`: `Σ_{t∈R_k} E[z_{t+1} z_{t+1}ᵀ]`          (`2n × 2n`)
 - `nk[k]`: how many transitions regime `k` owns
 
-`term_zz` / `term_n` hold `Σ_n E[[z_T;1][z_T;1]ᵀ]` and the trial count, the
-statistics of the terminal factor.
+`term_zz` / `term_n` hold `Σ_n E[[z_T;1;u_T][z_T;1;u_T]ᵀ]` and the trial count,
+the statistics of the terminal factor — the input block carries its reference.
 
 `Zw` / `Xv` / `Yv` / `Omega` are the *mixed-coordinate* blocks derived from those
 by [`_fill_mixed_blocks!`](@ref) at the start of each M-step; they live here
@@ -117,12 +117,12 @@ function _wrap_hamiltonian_suff_stats(
         [zeros(T, reg, d) for _ in 1:K],
         [zeros(T, d, d) for _ in 1:K],
         zeros(T, K),
-        zeros(T, d + 1, d + 1),
+        zeros(T, d + 1 + m, d + 1 + m),
         zero(T),
         [zeros(T, reg, reg) for _ in 1:K],
         [zeros(T, d, reg) for _ in 1:K],
         zeros(T, d, d),
-        zeros(T, d + 1, d + 1),
+        zeros(T, d + 1 + m, d + 1 + m),
     )
 end
 
@@ -234,13 +234,33 @@ function _aggregate_hamiltonian_stats!(
             end
         end
 
-        # Terminal factor statistics: E[[z_T; 1][z_T; 1]ᵀ], summed over trials.
+        #=
+        Terminal factor statistics: `E[[z_T; 1; u_T][z_T; 1; u_T]ᵀ]` summed over
+        trials. The input block is there for the terminal *reference* — a reach
+        is scored against where the target was, so the terminal residual carries
+        `+Q_f G_r u_T`.
+        =#
         if sm.terminal
             xT = tview(x, :, T_n)
             BLAS.ger!(one(T), xT, xT, tview(hs.term_zz, 1:d, 1:d))
             @views hs.term_zz[1:d, 1:d] .+= p_smooth[:, :, T_n]
             for i in 1:d
                 hs.term_zz[i, d + 1] += x[i, T_n]
+            end
+            if m > 0
+                uT = tview(ux, :, T_n)
+                @views mul!(
+                    hs.term_zz[1:d, (d + 2):(d + 1 + m)], xT, transpose(uT), one(T), one(T)
+                )
+                BLAS.ger!(
+                    one(T),
+                    uT,
+                    uT,
+                    tview(hs.term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)),
+                )
+                for j in 1:m
+                    hs.term_zz[d + 1, d + 1 + j] += ux[j, T_n]
+                end
             end
             hs.term_n += one(T)
         end
@@ -262,6 +282,12 @@ function _aggregate_hamiltonian_stats!(
     if sm.terminal
         @views hs.term_zz[d + 1, 1:d] .= hs.term_zz[1:d, d + 1]
         hs.term_zz[d + 1, d + 1] = hs.term_n
+        if m > 0
+            ur = (d + 2):(d + 1 + m)
+            @views hs.term_zz[ur, 1:d] .= transpose(hs.term_zz[1:d, ur])
+            @views hs.term_zz[ur, d + 1] .= hs.term_zz[d + 1, ur]
+            LinearAlgebra.copytri!(tview(hs.term_zz, ur, ur), 'U')
+        end
     end
 
     return hs
@@ -368,6 +394,7 @@ struct _HamPack
     iQ::Vector{UnitRange{Int}}
     ih::UnitRange{Int}
     iB::UnitRange{Int}
+    iG::UnitRange{Int}
     ihf::UnitRange{Int}
     np::Int
 end
@@ -383,12 +410,13 @@ function _HamPack(sm::HamiltonianStateModel)
         f.S ? n * n : 0,
         f.h ? d : 0,
         (f.Bu && m > 0) ? d * m : 0,
+        (f.Gref && m > 0) ? n * m : 0,
         (sm.terminal && f.terminal) ? n : 0,
     ]
     #=
-    Lay the blocks out in a fixed order — A, S, Q₁…Q_K, h, Bu, hf — so a packed
-    vector means the same thing across M-steps and can be warm started from the
-    previous one.
+    Lay the blocks out in a fixed order — A, S, Q₁…Q_K, h, Bu, Gref, hf — so a
+    packed vector means the same thing across M-steps and can be warm started
+    from the previous one.
     =#
     pos = 0
     iA = (pos + 1):(pos + widths[1])
@@ -405,176 +433,374 @@ function _HamPack(sm::HamiltonianStateModel)
     pos += widths[3]
     iB = (pos + 1):(pos + widths[4])
     pos += widths[4]
-    ihf = (pos + 1):(pos + widths[5])
+    iG = (pos + 1):(pos + widths[5])
     pos += widths[5]
-    return _HamPack(n, d, m, K, iA, iS, iQ, ih, iB, ihf, pos)
+    ihf = (pos + 1):(pos + widths[6])
+    pos += widths[6]
+    return _HamPack(n, d, m, K, iA, iS, iQ, ih, iB, iG, ihf, pos)
+end
+"""
+    _HamUnit{T,HS}
+
+One pooled group of trials in the structural M-step: its aggregated statistics,
+which structural parameter version it uses (`ab`), and which noise version
+(`q`).
+
+Cells that share both versions are pooled into one unit before the objective is
+built. That is exact, not an approximation: with the same `Θ` the residual
+scatter `R = Σ_c (Y_c − Θ X_cᵀ − X_c Θᵀ + Θ Z_c Θᵀ)` is linear in the
+statistics, so summing them first gives the same `R`. An ungrouped fit is one
+unit, which is why there is a single code path.
+"""
+struct _HamUnit{T<:Real,HS}
+    hs::HS
+    ab::Int
+    q::Int
+    n::T
 end
 
 """
-    _HamMStepCtx{T}
+    _HamMStepCtx{T,HS,SM}
 
-Everything the structural objective needs, assembled once per M-step: the mixed
-blocks, the current values of any frozen parameter, the packing plan, and the
-scratch the objective writes its trial parameters into.
+Everything the structural objective needs, assembled once per M-step.
+
+The layout generalizes over `depends_on`: `nab` structural versions and `nq`
+noise versions, with each unit naming the pair it uses. The flat parameter
+vector is `nab` copies of the single-version layout in `pack`, laid end to end,
+so version `a`'s block `X` lives at `(a-1)·pack.np .+ pack.iX`.
 
 `profile` says whether `Σ` is being profiled out — it is when the enclosing
-`fit_bool` lets the noise move, and then the objective is `(N/2) log det R`;
-otherwise `Σ` is held fixed and the objective is `½ tr(Σ⁻¹R)`. Both carry the
-same `−N log|det A|` Jacobian term and share one gradient expression, differing
-only in the weight `W` applied to the residual (`N R⁻¹` versus `Σ⁻¹`).
+`fit_bool` lets the noise move, and then the objective is `(N_s/2) log det R_s`
+per noise version; otherwise `Σ` is held fixed and the objective is
+`½ tr(Σ_s⁻¹R_s)`. Both carry the same `−N log|det A|` Jacobian term and share one
+gradient expression, differing only in the weight applied to the residual
+(`N_s R_s⁻¹` versus `Σ_s⁻¹`).
+
+Note where the coupling lives: units sharing a noise version pool into one `R_s`,
+so a model whose structure varies by group but whose noise does not is *not*
+separable across groups — which is exactly why the objective is built jointly
+rather than fitted group by group.
 """
 struct _HamMStepCtx{T<:Real,HS,SM}
     pack::_HamPack
-    hs::HS
-    sm::SM
+    nab::Int
+    nq::Int
+    units::Vector{_HamUnit{T,HS}}
+    sms::Vector{SM}                  # one structural variant per `ab` version
     profile::Bool
-    N::T
-    Nf::T
+    N_ab::Vector{T}                  # transitions per structural version
+    N_q::Vector{T}                   # transitions per noise version
+    Nf_q::Vector{T}                  # terminal factors per noise version
     kf::Int
-    Sinv::Matrix{T}
-    Sfinv::Matrix{T}
+    Sinv::Vector{Matrix{T}}
+    Sfinv::Vector{Matrix{T}}
     # scratch, reused across objective evaluations
-    A::Matrix{T}
-    S::Matrix{T}
-    Qc::Vector{Matrix{T}}
-    h::Vector{T}
-    Bu::Matrix{T}
-    hf::Vector{T}
-    Theta::Vector{Matrix{T}}
-    Psi::Matrix{T}
-    R::Matrix{T}
-    Rf::Matrix{T}
+    A::Vector{Matrix{T}}
+    S::Vector{Matrix{T}}
+    Qc::Vector{Vector{Matrix{T}}}
+    h::Vector{Vector{T}}
+    Bu::Vector{Matrix{T}}
+    Gref::Vector{Matrix{T}}
+    hf::Vector{Vector{T}}
+    Theta::Vector{Vector{Matrix{T}}}  # [ab version][regime]
+    Psi::Vector{Matrix{T}}            # [ab version]
+    R::Vector{Matrix{T}}              # [noise version], pooled
+    Rf::Vector{Matrix{T}}             # [noise version], pooled
+end
+
+"""
+    _ham_units(sufs, ab_slots, q_slots) -> Vector{_HamUnit}
+
+Pool cells that share both a structural and a noise version into one unit each.
+"""
+function _ham_units(
+    sufs::AbstractVector, ab_slots::AbstractVector{Int}, q_slots::AbstractVector{Int}
+)
+    T = eltype(first(sufs).nk)
+    pairs = Tuple{Int,Int}[]
+    members = Vector{Int}[]
+    for c in eachindex(sufs)
+        key = (ab_slots[c], q_slots[c])
+        i = findfirst(isequal(key), pairs)
+        if i === nothing
+            push!(pairs, key)
+            push!(members, [c])
+        else
+            push!(members[i], c)
+        end
+    end
+    units = _HamUnit{T,eltype(sufs)}[]
+    for (i, (a, q)) in enumerate(pairs)
+        hs = if length(members[i]) == 1
+            sufs[members[i][1]]
+        else
+            _pool_ham_stats(sufs, members[i])
+        end
+        push!(units, _HamUnit{T,eltype(sufs)}(hs, a, q, sum(hs.nk)))
+    end
+    return units
+end
+
+"""
+    _pool_ham_stats(sufs, idx) -> HamiltonianSufficientStatistics
+
+Sum the mixed-coordinate blocks of several cells into the first one's shape. The
+per-regime `Zw` / `Xv`, the total `Yv`, the terminal `Ω` and the counts all add,
+because every cell lives in the same latent space with the same cost schedule.
+
+Writes into a fresh copy: the cells' own statistics are still needed for their
+`x0` / `P0` updates and for the ELBO.
+"""
+function _pool_ham_stats(sufs::AbstractVector, idx::AbstractVector{Int})
+    base = sufs[idx[1]]
+    out = deepcopy(base)
+    for c in idx[2:end]
+        s = sufs[c]
+        for k in eachindex(out.Zw)
+            out.Zw[k] .+= s.Zw[k]
+            out.Xv[k] .+= s.Xv[k]
+            out.nk[k] += s.nk[k]
+        end
+        out.Yv .+= s.Yv
+        out.Omega .+= s.Omega
+        out.term_n += s.term_n
+    end
+    return out
 end
 
 function _HamMStepCtx(
-    hs::HamiltonianSufficientStatistics{T}, sm::HamiltonianStateModel{T}, profile::Bool
-) where {T<:Real}
-    pack = _HamPack(sm)
+    sufs::AbstractVector,
+    sms::AbstractVector,
+    ab_slots::AbstractVector{Int},
+    q_slots::AbstractVector{Int},
+    profile::Bool,
+)
+    units = _ham_units(sufs, ab_slots, q_slots)
+    sm1 = sms[1]
+    T = eltype(sm1.Σ)
+    pack = _HamPack(sm1)
     n, d, m, K = pack.n, pack.d, pack.m, pack.K
     reg = d + 1 + m
-    N = sum(hs.nk)
-    Nf = sm.terminal ? hs.term_n : zero(T)
-    kf = (sm.terminal && !isempty(sm.schedule)) ? sm.schedule[end] : 1
-    Sinv = profile ? zeros(T, d, d) : Matrix(inv(PDMat(Symmetrize!(Matrix{T}(sm.Σ)))))
-    Sfinv = if profile || !sm.terminal
-        zeros(T, n, n)
-    else
-        Matrix(inv(PDMat(Symmetrize!(Matrix{T}(sm.Σf)))))
+    nab = maximum(ab_slots)
+    nq = maximum(q_slots)
+
+    N_ab = zeros(T, nab)
+    N_q = zeros(T, nq)
+    Nf_q = zeros(T, nq)
+    for u in units
+        N_ab[u.ab] += u.n
+        N_q[u.q] += u.n
+        sm1.terminal && (Nf_q[u.q] += u.hs.term_n)
     end
-    return _HamMStepCtx{T,typeof(hs),typeof(sm)}(
+    kf = (sm1.terminal && !isempty(sm1.schedule)) ? sm1.schedule[end] : 1
+
+    #=
+    A noise version's inverse comes from any unit that uses it — every such unit
+    points at the same `Σ` array, since a shared parameter is shared by
+    reference across variants.
+    =#
+    noise_sm = Vector{typeof(sm1)}(undef, nq)
+    for u in units
+        noise_sm[u.q] = sms[u.ab]
+    end
+    Sinv = [
+        if profile
+            zeros(T, d, d)
+        else
+            Matrix(inv(PDMat(Symmetrize!(Matrix{T}(noise_sm[s].Σ)))))
+        end for s in 1:nq
+    ]
+    Sfinv = [
+        if (profile || !sm1.terminal)
+            zeros(T, n, n)
+        else
+            Matrix(inv(PDMat(Symmetrize!(Matrix{T}(noise_sm[s].Σf)))))
+        end for s in 1:nq
+    ]
+
+    return _HamMStepCtx{T,eltype(sufs),typeof(sm1)}(
         pack,
-        hs,
-        sm,
+        nab,
+        nq,
+        units,
+        collect(sms),
         profile,
-        N,
-        Nf,
+        N_ab,
+        N_q,
+        Nf_q,
         kf,
         Sinv,
         Sfinv,
-        Matrix{T}(undef, n, n),
-        Matrix{T}(undef, n, n),
-        [Matrix{T}(undef, n, n) for _ in 1:K],
-        Vector{T}(undef, d),
-        Matrix{T}(undef, d, m),
-        Vector{T}(undef, n),
-        [zeros(T, d, reg) for _ in 1:K],
-        zeros(T, n, d + 1),
-        Matrix{T}(undef, d, d),
-        Matrix{T}(undef, n, n),
+        [Matrix{T}(undef, n, n) for _ in 1:nab],
+        [Matrix{T}(undef, n, n) for _ in 1:nab],
+        [[Matrix{T}(undef, n, n) for _ in 1:K] for _ in 1:nab],
+        [Vector{T}(undef, d) for _ in 1:nab],
+        [Matrix{T}(undef, d, m) for _ in 1:nab],
+        [Matrix{T}(undef, n, m) for _ in 1:nab],
+        [Vector{T}(undef, n) for _ in 1:nab],
+        [[zeros(T, d, reg) for _ in 1:K] for _ in 1:nab],
+        [zeros(T, n, d + 1 + m) for _ in 1:nab],
+        [Matrix{T}(undef, d, d) for _ in 1:nq],
+        [Matrix{T}(undef, n, n) for _ in 1:nq],
     )
 end
+
+# Ungrouped convenience: one unit, one structural version, one noise version.
+function _HamMStepCtx(hs, sm::HamiltonianStateModel, profile::Bool)
+    return _HamMStepCtx([hs], [sm], [1], [1], profile)
+end
+
+"""
+    _ham_offset(ctx, a) -> Int
+
+Where structural version `a`'s block starts in the flat parameter vector.
+"""
+@inline _ham_offset(ctx::_HamMStepCtx, a::Int) = (a - 1) * ctx.pack.np
+
+@inline function _ham_range(ctx::_HamMStepCtx, a::Int, r::UnitRange{Int})
+    isempty(r) && return r
+    off = _ham_offset(ctx, a)
+    return (first(r) + off):(last(r) + off)
+end
+
+"""
+    _ham_nparams(ctx) -> Int
+
+Total free parameters: one structural layout per version.
+"""
+@inline _ham_nparams(ctx::_HamMStepCtx) = ctx.nab * ctx.pack.np
 
 """
     _ham_pack!(θ, ctx)
 
-Write the model's current structural parameters into the flat vector `θ`, which
-is where L-BFGS starts. Symmetric blocks are packed as full matrices: their
-gradients come back exactly symmetric, so a symmetric start stays symmetric
-through every L-BFGS iterate without any `vech` bookkeeping.
+Write every structural version's current parameters into the flat vector `θ`,
+which is where L-BFGS starts. Symmetric blocks are packed as full matrices:
+their gradients come back exactly symmetric, so a symmetric start stays
+symmetric through every L-BFGS iterate without any `vech` bookkeeping.
 """
 function _ham_pack!(θ::AbstractVector{T}, ctx::_HamMStepCtx{T}) where {T<:Real}
-    p, sm = ctx.pack, ctx.sm
-    isempty(p.iA) || copyto!(view(θ, p.iA), vec(sm.A))
-    isempty(p.iS) || copyto!(view(θ, p.iS), vec(sm.S))
-    for k in 1:(p.K)
-        isempty(p.iQ[k]) || copyto!(view(θ, p.iQ[k]), vec(sm.Qc[k]))
+    p = ctx.pack
+    for a in 1:(ctx.nab)
+        sm = ctx.sms[a]
+        rA = _ham_range(ctx, a, p.iA)
+        isempty(rA) || copyto!(view(θ, rA), vec(sm.A))
+        rS = _ham_range(ctx, a, p.iS)
+        isempty(rS) || copyto!(view(θ, rS), vec(sm.S))
+        for k in 1:(p.K)
+            rQ = _ham_range(ctx, a, p.iQ[k])
+            isempty(rQ) || copyto!(view(θ, rQ), vec(sm.Qc[k]))
+        end
+        rh = _ham_range(ctx, a, p.ih)
+        isempty(rh) || copyto!(view(θ, rh), sm.h)
+        rB = _ham_range(ctx, a, p.iB)
+        isempty(rB) || copyto!(view(θ, rB), vec(sm.Bu))
+        rG = _ham_range(ctx, a, p.iG)
+        isempty(rG) || copyto!(view(θ, rG), vec(sm.Gref))
+        rf = _ham_range(ctx, a, p.ihf)
+        isempty(rf) || copyto!(view(θ, rf), sm.hf)
     end
-    isempty(p.ih) || copyto!(view(θ, p.ih), sm.h)
-    isempty(p.iB) || copyto!(view(θ, p.iB), vec(sm.Bu))
-    isempty(p.ihf) || copyto!(view(θ, p.ihf), sm.hf)
     return θ
 end
 
 """
     _ham_unpack!(ctx, θ)
 
-Fill the context's scratch parameters from `θ`, taking any frozen block from the
-model instead. Symmetric blocks are symmetrized on the way in so an accumulated
-rounding asymmetry can never make `𝓔` leave the Hamiltonian form.
+Fill the context's scratch parameters from `θ`, taking any frozen block from
+that version's own model instead. Symmetric blocks are symmetrized on the way in
+so an accumulated rounding asymmetry can never make `𝓔` leave the Hamiltonian
+form.
 """
 function _ham_unpack!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
-    p, sm = ctx.pack, ctx.sm
+    p = ctx.pack
     n = p.n
-    if isempty(p.iA)
-        copyto!(ctx.A, sm.A)
-    else
-        copyto!(ctx.A, reshape(view(θ, p.iA), n, n))
-    end
-    if isempty(p.iS)
-        copyto!(ctx.S, sm.S)
-    else
-        copyto!(ctx.S, reshape(view(θ, p.iS), n, n))
-        Symmetrize!(ctx.S)
-    end
-    for k in 1:(p.K)
-        if isempty(p.iQ[k])
-            copyto!(ctx.Qc[k], sm.Qc[k])
+    for a in 1:(ctx.nab)
+        sm = ctx.sms[a]
+        rA = _ham_range(ctx, a, p.iA)
+        if isempty(rA)
+            copyto!(ctx.A[a], sm.A)
         else
-            copyto!(ctx.Qc[k], reshape(view(θ, p.iQ[k]), n, n))
-            Symmetrize!(ctx.Qc[k])
+            copyto!(ctx.A[a], reshape(view(θ, rA), n, n))
         end
-    end
-    isempty(p.ih) ? copyto!(ctx.h, sm.h) : copyto!(ctx.h, view(θ, p.ih))
-    if p.m > 0
-        if isempty(p.iB)
-            copyto!(ctx.Bu, sm.Bu)
+        rS = _ham_range(ctx, a, p.iS)
+        if isempty(rS)
+            copyto!(ctx.S[a], sm.S)
         else
-            copyto!(ctx.Bu, reshape(view(θ, p.iB), p.d, p.m))
+            copyto!(ctx.S[a], reshape(view(θ, rS), n, n))
+            Symmetrize!(ctx.S[a])
         end
+        for k in 1:(p.K)
+            rQ = _ham_range(ctx, a, p.iQ[k])
+            if isempty(rQ)
+                copyto!(ctx.Qc[a][k], sm.Qc[k])
+            else
+                copyto!(ctx.Qc[a][k], reshape(view(θ, rQ), n, n))
+                Symmetrize!(ctx.Qc[a][k])
+            end
+        end
+        rh = _ham_range(ctx, a, p.ih)
+        isempty(rh) ? copyto!(ctx.h[a], sm.h) : copyto!(ctx.h[a], view(θ, rh))
+        if p.m > 0
+            rB = _ham_range(ctx, a, p.iB)
+            if isempty(rB)
+                copyto!(ctx.Bu[a], sm.Bu)
+            else
+                copyto!(ctx.Bu[a], reshape(view(θ, rB), p.d, p.m))
+            end
+            rG = _ham_range(ctx, a, p.iG)
+            if isempty(rG)
+                copyto!(ctx.Gref[a], sm.Gref)
+            else
+                copyto!(ctx.Gref[a], reshape(view(θ, rG), n, p.m))
+            end
+        end
+        rf = _ham_range(ctx, a, p.ihf)
+        isempty(rf) ? copyto!(ctx.hf[a], sm.hf) : copyto!(ctx.hf[a], view(θ, rf))
     end
-    isempty(p.ihf) ? copyto!(ctx.hf, sm.hf) : copyto!(ctx.hf, view(θ, p.ihf))
     return ctx
 end
 
 """
     _ham_assemble!(ctx)
 
-Build `Θ_k = [𝓔_k  h  Bu]` for every regime and, when there is a terminal
-factor, `Ψ = [−Q_f  I  −h_f]`, from the unpacked scratch parameters.
+Build `Θ_{a,k} = [𝓔_{a,k}  h_a  B_{a,k}]` for every structural version and
+regime, and, when there is a terminal factor, `Ψ_a = [−Q_f  I  −h_f  Q_f G_r]`.
+
+The input block `B_{a,k} = B_u − [0; Q_{a,k} G_r]` is regime-dependent: its
+costate half is the tracking term `−Q_k r_t`, tied to that regime's own cost
+rather than free.
 """
 function _ham_assemble!(ctx::_HamMStepCtx{T}) where {T<:Real}
     p = ctx.pack
     n, d, m = p.n, p.d, p.m
     xr, lr = 1:n, (n + 1):d
-    for k in 1:(p.K)
-        Th = ctx.Theta[k]
-        @views begin
-            Th[xr, xr] .= ctx.A
-            Th[xr, lr] .= .-ctx.S
-            Th[lr, xr] .= ctx.Qc[k]
-            Th[lr, lr] .= transpose(ctx.A)
-            Th[:, d + 1] .= ctx.h
-            m > 0 && (Th[:, (d + 2):(d + 1 + m)] .= ctx.Bu)
-        end
-    end
-    if ctx.sm.terminal
-        @views begin
-            ctx.Psi[:, xr] .= .-ctx.Qc[ctx.kf]
-            fill!(ctx.Psi[:, lr], zero(T))
-            for i in 1:n
-                ctx.Psi[i, n + i] = one(T)
+    for a in 1:(ctx.nab)
+        for k in 1:(p.K)
+            Th = ctx.Theta[a][k]
+            @views begin
+                Th[xr, xr] .= ctx.A[a]
+                Th[xr, lr] .= .-ctx.S[a]
+                Th[lr, xr] .= ctx.Qc[a][k]
+                Th[lr, lr] .= transpose(ctx.A[a])
+                Th[:, d + 1] .= ctx.h[a]
+                if m > 0
+                    Bcol = Th[:, (d + 2):(d + 1 + m)]
+                    Bcol .= ctx.Bu[a]
+                    mul!(Bcol[lr, :], ctx.Qc[a][k], ctx.Gref[a], -one(T), one(T))
+                end
             end
-            ctx.Psi[:, d + 1] .= .-ctx.hf
+        end
+        if ctx.sms[1].terminal
+            Psi = ctx.Psi[a]
+            @views begin
+                Psi[:, xr] .= .-ctx.Qc[a][ctx.kf]
+                fill!(Psi[:, lr], zero(T))
+                for i in 1:n
+                    Psi[i, n + i] = one(T)
+                end
+                Psi[:, d + 1] .= .-ctx.hf[a]
+                # Terminal reference: the residual carries +Q_f G_r u_T.
+                m > 0 && mul!(Psi[:, (d + 2):(d + 1 + m)], ctx.Qc[a][ctx.kf], ctx.Gref[a])
+            end
         end
     end
     return ctx
@@ -583,25 +809,36 @@ end
 """
     _ham_residuals!(ctx)
 
-Residual scatters at the current scratch parameters:
-`R = Σ_k (Yv − Θ_k Xv_kᵀ − Xv_k Θ_kᵀ + Θ_k Zw_k Θ_kᵀ)` and, for the terminal
-factor, `R_f = Ψ Ω Ψᵀ`. Both are symmetrized: they are positive semi-definite by
-construction, and the factorizations downstream need that exactly.
+Residual scatters at the current scratch parameters, pooled per noise version:
+`R_s = Σ_{u: q(u)=s} Σ_k (Y_u − Θ X_uᵀ − X_u Θᵀ + Θ Z_u Θᵀ)` and, for the
+terminal factor, `R_{f,s} = Σ_u Ψ Ω_u Ψᵀ`. Both are symmetrized: they are
+positive semi-definite by construction, and the factorizations downstream need
+that exactly.
 """
 function _ham_residuals!(ctx::_HamMStepCtx{T}) where {T<:Real}
-    hs = ctx.hs
-    copyto!(ctx.R, hs.Yv)
-    for k in 1:(ctx.pack.K)
-        Th = ctx.Theta[k]
-        TX = Th * transpose(hs.Xv[k])
-        ctx.R .-= TX
-        ctx.R .-= transpose(TX)
-        ctx.R .+= Th * hs.Zw[k] * transpose(Th)
+    for s in 1:(ctx.nq)
+        fill!(ctx.R[s], zero(T))
+        fill!(ctx.Rf[s], zero(T))
     end
-    Symmetrize!(ctx.R)
-    if ctx.sm.terminal
-        mul!(ctx.Rf, ctx.Psi * hs.Omega, transpose(ctx.Psi))
-        Symmetrize!(ctx.Rf)
+    for u in ctx.units
+        hs = u.hs
+        R = ctx.R[u.q]
+        R .+= hs.Yv
+        for k in 1:(ctx.pack.K)
+            Th = ctx.Theta[u.ab][k]
+            TX = Th * transpose(hs.Xv[k])
+            R .-= TX
+            R .-= transpose(TX)
+            R .+= Th * hs.Zw[k] * transpose(Th)
+        end
+        if ctx.sms[1].terminal
+            Psi = ctx.Psi[u.ab]
+            ctx.Rf[u.q] .+= Psi * hs.Omega * transpose(Psi)
+        end
+    end
+    for s in 1:(ctx.nq)
+        Symmetrize!(ctx.R[s])
+        ctx.sms[1].terminal && Symmetrize!(ctx.Rf[s])
     end
     return ctx
 end
@@ -612,26 +849,29 @@ end
 The structural M-step objective and its gradient. Minimizing
 
 ```math
-g(\\theta) = \\tfrac{N}{2}\\log\\det R(\\theta)
-           + \\tfrac{N_f}{2}\\log\\det R_f(\\theta)
-           - N\\log|\\det A|
+g(\\theta) = \\sum_s \\tfrac{N_s}{2}\\log\\det R_s(\\theta)
+           + \\sum_s \\tfrac{N_{f,s}}{2}\\log\\det R_{f,s}(\\theta)
+           - \\sum_a N_a \\log|\\det A_a|
 ```
 
-(the `Σ`-profiled case; with `Σ` frozen the two `log det` terms become
-`½ tr(Σ⁻¹R)` and `½ tr(Σ_f⁻¹R_f)`) over `θ = (A, S, Q_{1:K}, h, B_u, h_f)`.
+(the `Σ`-profiled case; with `Σ` frozen the `log det` terms become
+`½ tr(Σ_s⁻¹R_s)`) over every structural version's `(A, S, Q_{1:K}, h, B_u, G_r,
+h_f)`.
 
-The elementwise gradient with respect to a regime's stacked regression is
-`G_k = W (Θ_k Z_k − X_k)` with `W = N R⁻¹` profiled and `W = Σ⁻¹` frozen, and
-chains onto the structural blocks by
+The elementwise gradient with respect to a unit's stacked regression is
+`G_k = W_{q(u)} (Θ_k Z_k − X_k)` with `W_s = N_s R_s⁻¹` profiled and `W_s = Σ_s⁻¹`
+frozen, and chains onto the structural blocks by
 
-- `∂/∂A   = Σ_k (G_k[x,x] + G_k[λ,λ]ᵀ) − N A⁻ᵀ`  (`A` sits in `𝓔` twice, once
-  transposed — and the `A⁻ᵀ` is the Jacobian term)
+- `∂/∂A   = Σ_k (G_k[x,x] + G_k[λ,λ]ᵀ) − N_a A_a⁻ᵀ`  (`A` sits in `𝓔` twice,
+  once transposed — and the `A⁻ᵀ` is the Jacobian term)
 - `∂/∂S   = −Σ_k G_k[x,λ]`, symmetrized
-- `∂/∂Q_k = G_k[λ,x]`, symmetrized, plus the terminal factor's share for `k = k_f`
+- `∂/∂Q_k = G_k[λ,x] − G_k[λ,u] G_rᵀ`, symmetrized, plus the terminal factor's
+  share for `k = k_f`
+- `∂/∂G_r = −Σ_k Q_k G_k[λ,u]`, plus the terminal factor's share
 
-Returns `Inf` (and leaves `grad` alone) at a `θ` where a residual scatter is not
-positive definite or `A` is singular, which the line search reads as a rejected
-step.
+Returns `Inf` (with `grad` zeroed) at a `θ` where a residual scatter is not
+positive definite or some `A_a` is singular, which the line search reads as a
+rejected step.
 """
 function _ham_fg!(
     grad::Union{Nothing,AbstractVector{T}}, θ::AbstractVector{T}, ctx::_HamMStepCtx{T}
@@ -639,6 +879,7 @@ function _ham_fg!(
     p = ctx.pack
     n, d, m, K = p.n, p.d, p.m, p.K
     xr, lr = 1:n, (n + 1):d
+    terminal = ctx.sms[1].terminal
 
     #=
     A rejected step must leave `grad` defined, not stale: L-BFGS's line search
@@ -648,107 +889,154 @@ function _ham_fg!(
     grad === nothing || fill!(grad, zero(T))
 
     _ham_unpack!(ctx, θ)
-    F = lu(ctx.A; check=false)
-    issuccess(F) || return T(Inf)
-    logdetA, _ = logabsdet(F)
-    isfinite(logdetA) || return T(Inf)
+
+    fval = zero(T)
+    F = Vector{Any}(undef, ctx.nab)
+    for a in 1:(ctx.nab)
+        Fa = lu(ctx.A[a]; check=false)
+        issuccess(Fa) || return T(Inf)
+        logdetA, _ = logabsdet(Fa)
+        isfinite(logdetA) || return T(Inf)
+        fval -= ctx.N_ab[a] * T(logdetA)
+        F[a] = Fa
+    end
 
     _ham_assemble!(ctx)
     _ham_residuals!(ctx)
 
-    fval = -ctx.N * T(logdetA)
-    W = ctx.Sinv
-    if ctx.profile
-        chol = cholesky(Symmetric(ctx.R); check=false)
-        issuccess(chol) || return T(Inf)
-        fval += T(0.5) * ctx.N * logdet(chol)
-        W = ctx.N .* Matrix(inv(chol))
-    else
-        fval += T(0.5) * dot(ctx.Sinv, ctx.R)
-    end
-
-    Wf = ctx.Sfinv
-    if ctx.sm.terminal
+    W = Vector{Matrix{T}}(undef, ctx.nq)
+    Wf = Vector{Matrix{T}}(undef, ctx.nq)
+    for s in 1:(ctx.nq)
         if ctx.profile
-            cholf = cholesky(Symmetric(ctx.Rf); check=false)
-            issuccess(cholf) || return T(Inf)
-            fval += T(0.5) * ctx.Nf * logdet(cholf)
-            Wf = ctx.Nf .* Matrix(inv(cholf))
+            chol = cholesky(Symmetric(ctx.R[s]); check=false)
+            issuccess(chol) || return T(Inf)
+            fval += T(0.5) * ctx.N_q[s] * logdet(chol)
+            W[s] = ctx.N_q[s] .* Matrix(inv(chol))
         else
-            fval += T(0.5) * dot(ctx.Sfinv, ctx.Rf)
+            fval += T(0.5) * dot(ctx.Sinv[s], ctx.R[s])
+            W[s] = ctx.Sinv[s]
+        end
+        if terminal && ctx.Nf_q[s] > zero(T)
+            if ctx.profile
+                cholf = cholesky(Symmetric(ctx.Rf[s]); check=false)
+                issuccess(cholf) || return T(Inf)
+                fval += T(0.5) * ctx.Nf_q[s] * logdet(cholf)
+                Wf[s] = ctx.Nf_q[s] .* Matrix(inv(cholf))
+            else
+                fval += T(0.5) * dot(ctx.Sfinv[s], ctx.Rf[s])
+                Wf[s] = ctx.Sfinv[s]
+            end
+        else
+            Wf[s] = zeros(T, n, n)
         end
     end
 
     grad === nothing && return fval
 
-    dA = zeros(T, n, n)
-    dS = zeros(T, n, n)
-    dh = zeros(T, d)
-    dB = zeros(T, d, m)
-    for k in 1:K
-        Gk = W * (ctx.Theta[k] * ctx.hs.Zw[k] .- ctx.hs.Xv[k])
-        @views begin
-            dA .+= Gk[xr, xr]
-            dA .+= transpose(Gk[lr, lr])
-            dS .-= Gk[xr, lr]
-            if !isempty(p.iQ[k])
-                dQ = Gk[lr, xr]
-                Gq = view(grad, p.iQ[k])
-                copyto!(Gq, vec(T(0.5) .* (dQ .+ transpose(dQ))))
+    dA = [zeros(T, n, n) for _ in 1:(ctx.nab)]
+    dS = [zeros(T, n, n) for _ in 1:(ctx.nab)]
+    dQ = [[zeros(T, n, n) for _ in 1:K] for _ in 1:(ctx.nab)]
+    dh = [zeros(T, d) for _ in 1:(ctx.nab)]
+    dB = [zeros(T, d, m) for _ in 1:(ctx.nab)]
+    dG = [zeros(T, n, m) for _ in 1:(ctx.nab)]
+    dhf = [zeros(T, n) for _ in 1:(ctx.nab)]
+
+    for u in ctx.units
+        a = u.ab
+        Ws = W[u.q]
+        for k in 1:K
+            Gk = Ws * (ctx.Theta[a][k] * u.hs.Zw[k] .- u.hs.Xv[k])
+            @views begin
+                dA[a] .+= Gk[xr, xr]
+                dA[a] .+= transpose(Gk[lr, lr])
+                dS[a] .-= Gk[xr, lr]
+                dQ[a][k] .+= Gk[lr, xr]
+                dh[a] .+= Gk[:, d + 1]
+                if m > 0
+                    #=
+                    The input block is `B_u − [0; Q_k G_r]`, so its gradient
+                    splits: `B_u` takes it whole, while `G_r` and `Q_k` share the
+                    tracking half bilinearly.
+                    =#
+                    dBk = Gk[:, (d + 2):(d + 1 + m)]
+                    dB[a] .+= dBk
+                    mul!(dQ[a][k], dBk[lr, :], transpose(ctx.Gref[a]), -one(T), one(T))
+                    mul!(dG[a], ctx.Qc[a][k], dBk[lr, :], -one(T), one(T))
+                end
             end
-            dh .+= Gk[:, d + 1]
-            m > 0 && (dB .+= Gk[:, (d + 2):(d + 1 + m)])
+        end
+        if terminal && ctx.Nf_q[u.q] > zero(T)
+            # ∂/∂Ψ of the terminal term; Ψ = [−Q_f  I  −h_f  Q_f G_r].
+            GP = Wf[u.q] * (ctx.Psi[a] * u.hs.Omega)
+            @views begin
+                dQ[a][ctx.kf] .-= GP[:, xr]
+                if m > 0
+                    dPu = GP[:, (d + 2):(d + 1 + m)]
+                    mul!(dQ[a][ctx.kf], dPu, transpose(ctx.Gref[a]), one(T), one(T))
+                    mul!(dG[a], ctx.Qc[a][ctx.kf], dPu, one(T), one(T))
+                end
+                dhf[a] .-= GP[:, d + 1]
+            end
         end
     end
 
-    if ctx.sm.terminal
-        # ∂/∂Ψ of the terminal term; Ψ = [−Q_f  I  −h_f].
-        GP = Wf * (ctx.Psi * ctx.hs.Omega)
-        @views begin
-            if !isempty(p.iQ[ctx.kf])
-                dQf = .-GP[:, xr]
-                Gq = reshape(view(grad, p.iQ[ctx.kf]), n, n)
-                Gq .+= T(0.5) .* (dQf .+ transpose(dQf))
-            end
-            isempty(p.ihf) || (view(grad, p.ihf) .= .-GP[:, d + 1])
+    for a in 1:(ctx.nab)
+        # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_a⁻ᵀ.
+        dA[a] .-= ctx.N_ab[a] .* transpose(inv(F[a]::LU{T,Matrix{T},Vector{Int}}))
+        rA = _ham_range(ctx, a, p.iA)
+        isempty(rA) || copyto!(view(grad, rA), vec(dA[a]))
+        rS = _ham_range(ctx, a, p.iS)
+        isempty(rS) || copyto!(view(grad, rS), vec(_sym(dS[a])))
+        for k in 1:K
+            rQ = _ham_range(ctx, a, p.iQ[k])
+            isempty(rQ) || copyto!(view(grad, rQ), vec(_sym(dQ[a][k])))
         end
+        rh = _ham_range(ctx, a, p.ih)
+        isempty(rh) || copyto!(view(grad, rh), dh[a])
+        rB = _ham_range(ctx, a, p.iB)
+        isempty(rB) || copyto!(view(grad, rB), vec(dB[a]))
+        rG = _ham_range(ctx, a, p.iG)
+        isempty(rG) || copyto!(view(grad, rG), vec(dG[a]))
+        rf = _ham_range(ctx, a, p.ihf)
+        isempty(rf) || copyto!(view(grad, rf), dhf[a])
     end
-
-    # Jacobian term: ∂(−N log|det A|)/∂A = −N A⁻ᵀ.
-    dA .-= ctx.N .* transpose(inv(F))
-
-    isempty(p.iA) || copyto!(view(grad, p.iA), vec(dA))
-    isempty(p.iS) || copyto!(view(grad, p.iS), vec(T(0.5) .* (dS .+ transpose(dS))))
-    isempty(p.ih) || copyto!(view(grad, p.ih), dh)
-    isempty(p.iB) || copyto!(view(grad, p.iB), vec(dB))
 
     return fval
 end
 
 """
-    _ham_writeback!(sm, ctx, θ)
+    _sym(D) -> Matrix
 
-Copy the optimized structural parameters out of `θ` into the model, leaving
-frozen blocks untouched.
+`(D + Dᵀ)/2`, the gradient with respect to a symmetric parameter matrix.
 """
-function _ham_writeback!(
-    sm::HamiltonianStateModel{T}, ctx::_HamMStepCtx{T}, θ::AbstractVector{T}
-) where {T<:Real}
+@inline _sym(D::AbstractMatrix{T}) where {T<:Real} = T(0.5) .* (D .+ transpose(D))
+
+"""
+    _ham_writeback!(ctx, θ)
+
+Copy the optimized structural parameters out of `θ` into each version's model,
+leaving frozen blocks untouched.
+"""
+function _ham_writeback!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
     _ham_unpack!(ctx, θ)
     p = ctx.pack
-    isempty(p.iA) || copyto!(sm.A, ctx.A)
-    isempty(p.iS) || copyto!(sm.S, ctx.S)
-    for k in 1:(p.K)
-        isempty(p.iQ[k]) || copyto!(sm.Qc[k], ctx.Qc[k])
+    for a in 1:(ctx.nab)
+        sm = ctx.sms[a]
+        isempty(p.iA) || copyto!(sm.A, ctx.A[a])
+        isempty(p.iS) || copyto!(sm.S, ctx.S[a])
+        for k in 1:(p.K)
+            isempty(p.iQ[k]) || copyto!(sm.Qc[k], ctx.Qc[a][k])
+        end
+        isempty(p.ih) || copyto!(sm.h, ctx.h[a])
+        isempty(p.iB) || copyto!(sm.Bu, ctx.Bu[a])
+        isempty(p.iG) || copyto!(sm.Gref, ctx.Gref[a])
+        isempty(p.ihf) || copyto!(sm.hf, ctx.hf[a])
     end
-    isempty(p.ih) || copyto!(sm.h, ctx.h)
-    isempty(p.iB) || copyto!(sm.Bu, ctx.Bu)
-    isempty(p.ihf) || copyto!(sm.hf, ctx.hf)
-    return sm
+    return ctx
 end
 
 """
-    _ham_structure_mstep!(lds, hs) -> ctx
+    _ham_structure_mstep!(ctx, fit_structure, mstep_iters) -> ctx
 
 Optimize the structural parameters, warm started at their current values.
 
@@ -757,20 +1045,17 @@ objective not to get worse, so the result is accepted only when it beats the
 starting point. That also makes a failed inner solve harmless — the parameters
 simply do not move that iteration.
 
-Returns the context, whose scratch holds the residual scatters at the accepted
-parameters, so the noise update can read them without recomputing.
+Leaves the scratch (and hence `ctx.R` / `ctx.Rf`) at the accepted parameters, so
+the noise update can read them without recomputing.
 """
 function _ham_structure_mstep!(
-    lds::LinearDynamicalSystem{T,S,O}, hs::HamiltonianSufficientStatistics{T}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
-    sm = lds.state_model
-    profile = lds.fit_bool[4]
-    ctx = _HamMStepCtx(hs, sm, profile)
-
-    θ0 = zeros(T, ctx.pack.np)
+    ctx::_HamMStepCtx{T}, fit_structure::Bool, mstep_iters::Int
+) where {T<:Real}
+    np = _ham_nparams(ctx)
+    θ0 = zeros(T, np)
     _ham_pack!(θ0, ctx)
 
-    if lds.fit_bool[3] && ctx.pack.np > 0
+    if fit_structure && np > 0
         f0 = _ham_fg!(nothing, θ0, ctx)
         if isfinite(f0)
             f_obj(θ) = _ham_fg!(nothing, θ, ctx)
@@ -779,7 +1064,7 @@ function _ham_structure_mstep!(
                 return G
             end
             opts = Optim.Options(;
-                x_abstol=1e-10, g_abstol=1e-9, f_reltol=1e-12, iterations=sm.mstep_iters
+                x_abstol=1e-10, g_abstol=1e-9, f_reltol=1e-12, iterations=mstep_iters
             )
             result = optimize(f_obj, g_obj!, θ0, LBFGS(; linesearch=HagerZhang()), opts)
             θ1 = Optim.minimizer(result)
@@ -790,13 +1075,12 @@ function _ham_structure_mstep!(
             otherwise hand EM a worse objective and break monotonicity.
             =#
             if isfinite(f1) && f1 <= f0
-                _ham_writeback!(sm, ctx, θ1)
+                _ham_writeback!(ctx, θ1)
                 copyto!(θ0, θ1)
             end
         end
     end
 
-    # Leave the scratch (and hence `ctx.R` / `ctx.Rf`) at the accepted parameters.
     _ham_unpack!(ctx, θ0)
     _ham_assemble!(ctx)
     _ham_residuals!(ctx)
@@ -804,31 +1088,38 @@ function _ham_structure_mstep!(
 end
 
 """
-    _ham_noise_mstep!(sm, ctx)
+    _ham_noise_mstep!(ctx)
 
-`Σ = R/N` and `Σf = R_f/N_f` — the closed-form maximizers given the structural
-parameters, which is exactly what profiling them out of the objective assumed.
+`Σ_s = R_s/N_s` and `Σ_{f,s} = R_{f,s}/N_{f,s}` — the closed-form maximizers
+given the structural parameters, which is exactly what profiling them out of the
+objective assumed. Units sharing a noise version pool into that version's `R`.
 """
-function _ham_noise_mstep!(
-    sm::HamiltonianStateModel{T}, ctx::_HamMStepCtx{T}
-) where {T<:Real}
-    if ctx.N > zero(T)
-        copyto!(sm.Σ, ctx.R)
-        sm.Σ ./= ctx.N
-        Symmetrize!(sm.Σ)
+function _ham_noise_mstep!(ctx::_HamMStepCtx{T}) where {T<:Real}
+    written = falses(ctx.nq)
+    for u in ctx.units
+        s = u.q
+        written[s] && continue
+        written[s] = true
+        sm = ctx.sms[u.ab]
+        if ctx.N_q[s] > zero(T)
+            copyto!(sm.Σ, ctx.R[s])
+            sm.Σ ./= ctx.N_q[s]
+            Symmetrize!(sm.Σ)
+        end
+        if sm.terminal && ctx.Nf_q[s] > zero(T)
+            copyto!(sm.Σf, ctx.Rf[s])
+            sm.Σf ./= ctx.Nf_q[s]
+            Symmetrize!(sm.Σf)
+        end
     end
-    if sm.terminal && ctx.Nf > zero(T)
-        copyto!(sm.Σf, ctx.Rf)
-        sm.Σf ./= ctx.Nf
-        Symmetrize!(sm.Σf)
-    end
-    return sm
+    return ctx
 end
 
 """
     _ham_state_mstep!(lds, hs, sws)
 
-The state half of the M-step, shared by every emission model.
+The state half of the M-step for an ungrouped fit, shared by every emission
+model.
 """
 function _ham_state_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -839,10 +1130,12 @@ function _ham_state_mstep!(
     update_initial_state_mean!(lds, base)
     update_initial_state_covariance!(lds, base, sws)
 
-    _fill_mixed_blocks!(hs, lds.state_model)
-    ctx = _ham_structure_mstep!(lds, hs)
-    lds.fit_bool[4] && _ham_noise_mstep!(lds.state_model, ctx)
-    refresh!(lds.state_model)
+    sm = lds.state_model
+    _fill_mixed_blocks!(hs, sm)
+    ctx = _HamMStepCtx(hs, sm, lds.fit_bool[4])
+    _ham_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
+    lds.fit_bool[4] && _ham_noise_mstep!(ctx)
+    refresh!(sm)
     return nothing
 end
 
@@ -871,8 +1164,8 @@ rests on, so computing the ELBO the same way keeps the two consistent to the
 last bit — and the `2 log|det A|` is why an ELBO that ignored the Jacobian would
 drift from the objective EM is actually improving.
 
-Requires [`_fill_mixed_blocks!`](@ref) to have run for the current statistics,
-which `elbo!` arranges.
+Fills the mixed blocks itself, so it is safe to call directly on freshly
+aggregated statistics.
 """
 function Q_state!(
     sws::SmoothWorkspace{T},
@@ -901,27 +1194,36 @@ function Q_state!(
     ldiv!(P0_U, S_init)
     Q_val = T(-0.5) * (T(N1) * (T(d) * log2π + logdet(P0_PD)) + tr(S_init))
 
+    #=
+    Fill the mixed blocks here rather than relying on the caller: this is reached
+    from the ungrouped `elbo!` and from the grouped one, and an ordering hazard
+    that silently reads stale blocks is not worth the block copies it saves.
+    =#
+    _fill_mixed_blocks!(hs, sm)
+
     # Transition term, in mixed coordinates, at the model's current parameters.
     ctx = _HamMStepCtx(hs, sm, false)
-    θ = zeros(T, ctx.pack.np)
+    θ = zeros(T, _ham_nparams(ctx))
     _ham_pack!(θ, ctx)
     _ham_unpack!(ctx, θ)
     _ham_assemble!(ctx)
     _ham_residuals!(ctx)
 
-    if ctx.N > zero(T)
+    # One unit and one noise version here: `Q_state!` is always called per cell.
+    if ctx.N_q[1] > zero(T)
         Σ_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σ)))
         Q_val +=
             T(-0.5) * (
-                ctx.N * (T(d) * log2π + logdet(Σ_PD) - T(2) * sm.cache.logabsdetA) +
-                dot(ctx.Sinv, ctx.R)
+                ctx.N_q[1] * (T(d) * log2π + logdet(Σ_PD) - T(2) * sm.cache.logabsdetA) +
+                dot(ctx.Sinv[1], ctx.R[1])
             )
     end
 
-    if sm.terminal && ctx.Nf > zero(T)
+    if sm.terminal && ctx.Nf_q[1] > zero(T)
         Σf_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σf)))
         Q_val +=
-            T(-0.5) * (ctx.Nf * (T(n) * log2π + logdet(Σf_PD)) + dot(ctx.Sfinv, ctx.Rf))
+            T(-0.5) *
+            (ctx.Nf_q[1] * (T(n) * log2π + logdet(Σf_PD)) + dot(ctx.Sfinv[1], ctx.Rf[1]))
     end
 
     return Q_val
