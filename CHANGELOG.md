@@ -79,15 +79,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     inverse-optimal-control scale invariance (the cost is identified only up to a
     nonzero scalar).
 
-### Changed
-- `AbstractStateModel` gained an intermediate supertype,
-  `AbstractGaussianStateModel`, for state models with a linear-Gaussian
-  transition. `GaussianStateModel` and `HamiltonianStateModel` are its subtypes,
-  and the drivers, emission kernels, workspaces and aggregators now dispatch on
-  it rather than on `GaussianStateModel`. Existing behaviour is unchanged; a new
-  state model plugs in by supplying the state half of the log-density, gradient,
-  curvature, ELBO and M-step.
-
 - Several observation models on one latent state. Hand `LinearDynamicalSystem` a
   `NamedTuple` of observation models instead of one and they all read out the
   same latent process, with observations supplied under the same keys:
@@ -259,6 +250,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   update
 
 ### Changed
+- `AbstractStateModel` gained an intermediate supertype,
+  `AbstractGaussianStateModel`, for state models with a linear-Gaussian
+  transition. `GaussianStateModel` and `HamiltonianStateModel` are its subtypes,
+  and the drivers, emission kernels, workspaces and aggregators now dispatch on
+  it rather than on `GaussianStateModel`. Existing behaviour is unchanged; a new
+  state model plugs in by supplying the state half of the log-density, gradient,
+  curvature, ELBO and M-step.
 - The emission kernels `observation_loglikelihood!`, `observation_gradient!` and
   `observation_hessian!` take the observation model rather than the enclosing
   `LinearDynamicalSystem`, which is what lets a composite emission call them once
