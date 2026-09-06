@@ -255,6 +255,61 @@ p2
 # plant; once the running cost switches on it is driven to the origin, and the
 # terminal cost pins the endpoint.
 
+# ## Tracking a reference
+#
+# For a tracking cost ``\tfrac12(x_t - r_t)^\top Q_t (x_t - r_t)`` the affine term
+# is ``[d_t;\, -Q_t r_t]``: the costate half is **not free**, it is tied to the
+# same cost matrix in ``\mathcal{E}_t`` and varies with the regime because
+# ``Q_t`` does. `Gref` supplies exactly that — pass the reference as the input
+# and freeze ``G_r`` at the identity.
+
+track_sm = HamiltonianStateModel(
+    copy(A),
+    [0.20 0.02; 0.02 0.18],                     # more control authority
+    [copy(Qc), 200.0 * Matrix(I, 2, 2)],        # heavy terminal cost
+    copy(Σ);
+    schedule=cost_schedule(tsteps; terminal=true),
+    terminal=true,
+    Bu=zeros(4, plant_dim),
+    Gref=Matrix(1.0I, plant_dim, plant_dim),    # the reference *is* the input
+    Σf=Matrix(1e-6I, plant_dim, plant_dim),
+    P0=Matrix(0.2I, 4, 4),
+)
+target = [1.5, -0.8]
+z_track = simulate_lqr(
+    track_sm, tsteps; process_noise=false, x1=zeros(plant_dim),
+    ux=repeat(target, 1, tsteps),
+)
+
+p3 = plot(z_track[1, :]; label=L"x_1", xlabel="time", title="Tracking a fixed target")
+plot!(p3, z_track[2, :]; label=L"x_2")
+hline!(p3, target; label="target", linestyle=:dot, color=:black)
+p3
+
+println("distance to target at the end: ",
+        round(norm(z_track[1:plant_dim, end] .- target); digits=4))
+
+# The costate is the gradient of the cost-to-go, so it vanishes as the state
+# reaches the target — `λ_T = Q_f(x_T − r_T)` is the terminal condition, and with
+# a heavy terminal cost that pins the endpoint.
+
+# ## Parameters that vary by group
+#
+# `depends_on` estimates parameters separately per group of trials. The state
+# side has four groups matching the `fit_bool` slots: `:x0`, `:P0`, `:structure`
+# (the whole joint block) and `:noise`. Stitching sessions — one shared plant and
+# cost, a per-session readout — is the observation side:
+#
+# ```julia
+# set_depends_on!(state_model, (structure = condition,))    # cost per condition
+# set_depends_on!(obs_model, (C = session, d = session,     # per-session readout,
+#                             D = session, R = session))    # shared LQR structure
+# ```
+#
+# Groups sharing a noise version pool into that version's residual scatter, so a
+# model whose cost varies by condition but whose noise does not is fitted jointly
+# rather than condition by condition.
+
 # ## Poisson observations
 #
 # Nothing above is specific to Gaussian emissions — spike counts work the same
@@ -282,3 +337,5 @@ using SSDTest  #src
 @test all(isfinite, z_var)  #src
 @test minimum(diff(poisson_elbos)) > -1e-6  #src
 @test all(iszero, plds.obs_model.C[:, (plant_dim + 1):end])  #src
+@test norm(z_track[1:plant_dim, end] .- target) < 0.05  #src
+@test size(z_track) == (4, tsteps)  #src
