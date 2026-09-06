@@ -34,7 +34,7 @@ const SSD = StateSpaceDynamics
 # ---------------------------------------------------------------------------
 
 """
-    truth_model(; n, terminal, tsteps, ux_dim, observe_costate, rho_target)
+    truth_model(; n, terminal, tsteps, ux_dim, observe_costate, tracking)
 
 The generating model. `A` is a mild contraction and `S`, `Qc` are scaled so the
 symplectic spectral radius stays near 1 — a Hamiltonian matrix has reciprocal
