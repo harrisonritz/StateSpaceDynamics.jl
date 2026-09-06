@@ -552,7 +552,7 @@ function test_hamiltonian_sufficient_statistics()
     zy = [zeros(reg, d) for _ in 1:K]
     yy = [zeros(d, d) for _ in 1:K]
     nk = zeros(K)
-    term = zeros(d + 1, d + 1)
+    term = zeros(reg, reg)   # the terminal regressor is [z_T; 1; u_T] too
     for n in 1:ntrials
         fs = tfs[n]
         x = fs.x_smooth
@@ -570,7 +570,7 @@ function test_hamiltonian_sufficient_statistics()
             yy[k] .+= x[:, t + 1] * x[:, t + 1]' .+ P[:, :, t + 1]
             nk[k] += 1
         end
-        zt = [x[:, tsteps]; 1.0]
+        zt = [x[:, tsteps]; 1.0; uxs[n][:, tsteps]]
         Ez = zt * zt'
         Ez[1:d, 1:d] .+= P[:, :, tsteps]
         term .+= Ez
