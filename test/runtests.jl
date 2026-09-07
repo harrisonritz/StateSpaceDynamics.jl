@@ -31,6 +31,18 @@ using SSDTest
 @testset verbose = true "StateSpaceDynamics.jl" begin
     # Package-wide quality tests
     @testset verbose = true "Package Quality" begin
+        #=
+        `test/Manifest.toml` is gitignored, so a Julia upgrade (or any fresh
+        resolve) can silently re-point StateSpaceDynamics at a *registry*
+        release instead of this working tree. Every API newer than that
+        release then surfaces as an `UndefVarError`/`MethodError` deep in an
+        unrelated testset, and the breakage reads as a code bug rather than
+        an environment one. Fail once, here, with the actual cause instead.
+        =#
+        @testset "Testing this working tree" begin
+            @test normpath(pkgdir(StateSpaceDynamics)) == normpath(dirname(@__DIR__))
+        end
+
         @testset "Aqua.jl" begin
             Aqua.test_all(StateSpaceDynamics; ambiguities=false)
             @test isempty(Test.detect_ambiguities(StateSpaceDynamics))
@@ -424,6 +436,30 @@ using SSDTest
                 test_hamiltonian_show()
                 test_hamiltonian_priors_and_fit_bool()
                 test_hamiltonian_single_trial_and_edge_cases()
+            end
+        end
+
+        include("LinearDynamicalSystems/TrialELBO.jl")
+        @testset "Per-trial ELBO" begin
+            test_trial_elbos_sum_to_elbo()
+            test_trial_elbos_ragged_and_inputs()
+            test_trial_elbos_single_trial()
+            test_trial_elbos_prior_excluded()
+            test_trial_elbos_rejects_grouping()
+        end
+
+        include("LinearDynamicalSystems/Holdout.jl")
+        @testset "Held-out ELBO and early stopping" begin
+            test_holdout_non_breaking()
+            test_holdout_matches_standalone_elbo()
+            test_holdout_determinism()
+            test_holdout_test_every()
+            test_holdout_early_stopping()
+            test_holdout_restore_best()
+            test_holdout_composite_emission()
+            test_holdout_grouped()
+            @testset "All model families" begin
+                test_holdout_all_families()
             end
         end
 

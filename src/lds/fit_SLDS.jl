@@ -21,9 +21,11 @@ are shared across regimes; the active regime `zₜ` selects which per-regime
 
     Fit:            fit!(slds, y; ux, uy, smoothing_iters)
 
-    Infer:          smooth(slds, y; ux, uy, smoothing_iters, tol)  # -> (; x, γ, elbo, p)
+    Infer:          smooth(slds, y; ux, uy, smoothing_iters, tol)
+                                                    # -> (; x, γ, elbo, trial_elbo, p)
 
     ELBO:           elbo(slds, y; ux, uy) == loglikelihood(slds, y; ux, uy)
+                    trial_elbos(slds, y; ux, uy)    # per trial
 =============================================================================#
 
 """
@@ -1224,13 +1226,18 @@ held-out data.
   count, so it needs its own label vectors.
 
 # Returns
-A `NamedTuple` `(; x, γ, elbo, p)`. For a single-trial matrix `y`, `x` is
+A `NamedTuple` `(; x, γ, elbo, trial_elbo, p)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
 
+`trial_elbo` is each trial's contribution to `elbo`, always a `Vector` with one entry
+per trial (a single-trial `y` included). It sums to `elbo` up to the parameter
+log-prior, which belongs to no trial — see [`trial_elbos`](@ref).
+
 Because a converged alternation is expensive, `smooth` returns everything it computed in
-one call — read its `elbo` field rather than calling [`elbo`](@ref) separately.
+one call — read its `elbo` / `trial_elbo` fields rather than calling [`elbo`](@ref) or
+[`trial_elbos`](@ref) separately.
 """
 function smooth(
     slds::SLDS{T,S,O},
@@ -1329,9 +1336,18 @@ function smooth(
         @warn "SLDS smoothing did not converge" smoothing_iters tol
     end
 
-    total_elbo = if grp === nothing
-        elbo!(
+    #=
+    Taken per trial and summed here, rather than through `elbo!` /
+    `_elbo_grouped!`, which return only the total. Both of those route through
+    `_slds_trial_elbos` themselves, so the total is the same number it always
+    was; keeping the vector is what lets `trial_elbo` come back alongside it for
+    nothing extra.
+    =#
+    trial_elbo, prior_logdensity = if grp === nothing
+        _slds_trial_elbos(
             slds,
+            nothing,
+            nothing,
             tfs,
             fb_storage,
             y_seq,
@@ -1341,9 +1357,11 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
-        )
+        ),
+        _slds_prior_logdensity(slds)
     else
-        _elbo_grouped!(
+        _slds_trial_elbos(
+            (cell_slds::Vector)[1],
             cell_slds::Vector,
             grp::ParameterGrouping,
             tfs,
@@ -1355,8 +1373,10 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
-        )
+        ),
+        _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T)
     end
+    total_elbo = sum(trial_elbo) + prior_logdensity
 
     γ_trials = Vector{Matrix{T}}(undef, ntrials)
     x_trials = Vector{Matrix{T}}(undef, ntrials)
@@ -1368,20 +1388,33 @@ function smooth(
         return_cov && (p_trials[trial] = copy(tfs[trial].p_smooth))
     end
 
-    return _collect_slds_smooth_output(x_trials, γ_trials, p_trials, total_elbo, y)
+    return _collect_slds_smooth_output(
+        x_trials, γ_trials, p_trials, total_elbo, trial_elbo, y
+    )
 end
 
 #=
 Public-shape return convention, mirroring `_collect_smooth_output` in fit_LDS.jl:
 matrix in → per-trial arrays out (single trial); vector / 3-D array in → vectors out.
 `y` is only inspected for its container type.
+
+`trial_elbo` is the exception: it stays a `Vector` even for a single-trial
+matrix. Its whole point is to be indexed by trial, and unwrapped to a scalar it
+would be indistinguishable from `elbo` — which for one trial and no priors is
+the same number.
 =#
-function _collect_slds_smooth_output(x, γ, p, total_elbo, ::AbstractMatrix)
-    return (; x=x[1], γ=γ[1], elbo=total_elbo, p=(p === nothing ? nothing : p[1]))
+function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, ::AbstractMatrix)
+    return (;
+        x=x[1],
+        γ=γ[1],
+        elbo=total_elbo,
+        trial_elbo=trial_elbo,
+        p=(p === nothing ? nothing : p[1]),
+    )
 end
 
-function _collect_slds_smooth_output(x, γ, p, total_elbo, _)
-    return (; x=x, γ=γ, elbo=total_elbo, p=p)
+function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, _)
+    return (; x=x, γ=γ, elbo=total_elbo, trial_elbo=trial_elbo, p=p)
 end
 
 # ============================================================================
@@ -3152,6 +3185,29 @@ its curvature and gradient over chunks, so a different chunk count is a
 different summation order. The effect is ~1e-11 relative after tens of EM
 iterations. Pin `npool` alongside `rng` to reproduce a fit exactly; leave it at
 the default for the best throughput on whatever machine is running.
+
+# Held-out scoring
+
+Pass `y_test` (with `ux_test` / `uy_test` / `depends_on_test` as needed) to
+score a held-out set every `test_every` iterations, at the same parameters the
+training ELBO was just evaluated at. `fit!` then returns a [`FitTrace`](@ref),
+which behaves exactly as the training-ELBO vector it replaces and carries
+`.test`, `.test_iters` and `.best_iter` alongside — `best_iter` is the answer
+to "how many iterations before this starts overfitting?".
+
+Set `early_stopping=true` to stop when the held-out ELBO turns over (`patience`
+consecutive non-improving scores, defaulting to 1 — the first decrease; and
+`min_delta` for how much counts as an improvement). `restore_best=true` (the
+default) then rolls the model back to the best-scoring parameters; a fit that
+runs to completion is always left at its final iterate. `test_kwargs` forwards
+extra keywords to the scoring [`elbo`](@ref) call, e.g.
+`(smoothing_iters=20,)` to make each SLDS check cheaper.
+
+The held-out score comes from the public [`elbo`](@ref), whose coordinate
+ascent is deterministic — unlike the fit's own Monte-Carlo E-step. The two
+traces are therefore produced by different inference routines and are not
+comparable in absolute terms; each is comparable to itself across iterations,
+which is what the overfitting question needs.
 """
 function fit!(
     slds::SLDS{T,S,O},
@@ -3168,9 +3224,32 @@ function fit!(
     npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     rng_mode in (:trial, :global) ||
         throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
     )
@@ -3378,6 +3457,18 @@ function fit!(
                 lognorm=lognorm,
             )
 
+            #=
+            Held-out score at the same parameters the training ELBO just used.
+            Stopping here, before the M-step, leaves the model exactly at the
+            scored parameters when `restore_best` is off.
+            =#
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            if _holdout_stop(monitor)
+                prog !== nothing && finish!(prog)
+                resize!(elbos, iter)
+                return _fit_result(monitor, elbos, slds)
+            end
+
             # M-step: update discrete and continuous parameters.
             mstep!(
                 slds,
@@ -3440,6 +3531,18 @@ function fit!(
                 lognorm=lognorm,
             )
 
+            #=
+            Held-out score at the same parameters the training ELBO just used.
+            Stopping here, before the M-step, leaves the model exactly at the
+            scored parameters when `restore_best` is off.
+            =#
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            if _holdout_stop(monitor)
+                prog !== nothing && finish!(prog)
+                resize!(elbos, iter)
+                return _fit_result(monitor, elbos, slds)
+            end
+
             _mstep_grouped!(
                 cells,
                 grouping,
@@ -3466,7 +3569,7 @@ function fit!(
     if prog !== nothing
         finish!(prog)
     end
-    return elbos
+    return _fit_result(monitor, elbos, slds)
 end
 
 # ============================================================================

@@ -396,6 +396,23 @@ a plant `A`, a control term `S = B R⁻¹ Bᵀ` and the state cost(s) `Qc` — r
 them with [`lqr_parameters`](@ref).
 
 `depends_on` grouping is not supported for this state model.
+
+# Held-out scoring
+
+Pass `y_test` (with `ux_test` / `uy_test` / `depends_on_test` as needed) to
+score a held-out set every `test_every` iterations, at the same parameters the
+training ELBO was just evaluated at. `fit!` then returns a [`FitTrace`](@ref),
+which behaves exactly as the training-ELBO vector it replaces and carries
+`.test`, `.test_iters` and `.best_iter` alongside — `best_iter` is the answer
+to "how many iterations before this starts overfitting?".
+
+Set `early_stopping=true` to stop when the held-out ELBO turns over (`patience`
+consecutive non-improving scores, defaulting to 1 — the first decrease; and
+`min_delta` for how much counts as an improvement). `restore_best=true` (the
+default) then rolls the model back to the best-scoring parameters; a fit that
+runs to completion is always left at its final iterate. `test_kwargs` forwards
+extra keywords to the scoring [`elbo`](@ref) call, e.g.
+`(smoothing_iters=20,)` to make each SLDS check cheaper.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -408,14 +425,39 @@ function fit!(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
-        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress
+        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
     )
-    return _fit_tridiag!(lds, data; max_iter=max_iter, tol=tol, progress=progress)
+    return _fit_tridiag!(
+        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+    )
 end
 
 """
@@ -570,7 +612,8 @@ end
     fit!(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel,<:NonQuadraticEmission}, y; ...)
 
 Fit a Hamiltonian LDS with a Poisson (or mixed) emission by Laplace EM. Same
-arguments as the Poisson [`fit!`](@ref), including the inner Newton controls.
+arguments as the Poisson [`fit!`](@ref), including the inner Newton controls
+and the held-out `y_test` / `early_stopping` controls.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -585,9 +628,32 @@ function fit!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_hamiltonian!(lds, data.tsteps)
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
         lds,
@@ -598,6 +664,7 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        monitor=monitor,
     )
     return _fit_laplace!(
         lds,
@@ -607,6 +674,7 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        monitor=monitor,
     )
 end
 

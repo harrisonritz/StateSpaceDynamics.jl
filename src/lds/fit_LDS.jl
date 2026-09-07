@@ -835,8 +835,33 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   to fit or score a dataset whose trial count differs from the one the labels
   on the model were written for; it may only re-assign trials to groups the
   model already declares.
+- `y_test`: optional held-out observations, in any shape `y` accepts. When
+  given, the held-out ELBO is scored every `test_every` iterations and `fit!`
+  returns a [`FitTrace`](@ref) instead of a plain `Vector` — a `FitTrace` *is*
+  the training-ELBO vector (same indexing, iteration and plotting), with the
+  held-out trace carried alongside in `.test` / `.test_iters` / `.best_iter`.
+  Scoring happens at the same parameters the training ELBO was just evaluated
+  at, so the two traces are directly comparable iteration by iteration.
+- `ux_test` / `uy_test`: input sequences for the held-out set, matching `y_test`.
+- `depends_on_test`: per-trial group labels for the held-out set, needed when
+  the model is grouped and the test set has a different trial count.
+- `test_every::Int=1`: score the held-out set every this many iterations.
+  Iteration 1 is always scored.
+- `early_stopping::Bool=false`: stop when the held-out ELBO stops improving.
+  Off by default, so passing `y_test` alone only records the trace.
+- `patience::Int=1`: consecutive scored iterations without improvement before
+  stopping. The default of 1 stops on the first decrease.
+- `min_delta::Real=0.0`: how much a held-out ELBO must beat the running best by
+  to count as an improvement.
+- `restore_best::Bool=true`: on an early stop, roll the model back to the
+  parameters that scored best. Applies only when early stopping actually fires;
+  a fit that runs to completion is always left at its final iterate.
+- `test_kwargs::NamedTuple=(;)`: extra keywords forwarded to the scoring
+  [`elbo`](@ref) call, e.g. `(smoothing_iters=20,)` for an SLDS or
+  `(newton_max_iter=10,)` for a Poisson emission.
 
-Returns a `Vector{T}` of ELBO values, one per iteration.
+Returns a `Vector{T}` of ELBO values, one per iteration — or a
+[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -849,13 +874,38 @@ function fit!(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
-        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress
+        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
     )
-    return _fit_tridiag!(lds, data; max_iter=max_iter, tol=tol, progress=progress)
+    return _fit_tridiag!(
+        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+    )
 end
 
 """
@@ -921,6 +971,7 @@ function _fit_tridiag_grouped!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
+    monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(lds, data)
     state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
@@ -941,6 +992,14 @@ function _fit_tridiag_grouped!(
     for iter in 1:max_iter
         elbos[iter] = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
 
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
         _grouped_state_mstep!(
             state.cell_lds,
             _state_sufs(state.sufs),
@@ -957,12 +1016,12 @@ function _fit_tridiag_grouped!(
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            return elbos
+            return _fit_result(monitor, elbos, lds)
         end
     end
 
     prog !== nothing && finish!(prog)
-    return elbos
+    return _fit_result(monitor, elbos, lds)
 end
 
 function _fit_tridiag!(
@@ -971,6 +1030,7 @@ function _fit_tridiag!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
+    monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
@@ -1035,6 +1095,14 @@ function _fit_tridiag!(
         total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
         elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
 
@@ -1045,12 +1113,12 @@ function _fit_tridiag!(
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            return elbos
+            return _fit_result(monitor, elbos, lds)
         end
     end
 
     prog !== nothing && finish!(prog)
-    return elbos
+    return _fit_result(monitor, elbos, lds)
 end
 
 function smooth!(
