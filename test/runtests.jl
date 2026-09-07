@@ -31,6 +31,18 @@ using SSDTest
 @testset verbose = true "StateSpaceDynamics.jl" begin
     # Package-wide quality tests
     @testset verbose = true "Package Quality" begin
+        #=
+        `test/Manifest.toml` is gitignored, so a Julia upgrade (or any fresh
+        resolve) can silently re-point StateSpaceDynamics at a *registry*
+        release instead of this working tree. Every API newer than that
+        release then surfaces as an `UndefVarError`/`MethodError` deep in an
+        unrelated testset, and the breakage reads as a code bug rather than
+        an environment one. Fail once, here, with the actual cause instead.
+        =#
+        @testset "Testing this working tree" begin
+            @test normpath(pkgdir(StateSpaceDynamics)) == normpath(dirname(@__DIR__))
+        end
+
         @testset "Aqua.jl" begin
             Aqua.test_all(StateSpaceDynamics; ambiguities=false)
             @test isempty(Test.detect_ambiguities(StateSpaceDynamics))

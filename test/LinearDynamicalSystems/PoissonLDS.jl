@@ -586,14 +586,18 @@ function test_poisson_obs_inputs(; rng=MersenneTwister(0xD0B5))
 end
 
 function test_EM_matlab()
+    # Anchored to this file, not to `pwd()`, so the suite runs from any
+    # working directory (`Pkg.test()` cd's into `test/`, a direct
+    # `julia --project=test test/runtests.jl` does not).
+    fixtures = joinpath(@__DIR__, "..", "test_data")
     # read data used to smooth the results
-    data_1 = Matrix(CSV.read("test_data/trial1.csv", DataFrame))
-    data_2 = Matrix(CSV.read("test_data/trial2.csv", DataFrame))
-    data_3 = Matrix(CSV.read("test_data/trial3.csv", DataFrame))
+    data_1 = Matrix(CSV.read(joinpath(fixtures, "trial1.csv"), DataFrame))
+    data_2 = Matrix(CSV.read(joinpath(fixtures, "trial2.csv"), DataFrame))
+    data_3 = Matrix(CSV.read(joinpath(fixtures, "trial3.csv"), DataFrame))
     y = [permutedims(d, [2, 1]) for d in (data_1, data_2, data_3)]
     # read the matlab objects to compare results
-    seq = matread("test_data/seq_matlab_3_trials_plds.mat")
-    params = matread("test_data/params_matlab_3_trials_plds.mat")
+    seq = matread(joinpath(fixtures, "seq_matlab_3_trials_plds.mat"))
+    params = matread(joinpath(fixtures, "params_matlab_3_trials_plds.mat"))
 
     #=
     The MATLAB reference was generated against the *buggy* Poisson model
