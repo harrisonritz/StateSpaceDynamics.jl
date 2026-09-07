@@ -1381,3 +1381,186 @@ function test_hamiltonian_single_trial_and_edge_cases()
     @test_throws ArgumentError smooth(lds, y; depends_on=(A=[1],))
     return nothing
 end
+
+# ---------------------------------------------------------------------------
+# `:free` mode
+# ---------------------------------------------------------------------------
+
+"""A `:free` state model and the `GaussianStateModel` it must reproduce, wired
+to one shared emission so the only difference is the state half."""
+function free_pair(rng; d::Int=4, p::Int=3, ux_dim::Int=0)
+    M = T_STABLE(rng, d)
+    Σ = Matrix(0.15I, d, d)
+    x0 = randn(rng, d)
+    P0 = Matrix(0.5I, d, d)
+    C = randn(rng, p, d)
+    R = Matrix(0.2I, p, p)
+    dv = randn(rng, p)
+    B = ux_dim > 0 ? 0.3 .* randn(rng, d, ux_dim) : zeros(d, 0)
+    b = randn(rng, d)
+
+    gsm = GaussianStateModel(;
+        A=copy(M),
+        Q=copy(Σ),
+        b=copy(b),
+        x0=copy(x0),
+        P0=copy(P0),
+        B=copy(B),
+        Q_prior=nothing,
+        P0_prior=nothing,
+        AB_prior=nothing,
+        x0_prior=nothing,
+    )
+    fsm = free_state_model(
+        copy(M), copy(Σ); h=copy(b), Bu=copy(B), x0=copy(x0), P0=copy(P0)
+    )
+    mkobs() = GaussianObservationModel(copy(C), copy(R), copy(dv))
+    return (LinearDynamicalSystem(gsm, mkobs()), LinearDynamicalSystem(fsm, mkobs()))
+end
+
+"""A mildly contractive `d × d` matrix."""
+T_STABLE(rng, d) = 0.85 * Matrix(1.0I, d, d) + 0.05 * randn(rng, d, d)
+
+function test_hamiltonian_free_construction()
+    M = 0.9 * Matrix(1.0I, 4, 4)
+    Σ = Matrix(0.1I, 4, 4)
+    sm = free_state_model(M, Σ)
+
+    @test sm.mode === :free
+    @test SSD._is_free(sm)
+    @test plant_dim(sm) == 2
+    @test SSD._state_latent_dim(sm) == 4
+    # One "regime" even though `Qc` is empty — the free transition is the only one.
+    @test SSD._nregimes(sm) == 1
+    @test isempty(sm.A) && isempty(sm.S) && isempty(sm.Qc)
+    @test !sm.terminal
+
+    # The cache is filled the free way: the transition *is* `Mfree`, `G = I`.
+    @test sm.cache.M[1] == M
+    @test Matrix(sm.cache.Qfwd) ≈ Σ
+    @test sm.cache.G ≈ Matrix(1.0I, 4, 4)
+    @test sm.cache.logabsdetA == 0.0     # G = I carries no Jacobian
+
+    # Rejections.
+    @test_throws DimensionMismatchError free_state_model(randn(4, 3), Σ)
+    @test_throws ArgumentError free_state_model(randn(3, 3), Matrix(0.1I, 3, 3))
+    @test_throws DimensionMismatchError free_state_model(M, Matrix(0.1I, 3, 3))
+    @test_throws DimensionMismatchError free_state_model(M, Σ; h=zeros(3))
+    @test_throws ArgumentError free_state_model(M, Σ; mstep_iters=0)
+
+    # An LQR readout has no answer in `:free` mode and must say so rather than
+    # returning something built from empty matrices.
+    @test_throws ArgumentError lqr_parameters(sm)
+    @test_throws ArgumentError riccati_solution(sm)
+    @test_throws ArgumentError closed_loop_dynamics(sm)
+    @test_throws ArgumentError hamiltonian_matrix(sm)
+    @test_throws ArgumentError symplectic_defect(sm)
+    @test_throws ArgumentError rescale_costate!(sm, 2.0)
+    @test_throws ArgumentError simulate_lqr(sm, 5)
+    @test_throws ArgumentError lqr_riccati_sequence(sm, 5)
+    return nothing
+end
+
+function test_hamiltonian_total_dim_constructor()
+    for D in (2, 4, 6)
+        @test plant_dim(HamiltonianStateModel(D)) == D ÷ 2
+        @test SSD._state_latent_dim(HamiltonianStateModel(D)) == D
+        @test plant_dim(HamiltonianStateModel(D; mode=:free)) == D ÷ 2
+        @test SSD._state_latent_dim(HamiltonianStateModel(D; mode=:free)) == D
+    end
+    @test HamiltonianStateModel(4).mode === :lqr
+    @test HamiltonianStateModel(4; mode=:free).mode === :free
+
+    # The latent is the state-costate pair, so an odd total is a user error.
+    @test_throws ArgumentError HamiltonianStateModel(5)
+    @test_throws ArgumentError HamiltonianStateModel(3; mode=:free)
+    @test_throws ArgumentError HamiltonianStateModel(0)
+    @test_throws ArgumentError HamiltonianStateModel(-2)
+    @test_throws ArgumentError HamiltonianStateModel(4; mode=:nonsense)
+
+    # Keywords reach the matrix constructor they stand in for.
+    sm = HamiltonianStateModel(4; terminal=true, observe_costate=true)
+    @test sm.terminal && sm.observe_costate
+    return nothing
+end
+
+"""`:free` mode is a plain linear-Gaussian state model wearing the Hamiltonian
+type, so it must agree with `GaussianStateModel` exactly — not approximately.
+Any divergence means the free path has invented structure of its own."""
+function test_hamiltonian_free_matches_gaussian_lds()
+    for ux_dim in (0, 2)
+        rng = StableRNG(4242 + ux_dim)
+        ldsG, ldsF = free_pair(rng; ux_dim=ux_dim)
+        tsteps, ntrials = 40, 5
+        uxs = if ux_dim > 0
+            [randn(StableRNG(70 + i), ux_dim, tsteps) for i in 1:ntrials]
+        else
+            nothing
+        end
+        ys = [
+            rand(StableRNG(90 + i), ldsG, tsteps; ux=(uxs === nothing ? nothing : uxs[i]))[2]
+            for i in 1:ntrials
+        ]
+
+        @test loglikelihood(ldsG, ys; ux=uxs) ≈ loglikelihood(ldsF, ys; ux=uxs) atol = 1e-9
+
+        sG = smooth(ldsG, ys; ux=uxs)
+        sF = smooth(ldsF, ys; ux=uxs)
+        @test maximum(maximum(abs, a .- b) for (a, b) in zip(sG[1], sF[1])) < 1e-10
+
+        # The M-step too: both updates are exact maximizers, so a full EM run
+        # must track iterate for iterate, not merely end up nearby.
+        eG = fit!(ldsG, ys; ux=uxs, max_iter=20, tol=1e-14)
+        eF = fit!(ldsF, ys; ux=uxs, max_iter=20, tol=1e-14)
+        eGv = eG isa Tuple ? eG[1] : eG
+        eFv = eF isa Tuple ? eF[1] : eF
+        @test length(eGv) == length(eFv)
+        @test maximum(abs, eGv .- eFv) < 1e-8
+        @test minimum(diff(eFv)) > -1e-8
+
+        @test maximum(abs, ldsG.state_model.A .- ldsF.state_model.Mfree) < 1e-10
+        @test maximum(abs, ldsG.state_model.Q .- ldsF.state_model.Σ) < 1e-10
+        @test maximum(abs, ldsG.state_model.b .- ldsF.state_model.h) < 1e-10
+        ux_dim > 0 && @test maximum(abs, ldsG.state_model.B .- ldsF.state_model.Bu) < 1e-10
+    end
+    return nothing
+end
+
+"""Freezing a column group of the free regression must hold exactly that group,
+and still improve the ELBO for the ones left free."""
+function test_hamiltonian_free_fit_flags()
+    rng = StableRNG(99)
+    _, lds = free_pair(rng; ux_dim=2)
+    sm = lds.state_model
+    ys = [randn(StableRNG(31 + i), lds.obs_dim, 30) .* 0.5 for i in 1:4]
+    uxs = [randn(StableRNG(41 + i), 2, 30) for i in 1:4]
+
+    sm.fit_flags = HamiltonianFitFlags(; A=true, h=false, Bu=false)
+    h0, Bu0 = copy(sm.h), copy(sm.Bu)
+    elbos = fit!(lds, ys; ux=uxs, max_iter=8, tol=1e-12)
+    elbos = elbos isa Tuple ? elbos[1] : elbos
+
+    @test sm.h == h0            # frozen exactly, not merely close
+    @test sm.Bu == Bu0
+    @test minimum(diff(elbos)) > -1e-8
+
+    # Freezing the whole structural block leaves the transition untouched.
+    M0 = copy(sm.Mfree)
+    lds.fit_bool[3] = false
+    fit!(lds, ys; ux=uxs, max_iter=3, tol=1e-12)
+    @test sm.Mfree == M0
+    return nothing
+end
+
+function test_hamiltonian_free_show()
+    sm = free_state_model(0.9 * Matrix(1.0I, 4, 4), Matrix(0.1I, 4, 4))
+    str = sprint(show, sm)
+    @test occursin(":free", str)
+    @test occursin("Latent dim = 4", str)
+    @test !occursin("symplectic defect", str)   # no such thing here
+    @test !occursin("Qc[", str)
+
+    big = free_state_model(0.9 * Matrix(1.0I, 12, 12), Matrix(0.1I, 12, 12))
+    @test occursin("size(M) = (12, 12)", sprint(show, big))
+    return nothing
+end

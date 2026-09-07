@@ -996,6 +996,7 @@ function _build_variants!(
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
     # Slot 3 is the whole structural block; slot 4 the noise.
     As = _slot_arrays(sm.A, dep.nslots[3])
+    Mfrees = _slot_arrays(sm.Mfree, dep.nslots[3])
     Ss = _slot_arrays(sm.S, dep.nslots[3])
     Qcs = [_slot_arrays(Q, dep.nslots[3]) for Q in sm.Qc]
     hs = _slot_arrays(sm.h, dep.nslots[3])
@@ -1005,12 +1006,14 @@ function _build_variants!(
     Σs = _slot_arrays(sm.Σ, dep.nslots[4])
     Σfs = _slot_arrays(sm.Σf, dep.nslots[4])
 
-    n = size(sm.A, 1)
+    n = _plant_dim(sm)
     variants = Vector{HamiltonianStateModel{T,M,V}}(undef, ncells)
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
         v = HamiltonianStateModel{T,M,V}(
+            sm.mode,
             As[s[3]],
+            Mfrees[s[3]],
             Ss[s[3]],
             [Qcs[k][s[3]] for k in eachindex(sm.Qc)],
             sm.schedule,
@@ -1030,7 +1033,7 @@ function _build_variants!(
             sm.x0_prior,
             nothing,
             nothing,
-            HamiltonianCache(T, n, length(sm.Qc), size(sm.Bu, 2)),
+            HamiltonianCache(T, n, _nregimes(sm), size(sm.Bu, 2)),
         )
         refresh!(v)
         variants[cell] = v

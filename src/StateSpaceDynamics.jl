@@ -81,6 +81,7 @@ export CovUpdateCache
 
 # Inverse LQR (Hamiltonian latents)
 export HamiltonianStateModel, HamiltonianFitFlags, cost_schedule, refresh!
+export free_state_model, plant_dim
 export hamiltonian_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
 export simulate_lqr, lqr_riccati_sequence

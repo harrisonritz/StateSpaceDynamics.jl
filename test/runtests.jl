@@ -384,6 +384,14 @@ using SSDTest
                 test_hamiltonian_rescale_costate()
             end
 
+            @testset "Free mode" begin
+                test_hamiltonian_free_construction()
+                test_hamiltonian_total_dim_constructor()
+                test_hamiltonian_free_matches_gaussian_lds()
+                test_hamiltonian_free_fit_flags()
+                test_hamiltonian_free_show()
+            end
+
             @testset "E-step" begin
                 test_hamiltonian_reduces_to_gaussian_lds()
                 test_hamiltonian_multitrial_equivalence()

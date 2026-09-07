@@ -80,8 +80,41 @@ function Base.show(io::IO, gsm::GaussianStateModel; gap="")
     return nothing
 end
 
+#=
+`:free` mode has no plant, cost or costate, so printing the LQR block would be
+printing empty matrices. Show what it actually carries instead.
+=#
+function _show_free_state_model(io::IO, hsm::HamiltonianStateModel, n::Int; gap="")
+    d = 2n
+    println(io, gap, "Hamiltonian State Model (:free — unconstrained dynamics):")
+    println(io, gap, "--------------------------------------------------------")
+    println(io, gap, " Latent dim = $d   [no costate interpretation in :free mode]")
+    if d <= 8
+        println(io, gap, "  M = $(round.(hsm.Mfree, sigdigits=3))")
+    else
+        println(io, gap, "  size(M) = ($d, $d)")
+    end
+    println(io, gap, " Noise:")
+    println(io, gap, "  size(Σ)  = ($(size(hsm.Σ, 1)), $(size(hsm.Σ, 2)))")
+    println(io, gap, " Initial state:")
+    println(io, gap, "  size(x0) = ($(length(hsm.x0)),)")
+    println(io, gap, "  size(P0) = ($(size(hsm.P0, 1)), $(size(hsm.P0, 2)))")
+    println(io, gap, " Dynamics input:")
+    println(io, gap, "  size(Bu) = ($(size(hsm.Bu, 1)), $(size(hsm.Bu, 2)))")
+    f = hsm.fit_flags
+    free = String[
+        s for (s, on) in (("M", f.A), ("h", f.h), ("Bu", f.Bu && size(hsm.Bu, 2) > 0)) if on
+    ]
+    println(io, gap, " Fitting:")
+    println(io, gap, "  free: " * (isempty(free) ? "(none)" : join(free, ", ")))
+    return nothing
+end
+
 function Base.show(io::IO, hsm::HamiltonianStateModel; gap="")
-    n = size(hsm.A, 1)
+    n = _plant_dim(hsm)
+    if _is_free(hsm)
+        return _show_free_state_model(io, hsm, n; gap=gap)
+    end
     println(io, gap, "Hamiltonian (inverse-LQR) State Model:")
     println(io, gap, "--------------------------------------")
     println(io, gap, " Plant dim n = $n, latent dim 2n = $(2n)   [z = (x; λ)]")

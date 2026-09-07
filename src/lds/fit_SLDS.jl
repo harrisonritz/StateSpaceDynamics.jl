@@ -622,6 +622,8 @@ function _add_cov_correction!(
             corr += _tr_prod(sub_entry, transpose(Σ_ttm1))
         end
 
+        t == Tsteps && (corr += _slds_terminal_cov_correction(lds_k, fs, Tsteps))
+
         ll[t] += T(0.5) * corr
     end
 
@@ -637,6 +639,87 @@ per-timestep by the responsibility `w[k, t]` and accumulated. Writes into
 `A'Q⁻¹` residuals via `Bₖ u`) and `uy` (observation input, feeds the emission
 gradient via `Dₖ v`) are per-trial matrices; `nothing` or zero-row skips them.
 """
+#=
+The soft terminal condition of an inverse-LQR state model is an extra Gaussian
+factor at `t = T`, on top of the transition factor. `joint_loglikelihood!` picks
+it up for free because it calls `state_loglikelihood!`, which is dispatched — but
+`gradient!`, `hessian!` and `_add_cov_correction!` build their state
+contributions from the flat `SmoothConstants` templates, which have no slot for
+it. These three helpers add it, weighted by the regime's responsibility at `T`
+exactly like every other factor, and no-op for a state model that has none.
+=#
+@inline function _slds_terminal_gradient!(
+    grad::AbstractMatrix, ws::SLDSSmoothWorkspace, lds::LinearDynamicalSystem, x, w_k, ux
+)
+    return _slds_terminal_gradient!(grad, ws, lds.state_model, x, w_k, ux)
+end
+
+@inline function _slds_terminal_gradient!(
+    ::AbstractMatrix, ::SLDSSmoothWorkspace, ::AbstractStateModel, _, _, _
+)
+    return nothing
+end
+
+function _slds_terminal_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    sm::HamiltonianStateModel{T},
+    x::AbstractMatrix{T},
+    w_k::AbstractVector{T},
+    ux::Union{Nothing,AbstractMatrix},
+) where {T<:Real}
+    sm.terminal || return nothing
+    tsteps = size(x, 2)
+    n = _plant_dim(sm)
+    rf = view(ws.opt.dxt, 1:n)
+    _terminal_residual!(rf, sm, x, ux)
+    # grad[:, T] -= w · Λfᵀ Σf⁻¹ r_f
+    @views mul!(grad[:, tsteps], sm.cache.LtSinv, rf, -w_k[tsteps], one(T))
+    return nothing
+end
+
+@inline function _slds_terminal_hessian!(
+    H_diag::AbstractVector, lds::LinearDynamicalSystem, w_k, tsteps::Int
+)
+    return _slds_terminal_hessian!(H_diag, lds.state_model, w_k, tsteps)
+end
+
+@inline function _slds_terminal_hessian!(::AbstractVector, ::AbstractStateModel, _, ::Int)
+    return nothing
+end
+
+function _slds_terminal_hessian!(
+    H_diag::AbstractVector,
+    sm::HamiltonianStateModel{T},
+    w_k::AbstractVector{T},
+    tsteps::Int,
+) where {T<:Real}
+    sm.terminal || return nothing
+    negLtSL = sm.cache.negLtSL
+    @. H_diag[tsteps] += w_k[tsteps] * negLtSL
+    return nothing
+end
+
+@inline function _slds_terminal_cov_correction(
+    lds::LinearDynamicalSystem, fs::FilterSmooth, tsteps::Int
+)
+    return _slds_terminal_cov_correction(lds.state_model, fs, tsteps)
+end
+
+@inline function _slds_terminal_cov_correction(
+    sm::AbstractStateModel{T}, ::FilterSmooth, ::Int
+) where {T}
+    return zero(T)
+end
+
+function _slds_terminal_cov_correction(
+    sm::HamiltonianStateModel{T}, fs::FilterSmooth{T}, tsteps::Int
+) where {T<:Real}
+    sm.terminal || return zero(T)
+    # `tr(H_f Σ_T)`; the caller's single ½ applies to it like every other term.
+    return _tr_prod(sm.cache.negLtSL, view(fs.p_smooth, :, :, tsteps))
+end
+
 function gradient!(
     ws::SLDSSmoothWorkspace{T},
     slds::SLDS{T},
@@ -712,6 +795,9 @@ function gradient!(
         _transition_residual!(dxt, lds_k, x, Tsteps, ux)
         mul!(tmp3, neg_Q_inv, dxt)
         @. grad[:, Tsteps] += w[k, Tsteps] * tmp3
+
+        # `dxt` is free again here, which is what the helper borrows for `r_f`.
+        _slds_terminal_gradient!(grad, ws, lds_k, x, view(w, k, :), ux)
     end
 
     return grad
@@ -898,6 +984,7 @@ function hessian!(
 
         if Tsteps == 1
             @. H_diag[1] += w[k, 1] * neg_P0_inv
+            _slds_terminal_hessian!(H_diag, lds_k, view(w, k, :), Tsteps)
             _slds_emission_hessian!(
                 ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ, _regime_obs(ws, k)
             )
@@ -926,6 +1013,7 @@ function hessian!(
 
         # - At t=T: current-role from factor at T weighted by w[k,T]
         @. H_diag[Tsteps] += w[k, Tsteps] * neg_Q_inv
+        _slds_terminal_hessian!(H_diag, lds_k, view(w, k, :), Tsteps)
 
         # Emission curvature contributions, weighted by w[k,t].
         _slds_emission_hessian!(

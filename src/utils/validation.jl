@@ -128,12 +128,38 @@ function _validate_state_model(
     state_model::HamiltonianStateModel{T}, latent_dim::Int
 ) where {T}
     sm = state_model
-    n = size(sm.A, 1)
+    n = _plant_dim(sm)
     if latent_dim != 2n
         throw(DimensionMismatchError("Hamiltonian latent_dim (2n)", 2n, latent_dim))
     end
 
-    _check_hamiltonian_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+    #=
+    A `:free` model has no plant, cost or costate to check, and no terminal
+    factor — only the shapes that both modes share. Its transition is checked
+    here instead of by `_check_hamiltonian_structure`, which is about the
+    symplectic form.
+    =#
+    if _is_free(sm)
+        if size(sm.Mfree) != (2n, 2n)
+            throw(DimensionMismatchError("free transition", (2n, 2n), size(sm.Mfree)))
+        end
+        if !isempty(sm.A) || !isempty(sm.S) || !isempty(sm.Qc)
+            throw(
+                ArgumentError(
+                    "a `:free` state model carries no plant or cost, but `A`, `S` or " *
+                    "`Qc` is non-empty. Build it with `free_state_model`.",
+                ),
+            )
+        end
+        sm.terminal && throw(
+            ArgumentError(
+                "a `:free` state model has no costate to pin, so it cannot carry a " *
+                "terminal condition. Use `:lqr` mode for that.",
+            ),
+        )
+    else
+        _check_hamiltonian_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+    end
 
     for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
         if size(Σ) != (dim, dim)

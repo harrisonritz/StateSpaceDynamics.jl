@@ -357,7 +357,9 @@ See also [`lqr_parameters`](@ref), [`riccati_solution`](@ref),
 """
 mutable struct HamiltonianStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} <:
                AbstractGaussianStateModel{T}
+    mode::Symbol
     A::M
+    Mfree::M
     S::M
     Qc::Vector{M}
     schedule::Vector{Int}
@@ -385,17 +387,61 @@ end
 
 The plant dimension `n`. The latent state is twice this.
 """
-@inline _plant_dim(sm::HamiltonianStateModel) = size(sm.A, 1)
+@inline function _plant_dim(sm::HamiltonianStateModel)
+    return sm.mode === :free ? size(sm.Mfree, 1) >> 1 : size(sm.A, 1)
+end
 
-_state_latent_dim(sm::HamiltonianStateModel) = 2 * size(sm.A, 1)
+_state_latent_dim(sm::HamiltonianStateModel) = 2 * _plant_dim(sm)
 _state_ux_dim(sm::HamiltonianStateModel) = size(sm.Bu, 2)
+
+"""
+    plant_dim(sm::HamiltonianStateModel) -> Int
+
+The plant dimension `n`. The model's `latent_dim` is `2n` — the state and its
+costate — so this is the dimension of the control problem itself, and the one
+`A`, `S`, `Qc` and `Gref` are sized by.
+
+```jldoctest
+julia> sm = HamiltonianStateModel(6);
+
+julia> (plant_dim(sm), StateSpaceDynamics._state_latent_dim(sm))
+(3, 6)
+```
+"""
+plant_dim(sm::HamiltonianStateModel) = _plant_dim(sm)
+
+"""
+    _is_free(sm) -> Bool
+
+Whether the model's transition is an unconstrained `2n × 2n` matrix rather than
+the symplectic form an LQR implies. See the `mode` field.
+"""
+@inline _is_free(sm::HamiltonianStateModel) = sm.mode === :free
+
+"""
+    _require_lqr(sm, what)
+
+Throw an informative `ArgumentError` when an LQR-only quantity is asked of a
+`:free` model, which has no plant, no cost and no costate interpretation.
+"""
+function _require_lqr(sm::HamiltonianStateModel, what::AbstractString)
+    _is_free(sm) && throw(
+        ArgumentError(
+            "$what is an LQR quantity, and this model is in `:free` mode — its " *
+            "transition is an unconstrained matrix with no plant, cost or costate " *
+            "to read off. Build it with `HamiltonianStateModel(A, S, Qc, Σ)` if you " *
+            "want the constrained form.",
+        ),
+    )
+    return nothing
+end
 
 """
     _nregimes(sm) -> Int
 
 How many distinct cost matrices the model carries.
 """
-@inline _nregimes(sm::HamiltonianStateModel) = length(sm.Qc)
+@inline _nregimes(sm::HamiltonianStateModel) = _is_free(sm) ? 1 : length(sm.Qc)
 
 """
     _regime(sm, t) -> Int
@@ -628,7 +674,9 @@ function HamiltonianStateModel(
     MT = typeof(A)
     VT = typeof(h_v)
     sm = HamiltonianStateModel{T,MT,VT}(
+        :lqr,
         A,
+        similar(A, 0, 0),
         S,
         Qc_vec,
         sched,
@@ -655,6 +703,168 @@ function HamiltonianStateModel(
 end
 
 """
+    free_state_model(M, Σ; kwargs...) -> HamiltonianStateModel
+
+A `HamiltonianStateModel` in `:free` mode: the latent transition is the
+unconstrained `2n × 2n` matrix `M` rather than the symplectic form an LQR
+implies, and `Σ` is the forward process noise directly.
+
+This exists so that an [`SLDS`](@ref) can mix plain linear dynamics with LQR
+dynamics. `SLDS` stores one concrete state-model type for every discrete state,
+so a "plain dynamics" state has to *be* a `HamiltonianStateModel` — this is that
+state. The latent dimension is `2n` in both modes, which is what lets the two
+share one continuous latent path.
+
+A free model has no plant, no cost and no costate: `A`, `S`, `Qc` and `Gref` are
+empty, `terminal` is off, and the LQR readouts (`lqr_parameters`,
+`riccati_solution`, `rescale_costate!`, …) throw rather than invent an answer.
+Its M-step is the ordinary closed-form regression, not the constrained one.
+
+# Arguments
+- `M`: the `2n × 2n` transition. Its size sets the latent dimension, so it must
+  be even-sized.
+- `Σ`: the `2n × 2n` process noise.
+
+# Keywords
+`h`, `Bu`, `x0`, `P0`, `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior` as for
+the LQR constructor. `Qc`, `Gref`, `schedule`, `terminal`, `Σf` and `hf` are not
+accepted — they have no meaning here.
+
+# Examples
+```julia
+free = free_state_model(0.9 * Matrix(I, 4, 4), Matrix(0.1I, 4, 4))
+lqr  = HamiltonianStateModel(A, S, Qc, Σ)          # same latent_dim = 4
+slds = SLDS(; A=P, πₖ=π, LDSs=[LinearDynamicalSystem(free, obs),
+                               LinearDynamicalSystem(lqr, obs)])
+```
+
+# Throws
+- `ArgumentError` when `M` is not square with an even size
+- `DimensionMismatchError` when `Σ` or any keyword disagrees with `2n`
+"""
+function free_state_model(
+    M::AbstractMatrix{T},
+    Σ::AbstractMatrix{T};
+    h::Union{Nothing,AbstractVector{T}}=nothing,
+    Bu::Union{Nothing,AbstractMatrix{T}}=nothing,
+    x0::Union{Nothing,AbstractVector{T}}=nothing,
+    P0::Union{Nothing,AbstractMatrix{T}}=nothing,
+    observe_costate::Bool=true,
+    fit_flags::HamiltonianFitFlags=HamiltonianFitFlags(),
+    mstep_iters::Int=100,
+    P0_prior::Union{Nothing,IWPrior{T}}=nothing,
+    x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+) where {T<:Real}
+    d = size(M, 1)
+    size(M, 2) == d ||
+        throw(DimensionMismatchError("free transition columns", d, size(M, 2)))
+    isodd(d) && throw(
+        ArgumentError(
+            "a free transition must be even-sized: the latent is the state-costate " *
+            "pair `[x; λ]`, so `latent_dim = 2n`. Got $(d)×$(d).",
+        ),
+    )
+    n = d >> 1
+
+    size(Σ) == (d, d) || throw(DimensionMismatchError("free Σ rows", d, size(Σ, 1)))
+
+    h_v = h === nothing ? zeros(T, d) : h
+    Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
+    x0_v = x0 === nothing ? zeros(T, d) : x0
+    P0_m = P0 === nothing ? Matrix{T}(I, d, d) : P0
+
+    length(h_v) == d || throw(DimensionMismatchError("free h", d, length(h_v)))
+    size(Bu_m, 1) == d || throw(DimensionMismatchError("free Bu rows", d, size(Bu_m, 1)))
+    length(x0_v) == d || throw(DimensionMismatchError("free x0", d, length(x0_v)))
+    size(P0_m) == (d, d) || throw(DimensionMismatchError("free P0 rows", d, size(P0_m, 1)))
+
+    mstep_iters >= 1 ||
+        throw(ArgumentError("mstep_iters must be at least 1; got $mstep_iters"))
+
+    MT = typeof(M)
+    VT = typeof(h_v)
+    empty_m = similar(M, 0, 0)
+    sm = HamiltonianStateModel{T,MT,VT}(
+        :free,
+        empty_m,
+        M,
+        empty_m,
+        MT[],
+        Int[],
+        false,
+        Σ,
+        h_v,
+        Bu_m,
+        similar(M, n, 0),
+        Matrix{T}(I, n, n),
+        zeros(T, n),
+        x0_v,
+        P0_m,
+        observe_costate,
+        fit_flags,
+        mstep_iters,
+        P0_prior,
+        x0_prior,
+        nothing,
+        nothing,
+        HamiltonianCache(T, n, 1, size(Bu_m, 2)),
+    )
+    refresh!(sm)
+    return sm
+end
+
+"""
+    HamiltonianStateModel(latent_dim; mode=:lqr, kwargs...) -> HamiltonianStateModel
+
+Build a default model of a stated **total** latent dimension, rather than from
+its parameter matrices.
+
+This is the spelling an [`SLDS`](@ref) wants: every discrete state shares one
+continuous latent path, so the natural thing to say is "all `K` states are
+`latent_dim`-dimensional" and let each work out its own `n`. `latent_dim` is the
+state *and* costate together, so it must be even — `latent_dim = 4` is two
+states and two costates.
+
+`mode = :lqr` gives a mildly contractive plant with a unit cost; `mode = :free`
+gives a contractive unconstrained transition (see [`free_state_model`](@ref)).
+Every keyword of the corresponding matrix constructor is accepted and overrides
+the default it names.
+
+# Throws
+- `ArgumentError` when `latent_dim` is odd, non-positive, or `mode` is neither
+  `:lqr` nor `:free`
+"""
+function HamiltonianStateModel(
+    latent_dim::Integer; T::Type{<:Real}=Float64, mode::Symbol=:lqr, kwargs...
+)
+    latent_dim > 0 || throw(ArgumentError("latent_dim must be positive; got $latent_dim"))
+    isodd(latent_dim) && throw(
+        ArgumentError(
+            "latent_dim must be even: the latent is the state-costate pair `[x; λ]`, " *
+            "so a plant of dimension `n` gives `latent_dim = 2n`. Got $latent_dim — " *
+            "did you mean $(latent_dim + 1)?",
+        ),
+    )
+    n = Int(latent_dim) >> 1
+    d = 2n
+    if mode === :free
+        return free_state_model(
+            Matrix{T}(T(0.9) * I, d, d), Matrix{T}(T(0.1) * I, d, d); kwargs...
+        )
+    elseif mode === :lqr
+        return HamiltonianStateModel(
+            Matrix{T}(T(0.95) * I, n, n),
+            Matrix{T}(T(0.05) * I, n, n),
+            Matrix{T}(I, n, n),
+            Matrix{T}(T(0.1) * I, d, d);
+            kwargs...,
+        )
+    else
+        throw(ArgumentError("mode must be :lqr or :free; got :$mode"))
+    end
+end
+
+"""
     refresh!(sm::HamiltonianStateModel) -> sm
 
 Rebuild the derived cache from the natural parameters: the per-regime symplectic
@@ -673,6 +883,41 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
     n = _plant_dim(sm)
     d = 2n
     c = sm.cache
+    if _is_free(sm)
+        _refresh_free_head!(sm, c, n, d)
+    else
+        _refresh_lqr_head!(sm, c, n, d)
+    end
+    _refresh_tail!(sm, c, n, d)
+    return sm
+end
+
+#=
+`:free` mode is the same cache filled a different way: the transition *is* the
+stored matrix, so the change of coordinates is the identity and the forward
+noise, bias and input are the mixed ones unchanged. Nothing downstream of
+`refresh!` branches on the mode — the smoother kernels read `M`, `Qfwd`,
+`negMtQinvM` and neither knows nor cares which branch wrote them.
+=#
+function _refresh_free_head!(
+    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+) where {T<:Real}
+    c.logabsdetA = zero(T)                # G = I carries no Jacobian
+    copyto!(c.AinvT, Matrix{T}(I, n, n))  # unused; kept finite for `show`
+
+    copyto!(c.M[1], sm.Mfree)
+    copyto!(c.G, Matrix{T}(I, d, d))
+
+    Q = Matrix{T}(sm.Σ)
+    c.Qfwd = PDMat(Symmetrize!(Q))
+    copyto!(c.bfwd, sm.h)
+    size(sm.Bu, 2) > 0 && copyto!(c.Bfwd[1], sm.Bu)
+    return nothing
+end
+
+function _refresh_lqr_head!(
+    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+) where {T<:Real}
     A = sm.A
     S = sm.S
 
@@ -739,13 +984,23 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
         end
     end
 
+    return nothing
+end
+
+#=
+Shared by both modes: everything downstream of `Qfwd`, `M` and the terminal
+factor's own parameters.
+=#
+function _refresh_tail!(
+    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+) where {T<:Real}
     Qchol = c.Qfwd.chol
     Imat = Matrix{T}(I, d, d)
     copyto!(c.negQinv, Imat)
     ldiv!(Qchol, c.negQinv)
     c.negQinv .*= -one(T)
 
-    for k in eachindex(sm.Qc)
+    for k in 1:_nregimes(sm)
         copyto!(c.QinvM[k], c.M[k])
         ldiv!(Qchol, c.QinvM[k])                 # Qfwd⁻¹ M_k
         copyto!(c.MtQinv[k], transpose(c.QinvM[k]))  # M_kᵀ Qfwd⁻¹ (Qfwd⁻¹ symmetric)
@@ -776,7 +1031,7 @@ function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
     c.negLtSL .*= -one(T)
     c.cF = -T(0.5) * (T(n) * log(T(2π)) + logdet(c.Sf_PD))
 
-    return sm
+    return nothing
 end
 
 # ============================================================================
@@ -791,6 +1046,7 @@ The mixed-form Hamiltonian matrix `𝓔_k = [A  −S; Q_k  Aᵀ]` mapping
 the model's free parameters, which is why it is the form the M-step estimates.
 """
 function hamiltonian_matrix(sm::HamiltonianStateModel{T}, k::Int=1) where {T<:Real}
+    _require_lqr(sm, "the Hamiltonian matrix")
     n = _plant_dim(sm)
     E = Matrix{T}(undef, 2n, 2n)
     @views begin
@@ -844,6 +1100,7 @@ function symplectic_defect(M::AbstractMatrix{T}) where {T<:Real}
 end
 
 function symplectic_defect(sm::HamiltonianStateModel, k::Int=1)
+    _require_lqr(sm, "the symplectic defect")
     return symplectic_defect(sm.cache.M[k])
 end
 
@@ -856,6 +1113,7 @@ combination `S` is — and the overall cost scale is free (see
 [`rescale_costate!`](@ref)).
 """
 function lqr_parameters(sm::HamiltonianStateModel)
+    _require_lqr(sm, "`lqr_parameters`")
     return (
         A=copy(sm.A),
         S=copy(sm.S),
@@ -886,6 +1144,7 @@ stabilizing solution.
 function riccati_solution(
     sm::HamiltonianStateModel{T}; k::Int=1, max_iter::Int=1000, tol::Real=1e-12
 ) where {T<:Real}
+    _require_lqr(sm, "the Riccati solution")
     A = Matrix{T}(sm.A)
     S = Matrix{T}(sm.S)
     P = Matrix{T}(sm.Qc[k])
@@ -922,6 +1181,7 @@ and `P` alone, so it does not need `B` and `R` separately.
 function closed_loop_dynamics(
     sm::HamiltonianStateModel{T}; k::Int=1, P::AbstractMatrix{T}=riccati_solution(sm; k=k)
 ) where {T<:Real}
+    _require_lqr(sm, "the closed-loop dynamics")
     n = _plant_dim(sm)
     return (Matrix{T}(I, n, n) + Matrix{T}(sm.S) * P) \ Matrix{T}(sm.A)
 end
@@ -943,6 +1203,7 @@ Two fits of the same data are only comparable in their cost matrices after this
 rescaled** — rescale `C[:, n+1:2n] ./= c` yourself if `observe_costate` is set.
 """
 function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
+    _require_lqr(sm, "rescaling the costate")
     #=
     Any nonzero `c` is a symmetry, negative included: `−S'λ' = −(S/c)(cλ) = −Sλ`
     holds for either sign, so the costate's *sign* is unidentified along with its
@@ -1047,6 +1308,7 @@ terminal factor and `P_T = 0`, `g_T = 0` (a free endpoint) when it does not.
 function lqr_riccati_sequence(
     sm::HamiltonianStateModel{T}, tsteps::Int; ux::Union{Nothing,AbstractMatrix{T}}=nothing
 ) where {T<:Real}
+    _require_lqr(sm, "the Riccati sequence")
     tsteps >= 2 || throw(ArgumentError("lqr_riccati_sequence needs tsteps ≥ 2"))
     _hamiltonian_lengths_ok(sm, [tsteps])
     n = _plant_dim(sm)
@@ -1156,6 +1418,7 @@ function simulate_lqr(
     costate_slack::Real=0,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
 ) where {T<:Real}
+    _require_lqr(sm, "`simulate_lqr`")
     Ti = Int(tsteps)
     n = _plant_dim(sm)
     d = 2n

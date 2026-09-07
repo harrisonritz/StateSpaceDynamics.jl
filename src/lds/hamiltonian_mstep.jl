@@ -316,6 +316,19 @@ function _fill_mixed_blocks!(
     m = reg - d - 1
     xr, lr = 1:n, (n + 1):d      # state rows / costate rows of a `z`
 
+    #=
+    In `:free` mode the mixed coordinates *are* the forward ones — the regressor
+    is `[z_t; 1; u_t]` and the response `z_{t+1}`, with no interleaving — so the
+    rearrangement below collapses to three copies.
+    =#
+    if _is_free(sm)
+        copyto!(hs.Zw[1], hs.zz[1])
+        copyto!(hs.Xv[1], transpose(hs.zy[1]))
+        copyto!(hs.Yv, hs.yy[1])
+        copyto!(hs.Omega, hs.term_zz)
+        return hs
+    end
+
     fill!(hs.Yv, zero(T))
     for k in 1:K
         P = hs.zz[k]                     # [z;1;u] Gram
@@ -1131,11 +1144,141 @@ function _ham_state_mstep!(
     update_initial_state_covariance!(lds, base, sws)
 
     sm = lds.state_model
+    if _is_free(sm)
+        _free_state_mstep!(lds, hs)
+        refresh!(sm)
+        return nothing
+    end
     _fill_mixed_blocks!(hs, sm)
     ctx = _HamMStepCtx(hs, sm, lds.fit_bool[4])
     _ham_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
     lds.fit_bool[4] && _ham_noise_mstep!(ctx)
     refresh!(sm)
+    return nothing
+end
+
+#=============================================================================
+`:free` mode: an unconstrained transition, so the M-step is the ordinary
+conjugate regression rather than the constrained one.
+
+Writing `Θ = [M | h | B_u]` and `ω_t = [z_t; 1; u_t]`, the transition term is
+
+    Q = −½[ N(d log2π + logdet Σ) + tr(Σ⁻¹ R(Θ)) ],
+    R(Θ) = S_vv − Θ S_vwᵀ − S_vw Θᵀ + Θ S_ww Θᵀ,
+
+with `S_ww = Σ E[ω ωᵀ]`, `S_vw = Σ E[z_{t+1} ωᵀ]`, `S_vv = Σ E[z_{t+1} z_{t+1}ᵀ]`
+— exactly the statistics the aggregator already stores as `zz`, `zy` and `yy`.
+There is no Jacobian term: `G = I` here, so the mixed and forward coordinates
+coincide and `logabsdetA` is zero.
+
+Both updates are exact maximizers, so this is a true M-step (not the generalized
+one the symplectic parameterization needs), and it reproduces a
+`GaussianStateModel` fit to machine precision.
+=============================================================================#
+
+"""
+    _free_theta(sm) -> Matrix
+
+The current `d × (d+1+m)` regression block `[M | h | B_u]` of a `:free` model.
+"""
+function _free_theta(sm::HamiltonianStateModel{T}) where {T<:Real}
+    d = _state_latent_dim(sm)
+    m = size(sm.Bu, 2)
+    Th = Matrix{T}(undef, d, d + 1 + m)
+    @views begin
+        Th[:, 1:d] .= sm.Mfree
+        Th[:, d + 1] .= sm.h
+        m > 0 && (Th[:, (d + 2):(d + 1 + m)] .= sm.Bu)
+    end
+    return Th
+end
+
+"""
+    _free_residual_scatter(Theta, hs) -> Matrix
+
+`R(Θ) = S_vv − Θ S_vwᵀ − S_vw Θᵀ + Θ S_ww Θᵀ`, symmetrized.
+"""
+function _free_residual_scatter(
+    Theta::AbstractMatrix{T}, hs::HamiltonianSufficientStatistics{T}
+) where {T<:Real}
+    Sww = hs.zz[1]
+    Svw = transpose(hs.zy[1])
+    R = Matrix{T}(hs.yy[1])
+    mul!(R, Theta, transpose(Svw), -one(T), one(T))
+    mul!(R, Svw, transpose(Theta), -one(T), one(T))
+    mul!(R, Theta * Sww, transpose(Theta), one(T), one(T))
+    # `Symmetrize!` returns a `Symmetric` view; hand back the plain matrix so
+    # callers can keep scaling it in place.
+    Symmetrize!(R)
+    return R
+end
+
+"""
+    _free_Q_transition(sm, hs) -> T
+
+The transition half of the state Q-term for a `:free` model, at its current
+parameters.
+"""
+function _free_Q_transition(
+    sm::HamiltonianStateModel{T}, hs::HamiltonianSufficientStatistics{T}
+) where {T<:Real}
+    N = T(hs.nk[1])
+    N > zero(T) || return zero(T)
+    d = _state_latent_dim(sm)
+    Theta = _free_theta(sm)
+    R = _free_residual_scatter(Theta, hs)
+    Σ_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σ)))
+    return T(-0.5) * (N * (T(d) * log(T(2π)) + logdet(Σ_PD)) + tr(Σ_PD \ R))
+end
+
+"""
+    _free_state_mstep!(lds, hs)
+
+Closed-form update of `[M | h | B_u]` and `Σ` for a `:free` state model.
+
+`fit_flags.A` / `.h` / `.Bu` select which *columns* of the regression are free;
+a partial selection solves for those columns with the frozen ones held at their
+current value, which is the ordinary partial least-squares update
+`Θ_free = (S_vw − Θ_fix S_ww[fix, ·])[:, free] · S_ww[free, free]⁻¹`.
+"""
+function _free_state_mstep!(
+    lds::LinearDynamicalSystem{T,S,O}, hs::HamiltonianSufficientStatistics{T}
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    d = _state_latent_dim(sm)
+    m = size(sm.Bu, 2)
+    reg = d + 1 + m
+    Sww = hs.zz[1]
+    Svw = Matrix{T}(transpose(hs.zy[1]))
+    N = T(hs.nk[1])
+
+    ff = sm.fit_flags
+    free_cols = Int[]
+    ff.A && append!(free_cols, 1:d)
+    ff.h && push!(free_cols, d + 1)
+    (ff.Bu && m > 0) && append!(free_cols, (d + 2):reg)
+
+    Theta = _free_theta(sm)
+    if lds.fit_bool[3] && !isempty(free_cols) && N > zero(T)
+        fixed = setdiff(1:reg, free_cols)
+        rhs = Svw[:, free_cols]
+        isempty(fixed) || mul!(rhs, Theta[:, fixed], Sww[fixed, free_cols], -one(T), one(T))
+        Gm = pd_gram(Matrix{T}(Sww[free_cols, free_cols]); name="free dynamics Gram")
+        # Θ_free Gm = rhs  ⇒  Gm Θ_freeᵀ = rhsᵀ, and Gm is symmetric.
+        Theta[:, free_cols] .= transpose(Gm.chol \ Matrix{T}(transpose(rhs)))
+    end
+
+    if lds.fit_bool[4] && N > zero(T)
+        R = _free_residual_scatter(Theta, hs)
+        R ./= N
+        copyto!(sm.Σ, R)
+    end
+
+    @views begin
+        copyto!(sm.Mfree, Theta[:, 1:d])
+        copyto!(sm.h, Theta[:, d + 1])
+        m > 0 && copyto!(sm.Bu, Theta[:, (d + 2):reg])
+    end
     return nothing
 end
 
@@ -1193,6 +1336,9 @@ function Q_state!(
     ldiv!(P0_U', S_init)
     ldiv!(P0_U, S_init)
     Q_val = T(-0.5) * (T(N1) * (T(d) * log2π + logdet(P0_PD)) + tr(S_init))
+
+    # `:free` mode has no constrained parameterization to profile through.
+    _is_free(sm) && return Q_val + _free_Q_transition(sm, hs)
 
     #=
     Fill the mixed blocks here rather than relying on the caller: this is reached
