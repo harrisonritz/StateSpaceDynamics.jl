@@ -21,9 +21,11 @@ are shared across regimes; the active regime `zₜ` selects which per-regime
 
     Fit:            fit!(slds, y; ux, uy, smoothing_iters)
 
-    Infer:          smooth(slds, y; ux, uy, smoothing_iters, tol)  # -> (; x, γ, elbo, p)
+    Infer:          smooth(slds, y; ux, uy, smoothing_iters, tol)
+                                                    # -> (; x, γ, elbo, trial_elbo, p)
 
     ELBO:           elbo(slds, y; ux, uy) == loglikelihood(slds, y; ux, uy)
+                    trial_elbos(slds, y; ux, uy)    # per trial
 =============================================================================#
 
 """
@@ -1136,13 +1138,18 @@ held-out data.
   count, so it needs its own label vectors.
 
 # Returns
-A `NamedTuple` `(; x, γ, elbo, p)`. For a single-trial matrix `y`, `x` is
+A `NamedTuple` `(; x, γ, elbo, trial_elbo, p)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
 
+`trial_elbo` is each trial's contribution to `elbo`, always a `Vector` with one entry
+per trial (a single-trial `y` included). It sums to `elbo` up to the parameter
+log-prior, which belongs to no trial — see [`trial_elbos`](@ref).
+
 Because a converged alternation is expensive, `smooth` returns everything it computed in
-one call — read its `elbo` field rather than calling [`elbo`](@ref) separately.
+one call — read its `elbo` / `trial_elbo` fields rather than calling [`elbo`](@ref) or
+[`trial_elbos`](@ref) separately.
 """
 function smooth(
     slds::SLDS{T,S,O},
@@ -1241,9 +1248,18 @@ function smooth(
         @warn "SLDS smoothing did not converge" smoothing_iters tol
     end
 
-    total_elbo = if grp === nothing
-        elbo!(
+    #=
+    Taken per trial and summed here, rather than through `elbo!` /
+    `_elbo_grouped!`, which return only the total. Both of those route through
+    `_slds_trial_elbos` themselves, so the total is the same number it always
+    was; keeping the vector is what lets `trial_elbo` come back alongside it for
+    nothing extra.
+    =#
+    trial_elbo, prior_logdensity = if grp === nothing
+        _slds_trial_elbos(
             slds,
+            nothing,
+            nothing,
             tfs,
             fb_storage,
             y_seq,
@@ -1253,9 +1269,11 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
-        )
+        ),
+        _slds_prior_logdensity(slds)
     else
-        _elbo_grouped!(
+        _slds_trial_elbos(
+            (cell_slds::Vector)[1],
             cell_slds::Vector,
             grp::ParameterGrouping,
             tfs,
@@ -1267,8 +1285,10 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
-        )
+        ),
+        _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T)
     end
+    total_elbo = sum(trial_elbo) + prior_logdensity
 
     γ_trials = Vector{Matrix{T}}(undef, ntrials)
     x_trials = Vector{Matrix{T}}(undef, ntrials)
@@ -1280,20 +1300,33 @@ function smooth(
         return_cov && (p_trials[trial] = copy(tfs[trial].p_smooth))
     end
 
-    return _collect_slds_smooth_output(x_trials, γ_trials, p_trials, total_elbo, y)
+    return _collect_slds_smooth_output(
+        x_trials, γ_trials, p_trials, total_elbo, trial_elbo, y
+    )
 end
 
 #=
 Public-shape return convention, mirroring `_collect_smooth_output` in fit_LDS.jl:
 matrix in → per-trial arrays out (single trial); vector / 3-D array in → vectors out.
 `y` is only inspected for its container type.
+
+`trial_elbo` is the exception: it stays a `Vector` even for a single-trial
+matrix. Its whole point is to be indexed by trial, and unwrapped to a scalar it
+would be indistinguishable from `elbo` — which for one trial and no priors is
+the same number.
 =#
-function _collect_slds_smooth_output(x, γ, p, total_elbo, ::AbstractMatrix)
-    return (; x=x[1], γ=γ[1], elbo=total_elbo, p=(p === nothing ? nothing : p[1]))
+function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, ::AbstractMatrix)
+    return (;
+        x=x[1],
+        γ=γ[1],
+        elbo=total_elbo,
+        trial_elbo=trial_elbo,
+        p=(p === nothing ? nothing : p[1]),
+    )
 end
 
-function _collect_slds_smooth_output(x, γ, p, total_elbo, _)
-    return (; x=x, γ=γ, elbo=total_elbo, p=p)
+function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, _)
+    return (; x=x, γ=γ, elbo=total_elbo, trial_elbo=trial_elbo, p=p)
 end
 
 # ============================================================================

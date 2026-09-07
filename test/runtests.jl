@@ -431,6 +431,15 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/TrialELBO.jl")
+        @testset "Per-trial ELBO" begin
+            test_trial_elbos_sum_to_elbo()
+            test_trial_elbos_ragged_and_inputs()
+            test_trial_elbos_single_trial()
+            test_trial_elbos_prior_excluded()
+            test_trial_elbos_rejects_grouping()
+        end
+
         include("LinearDynamicalSystems/Holdout.jl")
         @testset "Held-out ELBO and early stopping" begin
             test_holdout_non_breaking()

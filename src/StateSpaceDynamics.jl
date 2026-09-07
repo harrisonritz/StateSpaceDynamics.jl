@@ -61,6 +61,7 @@ include("lds/grouped_em.jl")
 include("lds/fit_LDS.jl")
 include("lds/fit_PLDS.jl")
 include("lds/fit_SLDS.jl")
+include("lds/trial_elbo.jl")                        # ELBO split by trial
 
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
@@ -99,6 +100,6 @@ export info_update!
 export tview
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, elbo, elbo!
+export rand, smooth, fit!, loglikelihood, elbo, elbo!, trial_elbos
 
 end
