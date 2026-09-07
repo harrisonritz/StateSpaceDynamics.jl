@@ -1564,3 +1564,104 @@ function test_hamiltonian_free_show()
     @test occursin("size(M) = (12, 12)", sprint(show, big))
     return nothing
 end
+
+# ---------------------------------------------------------------------------
+# Responsibility-weighted statistics (the SLDS M-step's input)
+# ---------------------------------------------------------------------------
+
+"""Aggregate `lds`'s statistics under per-trial weights `w`."""
+function ham_weighted_stats(lds, tfs, data, w)
+    hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+    SSD._aggregate_hamiltonian_stats_weighted!(hs, tfs, lds, data, w)
+    return hs
+end
+
+"""Largest absolute disagreement between two statistic sets, over every block."""
+function ham_stats_gap(a, b, K)
+    g = maximum([maximum(abs, a.zz[k] .- b.zz[k]) for k in 1:K])
+    g = max(g, maximum([maximum(abs, a.zy[k] .- b.zy[k]) for k in 1:K]))
+    g = max(g, maximum([maximum(abs, a.yy[k] .- b.yy[k]) for k in 1:K]))
+    g = max(g, maximum([abs(a.nk[k] - b.nk[k]) for k in 1:K]))
+    g = max(g, maximum(abs, a.term_zz .- b.term_zz))
+    return max(g, abs(a.term_n - b.term_n))
+end
+
+"""The weighted aggregator is the SLDS M-step's only source of statistics, and a
+one-index slip in the weight-to-timestep convention would bias every fit while
+still looking plausible. Three properties pin it down: it must reduce to the
+plain aggregator at unit weight, be additive in the weights, and vanish at zero.
+"""
+function test_hamiltonian_weighted_stats()
+    for (terminal, ux_dim, nregimes, onset) in (
+        (false, 0, 1, 1),
+        (false, 0, 2, 6),
+        (true, 0, 2, 1),
+        (true, 2, 2, 1),
+        (true, 2, 3, 6),
+    )
+        rng = StableRNG(5150)
+        tsteps, ntrials = 18, 4
+        sm, lds = ham_fixture(
+            rng;
+            terminal=terminal,
+            tsteps=tsteps,
+            ux_dim=ux_dim,
+            nregimes=nregimes,
+            onset=onset,
+        )
+        ys = [randn(StableRNG(7 + i), lds.obs_dim, tsteps) .* 0.4 for i in 1:ntrials]
+        uxs = if ux_dim > 0
+            [randn(StableRNG(17 + i), ux_dim, tsteps) for i in 1:ntrials]
+        else
+            nothing
+        end
+        plain, tfs, data, _ = ham_estep_stats(lds, ys; ux=uxs)
+        K = SSD._nregimes(sm)
+
+        # 1. Unit weight is the plain aggregate — the convention check. If the
+        #    transition out of `t` were weighted by `γ(t)` instead of `γ(t+1)`,
+        #    this would still pass, so 2. below is the one that pins the index.
+        ones_w = [ones(tsteps) for _ in 1:ntrials]
+        @test ham_stats_gap(plain, ham_weighted_stats(lds, tfs, data, ones_w), K) < 1e-10
+
+        # 2. Additive in the weights, with weights that vary within a trial so a
+        #    shifted index changes the answer.
+        w1 = [[0.1 + 0.8 * abs(sin(0.7t + i)) for t in 1:tsteps] for i in 1:ntrials]
+        w2 = [[0.05 + 0.5 * abs(cos(0.4t - i)) for t in 1:tsteps] for i in 1:ntrials]
+        s1 = ham_weighted_stats(lds, tfs, data, w1)
+        s2 = ham_weighted_stats(lds, tfs, data, w2)
+        ssum = ham_weighted_stats(lds, tfs, data, [w1[i] .+ w2[i] for i in 1:ntrials])
+        for k in 1:K
+            @test maximum(abs, ssum.zz[k] .- (s1.zz[k] .+ s2.zz[k])) < 1e-10
+            @test maximum(abs, ssum.zy[k] .- (s1.zy[k] .+ s2.zy[k])) < 1e-10
+            @test maximum(abs, ssum.yy[k] .- (s1.yy[k] .+ s2.yy[k])) < 1e-10
+            @test ssum.nk[k] ≈ s1.nk[k] + s2.nk[k]
+        end
+        @test maximum(abs, ssum.term_zz .- (s1.term_zz .+ s2.term_zz)) < 1e-10
+        @test ssum.term_n ≈ s1.term_n + s2.term_n
+
+        # 3. A partition of unity sums back to the plain aggregate: this is what
+        #    makes a K-state SLDS with `Σₖ γₖ(t) = 1` pool to the ungrouped fit.
+        wa = [[0.3 + 0.4 * abs(sin(1.1t + i)) for t in 1:tsteps] for i in 1:ntrials]
+        wb = [1 .- wa[i] for i in 1:ntrials]
+        sa = ham_weighted_stats(lds, tfs, data, wa)
+        sb = ham_weighted_stats(lds, tfs, data, wb)
+        for k in 1:K
+            @test maximum(abs, plain.zz[k] .- (sa.zz[k] .+ sb.zz[k])) < 1e-10
+            @test maximum(abs, plain.zy[k] .- (sa.zy[k] .+ sb.zy[k])) < 1e-10
+            @test plain.nk[k] ≈ sa.nk[k] + sb.nk[k]
+        end
+        @test plain.term_n ≈ sa.term_n + sb.term_n
+
+        # 4. Zero weight contributes nothing at all.
+        zed = ham_weighted_stats(lds, tfs, data, [zeros(tsteps) for _ in 1:ntrials])
+        for k in 1:K
+            @test all(iszero, zed.zz[k])
+            @test all(iszero, zed.zy[k])
+            @test all(iszero, zed.yy[k])
+            @test zed.nk[k] == 0
+        end
+        @test zed.term_n == 0
+    end
+    return nothing
+end

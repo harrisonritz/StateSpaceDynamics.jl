@@ -411,6 +411,7 @@ using SSDTest
                 test_hamiltonian_gradient_and_hessian()
                 test_hamiltonian_elbo_matches_exact_marginal()
                 test_hamiltonian_sufficient_statistics()
+                test_hamiltonian_weighted_stats()
             end
 
             @testset "M-step" begin

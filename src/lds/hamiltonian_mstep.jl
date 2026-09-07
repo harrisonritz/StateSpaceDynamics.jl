@@ -266,6 +266,24 @@ function _aggregate_hamiltonian_stats!(
         end
     end
 
+    return _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K)
+end
+
+"""
+    _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K) -> hs
+
+Mirror the upper triangles the accumulation loops filled, for both the
+transition Grams and the terminal one. Shared by the plain and the
+responsibility-weighted aggregators, which differ only in how they accumulate.
+"""
+function _finalize_hamiltonian_stats!(
+    hs::HamiltonianSufficientStatistics{T},
+    sm::HamiltonianStateModel{T},
+    d::Int,
+    m::Int,
+    reg::Int,
+    K::Int,
+) where {T<:Real}
     for k in 1:K
         zz = hs.zz[k]
         LinearAlgebra.copytri!(tview(zz, 1:d, 1:d), 'U')
@@ -289,8 +307,123 @@ function _aggregate_hamiltonian_stats!(
             LinearAlgebra.copytri!(tview(hs.term_zz, ur, ur), 'U')
         end
     end
-
     return hs
+end
+
+"""
+    _aggregate_hamiltonian_stats_weighted!(hs, tfs, lds, data, weights) -> hs
+
+The responsibility-weighted counterpart, for one discrete state of an `SLDS`.
+
+`weights[trial][t]` is that state's responsibility `γₖ(t)`. The convention is
+the one every other SLDS aggregator and kernel uses: the dynamics factor at `t`
+couples `(z_{t-1}, z_t)`, so the transition *out of* `t` carries `γₖ(t+1)`, and
+the terminal factor at `T` carries `γₖ(T)`.
+
+Everything the plain aggregator counts once, this counts `γ` times — including
+`nk`, which therefore holds the **effective** count `n̄ₖ = Σ γₖ(t)` rather than a
+number of timesteps. The M-step's Jacobian term is scaled by that same `n̄ₖ`,
+which is what keeps the generalized M-step monotone under unbalanced
+responsibilities.
+
+Accumulates per timestep rather than BLAS-3 over a schedule run: the weight
+varies within a run, so there is no run to batch over.
+"""
+function _aggregate_hamiltonian_stats_weighted!(
+    hs::HamiltonianSufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    weights::AbstractVector{<:AbstractVector{T}},
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    d = lds.latent_dim
+    m = lds.ux_dim
+    reg = d + 1 + m
+    K = _nregimes(sm)
+
+    for k in 1:K
+        fill!(hs.zz[k], zero(T))
+        fill!(hs.zy[k], zero(T))
+        fill!(hs.yy[k], zero(T))
+        hs.nk[k] = zero(T)
+    end
+    fill!(hs.term_zz, zero(T))
+    hs.term_n = zero(T)
+
+    for trial in 1:length(tfs)
+        fs = tfs[trial]
+        x = fs.x_smooth::Matrix{T}
+        p_smooth = fs.p_smooth::Array{T,3}
+        p_tt1 = fs.p_smooth_tt1::Array{T,3}
+        T_n = size(x, 2)
+        ux = data.ux[trial]
+        w = weights[trial]
+
+        @views for t in 1:(T_n - 1)
+            wt = w[t + 1]                     # the factor coupling (z_t, z_{t+1})
+            iszero(wt) && continue
+            k = _regime(sm, t)
+            zz = hs.zz[k]
+            zy = hs.zy[k]
+            yy = hs.yy[k]
+            hs.nk[k] += wt
+
+            z_prev = x[:, t]
+            z_next = x[:, t + 1]
+
+            BLAS.ger!(wt, z_prev, z_prev, tview(zz, 1:d, 1:d))
+            tview(zz, 1:d, 1:d) .+= wt .* p_smooth[:, :, t]
+            BLAS.ger!(wt, z_prev, z_next, tview(zy, 1:d, :))
+            tview(zy, 1:d, :) .+= wt .* adjoint(p_tt1[:, :, t + 1])
+            BLAS.ger!(wt, z_next, z_next, yy)
+            yy .+= wt .* p_smooth[:, :, t + 1]
+
+            for i in 1:d
+                zz[i, d + 1] += wt * z_prev[i]
+                zy[d + 1, i] += wt * z_next[i]
+            end
+            zz[d + 1, d + 1] += wt
+
+            if m > 0
+                u_prev = ux[:, t]
+                BLAS.ger!(wt, z_prev, u_prev, tview(zz, 1:d, (d + 2):reg))
+                BLAS.ger!(wt, u_prev, z_next, tview(zy, (d + 2):reg, :))
+                BLAS.ger!(wt, u_prev, u_prev, tview(zz, (d + 2):reg, (d + 2):reg))
+                for j in 1:m
+                    zz[d + 1, d + 1 + j] += wt * u_prev[j]
+                end
+            end
+        end
+
+        if sm.terminal
+            wT = w[T_n]
+            if !iszero(wT)
+                xT = tview(x, :, T_n)
+                BLAS.ger!(wT, xT, xT, tview(hs.term_zz, 1:d, 1:d))
+                @views hs.term_zz[1:d, 1:d] .+= wT .* p_smooth[:, :, T_n]
+                for i in 1:d
+                    hs.term_zz[i, d + 1] += wT * x[i, T_n]
+                end
+                if m > 0
+                    uT = tview(ux, :, T_n)
+                    BLAS.ger!(wT, xT, uT, tview(hs.term_zz, 1:d, (d + 2):(d + 1 + m)))
+                    BLAS.ger!(
+                        wT,
+                        uT,
+                        uT,
+                        tview(hs.term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)),
+                    )
+                    for j in 1:m
+                        hs.term_zz[d + 1, d + 1 + j] += wT * uT[j]
+                    end
+                end
+                hs.term_n += wT
+            end
+        end
+    end
+
+    return _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K)
 end
 
 """
