@@ -3064,6 +3064,29 @@ its curvature and gradient over chunks, so a different chunk count is a
 different summation order. The effect is ~1e-11 relative after tens of EM
 iterations. Pin `npool` alongside `rng` to reproduce a fit exactly; leave it at
 the default for the best throughput on whatever machine is running.
+
+# Held-out scoring
+
+Pass `y_test` (with `ux_test` / `uy_test` / `depends_on_test` as needed) to
+score a held-out set every `test_every` iterations, at the same parameters the
+training ELBO was just evaluated at. `fit!` then returns a [`FitTrace`](@ref),
+which behaves exactly as the training-ELBO vector it replaces and carries
+`.test`, `.test_iters` and `.best_iter` alongside — `best_iter` is the answer
+to "how many iterations before this starts overfitting?".
+
+Set `early_stopping=true` to stop when the held-out ELBO turns over (`patience`
+consecutive non-improving scores, defaulting to 1 — the first decrease; and
+`min_delta` for how much counts as an improvement). `restore_best=true` (the
+default) then rolls the model back to the best-scoring parameters; a fit that
+runs to completion is always left at its final iterate. `test_kwargs` forwards
+extra keywords to the scoring [`elbo`](@ref) call, e.g.
+`(smoothing_iters=20,)` to make each SLDS check cheaper.
+
+The held-out score comes from the public [`elbo`](@ref), whose coordinate
+ascent is deterministic — unlike the fit's own Monte-Carlo E-step. The two
+traces are therefore produced by different inference routines and are not
+comparable in absolute terms; each is comparable to itself across iterations,
+which is what the overfitting question needs.
 """
 function fit!(
     slds::SLDS{T,S,O},
@@ -3080,9 +3103,32 @@ function fit!(
     npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     rng_mode in (:trial, :global) ||
         throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
     )
@@ -3290,6 +3336,18 @@ function fit!(
                 lognorm=lognorm,
             )
 
+            #=
+            Held-out score at the same parameters the training ELBO just used.
+            Stopping here, before the M-step, leaves the model exactly at the
+            scored parameters when `restore_best` is off.
+            =#
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            if _holdout_stop(monitor)
+                prog !== nothing && finish!(prog)
+                resize!(elbos, iter)
+                return _fit_result(monitor, elbos, slds)
+            end
+
             # M-step: update discrete and continuous parameters.
             mstep!(
                 slds,
@@ -3352,6 +3410,18 @@ function fit!(
                 lognorm=lognorm,
             )
 
+            #=
+            Held-out score at the same parameters the training ELBO just used.
+            Stopping here, before the M-step, leaves the model exactly at the
+            scored parameters when `restore_best` is off.
+            =#
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            if _holdout_stop(monitor)
+                prog !== nothing && finish!(prog)
+                resize!(elbos, iter)
+                return _fit_result(monitor, elbos, slds)
+            end
+
             _mstep_grouped!(
                 cells,
                 grouping,
@@ -3378,7 +3448,7 @@ function fit!(
     if prog !== nothing
         finish!(prog)
     end
-    return elbos
+    return _fit_result(monitor, elbos, slds)
 end
 
 # ============================================================================

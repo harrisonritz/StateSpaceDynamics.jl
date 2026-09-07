@@ -931,6 +931,33 @@ Fit a Poisson LDS via Laplace-EM.
   `depends_on` declared on the models for this call (see the ancillary parameter
   dependency docs). Needed when this dataset's trial count differs from the one
   the labels on the model were written for.
+- `y_test`: optional held-out observations, in any shape `y` accepts. When
+  given, the held-out ELBO is scored every `test_every` iterations and `fit!`
+  returns a [`FitTrace`](@ref) instead of a plain `Vector` — a `FitTrace` *is*
+  the training-ELBO vector (same indexing, iteration and plotting), with the
+  held-out trace carried alongside in `.test` / `.test_iters` / `.best_iter`.
+  Scoring happens at the same parameters the training ELBO was just evaluated
+  at, so the two traces are directly comparable iteration by iteration.
+- `ux_test` / `uy_test`: input sequences for the held-out set, matching `y_test`.
+- `depends_on_test`: per-trial group labels for the held-out set, needed when
+  the model is grouped and the test set has a different trial count.
+- `test_every::Int=1`: score the held-out set every this many iterations.
+  Iteration 1 is always scored.
+- `early_stopping::Bool=false`: stop when the held-out ELBO stops improving.
+  Off by default, so passing `y_test` alone only records the trace.
+- `patience::Int=1`: consecutive scored iterations without improvement before
+  stopping. The default of 1 stops on the first decrease.
+- `min_delta::Real=0.0`: how much a held-out ELBO must beat the running best by
+  to count as an improvement.
+- `restore_best::Bool=true`: on an early stop, roll the model back to the
+  parameters that scored best. Applies only when early stopping actually fires;
+  a fit that runs to completion is always left at its final iterate.
+- `test_kwargs::NamedTuple=(;)`: extra keywords forwarded to the scoring
+  [`elbo`](@ref) call, e.g. `(smoothing_iters=20,)` for an SLDS or
+  `(newton_max_iter=10,)` for a Poisson emission.
+
+Returns a `Vector{T}` of ELBO values, one per iteration — or a
+[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     plds::LinearDynamicalSystem{T,S,O},
@@ -945,8 +972,31 @@ function fit!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux=ux, uy=uy)
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
         plds,
@@ -957,6 +1007,7 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        monitor=monitor,
     )
     return _fit_laplace!(
         plds,
@@ -966,6 +1017,7 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        monitor=monitor,
     )
 end
 
@@ -986,6 +1038,7 @@ function _fit_laplace!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
 
@@ -1027,6 +1080,14 @@ function _fit_laplace!(
         # compute the ELBO
         elbos[iter] = elbo!(plds, suf, tfs, data, sws_pool)
 
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, plds)
+        end
+
         # M-step: update state-side suff-stats from suf, update Poisson emission via LBFGS
         mstep!(plds, suf, tfs, data, sws_pool)
 
@@ -1037,12 +1098,12 @@ function _fit_laplace!(
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            return elbos
+            return _fit_result(monitor, elbos, plds)
         end
     end
 
     prog !== nothing && finish!(prog)
-    return elbos
+    return _fit_result(monitor, elbos, plds)
 end
 
 """
@@ -1273,6 +1334,7 @@ function _fit_plds_grouped!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
     state = _grouped_fit_state(plds, data, grp, sws_pool)
@@ -1294,6 +1356,14 @@ function _fit_plds_grouped!(
             state, grp, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
         )
 
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, plds)
+        end
+
         _grouped_state_mstep!(
             state.cell_lds,
             _state_sufs(state.sufs),
@@ -1308,10 +1378,10 @@ function _fit_plds_grouped!(
         if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            return elbos
+            return _fit_result(monitor, elbos, plds)
         end
     end
 
     prog !== nothing && finish!(prog)
-    return elbos
+    return _fit_result(monitor, elbos, plds)
 end

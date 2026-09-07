@@ -35,6 +35,7 @@ include("lds/types.jl")                             # abstract types, model stru
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
 include("lds/hamiltonian_types.jl")                 # inverse-LQR state model + derived cache
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
+include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
 include("utils/show.jl")
 include("utils/validation.jl")
 
@@ -78,6 +79,7 @@ export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior
 export CovUpdateCache
+export FitTrace
 
 # Inverse LQR (Hamiltonian latents)
 export HamiltonianStateModel, HamiltonianFitFlags, cost_schedule, refresh!

@@ -431,6 +431,21 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/Holdout.jl")
+        @testset "Held-out ELBO and early stopping" begin
+            test_holdout_non_breaking()
+            test_holdout_matches_standalone_elbo()
+            test_holdout_determinism()
+            test_holdout_test_every()
+            test_holdout_early_stopping()
+            test_holdout_restore_best()
+            test_holdout_composite_emission()
+            test_holdout_grouped()
+            @testset "All model families" begin
+                test_holdout_all_families()
+            end
+        end
+
         include("LinearDynamicalSystems/Stitching.jl")
         @testset "Stitching (per-session obs_dim)" begin
             @testset "Shapes and validation" begin
