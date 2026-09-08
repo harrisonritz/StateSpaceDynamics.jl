@@ -357,27 +357,35 @@ function _aggregate_hamiltonian_stats_weighted!(
         p_smooth = fs.p_smooth::Array{T,3}
         p_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
-        ux = data.ux[trial]
+        ux = data.ux[trial]::Matrix{T}
         w = weights[trial]
 
-        @views for t in 1:(T_n - 1)
-            wt = w[t + 1]                     # the factor coupling (z_t, z_{t+1})
+        #=
+        Everything handed to `ger!` is hoisted through `tview` with a concrete
+        annotation rather than `@views`: BLAS wrappers have no fallback method,
+        so a view whose element type JET cannot pin becomes a "no matching
+        method" report on every union-split branch.
+        =#
+        for t in 1:(T_n - 1)
+            wt = w[t + 1]::T                  # the factor coupling (z_t, z_{t+1})
             iszero(wt) && continue
             k = _regime(sm, t)
-            zz = hs.zz[k]
-            zy = hs.zy[k]
-            yy = hs.yy[k]
+            zz = hs.zz[k]::Matrix{T}
+            zy = hs.zy[k]::Matrix{T}
+            yy = hs.yy[k]::Matrix{T}
             hs.nk[k] += wt
 
-            z_prev = x[:, t]
-            z_next = x[:, t + 1]
+            z_prev = tview(x, :, t)
+            z_next = tview(x, :, t + 1)
 
             BLAS.ger!(wt, z_prev, z_prev, tview(zz, 1:d, 1:d))
-            tview(zz, 1:d, 1:d) .+= wt .* p_smooth[:, :, t]
             BLAS.ger!(wt, z_prev, z_next, tview(zy, 1:d, :))
-            tview(zy, 1:d, :) .+= wt .* adjoint(p_tt1[:, :, t + 1])
             BLAS.ger!(wt, z_next, z_next, yy)
-            yy .+= wt .* p_smooth[:, :, t + 1]
+            @views begin
+                tview(zz, 1:d, 1:d) .+= wt .* p_smooth[:, :, t]
+                tview(zy, 1:d, :) .+= wt .* adjoint(p_tt1[:, :, t + 1])
+                yy .+= wt .* p_smooth[:, :, t + 1]
+            end
 
             for i in 1:d
                 zz[i, d + 1] += wt * z_prev[i]
@@ -386,7 +394,7 @@ function _aggregate_hamiltonian_stats_weighted!(
             zz[d + 1, d + 1] += wt
 
             if m > 0
-                u_prev = ux[:, t]
+                u_prev = tview(ux, :, t)
                 BLAS.ger!(wt, z_prev, u_prev, tview(zz, 1:d, (d + 2):reg))
                 BLAS.ger!(wt, u_prev, z_next, tview(zy, (d + 2):reg, :))
                 BLAS.ger!(wt, u_prev, u_prev, tview(zz, (d + 2):reg, (d + 2):reg))
@@ -397,7 +405,7 @@ function _aggregate_hamiltonian_stats_weighted!(
         end
 
         if sm.terminal
-            wT = w[T_n]
+            wT = w[T_n]::T
             if !iszero(wT)
                 xT = tview(x, :, T_n)
                 BLAS.ger!(wT, xT, xT, tview(hs.term_zz, 1:d, 1:d))
