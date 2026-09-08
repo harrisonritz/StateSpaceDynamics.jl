@@ -462,6 +462,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `P0` now fails.
 
 ### Fixed
+
+- ELBO monotonicity assertions now scale their tolerance to the bound's own
+  magnitude rather than using a fixed `1e-6`. The sufficient statistics are
+  accumulated in parallel chunks, so summation order — and with it the last few
+  digits of every M-step — depends on the thread count. The result stays
+  deterministic for a given count (repeated fits agree bit for bit), but the
+  Gaussian+Poisson composite fit was monotone on one thread and dipped by ~6e-4
+  on two, purely from reassociation, which EM then amplified into a different
+  local optimum tens of nats away. The threshold was tighter than parallel
+  floating point can promise, not a symptom of a race. `SSDTest.elbo_monotone`
+  is the shared predicate; `test_em_monotone` takes `rtol` in place of `tol`.
+
 - A grouped (`depends_on`) SLDS with a **Poisson** emission threw
   `BoundsError` out of the first M-step, so no such fit could run at all. The
   grouped SLDS M-step read `cell_slot[_G_R]` before branching on the emission

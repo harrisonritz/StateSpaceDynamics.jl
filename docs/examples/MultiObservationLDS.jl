@@ -190,5 +190,5 @@ test_em_improves(elbos)  #src
 @test length(naive_lds.fit_bool) == 7  #src
 @test naive_lds.obs_dim == spk_dim + kin_dim  #src
 @test size(naive_lds.obs_model.C_kin) == (kin_dim, latent_dim)  #src
-@test all(diff(elbos) .>= -1e-6)  #src
+@test elbo_monotone(elbos)  #src
 @test isapprox(mean(exp.(naive_lds.obs_model.spk.d)), mean(exp.(d_spk)); rtol=0.4)  #src

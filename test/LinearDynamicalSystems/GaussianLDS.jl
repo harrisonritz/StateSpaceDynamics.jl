@@ -843,7 +843,7 @@ function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
         om2 = GaussianObservationModel(; C=copy(C), R=copy(R), d=copy(d))
         lds_fit = LinearDynamicalSystem(sm2, om2)
         elbos = fit!(lds_fit, y; max_iter=20, progress=false)
-        @test all(diff(elbos) .>= -1e-6)
+        @test elbo_monotone(elbos)
     end
     return nothing
 end

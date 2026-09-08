@@ -313,7 +313,7 @@ function test_multiobs_mixed_fit()
             ),
         )
         elbos = fit!(init, y; max_iter=30, progress=false)
-        @test all(diff(elbos) .>= -1e-6)
+        @test elbo_monotone(elbos)
         @test elbos[end] > elbos[1]
 
         # The Gaussian member's noise scale is recovered.
