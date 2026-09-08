@@ -475,6 +475,7 @@ using SSDTest
             test_slds_hamiltonian_validation()
             test_slds_hamiltonian_prior_vs_optimal_data()
             test_slds_hamiltonian_rand()
+            test_slds_hamiltonian_noise_version_lookup()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

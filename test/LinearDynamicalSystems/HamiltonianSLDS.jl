@@ -581,3 +581,51 @@ function test_slds_hamiltonian_rand()
     @test all(isfinite, xm) && all(isfinite, ym)
     return nothing
 end
+
+"""Each noise version's inverse must come from the model that *uses* it.
+
+The M-step context caches `Σ⁻¹` per noise version. Looking that model up by the
+structural version instead is wrong whenever the two groupings differ — with
+`:structure` tied and the noise untied, every version would take state 1's `Σ` —
+and it is wrong silently, since the objective stays finite and EM still moves.
+
+The assumption behind that lookup holds for `depends_on`, where cells sharing a
+parameter alias one array, and fails for an `SLDS`, whose discrete states hold
+separate arrays. This checks the case where the two groupings disagree."""
+function test_slds_hamiltonian_noise_version_lookup()
+    p = 4
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
+    sms = [lds.state_model for lds in slds.LDSs]
+    # Distinct noise per state, so taking the wrong one is visible.
+    copyto!(sms[1].Σ, Matrix(0.05I, 4, 4))
+    copyto!(sms[2].Σ, Matrix(0.40I, 4, 4))
+    for sm in sms
+        refresh!(sm)
+    end
+
+    ys = hslds_data(p, 30, 4)
+    _, tfs, data, _ = ham_estep_stats(
+        LinearDynamicalSystem(sms[1], slds.LDSs[1].obs_model), ys
+    )
+    sufs = map(1:2) do k
+        hs = SSD._initialize_td_sufficient_statistics(Float64, slds.LDSs[k], data.tsteps)
+        SSD._aggregate_hamiltonian_stats_weighted!(
+            hs, tfs, slds.LDSs[k], data, [fill(0.5, 30) for _ in 1:4]
+        )
+        SSD._fill_mixed_blocks!(hs, sms[k])
+        hs
+    end
+
+    # `:structure` shares every structural block; the noise stays per state.
+    slots = SSD._ham_block_slots([:structure], 2)
+    @test all(all(isone, sl) for sl in slots)          # structure is shared
+    ctx = SSD._HamMStepCtx(sufs, sms, slots, [1, 2], false)
+    @test ctx.nq == 2
+
+    # Version `k`'s inverse is state `k`'s, not state 1's twice over.
+    for k in 1:2
+        @test ctx.Sinv[k] ≈ inv(Matrix(sms[k].Σ)) atol = 1e-10
+    end
+    @test !(ctx.Sinv[1] ≈ ctx.Sinv[2])
+    return nothing
+end

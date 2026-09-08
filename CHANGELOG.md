@@ -462,6 +462,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A noise version's `Σ⁻¹` in the inverse-LQR M-step was looked up by the
+  *structural* version rather than by the model that uses it. Wherever the two
+  groupings differ — `tied_params = [:structure]` with the noise left free, or a
+  `depends_on` whose structural and noise groups are not the same partition —
+  every noise version took the first model's `Σ`, so the objective was
+  mis-specified while staying finite and letting EM keep moving. The assumption
+  behind it holds for `depends_on`, where cells sharing a parameter alias one
+  array, and fails for an `SLDS`, whose discrete states hold separate arrays.
+
+
 - ELBO monotonicity assertions now scale their tolerance to the bound's own
   magnitude rather than using a fixed `1e-6`. The sufficient statistics are
   accumulated in parallel chunks, so summation order — and with it the last few
