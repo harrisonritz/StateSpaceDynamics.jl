@@ -276,6 +276,24 @@ function test_slds_hamiltonian_tied()
     @test a.A != b.A
     @test a.Qc[1] != b.Qc[1]
 
+    #=
+    A partial tie must leave the per-state blocks alone, not merely refit them
+    afterwards. With `Qc` frozen there is no second pass to hide a clobber, so a
+    shared pass that broadcast the whole structural block would show up here as
+    both states ending on state 1's cost.
+    =#
+    frozen = hslds_model(costs; p=p)
+    for lds in frozen.LDSs
+        lds.state_model.fit_flags = HamiltonianFitFlags(; Qc=false)
+    end
+    q1 = copy(frozen.LDSs[1].state_model.Qc[1])
+    q2 = copy(frozen.LDSs[2].state_model.Qc[1])
+    @test q1 != q2
+    fit!(frozen, ys; max_iter=6, progress=false, rng=StableRNG(7), tied_params=[:A, :S])
+    @test frozen.LDSs[1].state_model.Qc[1] == q1      # frozen exactly
+    @test frozen.LDSs[2].state_model.Qc[1] == q2      # and *not* overwritten by q1
+    @test frozen.LDSs[1].state_model.A == frozen.LDSs[2].state_model.A
+
     # A name this model has no parameter for is still rejected.
     bad = hslds_model(costs; p=p)
     @test_throws ArgumentError fit!(

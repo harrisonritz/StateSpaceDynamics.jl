@@ -2849,7 +2849,10 @@ copied out — the same reason `_broadcast_tied_params!` exists for the Gaussian
 path.
 """
 function _ham_broadcast_tied!(
-    sms::AbstractVector, ab_slots::AbstractVector{Int}, q_slots::AbstractVector{Int}
+    sms::AbstractVector,
+    ab_slots::AbstractVector{Int},
+    q_slots::AbstractVector{Int};
+    blocks::NTuple{6,Bool}=ntuple(_ -> true, 6),
 )
     for v in unique(ab_slots)
         members = findall(isequal(v), ab_slots)
@@ -2857,15 +2860,24 @@ function _ham_broadcast_tied!(
         src = sms[first(members)]
         for k in members[2:end]
             dst = sms[k]
-            copyto!(dst.A, src.A)
-            copyto!(dst.S, src.S)
-            for j in eachindex(src.Qc)
-                copyto!(dst.Qc[j], src.Qc[j])
+            #=
+            Only the blocks this pass actually shared. A partial tie runs the
+            shared pass with every state in one version, so copying the whole
+            structural block here would overwrite the per-state blocks that pass
+            deliberately left alone — invisible when a later pass refits them,
+            but not when the user has frozen them.
+            =#
+            blocks[1] && copyto!(dst.A, src.A)
+            blocks[2] && copyto!(dst.S, src.S)
+            if blocks[3]
+                for j in eachindex(src.Qc)
+                    copyto!(dst.Qc[j], src.Qc[j])
+                end
             end
-            copyto!(dst.h, src.h)
-            size(src.Bu, 2) > 0 && copyto!(dst.Bu, src.Bu)
-            size(src.Gref, 2) > 0 && copyto!(dst.Gref, src.Gref)
-            copyto!(dst.hf, src.hf)
+            blocks[4] && copyto!(dst.h, src.h)
+            blocks[5] && size(src.Bu, 2) > 0 && copyto!(dst.Bu, src.Bu)
+            blocks[6] && size(src.Gref, 2) > 0 && copyto!(dst.Gref, src.Gref)
+            all(blocks) && copyto!(dst.hf, src.hf)
         end
     end
     for v in unique(q_slots)

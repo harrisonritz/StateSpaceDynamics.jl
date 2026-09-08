@@ -184,7 +184,22 @@ function _ham_structure_phases!(
     n = length(sms)
     keep = _ham_tied_blocks(tied)
     q_slots = (:noise in tied) ? ones(Int, n) : collect(1:n)
+    #=
+    One packed parameter layout covers every inverse-LQR state, so which blocks
+    are free has to be the same for all of them — as with `fit_bool` upstream,
+    a state whose freezes were quietly replaced by another's is worse than an
+    error.
+    =#
     base = sms[1].fit_flags
+    for (k, sm) in enumerate(sms)
+        sm.fit_flags == base || throw(
+            ArgumentError(
+                "discrete state $k has different `fit_flags` from state 1. " *
+                "Inverse-LQR states share one packed parameter layout in the " *
+                "M-step, so they must freeze the same blocks.",
+            ),
+        )
+    end
 
     if !fit_structure || all(keep) || !any(keep)
         # One pass: every free block has the same shared/per-state status.
@@ -203,7 +218,7 @@ function _ham_structure_phases!(
         ab = ones(Int, n)
         ctx = _HamMStepCtx(sufs, sms, ab, q_slots, false; flags=shared)
         _ham_structure_mstep!(ctx, true, iters)
-        _ham_broadcast_tied!(sms, ab, q_slots)
+        _ham_broadcast_tied!(sms, ab, q_slots; blocks=keep)
         for sm in sms
             refresh!(sm)
         end
@@ -214,11 +229,12 @@ function _ham_structure_phases!(
         ctx = _HamMStepCtx(sufs, sms, ab, q_slots, fit_noise; flags=private)
         _ham_structure_mstep!(ctx, true, iters)
         fit_noise && _ham_noise_mstep!(ctx)
-        _ham_broadcast_tied!(sms, ab, q_slots)
+        # `ab` is the identity here, so only a `:noise` tie broadcasts anything.
+        _ham_broadcast_tied!(sms, ab, q_slots; blocks=ntuple(_ -> false, 6))
     elseif fit_noise
         ctx = _HamMStepCtx(sufs, sms, collect(1:n), q_slots, true)
         _ham_noise_mstep!(ctx)
-        _ham_broadcast_tied!(sms, collect(1:n), q_slots)
+        _ham_broadcast_tied!(sms, collect(1:n), q_slots; blocks=ntuple(_ -> false, 6))
     end
     return nothing
 end
