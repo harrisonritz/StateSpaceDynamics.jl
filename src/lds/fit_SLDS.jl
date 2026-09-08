@@ -99,6 +99,7 @@ function Random.rand(
         _slds_cell_sldss(slds, grp)[grp.trial_cell[1]].LDSs
     end
 
+    _warn_slds_unstable_rollout(slds, Ti)
     state_params = [_extract_state_params(lds.state_model) for lds in regimes]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
 
@@ -142,6 +143,7 @@ function Random.rand(
     Per-trial, per-regime parameter sets: one entry per trial, each a vector
     over regimes. Ungrouped, every trial shares the same vector.
     =#
+    _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on)
     if grp === nothing
         base_state = [_extract_state_params(lds.state_model) for lds in slds.LDSs]
@@ -1260,6 +1262,7 @@ function smooth(
     (K × ΣT) log-likelihood matrix the forward-backward pass reads.
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    _prepare_slds!(slds, data.tsteps)
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -2163,7 +2166,7 @@ function _slds_trial_elbo(
     ux_trial::Union{Nothing,AbstractMatrix{T}},
     uy_trial::Union{Nothing,AbstractMatrix{T},NamedTuple},
     lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     K = length(slds.LDSs)
     Tsteps = t2 - t1 + 1
     w = view(fb_storage.γ, :, t1:t2)  # K × Tsteps
@@ -2542,6 +2545,16 @@ function _broadcast_tied_params!(
 ) where {T<:Real}
     isempty(tied) && return nothing
     src = slds.LDSs[1]
+    #=
+    A Hamiltonian state's tie is applied inside its own M-step, which fits the
+    shared version jointly from every state that uses it and copies it out. Its
+    parameters are not columns of a regression, so the packing below has nothing
+    to pack.
+    =#
+    if src.state_model isa HamiltonianStateModel
+        _broadcast_tied_obs!(src.obs_model, slds, tied)
+        return nothing
+    end
     D = src.latent_dim
     dyn_cols = _tied_dyn_cols(tied, D, src.ux_dim)
 
@@ -2768,6 +2781,149 @@ LBFGS routine) are re-estimated alongside `Aₖ` / `Cₖ`.
 `depends_on` path uses, then `_broadcast_tied_params!` copies the fitted value
 into the other regimes. `x0`/`P0` are tied unconditionally, below.
 """
+#=============================================================================
+Hamiltonian (inverse-LQR) discrete states.
+
+The SLDS machinery is state-model agnostic almost everywhere — `state_loglikelihood!`
+and `_transition_residual!` are dispatched, and `compute_smooth_constants!` fills
+the same `SmoothConstants` slots from either model — so what needs its own path
+is the M-step, where a symplectic parameterization is not a linear regression.
+
+The optimizer itself needs nothing new: `_HamMStepCtx` reads only the statistics,
+and its Jacobian coefficient `N_ab` comes from `sum(hs.nk)`, which the weighted
+aggregator fills with the *effective* count `n̄ₖ = Σ γₖ(t)`. So the weighted
+generalized M-step is the unweighted one fed weighted statistics.
+=============================================================================#
+
+"""
+    _slds_aggregate_weighted!(suf, tfs, lds, data, weights, sws)
+
+One discrete state's responsibility-weighted sufficient statistics.
+
+A Hamiltonian state needs two passes: the base regression/emission blocks that
+every model shares, and the mixed-coordinate blocks its own M-step consumes.
+"""
+function _slds_aggregate_weighted!(
+    suf,
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    weights::AbstractVector{<:AbstractVector{T}},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    return _aggregate_td_suff_stats_weighted!(suf, tfs, lds, data, weights, sws)
+end
+
+"""
+    _ham_broadcast_tied!(sms, ab_slots, q_slots)
+
+Copy each tied parameter version onto every discrete state that shares it.
+
+`_ham_writeback!` writes one state model per *version*, which is enough for
+`depends_on`, where variants sharing a parameter alias the same array. An
+`SLDS`'s discrete states hold separate arrays, so the fitted value has to be
+copied out — the same reason `_broadcast_tied_params!` exists for the Gaussian
+path.
+"""
+function _ham_broadcast_tied!(
+    sms::AbstractVector, ab_slots::AbstractVector{Int}, q_slots::AbstractVector{Int}
+)
+    for v in unique(ab_slots)
+        members = findall(isequal(v), ab_slots)
+        length(members) > 1 || continue
+        src = sms[first(members)]
+        for k in members[2:end]
+            dst = sms[k]
+            copyto!(dst.A, src.A)
+            copyto!(dst.S, src.S)
+            for j in eachindex(src.Qc)
+                copyto!(dst.Qc[j], src.Qc[j])
+            end
+            copyto!(dst.h, src.h)
+            size(src.Bu, 2) > 0 && copyto!(dst.Bu, src.Bu)
+            size(src.Gref, 2) > 0 && copyto!(dst.Gref, src.Gref)
+            copyto!(dst.hf, src.hf)
+        end
+    end
+    for v in unique(q_slots)
+        members = findall(isequal(v), q_slots)
+        length(members) > 1 || continue
+        src = sms[first(members)]
+        for k in members[2:end]
+            copyto!(sms[k].Σ, src.Σ)
+            copyto!(sms[k].Σf, src.Σf)
+        end
+    end
+    return nothing
+end
+
+"""
+    _slds_init_suf(suf)
+
+The statistics carrying the initial-state blocks (`init_xy`, `init_yy`,
+`init_n`). A Hamiltonian model keeps them on its base statistics, alongside the
+mixed-coordinate blocks its own M-step uses.
+"""
+_slds_init_suf(suf) = suf
+
+"""
+    _ham_tied_slots(tied, n) -> (ab_slots, q_slots)
+
+Which discrete states share a structural / noise parameter version.
+
+An inverse-LQR model's structural parameters are not separable columns of a
+regression but coordinates of one constrained parameterization, fitted together
+by L-BFGS on a profiled objective. So `:structure` ties the whole joint block
+`(A, S, Qc, h, Bu, Gref)`, and `:Q` ties the mixed-coordinate noise `Σ`.
+
+`:A` / `:S` / `:Qc` are not accepted — the shared `tied_params` validator rejects
+them with the list of names this model does take. That is deliberate rather than
+an omission: `tied = [:A, :S]`, a shared plant with a per-state cost, is a
+genuinely different and more useful model than a fully shared block, and quietly
+promoting it to the latter would fit something the caller did not ask for.
+
+States sharing a version pool their statistics into it, so a tie is fitted
+jointly from every state that uses it rather than fitted on one and copied.
+"""
+function _ham_tied_slots(tied::AbstractVector{Symbol}, n::Int)
+    structure = :structure in tied
+    noise = :noise in tied
+    return (structure ? ones(Int, n) : collect(1:n), noise ? ones(Int, n) : collect(1:n))
+end
+
+"""
+    _slds_state_mstep!(ldss, sf_state, tied, slots_q, sws, bufs, K, D, ux_dim) -> slots_ab
+
+The dynamics half of the SLDS M-step, dispatched on the state model.
+
+A Gaussian state is the conjugate `[A b B]` regression followed by the `Q`
+update. A Hamiltonian state is the constrained generalized M-step — L-BFGS on
+the symplectic parameterization, accepted only when it improves — then the
+closed-form noise update, which is what the ungrouped Hamiltonian fit does.
+
+Returns the regression-version slots the caller uses for its `Q` bookkeeping.
+Hamiltonian states do their own noise update here, so they return the identity
+and the caller skips `_grouped_update_Q!`.
+"""
+function _slds_state_mstep!(
+    ldss::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
+    sf_state::AbstractVector,
+    tied::AbstractVector{Symbol},
+    slots_q::AbstractVector{Int},
+    sws::SmoothWorkspace{T},
+    bufs,
+    K::Int,
+    D::Int,
+    ux_dim::Int,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    dyn_cols = _tied_dyn_cols(tied, D, ux_dim)
+    slots_ab = _slds_update_regression!(
+        _DynBlock(), ldss, sf_state, dyn_cols, slots_q, sws, bufs, K
+    )
+    _grouped_update_Q!(ldss, sf_state, slots_q, slots_ab, sws)
+    return slots_ab
+end
+
 function mstep!(
     slds::SLDS{T,S,O},
     tfs::TrialFilterSmooth{T},
@@ -2841,7 +2997,7 @@ function mstep!(
             hi = min(i * chunk, K)
             lo > hi && return nothing
             for k in lo:hi
-                _aggregate_td_suff_stats_weighted!(
+                _slds_aggregate_weighted!(
                     sf[k], tfs, slds.LDSs[k], dat, weights_of(k), sws_pool[i]
                 )
             end
@@ -2851,7 +3007,6 @@ function mstep!(
 
     lds1 = slds.LDSs[1]
     D = lds1.latent_dim
-    dyn_cols = _tied_dyn_cols(tied, D, lds1.ux_dim)
 
     slots_q = _tie_slots(:Q in tied, K)
     #=
@@ -2867,13 +3022,27 @@ function mstep!(
     how many distinct regressions there are, so a partial tie counts as `K` of
     them — every regime's stacked matrix differs, in its free columns.
     =#
-    slots_ab = _slds_update_regression!(
-        _DynBlock(), slds.LDSs, sf_state, dyn_cols, slots_q, sws, _state_bufs(bf), K
+    _slds_state_mstep!(
+        slds.LDSs, sf_state, tied, slots_q, sws, _state_bufs(bf), K, D, lds1.ux_dim
     )
-    _grouped_update_Q!(slds.LDSs, sf_state, slots_q, slots_ab, sws)
 
+    #=
+    The emission half reads the base regression blocks. A Hamiltonian model wraps
+    those alongside its own mixed-coordinate blocks, so unwrap before handing them
+    over; `_obs_suf` is the identity for every other model.
+    =#
     _slds_obs_mstep!(
-        lds1.obs_model, slds, sf, tfs, dat, tied, sws, bf, K, weights_of; ntasks=ntasks
+        lds1.obs_model,
+        slds,
+        _obs_sufs(sf),
+        tfs,
+        dat,
+        tied,
+        sws,
+        bf,
+        K,
+        weights_of;
+        ntasks=ntasks,
     )
 
     _broadcast_tied_params!(slds, tied)
@@ -2884,14 +3053,15 @@ function mstep!(
     over modes of the per-mode init stats the aggregator already computed.
     =#
     D = slds.LDSs[1].latent_dim
-    suf = sf_state[1]
+    suf = _slds_init_suf(sf_state[1])
     init_xy = zeros(T, 1, D)
     init_yy = zeros(T, D, D)
     init_n = zero(T)
     for k in 1:K
-        init_xy .+= sf_state[k].init_xy
-        init_yy .+= sf_state[k].init_yy[]
-        init_n += T(sf_state[k].init_n)
+        base_k = _slds_init_suf(sf_state[k])
+        init_xy .+= base_k.init_xy
+        init_yy .+= base_k.init_yy[]
+        init_n += T(base_k.init_n)
     end
     copyto!(suf.init_xy, init_xy)
     suf.init_yy[] = init_yy
@@ -3259,6 +3429,7 @@ function fit!(
     LDSs[1] covers all regimes). Absent ux/uy become zero-row matrices.
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    _prepare_slds!(slds, data.tsteps)
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy

@@ -574,6 +574,74 @@ function validate_SLDS(slds::SLDS)
         validate_LDS(lds)
     end
 
+    _validate_slds_state_models(slds.LDSs[1].state_model, slds)
+    return nothing
+end
+
+"""
+    _validate_slds_state_models(state_model, slds)
+
+State-model-specific constraints on an `SLDS`'s discrete states, beyond the
+shared dimension checks. A no-op for a model with none.
+"""
+_validate_slds_state_models(::AbstractStateModel, ::SLDS) = nothing
+
+#=
+An inverse-LQR discrete state carries a single cost: in a switching model the
+*discrete state* is the cost epoch, inferred rather than specified, so a
+deterministic schedule inside a state would be a second, competing notion of
+regime nested inside the first. `terminal` and `observe_costate` describe the
+trial and the emission rather than the state, so they must agree across states —
+a factor that applies in some states and not others, or a readout mask only half
+the states impose, is a modelling accident rather than a choice.
+=#
+function _validate_slds_state_models(::HamiltonianStateModel, slds::SLDS)
+    #=
+    `terminal` and `observe_costate` are compared among the *inverse-LQR* states
+    only. A `:free` state has no costate, so neither means anything for it: it
+    carries no terminal condition, and `_costate_range` already returns `nothing`
+    for it whatever its flag says. In a mixed model the readout mask is therefore
+    set by the LQR states, and a free state simply reads whatever coordinates are
+    left to it.
+    =#
+    ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
+    ref === nothing && return nothing
+    sm1 = slds.LDSs[ref].state_model
+    for (i, lds) in enumerate(slds.LDSs)
+        sm = lds.state_model
+        _is_free(sm) && continue
+        if _nregimes(sm) != 1
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: an inverse-LQR discrete state carries one cost matrix, " *
+                    "but this one has $(_nregimes(sm)). In a switching model the " *
+                    "discrete state *is* the cost epoch — inferred instead of given " *
+                    "by `schedule` — so add a discrete state per cost rather than a " *
+                    "schedule within one.",
+                ),
+            )
+        end
+        if sm.terminal != sm1.terminal
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `terminal` is $(sm.terminal) but LDSs[1] has " *
+                    "$(sm1.terminal). The terminal condition is a property of the " *
+                    "trial horizon, not of which state is active, so every discrete " *
+                    "state must agree.",
+                ),
+            )
+        end
+        if sm.observe_costate != sm1.observe_costate
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `observe_costate` is $(sm.observe_costate) but LDSs[1] " *
+                    "has $(sm1.observe_costate). The costate readout mask is applied " *
+                    "to the emission, so states that disagree would zero and fit the " *
+                    "same columns in turn.",
+                ),
+            )
+        end
+    end
     return nothing
 end
 

@@ -66,6 +66,7 @@ include("lds/trial_elbo.jl")                        # ELBO split by trial
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
 include("lds/hamiltonian_mstep.jl")
+include("lds/slds_hamiltonian.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_hamiltonian.jl")
 
 # Errors/Exceptions/Validations

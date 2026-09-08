@@ -310,6 +310,122 @@ println("distance to target at the end: ",
 # model whose cost varies by condition but whose noise does not is fitted jointly
 # rather than condition by condition.
 
+# ## Switching between control problems
+#
+# `cost_schedule` says *when* the cost changes. An `SLDS` instead **infers** it:
+# the discrete state becomes the cost epoch, and the responsibilities say which
+# control problem was active at each moment.
+#
+# Every discrete state shares one continuous latent path — the SLDS forms each
+# timestep as the responsibility-weighted mixture ``\ell_t = \sum_k w_{kt}
+# \ell_t^{(k)}(x)`` — so they all carry the same ``2n``-dimensional ``z``. The
+# switching is over parameters, never over dimension. Because the discrete state
+# *is* the epoch, each member carries a single `Qc`.
+
+# The data so far came from a *single* control problem, so start by giving the
+# switching model something to find: half the trials under a cheap cost, half
+# under an expensive one, sharing the plant.
+#
+# Draw them from each model's **own prior** with `rand`, not from `simulate_lqr`.
+# That matters more than it looks, and the reason is worth stating before the
+# result — see the note below.
+
+sw_T = 16
+Q_lo = [0.20 0.03; 0.03 0.15]
+Q_hi = [1.20 0.00; 0.00 0.90]
+gen(Q) = HamiltonianStateModel(copy(A), copy(S), copy(Q), copy(Σ); P0=Matrix(0.2I, 4, 4))
+sw_state(Q) = LinearDynamicalSystem(
+    gen(Q),
+    GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
+)
+ys_sw = vcat(
+    [rand(StableRNG(50 + i), sw_state(Q_lo), sw_T)[2] for i in 1:30],
+    [rand(StableRNG(90 + i), sw_state(Q_hi), sw_T)[2] for i in 1:30],
+)
+
+slds = SLDS(;
+    A=[0.92 0.08; 0.08 0.92],
+    πₖ=[0.5, 0.5],
+    LDSs=[sw_state([0.15 0.0; 0.0 0.15]), sw_state([1.5 0.0; 0.0 1.5])],
+)
+sw_elbos = fit!(slds, ys_sw; max_iter=30, progress=false, rng=StableRNG(7))
+println("switching ELBO: ", round(sw_elbos[1]; digits=1), " -> ",
+        round(sw_elbos[end]; digits=1))
+println("tr(Qc) recovered: ",
+        round.(sort([tr(l.state_model.Qc[1]) for l in slds.LDSs]); digits=3),
+        "   truth: ", round.([tr(Q_lo), tr(Q_hi)]; digits=3))
+
+# Each state stays a genuine control problem: the M-step optimizes the symplectic
+# parameterization, not a free transition.
+
+println("symplectic defects: ",
+        [round(symplectic_defect(l.state_model); sigdigits=2) for l in slds.LDSs])
+
+# The responsibilities say which problem was active. Switching here is between
+# trials, so they should be near-constant within a trial and differ across halves.
+
+γ = smooth(slds, ys_sw).γ
+mean_resp(trial) = sum(γ[trial][1, :]) / size(γ[trial], 2)
+lo_resp = sum(mean_resp(n) for n in 1:30) / 30
+hi_resp = sum(mean_resp(n) for n in 31:60) / 30
+println("mean γ₁: cheap-cost trials ", round(lo_resp; digits=3),
+        "   expensive ", round(hi_resp; digits=3))
+
+# !!! note "Read the converged bound, not the `fit!` trace"
+#     The trace `fit!` returns is the bound at whatever `q` the inner variational
+#     alternation reached that iteration — `smoothing_iters` of it, one by
+#     default. For an inverse-LQR state that inner problem is unusually hard,
+#     because a symplectic transition's forward flow is unstable and the shared
+#     `q(x)` converges slowly, so the trace sits well below `elbo(slds, y)` at the
+#     same parameters (~170 nats here, against ~0.5 for a Gaussian `SLDS`) and can
+#     dip while the parameters are still improving. Use `elbo(slds, y)`, or raise
+#     `smoothing_iters`, when you want to check that a fit is making progress.
+
+# !!! warning "Switching cannot be recovered from exactly-optimal trajectories"
+#     `simulate_lqr` follows the *stable manifold* — the Riccati solution — while
+#     the model's own density is the forward symplectic chain with process noise,
+#     which is divergent. They are different distributions, and this model is a
+#     relaxation of exact optimality rather than a description of it.
+#
+#     For a single fit that mismatch costs some accuracy. For *switching* it is
+#     fatal, because the responsibilities compare two such densities and the
+#     mismatch is larger than the cost signal. Measured on the models above:
+#     classifying trials by `loglik(cheap) − loglik(expensive)` is **100%**
+#     correct on data drawn from the models' own priors, and **50%** — chance —
+#     on `simulate_lqr` data, where the margin comes out positive for the cheap
+#     model even on expensive-cost trials.
+#
+#     So: infer switching from real behaviour or from `rand`, and treat
+#     `simulate_lqr` as the tool for *displaying* an optimal trajectory, not for
+#     generating data to recover switching from.
+
+# `tied_params` shares a parameter version across states. For an inverse-LQR
+# model the structural parameters are coordinates of one constrained
+# parameterization rather than separable regression columns, so `:structure` ties
+# the whole block ``(A, S, Q_c, h, B_u, G_r)`` and `:noise` ties ``\Sigma``.
+# Naming `:A` alone is an error rather than a whole-block tie — a shared plant
+# with a per-state cost is a different model, and answering it with a fully
+# shared block would fit something you did not ask for.
+#
+# A discrete state can also drop the LQR constraint entirely. `free_state_model`
+# gives an unconstrained ``2n \times 2n`` transition, so one model can mix "the
+# subject was optimizing" with "the subject was doing something else":
+#
+# ```julia
+# mixed = SLDS(; A = P, πₖ = π,
+#              LDSs = [sw_state(Qc),                                   # optimizing
+#                      LinearDynamicalSystem(free_state_model(M, Σ),   # not
+#                                            obs_model)])
+# ```
+#
+# !!! note "The inferred switch time is biased toward smoothness"
+#     The costate is the gradient of the cost-to-go, so it *jumps* when the cost
+#     changes. The structured variational approximation weights the two costate
+#     equations by the responsibilities rather than allowing the jump, so
+#     transitions are smoothed over and the recovered switch time carries a bias
+#     whose sign depends on the cost contrast. That is inherent to the
+#     approximation, not to the fit.
+
 # ## Poisson observations
 #
 # Nothing above is specific to Gaussian emissions — spike counts work the same
@@ -339,3 +455,7 @@ using SSDTest  #src
 @test all(iszero, plds.obs_model.C[:, (plant_dim + 1):end])  #src
 @test norm(z_track[1:plant_dim, end] .- target) < 0.05  #src
 @test size(z_track) == (4, tsteps)  #src
+@test sw_elbos[end] > sw_elbos[1]  #src
+@test all(symplectic_defect(l.state_model) < 1e-9 for l in slds.LDSs)  #src
+@test length(slds.LDSs) == 2  #src
+@test abs(lo_resp - hi_resp) > 0.25  #src

@@ -8,6 +8,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Switching inverse LQR.** An `SLDS` can now switch between inverse-LQR
+  dynamics, so the discrete state selects *which control problem* generated the
+  behaviour — different plants, different costs, or both.
+
+  ```julia
+  slds = SLDS(; A=P, πₖ=π, LDSs=[LinearDynamicalSystem(HamiltonianStateModel(A, S, Q₁, Σ), obs),
+                                 LinearDynamicalSystem(HamiltonianStateModel(A, S, Q₂, Σ), obs)])
+  fit!(slds, y; tied_params=[:structure])     # one shared control problem
+  ```
+
+  * **The latent dimension is uniform, and cannot be otherwise.** The `SLDS`
+    uses a structured variational approximation with a *single* continuous latent
+    path — each timestep is the responsibility-weighted mixture
+    `ℓₜ = Σₖ wₖₜ ℓₜ⁽ᵏ⁾(x)` — so every discrete state reads and writes the same
+    `2n`-dimensional `z = [x; λ]`. Differently-sized states are not expressible,
+    and would not be wanted even if they were: their per-timestep log densities
+    are against different base measures, so the responsibilities would drift
+    toward whichever state has more dimensions to spend.
+  * **The discrete state replaces the cost schedule.** In a switching model the
+    state *is* the cost epoch, inferred rather than specified, so a member with
+    more than one `Qc` is rejected — that would be a second notion of regime
+    nested inside the first. `terminal` and `observe_costate` describe the trial
+    and the emission rather than the state, so they must agree across states.
+  * **`:free` mode**, via `free_state_model(M, Σ)`: a state whose `2n × 2n`
+    transition is unconstrained rather than symplectic, so a switching model can
+    mix plain linear dynamics with LQR dynamics. `SLDS` stores one concrete
+    state-model type per discrete state, which is why a "plain dynamics" state
+    has to *be* a `HamiltonianStateModel`; `mode` is a runtime field rather than
+    a type parameter for the same reason. Its M-step is the ordinary conjugate
+    regression, and it reproduces a `GaussianStateModel` to machine precision —
+    matching log-likelihood, identical smoothed means, and EM that tracks
+    iterate for iterate.
+  * **The weighted generalized M-step** is the unweighted one fed
+    responsibility-weighted statistics: `_HamMStepCtx` reads only the statistics,
+    and its Jacobian coefficient comes from `Σ nk`, which the weighted aggregator
+    fills with the *effective* count `n̄ₖ = Σ γₖ(t)`. Scaling `−n̄ₖ log|det Aₖ|`
+    by a raw timestep count instead would stay monotone under balanced
+    responsibilities and break once they separate.
+  * **Tying.** `:structure` shares the whole joint block `(A, S, Qc, h, Bu, Gref)`
+    across discrete states, `:noise` shares `Σ`. Tied states pool their statistics
+    into one version, so a tie is fitted jointly rather than fitted once and
+    copied. `:A` / `:S` / `:Qc` are rejected rather than promoted to the whole
+    block: a shared plant with a per-state cost is a different and more useful
+    model, and it is not yet supported.
+  * A `HamiltonianStateModel(latent_dim)` constructor taking the **total**
+    dimension — the spelling a switching model wants — throwing on an odd value,
+    and `plant_dim` for the other half of the contract.
+
+  A `K = 1` switching model reproduces the ungrouped inverse-LQR fit, and an
+  all-`:free` one reproduces a Gaussian `SLDS`; both are tested, and the first is
+  what caught the costate readout leaking back through the switching emission
+  M-step.
+
 - **Inverse LQR through Hamiltonian latents.** A new state model,
   `HamiltonianStateModel`, whose latent state is the LQR state-costate pair
   `z = [x; λ]` and whose transition is constrained to the symplectic form a

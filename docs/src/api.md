@@ -48,7 +48,26 @@ lqr_riccati_sequence
 closed_loop_dynamics
 simulate_lqr
 rescale_costate!
+free_state_model
+plant_dim
 ```
+
+### Switching
+
+An [`SLDS`](@ref) whose discrete states are inverse-LQR models switches between
+control problems: the state selects which plant and cost generated the
+transition. Every discrete state shares one continuous latent path, so they all
+carry the same `2n`-dimensional `z = [x; λ]` — the switching is over parameters,
+not over dimension. In a switching model the discrete state *is* the cost epoch,
+inferred rather than given by `schedule`, so each member carries a single cost.
+
+`free_state_model` supplies a state whose transition is unconstrained rather than
+symplectic, which is how a switching model mixes plain linear dynamics with LQR
+dynamics under one concrete state-model type.
+
+`tied_params = [:structure]` shares the joint block `(A, S, Qc, h, Bu, Gref)`
+across discrete states and `[:noise]` shares `Σ`, each fitted jointly from the
+states that use it.
 
 ## Priors
 

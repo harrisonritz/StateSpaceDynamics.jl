@@ -464,6 +464,18 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/HamiltonianSLDS.jl")
+        @testset "Switching inverse-LQR (Hamiltonian SLDS)" begin
+            test_slds_hamiltonian_matches_lds()
+            test_slds_hamiltonian_monotone()
+            test_slds_free_matches_gaussian_slds()
+            test_slds_mixed_free_and_lqr()
+            test_slds_hamiltonian_tied()
+            test_slds_hamiltonian_terminal()
+            test_slds_hamiltonian_validation()
+            test_slds_hamiltonian_prior_vs_optimal_data()
+        end
+
         include("LinearDynamicalSystems/Stitching.jl")
         @testset "Stitching (per-session obs_dim)" begin
             @testset "Shapes and validation" begin
