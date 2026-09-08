@@ -2838,61 +2838,6 @@ function _slds_aggregate_weighted!(
 end
 
 """
-    _ham_broadcast_tied!(sms, ab_slots, q_slots)
-
-Copy each tied parameter version onto every discrete state that shares it.
-
-`_ham_writeback!` writes one state model per *version*, which is enough for
-`depends_on`, where variants sharing a parameter alias the same array. An
-`SLDS`'s discrete states hold separate arrays, so the fitted value has to be
-copied out — the same reason `_broadcast_tied_params!` exists for the Gaussian
-path.
-"""
-function _ham_broadcast_tied!(
-    sms::AbstractVector,
-    ab_slots::AbstractVector{Int},
-    q_slots::AbstractVector{Int};
-    blocks::NTuple{6,Bool}=ntuple(_ -> true, 6),
-)
-    for v in unique(ab_slots)
-        members = findall(isequal(v), ab_slots)
-        length(members) > 1 || continue
-        src = sms[first(members)]
-        for k in members[2:end]
-            dst = sms[k]
-            #=
-            Only the blocks this pass actually shared. A partial tie runs the
-            shared pass with every state in one version, so copying the whole
-            structural block here would overwrite the per-state blocks that pass
-            deliberately left alone — invisible when a later pass refits them,
-            but not when the user has frozen them.
-            =#
-            blocks[1] && copyto!(dst.A, src.A)
-            blocks[2] && copyto!(dst.S, src.S)
-            if blocks[3]
-                for j in eachindex(src.Qc)
-                    copyto!(dst.Qc[j], src.Qc[j])
-                end
-            end
-            blocks[4] && copyto!(dst.h, src.h)
-            blocks[5] && size(src.Bu, 2) > 0 && copyto!(dst.Bu, src.Bu)
-            blocks[6] && size(src.Gref, 2) > 0 && copyto!(dst.Gref, src.Gref)
-            all(blocks) && copyto!(dst.hf, src.hf)
-        end
-    end
-    for v in unique(q_slots)
-        members = findall(isequal(v), q_slots)
-        length(members) > 1 || continue
-        src = sms[first(members)]
-        for k in members[2:end]
-            copyto!(sms[k].Σ, src.Σ)
-            copyto!(sms[k].Σf, src.Σf)
-        end
-    end
-    return nothing
-end
-
-"""
     _slds_init_suf(suf)
 
 The statistics carrying the initial-state blocks (`init_xy`, `init_yy`,
@@ -2900,30 +2845,6 @@ The statistics carrying the initial-state blocks (`init_xy`, `init_yy`,
 mixed-coordinate blocks its own M-step uses.
 """
 _slds_init_suf(suf) = suf
-
-"""
-    _ham_tied_slots(tied, n) -> (ab_slots, q_slots)
-
-Which discrete states share a structural / noise parameter version.
-
-An inverse-LQR model's structural parameters are not separable columns of a
-regression but coordinates of one constrained parameterization, fitted together
-by L-BFGS on a profiled objective. So `:structure` ties the whole joint block
-`(A, S, Qc, h, Bu, Gref)`, and `:Q` ties the mixed-coordinate noise `Σ`.
-
-Individual blocks may also be named — `tied = [:A, :S]` shares the plant and
-fits a cost per discrete state — which `_ham_structure_phases!` runs as two
-alternating passes rather than one joint optimization. This helper reports only
-the whole-block case; the phase runner reads `tied` itself.
-
-States sharing a version pool their statistics into it, so a tie is fitted
-jointly from every state that uses it rather than fitted on one and copied.
-"""
-function _ham_tied_slots(tied::AbstractVector{Symbol}, n::Int)
-    structure = :structure in tied
-    noise = :noise in tied
-    return (structure ? ones(Int, n) : collect(1:n), noise ? ones(Int, n) : collect(1:n))
-end
 
 """
     _slds_state_mstep!(ldss, sf_state, tied, slots_q, sws, bufs, K, D, ux_dim) -> slots_ab

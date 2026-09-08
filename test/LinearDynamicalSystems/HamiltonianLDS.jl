@@ -130,17 +130,18 @@ function ham_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     pk = SSD._HamPack(sm)
     n, d, m, K = pk.n, pk.d, pk.m, pk.K
     grab(r, fallback) = isempty(r) ? V.(fallback) : θ[r]
-    A = reshape(grab(pk.iA, vec(sm.A)), n, n)
-    Sm = reshape(grab(pk.iS, vec(sm.S)), n, n)
+    blk(b) = SSD._ham_blk(pk, b, 1)
+    A = reshape(grab(blk(SSD._HB_A), vec(sm.A)), n, n)
+    Sm = reshape(grab(blk(SSD._HB_S), vec(sm.S)), n, n)
     Sm = (Sm + transpose(Sm)) / 2
     Qs = map(1:K) do k
-        q = reshape(grab(pk.iQ[k], vec(sm.Qc[k])), n, n)
+        q = reshape(grab(SSD._ham_blk_q(pk, 1, k), vec(sm.Qc[k])), n, n)
         return (q + transpose(q)) / 2
     end
-    h = grab(pk.ih, sm.h)
-    Bu = m > 0 ? reshape(grab(pk.iB, vec(sm.Bu)), d, m) : zeros(V, d, 0)
-    Gr = m > 0 ? reshape(grab(pk.iG, vec(sm.Gref)), n, m) : zeros(V, n, 0)
-    hf = grab(pk.ihf, sm.hf)
+    h = grab(blk(SSD._HB_H), sm.h)
+    Bu = m > 0 ? reshape(grab(blk(SSD._HB_B), vec(sm.Bu)), d, m) : zeros(V, d, 0)
+    Gr = m > 0 ? reshape(grab(blk(SSD._HB_G), vec(sm.Gref)), n, m) : zeros(V, n, 0)
+    hf = grab(blk(SSD._HB_F), sm.hf)
 
     R = V.(hs.Yv)
     for k in 1:K
@@ -652,10 +653,10 @@ function test_hamiltonian_mstep_objective_and_gradient()
     g = similar(θ)
     SSD._ham_fg!(g, θ, ctx)
     n = SSD._plant_dim(sm)
-    gS = reshape(g[ctx.pack.iS], n, n)
+    gS = reshape(g[SSD._ham_blk(ctx.pack, SSD._HB_S, 1)], n, n)
     @test gS ≈ transpose(gS) atol = 1e-14
     for k in 1:SSD._nregimes(sm)
-        gQ = reshape(g[ctx.pack.iQ[k]], n, n)
+        gQ = reshape(g[SSD._ham_blk_q(ctx.pack, 1, k)], n, n)
         @test gQ ≈ transpose(gQ) atol = 1e-14
     end
     return nothing
@@ -676,7 +677,8 @@ function test_hamiltonian_mstep_freezing()
     frozen = SSD._HamPack(sm)
     # Freezing shrinks the problem rather than projecting its solution.
     @test frozen.np == full - 2 * n * n
-    @test isempty(frozen.iA) && isempty(frozen.iS)
+    @test isempty(SSD._ham_blk(frozen, SSD._HB_A, 1)) &&
+        isempty(SSD._ham_blk(frozen, SSD._HB_S, 1))
     ctx = SSD._HamMStepCtx(hs, sm, true)
     θ = zeros(ctx.pack.np)
     SSD._ham_pack!(θ, ctx)

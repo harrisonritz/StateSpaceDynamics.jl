@@ -294,6 +294,33 @@ function test_slds_hamiltonian_tied()
     @test frozen.LDSs[2].state_model.Qc[1] == q2      # and *not* overwritten by q1
     @test frozen.LDSs[1].state_model.A == frozen.LDSs[2].state_model.A
 
+    #=
+    A frozen block is never shared, whatever the tie asks for. Freezing means
+    "keep your own value", so under `:structure` — which does ask to share the
+    cost — two states with different frozen costs must each keep theirs, and the
+    objective must score each against its own rather than against state 1's.
+    =#
+    frozen_struct = hslds_model(costs; p=p)
+    for lds in frozen_struct.LDSs
+        lds.state_model.fit_flags = HamiltonianFitFlags(; Qc=false)
+    end
+    fq1 = copy(frozen_struct.LDSs[1].state_model.Qc[1])
+    fq2 = copy(frozen_struct.LDSs[2].state_model.Qc[1])
+    @test fq1 != fq2
+    before_fs = elbo(frozen_struct, ys)
+    fit!(
+        frozen_struct,
+        ys;
+        max_iter=6,
+        progress=false,
+        rng=StableRNG(7),
+        tied_params=[:structure],
+    )
+    @test frozen_struct.LDSs[1].state_model.Qc[1] == fq1
+    @test frozen_struct.LDSs[2].state_model.Qc[1] == fq2
+    @test frozen_struct.LDSs[1].state_model.A == frozen_struct.LDSs[2].state_model.A
+    @test elbo(frozen_struct, ys) > before_fs
+
     # A name this model has no parameter for is still rejected.
     bad = hslds_model(costs; p=p)
     @test_throws ArgumentError fit!(

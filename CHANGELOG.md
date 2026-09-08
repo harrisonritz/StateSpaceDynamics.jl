@@ -51,12 +51,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     the individual blocks may also be named: `tied_params = [:A, :S]` is one
     plant with a cost per discrete state, which is what a switching inverse-LQR
     model is usually for. Tied states pool their statistics into one version, so
-    a tie is fitted jointly rather than fitted once and copied. A partial tie
-    cannot be a single constrained optimization — each parameter version owns a
-    full copy of every block — so it runs as two alternating passes, shared-free
-    then per-state-free; each accepts only an improvement, so the composition is
-    still non-decreasing, at the cost of converging more slowly than a joint step
-    would.
+    a tie is fitted jointly rather than fitted once and copied — including a
+    partial tie, which is one L-BFGS solve rather than an alternation, because
+    the parameter vector is laid out block-major and a shared block simply has
+    one copy instead of one per state. A frozen block is never shared whatever
+    the tie asks for, since freezing means "keep your own value".
   * A `HamiltonianStateModel(latent_dim)` constructor taking the **total**
     dimension — the spelling a switching model wants — throwing on an odd value,
     and `plant_dim` for the other half of the contract.

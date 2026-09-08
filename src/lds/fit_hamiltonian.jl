@@ -778,7 +778,13 @@ function _grouped_state_mstep!(
     _grouped_update_x0!(ldss, base, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, base, slots[_G_P0], slots[_G_X0], sws)
 
-    sms = _ham_slot_models(ldss, slots[_G_AB])
+    #=
+    One model per *cell*, matching `sufs`. Cells sharing a parameter version
+    alias the same arrays under `depends_on`, so writing the fitted value to each
+    cell's model writes the shared array — which is what makes a `depends_on`
+    group and an `SLDS` tie the same operation in the M-step.
+    =#
+    sms = [lds.state_model for lds in ldss]
     for (c, suf) in enumerate(sufs)
         _fill_mixed_blocks!(suf, ldss[c].state_model)
     end
@@ -791,22 +797,6 @@ function _grouped_state_mstep!(
         refresh!(lds.state_model)
     end
     return nothing
-end
-
-"""
-    _ham_slot_models(ldss, ab_slots) -> Vector
-
-One representative state model per structural version. Any cell using that
-version will do: cells sharing a version share the arrays by reference, so
-writing through the representative updates them all.
-"""
-function _ham_slot_models(ldss::AbstractVector, ab_slots::AbstractVector{Int})
-    nab = maximum(ab_slots)
-    sms = Vector{typeof(ldss[1].state_model)}(undef, nab)
-    for (c, a) in enumerate(ab_slots)
-        isassigned(sms, a) || (sms[a] = ldss[c].state_model)
-    end
-    return sms
 end
 
 """

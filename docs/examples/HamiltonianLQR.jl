@@ -406,11 +406,14 @@ println("mean γ₁: cheap-cost trials ", round(lo_resp; digits=3),
 #
 # Individual blocks may also be named, and that is usually the model you want:
 # `tied_params = [:A, :S]` shares the plant and fits a cost per discrete state —
-# one body, one task, a goal that changes. A partial tie cannot be a single
-# constrained optimization here, since each parameter version owns a full copy of
-# every block, so it runs as two alternating passes (shared free, then per-state
-# free). Each accepts only an improvement, so the bound still cannot decrease; it
-# converges more slowly than a joint step would.
+# one body, one task, a goal that changes. That is a single joint optimization,
+# not an alternation: the parameter vector is laid out block-major, so a shared
+# block simply has one copy instead of one per state, and the whole structural
+# problem is still one L-BFGS solve.
+#
+# A frozen block is never shared, whatever the tie asks for — freezing means
+# "keep your own value", so a state whose `Qc` is frozen keeps its own even under
+# `:structure`.
 
 shared_plant = SLDS(;
     A=[0.92 0.08; 0.08 0.92],
