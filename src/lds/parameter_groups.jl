@@ -117,7 +117,26 @@ function _param_group(::HamiltonianStateModel, name::Symbol)
     return nothing
 end
 
-_valid_param_names(::HamiltonianStateModel) = ":x0, :P0, :structure, :noise"
+function _valid_param_names(::HamiltonianStateModel)
+    return ":x0, :P0, :structure, :noise (and, for `tied_params` only, the " *
+           "individual structural blocks :A, :S, :Qc, :h, :Bu, :Gref)"
+end
+
+"""
+    _extra_tied_names(state_model) -> Tuple{Vararg{Symbol}}
+
+Names valid for `tied_params` but not for `depends_on`.
+
+An inverse-LQR model's structural block is estimated jointly, so `depends_on`
+offers it under the single name `:structure` — splitting it there would mean one
+variant per group of *every* structural parameter regardless of which was named.
+`tied_params` is different: sharing `A` and `S` across discrete states while
+fitting `Qc` per state is a genuinely useful model, and the switching M-step can
+deliver it by alternating over the two subsets. So the individual blocks are
+accepted there, and only there.
+"""
+_extra_tied_names(::AbstractStateModel) = ()
+_extra_tied_names(::HamiltonianStateModel) = (:A, :S, :Qc, :h, :Bu, :Gref)
 
 #=
 One member each: `:structure` and `:noise` *are* their groups, so a `depends_on`
@@ -321,7 +340,9 @@ function _resolve_tied_params(
                 "of type $(typeof(name))",
             ),
         )
-        if _param_group(sm, name) === nothing && _param_group(om, name) === nothing
+        if _param_group(sm, name) === nothing &&
+            _param_group(om, name) === nothing &&
+            !(name in _extra_tied_names(sm))
             throw(
                 ArgumentError(
                     "tied_params: `:$name` is not a parameter of this model; valid " *

@@ -46,12 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     fills with the *effective* count `n̄ₖ = Σ γₖ(t)`. Scaling `−n̄ₖ log|det Aₖ|`
     by a raw timestep count instead would stay monotone under balanced
     responsibilities and break once they separate.
-  * **Tying.** `:structure` shares the whole joint block `(A, S, Qc, h, Bu, Gref)`
-    across discrete states, `:noise` shares `Σ`. Tied states pool their statistics
-    into one version, so a tie is fitted jointly rather than fitted once and
-    copied. `:A` / `:S` / `:Qc` are rejected rather than promoted to the whole
-    block: a shared plant with a per-state cost is a different and more useful
-    model, and it is not yet supported.
+  * **Tying**, including partial. `:structure` shares the whole joint block
+    `(A, S, Qc, h, Bu, Gref)` across discrete states and `:noise` shares `Σ`, but
+    the individual blocks may also be named: `tied_params = [:A, :S]` is one
+    plant with a cost per discrete state, which is what a switching inverse-LQR
+    model is usually for. Tied states pool their statistics into one version, so
+    a tie is fitted jointly rather than fitted once and copied. A partial tie
+    cannot be a single constrained optimization — each parameter version owns a
+    full copy of every block — so it runs as two alternating passes, shared-free
+    then per-state-free; each accepts only an improvement, so the composition is
+    still non-decreasing, at the cost of converging more slowly than a joint step
+    would.
   * A `HamiltonianStateModel(latent_dim)` constructor taking the **total**
     dimension — the spelling a switching model wants — throwing on an odd value,
     and `plant_dim` for the other half of the contract.

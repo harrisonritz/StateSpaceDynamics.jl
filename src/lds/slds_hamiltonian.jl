@@ -110,6 +110,119 @@ end
 
 _slds_init_suf(hs::HamiltonianSufficientStatistics) = hs.base
 
+#=
+Partial ties: sharing some structural parameters across discrete states while
+fitting the rest per state.
+
+`tied = [:A, :S]` — one plant, a cost per state — is the configuration a
+switching inverse-LQR model is usually for, and it is not expressible as a single
+constrained optimization here, because `_HamMStepCtx` gives each *version* a full
+copy of every block. Rather than re-layout the packed parameter vector (which the
+ungrouped fit and `depends_on` also run through), it is run as two passes:
+
+  1. the shared blocks free and tied across states, the per-state ones frozen;
+  2. the per-state blocks free and untied, the shared ones frozen.
+
+Each pass is the existing generalized M-step on a subset of coordinates, and each
+accepts only an improvement, so the composition is still non-decreasing — an
+alternating maximization rather than a joint one. It converges more slowly than a
+joint step would, and that is the price of not disturbing the shared machinery.
+=#
+
+const _HAM_STRUCT_BLOCKS = (:A, :S, :Qc, :h, :Bu, :Gref)
+
+"""
+    _ham_tied_blocks(tied) -> NTuple{6,Bool}
+
+Which structural blocks `tied` shares, in `_HAM_STRUCT_BLOCKS` order.
+`:structure` shares all of them; naming blocks individually shares exactly those.
+"""
+function _ham_tied_blocks(tied::AbstractVector{Symbol})
+    :structure in tied && return ntuple(_ -> true, length(_HAM_STRUCT_BLOCKS))
+    return ntuple(i -> _HAM_STRUCT_BLOCKS[i] in tied, length(_HAM_STRUCT_BLOCKS))
+end
+
+"""
+    _ham_flags_subset(base, keep, want) -> HamiltonianFitFlags
+
+`base` restricted to the blocks whose shared/per-state status matches `want`.
+A block the model already freezes stays frozen either way.
+"""
+function _ham_flags_subset(base::HamiltonianFitFlags, keep::NTuple{6,Bool}, want::Bool)
+    on(i, flag) = flag && (keep[i] == want)
+    return HamiltonianFitFlags(;
+        A=on(1, base.A),
+        S=on(2, base.S),
+        Qc=on(3, base.Qc),
+        h=on(4, base.h),
+        Bu=on(5, base.Bu),
+        Gref=on(6, base.Gref),
+        # `hf` rides with the terminal factor and is treated as a per-state block.
+        terminal=base.terminal && !want,
+    )
+end
+
+function _ham_any_free(f::HamiltonianFitFlags)
+    return f.A || f.S || f.Qc || f.h || f.Bu || f.Gref || f.terminal
+end
+
+"""
+    _ham_structure_phases!(sms, sufs, tied, fit_structure, iters)
+
+Run the structural M-step over the discrete states, honouring whichever blocks
+`tied` shares. A whole-block tie (or no tie at all) is one pass; a partial tie is
+the two passes described above.
+"""
+function _ham_structure_phases!(
+    sms::AbstractVector,
+    sufs::AbstractVector,
+    tied::AbstractVector{Symbol},
+    fit_structure::Bool,
+    fit_noise::Bool,
+    iters::Int,
+)
+    n = length(sms)
+    keep = _ham_tied_blocks(tied)
+    q_slots = (:noise in tied) ? ones(Int, n) : collect(1:n)
+    base = sms[1].fit_flags
+
+    if !fit_structure || all(keep) || !any(keep)
+        # One pass: every free block has the same shared/per-state status.
+        ab_slots = all(keep) ? ones(Int, n) : collect(1:n)
+        ctx = _HamMStepCtx(sufs, sms, ab_slots, q_slots, fit_noise)
+        _ham_structure_mstep!(ctx, fit_structure, iters)
+        fit_noise && _ham_noise_mstep!(ctx)
+        _ham_broadcast_tied!(sms, ab_slots, q_slots)
+        return nothing
+    end
+
+    shared = _ham_flags_subset(base, keep, true)
+    private = _ham_flags_subset(base, keep, false)
+
+    if _ham_any_free(shared)
+        ab = ones(Int, n)
+        ctx = _HamMStepCtx(sufs, sms, ab, q_slots, false; flags=shared)
+        _ham_structure_mstep!(ctx, true, iters)
+        _ham_broadcast_tied!(sms, ab, q_slots)
+        for sm in sms
+            refresh!(sm)
+        end
+    end
+
+    if _ham_any_free(private)
+        ab = collect(1:n)
+        ctx = _HamMStepCtx(sufs, sms, ab, q_slots, fit_noise; flags=private)
+        _ham_structure_mstep!(ctx, true, iters)
+        fit_noise && _ham_noise_mstep!(ctx)
+        _ham_broadcast_tied!(sms, ab, q_slots)
+    elseif fit_noise
+        ctx = _HamMStepCtx(sufs, sms, collect(1:n), q_slots, true)
+        _ham_noise_mstep!(ctx)
+        _ham_broadcast_tied!(sms, collect(1:n), q_slots)
+    end
+    return nothing
+end
+
 function _slds_state_mstep!(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
     sf_state::AbstractVector,
@@ -161,13 +274,14 @@ function _slds_state_mstep!(
                     ),
                 )
         end
-        ab_slots, q_slots = _ham_tied_slots(tied, length(lqr))
-        ctx = _HamMStepCtx(
-            [sf_state[k] for k in lqr], [sms[k] for k in lqr], ab_slots, q_slots, fit_noise
+        _ham_structure_phases!(
+            sms[lqr],
+            [sf_state[k] for k in lqr],
+            tied,
+            fit_structure,
+            fit_noise,
+            maximum(sms[k].mstep_iters for k in lqr),
         )
-        _ham_structure_mstep!(ctx, fit_structure, maximum(sms[k].mstep_iters for k in lqr))
-        fit_noise && _ham_noise_mstep!(ctx)
-        _ham_broadcast_tied!(sms[lqr], ab_slots, q_slots)
         for k in lqr
             refresh!(sms[k])
         end

@@ -403,9 +403,25 @@ println("mean γ₁: cheap-cost trials ", round(lo_resp; digits=3),
 # model the structural parameters are coordinates of one constrained
 # parameterization rather than separable regression columns, so `:structure` ties
 # the whole block ``(A, S, Q_c, h, B_u, G_r)`` and `:noise` ties ``\Sigma``.
-# Naming `:A` alone is an error rather than a whole-block tie — a shared plant
-# with a per-state cost is a different model, and answering it with a fully
-# shared block would fit something you did not ask for.
+#
+# Individual blocks may also be named, and that is usually the model you want:
+# `tied_params = [:A, :S]` shares the plant and fits a cost per discrete state —
+# one body, one task, a goal that changes. A partial tie cannot be a single
+# constrained optimization here, since each parameter version owns a full copy of
+# every block, so it runs as two alternating passes (shared free, then per-state
+# free). Each accepts only an improvement, so the bound still cannot decrease; it
+# converges more slowly than a joint step would.
+
+shared_plant = SLDS(;
+    A=[0.92 0.08; 0.08 0.92],
+    πₖ=[0.5, 0.5],
+    LDSs=[sw_state([0.15 0.0; 0.0 0.15]), sw_state([1.5 0.0; 0.0 1.5])],
+)
+fit!(shared_plant, ys_sw; max_iter=15, progress=false, rng=StableRNG(7),
+     tied_params=[:A, :S])
+sp1, sp2 = shared_plant.LDSs[1].state_model, shared_plant.LDSs[2].state_model
+println("plant shared: ", sp1.A == sp2.A, "   cost differs: ", sp1.Qc[1] != sp2.Qc[1])
+
 #
 # A discrete state can also drop the LQR constraint entirely. `free_state_model`
 # gives an unconstrained ``2n \times 2n`` transition, so one model can mix "the
@@ -458,4 +474,6 @@ using SSDTest  #src
 @test sw_elbos[end] > sw_elbos[1]  #src
 @test all(symplectic_defect(l.state_model) < 1e-9 for l in slds.LDSs)  #src
 @test length(slds.LDSs) == 2  #src
+@test sp1.A == sp2.A  #src
+@test sp1.Qc[1] != sp2.Qc[1]  #src
 @test abs(lo_resp - hi_resp) > 0.25  #src

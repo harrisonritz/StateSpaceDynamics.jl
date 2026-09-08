@@ -546,11 +546,20 @@ struct _HamPack
 end
 
 function _HamPack(sm::HamiltonianStateModel)
+    return _HamPack(sm, sm.fit_flags)
+end
+
+#=
+Taking the flags explicitly rather than off the model is what lets a *partial*
+tie work: sharing `A` and `S` across discrete states while fitting `Qc` per state
+is run as two passes over the same machinery, one with only the shared blocks
+free and one with only the per-state blocks free. See `_ham_partial_tie_mstep!`.
+=#
+function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags)
     n = _plant_dim(sm)
     d = 2n
     m = size(sm.Bu, 2)
     K = _nregimes(sm)
-    f = sm.fit_flags
     widths = Int[
         f.A ? n * n : 0,
         f.S ? n * n : 0,
@@ -719,12 +728,13 @@ function _HamMStepCtx(
     sms::AbstractVector,
     ab_slots::AbstractVector{Int},
     q_slots::AbstractVector{Int},
-    profile::Bool,
+    profile::Bool;
+    flags::Union{Nothing,HamiltonianFitFlags}=nothing,
 )
     units = _ham_units(sufs, ab_slots, q_slots)
     sm1 = sms[1]
     T = eltype(sm1.Σ)
-    pack = _HamPack(sm1)
+    pack = _HamPack(sm1, flags === nothing ? sm1.fit_flags : flags)
     n, d, m, K = pack.n, pack.d, pack.m, pack.K
     reg = d + 1 + m
     nab = maximum(ab_slots)

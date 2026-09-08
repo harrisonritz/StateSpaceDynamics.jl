@@ -67,7 +67,8 @@ dynamics under one concrete state-model type.
 
 `tied_params = [:structure]` shares the joint block `(A, S, Qc, h, Bu, Gref)`
 across discrete states and `[:noise]` shares `Σ`, each fitted jointly from the
-states that use it.
+states that use it. Individual blocks may also be named — `[:A, :S]` is one plant
+with a cost per discrete state, the usual reason to switch at all.
 
 ## Priors
 

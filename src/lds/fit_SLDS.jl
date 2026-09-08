@@ -2498,6 +2498,29 @@ function _validate_tied_params(
 )
     isempty(tied) && return nothing
     D = lds.latent_dim
+    #=
+    An inverse-LQR state's structural parameters are not columns of a regression,
+    so the partial-column reasoning below does not apply to them. A tie there is
+    over named blocks, run as an alternation by `_ham_structure_phases!`, and the
+    emission half is validated on its own terms.
+    =#
+    if lds.state_model isa HamiltonianStateModel
+        obs_h = _tied_obs_cols(tied, D, lds.uy_dim)
+        if !isempty(obs_h) &&
+            length(obs_h) < D + 1 + lds.uy_dim &&
+            lds.obs_model isa PoissonObservationModel
+            throw(
+                ArgumentError(
+                    "tied_params: a Poisson emission's `[C d D]` is fitted by LBFGS, " *
+                    "not from sufficient statistics, so there is no way to share part " *
+                    "of it across regimes. Tie " *
+                    "$(_join_names(_group_members(lds.obs_model, :C))) together, or " *
+                    "none of them.",
+                ),
+            )
+        end
+        return nothing
+    end
     dyn = _tied_dyn_cols(tied, D, lds.ux_dim)
     obs = _tied_obs_cols(tied, D, lds.uy_dim)
     partial_dyn = !isempty(dyn) && length(dyn) < D + 1 + lds.ux_dim
@@ -2876,11 +2899,10 @@ regression but coordinates of one constrained parameterization, fitted together
 by L-BFGS on a profiled objective. So `:structure` ties the whole joint block
 `(A, S, Qc, h, Bu, Gref)`, and `:Q` ties the mixed-coordinate noise `Σ`.
 
-`:A` / `:S` / `:Qc` are not accepted — the shared `tied_params` validator rejects
-them with the list of names this model does take. That is deliberate rather than
-an omission: `tied = [:A, :S]`, a shared plant with a per-state cost, is a
-genuinely different and more useful model than a fully shared block, and quietly
-promoting it to the latter would fit something the caller did not ask for.
+Individual blocks may also be named — `tied = [:A, :S]` shares the plant and
+fits a cost per discrete state — which `_ham_structure_phases!` runs as two
+alternating passes rather than one joint optimization. This helper reports only
+the whole-block case; the phase runner reads `tied` itself.
 
 States sharing a version pool their statistics into it, so a tie is fitted
 jointly from every state that uses it rather than fitted on one and copied.

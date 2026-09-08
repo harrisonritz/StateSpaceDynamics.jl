@@ -216,59 +216,74 @@ function test_slds_mixed_free_and_lqr()
     return nothing
 end
 
-"""`tied` shares a parameter version across discrete states. An inverse-LQR
-model's structural parameters are coordinates of one constrained
-parameterization rather than separable regression columns, so `:structure` ties
-`(A, S, Qc, h, Bu, Gref)` as a unit, fitted jointly from the states that use it.
-Naming an individual one is rejected rather than promoted to the whole block —
-`[:A, :S]` is a different and more useful model than a fully shared block, and
-answering it with the latter would fit something the caller did not ask for."""
+"""`tied` shares a parameter version across discrete states.
+
+`:structure` shares the whole joint block `(A, S, Qc, h, Bu, Gref)` and `:noise`
+shares `Σ`. Individual blocks may also be named, which is the configuration a
+switching inverse-LQR model is usually for: `[:A, :S]` is one plant with a cost
+per discrete state. A partial tie cannot be one constrained optimization here —
+each parameter *version* owns a full copy of every block — so it runs as two
+alternating passes, shared-free then per-state-free. Each accepts only an
+improvement, so the composition still cannot decrease the bound.
+
+Shared parameters must come out bit-identical, not merely close: a tie is one
+fitted value copied out, and `≈` would pass on two independent fits that happened
+to land nearby."""
 function test_slds_hamiltonian_tied()
     p, tsteps, ntrials = 4, 35, 5
-    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
     ys = hslds_data(p, tsteps, ntrials)
-    elbos = _trace(
-        fit!(
-            slds,
-            ys;
-            max_iter=10,
-            rng=StableRNG(7),
-            progress=false,
-            tied_params=[:structure],
-        ),
-    )
+    costs = [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]
+    function fit_tied(names)
+        slds = hslds_model(costs; p=p)
+        before = elbo(slds, ys)
+        fit!(slds, ys; max_iter=10, progress=false, rng=StableRNG(7), tied_params=names)
+        return (slds, before, elbo(slds, ys))
+    end
 
-    @test minimum(diff(elbos)) > -1e-6
+    # Whole-block tie.
+    slds, before, after = fit_tied([:structure])
     a, b = slds.LDSs[1].state_model, slds.LDSs[2].state_model
-    # Shared exactly, not merely close: a tie is one fitted value copied out.
     @test a.A == b.A
     @test a.S == b.S
     @test a.Qc[1] == b.Qc[1]
+    @test a.Σ != b.Σ                     # noise untied
+    @test after > before
+
+    # The headline partial tie: one plant, a cost per discrete state.
+    slds, before, after = fit_tied([:A, :S])
+    a, b = slds.LDSs[1].state_model, slds.LDSs[2].state_model
+    @test a.A == b.A
+    @test a.S == b.S
+    @test a.Qc[1] != b.Qc[1]             # the cost is what switches
+    @test after > before
+    @test symplectic_defect(a) < 1e-10
+    @test symplectic_defect(b) < 1e-10
+
+    # A single named block shares exactly that block.
+    slds, _, _ = fit_tied([:A])
+    a, b = slds.LDSs[1].state_model, slds.LDSs[2].state_model
+    @test a.A == b.A
+    @test a.S != b.S
+    @test a.Qc[1] != b.Qc[1]
 
     # Tying the noise as well.
-    slds2 = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
-    fit!(
-        slds2,
-        ys;
-        max_iter=6,
-        progress=false,
-        rng=StableRNG(7),
-        tied_params=[:structure, :noise],
+    slds, _, _ = fit_tied([:structure, :noise])
+    @test slds.LDSs[1].state_model.Σ == slds.LDSs[2].state_model.Σ
+
+    # Untied, everything is free to differ — otherwise the tests above are vacuous.
+    slds, _, _ = fit_tied(Symbol[])
+    a, b = slds.LDSs[1].state_model, slds.LDSs[2].state_model
+    @test a.A != b.A
+    @test a.Qc[1] != b.Qc[1]
+
+    # A name this model has no parameter for is still rejected.
+    bad = hslds_model(costs; p=p)
+    @test_throws ArgumentError fit!(
+        bad, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=[:Q]
     )
-    @test slds2.LDSs[1].state_model.Σ == slds2.LDSs[2].state_model.Σ
-
-    # Naming part of the block is an error, not a silent whole-block tie.
-    slds_err = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
-    for names in ([:A], [:A, :S], [:Qc], [:Q])
-        @test_throws ArgumentError fit!(
-            slds_err, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=names
-        )
-    end
-
-    # Untied, the two states are free to differ — otherwise the test above is vacuous.
-    slds3 = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
-    fit!(slds3, ys; max_iter=10, progress=false, rng=StableRNG(7))
-    @test slds3.LDSs[1].state_model.Qc[1] != slds3.LDSs[2].state_model.Qc[1]
+    @test_throws ArgumentError fit!(
+        bad, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=[:nonsense]
+    )
     return nothing
 end
 
@@ -450,5 +465,74 @@ function test_slds_hamiltonian_prior_vs_optimal_data()
         ],
     )
     @test prior_acc - opt_acc > 0.25
+    return nothing
+end
+
+"""`rand` must draw from the model it is given, which for an inverse-LQR state
+means the *forward* chain `z_{t+1} = M z_t + G h + ε`, `ε ~ N(0, GΣGᵀ)` — the
+density inference uses, not the optimal trajectory `simulate_lqr` follows.
+
+Checked against the parameters directly rather than through a fit: the discrete
+path's empirical transitions must match `slds.A`, and regressing `z_{t+1}` on
+`z_t` within the timesteps each state was active must return that state's cached
+`M`. The transition *into* `t` is drawn under `z_t`, so a pair `(t-1, t)` belongs
+to state `z_t` — an off-by-one there would return a blend of the two."""
+function test_slds_hamiltonian_rand()
+    p, tsteps, ntrials = 4, 40, 60
+    # Persistent switching, so each state gets long runs to regress within.
+    slds = hslds_model([[0.20 0.03; 0.03 0.15], [1.20 0.0; 0.0 0.90]]; p=p, stay=0.97)
+    zs, xs, ys = rand(StableRNG(21), slds, fill(tsteps, ntrials))
+
+    @test length(zs) == ntrials
+    @test all(size(x) == (4, tsteps) for x in xs)
+    @test all(all(isfinite, x) for x in xs)
+    @test all(all(isfinite, y) for y in ys)
+    @test Set(reduce(vcat, zs)) == Set([1, 2])          # both states are visited
+
+    # Empirical transition matrix of the sampled discrete path.
+    counts = zeros(2, 2)
+    for z in zs, t in 2:tsteps
+        counts[z[t - 1], z[t]] += 1
+    end
+    emp = counts ./ sum(counts; dims=2)
+    @test maximum(abs, emp .- slds.A) < 0.05
+
+    #=
+    Within each state, least squares on the pairs it generated must return that
+    state's forward transition. `[z_t; 1]` as the regressor absorbs `G h`.
+    =#
+    d = 4
+    for k in 1:2
+        W = zeros(d + 1, d + 1)
+        V = zeros(d + 1, d)
+        for (z, x) in zip(zs, xs), t in 2:tsteps
+            z[t] == k || continue
+            w = vcat(x[:, t - 1], 1.0)
+            W .+= w * w'
+            V .+= w * x[:, t]'
+        end
+        Θ = (W \ V)'                                    # d × (d+1)
+        @test maximum(abs, Θ[:, 1:d] .- slds.LDSs[k].state_model.cache.M[1]) < 0.05
+    end
+
+    # A mixed free/LQR model samples too — the free state rolls its own matrix.
+    C = randn(StableRNG(11), p, 4)
+    C[:, 3:4] .= 0
+    mixed = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[
+            hslds_state([0.25 0.04; 0.04 0.18]; p=p, C=C),
+            LinearDynamicalSystem(
+                free_state_model(
+                    0.9 * Matrix(1.0I, 4, 4), Matrix(0.1I, 4, 4); P0=Matrix(0.3I, 4, 4)
+                ),
+                GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p)),
+            ),
+        ],
+    )
+    zm, xm, ym = rand(StableRNG(5), mixed, 25)
+    @test size(xm) == (4, 25)
+    @test all(isfinite, xm) && all(isfinite, ym)
     return nothing
 end
