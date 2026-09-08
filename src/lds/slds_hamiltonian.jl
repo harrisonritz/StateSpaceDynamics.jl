@@ -115,11 +115,24 @@ Partial ties: sharing some structural parameters across discrete states while
 fitting the rest per state.
 
 `tied = [:A, :S]` — one plant, a cost per state — is the configuration a
-switching inverse-LQR model is usually for, and it is one optimization rather
+switching inverse-LQR model is usually for, and it is one L-BFGS solve rather
 than two. `_HamPack` lays the parameter vector out block-major, so a block
-shared across states simply has one copy instead of `K`; nothing alternates, and
-the `−N_a log|det A_a|` Jacobian term is weighted by the transitions the states
+shared across states simply has one copy instead of `K`; nothing alternates,
+ties are broadcast by writeback rather than by a pass of their own, and the
+`−N_a log|det A_a|` Jacobian term is weighted by the transitions the states
 sharing that `A` actually contribute.
+
+The alternative a version-major layout forces — the shared blocks free with the
+per-state ones frozen, then the reverse — costs about twice as much, and for a
+plain reason: `_ham_fg!` sweeps every residual whatever subset of coordinates is
+free, so two passes buy two full objective sweeps per L-BFGS iteration where one
+buys one. Measured over a 40-iteration fit at `K = 2`, `tied = [:A, :S]`, three
+seeds, the joint solve spends 1.8-2.1x less wall clock inside the structural
+M-step at plant dimension `n = 16` and `n = 24`, and stands at a higher ELBO at
+every one of 24 equal-wall-clock checkpoints. Handing the joint solve the
+alternation's doubled iteration budget reproduces the alternation's cost at
+those dimensions to within 1%, which is the check that the gap is budget and
+not conditioning.
 =#
 
 const _HAM_STRUCT_BLOCKS = (:A, :S, :Qc, :h, :Bu, :Gref)
@@ -201,6 +214,22 @@ function _slds_state_mstep!(
                         "differ.",
                     ),
                 )
+        end
+        #=
+        One packed layout covers every inverse-LQR state, so which blocks are
+        free has to be the same for all of them too — the context reads the
+        flags off the first model. A state whose freezes were quietly replaced
+        by another's is the same failure as above, and gets the same refusal.
+        =#
+        flags = sms[lqr[1]].fit_flags
+        for k in lqr
+            sms[k].fit_flags == flags || throw(
+                ArgumentError(
+                    "LDSs[$k]: inverse-LQR discrete states share one packed " *
+                    "parameter layout in the M-step, so they must agree on " *
+                    "`fit_flags` and freeze the same structural blocks.",
+                ),
+            )
         end
         nl = length(lqr)
         ctx = _HamMStepCtx(

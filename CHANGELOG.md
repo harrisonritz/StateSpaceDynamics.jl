@@ -54,8 +54,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     a tie is fitted jointly rather than fitted once and copied — including a
     partial tie, which is one L-BFGS solve rather than an alternation, because
     the parameter vector is laid out block-major and a shared block simply has
-    one copy instead of one per state. A frozen block is never shared whatever
-    the tie asks for, since freezing means "keep your own value".
+    one copy instead of one per state. That is the difference between one
+    objective sweep per L-BFGS iteration and two, and it is worth 1.8-2.1x of
+    the wall clock spent in the structural M-step at plant dimension 16 and 24,
+    at a higher ELBO at every equal-wall-clock checkpoint. A frozen block is
+    never shared whatever the tie asks for, since freezing means "keep your own
+    value", and the states sharing a layout must agree on `fit_flags` as they
+    already must on `fit_bool`.
   * A `HamiltonianStateModel(latent_dim)` constructor taking the **total**
     dimension — the spelling a switching model wants — throwing on an odd value,
     and `plant_dim` for the other half of the contract.

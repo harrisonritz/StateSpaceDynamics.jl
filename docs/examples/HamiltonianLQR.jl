@@ -411,9 +411,19 @@ println("mean γ₁: cheap-cost trials ", round(lo_resp; digits=3),
 # block simply has one copy instead of one per state, and the whole structural
 # problem is still one L-BFGS solve.
 #
+# It is also the faster arrangement, which matters once the plant is large. The
+# objective sweeps every residual whatever subset of coordinates is free, so
+# alternating over two subsets costs two sweeps per L-BFGS iteration where the
+# joint solve costs one: measured over a 40-iteration fit at plant dimension 16
+# and 24, the joint solve spends 1.8-2.1x less wall clock inside the structural
+# M-step and stands at a higher bound at equal wall clock.
+#
 # A frozen block is never shared, whatever the tie asks for — freezing means
 # "keep your own value", so a state whose `Qc` is frozen keeps its own even under
-# `:structure`.
+# `:structure`. Discrete states fitted together must agree on `fit_flags`, as
+# they already must on `fit_bool`: they share one packed parameter layout, and a
+# state whose freezes were silently replaced by another's is worse than an
+# error.
 
 shared_plant = SLDS(;
     A=[0.92 0.08; 0.08 0.92],

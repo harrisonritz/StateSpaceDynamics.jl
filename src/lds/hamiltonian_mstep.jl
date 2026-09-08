@@ -831,10 +831,14 @@ function _HamMStepCtx(
     =#
     probe = _HamPack(sm1, f, ntuple(_ -> 1, _HB_N))
     ncell = length(slots[1])
+    #=
+    Bound to a fresh name rather than back onto `slots`: reassigning an argument
+    the closure above also reads boxes it, and the read becomes one JET cannot
+    prove defined.
+    =#
     eff = ntuple(b -> probe.w[b] == 0 ? collect(1:ncell) : slots[b], _HB_N)
-    slots = eff
-    units = _ham_units(sufs, slots, q_slots)
-    nv = ntuple(b -> maximum(slots[b]), _HB_N)
+    units = _ham_units(sufs, eff, q_slots)
+    nv = ntuple(b -> maximum(eff[b]), _HB_N)
     pack = _HamPack(sm1, f, nv)
     n, d, m, K = pack.n, pack.d, pack.m, pack.K
     reg = d + 1 + m
@@ -862,9 +866,9 @@ function _HamMStepCtx(
     a separate pass that has to know which blocks it may touch.
     =#
     owners = [[Int[] for _ in 1:nv[b]] for b in 1:_HB_N]
-    for c in eachindex(slots[1])
+    for c in eachindex(eff[1])
         for b in 1:_HB_N
-            push!(owners[b][slots[b][c]], c)
+            push!(owners[b][eff[b][c]], c)
         end
     end
 

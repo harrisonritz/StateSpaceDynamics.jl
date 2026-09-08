@@ -321,6 +321,18 @@ function test_slds_hamiltonian_tied()
     @test frozen_struct.LDSs[1].state_model.A == frozen_struct.LDSs[2].state_model.A
     @test elbo(frozen_struct, ys) > before_fs
 
+    #=
+    Every inverse-LQR state is packed into one parameter layout, which is read
+    off the first model's `fit_flags`. States that freeze different blocks would
+    have one state's freezes silently applied to the other, so the disagreement
+    is refused instead.
+    =#
+    mixed_flags = hslds_model(costs; p=p)
+    mixed_flags.LDSs[2].state_model.fit_flags = HamiltonianFitFlags(; Gref=false)
+    @test_throws ArgumentError fit!(
+        mixed_flags, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=[:A, :S]
+    )
+
     # A name this model has no parameter for is still rejected.
     bad = hslds_model(costs; p=p)
     @test_throws ArgumentError fit!(
