@@ -1039,29 +1039,38 @@ function _refresh_tail!(
     c.negLtSL .*= -one(T)
     c.cF = -T(0.5) * (T(n) * log(T(2π)) + logdet(c.Sf_PD))
 
+    #= Last, so a variant is rebuilt only from a parent whose own cache is
+    already current — they alias its arrays, so the order is what makes the two
+    consistent rather than merely both refreshed. =#
+    _refresh_variants!(sm)
     return nothing
 end
 
-# _refresh_variants!(sm)
-# return sm
-# end
+"""
+    _refresh_variants!(sm)
 
-# """
-# _refresh_variants!(sm)
+Rebuild the derived cache of every variant this model has built.
 
-# Rebuild the derived cache of every variant this model has built. A no-op for a
-# model with none — which is every variant, since they hold no variants of their
-# own, and every ungrouped model — so the recursion terminates after one level and
-# the ordinary path pays one `=== nothing` test.
-# """
-# function _refresh_variants!(sm::HamiltonianStateModel)
-# variants = sm.variants
-# variants === nothing && return sm
-# for v in variants
-#     v === sm || refresh!(v)
-# end
-# return sm
-# end
+Variants alias the parent's arrays for every group that does not vary, so a
+write to the parent *is* a write to theirs — but each carries its **own** derived
+cache, and a grouped model smooths through those, not through the parent's. So a
+hand-written parameter would reach the fields and never the transitions actually
+used: silent, and large. On a two-session stitched inverse-LQR fit, rescaling the
+costate without this moves the ELBO by tens of thousands of nats across an
+operation that is supposed to be an exact symmetry.
+
+A no-op for a model with no variants — which is every variant, since they hold
+none of their own, and every ungrouped model — so the recursion terminates after
+one level and the ordinary path pays one `=== nothing` test.
+"""
+function _refresh_variants!(sm::HamiltonianStateModel)
+    variants = sm.variants
+    variants === nothing && return sm
+    for v in variants
+        v === sm || refresh!(v)
+    end
+    return sm
+end
 
 # ============================================================================
 # Structure accessors and diagnostics

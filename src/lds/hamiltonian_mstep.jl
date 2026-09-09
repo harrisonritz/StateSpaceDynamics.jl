@@ -363,7 +363,12 @@ function _aggregate_hamiltonian_stats_weighted!(
         p_smooth = fs.p_smooth::Array{T,3}
         p_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
-        ux = data.ux[trial]::Matrix{T}
+        #= `AbstractMatrix`, not `Matrix`: a `Data` built from an array the
+        caller already owns holds *views* of it rather than copies, which is the
+        ordinary case when trials are slices of one session-wide matrix. `ux` is
+        only ever reached through `tview` below, which produces a `SubArray`
+        either way, so nothing downstream can tell the difference. =#
+        ux = data.ux[trial]::AbstractMatrix{T}
         w = weights[trial]
 
         #=

@@ -641,3 +641,115 @@ function test_slds_hamiltonian_noise_version_lookup()
     @test !(ctx.Sinv[1] ≈ ctx.Sinv[2])
     return nothing
 end
+
+"""
+    test_slds_hamiltonian_grouped()
+
+Switching inverse LQR whose *emission* is grouped: the stitched fit, where one
+control problem per discrete state is read out through one emission per session.
+
+The grouped switching M-step is a different code path from the ungrouped one —
+it aggregates over `K · ncells` (regime, cell) units rather than `K` states, and
+the structural parameters have no conjugate update to fall back on — so it gets
+the same anchor the ungrouped path has. With `K = 1` the responsibilities are
+identically one and the discrete layer contributes nothing, so a grouped
+switching fit must reproduce the grouped *single* inverse-LQR fit, parameter for
+parameter. Anything that reaches only one of the two shows up here.
+
+The second half checks the piece that anchor cannot see: with `K > 1` the
+structural version of unit `(k, c)` is the pair of its version across regimes and
+across cells, and a tie has to collapse the first without collapsing the second.
+"""
+function test_slds_hamiltonian_grouped()
+    p, tsteps, ntrials = 4, 30, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    labels = [:a, :a, :a, :b, :b, :b]
+    group(model) = (C=labels, d=labels, R=labels)
+
+    lds = hslds_state(Qc; p=p)
+    lds.obs_model.depends_on = group(lds.obs_model)
+    slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p)])
+    slds.LDSs[1].obs_model.depends_on = group(slds.LDSs[1].obs_model)
+
+    e_lds = _trace(fit!(lds, ys; max_iter=8, tol=1e-14))
+    e_slds = _trace(fit!(slds, ys; max_iter=8, progress=false, rng=StableRNG(7)))
+
+    @test all(isfinite, e_slds)
+    @test length(e_lds) == length(e_slds)
+    @test maximum(abs, e_lds .- e_slds) < 1e-5
+
+    a, b = lds.state_model, slds.LDSs[1].state_model
+    @test maximum(abs, a.A .- b.A) < 1e-6
+    @test maximum(abs, a.S .- b.S) < 1e-6
+    @test maximum(abs, a.Qc[1] .- b.Qc[1]) < 1e-5
+    @test maximum(abs, a.Σ .- b.Σ) < 1e-7
+    @test maximum(abs, a.x0 .- b.x0) < 1e-6
+    # Every group's emission, not just the template's: the whole point of the
+    # grouped path is that each session gets its own readout.
+    for label in (:a, :b)
+        @test maximum(
+            abs,
+            group_parameter(lds.obs_model, :C, label) .-
+            group_parameter(slds.LDSs[1].obs_model, :C, label),
+        ) < 1e-6
+    end
+    # `observe_costate` is off, so no group's emission may read the costate.
+    for label in (:a, :b)
+        @test all(iszero, group_parameter(slds.LDSs[1].obs_model, :C, label)[:, 3:4])
+    end
+
+    #=
+    Two states and two groups: four (regime, cell) units, and the structural
+    version of each is the pair of its regime version and its cell version. The
+    state side is ungrouped here — only the emission is stitched — so every cell
+    shares a structural version and the units collapse back to one per regime.
+    That is the case the pipeline actually fits, and the one where the stitched
+    and single-session fits have to be the same estimator.
+    =#
+    two = hslds_model([Qc, [0.9 0.0; 0.0 0.7]]; p=p)
+    for lds_k in two.LDSs
+        lds_k.obs_model.depends_on = group(lds_k.obs_model)
+    end
+    before = elbo(two, ys)
+    trace = _trace(
+        fit!(two, ys; max_iter=10, progress=false, rng=StableRNG(7), tied_params=[:A, :S])
+    )
+    after = elbo(two, ys)
+
+    @test all(isfinite, trace)
+    @test after > before
+    # The tie held across discrete states...
+    @test maximum(abs, two.LDSs[1].state_model.A .- two.LDSs[2].state_model.A) < 1e-9
+    @test maximum(abs, two.LDSs[1].state_model.S .- two.LDSs[2].state_model.S) < 1e-9
+    # ...while the untied cost did not collapse with it.
+    @test maximum(abs, two.LDSs[1].state_model.Qc[1] .- two.LDSs[2].state_model.Qc[1]) >
+        1e-6
+    for lds_k in two.LDSs
+        @test symplectic_defect(lds_k.state_model) < 1e-10
+        @test isposdef(lds_k.state_model.Σ)
+    end
+    return nothing
+end
+
+"""
+    test_ham_pair_slots()
+
+The (regime, cell) version map: units agreeing on both axes share a version,
+units differing on either get their own, and the result is renumbered from 1
+with no gaps — which is what `_HamMStepCtx` needs, since it sizes its per-version
+storage from the maximum.
+"""
+function test_ham_pair_slots()
+    # Two regimes x two cells, nothing shared: four versions.
+    @test SSD._ham_pair_slots([1, 1, 2, 2], [1, 2, 1, 2]) == [1, 2, 3, 4]
+    # Tied across regimes, grouped across cells: one version per cell.
+    @test SSD._ham_pair_slots([1, 1, 1, 1], [1, 2, 1, 2]) == [1, 2, 1, 2]
+    # Untied across regimes, ungrouped across cells: one version per regime.
+    @test SSD._ham_pair_slots([1, 1, 2, 2], [1, 1, 1, 1]) == [1, 1, 2, 2]
+    # Both collapsed: a single version.
+    @test SSD._ham_pair_slots([1, 1, 1, 1], [1, 1, 1, 1]) == [1, 1, 1, 1]
+    # Dense renumbering even when the inputs are not.
+    @test SSD._ham_pair_slots([3, 3, 7, 7], [2, 5, 2, 5]) == [1, 2, 3, 4]
+    return nothing
+end

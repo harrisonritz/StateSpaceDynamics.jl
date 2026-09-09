@@ -201,16 +201,20 @@ useful horizon and would leave nothing but overflow to compare.
 
 const TE_HN, TE_HT = 2, 18
 
-function _te_ham_sm(; ux_dim=0, terminal=false, K=1, tsteps=TE_HT, onset=1,
-                    observe_costate=false)
+function _te_ham_sm(;
+    ux_dim=0, terminal=false, K=1, tsteps=TE_HT, onset=1, observe_costate=false
+)
     n = TE_HN
     return HamiltonianStateModel(
         [1.0 0.1; -0.05 0.95],
         0.3 * Matrix{Float64}(I, n, n),
         [(0.5 + 0.4k) * Matrix{Float64}(I, n, n) for k in 1:K],
         0.05 * Matrix{Float64}(I, 2n, 2n);
-        schedule=K == 1 ? Int[] :
-                 SSD.cost_schedule(tsteps; terminal=terminal, onset=onset, nregimes=K),
+        schedule=if K == 1
+            Int[]
+        else
+            SSD.cost_schedule(tsteps; terminal=terminal, onset=onset, nregimes=K)
+        end,
         terminal=terminal,
         Bu=zeros(2n, ux_dim),
         Gref=zeros(n, ux_dim),
@@ -219,19 +223,26 @@ function _te_ham_sm(; ux_dim=0, terminal=false, K=1, tsteps=TE_HT, onset=1,
     )
 end
 
-_te_ham_gom(seed; costate=false) = GaussianObservationModel(;
-    C=costate ? randn(StableRNG(seed), TE_N, 2TE_HN) :
-      hcat(randn(StableRNG(seed), TE_N, TE_HN), zeros(TE_N, TE_HN)),
-    R=0.2 * Matrix{Float64}(I, TE_N, TE_N),
-    d=zeros(TE_N),
-    D=zeros(TE_N, 0),
-)
+function _te_ham_gom(seed; costate=false)
+    return GaussianObservationModel(;
+        C=if costate
+            randn(StableRNG(seed), TE_N, 2TE_HN)
+        else
+            hcat(randn(StableRNG(seed), TE_N, TE_HN), zeros(TE_N, TE_HN))
+        end,
+        R=0.2 * Matrix{Float64}(I, TE_N, TE_N),
+        d=zeros(TE_N),
+        D=zeros(TE_N, 0),
+    )
+end
 
-_te_ham_pom(seed) = PoissonObservationModel(;
-    C=hcat(0.4 .* randn(StableRNG(seed), TE_N, TE_HN), zeros(TE_N, TE_HN)),
-    d=fill(-0.5, TE_N),
-    D=zeros(TE_N, 0),
-)
+function _te_ham_pom(seed)
+    return PoissonObservationModel(;
+        C=hcat(0.4 .* randn(StableRNG(seed), TE_N, TE_HN), zeros(TE_N, TE_HN)),
+        d=fill(-0.5, TE_N),
+        D=zeros(TE_N, 0),
+    )
+end
 
 """
     _te_ham_data(rng, lds, lengths; ux=nothing) -> y
@@ -244,12 +255,15 @@ function _te_ham_data(rng, lds, lengths; ux=nothing)
     sm = lds.state_model
     params = SSD._extract_obs_params(lds.obs_model)
     ys = map(enumerate(lengths)) do (i, len)
-        z = simulate_lqr(
-            rng, sm, len; costate_slack=0.05, ux=ux === nothing ? nothing : ux[i]
-        )
+        z = simulate_lqr(rng, sm, len; costate_slack=0.05, ux=ux === nothing ? nothing : ux[i])
         y = SSD._alloc_obs(lds, len)
         SSD._sample_hamiltonian_obs!(
-            rng, y, z, lds.obs_model, params, SSD._check_uy(nothing, lds.uy_dim, len, lds.obs_model)
+            rng,
+            y,
+            z,
+            lds.obs_model,
+            params,
+            SSD._check_uy(nothing, lds.uy_dim, len, lds.obs_model),
         )
         y
     end

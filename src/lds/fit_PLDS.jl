@@ -1243,7 +1243,10 @@ function _grouped_member_obs_mstep!(
     member_sws = _member_unit_sws(cell_ws1, state.cell_lds, m)
     _grouped_gaussian_obs_mstep!(
         views,
-        [s[key] for s in state.sufs],
+        #= `_obs_suf` first: a Hamiltonian state's statistics *wrap* the
+        composite's per-member blocks rather than being them, so indexing the
+        wrapper by member key would fail. The identity for every other model. =#
+        [_obs_suf(s)[key] for s in state.sufs],
         grp.cell_slot[ord[1]],
         grp.cell_slot[ord[2]],
         member_sws[1],

@@ -3102,7 +3102,9 @@ function _slds_obs_mstep!(
         _slds_member_obs_mstep!(
             _models(om)[key],
             views,
-            [s[key] for s in sf],
+            # `_obs_suf` unwraps a Hamiltonian state's statistics, which wrap the
+            # composite's per-member blocks; the identity for every other model.
+            [_obs_suf(s)[key] for s in sf],
             tfs,
             datas[key],
             tied,
@@ -4157,7 +4159,10 @@ function _mstep_grouped!(
             lo > hi && return nothing
             for u in lo:hi
                 k, c = fldmod1(u, ncells)
-                _aggregate_td_suff_stats_weighted!(
+                #= Dispatched, as in the ungrouped M-step: a Hamiltonian state
+                needs its mixed-coordinate blocks filled alongside the base
+                ones, and the costate readout masked. =#
+                _slds_aggregate_weighted!(
                     unit_suf[u],
                     cell_tfs[c],
                     unit_lds[u],
@@ -4190,15 +4195,29 @@ function _mstep_grouped!(
     # takes them from `grp.cell_slot` at each model's own ordinals.
     slots_cd = nothing
 
-    _grouped_update_A_b!(
-        unit_lds, _state_sufs(unit_suf), slots_ab, slots_q, sws, _state_bufs(bf)
+    _grouped_slds_state_mstep!(
+        lds1.state_model,
+        unit_lds,
+        unit_suf,
+        grp,
+        K,
+        ncells,
+        tied,
+        slots_ab,
+        slots_q,
+        sws,
+        bf,
     )
-    _grouped_update_Q!(unit_lds, _state_sufs(unit_suf), slots_q, slots_ab, sws)
 
+    #= The emission side is state-model-agnostic and reads the shared blocks, so
+    a Hamiltonian state's wrapper is unwrapped first — `_state_suf` is *not*
+    applied, because a composite emission's M-step wants every member's blocks
+    rather than one of them. The identity for a plain Gaussian state. =#
+    obs_sufs = [_slds_init_suf(suf) for suf in unit_suf]
     _grouped_slds_obs_mstep!(
         lds1.obs_model,
         unit_lds,
-        unit_suf,
+        obs_sufs,
         grp,
         K,
         ncells,
@@ -4229,9 +4248,15 @@ function _mstep_grouped!(
     =#
     slots_x0 = repeat(grp.cell_slot[_G_X0], K)
     slots_P0 = repeat(grp.cell_slot[_G_P0], K)
-    _grouped_update_x0!(unit_lds, _state_sufs(unit_suf), slots_x0, _state_bufs(bf))
+    #= `_slds_init_suf` first: a Hamiltonian state's statistics wrap the shared
+    initial-state and emission blocks rather than being them, and it is those
+    blocks the pooled `x0` / `P0` updates read. `_state_suf` then picks a
+    composite emission's member. The two compose to the identity for a plain
+    Gaussian state. =#
+    init_sufs = [_state_suf(_slds_init_suf(suf)) for suf in unit_suf]
+    _grouped_update_x0!(unit_lds, init_sufs, slots_x0, _state_bufs(bf))
     _broadcast_initial_state!(cell_slds, K, lds1.fit_bool[_G_X0], false)
-    _grouped_update_P0!(unit_lds, _state_sufs(unit_suf), slots_P0, slots_x0, sws)
+    _grouped_update_P0!(unit_lds, init_sufs, slots_P0, slots_x0, sws)
     _broadcast_initial_state!(cell_slds, K, false, lds1.fit_bool[_G_P0])
 
     return nothing
@@ -4252,6 +4277,164 @@ function _grouped_unit_slots(cell_slot::AbstractVector{Int}, K::Int, tied::Bool)
     tied && return repeat(cell_slot, K)
     stride = maximum(cell_slot)
     return [(k - 1) * stride + s for k in 1:K for s in cell_slot]
+end
+
+"""
+    _grouped_slds_state_mstep!(state_model, unit_lds, unit_suf, grp, K, ncells,
+                               tied, slots_ab, slots_q, sws, bufs)
+
+The state half of the grouped switching M-step, dispatched on the state model.
+
+The units are the `K · ncells` (regime, cell) pairs the caller has already
+aggregated into, so a state model's grouped and switching versions meet here
+rather than in two places: `slots_ab` / `slots_q` say which parameter version
+each unit uses, combining the tie across regimes with the grouping across cells.
+
+The Gaussian case is the pair of conjugate regressions the ungrouped grouped
+path uses.
+"""
+function _grouped_slds_state_mstep!(
+    ::AbstractStateModel,
+    unit_lds::AbstractVector,
+    unit_suf::AbstractVector,
+    ::ParameterGrouping,
+    ::Int,
+    ::Int,
+    ::AbstractVector{Symbol},
+    slots_ab::AbstractVector{Int},
+    slots_q::AbstractVector{Int},
+    sws::SmoothWorkspace,
+    bufs,
+)
+    _grouped_update_A_b!(
+        unit_lds, _state_sufs(unit_suf), slots_ab, slots_q, sws, _state_bufs(bufs)
+    )
+    _grouped_update_Q!(unit_lds, _state_sufs(unit_suf), slots_q, slots_ab, sws)
+    return nothing
+end
+
+"""
+    _grouped_slds_state_mstep!(::HamiltonianStateModel, …)
+
+Inverse-LQR discrete states whose *emission* is grouped — the stitched switching
+fit, where one control problem per discrete state is read out through one
+emission per session.
+
+The structural parameters have no conjugate update, so this goes through the same
+constrained context the ungrouped switching M-step uses, over the `K · ncells`
+units instead of the `K` states. What changes is only the bookkeeping: each
+structural block's version at unit `(k, c)` is the pair of its version across
+regimes (from the tie) and its version across cells (from the grouping), mapped
+to a dense index by [`_ham_pair_slots`](@ref).
+
+For the common case — the state side ungrouped, only the emission stitched —
+every cell shares one structural version and this reduces exactly to the
+ungrouped switching M-step, which is what makes the stitched fit and the
+single-session one the same estimator.
+"""
+function _grouped_slds_state_mstep!(
+    ::HamiltonianStateModel,
+    unit_lds::AbstractVector,
+    unit_suf::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    ncells::Int,
+    tied::AbstractVector{Symbol},
+    ::AbstractVector{Int},
+    ::AbstractVector{Int},
+    ::SmoothWorkspace,
+    _,
+)
+    sms = [lds.state_model for lds in unit_lds]
+    for u in eachindex(unit_suf)
+        _fill_mixed_blocks!(unit_suf[u], sms[u])
+    end
+
+    # A `:free` state is an ordinary regression, updated on its own.
+    for u in eachindex(sms)
+        if _is_free(sms[u])
+            _free_state_mstep!(unit_lds[u], unit_suf[u])
+            refresh!(sms[u])
+        end
+    end
+
+    lqr = [u for u in eachindex(sms) if !_is_free(sms[u])]
+    isempty(lqr) && return nothing
+
+    fit_structure = unit_lds[lqr[1]].fit_bool[3]
+    fit_noise = unit_lds[lqr[1]].fit_bool[4]
+    flags = sms[lqr[1]].fit_flags
+    for u in lqr
+        (
+            unit_lds[u].fit_bool[3] == fit_structure && unit_lds[u].fit_bool[4] == fit_noise
+        ) || throw(
+            ArgumentError(
+                "inverse-LQR discrete states are optimized together, so they must " *
+                "agree on the `:A` and `:Q` entries of `fit_bool` — including across " *
+                "the groups a `depends_on` fit splits trials into.",
+            ),
+        )
+        sms[u].fit_flags == flags || throw(
+            ArgumentError(
+                "inverse-LQR discrete states share one packed parameter layout in " *
+                "the M-step, so they must agree on `fit_flags` and freeze the same " *
+                "structural blocks.",
+            ),
+        )
+    end
+
+    #=
+    Which unit is which: `unit_lds[(k-1)·ncells + c]` is regime `k`, cell `c`,
+    the layout `_mstep_grouped!` built. `lqr` may drop some of them (a `:free`
+    state is handled above), so the slot vectors are built over the full grid and
+    then restricted, keeping regime and cell recoverable from the flat index.
+    =#
+    regime_of(u) = fldmod1(u, ncells)[1]
+    cell_of(u) = fldmod1(u, ncells)[2]
+
+    block_slots = _ham_block_slots(tied, K)
+    ab_slots = ntuple(
+        b -> _ham_pair_slots(
+            [block_slots[b][regime_of(u)] for u in lqr],
+            [grp.cell_slot[_G_AB][cell_of(u)] for u in lqr],
+        ),
+        7,
+    )
+    q_slots = _ham_pair_slots(
+        [(:noise in tied) ? 1 : regime_of(u) for u in lqr],
+        [grp.cell_slot[_G_Q][cell_of(u)] for u in lqr],
+    )
+
+    ctx = _HamMStepCtx([unit_suf[u] for u in lqr], sms[lqr], ab_slots, q_slots, fit_noise)
+    _ham_structure_mstep!(ctx, fit_structure, maximum(sms[u].mstep_iters for u in lqr))
+    fit_noise && _ham_noise_mstep!(ctx)
+    for u in lqr
+        refresh!(sms[u])
+    end
+    return nothing
+end
+
+"""
+    _ham_pair_slots(regime_versions, cell_versions) -> Vector{Int}
+
+A dense version index per unit from the two axes a grouped switching fit varies
+along: which copy of a parameter the unit's *discrete state* uses, and which its
+*cell of trials* uses.
+
+Units agreeing on both share a version; units differing on either get their own.
+The result is renumbered from 1 with no gaps, which is what `_HamMStepCtx`
+expects — it sizes its per-version storage from the maximum.
+"""
+function _ham_pair_slots(
+    regime_versions::AbstractVector{Int}, cell_versions::AbstractVector{Int}
+)
+    seen = Dict{Tuple{Int,Int},Int}()
+    out = Vector{Int}(undef, length(regime_versions))
+    for i in eachindex(out)
+        key = (regime_versions[i], cell_versions[i])
+        out[i] = get!(seen, key, length(seen) + 1)
+    end
+    return out
 end
 
 """

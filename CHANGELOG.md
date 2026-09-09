@@ -7,7 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`refresh!` now rebuilds a grouped model's variant caches.** A
+  `HamiltonianStateModel` with `depends_on` builds one variant per cell, aliasing
+  the parent's arrays for every group that does not vary — so a write to the
+  parent *is* a write to theirs. But each variant carries its own derived cache,
+  and a grouped model smooths through those, not through the parent's. A
+  parameter assigned by hand therefore reached the fields and never the
+  transitions actually used. Silent, and large: on a two-session stitched fit,
+  `rescale_costate!` — which mutates `Qc` and `S` and then refreshes — moved the
+  ELBO by tens of thousands of nats across an operation that is an exact
+  symmetry. `refresh!` now refreshes any variants it has, one level deep.
+- **`rescale_costate!` refuses a model whose structure is grouped.** Variants
+  alias the parent for groups that do not vary, so rescaling the parent serves
+  them all — but a model whose *structural* block varies by cell holds separate
+  costs, and one global factor would rescale one cell and leave the rest on a
+  different costate scale. It says so instead.
+- **Composite emissions work with an inverse-LQR state.** Three sites indexed a
+  member's sufficient statistics by key — the grouped emission M-step, the
+  switching one, and the pooled initial-state update — but a Hamiltonian state's
+  statistics *wrap* the per-member blocks rather than being them, so a fit
+  combining an inverse-LQR state with several emissions threw a `MethodError`
+  the moment it reached the M-step. They now unwrap through the accessors that
+  already exist for it (`_obs_suf`, `_slds_init_suf`), which are the identity for
+  every other state model.
+
+- **The weighted Hamiltonian aggregator accepts input views.** It asserted
+  `data.ux[trial]::Matrix`, which rejected the ordinary case of a `Data` built
+  from an array the caller owns — where the per-trial inputs are views rather
+  than copies. `ux` is only ever reached through `tview`, so nothing downstream
+  could tell the difference.
+
 ### Added
+- **Switching inverse LQR under `depends_on`.** The grouped switching M-step now
+  handles Hamiltonian discrete states, so a switching inverse-LQR model can be
+  *stitched*: one control problem per discrete state, read out through one
+  emission per session. Previously this path aggregated with the base routine
+  rather than the dispatched one and then looked for a conjugate update that an
+  inverse-LQR state does not have.
+
+  The units are the `K · ncells` (regime, cell) pairs, and each structural
+  block's version at a unit is the pair of its version across regimes (from the
+  tie) and across cells (from the grouping), mapped to a dense index by
+  `_ham_pair_slots`. With the state side ungrouped — only the emission stitched,
+  which is the usual shape — every cell shares one structural version and this
+  reduces exactly to the ungrouped switching M-step, so the stitched fit and the
+  single-session one are the same estimator. A `K = 1` grouped switching fit
+  reproduces the grouped single fit parameter for parameter, which is the
+  anchor the ungrouped path already had.
+
 - **Switching inverse LQR.** An `SLDS` can now switch between inverse-LQR
   dynamics, so the discrete state selects *which control problem* generated the
   behaviour — different plants, different costs, or both.
