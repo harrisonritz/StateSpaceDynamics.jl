@@ -447,6 +447,11 @@ using SSDTest
             test_trial_elbos_single_trial()
             test_trial_elbos_prior_excluded()
             test_trial_elbos_rejects_grouping()
+            @testset "Hamiltonian latents" begin
+                test_trial_elbos_hamiltonian()
+                test_trial_elbos_hamiltonian_inputs()
+                test_trial_elbos_hamiltonian_rejects_grouping()
+            end
         end
 
         include("LinearDynamicalSystems/Holdout.jl")

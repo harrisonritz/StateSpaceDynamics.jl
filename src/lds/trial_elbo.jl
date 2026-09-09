@@ -24,6 +24,10 @@ Each per-trial term is the same three pieces the aggregated path sums —
 per-trial `Q_state!` / `Q_obs!` kernels rather than the sufficient-statistic
 ones. One E-step runs for the whole dataset, so the smoothing cost is exactly
 what `elbo` pays; only the Q-terms are recomputed trial by trial.
+
+A Hamiltonian (inverse-LQR) state model reaches the same split by a different
+route — see the section at the foot of this file — because its state Q-term has
+no per-trial kernel to call. The contract above is identical.
 =============================================================================#
 
 """
@@ -60,6 +64,10 @@ single parameter set the model carries. Call it once per cell instead.
 
 For an `SLDS`, [`smooth`](@ref) already returns this vector as its `trial_elbo`
 field — read that rather than paying for the alternation twice.
+
+A [`HamiltonianStateModel`](@ref) is supported on the same terms. Its entries
+cover the terminal pseudo-observation as well as `y` when the model carries one,
+matching what [`elbo`](@ref) and [`loglikelihood`](@ref) report for it.
 """
 function trial_elbos end
 
@@ -260,4 +268,138 @@ function trial_elbos(
         progress=progress,
         depends_on=depends_on,
     ).trial_elbo
+end
+
+# ============================================================================
+# Hamiltonian (inverse-LQR) latents
+# ============================================================================
+
+#=
+The state half is where this model differs, and it differs in a way that rules
+out the Gaussian per-trial kernel above: a Hamiltonian `Q_state!` is written
+against the *aggregated* statistics, because its transition term lives in mixed
+coordinates and carries the `N log|det A|` Jacobian that the change of
+coordinates costs. There is no per-trial kernel to call.
+
+There does not need to be one. At fixed parameters the residual scatter
+`R(θ)` is a linear function of the aggregated blocks, `N` and `N_f` are plain
+counts, and the initial-state term is a sum over trials — so `Q_state!` is
+exactly additive over trials, and one trial's contribution is `Q_state!` of that
+trial's own statistics. Re-aggregating per trial therefore reaches the same
+number the whole-dataset path would, through the same tested code, rather than
+through a second derivation of the objective that could drift from it.
+
+What it costs is one `_HamMStepCtx` per trial, which is `O(K d (d + 1 + m))` of
+scratch — small beside the smoothing pass that produced the input, and paid only
+by callers who asked for the split.
+=#
+
+"""
+    _ham_trial_state_suf!(hs, tfs, lds, data, n) -> hs
+
+Refill `hs` with trial `n`'s state-side statistics alone: the initial-state
+blocks of the base statistics, and the per-regime transition and terminal blocks
+from [`_aggregate_hamiltonian_stats!`](@ref) restricted to that trial.
+
+Only the initial-state third of `base` is written. The emission blocks are left
+untouched because the per-trial emission Q-term does not come from them — it
+comes from [`_trial_q_obs`](@ref), the same per-trial kernel the Gaussian path
+uses.
+"""
+function _ham_trial_state_suf!(
+    hs::HamiltonianSufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    n::Int,
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    suf = _state_suf(hs.base)
+    fs = tfs[n]
+    x1 = view(fs.x_smooth, :, 1)
+
+    suf.init_n = one(T)
+    @views suf.init_xy[1, :] .= x1
+    S0 = suf.init_yy[]
+    copyto!(S0, view(fs.p_smooth, :, :, 1))
+    S0 .+= x1 .* transpose(x1)
+
+    _aggregate_hamiltonian_stats!(hs, tfs, lds, data, n:n)
+    return hs
+end
+
+"""
+    _accumulate_ham_trial_elbos(lds, tfs, data, sws) -> Vector{T}
+
+Per-trial state Q-term + emission Q-term + posterior entropy for a Hamiltonian
+LDS, from a smoother output that is already filled.
+
+No `log 2π` correction, unlike the Gaussian path: the Hamiltonian `Q_state!` is
+the ELBO's own state term rather than an M-step objective, so it already carries
+the `2n log 2π` each Gaussian factor contributes.
+"""
+function _accumulate_ham_trial_elbos(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    sufficient_statistics!(tfs)
+    compute_smooth_constants!(sws, lds)
+    hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
+
+    per_trial = Vector{T}(undef, length(data.tsteps))
+    for n in eachindex(per_trial)
+        fs = tfs[n]
+        _ham_trial_state_suf!(hs, tfs, lds, data, n)
+        per_trial[n] =
+            Q_state!(sws, lds, hs) + _trial_q_obs(sws, lds, fs, data, n) + fs.entropy
+    end
+    return per_trial
+end
+
+"""
+    trial_elbos(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y; ux, uy)
+
+Per-trial ELBO contributions of a Hamiltonian (inverse-LQR) LDS with a quadratic
+emission. The smoother is exact on `z = [x; λ]`, so with no parameter priors
+each entry is that trial's exact marginal log-density — of `y` jointly with the
+terminal pseudo-observation when the model carries one, which is what
+[`loglikelihood`](@ref) reports too.
+"""
+function trial_elbos(
+    lds::LinearDynamicalSystem{T,S,O},
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
+    ux=nothing,
+    uy=nothing,
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
+    _prepare_hamiltonian!(lds, data.tsteps)
+    smooth!(lds, tfs, data, sws_pool)
+    return _accumulate_ham_trial_elbos(lds, tfs, data, sws_pool[1])
+end
+
+"""
+    trial_elbos(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y;
+                ux, uy, newton_max_iter=20, newton_tol=1e-6)
+
+Per-trial ELBO contributions of a Hamiltonian LDS with a non-quadratic emission
+(Poisson, or a composite with a Poisson member). Each entry is a lower bound on
+that trial's marginal log-density under the Laplace posterior.
+"""
+function trial_elbos(
+    lds::LinearDynamicalSystem{T,S,O},
+    y::Union{
+        AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
+    };
+    ux=nothing,
+    uy=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Float64=1e-6,
+) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
+    _prepare_hamiltonian!(lds, data.tsteps)
+    smooth!(lds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+    return _accumulate_ham_trial_elbos(lds, tfs, data, sws_pool[1])
 end

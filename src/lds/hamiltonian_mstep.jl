@@ -154,7 +154,7 @@ function _regime_runs(sm::HamiltonianStateModel, tsteps::Int)
 end
 
 """
-    _aggregate_hamiltonian_stats!(hs, tfs, lds, data)
+    _aggregate_hamiltonian_stats!(hs, tfs, lds, data[, trials])
 
 Accumulate the per-regime state-side statistics from the smoother output.
 
@@ -162,19 +162,25 @@ Accumulate the per-regime state-side statistics from the smoother output.
 z_{t+1})`, where the smoother stores `p_smooth_tt1[:, :, t] = Cov(z_t, z_{t-1})`
 — hence the adjoint on that term. Means go through GEMM per run; the covariance
 sums are the unavoidable per-timestep part, exactly as on the Gaussian path.
+
+`trials` restricts the sum to a subset, every other trial contributing nothing.
+The blocks are zeroed first either way, so the result is that subset's own
+statistics rather than an accumulation onto whatever was there — which is what
+lets [`trial_elbos`](@ref) reach one trial's state Q-term through the same
+aggregator the whole-dataset path uses.
 """
 function _aggregate_hamiltonian_stats!(
     hs::HamiltonianSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
+    trials::AbstractVector{Int}=Base.OneTo(length(tfs)),
 ) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     m = lds.ux_dim
     reg = d + 1 + m
     K = _nregimes(sm)
-    ntrials = length(tfs)
 
     for k in 1:K
         fill!(hs.zz[k], zero(T))
@@ -185,7 +191,7 @@ function _aggregate_hamiltonian_stats!(
     fill!(hs.term_zz, zero(T))
     hs.term_n = zero(T)
 
-    for trial in 1:ntrials
+    for trial in trials
         fs = tfs[trial]
         x = fs.x_smooth::Matrix{T}
         p_smooth = fs.p_smooth::Array{T,3}

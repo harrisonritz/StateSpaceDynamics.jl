@@ -70,6 +70,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what caught the costate readout leaking back through the switching emission
   M-step.
 
+- **`trial_elbos` covers Hamiltonian (inverse-LQR) latents.** The per-trial ELBO
+  split now accepts a `HamiltonianStateModel` alongside the Gaussian ones, with
+  the same contract — `sum(trial_elbos(m, y)) + log p(θ) == elbo(m, y)` — and
+  the same support for Gaussian, Poisson and composite emissions, multi-regime
+  cost schedules, the terminal factor, `observe_costate`, inputs and ragged
+  trial lengths.
+
+  This is what lets a Hamiltonian fit be scored per trial: a held-out likelihood
+  quoted per trial, a paired bootstrap between models, or a co-smoothing
+  conditional `log p(y_out | y_in)` taken as a difference of two ELBOs.
+
+  A Hamiltonian `Q_state!` has no per-trial kernel — its transition term lives
+  in mixed coordinates and carries the `N log|det A|` Jacobian — so the split
+  re-aggregates each trial's statistics and calls the aggregated `Q_state!` on
+  them. That is exact, not approximate: at fixed parameters the residual scatter
+  is linear in the aggregated blocks and `N` / `N_f` are plain counts, so the
+  objective is additive over trials. `_aggregate_hamiltonian_stats!` takes an
+  optional `trials` argument to make that reachable.
+
 - **Inverse LQR through Hamiltonian latents.** A new state model,
   `HamiltonianStateModel`, whose latent state is the LQR state-costate pair
   `z = [x; λ]` and whose transition is constrained to the symplectic form a

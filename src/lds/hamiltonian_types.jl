@@ -875,6 +875,14 @@ Called for you by the constructors and at the end of every M-step. Call it
 yourself after assigning to `A`, `S`, `Qc`, `Σ`, `h`, `Bu`, `Σf` or `hf` by
 hand — the smoother reads the cache, not the fields.
 
+Any parameter-group variants this model has built are refreshed too. They alias
+the parent's arrays for every group that does not vary, so a write to the parent
+*is* a write to theirs — but each variant carries its own derived cache, and a
+grouped model smooths through those. Without this a hand-written parameter would
+reach the fields and never the transitions actually used, which fails silently
+rather than loudly. Variants hold no variants of their own, so the recursion is
+one level deep.
+
 # Throws
 - `NumericalStabilityError` when `A` has become singular
 - `PosDefException` when `Σ` or `Σf` is not positive definite
@@ -1033,6 +1041,27 @@ function _refresh_tail!(
 
     return nothing
 end
+
+# _refresh_variants!(sm)
+# return sm
+# end
+
+# """
+# _refresh_variants!(sm)
+
+# Rebuild the derived cache of every variant this model has built. A no-op for a
+# model with none — which is every variant, since they hold no variants of their
+# own, and every ungrouped model — so the recursion terminates after one level and
+# the ordinary path pays one `=== nothing` test.
+# """
+# function _refresh_variants!(sm::HamiltonianStateModel)
+# variants = sm.variants
+# variants === nothing && return sm
+# for v in variants
+#     v === sm || refresh!(v)
+# end
+# return sm
+# end
 
 # ============================================================================
 # Structure accessors and diagnostics
@@ -1211,6 +1240,7 @@ function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
     pins the sign as well, by making `tr(Qc[1])` positive.
     =#
     iszero(c) && throw(ArgumentError("the costate scale must be nonzero; got $c"))
+    _check_rescalable(sm)
     cT = T(c)
     n = _plant_dim(sm)
     d = 2n
@@ -1231,6 +1261,36 @@ function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
         size(sm.Bu, 2) > 0 && (sm.Bu[(n + 1):d, :] .*= cT)
     end
     return refresh!(sm)
+end
+
+"""
+    _check_rescalable(sm)
+
+Refuse to rescale a model whose *structural* parameters are grouped.
+
+Variants alias the parent's arrays for every group that does not vary, so
+rescaling the parent rescales them all — correct, and the ordinary stitched case,
+where only the emission is grouped. A variant that holds its **own** `S` is one
+whose structure varies by cell, and then a single pass over the parent would
+rescale one cell's cost and leave the others, leaving the cells on different
+costate scales. There is no right global `c` to apply blind, so this says so
+rather than quietly making a mess.
+"""
+function _check_rescalable(sm::HamiltonianStateModel)
+    variants = sm.variants
+    variants === nothing && return nothing
+    for v in variants
+        v.S === sm.S && continue
+        throw(
+            ArgumentError(
+                "this model's structural parameters are grouped (`depends_on`), so its " *
+                "cells hold separate costs and one costate rescaling cannot serve them " *
+                "all. Rescale each variant on its own, or normalize after splitting the " *
+                "fit by cell.",
+            ),
+        )
+    end
+    return nothing
 end
 
 function rescale_costate!(

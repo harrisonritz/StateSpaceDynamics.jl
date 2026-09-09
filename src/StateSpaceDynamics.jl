@@ -61,13 +61,16 @@ include("lds/grouped_em.jl")
 include("lds/fit_LDS.jl")
 include("lds/fit_PLDS.jl")
 include("lds/fit_SLDS.jl")
-include("lds/trial_elbo.jl")                        # ELBO split by trial
 
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
 include("lds/hamiltonian_mstep.jl")
 include("lds/slds_hamiltonian.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_hamiltonian.jl")
+
+# ELBO split by trial. Last of the LDS files: it dispatches on every state model
+# above, so its signatures need all of their types to exist.
+include("lds/trial_elbo.jl")
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
