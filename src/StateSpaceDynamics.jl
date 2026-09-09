@@ -94,7 +94,7 @@ export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
 export simulate_lqr, lqr_riccati_sequence
 
 # Ancillary parameter dependencies (`depends_on`)
-export group_labels, group_parameter, set_group_seeds!, set_depends_on!
+export group_labels, group_parameter, group_variant, set_group_seeds!, set_depends_on!
 
 # Utilities
 export block_tridgm

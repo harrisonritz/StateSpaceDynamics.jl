@@ -100,26 +100,52 @@ end
 
 #=
 The Hamiltonian model's structural block is one joint estimate — the plant, the
-costs and the affine and reference terms move together, so there is nothing to
-gain from naming them separately and a `depends_on` would have to list all seven.
-It gets one user-facing name, `:structure`, and the two noise matrices another,
-`:noise`; the canonical group names stay `:A` and `:Q` so the slot ordinals keep
-lining up with the `fit_bool` layout `[x0, P0, structure, noise]`.
+costs and the affine and reference terms are solved together — so it resolves to
+one group, `:structure`, and the two noise matrices to another, `:noise`. The
+canonical group names stay `:A` and `:Q` so the slot ordinals keep lining up
+with the `fit_bool` layout `[x0, P0, structure, noise]`.
 
-Use `HamiltonianFitFlags` to freeze pieces *within* the structural block; that
-composes with grouping, since a frozen parameter keeps its starting value in
-every group and so is effectively shared.
+A piece of the block may be named on its own, though, and that is not the same
+request: `(Qc = reward,)` groups the *cost* by reward while the plant `A`, the
+control term `S` and the rest stay one array estimated from every trial. It
+resolves to the same group — the cells are the same, and the solve is still one
+joint optimization — because what changes is only how many copies of each block
+the M-step packs, which it already varies per block (see `_HAM_STRUCT_NAMES`).
+
+That is the model an inverse-LQR fit usually wants of a task variable: one arm,
+an objective per condition. Naming `:structure` gives every piece its own copy,
+which says the plant itself changed with the condition.
+
+`HamiltonianFitFlags` freezes pieces within the block, and composes with either:
+a frozen piece keeps its starting value in every group. Freezing and sharing are
+different, though — a shared piece is still fitted, from all the trials at once.
 =#
-function _param_group(::HamiltonianStateModel, name::Symbol)
+function _param_group(sm::HamiltonianStateModel, name::Symbol)
     name === :structure && return :A
     name === :noise && return :Q
     name in (:x0, :P0) && return name
+    #= A `:free` model's transition is one unconstrained matrix with no plant,
+    cost or reference to name, so only the whole block can be grouped there. =#
+    (!_is_free(sm) && name in _HAM_STRUCT_NAMES) && return :A
     return nothing
 end
 
-function _valid_param_names(::HamiltonianStateModel)
-    return ":x0, :P0, :structure, :noise (and, for `tied_params` only, the " *
-           "individual structural blocks :A, :S, :Qc, :h, :Bu, :Gref)"
+function _valid_param_names(sm::HamiltonianStateModel)
+    _is_free(sm) && return ":x0, :P0, :structure, :noise (a `:free` model's " *
+           "transition has no plant, cost or reference to name separately)"
+    return ":x0, :P0, :structure, :noise, and the individual structural blocks " *
+           ":A, :S, :Qc, :h, :Bu, :Gref, :terminal"
+end
+
+#=
+The structural block is the one group `depends_on` may name in part. Its pieces
+are fitted jointly, but jointly is not indivisibly: the M-step packs a separate
+number of copies per block, so "one plant, a cost per group" is a model it
+solves in one pass rather than a split it cannot represent. Every other group on
+this model has a single member, so nothing here can be named in part.
+=#
+function _require_whole_groups(::HamiltonianStateModel, named, context::AbstractString)
+    return nothing
 end
 
 """
@@ -1000,6 +1026,12 @@ One model per parameter-group cell. Arrays for a group that does not vary are
 shared **by reference**, so an M-step write through any variant is visible from
 all of them — the same contract as the Gaussian state model.
 
+The structural block refines that by piece. `dep` resolves `(Qc = labels,)` and
+`(structure = labels,)` to the same group and so to the same cells, and
+[`_ham_struct_varies`](@ref) is what tells the two apart: a piece nobody named
+gets *one* array shared by every variant, exactly as an ungrouped group does, so
+`(Qc = labels,)` gives one plant fitted from all the trials and a cost per group.
+
 The derived cache is the exception: every variant gets its own, because it is a
 function of that variant's parameters (`M_k` depends on its `Qc`). Two variants
 that share every structural array simply end up with equal caches.
@@ -1015,15 +1047,20 @@ function _build_variants!(
 
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
-    # Slot 3 is the whole structural block; slot 4 the noise.
-    As = _slot_arrays(sm.A, dep.nslots[3])
-    Mfrees = _slot_arrays(sm.Mfree, dep.nslots[3])
-    Ss = _slot_arrays(sm.S, dep.nslots[3])
-    Qcs = [_slot_arrays(Q, dep.nslots[3]) for Q in sm.Qc]
-    hs = _slot_arrays(sm.h, dep.nslots[3])
-    Bus = _slot_arrays(sm.Bu, dep.nslots[3])
-    Grefs = _slot_arrays(sm.Gref, dep.nslots[3])
-    hfs = _slot_arrays(sm.hf, dep.nslots[3])
+    #= Slot 3 is the structural block and slot 4 the noise. A structural piece
+    the declaration did not name takes one slot however many the block has, and
+    every variant then reads the same array. =#
+    varies = _ham_struct_varies(sm)
+    struct_slots(b::Int) = varies[b] ? dep.nslots[3] : 1
+    struct_slot(s::AbstractVector{Int}, b::Int) = varies[b] ? s[3] : 1
+    As = _slot_arrays(sm.A, struct_slots(_HB_A))
+    Mfrees = _slot_arrays(sm.Mfree, struct_slots(_HB_A))
+    Ss = _slot_arrays(sm.S, struct_slots(_HB_S))
+    Qcs = [_slot_arrays(Q, struct_slots(_HB_Q)) for Q in sm.Qc]
+    hs = _slot_arrays(sm.h, struct_slots(_HB_H))
+    Bus = _slot_arrays(sm.Bu, struct_slots(_HB_B))
+    Grefs = _slot_arrays(sm.Gref, struct_slots(_HB_G))
+    hfs = _slot_arrays(sm.hf, struct_slots(_HB_F))
     Σs = _slot_arrays(sm.Σ, dep.nslots[4])
     Σfs = _slot_arrays(sm.Σf, dep.nslots[4])
 
@@ -1033,18 +1070,18 @@ function _build_variants!(
         s = _variant_slots(dep.nslots, cell)
         v = HamiltonianStateModel{T,M,V}(
             sm.mode,
-            As[s[3]],
-            Mfrees[s[3]],
-            Ss[s[3]],
-            [Qcs[k][s[3]] for k in eachindex(sm.Qc)],
+            As[struct_slot(s, _HB_A)],
+            Mfrees[struct_slot(s, _HB_A)],
+            Ss[struct_slot(s, _HB_S)],
+            [Qcs[k][struct_slot(s, _HB_Q)] for k in eachindex(sm.Qc)],
             sm.schedule,
             sm.terminal,
             Σs[s[4]],
-            hs[s[3]],
-            Bus[s[3]],
-            Grefs[s[3]],
+            hs[struct_slot(s, _HB_H)],
+            Bus[struct_slot(s, _HB_B)],
+            Grefs[struct_slot(s, _HB_G)],
             Σfs[s[4]],
-            hfs[s[3]],
+            hfs[struct_slot(s, _HB_F)],
             x0s[s[1]],
             P0s[s[2]],
             sm.observe_costate,
@@ -1684,6 +1721,26 @@ Throws when the model declares no dependence for that parameter (read the field
 directly in that case) or when `label` is not one of its groups.
 """
 function group_parameter(model::DependentModel, name::Symbol, label)
+    return _group_readout(group_variant(model, name, label), name)
+end
+
+"""
+    group_variant(model, name, label) -> model
+
+The whole model version fitted from the trials labelled `label`, of which
+[`group_parameter`](@ref) returns one parameter.
+
+It is an ordinary ungrouped model — its own arrays for the parameters that vary,
+the parent's for the ones that do not — so anything written against a model works
+on it unchanged. That is what a caller wants when the *model* is the unit: one
+group's whole control problem to read a summary off, or the state model to smooth
+a held-out trial of that group with.
+
+`name` selects which grouping is being indexed, exactly as for
+`group_parameter`; when several parameters share a group, any of their names
+picks the same version out.
+"""
+function group_variant(model::DependentModel, name::Symbol, label)
     dep = _resolve_dependence(model)
     canonical = _param_group_checked(model, name)
     g = findfirst(isequal(canonical), dep.names)::Int
@@ -1696,7 +1753,7 @@ function group_parameter(model::DependentModel, name::Symbol, label)
     slots = fill(1, length(dep.nslots))
     slots[g] = _slot_of(dep, g, label)
     variants = _build_variants!(model, dep)
-    return _group_readout(variants[_variant_index(dep.nslots, slots)], name)
+    return variants[_variant_index(dep.nslots, slots)]
 end
 
 """

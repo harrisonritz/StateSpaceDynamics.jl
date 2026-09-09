@@ -790,7 +790,12 @@ function _grouped_state_mstep!(
     end
 
     lds1 = ldss[1]
-    ctx = _HamMStepCtx(sufs, sms, slots[_G_AB], slots[_G_Q], lds1.fit_bool[4])
+    #= One copy per group for the pieces the declaration named, one copy in
+    total for the rest — the same layout a partial tie across discrete states
+    uses, and the same single solve. =#
+    ctx = _HamMStepCtx(
+        sufs, sms, _ham_cell_slots(sms, slots[_G_AB]), slots[_G_Q], lds1.fit_bool[4]
+    )
     _ham_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
     lds1.fit_bool[4] && _ham_noise_mstep!(ctx)
     for lds in ldss

@@ -583,6 +583,7 @@ struct _HamPack
     w::NTuple{7,Int}       # width of one copy (0 when frozen)
     base::NTuple{7,Int}    # 0-based start of each block's run of copies
     np::Int
+    gcols::Vector{Int}     # input columns of `Gref` that are packed
 end
 
 # Block ordinals, in layout order.
@@ -637,13 +638,17 @@ function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags, nv::NTuple{
     d = 2n
     m = size(sm.Bu, 2)
     K = _nregimes(sm)
+    #= `Gref` is the one block that can be free in part: `Gref_cols` names the
+    input columns the reference is a function of, and the rest are packed no
+    more than a frozen block is. =#
+    gcols = _gref_cols(f, m)
     w = (
         f.A ? n * n : 0,
         f.S ? n * n : 0,
         f.Qc ? K * n * n : 0,
         f.h ? d : 0,
         (f.Bu && m > 0) ? d * m : 0,
-        (f.Gref && m > 0) ? n * m : 0,
+        n * length(gcols),
         (sm.terminal && f.terminal) ? n : 0,
     )
     bases = zeros(Int, _HB_N)
@@ -652,7 +657,7 @@ function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags, nv::NTuple{
         bases[b] = pos
         pos += nv[b] * w[b]
     end
-    return _HamPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _HB_N), pos)
+    return _HamPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _HB_N), pos, gcols)
 end
 
 """
@@ -809,10 +814,61 @@ function _HamMStepCtx(
     profile::Bool;
     flags::Union{Nothing,HamiltonianFitFlags}=nothing,
 )
-    # Every block moves together: the whole-block case, as `depends_on` uses it.
+    # Every block moves together: the whole-block case.
     return _HamMStepCtx(
         sufs, sms, ntuple(_ -> collect(ab_slots), _HB_N), q_slots, profile; flags=flags
     )
+end
+
+"""
+    _ham_block_array(sm, b) -> AbstractArray
+
+The array holding structural block `b` of `sm`, by `_HB_*` ordinal. Its
+*identity* is what says whether two cells share the block, which is how
+[`_ham_cell_slots`](@ref) recovers the grouping.
+"""
+@inline function _ham_block_array(sm::HamiltonianStateModel, b::Int)
+    b === _HB_A && return _is_free(sm) ? sm.Mfree : sm.A
+    b === _HB_S && return sm.S
+    #= The `Qc` *vector* is rebuilt per variant even when its matrices are
+    shared, so the matrix is what carries the sharing. =#
+    b === _HB_Q && return isempty(sm.Qc) ? sm.Mfree : first(sm.Qc)
+    b === _HB_H && return sm.h
+    b === _HB_B && return sm.Bu
+    b === _HB_G && return sm.Gref
+    return sm.hf
+end
+
+"""
+    _ham_shares_block(sms, b) -> Bool
+
+Whether every model in `sms` holds the *same array* for structural block `b`.
+"""
+function _ham_shares_block(sms::AbstractVector, b::Int)
+    arr = _ham_block_array(first(sms), b)
+    return all(sm -> _ham_block_array(sm, b) === arr, sms)
+end
+
+"""
+    _ham_cell_slots(sms, cell_slots) -> NTuple{7,Vector{Int}}
+
+Per-block copy indices for a `depends_on` fit: `cell_slots` — the structural
+group's slot for each cell — for the pieces that actually vary across cells, and
+a single shared copy for the rest.
+
+This is what makes `(Qc = labels,)` a different model from `(structure =
+labels,)` while resolving to the same cells: both split the trials the same way,
+and only the number of copies of each block differs.
+
+Which is which is read off the cells themselves rather than off the
+declaration. `_build_variants!` shares a piece across cells **by reference**
+exactly when the declaration left it out, so the arrays a cell holds *are* the
+declaration — and the cell models, unlike the model the user declared it on,
+are what this M-step is handed.
+"""
+function _ham_cell_slots(sms::AbstractVector, cell_slots::AbstractVector{Int})
+    shared = ones(Int, length(cell_slots))
+    return ntuple(b -> _ham_shares_block(sms, b) ? shared : collect(cell_slots), _HB_N)
 end
 
 """
@@ -989,7 +1045,8 @@ function _ham_pack!(θ::AbstractVector{T}, ctx::_HamMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_HB_G])
         r = _ham_blk(p, _HB_G, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_HB_G][v])].Gref))
+        isempty(r) ||
+            copyto!(view(θ, r), vec(view(ctx.sms[first(o[_HB_G][v])].Gref, :, p.gcols)))
     end
     for v in 1:(p.nv[_HB_F])
         r = _ham_blk(p, _HB_F, v)
@@ -1053,11 +1110,13 @@ function _ham_unpack!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         end
         for v in 1:(p.nv[_HB_G])
             r = _ham_blk(p, _HB_G, v)
-            if isempty(r)
-                copyto!(ctx.Gref[v], ctx.sms[first(o[_HB_G][v])].Gref)
-            else
-                copyto!(ctx.Gref[v], reshape(view(θ, r), n, p.m))
-            end
+            #= The model's own matrix first, then the free columns over the top:
+            a column `Gref_cols` leaves out keeps the value it was built with,
+            exactly as a frozen block does. =#
+            copyto!(ctx.Gref[v], ctx.sms[first(o[_HB_G][v])].Gref)
+            isempty(r) || copyto!(
+                view(ctx.Gref[v], :, p.gcols), reshape(view(θ, r), n, length(p.gcols))
+            )
         end
     end
     for v in 1:(p.nv[_HB_F])
@@ -1317,7 +1376,7 @@ function _ham_fg!(
     end
     for v in 1:(p.nv[_HB_G])
         r = _ham_blk(p, _HB_G, v)
-        isempty(r) || copyto!(view(grad, r), vec(ctx.dG[v]))
+        isempty(r) || copyto!(view(grad, r), vec(view(ctx.dG[v], :, p.gcols)))
     end
     for v in 1:(p.nv[_HB_F])
         r = _ham_blk(p, _HB_F, v)

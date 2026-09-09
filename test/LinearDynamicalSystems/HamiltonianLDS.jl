@@ -294,10 +294,15 @@ function test_hamiltonian_construction_errors()
     om = GaussianObservationModel(randn(rng, 3, d), Matrix(0.1I, 3, 3), zeros(3))
     @test_throws SSD.NotPositiveDefiniteError LinearDynamicalSystem(sm_bad, om)
 
-    # `depends_on` grouping is refused rather than silently ignored.
+    #= A structural piece may be grouped on its own — `(A = …,)` means "a plant
+    per group, everything else shared" — but a name the model does not own is
+    refused rather than silently ignored. =#
     sm_dep = HamiltonianStateModel(A, Sm, Qc, Σ)
     sm_dep.depends_on = (A=[1, 1, 2],)
-    @test_throws Exception LinearDynamicalSystem(sm_dep, om)
+    @test LinearDynamicalSystem(sm_dep, om) isa LinearDynamicalSystem
+    sm_bad_dep = HamiltonianStateModel(A, Sm, Qc, Σ)
+    sm_bad_dep.depends_on = (Σ=[1, 1, 2],)
+    @test_throws Exception LinearDynamicalSystem(sm_bad_dep, om)
 
     # A schedule that does not cover the longest trial is caught at fit entry.
     sm_short = HamiltonianStateModel(A, Sm, [Qc, Qc], Σ; schedule=cost_schedule(5))
@@ -363,6 +368,31 @@ function test_hamiltonian_rescale_costate()
     @test elbo(lds, y) ≈ before atol = 1e-8
     @test_throws ArgumentError rescale_costate!(sm, 0)
     @test_throws ArgumentError rescale_costate!(sm; target=:nonsense)
+
+    #=
+    A grouped model. One `c` serves every group — the transformation rescales the
+    costate, which they all share — and every array is transformed exactly once,
+    which a piece *shared* between groups makes a real question: visiting the
+    groups in turn would divide `S` by `c` once per group.
+    =#
+    smG, ldsG = ham_fixture(StableRNG(6); nregimes=1, tsteps=12)
+    labels = [1, 1, 2, 2]
+    set_depends_on!(smG, (Qc=labels,))
+    ldsG2 = LinearDynamicalSystem(smG, ldsG.obs_model)
+    ys = [randn(StableRNG(7), ldsG2.obs_dim, 12) .* 0.4 for _ in 1:4]
+    fit!(ldsG2, ys; max_iter=6, progress=false)
+    g1 = group_variant(smG, :Qc, 1)
+    g2 = group_variant(smG, :Qc, 2)
+    @test g1.S === g2.S                              # shared by reference
+    S0, Q1_0, Q2_0 = copy(g1.S), copy(g1.Qc[1]), copy(g2.Qc[1])
+    elbo_before = elbo(ldsG2, ys)
+
+    c = 3.0
+    rescale_costate!(smG, c)
+    @test g1.S ≈ S0 ./ c                             # once, not once per group
+    @test g1.Qc[1] ≈ Q1_0 .* c
+    @test g2.Qc[1] ≈ Q2_0 .* c
+    @test elbo(ldsG2, ys) ≈ elbo_before atol = 1e-7
     return nothing
 end
 
@@ -1182,6 +1212,70 @@ function test_hamiltonian_tracking_mstep()
     return nothing
 end
 
+function test_hamiltonian_gref_columns()
+    rng = StableRNG(62)
+    n = 2
+    m = 4
+    tsteps = 16
+    ntrials = 20
+
+    function fixture(cols)
+        r = StableRNG(62)
+        sm, lds = ham_fixture(r; terminal=true, nregimes=2, tsteps=tsteps, ux_dim=m)
+        sm.Gref .= 0
+        sm.Gref[:, 2:3] .= randn(r, n, 2) .* 0.5
+        sm.fit_flags = HamiltonianFitFlags(; Gref_cols=cols)
+        refresh!(sm)
+        ys = [randn(r, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
+        uxs = [randn(r, m, tsteps) for _ in 1:ntrials]
+        return sm, lds, ys, uxs
+    end
+
+    # Only the named columns are packed, and only they move.
+    sm, lds, ys, uxs = fixture([2, 3])
+    @test SSD._HamPack(sm).np == SSD._HamPack(sm, HamiltonianFitFlags()).np - n * (m - 2)
+    G0 = copy(sm.Gref)
+    els = fit!(lds, ys; ux=uxs, max_iter=8, progress=false)
+    @test minimum(diff(els)) > -1e-8
+    @test sm.Gref[:, [1, 4]] == G0[:, [1, 4]]
+    @test !(sm.Gref[:, 2:3] ≈ G0[:, 2:3])
+
+    #=
+    Naming every column must be the *same* fit as naming none: the narrowing is
+    a restriction of the packed problem, not a different objective.
+    =#
+    smA, ldsA, ysA, uxsA = fixture(collect(1:m))
+    elsA = fit!(ldsA, ysA; ux=uxsA, max_iter=8, progress=false)
+    smB, ldsB, ysB, uxsB = fixture(nothing)
+    elsB = fit!(ldsB, ysB; ux=uxsB, max_iter=8, progress=false)
+    @test maximum(abs, elsA .- elsB) < 1e-10
+    @test smA.Gref ≈ smB.Gref
+
+    # And the restricted model is nested inside the free one.
+    @test last(els) <= last(elsB) + 1e-8
+
+    # Freezing wins over narrowing, and the flags validate against the width.
+    smC, ldsC, ysC, uxsC = fixture([2, 3])
+    smC.fit_flags = HamiltonianFitFlags(; Gref=false, Gref_cols=[2, 3])
+    GC = copy(smC.Gref)
+    fit!(ldsC, ysC; ux=uxsC, max_iter=4, progress=false)
+    @test smC.Gref == GC
+    @test_throws ArgumentError HamiltonianFitFlags(; Gref_cols=Int[])
+    @test_throws ArgumentError HamiltonianStateModel(
+        Matrix(0.9I, n, n),
+        Matrix(0.2I, n, n),
+        [Matrix(1.0I, n, n)],
+        Matrix(0.1I, 2n, 2n);
+        Bu=zeros(2n, m),
+        fit_flags=HamiltonianFitFlags(; Gref_cols=[m + 1]),
+    )
+
+    # Flags compare by value, which an SLDS's "same flags" check relies on.
+    @test HamiltonianFitFlags(; Gref_cols=[2, 3]) == HamiltonianFitFlags(; Gref_cols=[2, 3])
+    @test HamiltonianFitFlags(; Gref_cols=[2, 3]) != HamiltonianFitFlags(; Gref_cols=[2])
+    return nothing
+end
+
 function test_hamiltonian_depends_on()
     rng = StableRNG(70)
     tsteps = 16
@@ -1238,11 +1332,53 @@ function test_hamiltonian_depends_on()
     `set_depends_on!` only records the declaration; it is resolved — and so
     rejected — when the model goes into a `LinearDynamicalSystem`.
     =#
-    for bad in ((A=session,), (Qc=session,), (Σ=session,))
+    for bad in ((Σ=session,), (Mfree=session,), (nonsense=session,))
         smE, ldsE = ham_fixture(StableRNG(73); nregimes=1, tsteps=tsteps)
         set_depends_on!(smE, bad)
         @test_throws ArgumentError LinearDynamicalSystem(smE, ldsE.obs_model)
     end
+
+    #=
+    A piece of the structural block on its own. The cells are the same ones
+    `:structure` would give — the pieces are still solved jointly — but only the
+    named piece gets a copy per group, so `(Qc = session,)` is "one plant, a cost
+    per session" rather than "a different arm per session".
+    =#
+    smP, ldsP = ham_fixture(StableRNG(74); nregimes=2, terminal=true, tsteps=tsteps)
+    set_depends_on!(smP, (Qc=session,))
+    ldsP2 = LinearDynamicalSystem(smP, ldsP.obs_model)
+    elsP = fit!(ldsP2, ys; max_iter=10, progress=false)
+    @test minimum(diff(elsP)) > -1e-8
+    p1 = group_parameter(smP, :structure, 1)
+    p2 = group_parameter(smP, :structure, 2)
+    @test !(p1.Qc[1] ≈ p2.Qc[1])              # the named piece varies
+    @test p1.A === p2.A                       # the rest is one shared array
+    @test p1.S === p2.S
+    @test p1.h === p2.h && p1.Bu === p2.Bu && p1.Gref === p2.Gref
+    @test group_labels(smP, :Qc) == Any[1, 2]
+    for v in (p1, p2)
+        @test symplectic_defect(v) < 1e-9
+    end
+
+    # Naming several pieces is legal; naming them inconsistently is not.
+    smQ, ldsQ = ham_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smQ, (Qc=session, h=session))
+    ldsQ2 = LinearDynamicalSystem(smQ, ldsQ.obs_model)
+    @test minimum(diff(fit!(ldsQ2, ys; max_iter=6, progress=false))) > -1e-8
+    q1 = group_parameter(smQ, :structure, 1)
+    q2 = group_parameter(smQ, :structure, 2)
+    @test q1.A === q2.A && !(q1.h === q2.h)
+    smR, ldsR = ham_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smR, (Qc=session, h=one_group))
+    @test_throws ArgumentError LinearDynamicalSystem(smR, ldsR.obs_model)
+
+    # A single group still reproduces the ungrouped fit exactly, piecewise too.
+    smS, ldsS = ham_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smS, (Qc=one_group,))
+    elsS = fit!(LinearDynamicalSystem(smS, ldsS.obs_model), ys; max_iter=8, progress=false)
+    smT, ldsT = ham_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    elsT = fit!(ldsT, ys; max_iter=8, progress=false)
+    @test maximum(abs, elsS .- elsT) < 1e-8
 
     # Grouped structure really does diverge, while a shared group stays shared.
     smF, ldsF = ham_fixture(StableRNG(74); nregimes=1, tsteps=tsteps)

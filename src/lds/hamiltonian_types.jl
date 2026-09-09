@@ -14,7 +14,7 @@ The E-step kernels live in `hamiltonian_latents.jl` and the M-step in
 
 """
     HamiltonianFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
-                        terminal=true)
+                        terminal=true, Gref_cols=nothing)
 
 Which structural parameters of a [`HamiltonianStateModel`](@ref) the M-step is
 free to move. Every flag defaults to `true`.
@@ -30,6 +30,24 @@ follows the enclosing `fit_bool`'s noise slot). The terminal *cost* is one of th
 `Qc` matrices, so it moves with `Qc` — and the terminal factor always contributes
 to the objective when the model has one, since leaving it out would make the
 gradient with respect to that cost matrix wrong.
+
+## Estimating the reference from part of the input
+
+`Gref_cols` narrows `Gref` to a subset of the input columns: those columns are
+estimated and every other column of `Gref` keeps its constructed value, normally
+zero. `nothing` (the default) leaves the whole matrix free, and `Gref = false`
+freezes all of it — `Gref_cols` is the middle setting between them.
+
+It is what "the reference depends on *this* variable" means when the variable is
+one block of a wider design. With inputs `[reward, direction[T.2] … direction[T.8],
+reward:direction…]`, naming the seven direction columns fits a free reference
+vector per direction while pinning the reference at zero for everything else —
+whereas a fully free `Gref` would also read a reference off reward, which is a
+different claim about the task. Like a frozen block, the narrowed columns are
+never packed, so this shrinks the M-step problem rather than projecting it.
+
+Columns are 1-based indices into the model's input width, validated when the
+model is built (which is the first point that width is known).
 """
 struct HamiltonianFitFlags
     A::Bool
@@ -39,6 +57,7 @@ struct HamiltonianFitFlags
     Bu::Bool
     Gref::Bool
     terminal::Bool
+    Gref_cols::Union{Nothing,Vector{Int}}
 end
 
 function HamiltonianFitFlags(;
@@ -49,8 +68,100 @@ function HamiltonianFitFlags(;
     Bu::Bool=true,
     Gref::Bool=true,
     terminal::Bool=true,
+    Gref_cols::Union{Nothing,AbstractVector{<:Integer}}=nothing,
 )
-    return HamiltonianFitFlags(A, S, Qc, h, Bu, Gref, terminal)
+    cols = Gref_cols === nothing ? nothing : sort!(unique(collect(Int, Gref_cols)))
+    if cols !== nothing
+        isempty(cols) && throw(
+            ArgumentError(
+                "Gref_cols is empty, which would leave nothing of the reference map " *
+                "to estimate; pass `Gref = false` to freeze it outright, or `nothing` " *
+                "to estimate every column",
+            ),
+        )
+        minimum(cols) >= 1 || throw(
+            ArgumentError("Gref_cols must be 1-based column indices; got $(minimum(cols))"),
+        )
+    end
+    return HamiltonianFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols)
+end
+
+"""
+    _HAM_STRUCT_NAMES
+
+The pieces of the structural block, in the order the M-step packs them — the
+`_HB_*` ordinals of `hamiltonian_mstep.jl`, so `_HAM_STRUCT_NAMES[b]` names
+block `b`. `:terminal` is the terminal factor's offset `hf`, named after the flag
+that gates it.
+
+They are one joint estimate, and `depends_on` still resolves them to the single
+group `:structure`. What the names buy is the *degree* of grouping: naming
+`:Qc` alone splits the cost across groups while every other piece stays one
+shared array, which the M-step delivers in a single solve because it already
+carries a per-block count of copies (that is how an SLDS ties `A` and `S` while
+`Qc` switches).
+"""
+const _HAM_STRUCT_NAMES = (:A, :S, :Qc, :h, :Bu, :Gref, :terminal)
+
+#=
+`Gref_cols` makes the flags no longer a plain-data struct, and the default `==`
+on those falls back to `===` — which would call two separately built but
+identical sets of flags different, and an SLDS refuses to run when its states
+disagree on them. Compare by value instead.
+=#
+function Base.:(==)(a::HamiltonianFitFlags, b::HamiltonianFitFlags)
+    return a.A == b.A &&
+           a.S == b.S &&
+           a.Qc == b.Qc &&
+           a.h == b.h &&
+           a.Bu == b.Bu &&
+           a.Gref == b.Gref &&
+           a.terminal == b.terminal &&
+           a.Gref_cols == b.Gref_cols
+end
+
+function Base.hash(f::HamiltonianFitFlags, h::UInt)
+    return hash(
+        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols),
+        hash(:HamiltonianFitFlags, h),
+    )
+end
+
+"""
+    _gref_cols(f, m) -> Vector{Int}
+
+The input columns of `Gref` the M-step packs, given an input width of `m`: every
+column unless [`HamiltonianFitFlags`](@ref)'s `Gref_cols` narrows them, and none
+when `Gref` is frozen or the model has no input at all.
+"""
+@inline function _gref_cols(f::HamiltonianFitFlags, m::Int)
+    (f.Gref && m > 0) || return Int[]
+    return f.Gref_cols === nothing ? collect(1:m) : f.Gref_cols
+end
+
+"""
+    _check_gref_cols(f, m)
+
+Reject `Gref_cols` that names a column the model does not have. Checked at model
+construction because that is where the input width is first known — the flags
+themselves are built before anyone knows how wide `Gref` will be.
+"""
+function _check_gref_cols(f::HamiltonianFitFlags, m::Int)
+    cols = f.Gref_cols
+    cols === nothing && return nothing
+    m > 0 || throw(
+        ArgumentError(
+            "fit_flags.Gref_cols names reference columns $(cols), but this model has " *
+            "no input for the reference to be a function of; give it a `Bu`/`Gref` " *
+            "width, or drop Gref_cols",
+        ),
+    )
+    maximum(cols) <= m || throw(
+        ArgumentError(
+            "fit_flags.Gref_cols names column $(maximum(cols)) of a $(m)-column input"
+        ),
+    )
+    return nothing
 end
 
 """
@@ -437,6 +548,25 @@ function _require_lqr(sm::HamiltonianStateModel, what::AbstractString)
 end
 
 """
+    _ham_struct_varies(sm) -> NTuple{7,Bool}
+
+Which pieces of the structural block get one copy per `depends_on` group, in
+`_HB_*` order. All of them for `(structure = labels,)`, exactly the named ones
+for `(Qc = labels,)`, and none at all when nothing groups the structural block.
+
+Every piece not named here is a single array shared by every variant, so it is
+estimated jointly from all the trials — shared *and* fitted, which freezing it
+would not give.
+"""
+function _ham_struct_varies(sm::HamiltonianStateModel)
+    dep = sm.depends_on
+    dep === nothing && return ntuple(_ -> false, length(_HAM_STRUCT_NAMES))
+    names = keys(dep)
+    :structure in names && return ntuple(_ -> true, length(_HAM_STRUCT_NAMES))
+    return ntuple(b -> _HAM_STRUCT_NAMES[b] in names, length(_HAM_STRUCT_NAMES))
+end
+
+"""
     _nregimes(sm) -> Int
 
 How many distinct cost matrices the model carries.
@@ -661,6 +791,7 @@ function HamiltonianStateModel(
             size(Gref_m, 2),
         ),
     )
+    _check_gref_cols(fit_flags, size(Gref_m, 2))
     length(x0_v) == d || throw(DimensionMismatchError("Hamiltonian x0", d, length(x0_v)))
     size(P0_m) == (d, d) ||
         throw(DimensionMismatchError("Hamiltonian P0 rows", d, size(P0_m, 1)))
@@ -1239,6 +1370,21 @@ Pass a number instead to set `c` yourself.
 Two fits of the same data are only comparable in their cost matrices after this
 (or some other) normalization. **The emission's costate columns are not
 rescaled** — rescale `C[:, n+1:2n] ./= c` yourself if `observe_costate` is set.
+
+## A grouped model
+
+One `c` serves the whole model, groups included. It has to: the transformation
+rescales the *costate*, and every group's parameters — and the one emission that
+reads them — are written against the same latent, so a factor per group would put
+the groups on scales that no longer compare with each other, which is the one
+thing a canonical scale is for. `target` therefore reads the scale off `Qc[1]` of
+the group whose arrays the model itself holds, and the other groups keep their
+size relative to it.
+
+Each array is transformed exactly once. That matters because a grouped model
+shares the pieces the declaration did not name **by reference**: with
+`depends_on = (Qc = labels,)` every group holds the same `S`, and visiting the
+groups in turn would divide it by `c` once per group.
 """
 function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
     _require_lqr(sm, "rescaling the costate")
@@ -1249,57 +1395,64 @@ function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
     pins the sign as well, by making `tr(Qc[1])` positive.
     =#
     iszero(c) && throw(ArgumentError("the costate scale must be nonzero; got $c"))
-    _check_rescalable(sm)
     cT = T(c)
-    n = _plant_dim(sm)
-    d = 2n
-    sm.S ./= cT
-    for Q in sm.Qc
-        Q .*= cT
-    end
-    sm.Σf .*= cT^2
-    sm.hf .*= cT
-    @views begin
-        # λ-rows of the 2n-vectors / matrices scale by c; x-rows are untouched.
-        sm.h[(n + 1):d] .*= cT
-        sm.x0[(n + 1):d] .*= cT
-        sm.P0[(n + 1):d, :] .*= cT
-        sm.P0[:, (n + 1):d] .*= cT
-        sm.Σ[(n + 1):d, :] .*= cT
-        sm.Σ[:, (n + 1):d] .*= cT
-        size(sm.Bu, 2) > 0 && (sm.Bu[(n + 1):d, :] .*= cT)
+    #= Every array the parent holds is some variant's slot 1, so walking the
+    variants reaches all of them; the parent still needs its own `refresh!`,
+    since each variant caches its own derived transition. =#
+    seen = Base.IdSet{Any}()
+    variants = sm.variants
+    for v in (variants === nothing ? (sm,) : variants)
+        _rescale_costate_arrays!(v, cT, seen)
+        refresh!(v)
     end
     return refresh!(sm)
 end
 
 """
-    _check_rescalable(sm)
+    _rescale_costate_arrays!(sm, c, seen) -> sm
 
-Refuse to rescale a model whose *structural* parameters are grouped.
+The array-level half of [`rescale_costate!`](@ref): scale each of this model's
+parameter arrays by the power of `c` the transformation gives it, skipping any
+array already in `seen` and adding the rest to it.
 
-Variants alias the parent's arrays for every group that does not vary, so
-rescaling the parent rescales them all — correct, and the ordinary stitched case,
-where only the emission is grouped. A variant that holds its **own** `S` is one
-whose structure varies by cell, and then a single pass over the parent would
-rescale one cell's cost and leave the others, leaving the cells on different
-costate scales. There is no right global `c` to apply blind, so this says so
-rather than quietly making a mess.
+`A` and `Gref` are absent because the transformation leaves them alone — the
+plant and the reference are in state coordinates, which do not move.
 """
-function _check_rescalable(sm::HamiltonianStateModel)
-    variants = sm.variants
-    variants === nothing && return nothing
-    for v in variants
-        v.S === sm.S && continue
-        throw(
-            ArgumentError(
-                "this model's structural parameters are grouped (`depends_on`), so its " *
-                "cells hold separate costs and one costate rescaling cannot serve them " *
-                "all. Rescale each variant on its own, or normalize after splitting the " *
-                "fit by cell.",
-            ),
-        )
+function _rescale_costate_arrays!(
+    sm::HamiltonianStateModel{T}, cT::T, seen::Base.IdSet
+) where {T<:Real}
+    n = _plant_dim(sm)
+    d = 2n
+    _rescale_once!(seen, sm.S) && (sm.S ./= cT)
+    for Q in sm.Qc
+        _rescale_once!(seen, Q) && (Q .*= cT)
     end
-    return nothing
+    _rescale_once!(seen, sm.Σf) && (sm.Σf .*= cT^2)
+    _rescale_once!(seen, sm.hf) && (sm.hf .*= cT)
+    @views begin
+        # λ-rows of the 2n-vectors / matrices scale by c; x-rows are untouched.
+        _rescale_once!(seen, sm.h) && (sm.h[(n + 1):d] .*= cT)
+        _rescale_once!(seen, sm.x0) && (sm.x0[(n + 1):d] .*= cT)
+        if _rescale_once!(seen, sm.P0)
+            sm.P0[(n + 1):d, :] .*= cT
+            sm.P0[:, (n + 1):d] .*= cT
+        end
+        if _rescale_once!(seen, sm.Σ)
+            sm.Σ[(n + 1):d, :] .*= cT
+            sm.Σ[:, (n + 1):d] .*= cT
+        end
+        if size(sm.Bu, 2) > 0 && _rescale_once!(seen, sm.Bu)
+            sm.Bu[(n + 1):d, :] .*= cT
+        end
+    end
+    return sm
+end
+
+"""Whether `array` is new to `seen`, recording it either way."""
+function _rescale_once!(seen::Base.IdSet, array)
+    array in seen && return false
+    push!(seen, array)
+    return true
 end
 
 function rescale_costate!(

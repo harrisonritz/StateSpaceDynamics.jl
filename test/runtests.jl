@@ -431,6 +431,7 @@ using SSDTest
                 test_hamiltonian_depends_on()
                 test_hamiltonian_tracking_control()
                 test_hamiltonian_tracking_mstep()
+                test_hamiltonian_gref_columns()
                 test_hamiltonian_ragged_with_schedule()
                 test_hamiltonian_sampling()
                 test_hamiltonian_simulate_lqr()

@@ -4393,10 +4393,16 @@ function _grouped_slds_state_mstep!(
     cell_of(u) = fldmod1(u, ncells)[2]
 
     block_slots = _ham_block_slots(tied, K)
+    #= Two axes, and each block may be shared on either: `tied_params` says
+    which pieces every discrete state shares, and the `depends_on` declaration
+    which pieces every group of trials shares. A piece shared on an axis takes
+    one version along it. =#
+    first_regime = [u for u in lqr if regime_of(u) == regime_of(lqr[1])]
+    cell_shares = ntuple(b -> _ham_shares_block(sms[first_regime], b), 7)
     ab_slots = ntuple(
         b -> _ham_pair_slots(
             [block_slots[b][regime_of(u)] for u in lqr],
-            [grp.cell_slot[_G_AB][cell_of(u)] for u in lqr],
+            [cell_shares[b] ? 1 : grp.cell_slot[_G_AB][cell_of(u)] for u in lqr],
         ),
         7,
     )
