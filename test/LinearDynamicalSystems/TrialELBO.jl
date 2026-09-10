@@ -185,9 +185,9 @@ function test_trial_elbos_rejects_grouping()
 end
 
 #=============================================================================
-Hamiltonian (inverse-LQR) latents.
+LQR latents.
 
-The same contract, reached by a different route: the Hamiltonian state Q-term
+The same contract, reached by a different route: the LQR state Q-term
 has no per-trial kernel, so the split re-aggregates each trial's statistics and
 calls the aggregated `Q_state!` on them. That is exact only because `Q_state!`
 is additive over trials at fixed parameters — the residual scatter is linear in
@@ -201,11 +201,11 @@ useful horizon and would leave nothing but overflow to compare.
 
 const TE_HN, TE_HT = 2, 18
 
-function _te_ham_sm(;
+function _te_lqr_sm(;
     ux_dim=0, terminal=false, K=1, tsteps=TE_HT, onset=1, observe_costate=false
 )
     n = TE_HN
-    return HamiltonianStateModel(
+    return LQRStateModel(
         [1.0 0.1; -0.05 0.95],
         0.3 * Matrix{Float64}(I, n, n),
         [(0.5 + 0.4k) * Matrix{Float64}(I, n, n) for k in 1:K],
@@ -223,7 +223,7 @@ function _te_ham_sm(;
     )
 end
 
-function _te_ham_gom(seed; costate=false)
+function _te_lqr_gom(seed; costate=false)
     return GaussianObservationModel(;
         C=if costate
             randn(StableRNG(seed), TE_N, 2TE_HN)
@@ -236,7 +236,7 @@ function _te_ham_gom(seed; costate=false)
     )
 end
 
-function _te_ham_pom(seed)
+function _te_lqr_pom(seed)
     return PoissonObservationModel(;
         C=hcat(0.4 .* randn(StableRNG(seed), TE_N, TE_HN), zeros(TE_N, TE_HN)),
         d=fill(-0.5, TE_N),
@@ -245,19 +245,19 @@ function _te_ham_pom(seed)
 end
 
 """
-    _te_ham_data(rng, lds, lengths; ux=nothing) -> y
+    _te_lqr_data(rng, lds, lengths; ux=nothing) -> y
 
 Latent paths on the stable manifold via [`simulate_lqr`](@ref), then one draw
 from the emission per trial, shaped the way `Data` wants it (a composite's
 per-trial `NamedTuple`s are transposed into a `NamedTuple` of vectors).
 """
-function _te_ham_data(rng, lds, lengths; ux=nothing)
+function _te_lqr_data(rng, lds, lengths; ux=nothing)
     sm = lds.state_model
     params = SSD._extract_obs_params(lds.obs_model)
     ys = map(enumerate(lengths)) do (i, len)
         z = simulate_lqr(rng, sm, len; costate_slack=0.05, ux=ux === nothing ? nothing : ux[i])
         y = SSD._alloc_obs(lds, len)
-        SSD._sample_hamiltonian_obs!(
+        SSD._sample_lqr_obs!(
             rng,
             y,
             z,
@@ -273,81 +273,81 @@ function _te_ham_data(rng, lds, lengths; ux=nothing)
 end
 
 """
-    test_trial_elbos_hamiltonian()
+    test_trial_elbos_lqr()
 
-The identity across the shapes a Hamiltonian model comes in: a Gaussian and a
+The identity across the shapes an LQR model comes in: a Gaussian and a
 Poisson emission at one cost regime, a scheduled multi-regime cost with the
 terminal factor on, and a composite mixing both emissions. The Gaussian case
 also pins the vector to the exact `loglikelihood`, whose smoother is exact on
 `z = [x; λ]` — and which, with a terminal factor, is `log p(y, y_term = 0)`.
 """
-function test_trial_elbos_hamiltonian()
-    lds = LinearDynamicalSystem(_te_ham_sm(), _te_ham_gom(21))
-    y = _te_ham_data(StableRNG(21), lds, fill(TE_HT, TE_NTR))
+function test_trial_elbos_lqr()
+    lds = LinearDynamicalSystem(_te_lqr_sm(), _te_lqr_gom(21))
+    y = _te_lqr_data(StableRNG(21), lds, fill(TE_HT, TE_NTR))
     per_trial = _te_sum_matches(lds, y, TE_NTR)
     @test isapprox(sum(per_trial), loglikelihood(lds, y); rtol=1e-10)
 
-    plds = LinearDynamicalSystem(_te_ham_sm(), _te_ham_pom(22))
-    _te_sum_matches(plds, _te_ham_data(StableRNG(22), plds, fill(TE_HT, TE_NTR)), TE_NTR)
+    plds = LinearDynamicalSystem(_te_lqr_sm(), _te_lqr_pom(22))
+    _te_sum_matches(plds, _te_lqr_data(StableRNG(22), plds, fill(TE_HT, TE_NTR)), TE_NTR)
 
     # Three cost regimes on a schedule, with the terminal costate factor active:
     # the transition blocks are per regime and the terminal block is per trial,
     # so a trial's share of either going astray shows up here.
     sched = LinearDynamicalSystem(
-        _te_ham_sm(; terminal=true, K=3, onset=8), _te_ham_pom(23)
+        _te_lqr_sm(; terminal=true, K=3, onset=8), _te_lqr_pom(23)
     )
-    _te_sum_matches(sched, _te_ham_data(StableRNG(23), sched, fill(TE_HT, TE_NTR)), TE_NTR)
+    _te_sum_matches(sched, _te_lqr_data(StableRNG(23), sched, fill(TE_HT, TE_NTR)), TE_NTR)
 
     comp = LinearDynamicalSystem(
-        _te_ham_sm(; terminal=true, K=2), (spk=_te_ham_pom(24), kin=_te_ham_gom(25))
+        _te_lqr_sm(; terminal=true, K=2), (spk=_te_lqr_pom(24), kin=_te_lqr_gom(25))
     )
     return _te_sum_matches(
-        comp, _te_ham_data(StableRNG(24), comp, fill(TE_HT, TE_NTR)), TE_NTR
+        comp, _te_lqr_data(StableRNG(24), comp, fill(TE_HT, TE_NTR)), TE_NTR
     )
 end
 
 """
-    test_trial_elbos_hamiltonian_inputs()
+    test_trial_elbos_lqr_inputs()
 
 Ragged trial lengths under a schedule that covers the longest, a costate the
 emission is allowed to read, and a tracking reference driven by `ux` — the three
 places a per-trial split could pick up the wrong trial's timesteps, regime or
 input column.
 """
-function test_trial_elbos_hamiltonian_inputs()
+function test_trial_elbos_lqr_inputs()
     lengths = [TE_HT, TE_HT - 5, TE_HT - 2]
 
-    ragged = LinearDynamicalSystem(_te_ham_sm(; K=2, onset=9), _te_ham_pom(26))
-    _te_sum_matches(ragged, _te_ham_data(StableRNG(26), ragged, lengths), length(lengths))
+    ragged = LinearDynamicalSystem(_te_lqr_sm(; K=2, onset=9), _te_lqr_pom(26))
+    _te_sum_matches(ragged, _te_lqr_data(StableRNG(26), ragged, lengths), length(lengths))
 
     costate = LinearDynamicalSystem(
-        _te_ham_sm(; observe_costate=true), _te_ham_gom(27; costate=true)
+        _te_lqr_sm(; observe_costate=true), _te_lqr_gom(27; costate=true)
     )
     @test !iszero(view(costate.obs_model.C, :, (TE_HN + 1):(2TE_HN)))
-    _te_sum_matches(costate, _te_ham_data(StableRNG(27), costate, lengths), length(lengths))
+    _te_sum_matches(costate, _te_lqr_data(StableRNG(27), costate, lengths), length(lengths))
 
     # Tracking: `Gref` maps the input to the reference the cost is measured
     # against, so it enters both the per-regime transition and the terminal
     # residual. Both are per trial through `ux`.
-    sm = _te_ham_sm(; ux_dim=TE_HN, terminal=true, K=3, onset=8)
+    sm = _te_lqr_sm(; ux_dim=TE_HN, terminal=true, K=3, onset=8)
     sm.Gref .= Matrix{Float64}(I, TE_HN, TE_HN)
     refresh!(sm)
-    track = LinearDynamicalSystem(sm, _te_ham_gom(28))
+    track = LinearDynamicalSystem(sm, _te_lqr_gom(28))
     ux = [randn(StableRNG(100 + i), TE_HN, len) for (i, len) in enumerate(lengths)]
-    y = _te_ham_data(StableRNG(28), track, lengths; ux=ux)
+    y = _te_lqr_data(StableRNG(28), track, lengths; ux=ux)
     return _te_sum_matches(track, y, length(lengths); ux=ux)
 end
 
 """
-    test_trial_elbos_hamiltonian_rejects_grouping()
+    test_trial_elbos_lqr_rejects_grouping()
 
-As for every other state model: a grouped Hamiltonian model carries one
+As for every other state model: a grouped LQR model carries one
 structural estimate per cell, and scoring trials under a single set would be
 silently wrong.
 """
-function test_trial_elbos_hamiltonian_rejects_grouping()
-    lds = LinearDynamicalSystem(_te_ham_sm(), _te_ham_gom(29))
-    y = _te_ham_data(StableRNG(29), lds, fill(TE_HT, TE_NTR))
+function test_trial_elbos_lqr_rejects_grouping()
+    lds = LinearDynamicalSystem(_te_lqr_sm(), _te_lqr_gom(29))
+    y = _te_lqr_data(StableRNG(29), lds, fill(TE_HT, TE_NTR))
     labels = [:a, :a, :b, :b, :b]
     set_depends_on!(lds.state_model, (structure=labels,))
     @test_throws ErrorException trial_elbos(lds, y)

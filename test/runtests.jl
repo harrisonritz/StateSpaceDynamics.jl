@@ -386,58 +386,58 @@ using SSDTest
             end
         end
 
-        include("LinearDynamicalSystems/HamiltonianLDS.jl")
-        @testset "Hamiltonian (inverse-LQR) LDS" begin
+        include("LinearDynamicalSystems/LQRLDS.jl")
+        @testset "LQR LDS" begin
             @testset "Structure" begin
-                test_hamiltonian_structure()
-                test_hamiltonian_regimes_and_schedule()
-                test_hamiltonian_construction_errors()
-                test_hamiltonian_refresh_and_utilities()
-                test_hamiltonian_rescale_costate()
+                test_lqr_structure()
+                test_lqr_regimes_and_schedule()
+                test_lqr_construction_errors()
+                test_lqr_refresh_and_utilities()
+                test_lqr_rescale_costate()
             end
 
             @testset "Free mode" begin
-                test_hamiltonian_free_construction()
-                test_hamiltonian_total_dim_constructor()
-                test_hamiltonian_free_matches_gaussian_lds()
-                test_hamiltonian_free_fit_flags()
-                test_hamiltonian_free_show()
+                test_lqr_free_construction()
+                test_lqr_total_dim_constructor()
+                test_lqr_free_matches_gaussian_lds()
+                test_lqr_free_fit_flags()
+                test_lqr_free_show()
             end
 
             @testset "E-step" begin
-                test_hamiltonian_reduces_to_gaussian_lds()
-                test_hamiltonian_multitrial_equivalence()
-                test_hamiltonian_batched_gradient_matches_per_trial()
-                test_hamiltonian_gradient_and_hessian()
-                test_hamiltonian_elbo_matches_exact_marginal()
-                test_hamiltonian_sufficient_statistics()
-                test_hamiltonian_weighted_stats()
+                test_lqr_reduces_to_gaussian_lds()
+                test_lqr_multitrial_equivalence()
+                test_lqr_batched_gradient_matches_per_trial()
+                test_lqr_gradient_and_hessian()
+                test_lqr_elbo_matches_exact_marginal()
+                test_lqr_sufficient_statistics()
+                test_lqr_weighted_stats()
             end
 
             @testset "M-step" begin
-                test_hamiltonian_mstep_objective_and_gradient()
-                test_hamiltonian_mstep_freezing()
-                test_hamiltonian_mstep_preserves_structure()
-                test_hamiltonian_em_monotone()
-                test_hamiltonian_noise_update_closed_form()
-                test_hamiltonian_recovers_parameters()
+                test_lqr_mstep_objective_and_gradient()
+                test_lqr_mstep_freezing()
+                test_lqr_mstep_preserves_structure()
+                test_lqr_em_monotone()
+                test_lqr_noise_update_closed_form()
+                test_lqr_recovers_parameters()
             end
 
             @testset "Emissions, sampling and printing" begin
-                test_hamiltonian_costate_readout_mask()
-                test_hamiltonian_masked_fit_matches_reduced_model()
-                test_hamiltonian_poisson_emission()
-                test_hamiltonian_composite_emission()
-                test_hamiltonian_depends_on()
-                test_hamiltonian_tracking_control()
-                test_hamiltonian_tracking_mstep()
-                test_hamiltonian_gref_columns()
-                test_hamiltonian_ragged_with_schedule()
-                test_hamiltonian_sampling()
-                test_hamiltonian_simulate_lqr()
-                test_hamiltonian_show()
-                test_hamiltonian_priors_and_fit_bool()
-                test_hamiltonian_single_trial_and_edge_cases()
+                test_lqr_costate_readout_mask()
+                test_lqr_masked_fit_matches_reduced_model()
+                test_lqr_poisson_emission()
+                test_lqr_composite_emission()
+                test_lqr_depends_on()
+                test_lqr_tracking_control()
+                test_lqr_tracking_mstep()
+                test_lqr_gref_columns()
+                test_lqr_ragged_with_schedule()
+                test_lqr_sampling()
+                test_lqr_simulate_lqr()
+                test_lqr_show()
+                test_lqr_priors_and_fit_bool()
+                test_lqr_single_trial_and_edge_cases()
             end
         end
 
@@ -448,10 +448,10 @@ using SSDTest
             test_trial_elbos_single_trial()
             test_trial_elbos_prior_excluded()
             test_trial_elbos_rejects_grouping()
-            @testset "Hamiltonian latents" begin
-                test_trial_elbos_hamiltonian()
-                test_trial_elbos_hamiltonian_inputs()
-                test_trial_elbos_hamiltonian_rejects_grouping()
+            @testset "LQR latents" begin
+                test_trial_elbos_lqr()
+                test_trial_elbos_lqr_inputs()
+                test_trial_elbos_lqr_rejects_grouping()
             end
         end
 
@@ -470,20 +470,20 @@ using SSDTest
             end
         end
 
-        include("LinearDynamicalSystems/HamiltonianSLDS.jl")
-        @testset "Switching inverse-LQR (Hamiltonian SLDS)" begin
-            test_slds_hamiltonian_matches_lds()
-            test_slds_hamiltonian_monotone()
+        include("LinearDynamicalSystems/LQRSLDS.jl")
+        @testset "Switching inverse-LQR (LQR SLDS)" begin
+            test_slds_lqr_matches_lds()
+            test_slds_lqr_monotone()
             test_slds_free_matches_gaussian_slds()
             test_slds_mixed_free_and_lqr()
-            test_slds_hamiltonian_tied()
-            test_slds_hamiltonian_terminal()
-            test_slds_hamiltonian_validation()
-            test_slds_hamiltonian_prior_vs_optimal_data()
-            test_slds_hamiltonian_rand()
-            test_slds_hamiltonian_noise_version_lookup()
-            test_slds_hamiltonian_grouped()
-            test_ham_pair_slots()
+            test_slds_lqr_tied()
+            test_slds_lqr_terminal()
+            test_slds_lqr_validation()
+            test_slds_lqr_prior_vs_optimal_data()
+            test_slds_lqr_rand()
+            test_slds_lqr_noise_version_lookup()
+            test_slds_lqr_grouped()
+            test_lqr_pair_slots()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

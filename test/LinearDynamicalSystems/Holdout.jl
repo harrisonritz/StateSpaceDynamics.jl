@@ -61,15 +61,15 @@ function _ho_gaussian_data(; seed=7)
 end
 
 #=
-A mild plant (`ρ(M)` near 1), matching `HamiltonianLDS.jl`'s fixture. A random
+A mild plant (`ρ(M)` near 1), matching `LQRLDS.jl`'s fixture. A random
 symplectic transition is unstable by construction, so sampling one over a long
 horizon diverges — these tests need a model whose forward chain is usable.
 =#
-function _ho_ham_lds(seed; poisson::Bool=false)
+function _ho_lqr_lds(seed; poisson::Bool=false)
     n = 2
     d = 2n
     A = [0.96 0.07; -0.05 0.93]
-    sm = HamiltonianStateModel(
+    sm = LQRStateModel(
         A,
         [0.06 0.01; 0.01 0.05],
         [[0.25 0.04; 0.04 0.18]],
@@ -420,16 +420,16 @@ function test_holdout_all_families()
         @test length(tr.test) == 4
     end
 
-    @testset "Hamiltonian (Gaussian emission)" begin
-        _, yh = rand(StableRNG(32), _ho_ham_lds(30), fill(14, HO_NTR))
+    @testset "LQR (Gaussian emission)" begin
+        _, yh = rand(StableRNG(32), _ho_lqr_lds(30), fill(14, HO_NTR))
         yh_tr, yh_te = _ho_split(yh)
-        plain = fit!(_ho_ham_lds(40), yh_tr; max_iter=6, progress=false)
-        tr = fit!(_ho_ham_lds(40), yh_tr; y_test=yh_te, max_iter=6, progress=false)
+        plain = fit!(_ho_lqr_lds(40), yh_tr; max_iter=6, progress=false)
+        tr = fit!(_ho_lqr_lds(40), yh_tr; y_test=yh_te, max_iter=6, progress=false)
         @test plain isa Vector{Float64}
         @test tr isa SSD.FitTrace
         @test collect(tr) == plain
 
-        stopped_model = _ho_ham_lds(40)
+        stopped_model = _ho_lqr_lds(40)
         st = fit!(
             stopped_model,
             yh_tr;
@@ -444,12 +444,12 @@ function test_holdout_all_families()
         end
     end
 
-    @testset "Hamiltonian (Poisson emission)" begin
-        _, yhp = rand(StableRNG(50), _ho_ham_lds(51; poisson=true), fill(14, HO_NTR))
+    @testset "LQR (Poisson emission)" begin
+        _, yhp = rand(StableRNG(50), _ho_lqr_lds(51; poisson=true), fill(14, HO_NTR))
         yhp_tr, yhp_te = _ho_split(yhp)
-        plain = fit!(_ho_ham_lds(52; poisson=true), yhp_tr; max_iter=5, progress=false)
+        plain = fit!(_ho_lqr_lds(52; poisson=true), yhp_tr; max_iter=5, progress=false)
         tr = fit!(
-            _ho_ham_lds(52; poisson=true), yhp_tr; y_test=yhp_te, max_iter=5, progress=false
+            _ho_lqr_lds(52; poisson=true), yhp_tr; y_test=yhp_te, max_iter=5, progress=false
         )
         @test plain isa Vector{Float64}
         @test tr isa SSD.FitTrace

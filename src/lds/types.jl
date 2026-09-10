@@ -22,7 +22,7 @@ path and the smoother's Hessian is block-tridiagonal.
 Every subtype exposes an initial state (`x0`, `P0`) and, for each timestep, an
 affine transition `x_{t+1} | x_t ~ N(A_t x_t + b_t + B_t u_t, Q_t)`. A subtype
 is free to *parameterize* those matrices however it likes — the transition may
-be structured ([`HamiltonianStateModel`](@ref) constrains it to be symplectic)
+be structured ([`LQRStateModel`](@ref) constrains it to be symplectic)
 and it may vary with `t`. What the subtype must supply is:
 
 - `_state_latent_dim(sm)` / `_state_ux_dim(sm)` — the dimensions the enclosing
@@ -643,7 +643,7 @@ members, so the constructor below is one code path for both.
     _state_latent_dim(state_model) -> Int
 
 Latent dimension the state model evolves. `size(A, 1)` for an ordinary
-[`GaussianStateModel`](@ref); a [`HamiltonianStateModel`](@ref) overrides it,
+[`GaussianStateModel`](@ref); a [`LQRStateModel`](@ref) overrides it,
 since its `A` is the `n × n` plant while the latent state `[x; \u03bb]` is `2n`.
 """
 _state_latent_dim(sm::AbstractStateModel) = size(sm.A, 1)

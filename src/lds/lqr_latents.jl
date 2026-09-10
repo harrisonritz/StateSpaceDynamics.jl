@@ -1,5 +1,5 @@
 #=============================================================================
-Hamiltonian (inverse-LQR) latents — E-step.
+LQR latents — E-step.
 
 The latent state is `z_t = [x_t; λ_t]` and the forward transition is
 `z_{t+1} = M_{k(t)} z_t + b + B u_t + w`, `w ~ N(0, Qfwd)`, with `M_k`
@@ -19,22 +19,22 @@ ordinary linear-Gaussian chain, so every kernel below mirrors its
 =============================================================================#
 
 """
-    _ham(lds) -> HamiltonianStateModel
+    _lqr(lds) -> LQRStateModel
 
-The state model of a Hamiltonian LDS, with its concrete type asserted so the
+The state model of an LQR LDS, with its concrete type asserted so the
 kernels below stay on the typed path.
 """
-@inline _ham(lds::LinearDynamicalSystem{T,S}) where {T,S<:HamiltonianStateModel} =
+@inline _lqr(lds::LinearDynamicalSystem{T,S}) where {T,S<:LQRStateModel} =
     lds.state_model::S
 
 """
-    _hamiltonian_lengths_ok(sm, tsteps)
+    _lqr_lengths_ok(sm, tsteps)
 
 Check that a cost schedule covers every timestep of the longest trial. Called at
 each fitting / smoothing entry point, where the trial lengths are known — the
 model itself is built without reference to any dataset.
 """
-function _hamiltonian_lengths_ok(sm::HamiltonianStateModel, tsteps::AbstractVector{Int})
+function _lqr_lengths_ok(sm::LQRStateModel, tsteps::AbstractVector{Int})
     isempty(sm.schedule) && return nothing
     T_max = maximum(tsteps)
     length(sm.schedule) >= T_max || throw(
@@ -50,7 +50,7 @@ end
 """
     _transition_residual!(out, lds, x, t[, ux])
 
-`z_t − M_{k(t-1)} z_{t-1} − b − B u_{t-1}` for a Hamiltonian state model: the
+`z_t − M_{k(t-1)} z_{t-1} − b − B u_{t-1}` for an LQR state model: the
 same residual as the Gaussian case, with the regime-dependent transition.
 Requires `t ≥ 2`.
 """
@@ -60,8 +60,8 @@ Requires `t ≥ 2`.
     x::AbstractMatrix{T},
     t::Int,
     ux::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:HamiltonianStateModel{T0},O<:AbstractObservationModel{T0}}
-    sm = _ham(lds)
+) where {T<:Real,T0<:Real,S<:LQRStateModel{T0},O<:AbstractObservationModel{T0}}
+    sm = _lqr(lds)
     c = sm.cache
     k = _regime(sm, t - 1)
     @views mul!(out, c.M[k], x[:, t - 1])
@@ -82,7 +82,7 @@ origin. Only meaningful when `sm.terminal` is set.
 """
 @inline function _terminal_residual!(
     out::AbstractVector{T},
-    sm::HamiltonianStateModel,
+    sm::LQRStateModel,
     x::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
@@ -99,14 +99,14 @@ end
     state_loglikelihood!(cc, dxt, tmp, lds, x, t[, ux])
 
 State-model contribution to the complete-data log-likelihood at timestep `t` for
-a Hamiltonian LDS:
+an LQR LDS:
 
 - `t == 1`: the initial-state term, as in the Gaussian case
 - `t ≥ 2`:  `cQ − ½‖Qfwd^{-1/2}(z_t − M_{k(t-1)} z_{t-1} − b − B u_{t-1})‖²`
 - `t == T` and `sm.terminal`: plus `cF − ½‖Σf^{-1/2}(Λf z_T − h_f)‖²`
 
 `cc` supplies the initial-state Cholesky; everything transition-side comes from
-the model's own [`HamiltonianCache`](@ref), which is shared across the trial
+the model's own [`LQRCache`](@ref), which is shared across the trial
 workspaces rather than recomputed per trial.
 """
 function state_loglikelihood!(
@@ -117,8 +117,8 @@ function state_loglikelihood!(
     x::AbstractMatrix{T},
     t::Int,
     ux::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:HamiltonianStateModel{T0},O<:AbstractObservationModel{T0}}
-    sm = _ham(lds)
+) where {T<:Real,T0<:Real,S<:LQRStateModel{T0},O<:AbstractObservationModel{T0}}
+    sm = _lqr(lds)
     c = sm.cache
     tsteps = size(x, 2)
 
@@ -146,7 +146,7 @@ end
 """
     _state_gradient!(grad, ws, lds, x[, ux])
 
-State half of the complete-data log-likelihood gradient for a Hamiltonian LDS:
+State half of the complete-data log-likelihood gradient for an LQR LDS:
 
 - `grad[:, 1] = −P0⁻¹(z₁ − x0) + M_{k(1)}ᵀ Qfwd⁻¹ r₂`
 - `grad[:, t] = −Qfwd⁻¹ r_t + M_{k(t)}ᵀ Qfwd⁻¹ r_{t+1}`
@@ -162,9 +162,9 @@ function _state_gradient!(
     lds::LinearDynamicalSystem{T,S,O},
     x::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
-    sm = _ham(lds)
+    sm = _lqr(lds)
     c = sm.cache
 
     neg_P0_inv = ws.consts.x_t     # −P0⁻¹ (initial-state term is model-agnostic)
@@ -206,7 +206,7 @@ function _state_gradient!(
 end
 
 """
-    _state_hessian_blocks!(btd, cc, sm::HamiltonianStateModel, tsteps)
+    _state_hessian_blocks!(btd, cc, sm::LQRStateModel, tsteps)
 
 Per-timestep state-side Hessian blocks. Unlike the Gaussian case there is no one
 template to copy: `H_sub[i]` and the `MᵀQ⁻¹M` half of `H_diag[t]` depend on the
@@ -214,7 +214,7 @@ regime of the transition leaving `t`, so each is looked up. The terminal factor
 adds `−Λfᵀ Σf⁻¹ Λf` to the last diagonal block.
 """
 function _state_hessian_blocks!(
-    btd, cc::SmoothConstants{T}, sm::HamiltonianStateModel, tsteps::Int
+    btd, cc::SmoothConstants{T}, sm::LQRStateModel, tsteps::Int
 ) where {T<:Real}
     c = sm.cache
     for i in 1:(tsteps - 1)
@@ -234,9 +234,9 @@ function _state_hessian_blocks!(
 end
 
 """
-    _compute_state_constants!(cc, sm::HamiltonianStateModel)
+    _compute_state_constants!(cc, sm::LQRStateModel)
 
-Fill the state half of a [`SmoothConstants`](@ref) for a Hamiltonian model.
+Fill the state half of a [`SmoothConstants`](@ref) for an LQR model.
 
 Only the initial-state terms (`P0_PD`, `cP0`, `x_t = −P0⁻¹`) are actually read by
 the kernels — everything transition-side lives on the model's own cache, shared
@@ -246,7 +246,7 @@ with the *forward* noise anyway so that generic consumers of a `SmoothConstants`
 are filled for the same reason.
 """
 function _compute_state_constants!(
-    cc::SmoothConstants{WT}, sm::HamiltonianStateModel{T}
+    cc::SmoothConstants{WT}, sm::LQRStateModel{T}
 ) where {WT<:Real,T<:Real}
     d = _state_latent_dim(sm)
     c = sm.cache
@@ -276,14 +276,14 @@ end
 """
     _state_prior_logdensity(lds, sws) -> T
 
-`log p(θ)` for a Hamiltonian state model. Only the initial-state priors exist
+`log p(θ)` for an LQR state model. Only the initial-state priors exist
 here: there is no Inverse-Wishart prior on `Σ` (the M-step profiles it out) and
 no matrix-normal prior on the structural block, whose entries are shared between
 `𝓔`'s (1,1) and (2,2) blocks and so do not form a free regression matrix.
 """
 function _state_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, ::Union{Nothing,SmoothWorkspace{T}}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     total = zero(T)
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))

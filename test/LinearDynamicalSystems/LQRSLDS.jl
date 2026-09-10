@@ -1,5 +1,5 @@
 #=============================================================================
-Switching inverse-LQR: `SLDS` whose discrete states are Hamiltonian models.
+Switching inverse-LQR: `SLDS` whose discrete states are LQR models.
 
 The SLDS uses one *shared* continuous latent path — `joint_loglikelihood!` forms
 each timestep as the responsibility-weighted mixture `Σₖ wₖₜ ℓₜ⁽ᵏ⁾(x)` — so every
@@ -24,7 +24,7 @@ function hslds_state(Qc; p::Int=4, C=nothing, terminal::Bool=false, seed::Int=11
     Σ = Matrix(0.05I, 4, 4)
     Cm = C === nothing ? randn(StableRNG(seed), p, 4) : copy(C)
     Cm[:, 3:4] .= 0
-    sm = HamiltonianStateModel(
+    sm = LQRStateModel(
         copy(A),
         copy(S),
         copy(Qc),
@@ -63,7 +63,7 @@ _trace(e) = e isa Tuple ? e[1] : e
 contributes nothing, and the weighted statistics are the plain ones — so this
 must reproduce the ungrouped fit, parameter for parameter. Anything that leaks
 into the switching path but not the plain one shows up here."""
-function test_slds_hamiltonian_matches_lds()
+function test_slds_lqr_matches_lds()
     p, tsteps, ntrials = 4, 35, 5
     ys = hslds_data(p, tsteps, ntrials)
     Qc = [0.25 0.04; 0.04 0.18]
@@ -109,7 +109,7 @@ here the trace sits well below `elbo` at the same parameters (~170 nats on the
 tutorial's model, against ~0.5 for a Gaussian `SLDS`), and it can dip from one
 iteration to the next while the parameters are still improving. So the trace is
 not a monotonicity diagnostic for a switching LQR; the converged bound is."""
-function test_slds_hamiltonian_monotone()
+function test_slds_lqr_monotone()
     p = 4
     slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
     ys = hslds_data(p, 40, 5)
@@ -136,7 +136,7 @@ function test_slds_hamiltonian_monotone()
     return nothing
 end
 
-"""An all-`:free` switching model is a Gaussian `SLDS` wearing the Hamiltonian
+"""An all-`:free` switching model is a Gaussian `SLDS` wearing the LQR
 type, which is the whole point of `:free` — so it must match one exactly."""
 function test_slds_free_matches_gaussian_slds()
     p, d, tsteps, ntrials = 3, 4, 30, 4
@@ -229,7 +229,7 @@ improvement, so the composition still cannot decrease the bound.
 Shared parameters must come out bit-identical, not merely close: a tie is one
 fitted value copied out, and `≈` would pass on two independent fits that happened
 to land nearby."""
-function test_slds_hamiltonian_tied()
+function test_slds_lqr_tied()
     p, tsteps, ntrials = 4, 35, 5
     ys = hslds_data(p, tsteps, ntrials)
     costs = [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]
@@ -284,7 +284,7 @@ function test_slds_hamiltonian_tied()
     =#
     frozen = hslds_model(costs; p=p)
     for lds in frozen.LDSs
-        lds.state_model.fit_flags = HamiltonianFitFlags(; Qc=false)
+        lds.state_model.fit_flags = LQRFitFlags(; Qc=false)
     end
     q1 = copy(frozen.LDSs[1].state_model.Qc[1])
     q2 = copy(frozen.LDSs[2].state_model.Qc[1])
@@ -302,7 +302,7 @@ function test_slds_hamiltonian_tied()
     =#
     frozen_struct = hslds_model(costs; p=p)
     for lds in frozen_struct.LDSs
-        lds.state_model.fit_flags = HamiltonianFitFlags(; Qc=false)
+        lds.state_model.fit_flags = LQRFitFlags(; Qc=false)
     end
     fq1 = copy(frozen_struct.LDSs[1].state_model.Qc[1])
     fq2 = copy(frozen_struct.LDSs[2].state_model.Qc[1])
@@ -328,7 +328,7 @@ function test_slds_hamiltonian_tied()
     is refused instead.
     =#
     mixed_flags = hslds_model(costs; p=p)
-    mixed_flags.LDSs[2].state_model.fit_flags = HamiltonianFitFlags(; Gref=false)
+    mixed_flags.LDSs[2].state_model.fit_flags = LQRFitFlags(; Gref=false)
     @test_throws ArgumentError fit!(
         mixed_flags, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=[:A, :S]
     )
@@ -349,7 +349,7 @@ is weighted by that state's responsibility at `T` like every other factor —
 `joint_loglikelihood!` gets it through the dispatched `state_loglikelihood!`, but
 the curvature paths build their state blocks from flat templates that have no
 slot for it, so it has to be added there by hand."""
-function test_slds_hamiltonian_terminal()
+function test_slds_lqr_terminal()
     p, tsteps, ntrials = 4, 30, 5
     slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p, terminal=true)
     @test all(lds.state_model.terminal for lds in slds.LDSs)
@@ -377,7 +377,7 @@ schedule: in a switching model the discrete state *is* the cost epoch, so a
 schedule inside one would be a second notion of regime nested in the first.
 `terminal` and `observe_costate` describe the trial and the emission rather than
 the state, so they have to agree across states."""
-function test_slds_hamiltonian_validation()
+function test_slds_lqr_validation()
     p = 4
     ok = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
     @test validate_SLDS(ok) === nothing
@@ -389,7 +389,7 @@ function test_slds_hamiltonian_validation()
     C = randn(StableRNG(11), p, 4)
     C[:, 3:4] .= 0
     obs() = GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
-    scheduled = HamiltonianStateModel(
+    scheduled = LQRStateModel(
         copy(A),
         copy(S),
         [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]],
@@ -419,7 +419,7 @@ function test_slds_hamiltonian_validation()
     @test_throws ArgumentError validate_SLDS(mixed_terminal)
 
     # `observe_costate` disagreeing across states.
-    seeing = HamiltonianStateModel(
+    seeing = LQRStateModel(
         copy(A),
         copy(S),
         [0.9 0.0; 0.0 0.7],
@@ -469,7 +469,7 @@ cost even on expensive-cost trials.
 The assertion is on the gap between the two regimes rather than on either
 accuracy alone, so it keeps stating the real claim if the absolute numbers move.
 """
-function test_slds_hamiltonian_prior_vs_optimal_data()
+function test_slds_lqr_prior_vs_optimal_data()
     A = [0.96 0.07; -0.05 0.93]
     S = [0.06 0.01; 0.01 0.05]
     Σ = Matrix(0.02I, 4, 4)
@@ -480,9 +480,7 @@ function test_slds_hamiltonian_prior_vs_optimal_data()
     C[:, 3:4] .= 0
 
     function gen(Q)
-        return HamiltonianStateModel(
-            copy(A), copy(S), copy(Q), copy(Σ); P0=Matrix(0.2I, 4, 4)
-        )
+        return LQRStateModel(copy(A), copy(S), copy(Q), copy(Σ); P0=Matrix(0.2I, 4, 4))
     end
     function st(Q)
         return LinearDynamicalSystem(
@@ -534,7 +532,7 @@ path's empirical transitions must match `slds.A`, and regressing `z_{t+1}` on
 `z_t` within the timesteps each state was active must return that state's cached
 `M`. The transition *into* `t` is drawn under `z_t`, so a pair `(t-1, t)` belongs
 to state `z_t` — an off-by-one there would return a blend of the two."""
-function test_slds_hamiltonian_rand()
+function test_slds_lqr_rand()
     p, tsteps, ntrials = 4, 40, 60
     # Persistent switching, so each state gets long runs to regress within.
     slds = hslds_model([[0.20 0.03; 0.03 0.15], [1.20 0.0; 0.0 0.90]]; p=p, stay=0.97)
@@ -604,7 +602,7 @@ and it is wrong silently, since the objective stays finite and EM still moves.
 The assumption behind that lookup holds for `depends_on`, where cells sharing a
 parameter alias one array, and fails for an `SLDS`, whose discrete states hold
 separate arrays. This checks the case where the two groupings disagree."""
-function test_slds_hamiltonian_noise_version_lookup()
+function test_slds_lqr_noise_version_lookup()
     p = 4
     slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
     sms = [lds.state_model for lds in slds.LDSs]
@@ -616,12 +614,12 @@ function test_slds_hamiltonian_noise_version_lookup()
     end
 
     ys = hslds_data(p, 30, 4)
-    _, tfs, data, _ = ham_estep_stats(
+    _, tfs, data, _ = lqr_estep_stats(
         LinearDynamicalSystem(sms[1], slds.LDSs[1].obs_model), ys
     )
     sufs = map(1:2) do k
         hs = SSD._initialize_td_sufficient_statistics(Float64, slds.LDSs[k], data.tsteps)
-        SSD._aggregate_hamiltonian_stats_weighted!(
+        SSD._aggregate_lqr_stats_weighted!(
             hs, tfs, slds.LDSs[k], data, [fill(0.5, 30) for _ in 1:4]
         )
         SSD._fill_mixed_blocks!(hs, sms[k])
@@ -629,9 +627,9 @@ function test_slds_hamiltonian_noise_version_lookup()
     end
 
     # `:structure` shares every structural block; the noise stays per state.
-    slots = SSD._ham_block_slots([:structure], 2)
+    slots = SSD._lqr_block_slots([:structure], 2)
     @test all(all(isone, sl) for sl in slots)          # structure is shared
-    ctx = SSD._HamMStepCtx(sufs, sms, slots, [1, 2], false)
+    ctx = SSD._LQRMStepCtx(sufs, sms, slots, [1, 2], false)
     @test ctx.nq == 2
 
     # Version `k`'s inverse is state `k`'s, not state 1's twice over.
@@ -643,7 +641,7 @@ function test_slds_hamiltonian_noise_version_lookup()
 end
 
 """
-    test_slds_hamiltonian_grouped()
+    test_slds_lqr_grouped()
 
 Switching inverse LQR whose *emission* is grouped: the stitched fit, where one
 control problem per discrete state is read out through one emission per session.
@@ -660,7 +658,7 @@ The second half checks the piece that anchor cannot see: with `K > 1` the
 structural version of unit `(k, c)` is the pair of its version across regimes and
 across cells, and a tie has to collapse the first without collapsing the second.
 """
-function test_slds_hamiltonian_grouped()
+function test_slds_lqr_grouped()
     p, tsteps, ntrials = 4, 30, 6
     ys = hslds_data(p, tsteps, ntrials)
     Qc = [0.25 0.04; 0.04 0.18]
@@ -733,23 +731,23 @@ function test_slds_hamiltonian_grouped()
 end
 
 """
-    test_ham_pair_slots()
+    test_lqr_pair_slots()
 
 The (regime, cell) version map: units agreeing on both axes share a version,
 units differing on either get their own, and the result is renumbered from 1
-with no gaps — which is what `_HamMStepCtx` needs, since it sizes its per-version
+with no gaps — which is what `_LQRMStepCtx` needs, since it sizes its per-version
 storage from the maximum.
 """
-function test_ham_pair_slots()
+function test_lqr_pair_slots()
     # Two regimes x two cells, nothing shared: four versions.
-    @test SSD._ham_pair_slots([1, 1, 2, 2], [1, 2, 1, 2]) == [1, 2, 3, 4]
+    @test SSD._lqr_pair_slots([1, 1, 2, 2], [1, 2, 1, 2]) == [1, 2, 3, 4]
     # Tied across regimes, grouped across cells: one version per cell.
-    @test SSD._ham_pair_slots([1, 1, 1, 1], [1, 2, 1, 2]) == [1, 2, 1, 2]
+    @test SSD._lqr_pair_slots([1, 1, 1, 1], [1, 2, 1, 2]) == [1, 2, 1, 2]
     # Untied across regimes, ungrouped across cells: one version per regime.
-    @test SSD._ham_pair_slots([1, 1, 2, 2], [1, 1, 1, 1]) == [1, 1, 2, 2]
+    @test SSD._lqr_pair_slots([1, 1, 2, 2], [1, 1, 1, 1]) == [1, 1, 2, 2]
     # Both collapsed: a single version.
-    @test SSD._ham_pair_slots([1, 1, 1, 1], [1, 1, 1, 1]) == [1, 1, 1, 1]
+    @test SSD._lqr_pair_slots([1, 1, 1, 1], [1, 1, 1, 1]) == [1, 1, 1, 1]
     # Dense renumbering even when the inputs are not.
-    @test SSD._ham_pair_slots([3, 3, 7, 7], [2, 5, 2, 5]) == [1, 2, 3, 4]
+    @test SSD._lqr_pair_slots([3, 3, 7, 7], [2, 5, 2, 5]) == [1, 2, 3, 4]
     return nothing
 end

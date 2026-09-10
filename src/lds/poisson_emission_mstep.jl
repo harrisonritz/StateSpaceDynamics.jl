@@ -555,7 +555,7 @@ function update_observation_model!(
         _poisson_mstep_prior!(fval, grad, H, W, solving, prior)
         #=
         A state model may declare part of the latent state unreadable by the
-        emission (a Hamiltonian model's costate, unless `observe_costate`).
+        emission (an LQR model's costate, unless `observe_costate`).
         Freezing those coordinates in the Newton system — rather than projecting
         afterwards — keeps this a properly constrained maximization, and so keeps
         the emission M-step monotone. `nothing` for every other model.

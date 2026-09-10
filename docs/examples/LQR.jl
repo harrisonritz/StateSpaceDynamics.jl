@@ -1,4 +1,4 @@
-# # Inverse LQR with Hamiltonian latents
+# # Inverse LQR
 #
 # Standard state-space models ask *how does the latent state evolve?* This one
 # asks *what was the state evolving toward?* — it fits a latent linear-quadratic
@@ -57,7 +57,7 @@ default(; # hide
 # ```
 #
 # So the latent dimension is **twice** the plant dimension, and the transition is
-# constrained to be symplectic. `HamiltonianStateModel` carries the natural
+# constrained to be symplectic. `LQRStateModel` carries the natural
 # parameters ``(A, S, Q_{1:K})`` and derives ``M_t`` from them, so every M-step
 # returns a model that is still exactly a control problem.
 
@@ -76,7 +76,7 @@ Qc = [0.20 0.03; 0.03 0.15]          # running state cost
 # some — the forward process-noise covariance is ``G\Sigma G^\top`` with ``G``
 # invertible, so a singular ``\Sigma`` leaves the smoother's precision undefined.
 
-state_model = HamiltonianStateModel(A, S, Qc, Σ; P0=Matrix(0.2I, 4, 4))
+state_model = LQRStateModel(A, S, Qc, Σ; P0=Matrix(0.2I, 4, 4))
 
 # The emission reads the state but not the costate — the default, since the
 # costate is an inferred intention rather than something recorded.
@@ -89,7 +89,7 @@ lds = LinearDynamicalSystem(state_model, obs_model)
 # ## Simulating an optimal trajectory
 #
 # A symplectic matrix has reciprocal eigenvalue pairs ``(\mu, 1/\mu)``, so half
-# its modes grow: the *forward* Hamiltonian flow is unstable by construction. The
+# its modes grow: the *forward* LQR flow is unstable by construction. The
 # optimal trajectory lives on the stable manifold, and the boundary condition is
 # what selects it. `simulate_lqr` follows that manifold directly, through the
 # backward Riccati sweep and the closed-loop forward map.
@@ -126,18 +126,18 @@ p1
 # from an exactly-optimal agent instead.
 
 model_lds = LinearDynamicalSystem(
-    HamiltonianStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
+    LQRStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
     GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
 )
 _, ys_model = rand(StableRNG(99), model_lds, fill(20, 120))
 
-init = HamiltonianStateModel(
+init = LQRStateModel(
     copy(A),
     copy(S),
     Matrix(0.4I, plant_dim, plant_dim),      # deliberately wrong starting cost
     Matrix(0.05I, 4, 4);
     P0=Matrix(0.2I, 4, 4),
-    fit_flags=HamiltonianFitFlags(; A=false, S=false),
+    fit_flags=LQRFitFlags(; A=false, S=false),
 )
 fit_lds = LinearDynamicalSystem(
     init,
@@ -157,7 +157,7 @@ plot(
 # change the policy it induces, the classical inverse-optimal-control invariance
 # — so compare in a canonical scale.
 
-truth = HamiltonianStateModel(copy(A), copy(S), copy(Qc), copy(Σ))
+truth = LQRStateModel(copy(A), copy(S), copy(Qc), copy(Σ))
 rescale_costate!(truth; target=:trace)
 rescale_costate!(init; target=:trace)
 
@@ -182,9 +182,9 @@ println("fitted Qc = ", round.(init.Qc[1]; digits=3))
 # rather than estimation within it, and the maximum-likelihood cost need not be
 # the generating one:
 
-fit_on_optimal = HamiltonianStateModel(
+fit_on_optimal = LQRStateModel(
     copy(A), copy(S), Matrix(0.4I, plant_dim, plant_dim), Matrix(0.05I, 4, 4);
-    P0=Matrix(0.2I, 4, 4), fit_flags=HamiltonianFitFlags(; A=false, S=false),
+    P0=Matrix(0.2I, 4, 4), fit_flags=LQRFitFlags(; A=false, S=false),
 )
 lds_opt = LinearDynamicalSystem(
     fit_on_optimal,
@@ -232,7 +232,7 @@ println("open loop eigenvalues   = ", round.(abs.(eigvals(A)); digits=3))
 schedule = cost_schedule(tsteps; terminal=true, onset=16)
 println("regimes in force: ", unique(schedule))
 
-varying = HamiltonianStateModel(
+varying = LQRStateModel(
     copy(A),
     copy(S),
     [0.05 * Matrix(I, 2, 2), copy(Qc), 2.0 * Matrix(I, 2, 2)],
@@ -263,7 +263,7 @@ p2
 # ``Q_t`` does. `Gref` supplies exactly that — pass the reference as the input
 # and freeze ``G_r`` at the identity.
 
-track_sm = HamiltonianStateModel(
+track_sm = LQRStateModel(
     copy(A),
     [0.20 0.02; 0.02 0.18],                     # more control authority
     [copy(Qc), 200.0 * Matrix(I, 2, 2)],        # heavy terminal cost
@@ -333,7 +333,7 @@ println("distance to target at the end: ",
 sw_T = 16
 Q_lo = [0.20 0.03; 0.03 0.15]
 Q_hi = [1.20 0.00; 0.00 0.90]
-gen(Q) = HamiltonianStateModel(copy(A), copy(S), copy(Q), copy(Σ); P0=Matrix(0.2I, 4, 4))
+gen(Q) = LQRStateModel(copy(A), copy(S), copy(Q), copy(Σ); P0=Matrix(0.2I, 4, 4))
 sw_state(Q) = LinearDynamicalSystem(
     gen(Q),
     GaussianObservationModel(copy(C), Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim)),
@@ -463,7 +463,7 @@ println("plant shared: ", sp1.A == sp2.A, "   cost differs: ", sp1.Qc[1] != sp2.
 C_spk = 0.4 .* randn(rng, 12, 4)
 C_spk[:, (plant_dim + 1):end] .= 0
 plds = LinearDynamicalSystem(
-    HamiltonianStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
+    LQRStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
     PoissonObservationModel(C_spk, fill(0.5, 12)),
 )
 counts = [Float64.(rand(rng, 0:3, 12, tsteps)) for _ in 1:10]

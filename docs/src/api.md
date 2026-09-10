@@ -27,19 +27,19 @@ AbstractGaussianStateModel
 AbstractObservationModel
 ```
 
-## Inverse LQR (Hamiltonian latents)
+## Inverse LQR
 
 A state model whose latent is the LQR state–costate pair and whose transition is
 constrained to the symplectic form a linear-quadratic control problem implies, so
 that fitting recovers the plant and the cost function directly.
 
 ```@docs
-HamiltonianStateModel
-HamiltonianFitFlags
+LQRStateModel
+LQRFitFlags
 cost_schedule
 refresh!
 lqr_parameters
-hamiltonian_matrix
+lqr_matrix
 symplectic_matrix
 symplectic_form
 symplectic_defect

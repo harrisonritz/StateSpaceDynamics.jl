@@ -1,8 +1,8 @@
 #=============================================================================
-Hamiltonian (inverse-LQR) latents — sufficient statistics, M-step and ELBO.
+LQR latents — sufficient statistics, M-step and ELBO.
 
 The E-step gives the usual linear-Gaussian smoother output on `z = [x; λ]`. The
-M-step must return parameters whose transition still has the Hamiltonian form,
+M-step must return parameters whose transition still has the LQR form,
 which is done in *mixed* coordinates: with
 
     w_t = [x_t; λ_{t+1}],    v_t = [x_{t+1}; λ_t],
@@ -36,9 +36,9 @@ the step a generalized M-step: the ELBO cannot decrease.
 =============================================================================#
 
 """
-    HamiltonianSufficientStatistics{T}
+    LQRSufficientStatistics{T}
 
-Aggregated E-step statistics for a [`HamiltonianStateModel`](@ref).
+Aggregated E-step statistics for a [`LQRStateModel`](@ref).
 
 `base` carries the initial-state and emission halves in whatever layout the
 emission's own allocator produces — one [`SufficientStatistics`](@ref), or a
@@ -62,7 +62,7 @@ the statistics of the terminal factor — the input block carries its reference.
 by [`_fill_mixed_blocks!`](@ref) at the start of each M-step; they live here
 rather than in a local so an EM run allocates them once.
 """
-mutable struct HamiltonianSufficientStatistics{T<:Real,B}
+mutable struct LQRSufficientStatistics{T<:Real,B}
     const base::B
     const zz::Vector{Matrix{T}}
     const zy::Vector{Matrix{T}}
@@ -79,8 +79,8 @@ end
 
 function _initialize_td_sufficient_statistics(
     ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
-    return _wrap_hamiltonian_suff_stats(
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    return _wrap_lqr_suff_stats(
         _base_td_sufficient_statistics(T, lds, tsteps_per_trial), lds, tsteps_per_trial
     )
 end
@@ -92,26 +92,26 @@ are ambiguous. Both just wrap whatever the emission's allocator returned.
 =#
 function _initialize_td_sufficient_statistics(
     ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:CompositeObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T}}
     views = _obs_views(lds)
     base = map(v -> _base_td_sufficient_statistics(T, v, tsteps_per_trial), views)
-    return _wrap_hamiltonian_suff_stats(base, lds, tsteps_per_trial)
+    return _wrap_lqr_suff_stats(base, lds, tsteps_per_trial)
 end
 
 """
-    _wrap_hamiltonian_suff_stats(base, lds, tsteps_per_trial)
+    _wrap_lqr_suff_stats(base, lds, tsteps_per_trial)
 
 Allocate the per-regime state-side blocks around an already-built `base`.
 """
-function _wrap_hamiltonian_suff_stats(
+function _wrap_lqr_suff_stats(
     base, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     m = lds.ux_dim
     K = _nregimes(sm)
     reg = d + 1 + m
-    return HamiltonianSufficientStatistics{T,typeof(base)}(
+    return LQRSufficientStatistics{T,typeof(base)}(
         base,
         [zeros(T, reg, reg) for _ in 1:K],
         [zeros(T, reg, d) for _ in 1:K],
@@ -137,7 +137,7 @@ Schedules in practice are a handful of contiguous epochs, so grouping lets the
 aggregator do the mean-side work with one GEMM per run instead of one rank-1
 update per timestep.
 """
-function _regime_runs(sm::HamiltonianStateModel, tsteps::Int)
+function _regime_runs(sm::LQRStateModel, tsteps::Int)
     runs = Tuple{Int,Int,Int}[]
     tsteps >= 2 || return runs
     t0 = 1
@@ -154,7 +154,7 @@ function _regime_runs(sm::HamiltonianStateModel, tsteps::Int)
 end
 
 """
-    _aggregate_hamiltonian_stats!(hs, tfs, lds, data[, trials])
+    _aggregate_lqr_stats!(hs, tfs, lds, data[, trials])
 
 Accumulate the per-regime state-side statistics from the smoother output.
 
@@ -169,13 +169,13 @@ statistics rather than an accumulation onto whatever was there — which is what
 lets [`trial_elbos`](@ref) reach one trial's state Q-term through the same
 aggregator the whole-dataset path uses.
 """
-function _aggregate_hamiltonian_stats!(
-    hs::HamiltonianSufficientStatistics{T},
+function _aggregate_lqr_stats!(
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     trials::AbstractVector{Int}=Base.OneTo(length(tfs)),
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     m = lds.ux_dim
@@ -272,23 +272,18 @@ function _aggregate_hamiltonian_stats!(
         end
     end
 
-    return _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K)
+    return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
 end
 
 """
-    _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K) -> hs
+    _finalize_lqr_stats!(hs, sm, d, m, reg, K) -> hs
 
 Mirror the upper triangles the accumulation loops filled, for both the
 transition Grams and the terminal one. Shared by the plain and the
 responsibility-weighted aggregators, which differ only in how they accumulate.
 """
-function _finalize_hamiltonian_stats!(
-    hs::HamiltonianSufficientStatistics{T},
-    sm::HamiltonianStateModel{T},
-    d::Int,
-    m::Int,
-    reg::Int,
-    K::Int,
+function _finalize_lqr_stats!(
+    hs::LQRSufficientStatistics{T}, sm::LQRStateModel{T}, d::Int, m::Int, reg::Int, K::Int
 ) where {T<:Real}
     for k in 1:K
         zz = hs.zz[k]
@@ -317,7 +312,7 @@ function _finalize_hamiltonian_stats!(
 end
 
 """
-    _aggregate_hamiltonian_stats_weighted!(hs, tfs, lds, data, weights) -> hs
+    _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights) -> hs
 
 The responsibility-weighted counterpart, for one discrete state of an `SLDS`.
 
@@ -335,13 +330,13 @@ responsibilities.
 Accumulates per timestep rather than BLAS-3 over a schedule run: the weight
 varies within a run, so there is no run to batch over.
 """
-function _aggregate_hamiltonian_stats_weighted!(
-    hs::HamiltonianSufficientStatistics{T},
+function _aggregate_lqr_stats_weighted!(
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     m = lds.ux_dim
@@ -442,7 +437,7 @@ function _aggregate_hamiltonian_stats_weighted!(
         end
     end
 
-    return _finalize_hamiltonian_stats!(hs, sm, d, m, reg, K)
+    return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
 end
 
 """
@@ -459,7 +454,7 @@ mixed moment are four blocks of `(Σ E[z_tz_tᵀ], Σ E[z_tz_{t+1}ᵀ],
 Σ E[z_{t+1}z_{t+1}ᵀ])`, transposed where the pairing reverses.
 """
 function _fill_mixed_blocks!(
-    hs::HamiltonianSufficientStatistics{T}, sm::HamiltonianStateModel{T}
+    hs::LQRSufficientStatistics{T}, sm::LQRStateModel{T}
 ) where {T<:Real}
     n = _plant_dim(sm)
     d = 2n
@@ -559,7 +554,7 @@ plant dimension.
 end
 
 """
-    _HamPack
+    _LQRPack
 
 Where each structural block sits in the flat L-BFGS parameter vector.
 
@@ -570,11 +565,11 @@ state is just a different count of copies per block, rather than a different
 problem. A version-major layout (one full copy of every block per version, which
 is what this was) can only express "all blocks shared" or "no blocks shared".
 
-A frozen block (see [`HamiltonianFitFlags`](@ref)) has width zero and is neither
+A frozen block (see [`LQRFitFlags`](@ref)) has width zero and is neither
 packed nor updated, so freezing shrinks the problem rather than projecting its
 solution. `Qc`'s copy spans all `K` regimes contiguously.
 """
-struct _HamPack
+struct _LQRPack
     n::Int
     d::Int
     m::Int
@@ -587,21 +582,21 @@ struct _HamPack
 end
 
 # Block ordinals, in layout order.
-const _HB_A = 1
-const _HB_S = 2
-const _HB_Q = 3
-const _HB_H = 4
-const _HB_B = 5
-const _HB_G = 6
-const _HB_F = 7
-const _HB_N = 7
+const _LQR_BLOCK_A = 1
+const _LQR_BLOCK_S = 2
+const _LQR_BLOCK_Q = 3
+const _LQR_BLOCK_H = 4
+const _LQR_BLOCK_B = 5
+const _LQR_BLOCK_G = 6
+const _LQR_BLOCK_F = 7
+const _LQR_BLOCK_N = 7
 
 """
-    _ham_blk(p, b, v) -> UnitRange
+    _lqr_blk(p, b, v) -> UnitRange
 
 Slots holding copy `v` of block `b`; empty when the block is frozen.
 """
-@inline function _ham_blk(p::_HamPack, b::Int, v::Int)
+@inline function _lqr_blk(p::_LQRPack, b::Int, v::Int)
     w = p.w[b]
     w == 0 && return 1:0
     off = p.base[b] + (v - 1) * w
@@ -609,23 +604,23 @@ Slots holding copy `v` of block `b`; empty when the block is frozen.
 end
 
 """
-    _ham_blk_q(p, v, k) -> UnitRange
+    _lqr_blk_q(p, v, k) -> UnitRange
 
 Slots holding regime `k` of copy `v` of the cost block.
 """
-@inline function _ham_blk_q(p::_HamPack, v::Int, k::Int)
-    p.w[_HB_Q] == 0 && return 1:0
+@inline function _lqr_blk_q(p::_LQRPack, v::Int, k::Int)
+    p.w[_LQR_BLOCK_Q] == 0 && return 1:0
     nn = p.n * p.n
-    off = p.base[_HB_Q] + (v - 1) * p.w[_HB_Q] + (k - 1) * nn
+    off = p.base[_LQR_BLOCK_Q] + (v - 1) * p.w[_LQR_BLOCK_Q] + (k - 1) * nn
     return (off + 1):(off + nn)
 end
 
-function _HamPack(sm::HamiltonianStateModel)
-    return _HamPack(sm, sm.fit_flags, ntuple(_ -> 1, _HB_N))
+function _LQRPack(sm::LQRStateModel)
+    return _LQRPack(sm, sm.fit_flags, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
 
-function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags)
-    return _HamPack(sm, f, ntuple(_ -> 1, _HB_N))
+function _LQRPack(sm::LQRStateModel, f::LQRFitFlags)
+    return _LQRPack(sm, f, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
 
 #=
@@ -633,7 +628,7 @@ Taking the flags explicitly rather than off the model is what lets a caller
 freeze part of the block for one pass; taking `nv` is what lets each block carry
 its own number of copies.
 =#
-function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags, nv::NTuple{7,Int})
+function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
     n = _plant_dim(sm)
     d = 2n
     m = size(sm.Bu, 2)
@@ -651,20 +646,20 @@ function _HamPack(sm::HamiltonianStateModel, f::HamiltonianFitFlags, nv::NTuple{
         n * length(gcols),
         (sm.terminal && f.terminal) ? n : 0,
     )
-    bases = zeros(Int, _HB_N)
+    bases = zeros(Int, _LQR_BLOCK_N)
     pos = 0
-    for b in 1:_HB_N
+    for b in 1:_LQR_BLOCK_N
         bases[b] = pos
         pos += nv[b] * w[b]
     end
-    return _HamPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _HB_N), pos, gcols)
+    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols)
 end
 
 """
-    _HamUnit{T,HS}
+    _LQRUnit{T,HS}
 
 One pooled group of trials in the structural M-step: its aggregated statistics,
-which copy of each structural block it uses (`v`, indexed by the `_HB_*`
+which copy of each structural block it uses (`v`, indexed by the `_LQR_BLOCK_*`
 ordinals), and which noise version (`q`).
 
 Cells agreeing on every version are pooled into one unit before the objective is
@@ -673,7 +668,7 @@ scatter `R = Σ_c (Y_c − Θ X_cᵀ − X_c Θᵀ + Θ Z_c Θᵀ)` is linear in
 statistics, so summing them first gives the same `R`. An ungrouped fit is one
 unit, which is why there is a single code path.
 """
-struct _HamUnit{T<:Real,HS}
+struct _LQRUnit{T<:Real,HS}
     hs::HS
     v::NTuple{7,Int}
     q::Int
@@ -681,7 +676,7 @@ struct _HamUnit{T<:Real,HS}
 end
 
 """
-    _HamMStepCtx{T,HS,SM}
+    _LQRMStepCtx{T,HS,SM}
 
 Everything the structural objective needs, assembled once per M-step.
 
@@ -708,10 +703,10 @@ assembled block mixes copies that no longer move together. The scratch below the
 is preallocated once and reused across objective evaluations: at a large plant
 dimension L-BFGS makes many evaluations and the `d × d` temporaries dominate.
 """
-struct _HamMStepCtx{T<:Real,HS,SM}
-    pack::_HamPack
+struct _LQRMStepCtx{T<:Real,HS,SM}
+    pack::_LQRPack
     nq::Int
-    units::Vector{_HamUnit{T,HS}}
+    units::Vector{_LQRUnit{T,HS}}
     sms::Vector{SM}
     owners::Vector{Vector{Vector{Int}}}  # [block][copy] -> models using it
     q_of::Vector{Int}                    # model -> noise version
@@ -753,19 +748,19 @@ struct _HamMStepCtx{T<:Real,HS,SM}
 end
 
 """
-    _ham_units(sufs, slots, q_slots) -> Vector{_HamUnit}
+    _lqr_units(sufs, slots, q_slots) -> Vector{_LQRUnit}
 
 Pool the cells into units. `slots[b][c]` is the copy of block `b` that cell `c`
 uses; cells agreeing on every block and on the noise version become one unit.
 """
-function _ham_units(
+function _lqr_units(
     sufs::AbstractVector, slots::NTuple{7,Vector{Int}}, q_slots::AbstractVector{Int}
 )
     T = eltype(first(sufs).nk)
     keys = NTuple{8,Int}[]
     members = Vector{Int}[]
     for c in eachindex(sufs)
-        key = (ntuple(b -> slots[b][c], _HB_N)..., q_slots[c])
+        key = (ntuple(b -> slots[b][c], _LQR_BLOCK_N)..., q_slots[c])
         idx = findfirst(isequal(key), keys)
         if idx === nothing
             push!(keys, key)
@@ -774,22 +769,24 @@ function _ham_units(
             push!(members[idx], c)
         end
     end
-    units = _HamUnit{T,eltype(sufs)}[]
+    units = _LQRUnit{T,eltype(sufs)}[]
     for (i, key) in enumerate(keys)
         hs = if length(members[i]) == 1
             sufs[members[i][1]]
         else
-            _pool_ham_stats(sufs, members[i])
+            _pool_lqr_stats(sufs, members[i])
         end
         push!(
             units,
-            _HamUnit{T,eltype(sufs)}(hs, ntuple(b -> key[b], _HB_N), key[8], sum(hs.nk)),
+            _LQRUnit{T,eltype(sufs)}(
+                hs, ntuple(b -> key[b], _LQR_BLOCK_N), key[8], sum(hs.nk)
+            ),
         )
     end
     return units
 end
 
-function _pool_ham_stats(sufs::AbstractVector, idx::AbstractVector{Int})
+function _pool_lqr_stats(sufs::AbstractVector, idx::AbstractVector{Int})
     base = sufs[idx[1]]
     out = deepcopy(base)
     for c in idx[2:end]
@@ -806,51 +803,56 @@ function _pool_ham_stats(sufs::AbstractVector, idx::AbstractVector{Int})
     return out
 end
 
-function _HamMStepCtx(
+function _LQRMStepCtx(
     sufs::AbstractVector,
     sms::AbstractVector,
     ab_slots::AbstractVector{Int},
     q_slots::AbstractVector{Int},
     profile::Bool;
-    flags::Union{Nothing,HamiltonianFitFlags}=nothing,
+    flags::Union{Nothing,LQRFitFlags}=nothing,
 )
     # Every block moves together: the whole-block case.
-    return _HamMStepCtx(
-        sufs, sms, ntuple(_ -> collect(ab_slots), _HB_N), q_slots, profile; flags=flags
+    return _LQRMStepCtx(
+        sufs,
+        sms,
+        ntuple(_ -> collect(ab_slots), _LQR_BLOCK_N),
+        q_slots,
+        profile;
+        flags=flags,
     )
 end
 
 """
-    _ham_block_array(sm, b) -> AbstractArray
+    _lqr_block_array(sm, b) -> AbstractArray
 
-The array holding structural block `b` of `sm`, by `_HB_*` ordinal. Its
+The array holding structural block `b` of `sm`, by `_LQR_BLOCK_*` ordinal. Its
 *identity* is what says whether two cells share the block, which is how
-[`_ham_cell_slots`](@ref) recovers the grouping.
+[`_lqr_cell_slots`](@ref) recovers the grouping.
 """
-@inline function _ham_block_array(sm::HamiltonianStateModel, b::Int)
-    b === _HB_A && return _is_free(sm) ? sm.Mfree : sm.A
-    b === _HB_S && return sm.S
+@inline function _lqr_block_array(sm::LQRStateModel, b::Int)
+    b === _LQR_BLOCK_A && return _is_free(sm) ? sm.Mfree : sm.A
+    b === _LQR_BLOCK_S && return sm.S
     #= The `Qc` *vector* is rebuilt per variant even when its matrices are
     shared, so the matrix is what carries the sharing. =#
-    b === _HB_Q && return isempty(sm.Qc) ? sm.Mfree : first(sm.Qc)
-    b === _HB_H && return sm.h
-    b === _HB_B && return sm.Bu
-    b === _HB_G && return sm.Gref
+    b === _LQR_BLOCK_Q && return isempty(sm.Qc) ? sm.Mfree : first(sm.Qc)
+    b === _LQR_BLOCK_H && return sm.h
+    b === _LQR_BLOCK_B && return sm.Bu
+    b === _LQR_BLOCK_G && return sm.Gref
     return sm.hf
 end
 
 """
-    _ham_shares_block(sms, b) -> Bool
+    _lqr_shares_block(sms, b) -> Bool
 
 Whether every model in `sms` holds the *same array* for structural block `b`.
 """
-function _ham_shares_block(sms::AbstractVector, b::Int)
-    arr = _ham_block_array(first(sms), b)
-    return all(sm -> _ham_block_array(sm, b) === arr, sms)
+function _lqr_shares_block(sms::AbstractVector, b::Int)
+    arr = _lqr_block_array(first(sms), b)
+    return all(sm -> _lqr_block_array(sm, b) === arr, sms)
 end
 
 """
-    _ham_cell_slots(sms, cell_slots) -> NTuple{7,Vector{Int}}
+    _lqr_cell_slots(sms, cell_slots) -> NTuple{7,Vector{Int}}
 
 Per-block copy indices for a `depends_on` fit: `cell_slots` — the structural
 group's slot for each cell — for the pieces that actually vary across cells, and
@@ -866,25 +868,27 @@ exactly when the declaration left it out, so the arrays a cell holds *are* the
 declaration — and the cell models, unlike the model the user declared it on,
 are what this M-step is handed.
 """
-function _ham_cell_slots(sms::AbstractVector, cell_slots::AbstractVector{Int})
+function _lqr_cell_slots(sms::AbstractVector, cell_slots::AbstractVector{Int})
     shared = ones(Int, length(cell_slots))
-    return ntuple(b -> _ham_shares_block(sms, b) ? shared : collect(cell_slots), _HB_N)
+    return ntuple(
+        b -> _lqr_shares_block(sms, b) ? shared : collect(cell_slots), _LQR_BLOCK_N
+    )
 end
 
 """
-    _HamMStepCtx(sufs, sms, slots, q_slots, profile; flags)
+    _LQRMStepCtx(sufs, sms, slots, q_slots, profile; flags)
 
 `slots[b][c]` is the copy of block `b` that cell `c` uses. Equal across blocks is
 the whole-block case; differing per block is a partial tie, and the two are the
 same optimization here.
 """
-function _HamMStepCtx(
+function _LQRMStepCtx(
     sufs::AbstractVector,
     sms::AbstractVector,
     slots::NTuple{7,Vector{Int}},
     q_slots::AbstractVector{Int},
     profile::Bool;
-    flags::Union{Nothing,HamiltonianFitFlags}=nothing,
+    flags::Union{Nothing,LQRFitFlags}=nothing,
 )
     sm1 = sms[1]
     T = eltype(sm1.Σ)
@@ -896,17 +900,17 @@ function _HamMStepCtx(
     cells on a version alias the same array — and with one cell there is nothing
     to distinguish either way.
     =#
-    probe = _HamPack(sm1, f, ntuple(_ -> 1, _HB_N))
+    probe = _LQRPack(sm1, f, ntuple(_ -> 1, _LQR_BLOCK_N))
     ncell = length(slots[1])
     #=
     Bound to a fresh name rather than back onto `slots`: reassigning an argument
     the closure above also reads boxes it, and the read becomes one JET cannot
     prove defined.
     =#
-    eff = ntuple(b -> probe.w[b] == 0 ? collect(1:ncell) : slots[b], _HB_N)
-    units = _ham_units(sufs, eff, q_slots)
-    nv = ntuple(b -> maximum(eff[b]), _HB_N)
-    pack = _HamPack(sm1, f, nv)
+    eff = ntuple(b -> probe.w[b] == 0 ? collect(1:ncell) : slots[b], _LQR_BLOCK_N)
+    units = _lqr_units(sufs, eff, q_slots)
+    nv = ntuple(b -> maximum(eff[b]), _LQR_BLOCK_N)
+    pack = _LQRPack(sm1, f, nv)
     n, d, m, K = pack.n, pack.d, pack.m, pack.K
     reg = d + 1 + m
     nq = maximum(q_slots)
@@ -916,11 +920,11 @@ function _HamMStepCtx(
     models sharing that `A` actually contribute, which under a partial tie is no
     longer the same grouping as any other block.
     =#
-    N_A = zeros(T, nv[_HB_A])
+    N_A = zeros(T, nv[_LQR_BLOCK_A])
     N_q = zeros(T, nq)
     Nf_q = zeros(T, nq)
     for u in units
-        N_A[u.v[_HB_A]] += u.n
+        N_A[u.v[_LQR_BLOCK_A]] += u.n
         N_q[u.q] += u.n
         sm1.terminal && (Nf_q[u.q] += u.hs.term_n)
     end
@@ -932,9 +936,9 @@ function _HamMStepCtx(
     model sharing the copy — so a tie is broadcast by construction rather than by
     a separate pass that has to know which blocks it may touch.
     =#
-    owners = [[Int[] for _ in 1:nv[b]] for b in 1:_HB_N]
+    owners = [[Int[] for _ in 1:nv[b]] for b in 1:_LQR_BLOCK_N]
     for c in eachindex(eff[1])
-        for b in 1:_HB_N
+        for b in 1:_LQR_BLOCK_N
             push!(owners[b][eff[b][c]], c)
         end
     end
@@ -959,7 +963,7 @@ function _HamMStepCtx(
     ]
 
     U = length(units)
-    return _HamMStepCtx{T,eltype(sufs),typeof(sm1)}(
+    return _LQRMStepCtx{T,eltype(sufs),typeof(sm1)}(
         pack,
         nq,
         units,
@@ -973,24 +977,24 @@ function _HamMStepCtx(
         kf,
         Sinv,
         Sfinv,
-        [Matrix{T}(undef, n, n) for _ in 1:nv[_HB_A]],
-        [Matrix{T}(undef, n, n) for _ in 1:nv[_HB_S]],
-        [[Matrix{T}(undef, n, n) for _ in 1:K] for _ in 1:nv[_HB_Q]],
-        [Vector{T}(undef, d) for _ in 1:nv[_HB_H]],
-        [Matrix{T}(undef, d, m) for _ in 1:nv[_HB_B]],
-        [Matrix{T}(undef, n, m) for _ in 1:nv[_HB_G]],
-        [Vector{T}(undef, n) for _ in 1:nv[_HB_F]],
+        [Matrix{T}(undef, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
+        [Matrix{T}(undef, n, n) for _ in 1:nv[_LQR_BLOCK_S]],
+        [[Matrix{T}(undef, n, n) for _ in 1:K] for _ in 1:nv[_LQR_BLOCK_Q]],
+        [Vector{T}(undef, d) for _ in 1:nv[_LQR_BLOCK_H]],
+        [Matrix{T}(undef, d, m) for _ in 1:nv[_LQR_BLOCK_B]],
+        [Matrix{T}(undef, n, m) for _ in 1:nv[_LQR_BLOCK_G]],
+        [Vector{T}(undef, n) for _ in 1:nv[_LQR_BLOCK_F]],
         [[zeros(T, d, reg) for _ in 1:K] for _ in 1:U],
         [zeros(T, n, reg) for _ in 1:U],
         [Matrix{T}(undef, d, d) for _ in 1:nq],
         [Matrix{T}(undef, n, n) for _ in 1:nq],
-        [zeros(T, n, n) for _ in 1:nv[_HB_A]],
-        [zeros(T, n, n) for _ in 1:nv[_HB_S]],
-        [[zeros(T, n, n) for _ in 1:K] for _ in 1:nv[_HB_Q]],
-        [zeros(T, d) for _ in 1:nv[_HB_H]],
-        [zeros(T, d, m) for _ in 1:nv[_HB_B]],
-        [zeros(T, n, m) for _ in 1:nv[_HB_G]],
-        [zeros(T, n) for _ in 1:nv[_HB_F]],
+        [zeros(T, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
+        [zeros(T, n, n) for _ in 1:nv[_LQR_BLOCK_S]],
+        [[zeros(T, n, n) for _ in 1:K] for _ in 1:nv[_LQR_BLOCK_Q]],
+        [zeros(T, d) for _ in 1:nv[_LQR_BLOCK_H]],
+        [zeros(T, d, m) for _ in 1:nv[_LQR_BLOCK_B]],
+        [zeros(T, n, m) for _ in 1:nv[_LQR_BLOCK_G]],
+        [zeros(T, n) for _ in 1:nv[_LQR_BLOCK_F]],
         [Matrix{T}(undef, d, d) for _ in 1:nq],
         [zeros(T, n, n) for _ in 1:nq],
         Matrix{T}(undef, d, d),
@@ -1003,126 +1007,127 @@ function _HamMStepCtx(
 end
 
 # Ungrouped convenience: one unit, one structural version, one noise version.
-function _HamMStepCtx(hs, sm::HamiltonianStateModel, profile::Bool)
-    return _HamMStepCtx([hs], [sm], [1], [1], profile)
+function _LQRMStepCtx(hs, sm::LQRStateModel, profile::Bool)
+    return _LQRMStepCtx([hs], [sm], [1], [1], profile)
 end
 
 """
-    _ham_nparams(ctx) -> Int
+    _lqr_nparams(ctx) -> Int
 
 Length of the flat parameter vector.
 """
-@inline _ham_nparams(ctx::_HamMStepCtx) = ctx.pack.np
+@inline _lqr_nparams(ctx::_LQRMStepCtx) = ctx.pack.np
 
 """
-    _ham_pack!(θ, ctx) -> θ
+    _lqr_pack!(θ, ctx) -> θ
 
 Read the current parameters into `θ`. A block's copy is read from any model that
 uses it — they agree, since a tie is written to all of them.
 """
-function _ham_pack!(θ::AbstractVector{T}, ctx::_HamMStepCtx{T}) where {T<:Real}
+function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     p = ctx.pack
     o = ctx.owners
-    for v in 1:(p.nv[_HB_A])
-        r = _ham_blk(p, _HB_A, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_HB_A][v])].A))
+    for v in 1:(p.nv[_LQR_BLOCK_A])
+        r = _lqr_blk(p, _LQR_BLOCK_A, v)
+        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_A][v])].A))
     end
-    for v in 1:(p.nv[_HB_S])
-        r = _ham_blk(p, _HB_S, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_HB_S][v])].S))
+    for v in 1:(p.nv[_LQR_BLOCK_S])
+        r = _lqr_blk(p, _LQR_BLOCK_S, v)
+        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_S][v])].S))
     end
-    for v in 1:(p.nv[_HB_Q]), k in 1:(p.K)
-        r = _ham_blk_q(p, v, k)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_HB_Q][v])].Qc[k]))
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
+        r = _lqr_blk_q(p, v, k)
+        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k]))
     end
-    for v in 1:(p.nv[_HB_H])
-        r = _ham_blk(p, _HB_H, v)
-        isempty(r) || copyto!(view(θ, r), ctx.sms[first(o[_HB_H][v])].h)
+    for v in 1:(p.nv[_LQR_BLOCK_H])
+        r = _lqr_blk(p, _LQR_BLOCK_H, v)
+        isempty(r) || copyto!(view(θ, r), ctx.sms[first(o[_LQR_BLOCK_H][v])].h)
     end
-    for v in 1:(p.nv[_HB_B])
-        r = _ham_blk(p, _HB_B, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_HB_B][v])].Bu))
+    for v in 1:(p.nv[_LQR_BLOCK_B])
+        r = _lqr_blk(p, _LQR_BLOCK_B, v)
+        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu))
     end
-    for v in 1:(p.nv[_HB_G])
-        r = _ham_blk(p, _HB_G, v)
-        isempty(r) ||
-            copyto!(view(θ, r), vec(view(ctx.sms[first(o[_HB_G][v])].Gref, :, p.gcols)))
+    for v in 1:(p.nv[_LQR_BLOCK_G])
+        r = _lqr_blk(p, _LQR_BLOCK_G, v)
+        isempty(r) || copyto!(
+            view(θ, r), vec(view(ctx.sms[first(o[_LQR_BLOCK_G][v])].Gref, :, p.gcols))
+        )
     end
-    for v in 1:(p.nv[_HB_F])
-        r = _ham_blk(p, _HB_F, v)
-        isempty(r) || copyto!(view(θ, r), ctx.sms[first(o[_HB_F][v])].hf)
+    for v in 1:(p.nv[_LQR_BLOCK_F])
+        r = _lqr_blk(p, _LQR_BLOCK_F, v)
+        isempty(r) || copyto!(view(θ, r), ctx.sms[first(o[_LQR_BLOCK_F][v])].hf)
     end
     return θ
 end
 
 """
-    _ham_unpack!(ctx, θ) -> ctx
+    _lqr_unpack!(ctx, θ) -> ctx
 
 Fill the per-copy parameter scratch from `θ`, falling back to the model's own
 value for a frozen block.
 """
-function _ham_unpack!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
+function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
     p = ctx.pack
     n = p.n
     o = ctx.owners
-    for v in 1:(p.nv[_HB_A])
-        r = _ham_blk(p, _HB_A, v)
+    for v in 1:(p.nv[_LQR_BLOCK_A])
+        r = _lqr_blk(p, _LQR_BLOCK_A, v)
         if isempty(r)
-            copyto!(ctx.A[v], ctx.sms[first(o[_HB_A][v])].A)
+            copyto!(ctx.A[v], ctx.sms[first(o[_LQR_BLOCK_A][v])].A)
         else
             copyto!(ctx.A[v], reshape(view(θ, r), n, n))
         end
     end
-    for v in 1:(p.nv[_HB_S])
-        r = _ham_blk(p, _HB_S, v)
+    for v in 1:(p.nv[_LQR_BLOCK_S])
+        r = _lqr_blk(p, _LQR_BLOCK_S, v)
         if isempty(r)
-            copyto!(ctx.S[v], ctx.sms[first(o[_HB_S][v])].S)
+            copyto!(ctx.S[v], ctx.sms[first(o[_LQR_BLOCK_S][v])].S)
         else
             copyto!(ctx.S[v], reshape(view(θ, r), n, n))
             Symmetrize!(ctx.S[v])
         end
     end
-    for v in 1:(p.nv[_HB_Q]), k in 1:(p.K)
-        r = _ham_blk_q(p, v, k)
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
+        r = _lqr_blk_q(p, v, k)
         if isempty(r)
-            copyto!(ctx.Qc[v][k], ctx.sms[first(o[_HB_Q][v])].Qc[k])
+            copyto!(ctx.Qc[v][k], ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k])
         else
             copyto!(ctx.Qc[v][k], reshape(view(θ, r), n, n))
             Symmetrize!(ctx.Qc[v][k])
         end
     end
-    for v in 1:(p.nv[_HB_H])
-        r = _ham_blk(p, _HB_H, v)
+    for v in 1:(p.nv[_LQR_BLOCK_H])
+        r = _lqr_blk(p, _LQR_BLOCK_H, v)
         if isempty(r)
-            copyto!(ctx.h[v], ctx.sms[first(o[_HB_H][v])].h)
+            copyto!(ctx.h[v], ctx.sms[first(o[_LQR_BLOCK_H][v])].h)
         else
             copyto!(ctx.h[v], view(θ, r))
         end
     end
     if p.m > 0
-        for v in 1:(p.nv[_HB_B])
-            r = _ham_blk(p, _HB_B, v)
+        for v in 1:(p.nv[_LQR_BLOCK_B])
+            r = _lqr_blk(p, _LQR_BLOCK_B, v)
             if isempty(r)
-                copyto!(ctx.Bu[v], ctx.sms[first(o[_HB_B][v])].Bu)
+                copyto!(ctx.Bu[v], ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu)
             else
                 copyto!(ctx.Bu[v], reshape(view(θ, r), p.d, p.m))
             end
         end
-        for v in 1:(p.nv[_HB_G])
-            r = _ham_blk(p, _HB_G, v)
+        for v in 1:(p.nv[_LQR_BLOCK_G])
+            r = _lqr_blk(p, _LQR_BLOCK_G, v)
             #= The model's own matrix first, then the free columns over the top:
             a column `Gref_cols` leaves out keeps the value it was built with,
             exactly as a frozen block does. =#
-            copyto!(ctx.Gref[v], ctx.sms[first(o[_HB_G][v])].Gref)
+            copyto!(ctx.Gref[v], ctx.sms[first(o[_LQR_BLOCK_G][v])].Gref)
             isempty(r) || copyto!(
                 view(ctx.Gref[v], :, p.gcols), reshape(view(θ, r), n, length(p.gcols))
             )
         end
     end
-    for v in 1:(p.nv[_HB_F])
-        r = _ham_blk(p, _HB_F, v)
+    for v in 1:(p.nv[_LQR_BLOCK_F])
+        r = _lqr_blk(p, _LQR_BLOCK_F, v)
         if isempty(r)
-            copyto!(ctx.hf[v], ctx.sms[first(o[_HB_F][v])].hf)
+            copyto!(ctx.hf[v], ctx.sms[first(o[_LQR_BLOCK_F][v])].hf)
         else
             copyto!(ctx.hf[v], view(θ, r))
         end
@@ -1130,16 +1135,16 @@ function _ham_unpack!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
     return ctx
 end
 
-function _ham_assemble!(ctx::_HamMStepCtx{T}) where {T<:Real}
+function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     p = ctx.pack
     n, d, m = p.n, p.d, p.m
     xr, lr = 1:n, (n + 1):d
     terminal = ctx.sms[1].terminal
     for (ui, u) in enumerate(ctx.units)
-        A = ctx.A[u.v[_HB_A]]
-        S = ctx.S[u.v[_HB_S]]
-        Qs = ctx.Qc[u.v[_HB_Q]]
-        hv = ctx.h[u.v[_HB_H]]
+        A = ctx.A[u.v[_LQR_BLOCK_A]]
+        S = ctx.S[u.v[_LQR_BLOCK_S]]
+        Qs = ctx.Qc[u.v[_LQR_BLOCK_Q]]
+        hv = ctx.h[u.v[_LQR_BLOCK_H]]
         for k in 1:(p.K)
             Th = ctx.Theta[ui][k]
             @views begin
@@ -1150,8 +1155,8 @@ function _ham_assemble!(ctx::_HamMStepCtx{T}) where {T<:Real}
                 Th[:, d + 1] .= hv
                 if m > 0
                     Bcol = Th[:, (d + 2):(d + 1 + m)]
-                    Bcol .= ctx.Bu[u.v[_HB_B]]
-                    mul!(Bcol[lr, :], Qs[k], ctx.Gref[u.v[_HB_G]], -one(T), one(T))
+                    Bcol .= ctx.Bu[u.v[_LQR_BLOCK_B]]
+                    mul!(Bcol[lr, :], Qs[k], ctx.Gref[u.v[_LQR_BLOCK_G]], -one(T), one(T))
                 end
             end
         end
@@ -1164,9 +1169,9 @@ function _ham_assemble!(ctx::_HamMStepCtx{T}) where {T<:Real}
                 for i in 1:n
                     Psi[i, n + i] = one(T)
                 end
-                Psi[:, d + 1] .= .-ctx.hf[u.v[_HB_F]]
+                Psi[:, d + 1] .= .-ctx.hf[u.v[_LQR_BLOCK_F]]
                 # Terminal reference: the residual carries +Q_f G_r u_T.
-                m > 0 && mul!(Psi[:, (d + 2):(d + 1 + m)], Qf, ctx.Gref[u.v[_HB_G]])
+                m > 0 && mul!(Psi[:, (d + 2):(d + 1 + m)], Qf, ctx.Gref[u.v[_LQR_BLOCK_G]])
             end
         end
     end
@@ -1183,7 +1188,7 @@ Everything is written through preallocated scratch and 5-argument `mul!`. The
 obvious spelling, `R .-= Th * Xvᵀ` and friends, allocates three `d × d` or
 `d × reg` temporaries per unit and regime on *every* evaluation.
 =#
-function _ham_residuals!(ctx::_HamMStepCtx{T}) where {T<:Real}
+function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     p = ctx.pack
     terminal = ctx.sms[1].terminal
     for s in 1:(ctx.nq)
@@ -1219,14 +1224,14 @@ function _ham_residuals!(ctx::_HamMStepCtx{T}) where {T<:Real}
     return ctx
 end
 
-function _ham_fg!(
-    grad::Union{Nothing,AbstractVector{T}}, θ::AbstractVector{T}, ctx::_HamMStepCtx{T}
+function _lqr_fg!(
+    grad::Union{Nothing,AbstractVector{T}}, θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}
 ) where {T<:Real}
     p = ctx.pack
     n, d, m, K = p.n, p.d, p.m, p.K
     xr, lr = 1:n, (n + 1):d
     terminal = ctx.sms[1].terminal
-    nA = p.nv[_HB_A]
+    nA = p.nv[_LQR_BLOCK_A]
 
     #=
     A rejected step must leave `grad` defined, not stale: L-BFGS's line search
@@ -1235,7 +1240,7 @@ function _ham_fg!(
     =#
     grad === nothing || fill!(grad, zero(T))
 
-    _ham_unpack!(ctx, θ)
+    _lqr_unpack!(ctx, θ)
 
     fval = zero(T)
     F = Vector{LU{T,Matrix{T},Vector{Int}}}(undef, nA)
@@ -1248,8 +1253,8 @@ function _ham_fg!(
         F[a] = Fa
     end
 
-    _ham_assemble!(ctx)
-    _ham_residuals!(ctx)
+    _lqr_assemble!(ctx)
+    _lqr_residuals!(ctx)
 
     for s in 1:(ctx.nq)
         if ctx.profile
@@ -1283,22 +1288,22 @@ function _ham_fg!(
     for a in 1:nA
         fill!(ctx.dA[a], zero(T))
     end
-    for v in 1:(p.nv[_HB_S])
+    for v in 1:(p.nv[_LQR_BLOCK_S])
         fill!(ctx.dS[v], zero(T))
     end
-    for v in 1:(p.nv[_HB_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
         fill!(ctx.dQ[v][k], zero(T))
     end
-    for v in 1:(p.nv[_HB_H])
+    for v in 1:(p.nv[_LQR_BLOCK_H])
         fill!(ctx.dh[v], zero(T))
     end
-    for v in 1:(p.nv[_HB_B])
+    for v in 1:(p.nv[_LQR_BLOCK_B])
         fill!(ctx.dB[v], zero(T))
     end
-    for v in 1:(p.nv[_HB_G])
+    for v in 1:(p.nv[_LQR_BLOCK_G])
         fill!(ctx.dG[v], zero(T))
     end
-    for v in 1:(p.nv[_HB_F])
+    for v in 1:(p.nv[_LQR_BLOCK_F])
         fill!(ctx.dhf[v], zero(T))
     end
 
@@ -1308,8 +1313,8 @@ function _ham_fg!(
     GP = ctx.tmp_nr2
     for (ui, u) in enumerate(ctx.units)
         Ws = ctx.W[u.q]
-        vA, vS, vQ = u.v[_HB_A], u.v[_HB_S], u.v[_HB_Q]
-        vh, vB, vG = u.v[_HB_H], u.v[_HB_B], u.v[_HB_G]
+        vA, vS, vQ = u.v[_LQR_BLOCK_A], u.v[_LQR_BLOCK_S], u.v[_LQR_BLOCK_Q]
+        vh, vB, vG = u.v[_LQR_BLOCK_H], u.v[_LQR_BLOCK_B], u.v[_LQR_BLOCK_G]
         for k in 1:K
             copyto!(E, u.hs.Xv[k])
             mul!(E, ctx.Theta[ui][k], u.hs.Zw[k], one(T), -one(T))
@@ -1346,7 +1351,7 @@ function _ham_fg!(
                     mul!(ctx.dQ[vQ][ctx.kf], dPu, transpose(ctx.Gref[vG]), one(T), one(T))
                     mul!(ctx.dG[vG], ctx.Qc[vQ][ctx.kf], dPu, one(T), one(T))
                 end
-                ctx.dhf[u.v[_HB_F]] .-= GP[:, d + 1]
+                ctx.dhf[u.v[_LQR_BLOCK_F]] .-= GP[:, d + 1]
             end
         end
     end
@@ -1355,31 +1360,31 @@ function _ham_fg!(
         # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_aâ»áµ€.
         copyto!(ctx.tmp_nn, transpose(inv(F[a])))
         ctx.dA[a] .-= ctx.N_A[a] .* ctx.tmp_nn
-        r = _ham_blk(p, _HB_A, a)
+        r = _lqr_blk(p, _LQR_BLOCK_A, a)
         isempty(r) || copyto!(view(grad, r), vec(ctx.dA[a]))
     end
-    for v in 1:(p.nv[_HB_S])
-        r = _ham_blk(p, _HB_S, v)
+    for v in 1:(p.nv[_LQR_BLOCK_S])
+        r = _lqr_blk(p, _LQR_BLOCK_S, v)
         isempty(r) || copyto!(view(grad, r), vec(_sym!(ctx.tmp_nn, ctx.dS[v])))
     end
-    for v in 1:(p.nv[_HB_Q]), k in 1:K
-        r = _ham_blk_q(p, v, k)
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+        r = _lqr_blk_q(p, v, k)
         isempty(r) || copyto!(view(grad, r), vec(_sym!(ctx.tmp_nn, ctx.dQ[v][k])))
     end
-    for v in 1:(p.nv[_HB_H])
-        r = _ham_blk(p, _HB_H, v)
+    for v in 1:(p.nv[_LQR_BLOCK_H])
+        r = _lqr_blk(p, _LQR_BLOCK_H, v)
         isempty(r) || copyto!(view(grad, r), ctx.dh[v])
     end
-    for v in 1:(p.nv[_HB_B])
-        r = _ham_blk(p, _HB_B, v)
+    for v in 1:(p.nv[_LQR_BLOCK_B])
+        r = _lqr_blk(p, _LQR_BLOCK_B, v)
         isempty(r) || copyto!(view(grad, r), vec(ctx.dB[v]))
     end
-    for v in 1:(p.nv[_HB_G])
-        r = _ham_blk(p, _HB_G, v)
+    for v in 1:(p.nv[_LQR_BLOCK_G])
+        r = _lqr_blk(p, _LQR_BLOCK_G, v)
         isempty(r) || copyto!(view(grad, r), vec(view(ctx.dG[v], :, p.gcols)))
     end
-    for v in 1:(p.nv[_HB_F])
-        r = _ham_blk(p, _HB_F, v)
+    for v in 1:(p.nv[_LQR_BLOCK_F])
+        r = _lqr_blk(p, _LQR_BLOCK_F, v)
         isempty(r) || copyto!(view(grad, r), ctx.dhf[v])
     end
 
@@ -1387,7 +1392,7 @@ function _ham_fg!(
 end
 
 """
-    _ham_writeback!(ctx, θ) -> ctx
+    _lqr_writeback!(ctx, θ) -> ctx
 
 Write the fitted parameters back onto every model that uses each block copy.
 
@@ -1395,47 +1400,47 @@ A tie is therefore broadcast by construction: the models sharing a copy are
 exactly the ones this writes it to, so there is no separate pass that has to know
 which blocks a partial tie shared.
 """
-function _ham_writeback!(ctx::_HamMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
-    _ham_unpack!(ctx, θ)
+function _lqr_writeback!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Real}
+    _lqr_unpack!(ctx, θ)
     p = ctx.pack
     o = ctx.owners
-    for v in 1:(p.nv[_HB_A]), c in o[_HB_A][v]
-        isempty(_ham_blk(p, _HB_A, v)) || copyto!(ctx.sms[c].A, ctx.A[v])
+    for v in 1:(p.nv[_LQR_BLOCK_A]), c in o[_LQR_BLOCK_A][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_A, v)) || copyto!(ctx.sms[c].A, ctx.A[v])
     end
-    for v in 1:(p.nv[_HB_S]), c in o[_HB_S][v]
-        isempty(_ham_blk(p, _HB_S, v)) || copyto!(ctx.sms[c].S, ctx.S[v])
+    for v in 1:(p.nv[_LQR_BLOCK_S]), c in o[_LQR_BLOCK_S][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_S, v)) || copyto!(ctx.sms[c].S, ctx.S[v])
     end
-    for v in 1:(p.nv[_HB_Q]), k in 1:(p.K), c in o[_HB_Q][v]
-        isempty(_ham_blk_q(p, v, k)) || copyto!(ctx.sms[c].Qc[k], ctx.Qc[v][k])
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K), c in o[_LQR_BLOCK_Q][v]
+        isempty(_lqr_blk_q(p, v, k)) || copyto!(ctx.sms[c].Qc[k], ctx.Qc[v][k])
     end
-    for v in 1:(p.nv[_HB_H]), c in o[_HB_H][v]
-        isempty(_ham_blk(p, _HB_H, v)) || copyto!(ctx.sms[c].h, ctx.h[v])
+    for v in 1:(p.nv[_LQR_BLOCK_H]), c in o[_LQR_BLOCK_H][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_H, v)) || copyto!(ctx.sms[c].h, ctx.h[v])
     end
-    for v in 1:(p.nv[_HB_B]), c in o[_HB_B][v]
-        isempty(_ham_blk(p, _HB_B, v)) || copyto!(ctx.sms[c].Bu, ctx.Bu[v])
+    for v in 1:(p.nv[_LQR_BLOCK_B]), c in o[_LQR_BLOCK_B][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_B, v)) || copyto!(ctx.sms[c].Bu, ctx.Bu[v])
     end
-    for v in 1:(p.nv[_HB_G]), c in o[_HB_G][v]
-        isempty(_ham_blk(p, _HB_G, v)) || copyto!(ctx.sms[c].Gref, ctx.Gref[v])
+    for v in 1:(p.nv[_LQR_BLOCK_G]), c in o[_LQR_BLOCK_G][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_G, v)) || copyto!(ctx.sms[c].Gref, ctx.Gref[v])
     end
-    for v in 1:(p.nv[_HB_F]), c in o[_HB_F][v]
-        isempty(_ham_blk(p, _HB_F, v)) || copyto!(ctx.sms[c].hf, ctx.hf[v])
+    for v in 1:(p.nv[_LQR_BLOCK_F]), c in o[_LQR_BLOCK_F][v]
+        isempty(_lqr_blk(p, _LQR_BLOCK_F, v)) || copyto!(ctx.sms[c].hf, ctx.hf[v])
     end
     return ctx
 end
 
-function _ham_structure_mstep!(
-    ctx::_HamMStepCtx{T}, fit_structure::Bool, mstep_iters::Int
+function _lqr_structure_mstep!(
+    ctx::_LQRMStepCtx{T}, fit_structure::Bool, mstep_iters::Int
 ) where {T<:Real}
-    np = _ham_nparams(ctx)
+    np = _lqr_nparams(ctx)
     θ0 = zeros(T, np)
-    _ham_pack!(θ0, ctx)
+    _lqr_pack!(θ0, ctx)
 
     if fit_structure && np > 0
-        f0 = _ham_fg!(nothing, θ0, ctx)
+        f0 = _lqr_fg!(nothing, θ0, ctx)
         if isfinite(f0)
-            f_obj(θ) = _ham_fg!(nothing, θ, ctx)
+            f_obj(θ) = _lqr_fg!(nothing, θ, ctx)
             function g_obj!(G, θ)
-                _ham_fg!(G, θ, ctx)
+                _lqr_fg!(G, θ, ctx)
                 return G
             end
             opts = Optim.Options(;
@@ -1443,33 +1448,33 @@ function _ham_structure_mstep!(
             )
             result = optimize(f_obj, g_obj!, θ0, LBFGS(; linesearch=HagerZhang()), opts)
             θ1 = Optim.minimizer(result)
-            f1 = _ham_fg!(nothing, θ1, ctx)
+            f1 = _lqr_fg!(nothing, θ1, ctx)
             #=
             Accept only a genuine improvement. L-BFGS normally returns one, but a
             line-search stall or a step into a region where `R` lost rank would
             otherwise hand EM a worse objective and break monotonicity.
             =#
             if isfinite(f1) && f1 <= f0
-                _ham_writeback!(ctx, θ1)
+                _lqr_writeback!(ctx, θ1)
                 copyto!(θ0, θ1)
             end
         end
     end
 
-    _ham_unpack!(ctx, θ0)
-    _ham_assemble!(ctx)
-    _ham_residuals!(ctx)
+    _lqr_unpack!(ctx, θ0)
+    _lqr_assemble!(ctx)
+    _lqr_residuals!(ctx)
     return ctx
 end
 
 """
-    _ham_noise_mstep!(ctx)
+    _lqr_noise_mstep!(ctx)
 
 `Σ_s = R_s/N_s` and `Σ_{f,s} = R_{f,s}/N_{f,s}` — the closed-form maximizers
 given the structural parameters, which is exactly what profiling them out of the
 objective assumed. Units sharing a noise version pool into that version's `R`.
 """
-function _ham_noise_mstep!(ctx::_HamMStepCtx{T}) where {T<:Real}
+function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     #=
     Written to every model on the noise version, not just one: as with the
     structural blocks, models sharing a version hold separate arrays in an
@@ -1495,16 +1500,16 @@ function _ham_noise_mstep!(ctx::_HamMStepCtx{T}) where {T<:Real}
 end
 
 """
-    _ham_state_mstep!(lds, hs, sws)
+    _lqr_state_mstep!(lds, hs, sws)
 
 The state half of the M-step for an ungrouped fit, shared by every emission
 model.
 """
-function _ham_state_mstep!(
+function _lqr_state_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     base = _state_suf(hs.base)
     update_initial_state_mean!(lds, base)
     update_initial_state_covariance!(lds, base, sws)
@@ -1516,9 +1521,9 @@ function _ham_state_mstep!(
         return nothing
     end
     _fill_mixed_blocks!(hs, sm)
-    ctx = _HamMStepCtx(hs, sm, lds.fit_bool[4])
-    _ham_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
-    lds.fit_bool[4] && _ham_noise_mstep!(ctx)
+    ctx = _LQRMStepCtx(hs, sm, lds.fit_bool[4])
+    _lqr_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
+    lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
     refresh!(sm)
     return nothing
 end
@@ -1547,7 +1552,7 @@ one the symplectic parameterization needs), and it reproduces a
 
 The current `d × (d+1+m)` regression block `[M | h | B_u]` of a `:free` model.
 """
-function _free_theta(sm::HamiltonianStateModel{T}) where {T<:Real}
+function _free_theta(sm::LQRStateModel{T}) where {T<:Real}
     d = _state_latent_dim(sm)
     m = size(sm.Bu, 2)
     Th = Matrix{T}(undef, d, d + 1 + m)
@@ -1565,7 +1570,7 @@ end
 `R(Θ) = S_vv − Θ S_vwᵀ − S_vw Θᵀ + Θ S_ww Θᵀ`, symmetrized.
 """
 function _free_residual_scatter(
-    Theta::AbstractMatrix{T}, hs::HamiltonianSufficientStatistics{T}
+    Theta::AbstractMatrix{T}, hs::LQRSufficientStatistics{T}
 ) where {T<:Real}
     Sww = hs.zz[1]
     Svw = transpose(hs.zy[1])
@@ -1586,7 +1591,7 @@ The transition half of the state Q-term for a `:free` model, at its current
 parameters.
 """
 function _free_Q_transition(
-    sm::HamiltonianStateModel{T}, hs::HamiltonianSufficientStatistics{T}
+    sm::LQRStateModel{T}, hs::LQRSufficientStatistics{T}
 ) where {T<:Real}
     N = T(hs.nk[1])
     N > zero(T) || return zero(T)
@@ -1608,8 +1613,8 @@ current value, which is the ordinary partial least-squares update
 `Θ_free = (S_vw − Θ_fix S_ww[fix, ·])[:, free] · S_ww[free, free]⁻¹`.
 """
 function _free_state_mstep!(
-    lds::LinearDynamicalSystem{T,S,O}, hs::HamiltonianSufficientStatistics{T}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    lds::LinearDynamicalSystem{T,S,O}, hs::LQRSufficientStatistics{T}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = _state_latent_dim(sm)
     m = size(sm.Bu, 2)
@@ -1655,7 +1660,7 @@ end
 """
     Q_state!(sws, lds, hs) -> T
 
-State-side expected complete-data log-likelihood for a Hamiltonian LDS:
+State-side expected complete-data log-likelihood for an LQR LDS:
 
 ```math
 Q = \\underbrace{-\\tfrac12\\left(N_1 (2n\\log 2\\pi + \\log\\det P_0)
@@ -1679,8 +1684,8 @@ aggregated statistics.
 function Q_state!(
     sws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+    hs::LQRSufficientStatistics{T},
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     suf = _state_suf(hs.base)
     n = _plant_dim(sm)
@@ -1714,12 +1719,12 @@ function Q_state!(
     _fill_mixed_blocks!(hs, sm)
 
     # Transition term, in mixed coordinates, at the model's current parameters.
-    ctx = _HamMStepCtx(hs, sm, false)
-    θ = zeros(T, _ham_nparams(ctx))
-    _ham_pack!(θ, ctx)
-    _ham_unpack!(ctx, θ)
-    _ham_assemble!(ctx)
-    _ham_residuals!(ctx)
+    ctx = _LQRMStepCtx(hs, sm, false)
+    θ = zeros(T, _lqr_nparams(ctx))
+    _lqr_pack!(θ, ctx)
+    _lqr_unpack!(ctx, θ)
+    _lqr_assemble!(ctx)
+    _lqr_residuals!(ctx)
 
     # One unit and one noise version here: `Q_state!` is always called per cell.
     if ctx.N_q[1] > zero(T)

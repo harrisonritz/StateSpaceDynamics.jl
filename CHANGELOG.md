@@ -7,9 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The inverse optimal control model now uses LQR naming throughout.** Use
+  `LQRStateModel`, `LQRFitFlags`, and `lqr_matrix`; source files, internal
+  helpers, tests, and tutorials follow the same convention. This is a complete
+  API rename without compatibility aliases; model behavior is unchanged.
+
 ### Fixed
 - **`refresh!` now rebuilds a grouped model's variant caches.** A
-  `HamiltonianStateModel` with `depends_on` builds one variant per cell, aliasing
+  `LQRStateModel` with `depends_on` builds one variant per cell, aliasing
   the parent's arrays for every group that does not vary — so a write to the
   parent *is* a write to theirs. But each variant carries its own derived cache,
   and a grouped model smooths through those, not through the parent's. A
@@ -25,14 +31,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different costate scale. It says so instead.
 - **Composite emissions work with an inverse-LQR state.** Three sites indexed a
   member's sufficient statistics by key — the grouped emission M-step, the
-  switching one, and the pooled initial-state update — but a Hamiltonian state's
+  switching one, and the pooled initial-state update — but an LQR state's
   statistics *wrap* the per-member blocks rather than being them, so a fit
   combining an inverse-LQR state with several emissions threw a `MethodError`
   the moment it reached the M-step. They now unwrap through the accessors that
   already exist for it (`_obs_suf`, `_slds_init_suf`), which are the identity for
   every other state model.
 
-- **The weighted Hamiltonian aggregator accepts input views.** It asserted
+- **The weighted LQR aggregator accepts input views.** It asserted
   `data.ux[trial]::Matrix`, which rejected the ordinary case of a `Data` built
   from an array the caller owns — where the per-trial inputs are views rather
   than copies. `ux` is only ever reached through `tview`, so nothing downstream
@@ -40,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Switching inverse LQR under `depends_on`.** The grouped switching M-step now
-  handles Hamiltonian discrete states, so a switching inverse-LQR model can be
+  handles LQR discrete states, so a switching inverse-LQR model can be
   *stitched*: one control problem per discrete state, read out through one
   emission per session. Previously this path aggregated with the base routine
   rather than the dispatched one and then looked for a conjugate update that an
@@ -49,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The units are the `K · ncells` (regime, cell) pairs, and each structural
   block's version at a unit is the pair of its version across regimes (from the
   tie) and across cells (from the grouping), mapped to a dense index by
-  `_ham_pair_slots`. With the state side ungrouped — only the emission stitched,
+  `_lqr_pair_slots`. With the state side ungrouped — only the emission stitched,
   which is the usual shape — every cell shares one structural version and this
   reduces exactly to the ungrouped switching M-step, so the stitched fit and the
   single-session one are the same estimator. A `K = 1` grouped switching fit
@@ -61,8 +67,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   behaviour — different plants, different costs, or both.
 
   ```julia
-  slds = SLDS(; A=P, πₖ=π, LDSs=[LinearDynamicalSystem(HamiltonianStateModel(A, S, Q₁, Σ), obs),
-                                 LinearDynamicalSystem(HamiltonianStateModel(A, S, Q₂, Σ), obs)])
+  slds = SLDS(; A=P, πₖ=π, LDSs=[LinearDynamicalSystem(LQRStateModel(A, S, Q₁, Σ), obs),
+                                 LinearDynamicalSystem(LQRStateModel(A, S, Q₂, Σ), obs)])
   fit!(slds, y; tied_params=[:structure])     # one shared control problem
   ```
 
@@ -83,13 +89,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     transition is unconstrained rather than symplectic, so a switching model can
     mix plain linear dynamics with LQR dynamics. `SLDS` stores one concrete
     state-model type per discrete state, which is why a "plain dynamics" state
-    has to *be* a `HamiltonianStateModel`; `mode` is a runtime field rather than
+    has to *be* an `LQRStateModel`; `mode` is a runtime field rather than
     a type parameter for the same reason. Its M-step is the ordinary conjugate
     regression, and it reproduces a `GaussianStateModel` to machine precision —
     matching log-likelihood, identical smoothed means, and EM that tracks
     iterate for iterate.
   * **The weighted generalized M-step** is the unweighted one fed
-    responsibility-weighted statistics: `_HamMStepCtx` reads only the statistics,
+    responsibility-weighted statistics: `_LQRMStepCtx` reads only the statistics,
     and its Jacobian coefficient comes from `Σ nk`, which the weighted aggregator
     fills with the *effective* count `n̄ₖ = Σ γₖ(t)`. Scaling `−n̄ₖ log|det Aₖ|`
     by a raw timestep count instead would stay monotone under balanced
@@ -109,7 +115,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     never shared whatever the tie asks for, since freezing means "keep your own
     value", and the states sharing a layout must agree on `fit_flags` as they
     already must on `fit_bool`.
-  * A `HamiltonianStateModel(latent_dim)` constructor taking the **total**
+  * A `LQRStateModel(latent_dim)` constructor taking the **total**
     dimension — the spelling a switching model wants — throwing on an odd value,
     and `plant_dim` for the other half of the contract.
 
@@ -118,39 +124,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   what caught the costate readout leaking back through the switching emission
   M-step.
 
-- **`trial_elbos` covers Hamiltonian (inverse-LQR) latents.** The per-trial ELBO
-  split now accepts a `HamiltonianStateModel` alongside the Gaussian ones, with
+- **`trial_elbos` covers LQR latents.** The per-trial ELBO
+  split now accepts an `LQRStateModel` alongside the Gaussian ones, with
   the same contract — `sum(trial_elbos(m, y)) + log p(θ) == elbo(m, y)` — and
   the same support for Gaussian, Poisson and composite emissions, multi-regime
   cost schedules, the terminal factor, `observe_costate`, inputs and ragged
   trial lengths.
 
-  This is what lets a Hamiltonian fit be scored per trial: a held-out likelihood
+  This is what lets an LQR fit be scored per trial: a held-out likelihood
   quoted per trial, a paired bootstrap between models, or a co-smoothing
   conditional `log p(y_out | y_in)` taken as a difference of two ELBOs.
 
-  A Hamiltonian `Q_state!` has no per-trial kernel — its transition term lives
+  An LQR `Q_state!` has no per-trial kernel — its transition term lives
   in mixed coordinates and carries the `N log|det A|` Jacobian — so the split
   re-aggregates each trial's statistics and calls the aggregated `Q_state!` on
   them. That is exact, not approximate: at fixed parameters the residual scatter
   is linear in the aggregated blocks and `N` / `N_f` are plain counts, so the
-  objective is additive over trials. `_aggregate_hamiltonian_stats!` takes an
+  objective is additive over trials. `_aggregate_lqr_stats!` takes an
   optional `trials` argument to make that reachable.
 
-- **Inverse LQR through Hamiltonian latents.** A new state model,
-  `HamiltonianStateModel`, whose latent state is the LQR state-costate pair
+- **Inverse LQR through LQR latents.** A new state model,
+  `LQRStateModel`, whose latent state is the LQR state-costate pair
   `z = [x; λ]` and whose transition is constrained to the symplectic form a
   linear-quadratic control problem implies — so fitting the state-space model
   *is* recovering the plant and the cost function the behaviour is optimal for.
 
   ```julia
-  sm = HamiltonianStateModel(A, S, Qc, Σ)          # S = B R⁻¹ Bᵀ, Qc the state cost
+  sm = LQRStateModel(A, S, Qc, Σ)          # S = B R⁻¹ Bᵀ, Qc the state cost
   lds = LinearDynamicalSystem(sm, GaussianObservationModel(C, R, d))
   fit!(lds, y)
   lqr_parameters(sm)                               # (A, S, Qc, schedule, terminal)
   ```
 
-  The user-facing latent dimension doubles: `HamiltonianStateModel(A, ...)` with
+  The user-facing latent dimension doubles: `LQRStateModel(A, ...)` with
   an `n × n` plant gives a `2n`-dimensional latent. Everything else — Gaussian,
   Poisson and composite emissions, single- and multi-trial, ragged and
   equal-length fast paths, inputs, initial-state priors — works as it does for
@@ -202,7 +208,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     — works too. Groups sharing a noise version pool into that version's
     residual scatter, so grouped fits are joint rather than group-by-group, and
     a single-group fit reproduces the ungrouped one exactly.
-  * Utilities: `symplectic_matrix`, `hamiltonian_matrix`, `symplectic_defect`,
+  * Utilities: `symplectic_matrix`, `lqr_matrix`, `symplectic_defect`,
     `riccati_solution`, `closed_loop_dynamics`, `lqr_parameters`,
     `lqr_riccati_sequence`, and `rescale_costate!` for the classical
     inverse-optimal-control scale invariance (the cost is identified only up to a
@@ -381,7 +387,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - `AbstractStateModel` gained an intermediate supertype,
   `AbstractGaussianStateModel`, for state models with a linear-Gaussian
-  transition. `GaussianStateModel` and `HamiltonianStateModel` are its subtypes,
+  transition. `GaussianStateModel` and `LQRStateModel` are its subtypes,
   and the drivers, emission kernels, workspaces and aggregators now dispatch on
   it rather than on `GaussianStateModel`. Existing behaviour is unchanged; a new
   state model plugs in by supplying the state half of the log-density, gradient,

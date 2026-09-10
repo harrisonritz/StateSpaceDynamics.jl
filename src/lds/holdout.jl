@@ -8,7 +8,7 @@
 #
 # The scoring call is the ordinary public `elbo(model, y; ...)`, which for every
 # model family here runs a deterministic E-step (an exact smoother for the
-# Gaussian LDS and the Hamiltonian model, a Laplace/Newton solve for a Poisson
+# Gaussian LDS and the LQR model, a Laplace/Newton solve for a Poisson
 # emission, and deterministic coordinate ascent for the SLDS — note that this is
 # *not* the SLDS fit's Monte-Carlo E-step). Scoring the same parameters on the
 # same data therefore returns the same number every time, which is what makes

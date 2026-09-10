@@ -190,7 +190,7 @@ end
     _base_td_sufficient_statistics(T, lds, tsteps_per_trial) -> SufficientStatistics
 
 The plain-layout allocator, split out from the entry point above so a state
-model with its own statistics type (see `HamiltonianSufficientStatistics`) can
+model with its own statistics type (see `LQRSufficientStatistics`) can
 still get the shared initial-state and emission blocks without reaching through
 `invoke`.
 """

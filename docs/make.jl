@@ -14,7 +14,7 @@ tutorials = [
     ("LDSModelSelection.jl", "lds_model_selection_example"),
     ("LDSIdentifiability.jl", "lds_identifiability_example"),
     ("SLDS.jl", "switching_linear_dynamical_system_example"),
-    ("HamiltonianLQR.jl", "hamiltonian_inverse_lqr_example"),
+    ("LQR.jl", "inverse_lqr_example"),
     ("ProbabilisticPCA.jl", "Probabilistic_PCA_example"),
 ]
 
@@ -55,7 +55,7 @@ makedocs(;
             "Non-Identifiability in LDS Models" => "tutorials/lds_identifiability_example.md",
             "Probabilistic PCA Example" => "tutorials/Probabilistic_PCA_example.md",
             "Switching Linear Dynamical System Example" => "tutorials/switching_linear_dynamical_system_example.md",
-            "Inverse LQR with Hamiltonian Latents" => "tutorials/hamiltonian_inverse_lqr_example.md",
+            "Inverse LQR" => "tutorials/inverse_lqr_example.md",
         ],
         "API Reference" => "api.md",
     ],

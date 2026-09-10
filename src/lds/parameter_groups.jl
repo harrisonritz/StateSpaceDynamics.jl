@@ -67,15 +67,15 @@ const _G_R = 6
 # `fit_bool` slots 1:4 and observation-model groups slots 5:6 (5:5 for Poisson).
 _group_names(::GaussianStateModel) = (:x0, :P0, :A, :Q)
 #=
-A Hamiltonian state model groups on the same four slots the `fit_bool` layout
+An LQR state model groups on the same four slots the `fit_bool` layout
 uses — `[x0, P0, structure, noise]` — with `:A` naming the whole structural
 block (`A`, `S`, every `Qc`, `h`, `Bu`, `Gref`, `hf`) because that block is one
 joint estimate rather than a set of separable regressions. Freezing individual
-pieces through `HamiltonianFitFlags` still works alongside grouping: a frozen
+pieces through `LQRFitFlags` still works alongside grouping: a frozen
 parameter is never updated, so every group keeps its starting value and the
 parameter is effectively shared.
 =#
-_group_names(::HamiltonianStateModel) = (:x0, :P0, :A, :Q)
+_group_names(::LQRStateModel) = (:x0, :P0, :A, :Q)
 _group_names(::GaussianObservationModel) = (:C, :R)
 _group_names(::PoissonObservationModel) = (:C,)
 
@@ -99,7 +99,7 @@ function _param_group(::GaussianStateModel, name::Symbol)
 end
 
 #=
-The Hamiltonian model's structural block is one joint estimate — the plant, the
+The LQR model's structural block is one joint estimate — the plant, the
 costs and the affine and reference terms are solved together — so it resolves to
 one group, `:structure`, and the two noise matrices to another, `:noise`. The
 canonical group names stay `:A` and `:Q` so the slot ordinals keep lining up
@@ -110,27 +110,27 @@ request: `(Qc = reward,)` groups the *cost* by reward while the plant `A`, the
 control term `S` and the rest stay one array estimated from every trial. It
 resolves to the same group — the cells are the same, and the solve is still one
 joint optimization — because what changes is only how many copies of each block
-the M-step packs, which it already varies per block (see `_HAM_STRUCT_NAMES`).
+the M-step packs, which it already varies per block (see `_LQR_STRUCT_NAMES`).
 
 That is the model an inverse-LQR fit usually wants of a task variable: one arm,
 an objective per condition. Naming `:structure` gives every piece its own copy,
 which says the plant itself changed with the condition.
 
-`HamiltonianFitFlags` freezes pieces within the block, and composes with either:
+`LQRFitFlags` freezes pieces within the block, and composes with either:
 a frozen piece keeps its starting value in every group. Freezing and sharing are
 different, though — a shared piece is still fitted, from all the trials at once.
 =#
-function _param_group(sm::HamiltonianStateModel, name::Symbol)
+function _param_group(sm::LQRStateModel, name::Symbol)
     name === :structure && return :A
     name === :noise && return :Q
     name in (:x0, :P0) && return name
     #= A `:free` model's transition is one unconstrained matrix with no plant,
     cost or reference to name, so only the whole block can be grouped there. =#
-    (!_is_free(sm) && name in _HAM_STRUCT_NAMES) && return :A
+    (!_is_free(sm) && name in _LQR_STRUCT_NAMES) && return :A
     return nothing
 end
 
-function _valid_param_names(sm::HamiltonianStateModel)
+function _valid_param_names(sm::LQRStateModel)
     _is_free(sm) && return ":x0, :P0, :structure, :noise (a `:free` model's " *
            "transition has no plant, cost or reference to name separately)"
     return ":x0, :P0, :structure, :noise, and the individual structural blocks " *
@@ -144,7 +144,7 @@ number of copies per block, so "one plant, a cost per group" is a model it
 solves in one pass rather than a split it cannot represent. Every other group on
 this model has a single member, so nothing here can be named in part.
 =#
-function _require_whole_groups(::HamiltonianStateModel, named, context::AbstractString)
+function _require_whole_groups(::LQRStateModel, named, context::AbstractString)
     return nothing
 end
 
@@ -162,13 +162,13 @@ deliver it by alternating over the two subsets. So the individual blocks are
 accepted there, and only there.
 """
 _extra_tied_names(::AbstractStateModel) = ()
-_extra_tied_names(::HamiltonianStateModel) = (:A, :S, :Qc, :h, :Bu, :Gref)
+_extra_tied_names(::LQRStateModel) = (:A, :S, :Qc, :h, :Bu, :Gref)
 
 #=
 One member each: `:structure` and `:noise` *are* their groups, so a `depends_on`
 naming one is already whole.
 =#
-function _group_members(::HamiltonianStateModel, group::Symbol)
+function _group_members(::LQRStateModel, group::Symbol)
     return group === :A ? (:structure,) : (group === :Q ? (:noise,) : (group,))
 end
 
@@ -1020,7 +1020,7 @@ function _build_variants!(
 end
 
 """
-    _build_variants!(sm::HamiltonianStateModel, dep)
+    _build_variants!(sm::LQRStateModel, dep)
 
 One model per parameter-group cell. Arrays for a group that does not vary are
 shared **by reference**, so an M-step write through any variant is visible from
@@ -1028,7 +1028,7 @@ all of them — the same contract as the Gaussian state model.
 
 The structural block refines that by piece. `dep` resolves `(Qc = labels,)` and
 `(structure = labels,)` to the same group and so to the same cells, and
-[`_ham_struct_varies`](@ref) is what tells the two apart: a piece nobody named
+[`_lqr_struct_varies`](@ref) is what tells the two apart: a piece nobody named
 gets *one* array shared by every variant, exactly as an ungrouped group does, so
 `(Qc = labels,)` gives one plant fitted from all the trials and a cost per group.
 
@@ -1037,7 +1037,7 @@ function of that variant's parameters (`M_k` depends on its `Qc`). Two variants
 that share every structural array simply end up with equal caches.
 """
 function _build_variants!(
-    sm::HamiltonianStateModel{T,M,V}, dep::ParameterDependence
+    sm::LQRStateModel{T,M,V}, dep::ParameterDependence
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     ncells = prod(dep.nslots)
     existing = sm.variants
@@ -1050,38 +1050,38 @@ function _build_variants!(
     #= Slot 3 is the structural block and slot 4 the noise. A structural piece
     the declaration did not name takes one slot however many the block has, and
     every variant then reads the same array. =#
-    varies = _ham_struct_varies(sm)
+    varies = _lqr_struct_varies(sm)
     struct_slots(b::Int) = varies[b] ? dep.nslots[3] : 1
     struct_slot(s::AbstractVector{Int}, b::Int) = varies[b] ? s[3] : 1
-    As = _slot_arrays(sm.A, struct_slots(_HB_A))
-    Mfrees = _slot_arrays(sm.Mfree, struct_slots(_HB_A))
-    Ss = _slot_arrays(sm.S, struct_slots(_HB_S))
-    Qcs = [_slot_arrays(Q, struct_slots(_HB_Q)) for Q in sm.Qc]
-    hs = _slot_arrays(sm.h, struct_slots(_HB_H))
-    Bus = _slot_arrays(sm.Bu, struct_slots(_HB_B))
-    Grefs = _slot_arrays(sm.Gref, struct_slots(_HB_G))
-    hfs = _slot_arrays(sm.hf, struct_slots(_HB_F))
+    As = _slot_arrays(sm.A, struct_slots(_LQR_BLOCK_A))
+    Mfrees = _slot_arrays(sm.Mfree, struct_slots(_LQR_BLOCK_A))
+    Ss = _slot_arrays(sm.S, struct_slots(_LQR_BLOCK_S))
+    Qcs = [_slot_arrays(Q, struct_slots(_LQR_BLOCK_Q)) for Q in sm.Qc]
+    hs = _slot_arrays(sm.h, struct_slots(_LQR_BLOCK_H))
+    Bus = _slot_arrays(sm.Bu, struct_slots(_LQR_BLOCK_B))
+    Grefs = _slot_arrays(sm.Gref, struct_slots(_LQR_BLOCK_G))
+    hfs = _slot_arrays(sm.hf, struct_slots(_LQR_BLOCK_F))
     Σs = _slot_arrays(sm.Σ, dep.nslots[4])
     Σfs = _slot_arrays(sm.Σf, dep.nslots[4])
 
     n = _plant_dim(sm)
-    variants = Vector{HamiltonianStateModel{T,M,V}}(undef, ncells)
+    variants = Vector{LQRStateModel{T,M,V}}(undef, ncells)
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
-        v = HamiltonianStateModel{T,M,V}(
+        v = LQRStateModel{T,M,V}(
             sm.mode,
-            As[struct_slot(s, _HB_A)],
-            Mfrees[struct_slot(s, _HB_A)],
-            Ss[struct_slot(s, _HB_S)],
-            [Qcs[k][struct_slot(s, _HB_Q)] for k in eachindex(sm.Qc)],
+            As[struct_slot(s, _LQR_BLOCK_A)],
+            Mfrees[struct_slot(s, _LQR_BLOCK_A)],
+            Ss[struct_slot(s, _LQR_BLOCK_S)],
+            [Qcs[k][struct_slot(s, _LQR_BLOCK_Q)] for k in eachindex(sm.Qc)],
             sm.schedule,
             sm.terminal,
             Σs[s[4]],
-            hs[struct_slot(s, _HB_H)],
-            Bus[struct_slot(s, _HB_B)],
-            Grefs[struct_slot(s, _HB_G)],
+            hs[struct_slot(s, _LQR_BLOCK_H)],
+            Bus[struct_slot(s, _LQR_BLOCK_B)],
+            Grefs[struct_slot(s, _LQR_BLOCK_G)],
             Σfs[s[4]],
-            hfs[struct_slot(s, _HB_F)],
+            hfs[struct_slot(s, _LQR_BLOCK_F)],
             x0s[s[1]],
             P0s[s[2]],
             sm.observe_costate,
@@ -1091,7 +1091,7 @@ function _build_variants!(
             sm.x0_prior,
             nothing,
             nothing,
-            HamiltonianCache(T, n, _nregimes(sm), size(sm.Bu, 2)),
+            LQRCache(T, n, _nregimes(sm), size(sm.Bu, 2)),
         )
         refresh!(v)
         variants[cell] = v
@@ -1761,12 +1761,12 @@ end
 
 What `group_parameter` hands back for one group of one variant. Normally the
 field of that name; a group whose user-facing name covers several fields — a
-[`HamiltonianStateModel`](@ref)'s `:structure` and `:noise` — returns the whole
+[`LQRStateModel`](@ref)'s `:structure` and `:noise` — returns the whole
 variant instead, so the caller reads `.A`, `.Qc`, `.Σ` off it.
 """
 _group_readout(variant, name::Symbol) = getproperty(variant, name)
 
-function _group_readout(variant::HamiltonianStateModel, name::Symbol)
+function _group_readout(variant::LQRStateModel, name::Symbol)
     name in (:structure, :noise) && return variant
     return getproperty(variant, name)
 end

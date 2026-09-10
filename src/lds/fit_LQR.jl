@@ -1,17 +1,17 @@
 #=============================================================================
-Hamiltonian (inverse-LQR) latents — driver glue.
+LQR latents — driver glue.
 
 The EM drivers in `fit_LDS.jl` / `fit_PLDS.jl` are already generic over the
 state model: they call `_initialize_td_sufficient_statistics`, `estep!`,
 `elbo!` and `mstep!` and know nothing else about it. This file supplies those
-four for a Hamiltonian state model, plus the entry-point preparation every
+four for an LQR state model, plus the entry-point preparation every
 public call needs (cache refresh, schedule check, costate-readout mask).
 =============================================================================#
 
 """
-    _prepare_hamiltonian!(lds, tsteps)
+    _prepare_lqr!(lds, tsteps)
 
-Bring a Hamiltonian LDS into a consistent state before inference:
+Bring an LQR LDS into a consistent state before inference:
 
 1. rebuild the derived cache, so a model whose fields were assigned by hand
    still smooths with the parameters it now holds;
@@ -23,12 +23,12 @@ Called at every public entry point (`fit!`, `elbo`, `smooth`, `loglikelihood`,
 every trial workspace, and refreshing it is the only write to it during an
 E-step.
 """
-function _prepare_hamiltonian!(
+function _prepare_lqr!(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     refresh!(sm)
-    _hamiltonian_lengths_ok(sm, tsteps)
+    _lqr_lengths_ok(sm, tsteps)
     sm.observe_costate || _zero_costate_readout!(lds.obs_model, _plant_dim(sm))
     return nothing
 end
@@ -47,7 +47,7 @@ _costate_range(::LinearDynamicalSystem) = nothing
 
 function _costate_range(
     lds::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     sm.observe_costate && return nothing
     n = _plant_dim(sm)
@@ -69,7 +69,7 @@ function _zero_costate_readout!(om::AbstractObservationModel{T}, n::Int) where {
     if any(!iszero, cols)
         @warn(
             "the emission's costate columns `C[:, $(n + 1):$(2n)]` were nonzero but the " *
-                "Hamiltonian state model has `observe_costate = false`; zeroing them. Set " *
+                "LQR state model has `observe_costate = false`; zeroing them. Set " *
                 "`observe_costate = true` on the state model to let the emission read the " *
                 "costate.",
             maxlog = 1
@@ -162,7 +162,7 @@ end
 """
     estep!(lds, hs, tfs, data, sws_pool)
 
-Hamiltonian E-step: smooth, run the shared aggregator for the initial-state and
+LQR E-step: smooth, run the shared aggregator for the initial-state and
 emission halves, then accumulate the per-regime state-side statistics the
 structural M-step needs.
 
@@ -172,14 +172,14 @@ iteration instead (see [`_freeze_masked_rows!`](@ref)).
 """
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     smooth!(lds, tfs, data, sws_pool)
     _aggregate_td_suff_stats!(hs.base, tfs, lds, data, sws_pool[1])
-    _aggregate_hamiltonian_stats!(hs, tfs, lds, data)
+    _aggregate_lqr_stats!(hs, tfs, lds, data)
     mask = _costate_range(lds)
     mask === nothing || _mask_costate_gram!(hs.base, mask)
     return hs
@@ -187,16 +187,16 @@ end
 
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     smooth!(lds, tfs, data, sws_pool; max_iter=max_iter, tol=tol)
     _aggregate_td_suff_stats!(hs.base, tfs, lds, data, sws_pool[1])
-    _aggregate_hamiltonian_stats!(hs, tfs, lds, data)
+    _aggregate_lqr_stats!(hs, tfs, lds, data)
     #=
     A composite may mix a Gaussian member (a linear solve, masked through the
     Gram) with a Poisson one (masked in its Newton system). Masking the Gram here
@@ -216,28 +216,28 @@ end
 # ============================================================================
 
 """
-    _ham_obs_mstep!(lds, hs, sws)
-    _ham_obs_mstep!(lds, hs, tfs, data, sws_pool)
+    _lqr_obs_mstep!(lds, hs, sws)
+    _lqr_obs_mstep!(lds, hs, tfs, data, sws_pool)
 
 The emission half of the M-step: the conjugate regression for a Gaussian
 emission, the row-wise Newton for a Poisson one, and one call per member for a
 composite.
 """
-function _ham_obs_mstep!(
+function _lqr_obs_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     update_C_d!(lds, hs.base, sws)
     update_R!(lds, hs.base, sws)
     return nothing
 end
 
-function _ham_obs_mstep!(
+function _lqr_obs_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:CompositeObservationModel{T,true}}
+) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
     subs = _obs_workspaces!(sws, lds)
     views = _obs_views(lds)
     for (i, key) in enumerate(_obs_keys(lds.obs_model))
@@ -247,24 +247,24 @@ function _ham_obs_mstep!(
     return nothing
 end
 
-function _ham_obs_mstep!(
+function _lqr_obs_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:PoissonObservationModel{T}}
     update_observation_model!(lds, tfs, data.y, sws_pool; uy=data.uy)
     return nothing
 end
 
-function _ham_obs_mstep!(
+function _lqr_obs_mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:CompositeObservationModel{T,false}}
+) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,false}}
     views = _obs_views(lds)
     datas = _member_datas(data)
     pools = _member_pools(sws_pool, lds)
@@ -275,28 +275,28 @@ function _ham_obs_mstep!(
 end
 
 """
-    _ham_q_obs(lds, hs, tfs, data, sws_pool) -> T
+    _lqr_q_obs(lds, hs, tfs, data, sws_pool) -> T
 
 Emission Q-term for a non-quadratic emission, which has no sufficient-statistic
 form and so stays a per-trial loop.
 """
-function _ham_q_obs(
+function _lqr_q_obs(
     lds::LinearDynamicalSystem{T,S,O},
-    ::HamiltonianSufficientStatistics{T},
+    ::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:PoissonObservationModel{T}}
     return _poisson_q_obs_total(lds, tfs, data, sws_pool)
 end
 
-function _ham_q_obs(
+function _lqr_q_obs(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:CompositeObservationModel{T,false}}
+) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,false}}
     return _composite_q_obs_total(lds, hs.base, tfs, data, sws_pool)
 end
 
@@ -307,16 +307,16 @@ end
 """
     elbo!(lds, hs, sws, total_entropy)
 
-ELBO of a Hamiltonian LDS with a quadratic emission, from the aggregated
+ELBO of an LQR LDS with a quadratic emission, from the aggregated
 statistics: the structured state Q-term, the emission Q-term, the parameter
 log-priors, and the posterior entropy.
 """
 function elbo!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
     total_entropy::T,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _fill_mixed_blocks!(hs, lds.state_model)
     Q_total = Q_state!(sws, lds, hs) + Q_obs!(sws, lds, hs.base)
     prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
@@ -326,24 +326,24 @@ end
 """
     elbo!(lds, hs, tfs, data, sws_pool)
 
-ELBO of a Hamiltonian LDS with a non-quadratic emission. Only the state half
+ELBO of an LQR LDS with a non-quadratic emission. Only the state half
 differs from the ordinary Laplace path; the emission Q-term stays the per-trial
 loop that emission already uses.
 """
 function elbo!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     total_entropy = zero(T)
     for fs in tfs.FilterSmooths
         total_entropy += fs.entropy
     end
     compute_smooth_constants!(sws_pool[1], lds)
     _fill_mixed_blocks!(hs, lds.state_model)
-    Q_total = Q_state!(sws_pool[1], lds, hs) + _ham_q_obs(lds, hs, tfs, data, sws_pool)
+    Q_total = Q_state!(sws_pool[1], lds, hs) + _lqr_q_obs(lds, hs, tfs, data, sws_pool)
     prior_term =
         _state_prior_logdensity(lds, sws_pool[1]) + _obs_prior_logdensity(lds, sws_pool[1])
     return Q_total + prior_term + total_entropy
@@ -353,29 +353,29 @@ end
     mstep!(lds, hs, sws)
     mstep!(lds, hs, tfs, data, sws_pool)
 
-M-step for a Hamiltonian LDS: the shared `x0` / `P0` updates, the structural
+M-step for an LQR LDS: the shared `x0` / `P0` updates, the structural
 update (`fit_bool[3]`), the noise update (`fit_bool[4]`), a cache refresh, and
 then the emission's own update.
 """
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
-    _ham_state_mstep!(lds, hs, sws)
-    _ham_obs_mstep!(lds, hs, sws)
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _lqr_state_mstep!(lds, hs, sws)
+    _lqr_obs_mstep!(lds, hs, sws)
     return nothing
 end
 
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
-    _ham_state_mstep!(lds, hs, sws_pool[1])
-    _ham_obs_mstep!(lds, hs, tfs, data, sws_pool)
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
+    _lqr_state_mstep!(lds, hs, sws_pool[1])
+    _lqr_obs_mstep!(lds, hs, tfs, data, sws_pool)
     return nothing
 end
 
@@ -384,14 +384,14 @@ end
 # ============================================================================
 
 """
-    fit!(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y; kwargs...)
+    fit!(lds::LinearDynamicalSystem{T,<:LQRStateModel}, y; kwargs...)
 
-Fit a Hamiltonian (inverse-LQR) LDS by EM. Accepts the same arguments as the
+Fit an LQR LDS by EM. Accepts the same arguments as the
 [`fit!`](@ref) for any other `LinearDynamicalSystem` and returns the per-iteration
 ELBO.
 
 The E-step is an ordinary linear-Gaussian smoother on `z = [x; λ]`; the M-step
-re-estimates the LQR structure (see `hamiltonian_mstep.jl`). What comes back is
+re-estimates the LQR structure (see `lqr_mstep.jl`). What comes back is
 a plant `A`, a control term `S = B R⁻¹ Bᵀ` and the state cost(s) `Qc` — read
 them with [`lqr_parameters`](@ref).
 
@@ -435,9 +435,9 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
         y_test;
@@ -461,9 +461,9 @@ function fit!(
 end
 
 """
-    elbo(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y; ux, uy)
+    elbo(lds::LinearDynamicalSystem{T,<:LQRStateModel}, y; ux, uy)
 
-Evidence lower bound of a Hamiltonian LDS at its current parameters. With a
+Evidence lower bound of an LQR LDS at its current parameters. With a
 Gaussian emission the smoother is exact, so with no parameter priors this equals
 the marginal log-likelihood.
 """
@@ -475,9 +475,9 @@ function elbo(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(lds, data)
@@ -485,7 +485,7 @@ function elbo(
         return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
     end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    sws_pool = _ham_sws_pool(lds, data)
+    sws_pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
     _td_init_const_blocks!(sws_pool[1], lds, data)
     estep!(lds, hs, tfs, data, sws_pool)
@@ -494,9 +494,9 @@ function elbo(
 end
 
 """
-    loglikelihood(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y; ux, uy)
+    loglikelihood(lds::LinearDynamicalSystem{T,<:LQRStateModel}, y; ux, uy)
 
-Marginal log-likelihood `log p(y)` of a Hamiltonian LDS with a Gaussian
+Marginal log-likelihood `log p(y)` of an LQR LDS with a Gaussian
 emission.
 
 The Kalman route used for a plain Gaussian LDS assumes one time-invariant
@@ -510,8 +510,8 @@ function StatsAPI.loglikelihood(
     y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
     ux=nothing,
     uy=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:GaussianObservationModel{T}}
-    return _ham_loglikelihood(lds, y; ux=ux, uy=uy)
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
+    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
 end
 
 #=
@@ -521,17 +521,17 @@ ambiguous, each more specific in a different argument.
 =#
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux=nothing, uy=nothing
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:CompositeObservationModel{T,true}}
-    return _ham_loglikelihood(lds, y; ux=ux, uy=uy)
+) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
+    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
 end
 
-function _ham_loglikelihood(
+function _lqr_loglikelihood(
     lds::LinearDynamicalSystem{T,S,O}, y; ux=nothing, uy=nothing
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    sws_pool = _ham_sws_pool(lds, data)
+    sws_pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
     _td_init_const_blocks!(sws_pool[1], lds, data)
     estep!(lds, hs, tfs, data, sws_pool)
@@ -542,7 +542,7 @@ function _ham_loglikelihood(
 end
 
 """
-    smooth(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, y; ux, uy)
+    smooth(lds::LinearDynamicalSystem{T,<:LQRStateModel}, y; ux, uy)
 
 Posterior over the state–costate path. Returns `(x_smooth, p_smooth, ll)` in the
 same shapes as every other `smooth`; rows `1:n` of `x_smooth` are the state and
@@ -556,26 +556,26 @@ function smooth(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:QuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    smooth!(lds, tfs, data, _ham_sws_pool(lds, data))
+    smooth!(lds, tfs, data, _lqr_sws_pool(lds, data))
     return _collect_smooth_output(tfs, y)
 end
 
 """
-    _ham_sws_pool(lds, data) -> Vector{SmoothWorkspace}
+    _lqr_sws_pool(lds, data) -> Vector{SmoothWorkspace}
 
 Workspace pool sized for this model and dataset, capped at the trial count —
 workspaces beyond `ntrials` are never touched and each carries `O(D²T)` of
 block-tridiagonal storage.
 """
-function _ham_sws_pool(
+function _lqr_sws_pool(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     npool = min(Threads.maxthreadid(), length(data.tsteps))
     return [
         SmoothWorkspace(
@@ -597,21 +597,21 @@ function smooth(
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    sws_pool = _ham_sws_pool(lds, data)
+    sws_pool = _lqr_sws_pool(lds, data)
     smooth!(lds, tfs, data, sws_pool)
     return _collect_smooth_output(tfs, y)
 end
 
 """
-    fit!(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel,<:NonQuadraticEmission}, y; ...)
+    fit!(lds::LinearDynamicalSystem{T,<:LQRStateModel,<:NonQuadraticEmission}, y; ...)
 
-Fit a Hamiltonian LDS with a Poisson (or mixed) emission by Laplace EM. Same
+Fit an LQR LDS with a Poisson (or mixed) emission by Laplace EM. Same
 arguments as the Poisson [`fit!`](@ref), including the inner Newton controls
 and the held-out `y_test` / `early_stopping` controls.
 """
@@ -638,9 +638,9 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
         y_test;
@@ -679,9 +679,9 @@ function fit!(
 end
 
 """
-    elbo(lds::LinearDynamicalSystem{T,<:HamiltonianStateModel,<:NonQuadraticEmission}, y; ...)
+    elbo(lds::LinearDynamicalSystem{T,<:LQRStateModel,<:NonQuadraticEmission}, y; ...)
 
-Evidence lower bound of a Hamiltonian LDS with a Poisson emission, at the
+Evidence lower bound of an LQR LDS with a Poisson emission, at the
 current parameters: one Laplace E-step, then the ELBO at the resulting Gaussian
 posterior approximation.
 """
@@ -695,9 +695,9 @@ function elbo(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:NonQuadraticEmission{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    _prepare_hamiltonian!(lds, data.tsteps)
+    _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(lds, data)
@@ -707,7 +707,7 @@ function elbo(
         )
     end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    sws_pool = _ham_sws_pool(lds, data)
+    sws_pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
     _td_init_const_blocks!(sws_pool[1], lds, data)
     estep!(lds, hs, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
@@ -718,35 +718,33 @@ end
 # Ancillary parameter dependencies (`depends_on`)
 # ============================================================================
 
-_obs_suf(hs::HamiltonianSufficientStatistics) = hs.base
+_obs_suf(hs::LQRSufficientStatistics) = hs.base
 
 """
-    _state_suf(hs::HamiltonianSufficientStatistics) -> hs
+    _state_suf(hs::LQRSufficientStatistics) -> hs
 
-The block the state side reads. A Hamiltonian model's state statistics are the
+The block the state side reads. An LQR model's state statistics are the
 whole object — the per-regime blocks live alongside the shared initial-state and
 emission halves — so this is the identity, unlike the composite case where it
 picks one member's.
 """
-_state_suf(hs::HamiltonianSufficientStatistics) = hs
+_state_suf(hs::LQRSufficientStatistics) = hs
 
 #=
 The emission side is entirely state-model-agnostic, so rather than teach it about
-`HamiltonianSufficientStatistics` these forward to the plain layout it wraps.
+`LQRSufficientStatistics` these forward to the plain layout it wraps.
 Dispatch, not `getproperty` forwarding: the emission entry points dispatch *on*
 the statistics type, so unwrapping has to happen at the call boundary.
 =#
 function Q_obs!(
-    sws::SmoothWorkspace{T},
-    lds::LinearDynamicalSystem{T},
-    hs::HamiltonianSufficientStatistics{T},
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T}, hs::LQRSufficientStatistics{T}
 ) where {T<:Real}
     return Q_obs!(sws, lds, hs.base)
 end
 
 function _grouped_cell_q_obs(
     lds::LinearDynamicalSystem{T},
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
@@ -757,7 +755,7 @@ end
 """
     _grouped_state_mstep!(ldss, sufs, slots, sws, bufs)
 
-State M-step for a Hamiltonian model whose parameters depend on an ancillary
+State M-step for an LQR model whose parameters depend on an ancillary
 variable.
 
 `x0` and `P0` reuse the shared grouped updates — they are ordinary pooled
@@ -769,11 +767,11 @@ Cells sharing *both* versions are pooled up front, which is exact.
 """
 function _grouped_state_mstep!(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
-    sufs::AbstractVector{<:HamiltonianSufficientStatistics{T}},
+    sufs::AbstractVector{<:LQRSufficientStatistics{T}},
     slots::AbstractVector{Vector{Int}},
     sws::SmoothWorkspace{T},
     bufs::GroupedSufBuffers,
-) where {T<:Real,S<:HamiltonianStateModel{T}}
+) where {T<:Real,S<:LQRStateModel{T}}
     base = [_state_suf(suf.base) for suf in sufs]
     _grouped_update_x0!(ldss, base, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, base, slots[_G_P0], slots[_G_X0], sws)
@@ -793,11 +791,11 @@ function _grouped_state_mstep!(
     #= One copy per group for the pieces the declaration named, one copy in
     total for the rest — the same layout a partial tie across discrete states
     uses, and the same single solve. =#
-    ctx = _HamMStepCtx(
-        sufs, sms, _ham_cell_slots(sms, slots[_G_AB]), slots[_G_Q], lds1.fit_bool[4]
+    ctx = _LQRMStepCtx(
+        sufs, sms, _lqr_cell_slots(sms, slots[_G_AB]), slots[_G_Q], lds1.fit_bool[4]
     )
-    _ham_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
-    lds1.fit_bool[4] && _ham_noise_mstep!(ctx)
+    _lqr_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
+    lds1.fit_bool[4] && _lqr_noise_mstep!(ctx)
     for lds in ldss
         refresh!(lds.state_model)
     end
@@ -807,7 +805,7 @@ end
 """
     _grouped_state_prior_logdensity(cell_ldss, cell_slot, T) contribution
 
-A Hamiltonian model carries only initial-state priors, so its grouped prior term
+An LQR model carries only initial-state priors, so its grouped prior term
 is the `P0` and `x0` half of the Gaussian one — there is no Inverse-Wishart term
 on `Σ` (the M-step profiles it out) and no matrix-normal term on the structural
 block, whose entries are shared between `𝓔`'s blocks and so form no free
@@ -817,7 +815,7 @@ function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
     cell_slot::AbstractVector{Vector{Int}},
     ::Type{T},
-) where {T<:Real,S<:HamiltonianStateModel{T}}
+) where {T<:Real,S<:LQRStateModel{T}}
     total = zero(T)
     for u in _slot_representatives(cell_slot[_G_P0])
         sm = ldss[u].state_model
@@ -839,7 +837,7 @@ end
 """
     gradient_batched!(ws, lds, x, y, ux, uy)
 
-Batched gradient for a Hamiltonian LDS with a Gaussian emission — the same
+Batched gradient for an LQR LDS with a Gaussian emission — the same
 promotion of every `mul!` from BLAS-2 to BLAS-3 by stacking the trial axis that
 the Gaussian version does, which is what keeps an aligned-epoch fit (every trial
 the same length, the common case here) on the shared-covariance fast path.
@@ -859,7 +857,7 @@ function gradient_batched!(
     y::AbstractArray{T,3},
     ux::AbstractArray{T,3},
     uy::AbstractArray{T,3},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(x, 2)
     sm = lds.state_model
     c = sm.cache
@@ -943,7 +941,7 @@ end
 # ============================================================================
 
 """
-    _sample_hamiltonian_path!(rng, z, sm, ux)
+    _sample_lqr_path!(rng, z, sm, ux)
 
 Draw one latent state–costate path from the forward form
 `z_{t+1} = M_{k(t)} z_t + b + B u_t + w`. The regime lookup per step is the only
@@ -952,12 +950,12 @@ event, not part of the generative chain, so a sampled path satisfies the termina
 condition only up to `Σf` — draw with a small `Σf` if you want trajectories that
 look terminally constrained.
 """
-function _sample_hamiltonian_path!(
+function _sample_lqr_path!(
     rng::AbstractRNG,
     z::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T,S,O},
     ux::AbstractMatrix{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     #=
     Without a terminal factor the state factors form an ordinary Markov chain, so
@@ -967,7 +965,7 @@ function _sample_hamiltonian_path!(
     distribution. The joint is still Gaussian with a block-tridiagonal precision,
     which is what the branch below samples.
     =#
-    sm.terminal && return _sample_hamiltonian_path_conditional!(rng, z, lds, ux)
+    sm.terminal && return _sample_lqr_path_conditional!(rng, z, lds, ux)
 
     c = sm.cache
     tsteps = size(z, 2)
@@ -989,7 +987,7 @@ function _sample_hamiltonian_path!(
 end
 
 """
-    _sample_hamiltonian_path_conditional!(rng, z, lds, ux)
+    _sample_lqr_path_conditional!(rng, z, lds, ux)
 
 Draw a path from the state-factor joint of a model that carries a terminal
 factor, i.e. from
@@ -1008,20 +1006,20 @@ unstable directions, so unlike the forward roll this stays bounded — the price
 is one `(dT)²` factorization, which is why long trials are refused rather than
 silently attempted.
 """
-function _sample_hamiltonian_path_conditional!(
+function _sample_lqr_path_conditional!(
     rng::AbstractRNG,
     z::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T,S,O},
     ux::AbstractMatrix{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     tsteps = size(z, 2)
-    tsteps >= 2 || throw(ArgumentError("sampling a Hamiltonian path needs tsteps ≥ 2"))
+    tsteps >= 2 || throw(ArgumentError("sampling an LQR path needs tsteps ≥ 2"))
     ndof = d * tsteps
     ndof <= 4000 || throw(
         ArgumentError(
-            "sampling a terminal-conditioned Hamiltonian path of $tsteps steps at latent " *
+            "sampling a terminal-conditioned LQR path of $tsteps steps at latent " *
             "dimension $d needs a $(ndof)×$(ndof) factorization. Use `simulate_lqr` for " *
             "long trajectories — it follows the stable manifold directly and costs O(T).",
         ),
@@ -1062,12 +1060,12 @@ diverge. `ρ(M)^T` is the growth of the fastest mode; past roughly `1/eps` the
 sampled path carries no usable signal, and the caller almost certainly wants
 [`simulate_lqr`](@ref).
 """
-function _warn_unstable_rollout(sm::HamiltonianStateModel{T}, tsteps::Int) where {T<:Real}
+function _warn_unstable_rollout(sm::LQRStateModel{T}, tsteps::Int) where {T<:Real}
     ρ = maximum(abs, eigvals(sm.cache.M[_regime(sm, 1)]))
     growth = ρ^tsteps
     if growth > 1 / sqrt(eps(T))
         @warn(
-            "rolling this Hamiltonian model forward for $tsteps steps grows the fastest " *
+            "rolling this LQR model forward for $tsteps steps grows the fastest " *
                 "mode by ~$(round(growth; sigdigits = 2)). A symplectic transition has " *
                 "reciprocal eigenvalue pairs, so its forward flow is unstable by " *
                 "construction and `rand` samples the model\'s own (divergent) prior. Use " *
@@ -1080,21 +1078,21 @@ function _warn_unstable_rollout(sm::HamiltonianStateModel{T}, tsteps::Int) where
 end
 
 """
-    _sample_hamiltonian_obs!(rng, y, z, obs_model, obs_params, uy)
+    _sample_lqr_obs!(rng, y, z, obs_model, obs_params, uy)
 
 Observations drawn from an already-sampled latent path, for one emission or for
 each member of a composite. The Gaussian path interleaves the state and
 observation recursions; here the path is drawn first (its regime lookup does not
 factor through `_sample_trial!`), so the emission half is taken separately.
 """
-function _sample_hamiltonian_obs!(
+function _sample_lqr_obs!(
     rng, y, z::AbstractMatrix, om::AbstractObservationModel, obs_params, uy
 )
     _sample_obs!(rng, y, obs_params, om, z, uy)
     return nothing
 end
 
-function _sample_hamiltonian_obs!(
+function _sample_lqr_obs!(
     rng, y::NamedTuple, z::AbstractMatrix, om::CompositeObservationModel, obs_params, uy
 )
     for (i, m) in enumerate(values(_models(om)))
@@ -1104,15 +1102,15 @@ function _sample_hamiltonian_obs!(
 end
 
 """
-    rand([rng,] lds::LinearDynamicalSystem{T,<:HamiltonianStateModel}, tsteps; ux, uy)
+    rand([rng,] lds::LinearDynamicalSystem{T,<:LQRStateModel}, tsteps; ux, uy)
     rand([rng,] lds, tsteps_per_trial::AbstractVector; ux, uy)
 
-Sample state–costate paths and observations from a Hamiltonian LDS, in the same
+Sample state–costate paths and observations from an LQR LDS, in the same
 shapes as [`rand`](@ref) for any other `LinearDynamicalSystem`. The returned
 latent has `2n` rows: `1:n` the state, `n+1:2n` the costate.
 
 !!! warning "This rolls an unstable recursion"
-    A Hamiltonian matrix has reciprocal eigenvalue pairs `(μ, 1/μ)`, so half the
+    An LQR matrix has reciprocal eigenvalue pairs `(μ, 1/μ)`, so half the
     forward transition's modes grow — the optimal trajectory lives on the stable
     manifold, and the terminal boundary condition is what selects it. This
     function samples the model's *own* generative form, `z_{t+1} = M z_t + w`,
@@ -1132,21 +1130,18 @@ function Random.rand(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    depends_on === nothing ||
+        throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     Ti = Int(tsteps)
-    _prepare_hamiltonian!(lds, [Ti])
+    _prepare_lqr!(lds, [Ti])
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     z = Matrix{T}(undef, lds.latent_dim, Ti)
-    _sample_hamiltonian_path!(rng, z, lds, ux_trial)
+    _sample_lqr_path!(rng, z, lds, ux_trial)
     y = _alloc_obs(lds, Ti)
-    _sample_hamiltonian_obs!(
-        rng, y, z, lds.obs_model, _extract_obs_params(lds.obs_model), uy_trial
-    )
+    _sample_lqr_obs!(rng, y, z, lds.obs_model, _extract_obs_params(lds.obs_model), uy_trial)
     return z, y
 end
 
@@ -1157,13 +1152,12 @@ function Random.rand(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
-    depends_on === nothing || throw(
-        ArgumentError("`depends_on` grouping is not supported for a HamiltonianStateModel"),
-    )
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    depends_on === nothing ||
+        throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     ntrials = length(tsteps_per_trial)
     lengths = Int[Int(t) for t in tsteps_per_trial]
-    _prepare_hamiltonian!(lds, lengths)
+    _prepare_lqr!(lds, lengths)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, lengths, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, lengths, T, lds.obs_model)
     obs_params = _extract_obs_params(lds.obs_model)
@@ -1171,24 +1165,22 @@ function Random.rand(
     z = Vector{Matrix{T}}(undef, ntrials)
     y = Vector{typeof(_alloc_obs(lds, 1))}(undef, ntrials)
     #=
-    Sampling stays serial: a Hamiltonian draw is a short matrix recursion, and a
+    Sampling stays serial: an LQR draw is a short matrix recursion, and a
     single RNG keeps a given seed reproducible without the child-RNG bookkeeping
     the Gaussian sampler needs for its parallel chunks.
     =#
     for i in 1:ntrials
         z[i] = Matrix{T}(undef, lds.latent_dim, lengths[i])
         y[i] = _alloc_obs(lds, lengths[i])
-        _sample_hamiltonian_path!(rng, z[i], lds, ux_seq[i])
-        _sample_hamiltonian_obs!(
-            rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i)
-        )
+        _sample_lqr_path!(rng, z[i], lds, ux_seq[i])
+        _sample_lqr_obs!(rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i))
     end
     return z, y
 end
 
 function Random.rand(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer; kwargs...
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     return rand(Random.default_rng(), lds, tsteps; kwargs...)
 end
 
@@ -1196,6 +1188,6 @@ function Random.rand(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     kwargs...,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     return rand(Random.default_rng(), lds, tsteps_per_trial; kwargs...)
 end

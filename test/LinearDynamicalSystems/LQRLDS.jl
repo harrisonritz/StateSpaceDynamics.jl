@@ -1,5 +1,5 @@
 #=============================================================================
-Inverse-LQR (Hamiltonian) latents.
+Inverse-LQR latents.
 
 The strategy throughout is to check the new code against something that does
 not share its implementation:
@@ -21,7 +21,7 @@ not share its implementation:
 
 """A mild plant: `ρ(M)` close to 1, so the forward chain is usable over the
 horizons the tests sample at."""
-function ham_fixture(
+function lqr_fixture(
     rng;
     n::Int=2,
     p::Int=4,
@@ -48,7 +48,7 @@ function ham_fixture(
     end
     Σ = Matrix(Diagonal(fill(0.03, d)))
     Bu = ux_dim > 0 ? randn(rng, d, ux_dim) : nothing
-    sm = HamiltonianStateModel(
+    sm = LQRStateModel(
         A,
         Sm,
         qcs,
@@ -71,9 +71,9 @@ end
 
 """The explicit `2n` Gaussian LDS carrying this model's materialised forward
 parameters. Only valid as a reference when there is one cost regime and no
-terminal factor — that is exactly when the Hamiltonian model reduces to an
+terminal factor — that is exactly when the LQR model reduces to an
 ordinary linear-Gaussian chain."""
-function ham_reference_lds(lds)
+function lqr_reference_lds(lds)
     sm = lds.state_model
     gsm = GaussianStateModel(
         Matrix(symplectic_matrix(sm)),
@@ -94,16 +94,16 @@ end
 
 """Exact marginal `log p(y, yᵗᵉʳᵐ = 0)` by the Laplace normalizer, built from the
 per-timestep kernels and a dense Hessian — independent of `Q_state!`."""
-function ham_exact_marginal(lds, y; ux=nothing, uy=nothing)
+function lqr_exact_marginal(lds, y; ux=nothing, uy=nothing)
     T = Float64
     d = lds.latent_dim
     tsteps = size(y, 2)
     data = SSD.Data(
         lds, [y]; ux=(ux === nothing ? nothing : [ux]), uy=(uy === nothing ? nothing : [uy])
     )
-    SSD._prepare_hamiltonian!(lds, data.tsteps)
+    SSD._prepare_lqr!(lds, data.tsteps)
     tfs = SSD.initialize_FilterSmooth(lds, data.tsteps)
-    pool = SSD._ham_sws_pool(lds, data)
+    pool = SSD._lqr_sws_pool(lds, data)
     SSD.smooth!(lds, tfs, data, pool)
     ẑ = tfs[1].x_smooth
     sws = pool[1]
@@ -126,22 +126,22 @@ end
 
 """Independent re-derivation of the structural M-step objective, generic in the
 number type so ForwardDiff can differentiate it."""
-function ham_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {V}
-    pk = SSD._HamPack(sm)
+function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {V}
+    pk = SSD._LQRPack(sm)
     n, d, m, K = pk.n, pk.d, pk.m, pk.K
     grab(r, fallback) = isempty(r) ? V.(fallback) : θ[r]
-    blk(b) = SSD._ham_blk(pk, b, 1)
-    A = reshape(grab(blk(SSD._HB_A), vec(sm.A)), n, n)
-    Sm = reshape(grab(blk(SSD._HB_S), vec(sm.S)), n, n)
+    blk(b) = SSD._lqr_blk(pk, b, 1)
+    A = reshape(grab(blk(SSD._LQR_BLOCK_A), vec(sm.A)), n, n)
+    Sm = reshape(grab(blk(SSD._LQR_BLOCK_S), vec(sm.S)), n, n)
     Sm = (Sm + transpose(Sm)) / 2
     Qs = map(1:K) do k
-        q = reshape(grab(SSD._ham_blk_q(pk, 1, k), vec(sm.Qc[k])), n, n)
+        q = reshape(grab(SSD._lqr_blk_q(pk, 1, k), vec(sm.Qc[k])), n, n)
         return (q + transpose(q)) / 2
     end
-    h = grab(blk(SSD._HB_H), sm.h)
-    Bu = m > 0 ? reshape(grab(blk(SSD._HB_B), vec(sm.Bu)), d, m) : zeros(V, d, 0)
-    Gr = m > 0 ? reshape(grab(blk(SSD._HB_G), vec(sm.Gref)), n, m) : zeros(V, n, 0)
-    hf = grab(blk(SSD._HB_F), sm.hf)
+    h = grab(blk(SSD._LQR_BLOCK_H), sm.h)
+    Bu = m > 0 ? reshape(grab(blk(SSD._LQR_BLOCK_B), vec(sm.Bu)), d, m) : zeros(V, d, 0)
+    Gr = m > 0 ? reshape(grab(blk(SSD._LQR_BLOCK_G), vec(sm.Gref)), n, m) : zeros(V, n, 0)
+    hf = grab(blk(SSD._LQR_BLOCK_F), sm.hf)
 
     R = V.(hs.Yv)
     for k in 1:K
@@ -173,11 +173,11 @@ end
 
 """Run one E-step and return the aggregated statistics, with the mixed blocks
 filled — the state the M-step tests need."""
-function ham_estep_stats(lds, ys; ux=nothing)
+function lqr_estep_stats(lds, ys; ux=nothing)
     data = SSD.Data(lds, ys; ux=ux)
-    SSD._prepare_hamiltonian!(lds, data.tsteps)
+    SSD._prepare_lqr!(lds, data.tsteps)
     tfs = SSD.initialize_FilterSmooth(lds, data.tsteps)
-    pool = SSD._ham_sws_pool(lds, data)
+    pool = SSD._lqr_sws_pool(lds, data)
     hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
     SSD._td_init_const_blocks!(pool[1], lds, data)
     SSD.estep!(lds, hs, tfs, data, pool)
@@ -189,9 +189,9 @@ end
 # Structure
 # ---------------------------------------------------------------------------
 
-function test_hamiltonian_structure()
+function test_lqr_structure()
     rng = StableRNG(1)
-    sm, lds = ham_fixture(rng; nregimes=1)
+    sm, lds = lqr_fixture(rng; nregimes=1)
     n = size(sm.A, 1)
 
     @test lds.latent_dim == 2n
@@ -204,7 +204,7 @@ function test_hamiltonian_structure()
     @test isapprox(det(M), 1.0; atol=1e-10)
 
     # The mixed matrix is what the M-step estimates; check its blocks.
-    E = hamiltonian_matrix(sm)
+    E = lqr_matrix(sm)
     @test E[1:n, 1:n] ≈ sm.A
     @test E[1:n, (n + 1):(2n)] ≈ -sm.S
     @test E[(n + 1):(2n), 1:n] ≈ sm.Qc[1]
@@ -230,9 +230,9 @@ function test_hamiltonian_structure()
     return nothing
 end
 
-function test_hamiltonian_regimes_and_schedule()
+function test_lqr_regimes_and_schedule()
     rng = StableRNG(2)
-    sm, _ = ham_fixture(rng; terminal=true, nregimes=3, tsteps=14, onset=8)
+    sm, _ = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=14, onset=8)
     @test SSD._nregimes(sm) == 3
     @test length(sm.schedule) == 14
     @test sm.schedule[1] == 1 && sm.schedule[7] == 1
@@ -264,7 +264,7 @@ function test_hamiltonian_regimes_and_schedule()
     return nothing
 end
 
-function test_hamiltonian_construction_errors()
+function test_lqr_construction_errors()
     rng = StableRNG(3)
     n = 2
     d = 2n
@@ -274,22 +274,18 @@ function test_hamiltonian_construction_errors()
     Σ = Matrix(0.03I, d, d)
 
     # A singular plant has no forward symplectic representation at all.
-    @test_throws SSD.NumericalStabilityError HamiltonianStateModel(
-        [1.0 1.0; 1.0 1.0], Sm, Qc, Σ
-    )
-    @test_throws SSD.NotSymmetricError HamiltonianStateModel(A, [1.0 0.5; 0.2 1.0], Qc, Σ)
-    @test_throws SSD.NotSymmetricError HamiltonianStateModel(A, Sm, [1.0 0.5; 0.2 1.0], Σ)
+    @test_throws SSD.NumericalStabilityError LQRStateModel([1.0 1.0; 1.0 1.0], Sm, Qc, Σ)
+    @test_throws SSD.NotSymmetricError LQRStateModel(A, [1.0 0.5; 0.2 1.0], Qc, Σ)
+    @test_throws SSD.NotSymmetricError LQRStateModel(A, Sm, [1.0 0.5; 0.2 1.0], Σ)
     # More than one cost matrix needs a schedule saying which timesteps use which.
-    @test_throws ArgumentError HamiltonianStateModel(A, Sm, [Qc, Qc], Σ)
-    @test_throws ArgumentError HamiltonianStateModel(A, Sm, Qc, Σ; schedule=[1, 2, 1])
-    @test_throws SSD.DimensionMismatchError HamiltonianStateModel(
-        A, Sm, Qc, Matrix(0.03I, 3, 3)
-    )
-    @test_throws SSD.DimensionMismatchError HamiltonianStateModel(A, Sm, Qc, Σ; h=zeros(3))
-    @test_throws ArgumentError HamiltonianStateModel(A, Sm, Qc, Σ; mstep_iters=0)
+    @test_throws ArgumentError LQRStateModel(A, Sm, [Qc, Qc], Σ)
+    @test_throws ArgumentError LQRStateModel(A, Sm, Qc, Σ; schedule=[1, 2, 1])
+    @test_throws SSD.DimensionMismatchError LQRStateModel(A, Sm, Qc, Matrix(0.03I, 3, 3))
+    @test_throws SSD.DimensionMismatchError LQRStateModel(A, Sm, Qc, Σ; h=zeros(3))
+    @test_throws ArgumentError LQRStateModel(A, Sm, Qc, Σ; mstep_iters=0)
 
     # A non-PD Σ is caught when the model goes into an LDS.
-    sm_bad = HamiltonianStateModel(A, Sm, Qc, Σ)
+    sm_bad = LQRStateModel(A, Sm, Qc, Σ)
     sm_bad.Σ = Matrix(-0.1I, d, d)
     om = GaussianObservationModel(randn(rng, 3, d), Matrix(0.1I, 3, 3), zeros(3))
     @test_throws SSD.NotPositiveDefiniteError LinearDynamicalSystem(sm_bad, om)
@@ -297,15 +293,15 @@ function test_hamiltonian_construction_errors()
     #= A structural piece may be grouped on its own — `(A = …,)` means "a plant
     per group, everything else shared" — but a name the model does not own is
     refused rather than silently ignored. =#
-    sm_dep = HamiltonianStateModel(A, Sm, Qc, Σ)
+    sm_dep = LQRStateModel(A, Sm, Qc, Σ)
     sm_dep.depends_on = (A=[1, 1, 2],)
     @test LinearDynamicalSystem(sm_dep, om) isa LinearDynamicalSystem
-    sm_bad_dep = HamiltonianStateModel(A, Sm, Qc, Σ)
+    sm_bad_dep = LQRStateModel(A, Sm, Qc, Σ)
     sm_bad_dep.depends_on = (Σ=[1, 1, 2],)
     @test_throws Exception LinearDynamicalSystem(sm_bad_dep, om)
 
     # A schedule that does not cover the longest trial is caught at fit entry.
-    sm_short = HamiltonianStateModel(A, Sm, [Qc, Qc], Σ; schedule=cost_schedule(5))
+    sm_short = LQRStateModel(A, Sm, [Qc, Qc], Σ; schedule=cost_schedule(5))
     lds_short = LinearDynamicalSystem(
         sm_short, GaussianObservationModel(randn(rng, 3, d), Matrix(0.1I, 3, 3), zeros(3))
     )
@@ -313,9 +309,9 @@ function test_hamiltonian_construction_errors()
     return nothing
 end
 
-function test_hamiltonian_refresh_and_utilities()
+function test_lqr_refresh_and_utilities()
     rng = StableRNG(4)
-    sm, _ = ham_fixture(rng; nregimes=1)
+    sm, _ = lqr_fixture(rng; nregimes=1)
     n = size(sm.A, 1)
 
     # The cache tracks the fields: mutate, refresh, and the transition follows.
@@ -335,7 +331,7 @@ function test_hamiltonian_refresh_and_utilities()
     @test P ≈ transpose(P) atol = 1e-10
     resid = sm.Qc[1] + transpose(sm.A) * P * ((I + sm.S * P) \ sm.A) - P
     @test maximum(abs, resid) < 1e-9
-    # `λ = Px` is a fixed point of the Hamiltonian flow: the symplectic map sends
+    # `λ = Px` is a fixed point of the LQR flow: the symplectic map sends
     # the graph of P to itself.
     M = symplectic_matrix(sm)
     x = randn(rng, n)
@@ -346,9 +342,9 @@ function test_hamiltonian_refresh_and_utilities()
     return nothing
 end
 
-function test_hamiltonian_rescale_costate()
+function test_lqr_rescale_costate()
     rng = StableRNG(5)
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=12)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=12)
     y = randn(rng, lds.obs_dim, 12) .* 0.4
     before = elbo(lds, y)
     SQ_before = sm.S * sm.Qc[1]
@@ -375,7 +371,7 @@ function test_hamiltonian_rescale_costate()
     which a piece *shared* between groups makes a real question: visiting the
     groups in turn would divide `S` by `c` once per group.
     =#
-    smG, ldsG = ham_fixture(StableRNG(6); nregimes=1, tsteps=12)
+    smG, ldsG = lqr_fixture(StableRNG(6); nregimes=1, tsteps=12)
     labels = [1, 1, 2, 2]
     set_depends_on!(smG, (Qc=labels,))
     ldsG2 = LinearDynamicalSystem(smG, ldsG.obs_model)
@@ -400,11 +396,11 @@ end
 # E-step: equivalence to an explicit 2n Gaussian LDS
 # ---------------------------------------------------------------------------
 
-function test_hamiltonian_reduces_to_gaussian_lds()
+function test_lqr_reduces_to_gaussian_lds()
     rng = StableRNG(11)
     for ux_dim in (0, 2)
-        sm, lds = ham_fixture(rng; nregimes=1, terminal=false, ux_dim=ux_dim, tsteps=18)
-        ref = ham_reference_lds(lds)
+        sm, lds = lqr_fixture(rng; nregimes=1, terminal=false, ux_dim=ux_dim, tsteps=18)
+        ref = lqr_reference_lds(lds)
         tsteps = 18
         y = randn(rng, lds.obs_dim, tsteps) .* 0.4
         ux = ux_dim > 0 ? randn(rng, ux_dim, tsteps) : nothing
@@ -413,7 +409,7 @@ function test_hamiltonian_reduces_to_gaussian_lds()
         xg, pg = smooth(ref, y; ux=ux)
         #=
         Exact equality, not approximate: with one cost regime and no terminal
-        factor the Hamiltonian kernels evaluate the very same arithmetic on the
+        factor the LQR kernels evaluate the very same arithmetic on the
         very same materialised matrices, so any difference at all would mean a
         different formula, not rounding.
         =#
@@ -427,10 +423,10 @@ function test_hamiltonian_reduces_to_gaussian_lds()
     return nothing
 end
 
-function test_hamiltonian_multitrial_equivalence()
+function test_lqr_multitrial_equivalence()
     rng = StableRNG(12)
-    sm, lds = ham_fixture(rng; nregimes=1, terminal=false, tsteps=16)
-    ref = ham_reference_lds(lds)
+    sm, lds = lqr_fixture(rng; nregimes=1, terminal=false, tsteps=16)
+    ref = lqr_reference_lds(lds)
     ys = [randn(rng, lds.obs_dim, 16) .* 0.4 for _ in 1:5]
     # Equal-length trials take the shared-covariance + batched mean fast path.
     @test elbo(lds, ys) ≈ elbo(ref, ys) atol = 1e-8
@@ -444,16 +440,16 @@ function test_hamiltonian_multitrial_equivalence()
     return nothing
 end
 
-function test_hamiltonian_batched_gradient_matches_per_trial()
+function test_lqr_batched_gradient_matches_per_trial()
     rng = StableRNG(13)
     # The batched mean pass is the equal-length fast path; check it against the
     # per-trial kernel on a model exercising regimes, a terminal factor and inputs.
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=15, onset=9, ux_dim=2)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=15, onset=9, ux_dim=2)
     ntrials = 4
     ys = [randn(rng, lds.obs_dim, 15) .* 0.4 for _ in 1:ntrials]
     uxs = [randn(rng, 2, 15) for _ in 1:ntrials]
     data = SSD.Data(lds, ys; ux=uxs)
-    SSD._prepare_hamiltonian!(lds, data.tsteps)
+    SSD._prepare_lqr!(lds, data.tsteps)
 
     ws = SSD.SmoothWorkspace(
         Float64, lds.latent_dim, lds.obs_dim, 15; ux_dim=2, ntrials=ntrials
@@ -480,11 +476,11 @@ end
 # Kernels against finite differences / the exact normalizer
 # ---------------------------------------------------------------------------
 
-function test_hamiltonian_gradient_and_hessian()
+function test_lqr_gradient_and_hessian()
     rng = StableRNG(21)
     for (terminal, nregimes, ux_dim) in ((false, 1, 0), (true, 2, 0), (true, 3, 2))
         tsteps = 12
-        sm, lds = ham_fixture(
+        sm, lds = lqr_fixture(
             rng;
             terminal=terminal,
             nregimes=nregimes,
@@ -536,12 +532,12 @@ function test_hamiltonian_gradient_and_hessian()
     return nothing
 end
 
-function test_hamiltonian_elbo_matches_exact_marginal()
+function test_lqr_elbo_matches_exact_marginal()
     rng = StableRNG(22)
     for (terminal, nregimes, ux_dim, onset) in
         ((false, 1, 0, 1), (true, 2, 0, 1), (true, 3, 2, 8), (false, 2, 2, 6))
         tsteps = 14
-        sm, lds = ham_fixture(
+        sm, lds = lqr_fixture(
             rng;
             terminal=terminal,
             nregimes=nregimes,
@@ -551,7 +547,7 @@ function test_hamiltonian_elbo_matches_exact_marginal()
         )
         y = randn(rng, lds.obs_dim, tsteps) .* 0.4
         ux = ux_dim > 0 ? randn(rng, ux_dim, tsteps) : nothing
-        exact = ham_exact_marginal(lds, y; ux=ux)
+        exact = lqr_exact_marginal(lds, y; ux=ux)
         #=
         `elbo` reaches this through the mixed-coordinate `Q_state!` — aggregated
         sufficient statistics, the rearrangement into (w, v), and the
@@ -565,14 +561,14 @@ function test_hamiltonian_elbo_matches_exact_marginal()
     return nothing
 end
 
-function test_hamiltonian_sufficient_statistics()
+function test_lqr_sufficient_statistics()
     rng = StableRNG(23)
     tsteps = 13
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=8, ux_dim=2)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=8, ux_dim=2)
     ntrials = 3
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
     uxs = [randn(rng, 2, tsteps) for _ in 1:ntrials]
-    hs, tfs, data, _ = ham_estep_stats(lds, ys; ux=uxs)
+    hs, tfs, data, _ = lqr_estep_stats(lds, ys; ux=uxs)
 
     d = lds.latent_dim
     K = SSD._nregimes(sm)
@@ -656,65 +652,65 @@ end
 # M-step
 # ---------------------------------------------------------------------------
 
-function test_hamiltonian_mstep_objective_and_gradient()
+function test_lqr_mstep_objective_and_gradient()
     rng = StableRNG(31)
     tsteps = 15
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=9, ux_dim=2)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=9, ux_dim=2)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
     uxs = [randn(rng, 2, tsteps) for _ in 1:4]
-    hs, _, _, _ = ham_estep_stats(lds, ys; ux=uxs)
+    hs, _, _, _ = lqr_estep_stats(lds, ys; ux=uxs)
 
     for profile in (true, false)
-        ctx = SSD._HamMStepCtx(hs, sm, profile)
+        ctx = SSD._LQRMStepCtx(hs, sm, profile)
         θ = zeros(ctx.pack.np)
-        SSD._ham_pack!(θ, ctx)
+        SSD._lqr_pack!(θ, ctx)
         g = similar(θ)
-        f = SSD._ham_fg!(g, θ, ctx)
-        @test f ≈ ham_ref_objective(θ, hs, sm, profile) atol = 1e-8
-        g_fd = ForwardDiff.gradient(t -> ham_ref_objective(t, hs, sm, profile), θ)
+        f = SSD._lqr_fg!(g, θ, ctx)
+        @test f ≈ lqr_ref_objective(θ, hs, sm, profile) atol = 1e-8
+        g_fd = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
         @test maximum(abs, g .- g_fd) / max(1.0, maximum(abs, g_fd)) < 1e-8
     end
 
     # Symmetric blocks must produce exactly symmetric gradients — that is what
     # keeps the L-BFGS iterates symmetric without any `vech` bookkeeping.
-    ctx = SSD._HamMStepCtx(hs, sm, true)
+    ctx = SSD._LQRMStepCtx(hs, sm, true)
     θ = zeros(ctx.pack.np)
-    SSD._ham_pack!(θ, ctx)
+    SSD._lqr_pack!(θ, ctx)
     g = similar(θ)
-    SSD._ham_fg!(g, θ, ctx)
+    SSD._lqr_fg!(g, θ, ctx)
     n = SSD._plant_dim(sm)
-    gS = reshape(g[SSD._ham_blk(ctx.pack, SSD._HB_S, 1)], n, n)
+    gS = reshape(g[SSD._lqr_blk(ctx.pack, SSD._LQR_BLOCK_S, 1)], n, n)
     @test gS ≈ transpose(gS) atol = 1e-14
     for k in 1:SSD._nregimes(sm)
-        gQ = reshape(g[SSD._ham_blk_q(ctx.pack, 1, k)], n, n)
+        gQ = reshape(g[SSD._lqr_blk_q(ctx.pack, 1, k)], n, n)
         @test gQ ≈ transpose(gQ) atol = 1e-14
     end
     return nothing
 end
 
-function test_hamiltonian_mstep_freezing()
+function test_lqr_mstep_freezing()
     rng = StableRNG(32)
     tsteps = 14
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps, ux_dim=2)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps, ux_dim=2)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
     uxs = [randn(rng, 2, tsteps) for _ in 1:4]
-    hs, _, _, _ = ham_estep_stats(lds, ys; ux=uxs)
+    hs, _, _, _ = lqr_estep_stats(lds, ys; ux=uxs)
 
     n = SSD._plant_dim(sm)
-    full = SSD._HamPack(sm).np
+    full = SSD._LQRPack(sm).np
 
-    sm.fit_flags = HamiltonianFitFlags(; A=false, S=false)
-    frozen = SSD._HamPack(sm)
+    sm.fit_flags = LQRFitFlags(; A=false, S=false)
+    frozen = SSD._LQRPack(sm)
     # Freezing shrinks the problem rather than projecting its solution.
     @test frozen.np == full - 2 * n * n
-    @test isempty(SSD._ham_blk(frozen, SSD._HB_A, 1)) &&
-        isempty(SSD._ham_blk(frozen, SSD._HB_S, 1))
-    ctx = SSD._HamMStepCtx(hs, sm, true)
+    @test isempty(SSD._lqr_blk(frozen, SSD._LQR_BLOCK_A, 1)) &&
+        isempty(SSD._lqr_blk(frozen, SSD._LQR_BLOCK_S, 1))
+    ctx = SSD._LQRMStepCtx(hs, sm, true)
     θ = zeros(ctx.pack.np)
-    SSD._ham_pack!(θ, ctx)
+    SSD._lqr_pack!(θ, ctx)
     g = similar(θ)
-    SSD._ham_fg!(g, θ, ctx)
-    g_fd = ForwardDiff.gradient(t -> ham_ref_objective(t, hs, sm, true), θ)
+    SSD._lqr_fg!(g, θ, ctx)
+    g_fd = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, true), θ)
     @test maximum(abs, g .- g_fd) < 1e-8
 
     # A frozen parameter comes back unchanged from a whole fit.
@@ -732,20 +728,20 @@ function test_hamiltonian_mstep_freezing()
     matrix itself is one of the `Qc` and moves with that flag. Freeze both to get
     an empty structural problem.
     =#
-    sm.fit_flags = HamiltonianFitFlags(;
+    sm.fit_flags = LQRFitFlags(;
         A=false, S=false, Qc=false, h=false, Bu=false, Gref=false, terminal=false
     )
-    @test SSD._HamPack(sm).np == 0
+    @test SSD._LQRPack(sm).np == 0
     before = deepcopy(sm.Qc)
     fit!(lds, ys; ux=uxs, max_iter=3, progress=false)
     @test all(sm.Qc[k] == before[k] for k in eachindex(before))
     return nothing
 end
 
-function test_hamiltonian_mstep_preserves_structure()
+function test_lqr_mstep_preserves_structure()
     rng = StableRNG(33)
     tsteps = 14
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:6]
     fit!(lds, ys; max_iter=10, progress=false)
     # The point of the whole exercise: after fitting, the transition is still
@@ -761,12 +757,12 @@ function test_hamiltonian_mstep_preserves_structure()
     return nothing
 end
 
-function test_hamiltonian_em_monotone()
+function test_lqr_em_monotone()
     rng = StableRNG(34)
     for (terminal, nregimes, ux_dim, ntrials, onset) in
         ((false, 1, 0, 1, 1), (false, 1, 0, 6, 1), (true, 2, 0, 5, 1), (true, 3, 2, 4, 8))
         tsteps = 14
-        sm, lds = ham_fixture(
+        sm, lds = lqr_fixture(
             rng;
             terminal=terminal,
             nregimes=nregimes,
@@ -787,15 +783,15 @@ function test_hamiltonian_em_monotone()
     return nothing
 end
 
-function test_hamiltonian_noise_update_closed_form()
+function test_lqr_noise_update_closed_form()
     rng = StableRNG(35)
     tsteps = 14
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:5]
-    hs, _, _, pool = ham_estep_stats(lds, ys)
-    ctx = SSD._HamMStepCtx(hs, sm, true)
-    SSD._ham_structure_mstep!(ctx, true, sm.mstep_iters)
-    SSD._ham_noise_mstep!(ctx)
+    hs, _, _, pool = lqr_estep_stats(lds, ys)
+    ctx = SSD._LQRMStepCtx(hs, sm, true)
+    SSD._lqr_structure_mstep!(ctx, true, sm.mstep_iters)
+    SSD._lqr_noise_mstep!(ctx)
     # Σ = R/N and Σf = R_f/N_f exactly, which is what profiling them out assumed.
     @test sm.Σ ≈ ctx.R[1] ./ ctx.N_q[1] atol = 1e-12
     @test sm.Σf ≈ ctx.Rf[1] ./ ctx.Nf_q[1] atol = 1e-12
@@ -803,7 +799,7 @@ function test_hamiltonian_noise_update_closed_form()
     return nothing
 end
 
-function test_hamiltonian_recovers_parameters()
+function test_lqr_recovers_parameters()
     rng = StableRNG(36)
     #=
     Self-consistency: with one cost regime and no terminal factor the model is a
@@ -822,7 +818,7 @@ function test_hamiltonian_recovers_parameters()
     Sm = [0.05 0.01; 0.01 0.04]
     Qc = [0.20 0.03; 0.03 0.15]
     Σ = Matrix(Diagonal(fill(0.02, d)))
-    sm = HamiltonianStateModel(A, Sm, Qc, Σ; P0=Matrix(0.2I, d, d))
+    sm = LQRStateModel(A, Sm, Qc, Σ; P0=Matrix(0.2I, d, d))
     C = randn(rng, p, d)
     C[:, (n + 1):d] .= 0
     R = Matrix(0.05I, p, p)
@@ -830,13 +826,13 @@ function test_hamiltonian_recovers_parameters()
     _, ys = rand(rng, lds, fill(tsteps, ntrials))
 
     # Inverse LQR proper: the plant is known, the cost is what we are after.
-    sm0 = HamiltonianStateModel(
+    sm0 = LQRStateModel(
         copy(A),
         copy(Sm),
         Matrix(0.4I, n, n),
         Matrix(0.05I, d, d);
         P0=Matrix(0.2I, d, d),
-        fit_flags=HamiltonianFitFlags(; A=false, S=false),
+        fit_flags=LQRFitFlags(; A=false, S=false),
     )
     lds0 = LinearDynamicalSystem(sm0, GaussianObservationModel(copy(C), copy(R), zeros(p)))
     els = fit!(lds0, ys; max_iter=250, tol=1e-10, progress=false)
@@ -857,10 +853,10 @@ end
 # Emission models, costate readout, sampling, printing
 # ---------------------------------------------------------------------------
 
-function test_hamiltonian_costate_readout_mask()
+function test_lqr_costate_readout_mask()
     rng = StableRNG(41)
     tsteps = 14
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     n = SSD._plant_dim(sm)
     d = lds.latent_dim
     @test SSD._costate_range(lds) == (n + 1):d
@@ -878,14 +874,14 @@ function test_hamiltonian_costate_readout_mask()
     @test all(iszero, lds.obs_model.C[:, (n + 1):d])
 
     # Opting in leaves the emission free.
-    sm2, lds2 = ham_fixture(rng; nregimes=1, tsteps=tsteps, observe_costate=true)
+    sm2, lds2 = lqr_fixture(rng; nregimes=1, tsteps=tsteps, observe_costate=true)
     @test SSD._costate_range(lds2) === nothing
     fit!(lds2, ys; max_iter=6, progress=false)
     @test !all(iszero, lds2.obs_model.C[:, (n + 1):d])
     return nothing
 end
 
-function test_hamiltonian_masked_fit_matches_reduced_model()
+function test_lqr_masked_fit_matches_reduced_model()
     rng = StableRNG(42)
     #=
     Pinning C's costate columns at zero must give exactly the emission a model
@@ -893,11 +889,11 @@ function test_hamiltonian_masked_fit_matches_reduced_model()
     equations rather than projecting after the solve.
     =#
     tsteps = 14
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     n = SSD._plant_dim(sm)
     d = lds.latent_dim
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
-    hs, tfs, data, pool = ham_estep_stats(lds, ys)
+    hs, tfs, data, pool = lqr_estep_stats(lds, ys)
     SSD.update_C_d!(lds, hs.base, pool[1])
     C_masked = copy(lds.obs_model.C)
     @test all(iszero, C_masked[:, (n + 1):d])
@@ -912,13 +908,13 @@ function test_hamiltonian_masked_fit_matches_reduced_model()
     return nothing
 end
 
-function test_hamiltonian_poisson_emission()
+function test_lqr_poisson_emission()
     rng = StableRNG(43)
     tsteps = 14
     n = 2
     d = 2n
     p = 5
-    sm, _ = ham_fixture(rng; nregimes=2, terminal=true, tsteps=tsteps)
+    sm, _ = lqr_fixture(rng; nregimes=2, terminal=true, tsteps=tsteps)
     C = randn(rng, p, d) .* 0.3
     C[:, (n + 1):d] .= 0
     plds = LinearDynamicalSystem(sm, PoissonObservationModel(C, fill(1.0, p)))
@@ -941,12 +937,12 @@ function test_hamiltonian_poisson_emission()
     return nothing
 end
 
-function test_hamiltonian_composite_emission()
+function test_lqr_composite_emission()
     rng = StableRNG(44)
     tsteps = 13
     n = 2
     d = 2n
-    sm, _ = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     Ck = randn(rng, 3, d)
     Ck[:, (n + 1):d] .= 0
     Cs = randn(rng, 4, d) .* 0.3
@@ -973,7 +969,7 @@ function test_hamiltonian_composite_emission()
 
     # An all-Gaussian composite takes the quadratic path, with its own ELBO
     # method; check it against the equivalent stacked single emission.
-    sm2, _ = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm2, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     C1 = randn(rng, 3, d)
     C1[:, (n + 1):d] .= 0
     C2 = randn(rng, 2, d)
@@ -987,7 +983,7 @@ function test_hamiltonian_composite_emission()
     )
     ya = randn(rng, 3, tsteps) .* 0.4
     yb = randn(rng, 2, tsteps) .* 0.4
-    sm3, _ = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm3, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     sm3.A = copy(sm2.A)
     sm3.S = copy(sm2.S)
     sm3.Qc[1] = copy(sm2.Qc[1])
@@ -1006,7 +1002,7 @@ function test_hamiltonian_composite_emission()
     return nothing
 end
 
-function test_hamiltonian_sampling()
+function test_lqr_sampling()
     rng = StableRNG(45)
     tsteps = 12
     n = 2
@@ -1014,7 +1010,7 @@ function test_hamiltonian_sampling()
 
     # Without a terminal factor the chain is a proper directed model, so the
     # forward roll is the model's own distribution.
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     z, y = rand(StableRNG(1), lds, tsteps)
     @test size(z) == (d, tsteps)
     @test size(y) == (lds.obs_dim, tsteps)
@@ -1028,7 +1024,7 @@ function test_hamiltonian_sampling()
 
     # With a terminal factor the path is drawn from the *conditioned* joint, so
     # sampled paths satisfy the terminal condition to within Σf.
-    smt, ldst = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
+    smt, ldst = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     zt, _ = rand(StableRNG(4), ldst, tsteps)
     resid = zt[(n + 1):d, end] .- smt.Qc[smt.schedule[end]] * zt[1:n, end] .- smt.hf
     @test norm(resid) < 5 * sqrt(maximum(diag(smt.Σf))) * sqrt(n)
@@ -1041,20 +1037,20 @@ function test_hamiltonian_sampling()
     return nothing
 end
 
-function test_hamiltonian_simulate_lqr()
+function test_lqr_simulate_lqr()
     rng = StableRNG(46)
     tsteps = 25
     n = 2
-    sm, _ = ham_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
+    sm, _ = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     sm.h .= 0
     sm.hf .= 0
     refresh!(sm)
 
-    # The noiseless rollout must satisfy the Hamiltonian recursion exactly.
+    # The noiseless rollout must satisfy the LQR recursion exactly.
     z = simulate_lqr(rng, sm, tsteps; process_noise=false, x1=[0.5, -0.3])
     @test size(z) == (2n, tsteps)
     for t in 1:(tsteps - 1)
-        E = hamiltonian_matrix(sm, SSD._regime(sm, t))
+        E = lqr_matrix(sm, SSD._regime(sm, t))
         w = [z[1:n, t]; z[(n + 1):(2n), t + 1]]
         v = [z[1:n, t + 1]; z[(n + 1):(2n), t]]
         @test maximum(abs, E * w .- v) < 1e-9
@@ -1077,13 +1073,13 @@ function test_hamiltonian_simulate_lqr()
     @test all(isfinite, zn)
 
     # Far from the terminal step the Riccati solution has reached its fixed point.
-    sm1, _ = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm1, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     P1, _, _ = lqr_riccati_sequence(sm1, 200)
     @test maximum(abs, P1[1] .- riccati_solution(sm1)) < 1e-8
     return nothing
 end
 
-function test_hamiltonian_tracking_control()
+function test_lqr_tracking_control()
     rng = StableRNG(60)
     n = 2
     d = 2n
@@ -1095,7 +1091,7 @@ function test_hamiltonian_tracking_control()
     Σ = Matrix(Diagonal(fill(0.01, d)))
     sched = cost_schedule(tsteps; terminal=true)
     Gref = Matrix(1.0I, n, m)          # the reference *is* the input
-    sm = HamiltonianStateModel(
+    sm = LQRStateModel(
         A,
         Sm,
         Qcs,
@@ -1112,13 +1108,13 @@ function test_hamiltonian_tracking_control()
     z = simulate_lqr(rng, sm, tsteps; process_noise=false, x1=zeros(n), ux=ux)
 
     #=
-    The tracking rollout must satisfy the *inhomogeneous* Hamiltonian recursion
+    The tracking rollout must satisfy the *inhomogeneous* LQR recursion
     exactly, with the affine term `[d_t; −Q_t r_t]`. That the costate half
     carries this regime's own cost is the whole point of `Gref`.
     =#
     for t in 1:(tsteps - 1)
         k = SSD._regime(sm, t)
-        E = hamiltonian_matrix(sm, k)
+        E = lqr_matrix(sm, k)
         w = [z[1:n, t]; z[(n + 1):d, t + 1]]
         v = [z[1:n, t + 1]; z[(n + 1):d, t]]
         affine = [zeros(n); -Qcs[k] * (Gref * ux[:, t])]
@@ -1129,7 +1125,7 @@ function test_hamiltonian_tracking_control()
     @test maximum(abs, z[(n + 1):d, end] .- Qcs[kT] * (z[1:n, end] .- target)) < 1e-10
 
     # A heavier terminal cost pulls the endpoint onto the target.
-    sm_heavy = HamiltonianStateModel(
+    sm_heavy = LQRStateModel(
         A,
         Sm,
         [copy(Qcs[1]), 200.0 * Matrix(I, n, n)],
@@ -1146,7 +1142,7 @@ function test_hamiltonian_tracking_control()
 
     # With no reference the model is the regulation problem: the input cannot
     # move the costate at all.
-    sm_reg = HamiltonianStateModel(
+    sm_reg = LQRStateModel(
         A,
         Sm,
         Qcs,
@@ -1163,17 +1159,17 @@ function test_hamiltonian_tracking_control()
     return nothing
 end
 
-function test_hamiltonian_tracking_mstep()
+function test_lqr_tracking_mstep()
     rng = StableRNG(61)
     n = 2
     m = 2
     tsteps = 16
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, ux_dim=m, onset=9)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, ux_dim=m, onset=9)
     sm.Gref .= randn(rng, n, m) .* 0.5
     refresh!(sm)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
     uxs = [randn(rng, m, tsteps) for _ in 1:4]
-    hs, _, _, _ = ham_estep_stats(lds, ys; ux=uxs)
+    hs, _, _, _ = lqr_estep_stats(lds, ys; ux=uxs)
 
     #=
     `Gref` enters the objective bilinearly with `Q_k` — through the input block
@@ -1181,38 +1177,38 @@ function test_hamiltonian_tracking_mstep()
     gradients get cross terms. Check them against the independent reference.
     =#
     for profile in (true, false)
-        ctx = SSD._HamMStepCtx(hs, sm, profile)
+        ctx = SSD._LQRMStepCtx(hs, sm, profile)
         θ = zeros(ctx.pack.np)
-        SSD._ham_pack!(θ, ctx)
+        SSD._lqr_pack!(θ, ctx)
         g = similar(θ)
-        f = SSD._ham_fg!(g, θ, ctx)
-        @test f ≈ ham_ref_objective(θ, hs, sm, profile) atol = 1e-8
-        gref = ForwardDiff.gradient(t -> ham_ref_objective(t, hs, sm, profile), θ)
+        f = SSD._lqr_fg!(g, θ, ctx)
+        @test f ≈ lqr_ref_objective(θ, hs, sm, profile) atol = 1e-8
+        gref = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
         @test maximum(abs, g .- gref) / max(1.0, maximum(abs, gref)) < 1e-8
     end
 
     # `Gref` is a packed block, and freezing it removes it from the problem.
-    full = SSD._HamPack(sm).np
-    sm.fit_flags = HamiltonianFitFlags(; Gref=false)
-    @test SSD._HamPack(sm).np == full - n * m
+    full = SSD._LQRPack(sm).np
+    sm.fit_flags = LQRFitFlags(; Gref=false)
+    @test SSD._LQRPack(sm).np == full - n * m
     G0 = copy(sm.Gref)
     els = fit!(lds, ys; ux=uxs, max_iter=6, progress=false)
     @test sm.Gref == G0
     @test minimum(diff(els)) > -1e-8
 
     # Unfrozen, it moves and EM stays monotone.
-    sm.fit_flags = HamiltonianFitFlags()
+    sm.fit_flags = LQRFitFlags()
     els2 = fit!(lds, ys; ux=uxs, max_iter=10, progress=false)
     @test sm.Gref != G0
     @test minimum(diff(els2)) > -1e-8
 
     # The ELBO still matches the exact Laplace normalizer with tracking on.
-    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ ham_exact_marginal(lds, ys[1]; ux=uxs[1]) atol =
+    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ lqr_exact_marginal(lds, ys[1]; ux=uxs[1]) atol =
         1e-7
     return nothing
 end
 
-function test_hamiltonian_gref_columns()
+function test_lqr_gref_columns()
     rng = StableRNG(62)
     n = 2
     m = 4
@@ -1221,10 +1217,10 @@ function test_hamiltonian_gref_columns()
 
     function fixture(cols)
         r = StableRNG(62)
-        sm, lds = ham_fixture(r; terminal=true, nregimes=2, tsteps=tsteps, ux_dim=m)
+        sm, lds = lqr_fixture(r; terminal=true, nregimes=2, tsteps=tsteps, ux_dim=m)
         sm.Gref .= 0
         sm.Gref[:, 2:3] .= randn(r, n, 2) .* 0.5
-        sm.fit_flags = HamiltonianFitFlags(; Gref_cols=cols)
+        sm.fit_flags = LQRFitFlags(; Gref_cols=cols)
         refresh!(sm)
         ys = [randn(r, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
         uxs = [randn(r, m, tsteps) for _ in 1:ntrials]
@@ -1233,7 +1229,7 @@ function test_hamiltonian_gref_columns()
 
     # Only the named columns are packed, and only they move.
     sm, lds, ys, uxs = fixture([2, 3])
-    @test SSD._HamPack(sm).np == SSD._HamPack(sm, HamiltonianFitFlags()).np - n * (m - 2)
+    @test SSD._LQRPack(sm).np == SSD._LQRPack(sm, LQRFitFlags()).np - n * (m - 2)
     G0 = copy(sm.Gref)
     els = fit!(lds, ys; ux=uxs, max_iter=8, progress=false)
     @test minimum(diff(els)) > -1e-8
@@ -1256,31 +1252,31 @@ function test_hamiltonian_gref_columns()
 
     # Freezing wins over narrowing, and the flags validate against the width.
     smC, ldsC, ysC, uxsC = fixture([2, 3])
-    smC.fit_flags = HamiltonianFitFlags(; Gref=false, Gref_cols=[2, 3])
+    smC.fit_flags = LQRFitFlags(; Gref=false, Gref_cols=[2, 3])
     GC = copy(smC.Gref)
     fit!(ldsC, ysC; ux=uxsC, max_iter=4, progress=false)
     @test smC.Gref == GC
-    @test_throws ArgumentError HamiltonianFitFlags(; Gref_cols=Int[])
-    @test_throws ArgumentError HamiltonianStateModel(
+    @test_throws ArgumentError LQRFitFlags(; Gref_cols=Int[])
+    @test_throws ArgumentError LQRStateModel(
         Matrix(0.9I, n, n),
         Matrix(0.2I, n, n),
         [Matrix(1.0I, n, n)],
         Matrix(0.1I, 2n, 2n);
         Bu=zeros(2n, m),
-        fit_flags=HamiltonianFitFlags(; Gref_cols=[m + 1]),
+        fit_flags=LQRFitFlags(; Gref_cols=[m + 1]),
     )
 
     # Flags compare by value, which an SLDS's "same flags" check relies on.
-    @test HamiltonianFitFlags(; Gref_cols=[2, 3]) == HamiltonianFitFlags(; Gref_cols=[2, 3])
-    @test HamiltonianFitFlags(; Gref_cols=[2, 3]) != HamiltonianFitFlags(; Gref_cols=[2])
+    @test LQRFitFlags(; Gref_cols=[2, 3]) == LQRFitFlags(; Gref_cols=[2, 3])
+    @test LQRFitFlags(; Gref_cols=[2, 3]) != LQRFitFlags(; Gref_cols=[2])
     return nothing
 end
 
-function test_hamiltonian_depends_on()
+function test_lqr_depends_on()
     rng = StableRNG(70)
     tsteps = 16
     ntrials = 12
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
     session = repeat([1, 2]; inner=ntrials ÷ 2)
     one_group = fill(1, ntrials)
@@ -1290,16 +1286,16 @@ function test_hamiltonian_depends_on()
     the sharpest check that the grouped path is the same estimator, since the
     cells pool back into one unit.
     =#
-    smA, ldsA = ham_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
+    smA, ldsA = lqr_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
     set_depends_on!(smA, (structure=one_group, noise=one_group))
     ldsA2 = LinearDynamicalSystem(smA, ldsA.obs_model)
     elsA = fit!(ldsA2, ys; max_iter=8, progress=false)
-    smB, ldsB = ham_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
+    smB, ldsB = lqr_fixture(StableRNG(70); nregimes=1, tsteps=tsteps)
     elsB = fit!(ldsB, ys; max_iter=8, progress=false)
     @test maximum(abs, elsA .- elsB) < 1e-8
 
     # Stitching: one shared LQR structure, per-session emission.
-    smC, ldsC = ham_fixture(StableRNG(71); nregimes=1, tsteps=tsteps)
+    smC, ldsC = lqr_fixture(StableRNG(71); nregimes=1, tsteps=tsteps)
     set_depends_on!(ldsC.obs_model, (C=session, d=session, D=session, R=session))
     ldsC2 = LinearDynamicalSystem(smC, ldsC.obs_model)
     elsC = fit!(ldsC2, ys; max_iter=10, progress=false)
@@ -1320,7 +1316,7 @@ function test_hamiltonian_depends_on()
         (structure=session, noise=session),
         (x0=session, P0=session),
     )
-        smD, ldsD = ham_fixture(StableRNG(72); nregimes=2, terminal=true, tsteps=tsteps)
+        smD, ldsD = lqr_fixture(StableRNG(72); nregimes=2, terminal=true, tsteps=tsteps)
         set_depends_on!(smD, dep)
         ldsD2 = LinearDynamicalSystem(smD, ldsD.obs_model)
         els = fit!(ldsD2, ys; max_iter=8, progress=false)
@@ -1333,7 +1329,7 @@ function test_hamiltonian_depends_on()
     rejected — when the model goes into a `LinearDynamicalSystem`.
     =#
     for bad in ((Σ=session,), (Mfree=session,), (nonsense=session,))
-        smE, ldsE = ham_fixture(StableRNG(73); nregimes=1, tsteps=tsteps)
+        smE, ldsE = lqr_fixture(StableRNG(73); nregimes=1, tsteps=tsteps)
         set_depends_on!(smE, bad)
         @test_throws ArgumentError LinearDynamicalSystem(smE, ldsE.obs_model)
     end
@@ -1344,7 +1340,7 @@ function test_hamiltonian_depends_on()
     named piece gets a copy per group, so `(Qc = session,)` is "one plant, a cost
     per session" rather than "a different arm per session".
     =#
-    smP, ldsP = ham_fixture(StableRNG(74); nregimes=2, terminal=true, tsteps=tsteps)
+    smP, ldsP = lqr_fixture(StableRNG(74); nregimes=2, terminal=true, tsteps=tsteps)
     set_depends_on!(smP, (Qc=session,))
     ldsP2 = LinearDynamicalSystem(smP, ldsP.obs_model)
     elsP = fit!(ldsP2, ys; max_iter=10, progress=false)
@@ -1361,27 +1357,27 @@ function test_hamiltonian_depends_on()
     end
 
     # Naming several pieces is legal; naming them inconsistently is not.
-    smQ, ldsQ = ham_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
+    smQ, ldsQ = lqr_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
     set_depends_on!(smQ, (Qc=session, h=session))
     ldsQ2 = LinearDynamicalSystem(smQ, ldsQ.obs_model)
     @test minimum(diff(fit!(ldsQ2, ys; max_iter=6, progress=false))) > -1e-8
     q1 = group_parameter(smQ, :structure, 1)
     q2 = group_parameter(smQ, :structure, 2)
     @test q1.A === q2.A && !(q1.h === q2.h)
-    smR, ldsR = ham_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
+    smR, ldsR = lqr_fixture(StableRNG(75); nregimes=1, tsteps=tsteps)
     set_depends_on!(smR, (Qc=session, h=one_group))
     @test_throws ArgumentError LinearDynamicalSystem(smR, ldsR.obs_model)
 
     # A single group still reproduces the ungrouped fit exactly, piecewise too.
-    smS, ldsS = ham_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    smS, ldsS = lqr_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
     set_depends_on!(smS, (Qc=one_group,))
     elsS = fit!(LinearDynamicalSystem(smS, ldsS.obs_model), ys; max_iter=8, progress=false)
-    smT, ldsT = ham_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    smT, ldsT = lqr_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
     elsT = fit!(ldsT, ys; max_iter=8, progress=false)
     @test maximum(abs, elsS .- elsT) < 1e-8
 
     # Grouped structure really does diverge, while a shared group stays shared.
-    smF, ldsF = ham_fixture(StableRNG(74); nregimes=1, tsteps=tsteps)
+    smF, ldsF = lqr_fixture(StableRNG(74); nregimes=1, tsteps=tsteps)
     set_depends_on!(smF, (structure=session,))
     ldsF2 = LinearDynamicalSystem(smF, ldsF.obs_model)
     fit!(ldsF2, ys; max_iter=10, progress=false)
@@ -1401,26 +1397,26 @@ function test_hamiltonian_depends_on()
     return nothing
 end
 
-function test_hamiltonian_show()
+function test_lqr_show()
     rng = StableRNG(47)
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=2, tsteps=12)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=12)
     str = sprint(show, sm)
-    @test occursin("Hamiltonian", str)
+    @test occursin("LQR", str)
     @test occursin("B R⁻¹ Bᵀ", str)
     @test occursin("Cost schedule", str)
     @test occursin("observe_costate = false", str)
     @test occursin("symplectic defect", str)
     # A wide model prints shapes instead of contents.
-    big, _ = ham_fixture(rng; n=6, p=3, tsteps=12)
+    big, _ = lqr_fixture(rng; n=6, p=3, tsteps=12)
     @test occursin("size(A)", sprint(show, big))
-    @test occursin("Hamiltonian", sprint(show, lds))
+    @test occursin("LQR", sprint(show, lds))
     return nothing
 end
 
-function test_hamiltonian_priors_and_fit_bool()
+function test_lqr_priors_and_fit_bool()
     rng = StableRNG(48)
     tsteps = 14
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
 
     # fit_bool's four state slots: [x0, P0, structure, noise].
@@ -1438,7 +1434,7 @@ function test_hamiltonian_priors_and_fit_bool()
     @test sm.Qc[1] == Q0     # slot 3 gates the whole structural update
 
     # With the noise frozen the objective is the fixed-Σ form; still monotone.
-    sm2, lds2 = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm2, lds2 = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     lds2_noQ = LinearDynamicalSystem(sm2, lds2.obs_model; fit_bool=(Q=false,))
     Σ2 = copy(sm2.Σ)
     els = fit!(lds2_noQ, ys; max_iter=12, progress=false)
@@ -1446,7 +1442,7 @@ function test_hamiltonian_priors_and_fit_bool()
     @test minimum(diff(els)) > -1e-8
 
     # An initial-state prior contributes to the ELBO and shrinks P0.
-    sm3, lds3 = ham_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm3, lds3 = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     d = lds3.latent_dim
     bare = elbo(lds3, ys)
     sm3.P0_prior = IWPrior(Matrix(1.0I, d, d), Float64(d + 8))
@@ -1456,7 +1452,7 @@ function test_hamiltonian_priors_and_fit_bool()
     return nothing
 end
 
-function test_hamiltonian_ragged_with_schedule()
+function test_lqr_ragged_with_schedule()
     rng = StableRNG(50)
     #=
     Trials of unequal length under a schedule: the schedule is indexed by
@@ -1465,7 +1461,7 @@ function test_hamiltonian_ragged_with_schedule()
     longest trial's.
     =#
     tsteps = 18
-    sm, lds = ham_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
     lengths = [12, 18, 15]
     ys = [randn(rng, lds.obs_dim, t) .* 0.4 for t in lengths]
 
@@ -1474,7 +1470,7 @@ function test_hamiltonian_ragged_with_schedule()
     @test all(isfinite, els)
 
     # The per-regime transition counts must match the schedule, trial by trial.
-    hs, _, _, _ = ham_estep_stats(lds, ys)
+    hs, _, _, _ = lqr_estep_stats(lds, ys)
     expected = zeros(3)
     for t_n in lengths, t in 1:(t_n - 1)
         expected[SSD._regime(sm, t)] += 1
@@ -1492,9 +1488,9 @@ function test_hamiltonian_ragged_with_schedule()
     return nothing
 end
 
-function test_hamiltonian_single_trial_and_edge_cases()
+function test_lqr_single_trial_and_edge_cases()
     rng = StableRNG(49)
-    sm, lds = ham_fixture(rng; nregimes=1, tsteps=10)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=10)
     y = randn(rng, lds.obs_dim, 10) .* 0.4
     els = fit!(lds, y; max_iter=8, progress=false)
     @test minimum(diff(els)) > -1e-8
@@ -1509,7 +1505,7 @@ function test_hamiltonian_single_trial_and_edge_cases()
     A = [0.96 0.07; -0.05 0.93]
     Sm = [0.06 0.01; 0.01 0.05]
     Qc = [0.25 0.04; 0.04 0.18]
-    @test_logs (:warn, r"never used") match_mode = :any HamiltonianStateModel(
+    @test_logs (:warn, r"never used") match_mode = :any LQRStateModel(
         A, Sm, [Qc, Qc], Matrix(0.03I, 4, 4); schedule=fill(1, 8)
     )
 
@@ -1559,7 +1555,7 @@ end
 """A mildly contractive `d × d` matrix."""
 T_STABLE(rng, d) = 0.85 * Matrix(1.0I, d, d) + 0.05 * randn(rng, d, d)
 
-function test_hamiltonian_free_construction()
+function test_lqr_free_construction()
     M = 0.9 * Matrix(1.0I, 4, 4)
     Σ = Matrix(0.1I, 4, 4)
     sm = free_state_model(M, Σ)
@@ -1591,7 +1587,7 @@ function test_hamiltonian_free_construction()
     @test_throws ArgumentError lqr_parameters(sm)
     @test_throws ArgumentError riccati_solution(sm)
     @test_throws ArgumentError closed_loop_dynamics(sm)
-    @test_throws ArgumentError hamiltonian_matrix(sm)
+    @test_throws ArgumentError lqr_matrix(sm)
     @test_throws ArgumentError symplectic_defect(sm)
     @test_throws ArgumentError rescale_costate!(sm, 2.0)
     @test_throws ArgumentError simulate_lqr(sm, 5)
@@ -1599,33 +1595,33 @@ function test_hamiltonian_free_construction()
     return nothing
 end
 
-function test_hamiltonian_total_dim_constructor()
+function test_lqr_total_dim_constructor()
     for D in (2, 4, 6)
-        @test plant_dim(HamiltonianStateModel(D)) == D ÷ 2
-        @test SSD._state_latent_dim(HamiltonianStateModel(D)) == D
-        @test plant_dim(HamiltonianStateModel(D; mode=:free)) == D ÷ 2
-        @test SSD._state_latent_dim(HamiltonianStateModel(D; mode=:free)) == D
+        @test plant_dim(LQRStateModel(D)) == D ÷ 2
+        @test SSD._state_latent_dim(LQRStateModel(D)) == D
+        @test plant_dim(LQRStateModel(D; mode=:free)) == D ÷ 2
+        @test SSD._state_latent_dim(LQRStateModel(D; mode=:free)) == D
     end
-    @test HamiltonianStateModel(4).mode === :lqr
-    @test HamiltonianStateModel(4; mode=:free).mode === :free
+    @test LQRStateModel(4).mode === :lqr
+    @test LQRStateModel(4; mode=:free).mode === :free
 
     # The latent is the state-costate pair, so an odd total is a user error.
-    @test_throws ArgumentError HamiltonianStateModel(5)
-    @test_throws ArgumentError HamiltonianStateModel(3; mode=:free)
-    @test_throws ArgumentError HamiltonianStateModel(0)
-    @test_throws ArgumentError HamiltonianStateModel(-2)
-    @test_throws ArgumentError HamiltonianStateModel(4; mode=:nonsense)
+    @test_throws ArgumentError LQRStateModel(5)
+    @test_throws ArgumentError LQRStateModel(3; mode=:free)
+    @test_throws ArgumentError LQRStateModel(0)
+    @test_throws ArgumentError LQRStateModel(-2)
+    @test_throws ArgumentError LQRStateModel(4; mode=:nonsense)
 
     # Keywords reach the matrix constructor they stand in for.
-    sm = HamiltonianStateModel(4; terminal=true, observe_costate=true)
+    sm = LQRStateModel(4; terminal=true, observe_costate=true)
     @test sm.terminal && sm.observe_costate
     return nothing
 end
 
-"""`:free` mode is a plain linear-Gaussian state model wearing the Hamiltonian
+"""`:free` mode is a plain linear-Gaussian state model wearing the LQR
 type, so it must agree with `GaussianStateModel` exactly — not approximately.
 Any divergence means the free path has invented structure of its own."""
-function test_hamiltonian_free_matches_gaussian_lds()
+function test_lqr_free_matches_gaussian_lds()
     for ux_dim in (0, 2)
         rng = StableRNG(4242 + ux_dim)
         ldsG, ldsF = free_pair(rng; ux_dim=ux_dim)
@@ -1666,14 +1662,14 @@ end
 
 """Freezing a column group of the free regression must hold exactly that group,
 and still improve the ELBO for the ones left free."""
-function test_hamiltonian_free_fit_flags()
+function test_lqr_free_fit_flags()
     rng = StableRNG(99)
     _, lds = free_pair(rng; ux_dim=2)
     sm = lds.state_model
     ys = [randn(StableRNG(31 + i), lds.obs_dim, 30) .* 0.5 for i in 1:4]
     uxs = [randn(StableRNG(41 + i), 2, 30) for i in 1:4]
 
-    sm.fit_flags = HamiltonianFitFlags(; A=true, h=false, Bu=false)
+    sm.fit_flags = LQRFitFlags(; A=true, h=false, Bu=false)
     h0, Bu0 = copy(sm.h), copy(sm.Bu)
     elbos = fit!(lds, ys; ux=uxs, max_iter=8, tol=1e-12)
     elbos = elbos isa Tuple ? elbos[1] : elbos
@@ -1690,7 +1686,7 @@ function test_hamiltonian_free_fit_flags()
     return nothing
 end
 
-function test_hamiltonian_free_show()
+function test_lqr_free_show()
     sm = free_state_model(0.9 * Matrix(1.0I, 4, 4), Matrix(0.1I, 4, 4))
     str = sprint(show, sm)
     @test occursin(":free", str)
@@ -1708,14 +1704,14 @@ end
 # ---------------------------------------------------------------------------
 
 """Aggregate `lds`'s statistics under per-trial weights `w`."""
-function ham_weighted_stats(lds, tfs, data, w)
+function lqr_weighted_stats(lds, tfs, data, w)
     hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
-    SSD._aggregate_hamiltonian_stats_weighted!(hs, tfs, lds, data, w)
+    SSD._aggregate_lqr_stats_weighted!(hs, tfs, lds, data, w)
     return hs
 end
 
 """Largest absolute disagreement between two statistic sets, over every block."""
-function ham_stats_gap(a, b, K)
+function lqr_stats_gap(a, b, K)
     g = maximum([maximum(abs, a.zz[k] .- b.zz[k]) for k in 1:K])
     g = max(g, maximum([maximum(abs, a.zy[k] .- b.zy[k]) for k in 1:K]))
     g = max(g, maximum([maximum(abs, a.yy[k] .- b.yy[k]) for k in 1:K]))
@@ -1729,7 +1725,7 @@ one-index slip in the weight-to-timestep convention would bias every fit while
 still looking plausible. Three properties pin it down: it must reduce to the
 plain aggregator at unit weight, be additive in the weights, and vanish at zero.
 """
-function test_hamiltonian_weighted_stats()
+function test_lqr_weighted_stats()
     for (terminal, ux_dim, nregimes, onset) in (
         (false, 0, 1, 1),
         (false, 0, 2, 6),
@@ -1739,7 +1735,7 @@ function test_hamiltonian_weighted_stats()
     )
         rng = StableRNG(5150)
         tsteps, ntrials = 18, 4
-        sm, lds = ham_fixture(
+        sm, lds = lqr_fixture(
             rng;
             terminal=terminal,
             tsteps=tsteps,
@@ -1753,22 +1749,22 @@ function test_hamiltonian_weighted_stats()
         else
             nothing
         end
-        plain, tfs, data, _ = ham_estep_stats(lds, ys; ux=uxs)
+        plain, tfs, data, _ = lqr_estep_stats(lds, ys; ux=uxs)
         K = SSD._nregimes(sm)
 
         # 1. Unit weight is the plain aggregate — the convention check. If the
         #    transition out of `t` were weighted by `γ(t)` instead of `γ(t+1)`,
         #    this would still pass, so 2. below is the one that pins the index.
         ones_w = [ones(tsteps) for _ in 1:ntrials]
-        @test ham_stats_gap(plain, ham_weighted_stats(lds, tfs, data, ones_w), K) < 1e-10
+        @test lqr_stats_gap(plain, lqr_weighted_stats(lds, tfs, data, ones_w), K) < 1e-10
 
         # 2. Additive in the weights, with weights that vary within a trial so a
         #    shifted index changes the answer.
         w1 = [[0.1 + 0.8 * abs(sin(0.7t + i)) for t in 1:tsteps] for i in 1:ntrials]
         w2 = [[0.05 + 0.5 * abs(cos(0.4t - i)) for t in 1:tsteps] for i in 1:ntrials]
-        s1 = ham_weighted_stats(lds, tfs, data, w1)
-        s2 = ham_weighted_stats(lds, tfs, data, w2)
-        ssum = ham_weighted_stats(lds, tfs, data, [w1[i] .+ w2[i] for i in 1:ntrials])
+        s1 = lqr_weighted_stats(lds, tfs, data, w1)
+        s2 = lqr_weighted_stats(lds, tfs, data, w2)
+        ssum = lqr_weighted_stats(lds, tfs, data, [w1[i] .+ w2[i] for i in 1:ntrials])
         for k in 1:K
             @test maximum(abs, ssum.zz[k] .- (s1.zz[k] .+ s2.zz[k])) < 1e-10
             @test maximum(abs, ssum.zy[k] .- (s1.zy[k] .+ s2.zy[k])) < 1e-10
@@ -1782,8 +1778,8 @@ function test_hamiltonian_weighted_stats()
         #    makes a K-state SLDS with `Σₖ γₖ(t) = 1` pool to the ungrouped fit.
         wa = [[0.3 + 0.4 * abs(sin(1.1t + i)) for t in 1:tsteps] for i in 1:ntrials]
         wb = [1 .- wa[i] for i in 1:ntrials]
-        sa = ham_weighted_stats(lds, tfs, data, wa)
-        sb = ham_weighted_stats(lds, tfs, data, wb)
+        sa = lqr_weighted_stats(lds, tfs, data, wa)
+        sb = lqr_weighted_stats(lds, tfs, data, wb)
         for k in 1:K
             @test maximum(abs, plain.zz[k] .- (sa.zz[k] .+ sb.zz[k])) < 1e-10
             @test maximum(abs, plain.zy[k] .- (sa.zy[k] .+ sb.zy[k])) < 1e-10
@@ -1792,7 +1788,7 @@ function test_hamiltonian_weighted_stats()
         @test plain.term_n ≈ sa.term_n + sb.term_n
 
         # 4. Zero weight contributes nothing at all.
-        zed = ham_weighted_stats(lds, tfs, data, [zeros(tsteps) for _ in 1:ntrials])
+        zed = lqr_weighted_stats(lds, tfs, data, [zeros(tsteps) for _ in 1:ntrials])
         for k in 1:K
             @test all(iszero, zed.zz[k])
             @test all(iszero, zed.zy[k])

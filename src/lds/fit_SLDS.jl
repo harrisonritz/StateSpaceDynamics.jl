@@ -667,7 +667,7 @@ end
 function _slds_terminal_gradient!(
     grad::AbstractMatrix{T},
     ws::SLDSSmoothWorkspace{T},
-    sm::HamiltonianStateModel{T},
+    sm::LQRStateModel{T},
     x::AbstractMatrix{T},
     w_k::AbstractVector{T},
     ux::Union{Nothing,AbstractMatrix},
@@ -693,10 +693,7 @@ end
 end
 
 function _slds_terminal_hessian!(
-    H_diag::AbstractVector,
-    sm::HamiltonianStateModel{T},
-    w_k::AbstractVector{T},
-    tsteps::Int,
+    H_diag::AbstractVector, sm::LQRStateModel{T}, w_k::AbstractVector{T}, tsteps::Int
 ) where {T<:Real}
     sm.terminal || return nothing
     negLtSL = sm.cache.negLtSL
@@ -717,7 +714,7 @@ end
 end
 
 function _slds_terminal_cov_correction(
-    sm::HamiltonianStateModel{T}, fs::FilterSmooth{T}, tsteps::Int
+    sm::LQRStateModel{T}, fs::FilterSmooth{T}, tsteps::Int
 ) where {T<:Real}
     sm.terminal || return zero(T)
     # `tr(H_f Σ_T)`; the caller's single ½ applies to it like every other term.
@@ -2501,10 +2498,10 @@ function _validate_tied_params(
     #=
     An inverse-LQR state's structural parameters are not columns of a regression,
     so the partial-column reasoning below does not apply to them. A tie there is
-    over named blocks, run as an alternation by `_ham_structure_phases!`, and the
+    over named blocks, run as an alternation by `_lqr_structure_phases!`, and the
     emission half is validated on its own terms.
     =#
-    if lds.state_model isa HamiltonianStateModel
+    if lds.state_model isa LQRStateModel
         obs_h = _tied_obs_cols(tied, D, lds.uy_dim)
         if !isempty(obs_h) &&
             length(obs_h) < D + 1 + lds.uy_dim &&
@@ -2569,12 +2566,12 @@ function _broadcast_tied_params!(
     isempty(tied) && return nothing
     src = slds.LDSs[1]
     #=
-    A Hamiltonian state's tie is applied inside its own M-step, which fits the
+    An LQR state's tie is applied inside its own M-step, which fits the
     shared version jointly from every state that uses it and copies it out. Its
     parameters are not columns of a regression, so the packing below has nothing
     to pack.
     =#
-    if src.state_model isa HamiltonianStateModel
+    if src.state_model isa LQRStateModel
         _broadcast_tied_obs!(src.obs_model, slds, tied)
         return nothing
     end
@@ -2805,14 +2802,14 @@ LBFGS routine) are re-estimated alongside `Aₖ` / `Cₖ`.
 into the other regimes. `x0`/`P0` are tied unconditionally, below.
 """
 #=============================================================================
-Hamiltonian (inverse-LQR) discrete states.
+LQR discrete states.
 
 The SLDS machinery is state-model agnostic almost everywhere — `state_loglikelihood!`
 and `_transition_residual!` are dispatched, and `compute_smooth_constants!` fills
 the same `SmoothConstants` slots from either model — so what needs its own path
 is the M-step, where a symplectic parameterization is not a linear regression.
 
-The optimizer itself needs nothing new: `_HamMStepCtx` reads only the statistics,
+The optimizer itself needs nothing new: `_LQRMStepCtx` reads only the statistics,
 and its Jacobian coefficient `N_ab` comes from `sum(hs.nk)`, which the weighted
 aggregator fills with the *effective* count `n̄ₖ = Σ γₖ(t)`. So the weighted
 generalized M-step is the unweighted one fed weighted statistics.
@@ -2823,7 +2820,7 @@ generalized M-step is the unweighted one fed weighted statistics.
 
 One discrete state's responsibility-weighted sufficient statistics.
 
-A Hamiltonian state needs two passes: the base regression/emission blocks that
+An LQR state needs two passes: the base regression/emission blocks that
 every model shares, and the mixed-coordinate blocks its own M-step consumes.
 """
 function _slds_aggregate_weighted!(
@@ -2841,7 +2838,7 @@ end
     _slds_init_suf(suf)
 
 The statistics carrying the initial-state blocks (`init_xy`, `init_yy`,
-`init_n`). A Hamiltonian model keeps them on its base statistics, alongside the
+`init_n`). An LQR model keeps them on its base statistics, alongside the
 mixed-coordinate blocks its own M-step uses.
 """
 _slds_init_suf(suf) = suf
@@ -2852,12 +2849,12 @@ _slds_init_suf(suf) = suf
 The dynamics half of the SLDS M-step, dispatched on the state model.
 
 A Gaussian state is the conjugate `[A b B]` regression followed by the `Q`
-update. A Hamiltonian state is the constrained generalized M-step — L-BFGS on
+update. An LQR state is the constrained generalized M-step — L-BFGS on
 the symplectic parameterization, accepted only when it improves — then the
-closed-form noise update, which is what the ungrouped Hamiltonian fit does.
+closed-form noise update, which is what the ungrouped LQR fit does.
 
 Returns the regression-version slots the caller uses for its `Q` bookkeeping.
-Hamiltonian states do their own noise update here, so they return the identity
+LQR states do their own noise update here, so they return the identity
 and the caller skips `_grouped_update_Q!`.
 """
 function _slds_state_mstep!(
@@ -2982,7 +2979,7 @@ function mstep!(
     )
 
     #=
-    The emission half reads the base regression blocks. A Hamiltonian model wraps
+    The emission half reads the base regression blocks. An LQR model wraps
     those alongside its own mixed-coordinate blocks, so unwrap before handing them
     over; `_obs_suf` is the identity for every other model.
     =#
@@ -3102,7 +3099,7 @@ function _slds_obs_mstep!(
         _slds_member_obs_mstep!(
             _models(om)[key],
             views,
-            # `_obs_suf` unwraps a Hamiltonian state's statistics, which wrap the
+            # `_obs_suf` unwraps an LQR state's statistics, which wrap the
             # composite's per-member blocks; the identity for every other model.
             [_obs_suf(s)[key] for s in sf],
             tfs,
@@ -4159,7 +4156,7 @@ function _mstep_grouped!(
             lo > hi && return nothing
             for u in lo:hi
                 k, c = fldmod1(u, ncells)
-                #= Dispatched, as in the ungrouped M-step: a Hamiltonian state
+                #= Dispatched, as in the ungrouped M-step: an LQR state
                 needs its mixed-coordinate blocks filled alongside the base
                 ones, and the costate readout masked. =#
                 _slds_aggregate_weighted!(
@@ -4210,7 +4207,7 @@ function _mstep_grouped!(
     )
 
     #= The emission side is state-model-agnostic and reads the shared blocks, so
-    a Hamiltonian state's wrapper is unwrapped first — `_state_suf` is *not*
+    an LQR state's wrapper is unwrapped first — `_state_suf` is *not*
     applied, because a composite emission's M-step wants every member's blocks
     rather than one of them. The identity for a plain Gaussian state. =#
     obs_sufs = [_slds_init_suf(suf) for suf in unit_suf]
@@ -4248,7 +4245,7 @@ function _mstep_grouped!(
     =#
     slots_x0 = repeat(grp.cell_slot[_G_X0], K)
     slots_P0 = repeat(grp.cell_slot[_G_P0], K)
-    #= `_slds_init_suf` first: a Hamiltonian state's statistics wrap the shared
+    #= `_slds_init_suf` first: an LQR state's statistics wrap the shared
     initial-state and emission blocks rather than being them, and it is those
     blocks the pooled `x0` / `P0` updates read. `_state_suf` then picks a
     composite emission's member. The two compose to the identity for a plain
@@ -4314,7 +4311,7 @@ function _grouped_slds_state_mstep!(
 end
 
 """
-    _grouped_slds_state_mstep!(::HamiltonianStateModel, …)
+    _grouped_slds_state_mstep!(::LQRStateModel, …)
 
 Inverse-LQR discrete states whose *emission* is grouped — the stitched switching
 fit, where one control problem per discrete state is read out through one
@@ -4325,7 +4322,7 @@ constrained context the ungrouped switching M-step uses, over the `K · ncells`
 units instead of the `K` states. What changes is only the bookkeeping: each
 structural block's version at unit `(k, c)` is the pair of its version across
 regimes (from the tie) and its version across cells (from the grouping), mapped
-to a dense index by [`_ham_pair_slots`](@ref).
+to a dense index by [`_lqr_pair_slots`](@ref).
 
 For the common case — the state side ungrouped, only the emission stitched —
 every cell shares one structural version and this reduces exactly to the
@@ -4333,7 +4330,7 @@ ungrouped switching M-step, which is what makes the stitched fit and the
 single-session one the same estimator.
 """
 function _grouped_slds_state_mstep!(
-    ::HamiltonianStateModel,
+    ::LQRStateModel,
     unit_lds::AbstractVector,
     unit_suf::AbstractVector,
     grp::ParameterGrouping,
@@ -4392,28 +4389,28 @@ function _grouped_slds_state_mstep!(
     regime_of(u) = fldmod1(u, ncells)[1]
     cell_of(u) = fldmod1(u, ncells)[2]
 
-    block_slots = _ham_block_slots(tied, K)
+    block_slots = _lqr_block_slots(tied, K)
     #= Two axes, and each block may be shared on either: `tied_params` says
     which pieces every discrete state shares, and the `depends_on` declaration
     which pieces every group of trials shares. A piece shared on an axis takes
     one version along it. =#
     first_regime = [u for u in lqr if regime_of(u) == regime_of(lqr[1])]
-    cell_shares = ntuple(b -> _ham_shares_block(sms[first_regime], b), 7)
+    cell_shares = ntuple(b -> _lqr_shares_block(sms[first_regime], b), 7)
     ab_slots = ntuple(
-        b -> _ham_pair_slots(
+        b -> _lqr_pair_slots(
             [block_slots[b][regime_of(u)] for u in lqr],
             [cell_shares[b] ? 1 : grp.cell_slot[_G_AB][cell_of(u)] for u in lqr],
         ),
         7,
     )
-    q_slots = _ham_pair_slots(
+    q_slots = _lqr_pair_slots(
         [(:noise in tied) ? 1 : regime_of(u) for u in lqr],
         [grp.cell_slot[_G_Q][cell_of(u)] for u in lqr],
     )
 
-    ctx = _HamMStepCtx([unit_suf[u] for u in lqr], sms[lqr], ab_slots, q_slots, fit_noise)
-    _ham_structure_mstep!(ctx, fit_structure, maximum(sms[u].mstep_iters for u in lqr))
-    fit_noise && _ham_noise_mstep!(ctx)
+    ctx = _LQRMStepCtx([unit_suf[u] for u in lqr], sms[lqr], ab_slots, q_slots, fit_noise)
+    _lqr_structure_mstep!(ctx, fit_structure, maximum(sms[u].mstep_iters for u in lqr))
+    fit_noise && _lqr_noise_mstep!(ctx)
     for u in lqr
         refresh!(sms[u])
     end
@@ -4421,17 +4418,17 @@ function _grouped_slds_state_mstep!(
 end
 
 """
-    _ham_pair_slots(regime_versions, cell_versions) -> Vector{Int}
+    _lqr_pair_slots(regime_versions, cell_versions) -> Vector{Int}
 
 A dense version index per unit from the two axes a grouped switching fit varies
 along: which copy of a parameter the unit's *discrete state* uses, and which its
 *cell of trials* uses.
 
 Units agreeing on both share a version; units differing on either get their own.
-The result is renumbered from 1 with no gaps, which is what `_HamMStepCtx`
+The result is renumbered from 1 with no gaps, which is what `_LQRMStepCtx`
 expects — it sizes its per-version storage from the maximum.
 """
-function _ham_pair_slots(
+function _lqr_pair_slots(
     regime_versions::AbstractVector{Int}, cell_versions::AbstractVector{Int}
 )
     seen = Dict{Tuple{Int,Int},Int}()

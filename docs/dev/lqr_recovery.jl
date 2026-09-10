@@ -3,8 +3,8 @@ Inverse-LQR parameter recovery — a standalone validation harness.
 
 Run it:
 
-    julia --project=docs/dev docs/dev/hamiltonian_recovery.jl
-    julia --project=. -e 'include("docs/dev/hamiltonian_recovery.jl")'
+    julia --project=docs/dev docs/dev/lqr_recovery.jl
+    julia --project=. -e 'include("docs/dev/lqr_recovery.jl")'
 
 This is not a test. Tests check that the machinery computes what it claims;
 this checks what you can actually *learn* from data, which is a different and
@@ -49,7 +49,7 @@ const SSD = StateSpaceDynamics
     truth_model(; n, terminal, tsteps, ux_dim, observe_costate, tracking, drift)
 
 The generating model. `A` is a mild contraction and `S`, `Qc` are scaled so the
-symplectic spectral radius stays near 1 — a Hamiltonian matrix has reciprocal
+symplectic spectral radius stays near 1 — an LQR matrix has reciprocal
 eigenvalue pairs, so `ρ(M)^T` is how fast the model's own forward chain
 diverges, and a sampler-based recovery check needs it modest.
 
@@ -81,7 +81,7 @@ function truth_model(;
     Σ = Matrix(0.02I, d, d)
     # Deterministic, so the truth does not depend on where the rng happens to be.
     h = drift ? [fill(0.03, n); collect(range(-0.04, 0.04; length=n))] : nothing
-    return HamiltonianStateModel(
+    return LQRStateModel(
         A,
         S,
         qcs,
@@ -363,7 +363,7 @@ function recover(;
         fit_sm.A .= 0.90 .* truth.A .+ Matrix(0.03I, n, n)
         fit_sm.S .= 1.5 .* truth.S
     end
-    fit_sm.fit_flags = HamiltonianFitFlags(; A=(!known_plant), S=(!known_plant), Gref=false)
+    fit_sm.fit_flags = LQRFitFlags(; A=(!known_plant), S=(!known_plant), Gref=false)
     refresh!(fit_sm)
     fit_lds = LinearDynamicalSystem(
         fit_sm, GaussianObservationModel(copy(C), copy(R), zeros(obs_dim))

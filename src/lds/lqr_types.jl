@@ -1,22 +1,22 @@
 #=============================================================================
-Hamiltonian (inverse-LQR) latents — model type, derived cache, and structure
+LQR latents — model type, derived cache, and structure
 utilities.
 
-    Model:      HamiltonianStateModel, HamiltonianCostSchedule
-    Cache:      HamiltonianCache, refresh!
-    Structure:  hamiltonian_matrix, symplectic_matrix, symplectic_defect,
+    Model:      LQRStateModel, cost_schedule
+    Cache:      LQRCache, refresh!
+    Structure:  lqr_matrix, symplectic_matrix, symplectic_defect,
                 riccati_solution, closed_loop_dynamics, lqr_parameters,
                 rescale_costate!
 
-The E-step kernels live in `hamiltonian_latents.jl` and the M-step in
-`hamiltonian_mstep.jl`.
+The E-step kernels live in `lqr_latents.jl` and the M-step in
+`lqr_mstep.jl`.
 =============================================================================#
 
 """
-    HamiltonianFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
+    LQRFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
                         terminal=true, Gref_cols=nothing)
 
-Which structural parameters of a [`HamiltonianStateModel`](@ref) the M-step is
+Which structural parameters of a [`LQRStateModel`](@ref) the M-step is
 free to move. Every flag defaults to `true`.
 
 Freezing is what makes the *inverse* problem inverse: with a known plant you set
@@ -49,7 +49,7 @@ never packed, so this shrinks the M-step problem rather than projecting it.
 Columns are 1-based indices into the model's input width, validated when the
 model is built (which is the first point that width is known).
 """
-struct HamiltonianFitFlags
+struct LQRFitFlags
     A::Bool
     S::Bool
     Qc::Bool
@@ -60,7 +60,7 @@ struct HamiltonianFitFlags
     Gref_cols::Union{Nothing,Vector{Int}}
 end
 
-function HamiltonianFitFlags(;
+function LQRFitFlags(;
     A::Bool=true,
     S::Bool=true,
     Qc::Bool=true,
@@ -83,14 +83,14 @@ function HamiltonianFitFlags(;
             ArgumentError("Gref_cols must be 1-based column indices; got $(minimum(cols))"),
         )
     end
-    return HamiltonianFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols)
+    return LQRFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols)
 end
 
 """
-    _HAM_STRUCT_NAMES
+    _LQR_STRUCT_NAMES
 
 The pieces of the structural block, in the order the M-step packs them — the
-`_HB_*` ordinals of `hamiltonian_mstep.jl`, so `_HAM_STRUCT_NAMES[b]` names
+`_LQR_BLOCK_*` ordinals of `lqr_mstep.jl`, so `_LQR_STRUCT_NAMES[b]` names
 block `b`. `:terminal` is the terminal factor's offset `hf`, named after the flag
 that gates it.
 
@@ -101,7 +101,7 @@ shared array, which the M-step delivers in a single solve because it already
 carries a per-block count of copies (that is how an SLDS ties `A` and `S` while
 `Qc` switches).
 """
-const _HAM_STRUCT_NAMES = (:A, :S, :Qc, :h, :Bu, :Gref, :terminal)
+const _LQR_STRUCT_NAMES = (:A, :S, :Qc, :h, :Bu, :Gref, :terminal)
 
 #=
 `Gref_cols` makes the flags no longer a plain-data struct, and the default `==`
@@ -109,7 +109,7 @@ on those falls back to `===` — which would call two separately built but
 identical sets of flags different, and an SLDS refuses to run when its states
 disagree on them. Compare by value instead.
 =#
-function Base.:(==)(a::HamiltonianFitFlags, b::HamiltonianFitFlags)
+function Base.:(==)(a::LQRFitFlags, b::LQRFitFlags)
     return a.A == b.A &&
            a.S == b.S &&
            a.Qc == b.Qc &&
@@ -120,10 +120,9 @@ function Base.:(==)(a::HamiltonianFitFlags, b::HamiltonianFitFlags)
            a.Gref_cols == b.Gref_cols
 end
 
-function Base.hash(f::HamiltonianFitFlags, h::UInt)
+function Base.hash(f::LQRFitFlags, h::UInt)
     return hash(
-        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols),
-        hash(:HamiltonianFitFlags, h),
+        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols), hash(:LQRFitFlags, h)
     )
 end
 
@@ -131,10 +130,10 @@ end
     _gref_cols(f, m) -> Vector{Int}
 
 The input columns of `Gref` the M-step packs, given an input width of `m`: every
-column unless [`HamiltonianFitFlags`](@ref)'s `Gref_cols` narrows them, and none
+column unless [`LQRFitFlags`](@ref)'s `Gref_cols` narrows them, and none
 when `Gref` is frozen or the model has no input at all.
 """
-@inline function _gref_cols(f::HamiltonianFitFlags, m::Int)
+@inline function _gref_cols(f::LQRFitFlags, m::Int)
     (f.Gref && m > 0) || return Int[]
     return f.Gref_cols === nothing ? collect(1:m) : f.Gref_cols
 end
@@ -146,7 +145,7 @@ Reject `Gref_cols` that names a column the model does not have. Checked at model
 construction because that is where the input width is first known — the flags
 themselves are built before anyone knows how wide `Gref` will be.
 """
-function _check_gref_cols(f::HamiltonianFitFlags, m::Int)
+function _check_gref_cols(f::LQRFitFlags, m::Int)
     cols = f.Gref_cols
     cols === nothing && return nothing
     m > 0 || throw(
@@ -165,10 +164,10 @@ function _check_gref_cols(f::HamiltonianFitFlags, m::Int)
 end
 
 """
-    HamiltonianCache{T}
+    LQRCache{T}
 
 Everything the smoother and the ELBO need, derived from a
-[`HamiltonianStateModel`](@ref)'s natural parameters by [`refresh!`](@ref).
+[`LQRStateModel`](@ref)'s natural parameters by [`refresh!`](@ref).
 
 The latent state is `z_t = [x_t; λ_t]` (`2n`), and the forward transition
 `z_{t+1} = M_k z_t + b + B u_t + noise` is what the block-tridiagonal smoother
@@ -194,7 +193,7 @@ and `S` alone, so `Qfwd`, `bfwd` and `Bfwd` are shared by every regime.
     templates. Present (as identity placeholders) even when the model carries no
     terminal factor.
 """
-mutable struct HamiltonianCache{T<:Real}
+mutable struct LQRCache{T<:Real}
     const n::Int
     const M::Vector{Matrix{T}}
     const G::Matrix{T}
@@ -216,9 +215,9 @@ mutable struct HamiltonianCache{T<:Real}
     cF::T
 end
 
-function HamiltonianCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
+function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
     d = 2n
-    return HamiltonianCache{T}(
+    return LQRCache{T}(
         n,
         [zeros(T, d, d) for _ in 1:nregimes],
         zeros(T, d, d),
@@ -242,11 +241,11 @@ function HamiltonianCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {
 end
 
 """
-    HamiltonianStateModel{T,M,V} <: AbstractGaussianStateModel{T}
+    LQRStateModel{T,M,V} <: AbstractGaussianStateModel{T}
 
 Latent-state model for **inverse LQR**: the latent state is the LQR
 state–costate pair `z_t = [x_t; λ_t]` and the transition is constrained to the
-Hamiltonian (symplectic) form implied by a linear-quadratic optimal control
+LQR (symplectic) form implied by a linear-quadratic optimal control
 problem, so that fitting the SSM *is* recovering the plant and the cost.
 
 ## The structure being fitted
@@ -308,7 +307,7 @@ covariance, so nothing is lost by parameterizing it here.
 `Qc` holds `K` cost matrices and `schedule` says which one each timestep uses:
 `schedule[t]` indexes the transition `t → t+1` for `t < T`, and `schedule[T]`
 the terminal factor. A running-plus-terminal cost is
-`HamiltonianCostSchedule(T; terminal=true)`; see [`cost_schedule`](@ref).
+`cost_schedule(T; terminal=true)`; see [`cost_schedule`](@ref).
 An empty `schedule` means "regime 1 everywhere", which requires `K == 1`.
 
 ## Tracking a reference
@@ -341,7 +340,7 @@ and the terminal factor picks up `+ Q_{k_T} G_r u_T` in its residual — a reach
 scored against where the target was, not against the origin.
 
 Pass the reference itself as the input (`ux_dim = n`) and `G_r` is a plain
-selection: freeze it at `I` with `HamiltonianFitFlags(; Gref = false)`. Pass task
+selection: freeze it at `I` with `LQRFitFlags(; Gref = false)`. Pass task
 regressors instead (a target identity, say) and `G_r` is estimated, mapping them
 to the reference the agent was actually steering toward.
 
@@ -391,7 +390,7 @@ set_depends_on!(obs_model, (C = session, d = session,       # stitching: one sha
 ```
 
 The structural block gets *one* name because its pieces are one joint estimate;
-freeze pieces within it with [`HamiltonianFitFlags`](@ref), which composes with
+freeze pieces within it with [`LQRFitFlags`](@ref), which composes with
 grouping — a frozen parameter keeps its starting value in every group and so is
 effectively shared while the rest vary.
 
@@ -451,11 +450,11 @@ not an artifact of the parameterization.
 - `x0::V`, `P0::M`: prior on `z₁ = [x₁; λ₁]` (`2n`).
 - `observe_costate::Bool`: whether the emission may read the costate. `false`
     (the default) pins the costate columns of `C` at zero.
-- `fit_flags::HamiltonianFitFlags`: which structural parameters move.
+- `fit_flags::LQRFitFlags`: which structural parameters move.
 - `mstep_iters::Int`: L-BFGS iterations per M-step.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
-- `cache::HamiltonianCache{T}`: derived forward parameters. Rebuilt by
+- `cache::LQRCache{T}`: derived forward parameters. Rebuilt by
     [`refresh!`](@ref), which the constructors and the M-step call for you —
     call it yourself after mutating a field by hand.
 
@@ -466,7 +465,7 @@ state slots: `[x0, P0, structure, noise]`, where `structure` gates the
 See also [`lqr_parameters`](@ref), [`riccati_solution`](@ref),
 [`symplectic_matrix`](@ref).
 """
-mutable struct HamiltonianStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} <:
+mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} <:
                AbstractGaussianStateModel{T}
     mode::Symbol
     A::M
@@ -484,13 +483,13 @@ mutable struct HamiltonianStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVec
     x0::V
     P0::M
     observe_costate::Bool
-    fit_flags::HamiltonianFitFlags
+    fit_flags::LQRFitFlags
     mstep_iters::Int
     P0_prior::Union{Nothing,IWPrior{T}}
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     depends_on::Union{Nothing,NamedTuple}
-    variants::Union{Nothing,Vector{HamiltonianStateModel{T,M,V}}}
-    cache::HamiltonianCache{T}
+    variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
+    cache::LQRCache{T}
 end
 
 """
@@ -498,28 +497,28 @@ end
 
 The plant dimension `n`. The latent state is twice this.
 """
-@inline function _plant_dim(sm::HamiltonianStateModel)
+@inline function _plant_dim(sm::LQRStateModel)
     return sm.mode === :free ? size(sm.Mfree, 1) >> 1 : size(sm.A, 1)
 end
 
-_state_latent_dim(sm::HamiltonianStateModel) = 2 * _plant_dim(sm)
-_state_ux_dim(sm::HamiltonianStateModel) = size(sm.Bu, 2)
+_state_latent_dim(sm::LQRStateModel) = 2 * _plant_dim(sm)
+_state_ux_dim(sm::LQRStateModel) = size(sm.Bu, 2)
 
 """
-    plant_dim(sm::HamiltonianStateModel) -> Int
+    plant_dim(sm::LQRStateModel) -> Int
 
 The plant dimension `n`. The model's `latent_dim` is `2n` — the state and its
 costate — so this is the dimension of the control problem itself, and the one
 `A`, `S`, `Qc` and `Gref` are sized by.
 
 ```jldoctest
-julia> sm = HamiltonianStateModel(6);
+julia> sm = LQRStateModel(6);
 
 julia> (plant_dim(sm), StateSpaceDynamics._state_latent_dim(sm))
 (3, 6)
 ```
 """
-plant_dim(sm::HamiltonianStateModel) = _plant_dim(sm)
+plant_dim(sm::LQRStateModel) = _plant_dim(sm)
 
 """
     _is_free(sm) -> Bool
@@ -527,7 +526,7 @@ plant_dim(sm::HamiltonianStateModel) = _plant_dim(sm)
 Whether the model's transition is an unconstrained `2n × 2n` matrix rather than
 the symplectic form an LQR implies. See the `mode` field.
 """
-@inline _is_free(sm::HamiltonianStateModel) = sm.mode === :free
+@inline _is_free(sm::LQRStateModel) = sm.mode === :free
 
 """
     _require_lqr(sm, what)
@@ -535,12 +534,12 @@ the symplectic form an LQR implies. See the `mode` field.
 Throw an informative `ArgumentError` when an LQR-only quantity is asked of a
 `:free` model, which has no plant, no cost and no costate interpretation.
 """
-function _require_lqr(sm::HamiltonianStateModel, what::AbstractString)
+function _require_lqr(sm::LQRStateModel, what::AbstractString)
     _is_free(sm) && throw(
         ArgumentError(
             "$what is an LQR quantity, and this model is in `:free` mode — its " *
             "transition is an unconstrained matrix with no plant, cost or costate " *
-            "to read off. Build it with `HamiltonianStateModel(A, S, Qc, Σ)` if you " *
+            "to read off. Build it with `LQRStateModel(A, S, Qc, Σ)` if you " *
             "want the constrained form.",
         ),
     )
@@ -548,22 +547,22 @@ function _require_lqr(sm::HamiltonianStateModel, what::AbstractString)
 end
 
 """
-    _ham_struct_varies(sm) -> NTuple{7,Bool}
+    _lqr_struct_varies(sm) -> NTuple{7,Bool}
 
 Which pieces of the structural block get one copy per `depends_on` group, in
-`_HB_*` order. All of them for `(structure = labels,)`, exactly the named ones
+`_LQR_BLOCK_*` order. All of them for `(structure = labels,)`, exactly the named ones
 for `(Qc = labels,)`, and none at all when nothing groups the structural block.
 
 Every piece not named here is a single array shared by every variant, so it is
 estimated jointly from all the trials — shared *and* fitted, which freezing it
 would not give.
 """
-function _ham_struct_varies(sm::HamiltonianStateModel)
+function _lqr_struct_varies(sm::LQRStateModel)
     dep = sm.depends_on
-    dep === nothing && return ntuple(_ -> false, length(_HAM_STRUCT_NAMES))
+    dep === nothing && return ntuple(_ -> false, length(_LQR_STRUCT_NAMES))
     names = keys(dep)
-    :structure in names && return ntuple(_ -> true, length(_HAM_STRUCT_NAMES))
-    return ntuple(b -> _HAM_STRUCT_NAMES[b] in names, length(_HAM_STRUCT_NAMES))
+    :structure in names && return ntuple(_ -> true, length(_LQR_STRUCT_NAMES))
+    return ntuple(b -> _LQR_STRUCT_NAMES[b] in names, length(_LQR_STRUCT_NAMES))
 end
 
 """
@@ -571,7 +570,7 @@ end
 
 How many distinct cost matrices the model carries.
 """
-@inline _nregimes(sm::HamiltonianStateModel) = _is_free(sm) ? 1 : length(sm.Qc)
+@inline _nregimes(sm::LQRStateModel) = _is_free(sm) ? 1 : length(sm.Qc)
 
 """
     _regime(sm, t) -> Int
@@ -579,7 +578,7 @@ How many distinct cost matrices the model carries.
 Cost index in force at timestep `t`: `schedule[t]` for a scheduled model, and 1
 when the schedule is empty (a single cost everywhere).
 """
-@inline function _regime(sm::HamiltonianStateModel, t::Int)
+@inline function _regime(sm::LQRStateModel, t::Int)
     sched = sm.schedule
     return isempty(sched) ? 1 : sched[t]
 end
@@ -635,7 +634,7 @@ Structural checks shared by the constructor and `validate_LDS`. Kept separate
 from `_validate_state_model` so the constructor can fail before building a cache
 against nonsense.
 =#
-function _check_hamiltonian_structure(
+function _check_lqr_structure(
     A::AbstractMatrix{T},
     S::AbstractMatrix{T},
     Qc::AbstractVector{<:AbstractMatrix{T}},
@@ -643,13 +642,12 @@ function _check_hamiltonian_structure(
     terminal::Bool,
 ) where {T<:Real}
     n = size(A, 1)
-    size(A, 2) == n || throw(DimensionMismatchError("Hamiltonian A columns", n, size(A, 2)))
-    size(S) == (n, n) || throw(DimensionMismatchError("Hamiltonian S rows", n, size(S, 1)))
+    size(A, 2) == n || throw(DimensionMismatchError("LQR A columns", n, size(A, 2)))
+    size(S) == (n, n) || throw(DimensionMismatchError("LQR S rows", n, size(S, 1)))
     isempty(Qc) &&
-        throw(ArgumentError("a HamiltonianStateModel needs at least one cost matrix `Qc`"))
+        throw(ArgumentError("an LQRStateModel needs at least one cost matrix `Qc`"))
     for (k, Q) in enumerate(Qc)
-        size(Q) == (n, n) ||
-            throw(DimensionMismatchError("Hamiltonian Qc[$k] rows", n, size(Q, 1)))
+        size(Q) == (n, n) || throw(DimensionMismatchError("LQR Qc[$k] rows", n, size(Q, 1)))
         asym = maximum(abs, Q .- transpose(Q); init=zero(T))
         asym <= 1e-8 * max(one(T), maximum(abs, Q; init=one(T))) ||
             throw(NotSymmetricError("Qc[$k]", Float64(asym)))
@@ -667,7 +665,7 @@ function _check_hamiltonian_structure(
     issuccess(F) || throw(
         NumericalStabilityError(
             "A",
-            "the Hamiltonian plant matrix is singular. The forward symplectic " *
+            "the LQR plant matrix is singular. The forward symplectic " *
             "transition is built from A⁻ᵀ, so `A` must be invertible; a discretized " *
             "plant (A = exp(Aᶜ·dt)) always is",
         ),
@@ -680,7 +678,7 @@ function _check_hamiltonian_structure(
     if isempty(schedule)
         K == 1 || throw(
             ArgumentError(
-                "a HamiltonianStateModel with $K cost matrices needs a `schedule` saying " *
+                "an LQRStateModel with $K cost matrices needs a `schedule` saying " *
                 "which timesteps use which; an empty schedule means one cost everywhere",
             ),
         )
@@ -714,9 +712,9 @@ function _check_hamiltonian_structure(
 end
 
 """
-    HamiltonianStateModel(A, S, Qc, Σ; kwargs...)
+    LQRStateModel(A, S, Qc, Σ; kwargs...)
 
-Build a Hamiltonian (inverse-LQR) state model from the plant `A` (`n × n`,
+Build an LQR state model from the plant `A` (`n × n`,
 invertible), the control term `S = B R⁻¹ Bᵀ` (`n × n`, symmetric), the state
 cost(s) `Qc` (one symmetric `n × n` matrix, or a vector of them), and the
 mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
@@ -737,7 +735,7 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
 Everything derived (the symplectic transitions, the forward noise) is built
 here; you never pass it in.
 """
-function HamiltonianStateModel(
+function LQRStateModel(
     A::AbstractMatrix{T},
     S::AbstractMatrix{T},
     Qc::Union{AbstractMatrix{T},AbstractVector{<:AbstractMatrix{T}}},
@@ -752,7 +750,7 @@ function HamiltonianStateModel(
     x0::Union{Nothing,AbstractVector{T}}=nothing,
     P0::Union{Nothing,AbstractMatrix{T}}=nothing,
     observe_costate::Bool=false,
-    fit_flags::HamiltonianFitFlags=HamiltonianFitFlags(),
+    fit_flags::LQRFitFlags=LQRFitFlags(),
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
@@ -762,9 +760,9 @@ function HamiltonianStateModel(
     Qc_vec = Qc isa AbstractMatrix ? [Qc] : collect(Qc)
     sched = collect(Int, schedule)
 
-    _check_hamiltonian_structure(A, S, Qc_vec, sched, terminal)
+    _check_lqr_structure(A, S, Qc_vec, sched, terminal)
 
-    size(Σ) == (d, d) || throw(DimensionMismatchError("Hamiltonian Σ rows", d, size(Σ, 1)))
+    size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
 
     h_v = h === nothing ? zeros(T, d) : h
     Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
@@ -779,32 +777,29 @@ function HamiltonianStateModel(
     Σf_m = Σf === nothing ? Matrix{T}(I, n, n) : Σf
     hf_v = hf === nothing ? zeros(T, n) : hf
 
-    length(h_v) == d || throw(DimensionMismatchError("Hamiltonian h", d, length(h_v)))
-    size(Bu_m, 1) == d ||
-        throw(DimensionMismatchError("Hamiltonian Bu rows", d, size(Bu_m, 1)))
+    length(h_v) == d || throw(DimensionMismatchError("LQR h", d, length(h_v)))
+    size(Bu_m, 1) == d || throw(DimensionMismatchError("LQR Bu rows", d, size(Bu_m, 1)))
     size(Gref_m, 1) == n ||
-        throw(DimensionMismatchError("Hamiltonian Gref rows", n, size(Gref_m, 1)))
+        throw(DimensionMismatchError("LQR Gref rows", n, size(Gref_m, 1)))
     size(Gref_m, 2) == size(Bu_m, 2) || throw(
         DimensionMismatchError(
-            "Hamiltonian Gref columns (must match the input width)",
+            "LQR Gref columns (must match the input width)",
             size(Bu_m, 2),
             size(Gref_m, 2),
         ),
     )
     _check_gref_cols(fit_flags, size(Gref_m, 2))
-    length(x0_v) == d || throw(DimensionMismatchError("Hamiltonian x0", d, length(x0_v)))
-    size(P0_m) == (d, d) ||
-        throw(DimensionMismatchError("Hamiltonian P0 rows", d, size(P0_m, 1)))
-    size(Σf_m) == (n, n) ||
-        throw(DimensionMismatchError("Hamiltonian Σf rows", n, size(Σf_m, 1)))
-    length(hf_v) == n || throw(DimensionMismatchError("Hamiltonian hf", n, length(hf_v)))
+    length(x0_v) == d || throw(DimensionMismatchError("LQR x0", d, length(x0_v)))
+    size(P0_m) == (d, d) || throw(DimensionMismatchError("LQR P0 rows", d, size(P0_m, 1)))
+    size(Σf_m) == (n, n) || throw(DimensionMismatchError("LQR Σf rows", n, size(Σf_m, 1)))
+    length(hf_v) == n || throw(DimensionMismatchError("LQR hf", n, length(hf_v)))
 
     mstep_iters >= 1 ||
         throw(ArgumentError("mstep_iters must be at least 1; got $mstep_iters"))
 
     MT = typeof(A)
     VT = typeof(h_v)
-    sm = HamiltonianStateModel{T,MT,VT}(
+    sm = LQRStateModel{T,MT,VT}(
         :lqr,
         A,
         similar(A, 0, 0),
@@ -827,22 +822,22 @@ function HamiltonianStateModel(
         x0_prior,
         nothing,
         nothing,
-        HamiltonianCache(T, n, length(Qc_vec), size(Bu_m, 2)),
+        LQRCache(T, n, length(Qc_vec), size(Bu_m, 2)),
     )
     refresh!(sm)
     return sm
 end
 
 """
-    free_state_model(M, Σ; kwargs...) -> HamiltonianStateModel
+    free_state_model(M, Σ; kwargs...) -> LQRStateModel
 
-A `HamiltonianStateModel` in `:free` mode: the latent transition is the
+A `LQRStateModel` in `:free` mode: the latent transition is the
 unconstrained `2n × 2n` matrix `M` rather than the symplectic form an LQR
 implies, and `Σ` is the forward process noise directly.
 
 This exists so that an [`SLDS`](@ref) can mix plain linear dynamics with LQR
 dynamics. `SLDS` stores one concrete state-model type for every discrete state,
-so a "plain dynamics" state has to *be* a `HamiltonianStateModel` — this is that
+so a "plain dynamics" state has to *be* an `LQRStateModel` — this is that
 state. The latent dimension is `2n` in both modes, which is what lets the two
 share one continuous latent path.
 
@@ -864,7 +859,7 @@ accepted — they have no meaning here.
 # Examples
 ```julia
 free = free_state_model(0.9 * Matrix(I, 4, 4), Matrix(0.1I, 4, 4))
-lqr  = HamiltonianStateModel(A, S, Qc, Σ)          # same latent_dim = 4
+lqr  = LQRStateModel(A, S, Qc, Σ)          # same latent_dim = 4
 slds = SLDS(; A=P, πₖ=π, LDSs=[LinearDynamicalSystem(free, obs),
                                LinearDynamicalSystem(lqr, obs)])
 ```
@@ -881,7 +876,7 @@ function free_state_model(
     x0::Union{Nothing,AbstractVector{T}}=nothing,
     P0::Union{Nothing,AbstractMatrix{T}}=nothing,
     observe_costate::Bool=true,
-    fit_flags::HamiltonianFitFlags=HamiltonianFitFlags(),
+    fit_flags::LQRFitFlags=LQRFitFlags(),
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
@@ -915,7 +910,7 @@ function free_state_model(
     MT = typeof(M)
     VT = typeof(h_v)
     empty_m = similar(M, 0, 0)
-    sm = HamiltonianStateModel{T,MT,VT}(
+    sm = LQRStateModel{T,MT,VT}(
         :free,
         empty_m,
         M,
@@ -938,14 +933,14 @@ function free_state_model(
         x0_prior,
         nothing,
         nothing,
-        HamiltonianCache(T, n, 1, size(Bu_m, 2)),
+        LQRCache(T, n, 1, size(Bu_m, 2)),
     )
     refresh!(sm)
     return sm
 end
 
 """
-    HamiltonianStateModel(latent_dim; mode=:lqr, kwargs...) -> HamiltonianStateModel
+    LQRStateModel(latent_dim; mode=:lqr, kwargs...) -> LQRStateModel
 
 Build a default model of a stated **total** latent dimension, rather than from
 its parameter matrices.
@@ -965,7 +960,7 @@ the default it names.
 - `ArgumentError` when `latent_dim` is odd, non-positive, or `mode` is neither
   `:lqr` nor `:free`
 """
-function HamiltonianStateModel(
+function LQRStateModel(
     latent_dim::Integer; T::Type{<:Real}=Float64, mode::Symbol=:lqr, kwargs...
 )
     latent_dim > 0 || throw(ArgumentError("latent_dim must be positive; got $latent_dim"))
@@ -983,7 +978,7 @@ function HamiltonianStateModel(
             Matrix{T}(T(0.9) * I, d, d), Matrix{T}(T(0.1) * I, d, d); kwargs...
         )
     elseif mode === :lqr
-        return HamiltonianStateModel(
+        return LQRStateModel(
             Matrix{T}(T(0.95) * I, n, n),
             Matrix{T}(T(0.05) * I, n, n),
             Matrix{T}(I, n, n),
@@ -996,7 +991,7 @@ function HamiltonianStateModel(
 end
 
 """
-    refresh!(sm::HamiltonianStateModel) -> sm
+    refresh!(sm::LQRStateModel) -> sm
 
 Rebuild the derived cache from the natural parameters: the per-regime symplectic
 transitions `M_k`, the noise map `G`, the forward noise / bias / input, and the
@@ -1018,7 +1013,7 @@ one level deep.
 - `NumericalStabilityError` when `A` has become singular
 - `PosDefException` when `Σ` or `Σf` is not positive definite
 """
-function refresh!(sm::HamiltonianStateModel{T}) where {T<:Real}
+function refresh!(sm::LQRStateModel{T}) where {T<:Real}
     n = _plant_dim(sm)
     d = 2n
     c = sm.cache
@@ -1039,7 +1034,7 @@ noise, bias and input are the mixed ones unchanged. Nothing downstream of
 `negMtQinvM` and neither knows nor cares which branch wrote them.
 =#
 function _refresh_free_head!(
-    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+    sm::LQRStateModel{T}, c::LQRCache{T}, n::Int, d::Int
 ) where {T<:Real}
     c.logabsdetA = zero(T)                # G = I carries no Jacobian
     copyto!(c.AinvT, Matrix{T}(I, n, n))  # unused; kept finite for `show`
@@ -1055,7 +1050,7 @@ function _refresh_free_head!(
 end
 
 function _refresh_lqr_head!(
-    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+    sm::LQRStateModel{T}, c::LQRCache{T}, n::Int, d::Int
 ) where {T<:Real}
     A = sm.A
     S = sm.S
@@ -1131,7 +1126,7 @@ Shared by both modes: everything downstream of `Qfwd`, `M` and the terminal
 factor's own parameters.
 =#
 function _refresh_tail!(
-    sm::HamiltonianStateModel{T}, c::HamiltonianCache{T}, n::Int, d::Int
+    sm::LQRStateModel{T}, c::LQRCache{T}, n::Int, d::Int
 ) where {T<:Real}
     Qchol = c.Qfwd.chol
     Imat = Matrix{T}(I, d, d)
@@ -1194,7 +1189,7 @@ A no-op for a model with no variants — which is every variant, since they hold
 none of their own, and every ungrouped model — so the recursion terminates after
 one level and the ordinary path pays one `=== nothing` test.
 """
-function _refresh_variants!(sm::HamiltonianStateModel)
+function _refresh_variants!(sm::LQRStateModel)
     variants = sm.variants
     variants === nothing && return sm
     for v in variants
@@ -1208,14 +1203,14 @@ end
 # ============================================================================
 
 """
-    hamiltonian_matrix(sm[, k]) -> Matrix
+    lqr_matrix(sm[, k]) -> Matrix
 
-The mixed-form Hamiltonian matrix `𝓔_k = [A  −S; Q_k  Aᵀ]` mapping
+The mixed-form LQR matrix `𝓔_k = [A  −S; Q_k  Aᵀ]` mapping
 `[x_t; λ_{t+1}]` to `[x_{t+1}; λ_t]` under cost regime `k` (default 1). Linear in
 the model's free parameters, which is why it is the form the M-step estimates.
 """
-function hamiltonian_matrix(sm::HamiltonianStateModel{T}, k::Int=1) where {T<:Real}
-    _require_lqr(sm, "the Hamiltonian matrix")
+function lqr_matrix(sm::LQRStateModel{T}, k::Int=1) where {T<:Real}
+    _require_lqr(sm, "the LQR matrix")
     n = _plant_dim(sm)
     E = Matrix{T}(undef, 2n, 2n)
     @views begin
@@ -1234,7 +1229,7 @@ The forward transition `M_k` on `z = [x; λ]`, which satisfies `Mᵀ J M = J`. T
 is the matrix the smoother actually propagates; see
 [`symplectic_defect`](@ref) to check it numerically.
 """
-symplectic_matrix(sm::HamiltonianStateModel, k::Int=1) = copy(sm.cache.M[k])
+symplectic_matrix(sm::LQRStateModel, k::Int=1) = copy(sm.cache.M[k])
 
 """
     symplectic_form(n) -> Matrix
@@ -1268,7 +1263,7 @@ function symplectic_defect(M::AbstractMatrix{T}) where {T<:Real}
     return maximum(abs, transpose(M) * J * M .- J)
 end
 
-function symplectic_defect(sm::HamiltonianStateModel, k::Int=1)
+function symplectic_defect(sm::LQRStateModel, k::Int=1)
     _require_lqr(sm, "the symplectic defect")
     return symplectic_defect(sm.cache.M[k])
 end
@@ -1281,7 +1276,7 @@ schedule, terminal)`. `B` and `R` are not separately identified — only their
 combination `S` is — and the overall cost scale is free (see
 [`rescale_costate!`](@ref)).
 """
-function lqr_parameters(sm::HamiltonianStateModel)
+function lqr_parameters(sm::LQRStateModel)
     _require_lqr(sm, "`lqr_parameters`")
     return (
         A=copy(sm.A),
@@ -1311,7 +1306,7 @@ does not converge, which is the honest answer when regime `k`'s cost admits no
 stabilizing solution.
 """
 function riccati_solution(
-    sm::HamiltonianStateModel{T}; k::Int=1, max_iter::Int=1000, tol::Real=1e-12
+    sm::LQRStateModel{T}; k::Int=1, max_iter::Int=1000, tol::Real=1e-12
 ) where {T<:Real}
     _require_lqr(sm, "the Riccati solution")
     A = Matrix{T}(sm.A)
@@ -1348,7 +1343,7 @@ the optimal control `u = −R⁻¹Bᵀλ` is substituted back in. Computable fro
 and `P` alone, so it does not need `B` and `R` separately.
 """
 function closed_loop_dynamics(
-    sm::HamiltonianStateModel{T}; k::Int=1, P::AbstractMatrix{T}=riccati_solution(sm; k=k)
+    sm::LQRStateModel{T}; k::Int=1, P::AbstractMatrix{T}=riccati_solution(sm; k=k)
 ) where {T<:Real}
     _require_lqr(sm, "the closed-loop dynamics")
     n = _plant_dim(sm)
@@ -1386,7 +1381,7 @@ shares the pieces the declaration did not name **by reference**: with
 `depends_on = (Qc = labels,)` every group holds the same `S`, and visiting the
 groups in turn would divide it by `c` once per group.
 """
-function rescale_costate!(sm::HamiltonianStateModel{T}, c::Real) where {T<:Real}
+function rescale_costate!(sm::LQRStateModel{T}, c::Real) where {T<:Real}
     _require_lqr(sm, "rescaling the costate")
     #=
     Any nonzero `c` is a symmetry, negative included: `−S'λ' = −(S/c)(cλ) = −Sλ`
@@ -1419,7 +1414,7 @@ array already in `seen` and adding the rest to it.
 plant and the reference are in state coordinates, which do not move.
 """
 function _rescale_costate_arrays!(
-    sm::HamiltonianStateModel{T}, cT::T, seen::Base.IdSet
+    sm::LQRStateModel{T}, cT::T, seen::Base.IdSet
 ) where {T<:Real}
     n = _plant_dim(sm)
     d = 2n
@@ -1455,9 +1450,7 @@ function _rescale_once!(seen::Base.IdSet, array)
     return true
 end
 
-function rescale_costate!(
-    sm::HamiltonianStateModel{T}; target::Symbol=:trace
-) where {T<:Real}
+function rescale_costate!(sm::LQRStateModel{T}; target::Symbol=:trace) where {T<:Real}
     n = _plant_dim(sm)
     Q1 = sm.Qc[1]
     scale = if target === :trace
@@ -1482,15 +1475,15 @@ end
 # ============================================================================
 
 """
-    _ham_input_matrix(sm, ux, tsteps) -> Matrix
+    _lqr_input_matrix(sm, ux, tsteps) -> Matrix
 
 The exogenous input sequence as a concrete matrix: `ux` itself, or a zero-row
 matrix when the model takes no input. Normalizing here rather than branching at
 every use keeps the rollout concretely typed — a `Union{Nothing,AbstractMatrix}`
 guarded by a runtime flag is not something inference can narrow.
 """
-function _ham_input_matrix(
-    sm::HamiltonianStateModel{T}, ux::Union{Nothing,AbstractMatrix{T}}, tsteps::Int
+function _lqr_input_matrix(
+    sm::LQRStateModel{T}, ux::Union{Nothing,AbstractMatrix{T}}, tsteps::Int
 ) where {T<:Real}
     ux === nothing && return zeros(T, 0, tsteps)
     size(ux, 2) >= tsteps || throw(
@@ -1528,11 +1521,11 @@ The terminal condition is `P_T = Q_{k_T}`, `g_T = h_f` when the model carries a
 terminal factor and `P_T = 0`, `g_T = 0` (a free endpoint) when it does not.
 """
 function lqr_riccati_sequence(
-    sm::HamiltonianStateModel{T}, tsteps::Int; ux::Union{Nothing,AbstractMatrix{T}}=nothing
+    sm::LQRStateModel{T}, tsteps::Int; ux::Union{Nothing,AbstractMatrix{T}}=nothing
 ) where {T<:Real}
     _require_lqr(sm, "the Riccati sequence")
     tsteps >= 2 || throw(ArgumentError("lqr_riccati_sequence needs tsteps ≥ 2"))
-    _hamiltonian_lengths_ok(sm, [tsteps])
+    _lqr_lengths_ok(sm, [tsteps])
     n = _plant_dim(sm)
     d = 2n
     A = Matrix{T}(sm.A)
@@ -1544,11 +1537,11 @@ function lqr_riccati_sequence(
     W = [Matrix{T}(I, n, n) for _ in 1:tsteps]
 
     #=
-    Normalize the input first: `_ham_input_matrix` is the single shape check, and
+    Normalize the input first: `_lqr_input_matrix` is the single shape check, and
     the terminal block below reads it too.
     =#
     vbuf = Vector{T}(undef, d)
-    ux_mat = _ham_input_matrix(sm, ux, tsteps)
+    ux_mat = _lqr_input_matrix(sm, ux, tsteps)
     has_input = size(ux_mat, 1) > 0
 
     if sm.terminal
@@ -1595,7 +1588,7 @@ Roll out the optimal trajectory of the control problem `sm` encodes, as a
 `2n × tsteps` array whose rows `1:n` are the state and `n+1:2n` the costate.
 
 **This, not `rand`, is how to generate ground truth for inverse LQR.** A
-Hamiltonian matrix has reciprocal eigenvalue pairs `(μ, 1/μ)`, so its forward
+LQR matrix has reciprocal eigenvalue pairs `(μ, 1/μ)`, so its forward
 flow is unstable by construction: half the modes grow. The optimal trajectory
 lives on the stable manifold — the boundary condition is exactly what selects it
 — and this function follows that manifold directly, via the backward Riccati
@@ -1633,7 +1626,7 @@ precise sense in which the costate must carry process noise.
 """
 function simulate_lqr(
     rng::AbstractRNG,
-    sm::HamiltonianStateModel{T},
+    sm::LQRStateModel{T},
     tsteps::Integer;
     x1::Union{Nothing,AbstractVector{T}}=nothing,
     process_noise::Bool=true,
@@ -1673,7 +1666,7 @@ function simulate_lqr(
     =#
     ν = [slack > 0 ? slack .* randn(rng, T, n) : zeros(T, n) for _ in 1:Ti]
     vbuf = Vector{T}(undef, d)
-    ux_mat = _ham_input_matrix(sm, ux, Ti)
+    ux_mat = _lqr_input_matrix(sm, ux, Ti)
     has_input = size(ux_mat, 1) > 0
 
     for t in 1:Ti
@@ -1692,6 +1685,6 @@ function simulate_lqr(
     return z
 end
 
-function simulate_lqr(sm::HamiltonianStateModel, tsteps::Integer; kwargs...)
+function simulate_lqr(sm::LQRStateModel, tsteps::Integer; kwargs...)
     return simulate_lqr(Random.default_rng(), sm, tsteps; kwargs...)
 end

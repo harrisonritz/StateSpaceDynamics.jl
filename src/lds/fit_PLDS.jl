@@ -1025,7 +1025,7 @@ end
     _fit_laplace!(plds, data; max_iter, tol, progress, newton_max_iter, newton_tol)
 
 The ungrouped Laplace-EM loop, split out from `fit!` so a state model with its
-own statistics type and entry-point preparation (see `fit_hamiltonian.jl`) can
+own statistics type and entry-point preparation (see `fit_LQR.jl`) can
 reuse it rather than restate it. Everything model-specific is behind the four
 hooks the loop calls: `_initialize_td_sufficient_statistics`, `estep!`,
 `elbo!` and `mstep!`.
@@ -1243,7 +1243,7 @@ function _grouped_member_obs_mstep!(
     member_sws = _member_unit_sws(cell_ws1, state.cell_lds, m)
     _grouped_gaussian_obs_mstep!(
         views,
-        #= `_obs_suf` first: a Hamiltonian state's statistics *wrap* the
+        #= `_obs_suf` first: an LQR state's statistics *wrap* the
         composite's per-member blocks rather than being them, so indexing the
         wrapper by member key would fail. The identity for every other model. =#
         [_obs_suf(s)[key] for s in state.sufs],

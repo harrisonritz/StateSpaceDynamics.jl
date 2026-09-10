@@ -33,7 +33,7 @@ include("stats/priors.jl")
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
-include("lds/hamiltonian_types.jl")                 # inverse-LQR state model + derived cache
+include("lds/lqr_types.jl")                         # inverse-LQR state model + derived cache
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
 include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
 include("utils/show.jl")
@@ -46,7 +46,7 @@ include("stats/simulate.jl")
 
 # latents models (LDS, PLDS, SLDS) + inference machinery (E-step).
 include("lds/continuous_latents.jl")                # state-model Q-term + state M-step
-include("lds/hamiltonian_latents.jl")               # inverse-LQR E-step kernels
+include("lds/lqr_latents.jl")                       # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
@@ -64,9 +64,9 @@ include("lds/fit_SLDS.jl")
 
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
-include("lds/hamiltonian_mstep.jl")
-include("lds/slds_hamiltonian.jl")     # inverse-LQR discrete states in an SLDS
-include("lds/fit_hamiltonian.jl")
+include("lds/lqr_mstep.jl")
+include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
+include("lds/fit_LQR.jl")
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.
@@ -86,10 +86,10 @@ export IWPrior, MNPrior, x0_mean_prior
 export CovUpdateCache
 export FitTrace
 
-# Inverse LQR (Hamiltonian latents)
-export HamiltonianStateModel, HamiltonianFitFlags, cost_schedule, refresh!
+# Inverse LQR
+export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
 export free_state_model, plant_dim
-export hamiltonian_matrix, symplectic_matrix, symplectic_form, symplectic_defect
+export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
 export simulate_lqr, lqr_riccati_sequence
 

@@ -112,9 +112,9 @@ function Base.showerror(io::IO, e::NumericalStabilityError)
 end
 
 """
-    _validate_state_model(state_model::HamiltonianStateModel{T}, latent_dim::Int) where T
+    _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) where T
 
-Validate a [`HamiltonianStateModel`](@ref): the LQR structure (`A` square and
+Validate a [`LQRStateModel`](@ref): the LQR structure (`A` square and
 invertible, `S` and every `Qc` symmetric, a schedule that indexes real cost
 matrices), the shapes of the mixed-coordinate noise and bias against the doubled
 latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`.
@@ -124,19 +124,17 @@ latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`.
   `NumericalStabilityError` (a singular plant), or `ArgumentError` (a bad
   schedule, or a `depends_on` this model cannot honor)
 """
-function _validate_state_model(
-    state_model::HamiltonianStateModel{T}, latent_dim::Int
-) where {T}
+function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) where {T}
     sm = state_model
     n = _plant_dim(sm)
     if latent_dim != 2n
-        throw(DimensionMismatchError("Hamiltonian latent_dim (2n)", 2n, latent_dim))
+        throw(DimensionMismatchError("LQR latent_dim (2n)", 2n, latent_dim))
     end
 
     #=
     A `:free` model has no plant, cost or costate to check, and no terminal
     factor — only the shapes that both modes share. Its transition is checked
-    here instead of by `_check_hamiltonian_structure`, which is about the
+    here instead of by `_check_lqr_structure`, which is about the
     symplectic form.
     =#
     if _is_free(sm)
@@ -158,32 +156,32 @@ function _validate_state_model(
             ),
         )
     else
-        _check_hamiltonian_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+        _check_lqr_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
     end
 
     for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
         if size(Σ) != (dim, dim)
-            throw(DimensionMismatchError("Hamiltonian $name", (dim, dim), size(Σ)))
+            throw(DimensionMismatchError("LQR $name", (dim, dim), size(Σ)))
         end
         if !issymmetric(Σ)
-            throw(NotSymmetricError("Hamiltonian $name", maximum(abs.(Σ .- Σ'))))
+            throw(NotSymmetricError("LQR $name", maximum(abs.(Σ .- Σ'))))
         end
         if !isposdef(Σ)
-            throw(NotPositiveDefiniteError("Hamiltonian $name", minimum(eigvals(Σ))))
+            throw(NotPositiveDefiniteError("LQR $name", minimum(eigvals(Σ))))
         end
     end
 
     if length(sm.h) != 2n
-        throw(DimensionMismatchError("Hamiltonian h", 2n, length(sm.h)))
+        throw(DimensionMismatchError("LQR h", 2n, length(sm.h)))
     end
     if length(sm.x0) != 2n
-        throw(DimensionMismatchError("Hamiltonian x0", 2n, length(sm.x0)))
+        throw(DimensionMismatchError("LQR x0", 2n, length(sm.x0)))
     end
     if length(sm.hf) != n
-        throw(DimensionMismatchError("Hamiltonian hf", n, length(sm.hf)))
+        throw(DimensionMismatchError("LQR hf", n, length(sm.hf)))
     end
     if size(sm.Bu, 1) != 2n
-        throw(DimensionMismatchError("Hamiltonian Bu rows", 2n, size(sm.Bu, 1)))
+        throw(DimensionMismatchError("LQR Bu rows", 2n, size(sm.Bu, 1)))
     end
     return nothing
 end
@@ -595,7 +593,7 @@ trial and the emission rather than the state, so they must agree across states �
 a factor that applies in some states and not others, or a readout mask only half
 the states impose, is a modelling accident rather than a choice.
 =#
-function _validate_slds_state_models(::HamiltonianStateModel, slds::SLDS)
+function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     #=
     `terminal` and `observe_costate` are compared among the *inverse-LQR* states
     only. A `:free` state has no costate, so neither means anything for it: it

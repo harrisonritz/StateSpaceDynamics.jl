@@ -305,7 +305,7 @@ function observation_hessian! end
 Write the state-side (prior/transition) Hessian blocks — identical for every
 observation model — into `btd.H_diag` / `H_sub` / `H_super`. Dispatches on the
 state model, which is what lets a structured or time-varying transition
-([`HamiltonianStateModel`](@ref)) write per-timestep blocks; the
+([`LQRStateModel`](@ref)) write per-timestep blocks; the
 [`GaussianStateModel`](@ref) method below ignores it and copies one cached
 template into every position:
 

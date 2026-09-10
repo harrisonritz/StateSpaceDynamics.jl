@@ -52,7 +52,7 @@ function GroupedSufBuffers(
     obs_reg_dim = D + 1 + lds.uy_dim
     #=
     Pooling scratch, so it wants the plain block layout regardless of what the
-    state model's own statistics type is — a `HamiltonianSufficientStatistics`
+    state model's own statistics type is — an `LQRSufficientStatistics`
     wraps this layout rather than replacing it.
     =#
     return GroupedSufBuffers{T}(
@@ -999,7 +999,7 @@ _state_sufs(sufs::AbstractVector) = [_state_suf(s) for s in sufs]
     _obs_sufs(sufs)
 
 The emission-side sufficient statistics. Identity for the plain layout; a state
-model with its own statistics type (see `HamiltonianSufficientStatistics`) wraps
+model with its own statistics type (see `LQRSufficientStatistics`) wraps
 that layout, and the emission updates want what is inside.
 """
 _obs_suf(suf) = suf

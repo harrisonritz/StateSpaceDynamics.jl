@@ -1,8 +1,8 @@
 #=============================================================================
-Hamiltonian (inverse-LQR) discrete states in an `SLDS`.
+LQR discrete states in an `SLDS`.
 
 The pieces of the switching M-step that need the inverse-LQR types, which are
-defined after `fit_SLDS.jl`. Everything else about a Hamiltonian discrete state
+defined after `fit_SLDS.jl`. Everything else about an LQR discrete state
 already flows through the shared SLDS path: `state_loglikelihood!` and
 `_transition_residual!` are dispatched, `compute_smooth_constants!` fills the
 same `SmoothConstants` slots from either model, and the terminal factor is added
@@ -10,7 +10,7 @@ by the helpers in `fit_SLDS.jl` itself.
 =============================================================================#
 
 """
-    _extract_state_params(sm::HamiltonianStateModel)
+    _extract_state_params(sm::LQRStateModel)
 
 The *forward* transition parameters an `SLDS` sampler rolls, read from the cache:
 `M`, `Q^fwd = G Σ Gᵀ`, `G h` and the regime's forward input matrix. Presenting
@@ -24,7 +24,7 @@ As with a single inverse-LQR model, this rolls the model's own forward flow,
 which is unstable by construction — see [`_warn_unstable_rollout`](@ref) and
 prefer `simulate_lqr` for trajectories on the stable manifold.
 """
-function _extract_state_params(sm::HamiltonianStateModel{T}) where {T<:Real}
+function _extract_state_params(sm::LQRStateModel{T}) where {T<:Real}
     c = sm.cache
     d = _state_latent_dim(sm)
     m = size(sm.Bu, 2)
@@ -47,7 +47,7 @@ switching sample would roll through.
 function _warn_slds_unstable_rollout(slds::SLDS, tsteps::Int)
     for lds in slds.LDSs
         sm = lds.state_model
-        sm isa HamiltonianStateModel && !_is_free(sm) && _warn_unstable_rollout(sm, tsteps)
+        sm isa LQRStateModel && !_is_free(sm) && _warn_unstable_rollout(sm, tsteps)
     end
     return nothing
 end
@@ -56,7 +56,7 @@ end
     _prepare_slds!(slds, tsteps)
 
 Entry-point preparation for every discrete state, mirroring what
-`_prepare_hamiltonian!` does for a single inverse-LQR model: refresh the derived
+`_prepare_lqr!` does for a single inverse-LQR model: refresh the derived
 cache, check the horizons against the cost schedule, and zero the costate readout
 when the emission is not allowed to see it.
 
@@ -74,8 +74,8 @@ _prepare_slds_regime!(::LinearDynamicalSystem, ::AbstractVector{Int}) = nothing
 
 function _prepare_slds_regime!(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
-    return _prepare_hamiltonian!(lds, tsteps)
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    return _prepare_lqr!(lds, tsteps)
 end
 
 """
@@ -83,19 +83,19 @@ end
 
 One discrete state's responsibility-weighted sufficient statistics.
 
-A Hamiltonian state needs two passes: the base regression / emission blocks that
+An LQR state needs two passes: the base regression / emission blocks that
 every model shares, and the mixed-coordinate blocks its own M-step consumes.
 """
 function _slds_aggregate_weighted!(
-    hs::HamiltonianSufficientStatistics{T},
+    hs::LQRSufficientStatistics{T},
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     _aggregate_td_suff_stats_weighted!(hs.base, tfs, lds, data, weights, sws)
-    _aggregate_hamiltonian_stats_weighted!(hs, tfs, lds, data, weights)
+    _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights)
     #=
     Same masking the ungrouped `estep!` applies, at the same point: with
     `observe_costate` off the emission may not read the costate half, and the
@@ -108,7 +108,7 @@ function _slds_aggregate_weighted!(
     return hs
 end
 
-_slds_init_suf(hs::HamiltonianSufficientStatistics) = hs.base
+_slds_init_suf(hs::LQRSufficientStatistics) = hs.base
 
 #=
 Partial ties: sharing some structural parameters across discrete states while
@@ -116,7 +116,7 @@ fitting the rest per state.
 
 `tied = [:A, :S]` — one plant, a cost per state — is the configuration a
 switching inverse-LQR model is usually for, and it is one L-BFGS solve rather
-than two. `_HamPack` lays the parameter vector out block-major, so a block
+than two. `_LQRPack` lays the parameter vector out block-major, so a block
 shared across states simply has one copy instead of `K`; nothing alternates,
 ties are broadcast by writeback rather than by a pass of their own, and the
 `−N_a log|det A_a|` Jacobian term is weighted by the transitions the states
@@ -124,7 +124,7 @@ sharing that `A` actually contribute.
 
 The alternative a version-major layout forces — the shared blocks free with the
 per-state ones frozen, then the reverse — costs about twice as much, and for a
-plain reason: `_ham_fg!` sweeps every residual whatever subset of coordinates is
+plain reason: `_lqr_fg!` sweeps every residual whatever subset of coordinates is
 free, so two passes buy two full objective sweeps per L-BFGS iteration where one
 buys one. Measured over a 40-iteration fit at `K = 2`, `tied = [:A, :S]`, three
 seeds, the joint solve spends 1.8-2.1x less wall clock inside the structural
@@ -135,10 +135,10 @@ those dimensions to within 1%, which is the check that the gap is budget and
 not conditioning.
 =#
 
-const _HAM_STRUCT_BLOCKS = (:A, :S, :Qc, :h, :Bu, :Gref)
+const _LQR_STRUCT_BLOCKS = (:A, :S, :Qc, :h, :Bu, :Gref)
 
 """
-    _ham_block_slots(tied, n) -> NTuple{7,Vector{Int}}
+    _lqr_block_slots(tied, n) -> NTuple{7,Vector{Int}}
 
 Which copy of each structural block each of the `n` discrete states uses. A
 shared block gets one copy; an untied one gets a copy per state. `:structure`
@@ -147,20 +147,20 @@ shares all of them.
 `hf` follows the cost: the terminal offset is the terminal cost's affine partner,
 and sharing one without the other is not a model anyone asks for.
 """
-function _ham_block_slots(tied::AbstractVector{Symbol}, n::Int)
+function _lqr_block_slots(tied::AbstractVector{Symbol}, n::Int)
     all_tied = :structure in tied
     shared = ntuple(
-        i -> all_tied || (_HAM_STRUCT_BLOCKS[i] in tied), length(_HAM_STRUCT_BLOCKS)
+        i -> all_tied || (_LQR_STRUCT_BLOCKS[i] in tied), length(_LQR_STRUCT_BLOCKS)
     )
     pick(b) = shared[b] ? ones(Int, n) : collect(1:n)
     return (
-        pick(_HB_A),
-        pick(_HB_S),
-        pick(_HB_Q),
-        pick(_HB_H),
-        pick(_HB_B),
-        pick(_HB_G),
-        pick(_HB_Q),          # `hf` rides with the cost
+        pick(_LQR_BLOCK_A),
+        pick(_LQR_BLOCK_S),
+        pick(_LQR_BLOCK_Q),
+        pick(_LQR_BLOCK_H),
+        pick(_LQR_BLOCK_B),
+        pick(_LQR_BLOCK_G),
+        pick(_LQR_BLOCK_Q),          # `hf` rides with the cost
     )
 end
 
@@ -174,7 +174,7 @@ function _slds_state_mstep!(
     K::Int,
     ::Int,
     ::Int,
-) where {T<:Real,S<:HamiltonianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sms = [lds.state_model for lds in ldss]
 
     for k in 1:K
@@ -232,15 +232,15 @@ function _slds_state_mstep!(
             )
         end
         nl = length(lqr)
-        ctx = _HamMStepCtx(
+        ctx = _LQRMStepCtx(
             [sf_state[k] for k in lqr],
             sms[lqr],
-            _ham_block_slots(tied, nl),
+            _lqr_block_slots(tied, nl),
             (:noise in tied) ? ones(Int, nl) : collect(1:nl),
             fit_noise,
         )
-        _ham_structure_mstep!(ctx, fit_structure, maximum(sms[k].mstep_iters for k in lqr))
-        fit_noise && _ham_noise_mstep!(ctx)
+        _lqr_structure_mstep!(ctx, fit_structure, maximum(sms[k].mstep_iters for k in lqr))
+        fit_noise && _lqr_noise_mstep!(ctx)
         for k in lqr
             refresh!(sms[k])
         end
