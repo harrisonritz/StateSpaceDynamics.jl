@@ -579,6 +579,7 @@ struct _LQRPack
     base::NTuple{7,Int}    # 0-based start of each block's run of copies
     np::Int
     gcols::Vector{Int}     # input columns of `Gref` that are packed
+    bcols::Vector{Int}     # input columns of `Bu` that are packed
 end
 
 # Block ordinals, in layout order.
@@ -637,12 +638,13 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
     input columns the reference is a function of, and the rest are packed no
     more than a frozen block is. =#
     gcols = _gref_cols(f, m)
+    bcols = _bu_cols(f, m)
     w = (
         f.A ? n * n : 0,
         f.S ? n * n : 0,
         f.Qc ? K * n * n : 0,
         f.h ? d : 0,
-        (f.Bu && m > 0) ? d * m : 0,
+        d * length(bcols),
         n * length(gcols),
         (sm.terminal && f.terminal) ? n : 0,
     )
@@ -652,7 +654,7 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
         bases[b] = pos
         pos += nv[b] * w[b]
     end
-    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols)
+    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols)
 end
 
 """
@@ -1045,7 +1047,7 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_LQR_BLOCK_B])
         r = _lqr_blk(p, _LQR_BLOCK_B, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu))
+        isempty(r) || copyto!(view(θ, r), vec(view(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu, :, p.bcols)))
     end
     for v in 1:(p.nv[_LQR_BLOCK_G])
         r = _lqr_blk(p, _LQR_BLOCK_G, v)
@@ -1107,11 +1109,10 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
     if p.m > 0
         for v in 1:(p.nv[_LQR_BLOCK_B])
             r = _lqr_blk(p, _LQR_BLOCK_B, v)
-            if isempty(r)
-                copyto!(ctx.Bu[v], ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu)
-            else
-                copyto!(ctx.Bu[v], reshape(view(θ, r), p.d, p.m))
-            end
+            copyto!(ctx.Bu[v], ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu)
+            isempty(r) || copyto!(
+                view(ctx.Bu[v], :, p.bcols), reshape(view(θ, r), p.d, length(p.bcols))
+            )
         end
         for v in 1:(p.nv[_LQR_BLOCK_G])
             r = _lqr_blk(p, _LQR_BLOCK_G, v)
@@ -1377,7 +1378,7 @@ function _lqr_fg!(
     end
     for v in 1:(p.nv[_LQR_BLOCK_B])
         r = _lqr_blk(p, _LQR_BLOCK_B, v)
-        isempty(r) || copyto!(view(grad, r), vec(ctx.dB[v]))
+        isempty(r) || copyto!(view(grad, r), vec(view(ctx.dB[v], :, p.bcols)))
     end
     for v in 1:(p.nv[_LQR_BLOCK_G])
         r = _lqr_blk(p, _LQR_BLOCK_G, v)
@@ -1627,7 +1628,7 @@ function _free_state_mstep!(
     free_cols = Int[]
     ff.A && append!(free_cols, 1:d)
     ff.h && push!(free_cols, d + 1)
-    (ff.Bu && m > 0) && append!(free_cols, (d + 2):reg)
+    append!(free_cols, (d + 1) .+ _bu_cols(ff, m))
 
     Theta = _free_theta(sm)
     if lds.fit_bool[3] && !isempty(free_cols) && N > zero(T)

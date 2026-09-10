@@ -14,7 +14,7 @@ The E-step kernels live in `lqr_latents.jl` and the M-step in
 
 """
     LQRFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
-                        terminal=true, Gref_cols=nothing)
+                        terminal=true, Gref_cols=nothing, Bu_cols=nothing)
 
 Which structural parameters of a [`LQRStateModel`](@ref) the M-step is
 free to move. Every flag defaults to `true`.
@@ -46,6 +46,12 @@ whereas a fully free `Gref` would also read a reference off reward, which is a
 different claim about the task. Like a frozen block, the narrowed columns are
 never packed, so this shrinks the M-step problem rather than projecting it.
 
+`Bu_cols` applies the same restriction to the general input matrix. In a
+packed input `[ux; ur; ref]`, select only `ux` for `Bu_cols` and only `ur` for
+`Gref_cols`; initialise the other `Bu` columns to zero and the known-reference
+columns of `Gref` to a fixed selection matrix. An empty `Bu_cols` freezes all
+columns. Excluded columns retain their constructed values throughout fitting.
+
 Columns are 1-based indices into the model's input width, validated when the
 model is built (which is the first point that width is known).
 """
@@ -58,6 +64,7 @@ struct LQRFitFlags
     Gref::Bool
     terminal::Bool
     Gref_cols::Union{Nothing,Vector{Int}}
+    Bu_cols::Union{Nothing,Vector{Int}}
 end
 
 function LQRFitFlags(;
@@ -69,6 +76,7 @@ function LQRFitFlags(;
     Gref::Bool=true,
     terminal::Bool=true,
     Gref_cols::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+    Bu_cols::Union{Nothing,AbstractVector{<:Integer}}=nothing,
 )
     cols = Gref_cols === nothing ? nothing : sort!(unique(collect(Int, Gref_cols)))
     if cols !== nothing
@@ -83,7 +91,11 @@ function LQRFitFlags(;
             ArgumentError("Gref_cols must be 1-based column indices; got $(minimum(cols))"),
         )
     end
-    return LQRFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols)
+    bcols = Bu_cols === nothing ? nothing : sort!(unique(collect(Int, Bu_cols)))
+    if bcols !== nothing && !isempty(bcols)
+        minimum(bcols) >= 1 || throw(ArgumentError("Bu_cols must be 1-based column indices"))
+    end
+    return LQRFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols, bcols)
 end
 
 """
@@ -117,12 +129,12 @@ function Base.:(==)(a::LQRFitFlags, b::LQRFitFlags)
            a.Bu == b.Bu &&
            a.Gref == b.Gref &&
            a.terminal == b.terminal &&
-           a.Gref_cols == b.Gref_cols
+           a.Gref_cols == b.Gref_cols && a.Bu_cols == b.Bu_cols
 end
 
 function Base.hash(f::LQRFitFlags, h::UInt)
     return hash(
-        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols), hash(:LQRFitFlags, h)
+        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols, f.Bu_cols), hash(:LQRFitFlags, h)
     )
 end
 
@@ -145,7 +157,17 @@ Reject `Gref_cols` that names a column the model does not have. Checked at model
 construction because that is where the input width is first known — the flags
 themselves are built before anyone knows how wide `Gref` will be.
 """
+@inline function _bu_cols(f::LQRFitFlags, m::Int)
+    (f.Bu && m > 0) || return Int[]
+    return f.Bu_cols === nothing ? collect(1:m) : f.Bu_cols
+end
+
 function _check_gref_cols(f::LQRFitFlags, m::Int)
+    if f.Bu_cols !== nothing && !isempty(f.Bu_cols)
+        maximum(f.Bu_cols) <= m || throw(ArgumentError(
+            "fit_flags.Bu_cols names column $(maximum(f.Bu_cols)) of a $(m)-column input"
+        ))
+    end
     cols = f.Gref_cols
     cols === nothing && return nothing
     m > 0 || throw(
