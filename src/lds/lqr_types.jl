@@ -14,7 +14,7 @@ The E-step kernels live in `lqr_latents.jl` and the M-step in
 
 """
     LQRFitFlags(; A=true, S=true, Qc=true, h=true, Bu=true, Gref=true,
-                        terminal=true, Gref_cols=nothing, Bu_cols=nothing)
+                        terminal=true, Gref_cols=nothing, Bu_cols=nothing, Bu_rows=nothing)
 
 Which structural parameters of a [`LQRStateModel`](@ref) the M-step is
 free to move. Every flag defaults to `true`.
@@ -50,7 +50,12 @@ never packed, so this shrinks the M-step problem rather than projecting it.
 packed input `[ux; ur; ref]`, select only `ux` for `Bu_cols` and only `ur` for
 `Gref_cols`; initialise the other `Bu` columns to zero and the known-reference
 columns of `Gref` to a fixed selection matrix. An empty `Bu_cols` freezes all
-columns. Excluded columns retain their constructed values throughout fitting.
+columns. Excluded entries retain their constructed values throughout fitting.
+`Bu_rows=1:n` additionally restricts fitting to the plant rows of the mixed
+input matrix, so general inputs act as plant disturbances without creating a
+free linear term in the state cost. Initialize excluded costate rows to zero.
+The default `nothing` retains the general mixed-input model; `Bu_rows` applies
+only to LQR mode, not to the unconstrained `free_state_model`.
 
 Columns are 1-based indices into the model's input width, validated when the
 model is built (which is the first point that width is known).
@@ -65,6 +70,7 @@ struct LQRFitFlags
     terminal::Bool
     Gref_cols::Union{Nothing,Vector{Int}}
     Bu_cols::Union{Nothing,Vector{Int}}
+    Bu_rows::Union{Nothing,Vector{Int}}
 end
 
 function LQRFitFlags(;
@@ -77,6 +83,7 @@ function LQRFitFlags(;
     terminal::Bool=true,
     Gref_cols::Union{Nothing,AbstractVector{<:Integer}}=nothing,
     Bu_cols::Union{Nothing,AbstractVector{<:Integer}}=nothing,
+    Bu_rows::Union{Nothing,AbstractVector{<:Integer}}=nothing,
 )
     cols = Gref_cols === nothing ? nothing : sort!(unique(collect(Int, Gref_cols)))
     if cols !== nothing
@@ -95,7 +102,11 @@ function LQRFitFlags(;
     if bcols !== nothing && !isempty(bcols)
         minimum(bcols) >= 1 || throw(ArgumentError("Bu_cols must be 1-based column indices"))
     end
-    return LQRFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols, bcols)
+    brows = Bu_rows === nothing ? nothing : sort!(unique(collect(Int, Bu_rows)))
+    if brows !== nothing && !isempty(brows)
+        minimum(brows) >= 1 || throw(ArgumentError("Bu_rows must be 1-based row indices"))
+    end
+    return LQRFitFlags(A, S, Qc, h, Bu, Gref, terminal, cols, bcols, brows)
 end
 
 """
@@ -129,12 +140,12 @@ function Base.:(==)(a::LQRFitFlags, b::LQRFitFlags)
            a.Bu == b.Bu &&
            a.Gref == b.Gref &&
            a.terminal == b.terminal &&
-           a.Gref_cols == b.Gref_cols && a.Bu_cols == b.Bu_cols
+           a.Gref_cols == b.Gref_cols && a.Bu_cols == b.Bu_cols && a.Bu_rows == b.Bu_rows
 end
 
 function Base.hash(f::LQRFitFlags, h::UInt)
     return hash(
-        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols, f.Bu_cols), hash(:LQRFitFlags, h)
+        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols, f.Bu_cols, f.Bu_rows), hash(:LQRFitFlags, h)
     )
 end
 
@@ -162,7 +173,15 @@ themselves are built before anyone knows how wide `Gref` will be.
     return f.Bu_cols === nothing ? collect(1:m) : f.Bu_cols
 end
 
-function _check_gref_cols(f::LQRFitFlags, m::Int)
+@inline function _bu_rows(f::LQRFitFlags, d::Int)
+    f.Bu || return Int[]
+    return f.Bu_rows === nothing ? collect(1:d) : f.Bu_rows
+end
+
+function _check_gref_cols(f::LQRFitFlags, m::Int, d::Int)
+    if f.Bu_rows !== nothing && !isempty(f.Bu_rows)
+        maximum(f.Bu_rows) <= d || throw(ArgumentError("Bu_rows exceeds the $d mixed-coordinate rows"))
+    end
     if f.Bu_cols !== nothing && !isempty(f.Bu_cols)
         maximum(f.Bu_cols) <= m || throw(ArgumentError(
             "fit_flags.Bu_cols names column $(maximum(f.Bu_cols)) of a $(m)-column input"
@@ -814,7 +833,7 @@ function LQRStateModel(
             size(Gref_m, 2),
         ),
     )
-    _check_gref_cols(fit_flags, size(Gref_m, 2))
+    _check_gref_cols(fit_flags, size(Gref_m, 2), d)
     length(x0_v) == d || throw(DimensionMismatchError("LQR x0", d, length(x0_v)))
     size(P0_m) == (d, d) || throw(DimensionMismatchError("LQR P0 rows", d, size(P0_m, 1)))
     size(Σf_m) == (n, n) || throw(DimensionMismatchError("LQR Σf rows", n, size(Σf_m, 1)))
@@ -916,6 +935,7 @@ function free_state_model(
             "pair `[x; λ]`, so `latent_dim = 2n`. Got $(d)×$(d).",
         ),
     )
+    fit_flags.Bu_rows === nothing || throw(ArgumentError("Bu_rows is supported only in LQR mode"))
     n = d >> 1
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("free Σ rows", d, size(Σ, 1)))
@@ -1571,7 +1591,7 @@ function lqr_riccati_sequence(
     has_input = size(ux_mat, 1) > 0
 
     if sm.terminal
-        kT = _regime(sm, tsteps)
+        kT = isempty(sm.schedule) ? 1 : sm.schedule[end]
         copyto!(P[tsteps], sm.Qc[kT])
         copyto!(g[tsteps], sm.hf)
         # Terminal reference: λ_T = Q_f(x_T − r_T) + h_f, so g_T = h_f − Q_f r_T.

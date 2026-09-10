@@ -586,6 +586,7 @@ struct _LQRPack
     np::Int
     gcols::Vector{Int}     # input columns of `Gref` that are packed
     bcols::Vector{Int}     # input columns of `Bu` that are packed
+    brows::Vector{Int}     # mixed-coordinate rows of `Bu` that are packed
 end
 
 # Block ordinals, in layout order.
@@ -645,12 +646,13 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
     more than a frozen block is. =#
     gcols = _gref_cols(f, m)
     bcols = _bu_cols(f, m)
+    brows = _bu_rows(f, d)
     w = (
         f.A ? n * n : 0,
         f.S ? n * n : 0,
         f.Qc ? K * n * n : 0,
         f.h ? d : 0,
-        d * length(bcols),
+        length(brows) * length(bcols),
         n * length(gcols),
         (sm.terminal && f.terminal) ? n : 0,
     )
@@ -660,7 +662,7 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
         bases[b] = pos
         pos += nv[b] * w[b]
     end
-    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols)
+    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols, brows)
 end
 
 """
@@ -1071,7 +1073,7 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_LQR_BLOCK_B])
         r = _lqr_blk(p, _LQR_BLOCK_B, v)
-        isempty(r) || copyto!(view(θ, r), vec(view(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu, :, p.bcols)))
+        isempty(r) || copyto!(view(θ, r), vec(view(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu, p.brows, p.bcols)))
     end
     for v in 1:(p.nv[_LQR_BLOCK_G])
         r = _lqr_blk(p, _LQR_BLOCK_G, v)
@@ -1135,7 +1137,7 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
             r = _lqr_blk(p, _LQR_BLOCK_B, v)
             copyto!(ctx.Bu[v], ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu)
             isempty(r) || copyto!(
-                view(ctx.Bu[v], :, p.bcols), reshape(view(θ, r), p.d, length(p.bcols))
+                view(ctx.Bu[v], p.brows, p.bcols), reshape(view(θ, r), length(p.brows), length(p.bcols))
             )
         end
         for v in 1:(p.nv[_LQR_BLOCK_G])
@@ -1421,7 +1423,7 @@ function _lqr_fg!(
     end
     for v in 1:(p.nv[_LQR_BLOCK_B])
         r = _lqr_blk(p, _LQR_BLOCK_B, v)
-        isempty(r) || copyto!(view(grad, r), vec(view(ctx.dB[v], :, p.bcols)))
+        isempty(r) || copyto!(view(grad, r), vec(view(ctx.dB[v], p.brows, p.bcols)))
     end
     for v in 1:(p.nv[_LQR_BLOCK_G])
         r = _lqr_blk(p, _LQR_BLOCK_G, v)

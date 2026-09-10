@@ -417,6 +417,7 @@ using SSDTest
             @testset "M-step" begin
                 test_lqr_mstep_objective_and_gradient()
                 test_lqr_mstep_freezing()
+                test_lqr_plant_only_inputs()
                 test_lqr_mstep_preserves_structure()
                 test_lqr_em_monotone()
                 test_lqr_noise_update_closed_form()
@@ -433,6 +434,7 @@ using SSDTest
                 test_lqr_tracking_mstep()
                 test_lqr_gref_columns()
                 test_lqr_ragged_with_schedule()
+                test_lqr_ragged_riccati_terminal()
                 test_lqr_sampling()
                 test_lqr_simulate_lqr()
                 test_lqr_show()

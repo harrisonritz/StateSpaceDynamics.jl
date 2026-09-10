@@ -144,7 +144,11 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
         return psd(SSD._lqr_blk_q(pk, 1, k), sm.Qc[k])
     end
     h = grab(blk(SSD._LQR_BLOCK_H), sm.h)
-    Bu = m > 0 ? reshape(grab(blk(SSD._LQR_BLOCK_B), vec(sm.Bu)), d, m) : zeros(V, d, 0)
+    Bu = V.(sm.Bu)
+    br = blk(SSD._LQR_BLOCK_B)
+    if !isempty(br)
+        Bu[pk.brows, pk.bcols] = reshape(θ[br], length(pk.brows), length(pk.bcols))
+    end
     Gr = m > 0 ? reshape(grab(blk(SSD._LQR_BLOCK_G), vec(sm.Gref)), n, m) : zeros(V, n, 0)
     hf = grab(blk(SSD._LQR_BLOCK_F), sm.hf)
 
@@ -1813,5 +1817,55 @@ function test_lqr_weighted_stats()
         end
         @test zed.term_n == 0
     end
+    return nothing
+end
+
+
+function test_lqr_plant_only_inputs()
+    rng = StableRNG(91)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=14, ux_dim=3)
+    sm.Bu[3:4, :] .= 0
+    sm.fit_flags = LQRFitFlags(; Bu_rows=1:2, Bu_cols=[1, 3])
+    refresh!(sm)
+    ys = [randn(rng, lds.obs_dim, 14) for _ in 1:4]
+    us = [randn(rng, 3, 14) for _ in 1:4]
+    hs, _, _, _ = lqr_estep_stats(lds, ys; ux=us)
+    frozen = copy(sm.Bu[:, 2])
+    for profile in (true, false)
+        ctx = SSD._LQRMStepCtx(hs, sm, profile)
+        θ = zeros(ctx.pack.np)
+        SSD._lqr_pack!(θ, ctx)
+        @test length(SSD._lqr_blk(ctx.pack, SSD._LQR_BLOCK_B, 1)) == 4
+        g = similar(θ)
+        SSD._lqr_fg!(g, θ, ctx)
+        reference = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
+        @test g ≈ reference rtol=1e-8 atol=1e-8
+    end
+    fit!(lds, ys; ux=us, max_iter=3, progress=false)
+    @test iszero(sm.Bu[3:4, :])
+    @test sm.Bu[:, 2] == frozen
+    @test all(iszero(B[3:4, :]) for B in sm.cache.Bfwd)
+    @test LQRFitFlags(; Bu_rows=[2,1]) == LQRFitFlags(; Bu_rows=1:2)
+    @test hash(LQRFitFlags(; Bu_rows=[2,1])) == hash(LQRFitFlags(; Bu_rows=1:2))
+    @test LQRFitFlags(; Bu_rows=1:2) != LQRFitFlags()
+    @test_throws ArgumentError LQRFitFlags(; Bu_rows=[0])
+    @test_throws ArgumentError LQRStateModel(sm.A, sm.S, sm.Qc, sm.Σ;
+        schedule=sm.schedule, fit_flags=LQRFitFlags(; Bu_rows=[5]))
+    return nothing
+end
+
+function test_lqr_ragged_riccati_terminal()
+    rng = StableRNG(92)
+    sm, _ = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=18, onset=10, ux_dim=2)
+    sm.Gref .= 0.2 .* randn(rng, 2, 2)
+    refresh!(sm)
+    us = randn(rng, 2, 12)
+    P, g, _ = lqr_riccati_sequence(sm, 12; ux=us)
+    @test P[end] ≈ sm.Qc[end]
+    @test g[end] ≈ sm.hf - sm.Qc[end] * sm.Gref * us[:, end]
+    z = simulate_lqr(rng, sm, 12; ux=us, process_noise=false, x1=zeros(2))
+    residual = zeros(2)
+    SSD._terminal_residual!(residual, sm, z, us)
+    @test norm(residual) < 1e-10
     return nothing
 end
