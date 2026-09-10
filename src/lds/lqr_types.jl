@@ -304,7 +304,11 @@ M_t = \\begin{bmatrix} A + S A^{-\\top} Q_t & -S A^{-\\top} \\\\
 ```
 
 `A` must therefore be invertible — true of any discretized plant, and checked at
-construction.
+construction. Symplectic structure alone does not guarantee a minimizing
+controller: convex LQR also requires `S` and every `Qc` to be positive
+semidefinite. The M-step enforces this with square factors and refuses
+indefinite starting matrices. Construction still accepts symmetric indefinite
+matrices so historical fits can be loaded and diagnosed.
 
 ## Noise
 
@@ -1324,8 +1328,8 @@ by fixed-point iteration from `P = Q_k`. `P` is the steady-state costate map
 tracks `P x` is one the LQR interpretation fits well.
 
 Returns the converged `P`; throws `NumericalStabilityError` if the iteration
-does not converge, which is the honest answer when regime `k`'s cost admits no
-stabilizing solution.
+does not converge. Nonconvergence alone does not prove that a stabilizing
+solution does not exist; convergence may also be slow or numerically difficult.
 """
 function riccati_solution(
     sm::LQRStateModel{T}; k::Int=1, max_iter::Int=1000, tol::Real=1e-12

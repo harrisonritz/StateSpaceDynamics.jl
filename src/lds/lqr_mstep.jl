@@ -8,8 +8,9 @@ which is done in *mixed* coordinates: with
     w_t = [x_t; λ_{t+1}],    v_t = [x_{t+1}; λ_t],
 
 the constraint is that the regression `v_t ≈ 𝓔_k w_t + h + Bu u_t` has
-`𝓔_k = [A −S; Q_k Aᵀ]` with `S`, `Q_k` symmetric — *linear* in the free
-parameters, where the forward symplectic transition `M_k` is rational in them.
+`𝓔_k = [A −S; Q_k Aᵀ]` with `S`, `Q_k` positive semidefinite. The mixed
+form is linear in these matrices; the optimizer represents each as `L Lᵀ`
+to preserve convexity, while the forward transition is rational in `A`.
 
 The rearrangement is free: every second moment of `(w_t, v_t)` is a block of the
 joint second moment of `(z_t, z_{t+1})` the smoother already returns, so nothing
@@ -565,6 +566,11 @@ state is just a different count of copies per block, rather than a different
 problem. A version-major layout (one full copy of every block per version, which
 is what this was) can only express "all blocks shared" or "no blocks shared".
 
+`S` and `Qc` store square factors `L`, with the actual matrices `L Lᵀ`.
+This keeps every optimizer iterate positive semidefinite, including for grouped
+and switching fits. Initialize free blocks positive definite to avoid the
+zero-gradient stationary point of a zero factor.
+
 A frozen block (see [`LQRFitFlags`](@ref)) has width zero and is neither
 packed nor updated, so freezing shrinks the problem rather than projecting its
 solution. `Qc`'s copy spans all `K` regimes contiguously.
@@ -1020,6 +1026,24 @@ Length of the flat parameter vector.
 """
 @inline _lqr_nparams(ctx::_LQRMStepCtx) = ctx.pack.np
 
+function _lqr_pack_psd!(θ, r, matrix, name)
+    # Symmetry alone describes a Hamiltonian system, not a convex LQR problem.
+    # Keep old indefinite models readable, but refuse to fit them as LQR.
+    E = eigen(Symmetric(Matrix(matrix)))
+    tolerance = 100 * eps(eltype(matrix)) * max(one(eltype(matrix)), maximum(abs, E.values))
+    minimum(E.values) >= -tolerance || throw(
+        ArgumentError(
+            "$name must be positive semidefinite to fit an LQR model; " *
+            "restart from a valid initialization (minimum eigenvalue $(minimum(E.values)))",
+        ),
+    )
+    if !isempty(r)
+        factor = E.vectors * Diagonal(sqrt.(max.(E.values, zero(eltype(matrix)))))
+        copyto!(view(θ, r), vec(factor))
+    end
+    return θ
+end
+
 """
     _lqr_pack!(θ, ctx) -> θ
 
@@ -1035,11 +1059,11 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_LQR_BLOCK_S])
         r = _lqr_blk(p, _LQR_BLOCK_S, v)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_S][v])].S))
+        _lqr_pack_psd!(θ, r, ctx.sms[first(o[_LQR_BLOCK_S][v])].S, "S")
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
         r = _lqr_blk_q(p, v, k)
-        isempty(r) || copyto!(view(θ, r), vec(ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k]))
+        _lqr_pack_psd!(θ, r, ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k], "Qc[$k]")
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
         r = _lqr_blk(p, _LQR_BLOCK_H, v)
@@ -1085,8 +1109,8 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         if isempty(r)
             copyto!(ctx.S[v], ctx.sms[first(o[_LQR_BLOCK_S][v])].S)
         else
-            copyto!(ctx.S[v], reshape(view(θ, r), n, n))
-            Symmetrize!(ctx.S[v])
+            factor = reshape(view(θ, r), n, n)
+            mul!(ctx.S[v], factor, transpose(factor))
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
@@ -1094,8 +1118,8 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         if isempty(r)
             copyto!(ctx.Qc[v][k], ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k])
         else
-            copyto!(ctx.Qc[v][k], reshape(view(θ, r), n, n))
-            Symmetrize!(ctx.Qc[v][k])
+            factor = reshape(view(θ, r), n, n)
+            mul!(ctx.Qc[v][k], factor, transpose(factor))
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
@@ -1366,11 +1390,30 @@ function _lqr_fg!(
     end
     for v in 1:(p.nv[_LQR_BLOCK_S])
         r = _lqr_blk(p, _LQR_BLOCK_S, v)
-        isempty(r) || copyto!(view(grad, r), vec(_sym!(ctx.tmp_nn, ctx.dS[v])))
+        if !isempty(r)
+            # For S = L Lᵀ, dF/dL = (dF/dS + (dF/dS)ᵀ) L.
+            _sym!(ctx.tmp_nn, ctx.dS[v])
+            mul!(
+                reshape(view(grad, r), n, n),
+                ctx.tmp_nn,
+                reshape(view(θ, r), n, n),
+                T(2),
+                zero(T),
+            )
+        end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
         r = _lqr_blk_q(p, v, k)
-        isempty(r) || copyto!(view(grad, r), vec(_sym!(ctx.tmp_nn, ctx.dQ[v][k])))
+        if !isempty(r)
+            _sym!(ctx.tmp_nn, ctx.dQ[v][k])
+            mul!(
+                reshape(view(grad, r), n, n),
+                ctx.tmp_nn,
+                reshape(view(θ, r), n, n),
+                T(2),
+                zero(T),
+            )
+        end
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
         r = _lqr_blk(p, _LQR_BLOCK_H, v)

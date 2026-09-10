@@ -132,11 +132,16 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     grab(r, fallback) = isempty(r) ? V.(fallback) : θ[r]
     blk(b) = SSD._lqr_blk(pk, b, 1)
     A = reshape(grab(blk(SSD._LQR_BLOCK_A), vec(sm.A)), n, n)
-    Sm = reshape(grab(blk(SSD._LQR_BLOCK_S), vec(sm.S)), n, n)
-    Sm = (Sm + transpose(Sm)) / 2
+    psd(r, fallback) =
+        if isempty(r)
+            V.(fallback)
+        else
+            L = reshape(θ[r], n, n)
+            L * transpose(L)
+        end
+    Sm = psd(blk(SSD._LQR_BLOCK_S), sm.S)
     Qs = map(1:K) do k
-        q = reshape(grab(SSD._lqr_blk_q(pk, 1, k), vec(sm.Qc[k])), n, n)
-        return (q + transpose(q)) / 2
+        return psd(SSD._lqr_blk_q(pk, 1, k), sm.Qc[k])
     end
     h = grab(blk(SSD._LQR_BLOCK_H), sm.h)
     Bu = m > 0 ? reshape(grab(blk(SSD._LQR_BLOCK_B), vec(sm.Bu)), d, m) : zeros(V, d, 0)
@@ -671,20 +676,29 @@ function test_lqr_mstep_objective_and_gradient()
         @test maximum(abs, g .- g_fd) / max(1.0, maximum(abs, g_fd)) < 1e-8
     end
 
-    # Symmetric blocks must produce exactly symmetric gradients — that is what
-    # keeps the L-BFGS iterates symmetric without any `vech` bookkeeping.
+    # Arbitrary optimizer iterates must remain valid costs/control authority.
+    # Also check the gradient away from the initial square-root factors.
     ctx = SSD._LQRMStepCtx(hs, sm, true)
     θ = zeros(ctx.pack.np)
     SSD._lqr_pack!(θ, ctx)
+    SSD._lqr_unpack!(ctx, θ)
+    @test ctx.S[1] ≈ sm.S
+    @test all(ctx.Qc[1][k] ≈ sm.Qc[k] for k in eachindex(sm.Qc))
+    θ .+= 0.1 .* randn(rng, length(θ))
     g = similar(θ)
     SSD._lqr_fg!(g, θ, ctx)
-    n = SSD._plant_dim(sm)
-    gS = reshape(g[SSD._lqr_blk(ctx.pack, SSD._LQR_BLOCK_S, 1)], n, n)
-    @test gS ≈ transpose(gS) atol = 1e-14
-    for k in 1:SSD._nregimes(sm)
-        gQ = reshape(g[SSD._lqr_blk_q(ctx.pack, 1, k)], n, n)
-        @test gQ ≈ transpose(gQ) atol = 1e-14
+    g_fd = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, true), θ)
+    @test maximum(abs, g .- g_fd) / max(1.0, maximum(abs, g_fd)) < 1e-8
+    @test minimum(eigvals(Symmetric(ctx.S[1]))) >= -1e-12
+    for Q in ctx.Qc[1]
+        @test minimum(eigvals(Symmetric(Q))) >= -1e-12
     end
+    # Regression: the reported real-data fit escaped to a negative-definite S.
+    sm.S .*= -1
+    @test_throws ArgumentError SSD._lqr_pack!(θ, ctx)
+    sm.S .*= -1
+    sm.Qc[1] .*= -1
+    @test_throws ArgumentError SSD._lqr_pack!(θ, ctx)
     return nothing
 end
 
@@ -747,8 +761,10 @@ function test_lqr_mstep_preserves_structure()
     # The point of the whole exercise: after fitting, the transition is still
     # symplectic and the cost matrices still symmetric.
     @test sm.S ≈ transpose(sm.S) atol = 1e-12
+    @test minimum(eigvals(Symmetric(sm.S))) >= -1e-12
     for k in 1:SSD._nregimes(sm)
         @test sm.Qc[k] ≈ transpose(sm.Qc[k]) atol = 1e-12
+        @test minimum(eigvals(Symmetric(sm.Qc[k]))) >= -1e-12
         @test symplectic_defect(sm, k) < 1e-9
     end
     @test issymmetric(Symmetric(sm.Σ))
