@@ -136,7 +136,12 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
         if isempty(r)
             V.(fallback)
         else
-            L = reshape(θ[r], n, n)
+            L = zeros(V, n, n)
+            q = first(r)
+            for j in 1:n, i in j:n
+                L[i, j] = i == j ? exp(θ[q]) : θ[q]
+                q += 1
+            end
             L * transpose(L)
         end
     Sm = psd(blk(SSD._LQR_BLOCK_S), sm.S)
@@ -166,13 +171,16 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     obj = -N * log(abs(det(A)))
     obj += profile ? 0.5 * N * logdet(R) : 0.5 * dot(inv(Symmetric(V.(sm.Σ))), R)
     if sm.terminal
-        kf = isempty(sm.schedule) ? 1 : sm.schedule[end]
-        Psi = hcat(-Qs[kf], Matrix{V}(I, n, n), reshape(-hf, n, 1))
-        m > 0 && (Psi = hcat(Psi, Qs[kf] * Gr))
-        Rf = Psi * V.(hs.Omega) * transpose(Psi)
+        Rf = zeros(V, n, n)
+        for k in 1:K
+            Psi = hcat(-Qs[k], Matrix{V}(I, n, n), reshape(-hf, n, 1))
+            m > 0 && (Psi = hcat(Psi, Qs[k] * Gr))
+            Rf .+= Psi * V.(hs.Omega[k]) * transpose(Psi)
+        end
         Rf = (Rf + transpose(Rf)) / 2
+        Nf = sum(hs.term_n)
         obj += if profile
-            0.5 * hs.term_n * logdet(Rf)
+            0.5 * Nf * logdet(Rf)
         else
             0.5 * dot(inv(Symmetric(V.(sm.Σf))), Rf)
         end
@@ -588,7 +596,7 @@ function test_lqr_sufficient_statistics()
     zy = [zeros(reg, d) for _ in 1:K]
     yy = [zeros(d, d) for _ in 1:K]
     nk = zeros(K)
-    term = zeros(reg, reg)   # the terminal regressor is [z_T; 1; u_T] too
+    term = [zeros(reg, reg) for _ in 1:K] # terminal regressor is [z_T; 1; u_T]
     for n in 1:ntrials
         fs = tfs[n]
         x = fs.x_smooth
@@ -609,7 +617,7 @@ function test_lqr_sufficient_statistics()
         zt = [x[:, tsteps]; 1.0; uxs[n][:, tsteps]]
         Ez = zt * zt'
         Ez[1:d, 1:d] .+= P[:, :, tsteps]
-        term .+= Ez
+        term[SSD._regime(sm, tsteps)] .+= Ez
     end
     for k in 1:K
         @test maximum(abs, hs.zz[k] .- zz[k]) < 1e-10
@@ -617,8 +625,9 @@ function test_lqr_sufficient_statistics()
         @test maximum(abs, hs.yy[k] .- yy[k]) < 1e-10
         @test hs.nk[k] ≈ nk[k]
     end
-    @test maximum(abs, hs.term_zz .- term) < 1e-10
-    @test hs.term_n ≈ ntrials
+    @test all(maximum(abs, hs.term_zz[k] .- term[k]) < 1e-10 for k in 1:K)
+    @test sum(hs.term_n) ≈ ntrials
+    @test hs.term_n[SSD._regime(sm, tsteps)] ≈ ntrials
 
     # The mixed blocks must be the second moments of (w, v) built the direct way.
     n = SSD._plant_dim(sm)
@@ -720,7 +729,7 @@ function test_lqr_mstep_freezing()
     sm.fit_flags = LQRFitFlags(; A=false, S=false)
     frozen = SSD._LQRPack(sm)
     # Freezing shrinks the problem rather than projecting its solution.
-    @test frozen.np == full - 2 * n * n
+    @test frozen.np == full - n * n - n * (n + 1) ÷ 2
     @test isempty(SSD._lqr_blk(frozen, SSD._LQR_BLOCK_A, 1)) &&
         isempty(SSD._lqr_blk(frozen, SSD._LQR_BLOCK_S, 1))
     ctx = SSD._LQRMStepCtx(hs, sm, true)
@@ -799,6 +808,8 @@ function test_lqr_em_monotone()
         @test minimum(diff(els)) > -1e-8
         @test els[end] > els[1]
         @test all(isfinite, els)
+        # The returned parameters are the ones scored by the final trace entry.
+        @test els[end] ≈ elbo(lds, ys; ux=uxs) atol = 1e-7
     end
     return nothing
 end
@@ -898,6 +909,36 @@ function test_lqr_costate_readout_mask()
     @test SSD._costate_range(lds2) === nothing
     fit!(lds2, ys; max_iter=6, progress=false)
     @test !all(iszero, lds2.obs_model.C[:, (n + 1):d])
+
+    # A full matrix-normal prior must be restricted to the observable columns.
+    # A nonzero masked prior mean and dense cross-column precision previously
+    # recreated costate readout after the first M-step.
+    sm3, lds3 = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
+    regdim = d + 1
+    M₀ = randn(rng, lds3.obs_dim, regdim)
+    M₀[:, (n + 1):d] .= 5
+    Λ = Matrix(1.0I, regdim, regdim) .+ 0.1 .* ones(regdim, regdim)
+    lds3.obs_model.CD_prior = MNPrior(M₀, Λ)
+    fit!(lds3, ys; max_iter=4, progress=false)
+    @test all(iszero, lds3.obs_model.C[:, (n + 1):d])
+    return nothing
+end
+
+function test_lqr_singular_fitted_psd_rejected()
+    rng = StableRNG(410)
+    sm, lds = lqr_fixture(rng; nregimes=1, tsteps=10)
+    ys = [randn(rng, lds.obs_dim, 10) for _ in 1:2]
+    hs, _, _, _ = lqr_estep_stats(lds, ys)
+
+    fill!(sm.Qc[1], 0)
+    ctx = SSD._LQRMStepCtx(hs, sm, true)
+    θ = zeros(ctx.pack.np)
+    @test_throws ArgumentError SSD._lqr_pack!(θ, ctx)
+
+    # Exact singular costs are still legal when they are intentionally frozen.
+    sm.fit_flags = LQRFitFlags(; Qc=false)
+    frozen = SSD._LQRMStepCtx(hs, sm, true)
+    @test SSD._lqr_pack!(zeros(frozen.pack.np), frozen) isa Vector
     return nothing
 end
 
@@ -1496,7 +1537,11 @@ function test_lqr_ragged_with_schedule()
         expected[SSD._regime(sm, t)] += 1
     end
     @test hs.nk ≈ expected
-    @test hs.term_n ≈ length(lengths)
+    expected_terminal = zeros(3)
+    for t_n in lengths
+        expected_terminal[SSD._regime(sm, t_n)] += 1
+    end
+    @test hs.term_n ≈ expected_terminal
     @test sum(hs.nk) ≈ sum(lengths) - length(lengths)
 
     xs, _ = smooth(lds, ys)
@@ -1736,8 +1781,8 @@ function lqr_stats_gap(a, b, K)
     g = max(g, maximum([maximum(abs, a.zy[k] .- b.zy[k]) for k in 1:K]))
     g = max(g, maximum([maximum(abs, a.yy[k] .- b.yy[k]) for k in 1:K]))
     g = max(g, maximum([abs(a.nk[k] - b.nk[k]) for k in 1:K]))
-    g = max(g, maximum(abs, a.term_zz .- b.term_zz))
-    return max(g, abs(a.term_n - b.term_n))
+    g = max(g, maximum(maximum(abs, a.term_zz[k] .- b.term_zz[k]) for k in 1:K))
+    return max(g, maximum(abs, a.term_n .- b.term_n))
 end
 
 """The weighted aggregator is the SLDS M-step's only source of statistics, and a
@@ -1791,7 +1836,9 @@ function test_lqr_weighted_stats()
             @test maximum(abs, ssum.yy[k] .- (s1.yy[k] .+ s2.yy[k])) < 1e-10
             @test ssum.nk[k] ≈ s1.nk[k] + s2.nk[k]
         end
-        @test maximum(abs, ssum.term_zz .- (s1.term_zz .+ s2.term_zz)) < 1e-10
+        for k in 1:K
+            @test maximum(abs, ssum.term_zz[k] .- (s1.term_zz[k] .+ s2.term_zz[k])) < 1e-10
+        end
         @test ssum.term_n ≈ s1.term_n + s2.term_n
 
         # 3. A partition of unity sums back to the plain aggregate: this is what
@@ -1815,17 +1862,16 @@ function test_lqr_weighted_stats()
             @test all(iszero, zed.yy[k])
             @test zed.nk[k] == 0
         end
-        @test zed.term_n == 0
+        @test all(iszero, zed.term_n)
     end
     return nothing
 end
-
 
 function test_lqr_plant_only_inputs()
     rng = StableRNG(91)
     sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=14, ux_dim=3)
     sm.Bu[3:4, :] .= 0
-    sm.fit_flags = LQRFitFlags(; Bu_rows=1:2, Bu_cols=[1, 3])
+    sm.fit_flags = LQRFitFlags(; Gref=false, Bu_rows=1:2, Bu_cols=[1, 3])
     refresh!(sm)
     ys = [randn(rng, lds.obs_dim, 14) for _ in 1:4]
     us = [randn(rng, 3, 14) for _ in 1:4]
@@ -1839,18 +1885,19 @@ function test_lqr_plant_only_inputs()
         g = similar(θ)
         SSD._lqr_fg!(g, θ, ctx)
         reference = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
-        @test g ≈ reference rtol=1e-8 atol=1e-8
+        @test g ≈ reference rtol = 1e-8 atol = 1e-8
     end
     fit!(lds, ys; ux=us, max_iter=3, progress=false)
     @test iszero(sm.Bu[3:4, :])
     @test sm.Bu[:, 2] == frozen
     @test all(iszero(B[3:4, :]) for B in sm.cache.Bfwd)
-    @test LQRFitFlags(; Bu_rows=[2,1]) == LQRFitFlags(; Bu_rows=1:2)
-    @test hash(LQRFitFlags(; Bu_rows=[2,1])) == hash(LQRFitFlags(; Bu_rows=1:2))
+    @test LQRFitFlags(; Bu_rows=[2, 1]) == LQRFitFlags(; Bu_rows=1:2)
+    @test hash(LQRFitFlags(; Bu_rows=[2, 1])) == hash(LQRFitFlags(; Bu_rows=1:2))
     @test LQRFitFlags(; Bu_rows=1:2) != LQRFitFlags()
     @test_throws ArgumentError LQRFitFlags(; Bu_rows=[0])
-    @test_throws ArgumentError LQRStateModel(sm.A, sm.S, sm.Qc, sm.Σ;
-        schedule=sm.schedule, fit_flags=LQRFitFlags(; Bu_rows=[5]))
+    @test_throws ArgumentError LQRStateModel(
+        sm.A, sm.S, sm.Qc, sm.Σ; schedule=sm.schedule, fit_flags=LQRFitFlags(; Bu_rows=[5])
+    )
     return nothing
 end
 
@@ -1861,8 +1908,9 @@ function test_lqr_ragged_riccati_terminal()
     refresh!(sm)
     us = randn(rng, 2, 12)
     P, g, _ = lqr_riccati_sequence(sm, 12; ux=us)
-    @test P[end] ≈ sm.Qc[end]
-    @test g[end] ≈ sm.hf - sm.Qc[end] * sm.Gref * us[:, end]
+    kT = SSD._regime(sm, 12)
+    @test P[end] ≈ sm.Qc[kT]
+    @test g[end] ≈ sm.hf - sm.Qc[kT] * sm.Gref * us[:, end]
     z = simulate_lqr(rng, sm, 12; ux=us, process_noise=false, x1=zeros(2))
     residual = zeros(2)
     SSD._terminal_residual!(residual, sm, z, us)

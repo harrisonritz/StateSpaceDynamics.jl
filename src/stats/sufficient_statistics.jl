@@ -415,7 +415,14 @@ function _aggregate_td_suff_stats!(
     copyto!(suf.obs_xy, td_obs_xy)
 
     suf.init_yy[] = copy(S0_sum)                # see above; not needed to be PDMat
-    suf.dyn_xx[] = pd_gram(copy(Szz_Ab); name="dynamics Gram [x b ux]")
+    # The inverse-LQR state M-step consumes its own per-cost-regime moments,
+    # not this compatibility block. Its regressors can therefore be singular
+    # inside an individual cost epoch (an event-locked step is the common
+    # example) while the joint structural objective remains well-defined.
+    warn_dyn_rank = !(lds.state_model isa LQRStateModel)
+    suf.dyn_xx[] = pd_gram(
+        copy(Szz_Ab); name="dynamics Gram [x b ux]", warn_on_ridge=warn_dyn_rank
+    )
     suf.dyn_yy[] = pd_gram(copy(Q_sum); name="dynamics scatter")
     suf.obs_xx[] = pd_gram(copy(Szz_Cd); name="emission Gram [x d uy]")
     suf.obs_yy[] = pd_gram(copy(R_sum); name="emission scatter")
@@ -638,7 +645,12 @@ function _aggregate_td_suff_stats_weighted!(
     copyto!(suf.obs_xy, obs_xy)
 
     suf.init_yy[] = copy(init_yy)               # see above
-    suf.dyn_xx[] = pd_gram(copy(dyn_xx); name="regime-weighted dynamics Gram [x b ux]")
+    warn_dyn_rank = !(lds.state_model isa LQRStateModel)
+    suf.dyn_xx[] = pd_gram(
+        copy(dyn_xx);
+        name="regime-weighted dynamics Gram [x b ux]",
+        warn_on_ridge=warn_dyn_rank,
+    )
     suf.dyn_yy[] = pd_gram(copy(dyn_yy); name="regime-weighted dynamics scatter")
     suf.obs_xx[] = pd_gram(copy(obs_xx); name="regime-weighted emission Gram [x d uy]")
     suf.obs_yy[] = pd_gram(copy(obs_yy); name="regime-weighted emission scatter")

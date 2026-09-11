@@ -972,6 +972,7 @@ function _fit_tridiag_grouped!(
     tol::Float64=1e-6,
     progress::Bool=true,
     monitor=nothing,
+    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(lds, data)
     state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
@@ -1000,6 +1001,13 @@ function _fit_tridiag_grouped!(
             return _fit_result(monitor, elbos, lds)
         end
 
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
         _grouped_state_mstep!(
             state.cell_lds,
             _state_sufs(state.sufs),
@@ -1013,7 +1021,7 @@ function _fit_tridiag_grouped!(
 
         prog !== nothing && next!(prog)
 
-        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if converged
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)
@@ -1031,6 +1039,7 @@ function _fit_tridiag!(
     tol::Float64=1e-6,
     progress::Bool=true,
     monitor=nothing,
+    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
@@ -1103,6 +1112,13 @@ function _fit_tridiag!(
             return _fit_result(monitor, elbos, lds)
         end
 
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
 
@@ -1110,7 +1126,7 @@ function _fit_tridiag!(
         prog !== nothing && next!(prog)
 
         # check convergence
-        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if converged
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)

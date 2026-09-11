@@ -675,10 +675,11 @@ function _slds_terminal_gradient!(
     sm.terminal || return nothing
     tsteps = size(x, 2)
     n = _plant_dim(sm)
+    kf = _regime(sm, tsteps)
     rf = view(ws.opt.dxt, 1:n)
     _terminal_residual!(rf, sm, x, ux)
     # grad[:, T] -= w · Λfᵀ Σf⁻¹ r_f
-    @views mul!(grad[:, tsteps], sm.cache.LtSinv, rf, -w_k[tsteps], one(T))
+    @views mul!(grad[:, tsteps], sm.cache.LtSinv[kf], rf, -w_k[tsteps], one(T))
     return nothing
 end
 
@@ -696,7 +697,7 @@ function _slds_terminal_hessian!(
     H_diag::AbstractVector, sm::LQRStateModel{T}, w_k::AbstractVector{T}, tsteps::Int
 ) where {T<:Real}
     sm.terminal || return nothing
-    negLtSL = sm.cache.negLtSL
+    negLtSL = sm.cache.negLtSL[_regime(sm, tsteps)]
     @. H_diag[tsteps] += w_k[tsteps] * negLtSL
     return nothing
 end
@@ -718,7 +719,7 @@ function _slds_terminal_cov_correction(
 ) where {T<:Real}
     sm.terminal || return zero(T)
     # `tr(H_f Σ_T)`; the caller's single ½ applies to it like every other term.
-    return _tr_prod(sm.cache.negLtSL, view(fs.p_smooth, :, :, tsteps))
+    return _tr_prod(sm.cache.negLtSL[_regime(sm, tsteps)], view(fs.p_smooth, :, :, tsteps))
 end
 
 function gradient!(
@@ -3517,6 +3518,9 @@ function fit!(
         nothing
     end
     elbos = Vector{T}(undef, max_iter)
+    # LQR fits report a parameter-aligned final ELBO: the last scored iterate is
+    # returned unchanged rather than taking one unscored structural M-step.
+    align_final = S <: LQRStateModel && any(lds -> !_is_free(lds.state_model), slds.LDSs)
 
     #=
     Warm-start: smooth each trial once with uniform weights, drawing the first
@@ -3593,6 +3597,10 @@ function fit!(
                 resize!(elbos, iter)
                 return _fit_result(monitor, elbos, slds)
             end
+            if align_final && iter == max_iter
+                prog !== nothing && next!(prog)
+                continue
+            end
 
             # M-step: update discrete and continuous parameters.
             mstep!(
@@ -3666,6 +3674,10 @@ function fit!(
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
                 return _fit_result(monitor, elbos, slds)
+            end
+            if align_final && iter == max_iter
+                prog !== nothing && next!(prog)
+                continue
             end
 
             _mstep_grouped!(

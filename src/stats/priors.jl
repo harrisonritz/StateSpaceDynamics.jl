@@ -106,6 +106,20 @@ end
 end
 
 """
+    _restrict_mn_prior(prior, cols)
+
+Restrict a matrix-normal regression prior to a set of free coefficient columns.
+Cross-precision terms involving omitted (constrained) columns are deliberately
+dropped: the resulting prior is the one induced on the model's actual free
+parameter space.
+"""
+@inline _restrict_mn_prior(::Nothing, ::AbstractVector{Int}) = nothing
+
+@inline function _restrict_mn_prior(prior::MNPrior, cols::AbstractVector{Int})
+    return MNPrior(Matrix(prior.M₀[:, cols]), Matrix(prior.Λ[cols, cols]))
+end
+
+"""
     mn_logprior_term(W, Σ, prior) -> Real
 
 W-dependent part of the matrix-normal log prior `log p(W | Σ)` evaluated at the

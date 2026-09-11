@@ -655,9 +655,25 @@ function _tied_gls_regression(
     Σ::AbstractVector{<:AbstractMatrix{T}},
     prior::Union{Nothing,MNPrior},
     Σ_prior::AbstractMatrix{T},
+    ;
+    free_cols::Union{Nothing,AbstractVector{Int}}=nothing,
 ) where {T<:Real}
     m = size(Szz[1], 1)
     p = size(Szy[1], 2)
+
+    if free_cols !== nothing && length(free_cols) < m
+        cols = collect(free_cols)
+        Wfree = _tied_gls_regression(
+            [Matrix(S[cols, cols]) for S in Szz],
+            [Matrix(Y[cols, :]) for Y in Szy],
+            Σ,
+            _restrict_mn_prior(prior, cols),
+            Σ_prior,
+        )
+        W = zeros(T, p, m)
+        W[:, cols] .= Wfree
+        return W
+    end
 
     lhs = zeros(T, m * p, m * p)
     rhs = zeros(T, p, m)
@@ -927,12 +943,20 @@ function _grouped_update_C_d!(
             )
         else
             lds.fit_bool[_G_CD] || continue
+            mask = _costate_range(lds)
+            free_cols = if mask === nothing
+                nothing
+            else
+                setdiff(1:size(sufs[units[1]].obs_xx[].mat, 1), mask)
+            end
             V = _tied_gls_regression(
                 [sufs[u].obs_xx[].mat for u in units],
                 [sufs[u].obs_xy for u in units],
                 [ldss[u].obs_model.R for u in units],
                 lds.obs_model.CD_prior,
                 lds.obs_model.R,
+                ;
+                free_cols=free_cols,
             )
             _unpack_obs_V!(lds, V)
         end
@@ -1301,7 +1325,15 @@ function _grouped_gaussian_obs_prior_logdensity(
         om.CD_prior === nothing && continue
         D = lds.latent_dim
         W_cd = _pack_obs_V!(Matrix{T}(undef, lds.obs_dim, D + 1 + lds.uy_dim), lds)
-        total += mn_logprior_term(W_cd, om.R, om.CD_prior)
+        mask = _costate_range(lds)
+        if mask === nothing
+            total += mn_logprior_term(W_cd, om.R, om.CD_prior)
+        else
+            free = setdiff(axes(W_cd, 2), mask)
+            total += mn_logprior_term(
+                W_cd[:, free], om.R, _restrict_mn_prior(om.CD_prior, free)
+            )
+        end
     end
     return total
 end

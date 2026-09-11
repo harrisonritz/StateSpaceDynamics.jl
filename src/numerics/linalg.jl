@@ -173,7 +173,7 @@ function random_rotation_matrix(n::Int, rng::AbstractRNG=Random.default_rng())
 end
 
 """
-    pd_gram(A; name="gram") -> PDMat
+    pd_gram(A; name="gram", warn_on_ridge=true) -> PDMat
 
 `PDMat` for a Gram / scatter matrix that is positive **semi**-definite by
 construction — a weighted sum of outer products plus smoother covariances, as
@@ -197,7 +197,9 @@ The ridge escalates from `1e-10·max|diag|` until the factorisation succeeds and
 warns when it fires, since a *structural* collinearity is worth fixing in the
 design rather than absorbing here.
 """
-function pd_gram(A::Matrix{T}; name::AbstractString="gram") where {T<:Real}
+function pd_gram(
+    A::Matrix{T}; name::AbstractString="gram", warn_on_ridge::Bool=true
+) where {T<:Real}
     fac = copy(A)                       # cholesky! destroys its argument
     F = cholesky!(Symmetric(fac, :U); check=false)
     issuccess(F) && return PDMat(A, F)
@@ -222,11 +224,13 @@ function pd_gram(A::Matrix{T}; name::AbstractString="gram") where {T<:Real}
         copyto!(fac, A)
         F = cholesky!(Symmetric(fac, :U); check=false)
         if issuccess(F)
-            @warn "rank-deficient $name in the M-step; ridged to keep the fit alive. \
-                   A `ux`/`uy` column that is constant within a regime (an epoch-locked \
-                   step is the usual culprit) is collinear with the bias column and \
-                   should be dropped from the design." ridge relative = ridge / scale maxlog =
-                5
+            if warn_on_ridge
+                @warn "rank-deficient $name in the M-step; ridged to keep the fit alive. \
+                       A `ux`/`uy` column that is constant within a regime (an epoch-locked \
+                       step is the usual culprit) is collinear with the bias column and \
+                       should be dropped from the design." ridge relative = ridge / scale maxlog =
+                    5
+            end
             return PDMat(A, F)
         end
         ridge *= T(10)

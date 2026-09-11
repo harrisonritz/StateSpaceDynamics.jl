@@ -100,7 +100,8 @@ function LQRFitFlags(;
     end
     bcols = Bu_cols === nothing ? nothing : sort!(unique(collect(Int, Bu_cols)))
     if bcols !== nothing && !isempty(bcols)
-        minimum(bcols) >= 1 || throw(ArgumentError("Bu_cols must be 1-based column indices"))
+        minimum(bcols) >= 1 ||
+            throw(ArgumentError("Bu_cols must be 1-based column indices"))
     end
     brows = Bu_rows === nothing ? nothing : sort!(unique(collect(Int, Bu_rows)))
     if brows !== nothing && !isempty(brows)
@@ -140,12 +141,15 @@ function Base.:(==)(a::LQRFitFlags, b::LQRFitFlags)
            a.Bu == b.Bu &&
            a.Gref == b.Gref &&
            a.terminal == b.terminal &&
-           a.Gref_cols == b.Gref_cols && a.Bu_cols == b.Bu_cols && a.Bu_rows == b.Bu_rows
+           a.Gref_cols == b.Gref_cols &&
+           a.Bu_cols == b.Bu_cols &&
+           a.Bu_rows == b.Bu_rows
 end
 
 function Base.hash(f::LQRFitFlags, h::UInt)
     return hash(
-        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols, f.Bu_cols, f.Bu_rows), hash(:LQRFitFlags, h)
+        (f.A, f.S, f.Qc, f.h, f.Bu, f.Gref, f.terminal, f.Gref_cols, f.Bu_cols, f.Bu_rows),
+        hash(:LQRFitFlags, h),
     )
 end
 
@@ -180,12 +184,15 @@ end
 
 function _check_gref_cols(f::LQRFitFlags, m::Int, d::Int)
     if f.Bu_rows !== nothing && !isempty(f.Bu_rows)
-        maximum(f.Bu_rows) <= d || throw(ArgumentError("Bu_rows exceeds the $d mixed-coordinate rows"))
+        maximum(f.Bu_rows) <= d ||
+            throw(ArgumentError("Bu_rows exceeds the $d mixed-coordinate rows"))
     end
     if f.Bu_cols !== nothing && !isempty(f.Bu_cols)
-        maximum(f.Bu_cols) <= m || throw(ArgumentError(
-            "fit_flags.Bu_cols names column $(maximum(f.Bu_cols)) of a $(m)-column input"
-        ))
+        maximum(f.Bu_cols) <= m || throw(
+            ArgumentError(
+                "fit_flags.Bu_cols names column $(maximum(f.Bu_cols)) of a $(m)-column input",
+            ),
+        )
     end
     cols = f.Gref_cols
     cols === nothing && return nothing
@@ -226,13 +233,14 @@ and `S` alone, so `Qfwd`, `bfwd` and `Bfwd` are shared by every regime.
     `G (B_u - [0; Q_k G_r])`, one per regime. Unlike the noise map, the input
     matrix *is* regime-dependent whenever a reference is in play, because the
     tracking term `-Q_k r_t` carries that regime's own cost.
-- `Ftrm`: `Q_{k_T} G_r`, the terminal factor's input block.
+- `Ftrm`: one `Q_k G_r` terminal-factor input block per cost regime.
 - `negQinv`, `QinvM`, `MtQinv`, `negMtQinvM`, `cQ`: Cholesky-derived templates
     for the gradient and Hessian blocks, the per-regime ones indexed by regime.
 - `Sf_PD`, `Lf`, `negLtSL`, `LtSinv`, `cF`: the terminal factor's covariance,
-    its design matrix `Λf = [−Q_f  I]`, and the derived curvature / gradient
-    templates. Present (as identity placeholders) even when the model carries no
-    terminal factor.
+    per-regime design matrices `Λf[k] = [−Q_k  I]`, and their derived
+    curvature / gradient templates. Present (as identity placeholders) even when
+    the model carries no terminal factor. Indexing these by regime is what lets a
+    ragged trial use `schedule[T_trial]` rather than the longest schedule's end.
 """
 mutable struct LQRCache{T<:Real}
     const n::Int
@@ -243,16 +251,16 @@ mutable struct LQRCache{T<:Real}
     Qfwd::DensePDMat{T}
     const bfwd::Vector{T}
     const Bfwd::Vector{Matrix{T}}
-    const Ftrm::Matrix{T}
+    const Ftrm::Vector{Matrix{T}}
     const negQinv::Matrix{T}
     const QinvM::Vector{Matrix{T}}
     const MtQinv::Vector{Matrix{T}}
     const negMtQinvM::Vector{Matrix{T}}
     cQ::T
     Sf_PD::DensePDMat{T}
-    const Lf::Matrix{T}
-    const negLtSL::Matrix{T}
-    const LtSinv::Matrix{T}
+    const Lf::Vector{Matrix{T}}
+    const negLtSL::Vector{Matrix{T}}
+    const LtSinv::Vector{Matrix{T}}
     cF::T
 end
 
@@ -267,16 +275,16 @@ function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
         PDMat(Matrix{T}(I, d, d)),
         zeros(T, d),
         [zeros(T, d, ux_dim) for _ in 1:nregimes],
-        zeros(T, n, ux_dim),
+        [zeros(T, n, ux_dim) for _ in 1:nregimes],
         zeros(T, d, d),
         [zeros(T, d, d) for _ in 1:nregimes],
         [zeros(T, d, d) for _ in 1:nregimes],
         [zeros(T, d, d) for _ in 1:nregimes],
         zero(T),
         PDMat(Matrix{T}(I, n, n)),
-        zeros(T, n, d),
-        zeros(T, d, d),
-        zeros(T, d, n),
+        [zeros(T, n, d) for _ in 1:nregimes],
+        [zeros(T, d, d) for _ in 1:nregimes],
+        [zeros(T, d, n) for _ in 1:nregimes],
         zero(T),
     )
 end
@@ -935,7 +943,8 @@ function free_state_model(
             "pair `[x; λ]`, so `latent_dim = 2n`. Got $(d)×$(d).",
         ),
     )
-    fit_flags.Bu_rows === nothing || throw(ArgumentError("Bu_rows is supported only in LQR mode"))
+    fit_flags.Bu_rows === nothing ||
+        throw(ArgumentError("Bu_rows is supported only in LQR mode"))
     n = d >> 1
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("free Σ rows", d, size(Σ, 1)))
@@ -1192,23 +1201,33 @@ function _refresh_tail!(
     # Terminal factor: 0 = Λf z_T − hf + ε,  Λf = [−Q_f  I].
     Σf_w = Matrix{T}(sm.Σf)
     c.Sf_PD = PDMat(Symmetrize!(Σf_w))
-    fill!(c.Lf, zero(T))
-    fill!(c.Ftrm, zero(T))
-    if sm.terminal
-        kf = isempty(sm.schedule) ? 1 : sm.schedule[end]
-        @views begin
-            c.Lf[:, 1:n] .= .-sm.Qc[kf]
-            for i in 1:n
-                c.Lf[i, n + i] = one(T)
-            end
-        end
-        # Terminal tracking: λ_T = Q_f (x_T - r_T), so the residual carries +Q_f G_r u_T.
-        size(c.Ftrm, 2) > 0 && mul!(c.Ftrm, sm.Qc[kf], sm.Gref)
+    for k in 1:_nregimes(sm)
+        fill!(c.Lf[k], zero(T))
+        fill!(c.Ftrm[k], zero(T))
+        fill!(c.negLtSL[k], zero(T))
+        fill!(c.LtSinv[k], zero(T))
     end
-    copyto!(c.LtSinv, transpose(c.Lf))
-    rdiv!(c.LtSinv, c.Sf_PD.chol)                # Λfᵀ Σf⁻¹  (d × n)
-    mul!(c.negLtSL, c.LtSinv, c.Lf)
-    c.negLtSL .*= -one(T)
+    if sm.terminal
+        for k in 1:_nregimes(sm)
+            Lf = c.Lf[k]
+            Ftrm = c.Ftrm[k]
+            LtSinv = c.LtSinv[k]
+            negLtSL = c.negLtSL[k]
+            @views begin
+                Lf[:, 1:n] .= .-sm.Qc[k]
+                for i in 1:n
+                    Lf[i, n + i] = one(T)
+                end
+            end
+            # Terminal tracking: λ_T = Q_k (x_T - r_T), so the residual
+            # carries +Q_k G_r u_T.
+            size(Ftrm, 2) > 0 && mul!(Ftrm, sm.Qc[k], sm.Gref)
+            copyto!(LtSinv, transpose(Lf))
+            rdiv!(LtSinv, c.Sf_PD.chol)             # Λfᵀ Σf⁻¹  (d × n)
+            mul!(negLtSL, LtSinv, Lf)
+            negLtSL .*= -one(T)
+        end
+    end
     c.cF = -T(0.5) * (T(n) * log(T(2π)) + logdet(c.Sf_PD))
 
     #= Last, so a variant is rebuilt only from a parent whose own cache is
@@ -1591,7 +1610,7 @@ function lqr_riccati_sequence(
     has_input = size(ux_mat, 1) > 0
 
     if sm.terminal
-        kT = isempty(sm.schedule) ? 1 : sm.schedule[end]
+        kT = _regime(sm, tsteps)
         copyto!(P[tsteps], sm.Qc[kT])
         copyto!(g[tsteps], sm.hf)
         # Terminal reference: λ_T = Q_f(x_T − r_T) + h_f, so g_T = h_f − Q_f r_T.

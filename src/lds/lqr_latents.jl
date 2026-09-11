@@ -87,9 +87,10 @@ origin. Only meaningful when `sm.terminal` is set.
     ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
     tsteps = size(x, 2)
-    @views mul!(out, sm.cache.Lf, x[:, tsteps])
-    if ux !== nothing && size(sm.cache.Ftrm, 2) > 0
-        @views mul!(out, sm.cache.Ftrm, ux[:, tsteps], one(T), one(T))
+    kf = _regime(sm, tsteps)
+    @views mul!(out, sm.cache.Lf[kf], x[:, tsteps])
+    if ux !== nothing && size(sm.cache.Ftrm[kf], 2) > 0
+        @views mul!(out, sm.cache.Ftrm[kf], ux[:, tsteps], one(T), one(T))
     end
     out .-= sm.hf
     return out
@@ -196,10 +197,11 @@ function _state_gradient!(
 
     if sm.terminal
         n = _plant_dim(sm)
+        kf = _regime(sm, tsteps)
         rf = view(dxt, 1:n)
         _terminal_residual!(rf, sm, x, ux)
         # −Λfᵀ Σf⁻¹ r, accumulated onto the last column.
-        @views mul!(grad[:, tsteps], c.LtSinv, rf, -one(T), one(T))
+        @views mul!(grad[:, tsteps], c.LtSinv[kf], rf, -one(T), one(T))
     end
 
     return grad
@@ -228,7 +230,7 @@ function _state_hessian_blocks!(
         btd.H_diag[t] .= c.negMtQinvM[_regime(sm, t)] .+ c.negQinv
     end
     btd.H_diag[tsteps] .= c.negQinv
-    sm.terminal && (btd.H_diag[tsteps] .+= c.negLtSL)
+    sm.terminal && (btd.H_diag[tsteps] .+= c.negLtSL[_regime(sm, tsteps)])
 
     return nothing
 end

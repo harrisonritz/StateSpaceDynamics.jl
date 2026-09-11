@@ -56,8 +56,10 @@ path's `dyn_*` triple, over the regressor `[z_t; 1; u_t]`:
 - `yy[k]`: `Σ_{t∈R_k} E[z_{t+1} z_{t+1}ᵀ]`          (`2n × 2n`)
 - `nk[k]`: how many transitions regime `k` owns
 
-`term_zz` / `term_n` hold `Σ_n E[[z_T;1;u_T][z_T;1;u_T]ᵀ]` and the trial count,
-the statistics of the terminal factor — the input block carries its reference.
+`term_zz[k]` / `term_n[k]` hold
+`Σ_{n: k(T_n)=k} E[[z_T;1;u_T][z_T;1;u_T]ᵀ]` and the corresponding
+trial count. Keeping these statistics per terminal cost regime is required for
+ragged trials, whose endpoints can land on different schedule entries.
 
 `Zw` / `Xv` / `Yv` / `Omega` are the *mixed-coordinate* blocks derived from those
 by [`_fill_mixed_blocks!`](@ref) at the start of each M-step; they live here
@@ -69,13 +71,13 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     const zy::Vector{Matrix{T}}
     const yy::Vector{Matrix{T}}
     const nk::Vector{T}
-    const term_zz::Matrix{T}
-    term_n::T
+    const term_zz::Vector{Matrix{T}}
+    const term_n::Vector{T}
     # Mixed-coordinate blocks (derived; see `_fill_mixed_blocks!`).
     const Zw::Vector{Matrix{T}}
     const Xv::Vector{Matrix{T}}
     const Yv::Matrix{T}
-    const Omega::Matrix{T}
+    const Omega::Vector{Matrix{T}}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -118,12 +120,12 @@ function _wrap_lqr_suff_stats(
         [zeros(T, reg, d) for _ in 1:K],
         [zeros(T, d, d) for _ in 1:K],
         zeros(T, K),
-        zeros(T, d + 1 + m, d + 1 + m),
-        zero(T),
+        [zeros(T, d + 1 + m, d + 1 + m) for _ in 1:K],
+        zeros(T, K),
         [zeros(T, reg, reg) for _ in 1:K],
         [zeros(T, d, reg) for _ in 1:K],
         zeros(T, d, d),
-        zeros(T, d + 1 + m, d + 1 + m),
+        [zeros(T, d + 1 + m, d + 1 + m) for _ in 1:K],
     )
 end
 
@@ -189,8 +191,10 @@ function _aggregate_lqr_stats!(
         fill!(hs.yy[k], zero(T))
         hs.nk[k] = zero(T)
     end
-    fill!(hs.term_zz, zero(T))
-    hs.term_n = zero(T)
+    for k in 1:K
+        fill!(hs.term_zz[k], zero(T))
+        hs.term_n[k] = zero(T)
+    end
 
     for trial in trials
         fs = tfs[trial]
@@ -248,28 +252,27 @@ function _aggregate_lqr_stats!(
         `+Q_f G_r u_T`.
         =#
         if sm.terminal
+            kT = _regime(sm, T_n)
+            term_zz = hs.term_zz[kT]
             xT = tview(x, :, T_n)
-            BLAS.ger!(one(T), xT, xT, tview(hs.term_zz, 1:d, 1:d))
-            @views hs.term_zz[1:d, 1:d] .+= p_smooth[:, :, T_n]
+            BLAS.ger!(one(T), xT, xT, tview(term_zz, 1:d, 1:d))
+            @views term_zz[1:d, 1:d] .+= p_smooth[:, :, T_n]
             for i in 1:d
-                hs.term_zz[i, d + 1] += x[i, T_n]
+                term_zz[i, d + 1] += x[i, T_n]
             end
             if m > 0
                 uT = tview(ux, :, T_n)
                 @views mul!(
-                    hs.term_zz[1:d, (d + 2):(d + 1 + m)], xT, transpose(uT), one(T), one(T)
+                    term_zz[1:d, (d + 2):(d + 1 + m)], xT, transpose(uT), one(T), one(T)
                 )
                 BLAS.ger!(
-                    one(T),
-                    uT,
-                    uT,
-                    tview(hs.term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)),
+                    one(T), uT, uT, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m))
                 )
                 for j in 1:m
-                    hs.term_zz[d + 1, d + 1 + j] += ux[j, T_n]
+                    term_zz[d + 1, d + 1 + j] += ux[j, T_n]
                 end
             end
-            hs.term_n += one(T)
+            hs.term_n[kT] += one(T)
         end
     end
 
@@ -300,13 +303,16 @@ function _finalize_lqr_stats!(
         LinearAlgebra.copytri!(hs.yy[k], 'U')
     end
     if sm.terminal
-        @views hs.term_zz[d + 1, 1:d] .= hs.term_zz[1:d, d + 1]
-        hs.term_zz[d + 1, d + 1] = hs.term_n
-        if m > 0
-            ur = (d + 2):(d + 1 + m)
-            @views hs.term_zz[ur, 1:d] .= transpose(hs.term_zz[1:d, ur])
-            @views hs.term_zz[ur, d + 1] .= hs.term_zz[d + 1, ur]
-            LinearAlgebra.copytri!(tview(hs.term_zz, ur, ur), 'U')
+        for k in 1:K
+            term_zz = hs.term_zz[k]
+            @views term_zz[d + 1, 1:d] .= term_zz[1:d, d + 1]
+            term_zz[d + 1, d + 1] = hs.term_n[k]
+            if m > 0
+                ur = (d + 2):(d + 1 + m)
+                @views term_zz[ur, 1:d] .= transpose(term_zz[1:d, ur])
+                @views term_zz[ur, d + 1] .= term_zz[d + 1, ur]
+                LinearAlgebra.copytri!(tview(term_zz, ur, ur), 'U')
+            end
         end
     end
     return hs
@@ -350,8 +356,10 @@ function _aggregate_lqr_stats_weighted!(
         fill!(hs.yy[k], zero(T))
         hs.nk[k] = zero(T)
     end
-    fill!(hs.term_zz, zero(T))
-    hs.term_n = zero(T)
+    for k in 1:K
+        fill!(hs.term_zz[k], zero(T))
+        hs.term_n[k] = zero(T)
+    end
 
     for trial in 1:length(tfs)
         fs = tfs[trial]
@@ -414,26 +422,25 @@ function _aggregate_lqr_stats_weighted!(
         if sm.terminal
             wT = w[T_n]::T
             if !iszero(wT)
+                kT = _regime(sm, T_n)
+                term_zz = hs.term_zz[kT]
                 xT = tview(x, :, T_n)
-                BLAS.ger!(wT, xT, xT, tview(hs.term_zz, 1:d, 1:d))
-                @views hs.term_zz[1:d, 1:d] .+= wT .* p_smooth[:, :, T_n]
+                BLAS.ger!(wT, xT, xT, tview(term_zz, 1:d, 1:d))
+                @views term_zz[1:d, 1:d] .+= wT .* p_smooth[:, :, T_n]
                 for i in 1:d
-                    hs.term_zz[i, d + 1] += wT * x[i, T_n]
+                    term_zz[i, d + 1] += wT * x[i, T_n]
                 end
                 if m > 0
                     uT = tview(ux, :, T_n)
-                    BLAS.ger!(wT, xT, uT, tview(hs.term_zz, 1:d, (d + 2):(d + 1 + m)))
+                    BLAS.ger!(wT, xT, uT, tview(term_zz, 1:d, (d + 2):(d + 1 + m)))
                     BLAS.ger!(
-                        wT,
-                        uT,
-                        uT,
-                        tview(hs.term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)),
+                        wT, uT, uT, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m))
                     )
                     for j in 1:m
-                        hs.term_zz[d + 1, d + 1 + j] += wT * uT[j]
+                        term_zz[d + 1, d + 1 + j] += wT * uT[j]
                     end
                 end
-                hs.term_n += wT
+                hs.term_n[kT] += wT
             end
         end
     end
@@ -473,7 +480,9 @@ function _fill_mixed_blocks!(
         copyto!(hs.Zw[1], hs.zz[1])
         copyto!(hs.Xv[1], transpose(hs.zy[1]))
         copyto!(hs.Yv, hs.yy[1])
-        copyto!(hs.Omega, hs.term_zz)
+        for k in 1:K
+            copyto!(hs.Omega[k], hs.term_zz[k])
+        end
         return hs
     end
 
@@ -529,7 +538,9 @@ function _fill_mixed_blocks!(
         end
     end
 
-    copyto!(hs.Omega, hs.term_zz)
+    for k in 1:K
+        copyto!(hs.Omega[k], hs.term_zz[k])
+    end
     return hs
 end
 
@@ -566,10 +577,12 @@ state is just a different count of copies per block, rather than a different
 problem. A version-major layout (one full copy of every block per version, which
 is what this was) can only express "all blocks shared" or "no blocks shared".
 
-`S` and `Qc` store square factors `L`, with the actual matrices `L Lᵀ`.
-This keeps every optimizer iterate positive semidefinite, including for grouped
-and switching fits. Initialize free blocks positive definite to avoid the
-zero-gradient stationary point of a zero factor.
+`S` and `Qc` store the lower triangle of a Cholesky factor `L`, with a
+log-parameterized positive diagonal and actual matrices `L Lᵀ`. This uses the
+identifiable `n(n+1)/2` coordinates of a positive-definite matrix rather than a
+redundant `n²` square factor. A fitted block must start positive definite; exact
+singular costs remain supported when frozen, but are rejected when fitting
+instead of silently becoming rank-locked.
 
 A frozen block (see [`LQRFitFlags`](@ref)) has width zero and is neither
 packed nor updated, so freezing shrinks the problem rather than projecting its
@@ -618,9 +631,9 @@ Slots holding regime `k` of copy `v` of the cost block.
 """
 @inline function _lqr_blk_q(p::_LQRPack, v::Int, k::Int)
     p.w[_LQR_BLOCK_Q] == 0 && return 1:0
-    nn = p.n * p.n
-    off = p.base[_LQR_BLOCK_Q] + (v - 1) * p.w[_LQR_BLOCK_Q] + (k - 1) * nn
-    return (off + 1):(off + nn)
+    nc = p.n * (p.n + 1) ÷ 2
+    off = p.base[_LQR_BLOCK_Q] + (v - 1) * p.w[_LQR_BLOCK_Q] + (k - 1) * nc
+    return (off + 1):(off + nc)
 end
 
 function _LQRPack(sm::LQRStateModel)
@@ -647,10 +660,11 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
     gcols = _gref_cols(f, m)
     bcols = _bu_cols(f, m)
     brows = _bu_rows(f, d)
+    nc = n * (n + 1) ÷ 2
     w = (
         f.A ? n * n : 0,
-        f.S ? n * n : 0,
-        f.Qc ? K * n * n : 0,
+        f.S ? nc : 0,
+        f.Qc ? K * nc : 0,
         f.h ? d : 0,
         length(brows) * length(bcols),
         n * length(gcols),
@@ -662,7 +676,9 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
         bases[b] = pos
         pos += nv[b] * w[b]
     end
-    return _LQRPack(n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols, brows)
+    return _LQRPack(
+        n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols, brows
+    )
 end
 
 """
@@ -724,7 +740,7 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     N_A::Vector{T}                   # transitions per `A` copy (Jacobian weight)
     N_q::Vector{T}                   # transitions per noise version
     Nf_q::Vector{T}                  # terminal factors per noise version
-    kf::Int
+    active_q::BitVector              # noise versions with a meaningful effective count
     Sinv::Vector{Matrix{T}}
     Sfinv::Vector{Matrix{T}}
     # unpacked parameters, per block copy
@@ -736,7 +752,7 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     Gref::Vector{Matrix{T}}
     hf::Vector{Vector{T}}
     Theta::Vector{Vector{Matrix{T}}}  # [unit][regime]
-    Psi::Vector{Matrix{T}}            # [unit]
+    Psi::Vector{Vector{Matrix{T}}}    # [unit][terminal regime]
     R::Vector{Matrix{T}}              # [noise version], pooled
     Rf::Vector{Matrix{T}}             # [noise version], pooled
     # preallocated evaluation scratch
@@ -807,8 +823,10 @@ function _pool_lqr_stats(sufs::AbstractVector, idx::AbstractVector{Int})
             out.nk[k] += s.nk[k]
         end
         out.Yv .+= s.Yv
-        out.Omega .+= s.Omega
-        out.term_n += s.term_n
+        for k in eachindex(out.Omega)
+            out.Omega[k] .+= s.Omega[k]
+            out.term_n[k] += s.term_n[k]
+        end
     end
     return out
 end
@@ -934,11 +952,26 @@ function _LQRMStepCtx(
     N_q = zeros(T, nq)
     Nf_q = zeros(T, nq)
     for u in units
-        N_A[u.v[_LQR_BLOCK_A]] += u.n
         N_q[u.q] += u.n
-        sm1.terminal && (Nf_q[u.q] += u.hs.term_n)
+        sm1.terminal && (Nf_q[u.q] += sum(u.hs.term_n))
     end
-    kf = (sm1.terminal && !isempty(sm1.schedule)) ? sm1.schedule[end] : 1
+    count_tol = sqrt(eps(T)) * max(maximum(N_q; init=zero(T)), one(T))
+    active_q = BitVector(N_q .> count_tol)
+    inactive = findall(!, active_q)
+    if !isempty(inactive) && any(active_q)
+        @warn(
+            "ignoring inverse-LQR noise versions with negligible effective " *
+                "transition count; their parameters will be left unchanged",
+            inactive_versions = inactive,
+            effective_counts = N_q[inactive],
+            threshold = count_tol,
+            maxlog = 3,
+        )
+    end
+    for u in units
+        active_q[u.q] || continue
+        N_A[u.v[_LQR_BLOCK_A]] += u.n
+    end
 
     #=
     Which models use each copy of each block. Two jobs: a frozen block reads its
@@ -984,7 +1017,7 @@ function _LQRMStepCtx(
         N_A,
         N_q,
         Nf_q,
-        kf,
+        active_q,
         Sinv,
         Sfinv,
         [Matrix{T}(undef, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
@@ -995,7 +1028,7 @@ function _LQRMStepCtx(
         [Matrix{T}(undef, n, m) for _ in 1:nv[_LQR_BLOCK_G]],
         [Vector{T}(undef, n) for _ in 1:nv[_LQR_BLOCK_F]],
         [[zeros(T, d, reg) for _ in 1:K] for _ in 1:U],
-        [zeros(T, n, reg) for _ in 1:U],
+        [[zeros(T, n, reg) for _ in 1:K] for _ in 1:U],
         [Matrix{T}(undef, d, d) for _ in 1:nq],
         [Matrix{T}(undef, n, n) for _ in 1:nq],
         [zeros(T, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
@@ -1029,21 +1062,45 @@ Length of the flat parameter vector.
 @inline _lqr_nparams(ctx::_LQRMStepCtx) = ctx.pack.np
 
 function _lqr_pack_psd!(θ, r, matrix, name)
-    # Symmetry alone describes a Hamiltonian system, not a convex LQR problem.
-    # Keep old indefinite models readable, but refuse to fit them as LQR.
-    E = eigen(Symmetric(Matrix(matrix)))
-    tolerance = 100 * eps(eltype(matrix)) * max(one(eltype(matrix)), maximum(abs, E.values))
-    minimum(E.values) >= -tolerance || throw(
+    isempty(r) && return θ
+    # A frozen cost may be exactly singular, but a fitted one cannot be packed
+    # into an interior Cholesky parameterization without changing the incoming
+    # model (and hence the generalized-EM acceptance baseline).
+    F = cholesky(Symmetric(Matrix(matrix)); check=false)
+    issuccess(F) || throw(
         ArgumentError(
-            "$name must be positive semidefinite to fit an LQR model; " *
-            "restart from a valid initialization (minimum eigenvalue $(minimum(E.values)))",
+            "$name must be positive definite when it is fitted. A singular " *
+            "`L*L'` initialization is rank-locked and cannot discover missing " *
+            "cost directions; add a small diagonal initialization or freeze this block.",
         ),
     )
-    if !isempty(r)
-        factor = E.vectors * Diagonal(sqrt.(max.(E.values, zero(eltype(matrix)))))
-        copyto!(view(θ, r), vec(factor))
+    L = F.L
+    q = first(r)
+    for j in axes(L, 2), i in j:size(L, 1)
+        θ[q] = i == j ? log(L[i, j]) : L[i, j]
+        q += 1
     end
     return θ
+end
+
+@inline function _lqr_unpack_psd!(matrix, factor, θ, r)
+    fill!(factor, zero(eltype(factor)))
+    q = first(r)
+    for j in axes(factor, 2), i in j:size(factor, 1)
+        factor[i, j] = i == j ? exp(θ[q]) : θ[q]
+        q += 1
+    end
+    mul!(matrix, factor, transpose(factor))
+    return matrix
+end
+
+@inline function _lqr_pack_psd_gradient!(grad, r, dL, L)
+    q = first(r)
+    for j in axes(L, 2), i in j:size(L, 1)
+        grad[q] = i == j ? dL[i, j] * L[i, j] : dL[i, j]
+        q += 1
+    end
+    return grad
 end
 
 """
@@ -1073,7 +1130,10 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_LQR_BLOCK_B])
         r = _lqr_blk(p, _LQR_BLOCK_B, v)
-        isempty(r) || copyto!(view(θ, r), vec(view(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu, p.brows, p.bcols)))
+        isempty(r) || copyto!(
+            view(θ, r),
+            vec(view(ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu, p.brows, p.bcols)),
+        )
     end
     for v in 1:(p.nv[_LQR_BLOCK_G])
         r = _lqr_blk(p, _LQR_BLOCK_G, v)
@@ -1111,8 +1171,8 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         if isempty(r)
             copyto!(ctx.S[v], ctx.sms[first(o[_LQR_BLOCK_S][v])].S)
         else
-            factor = reshape(view(θ, r), n, n)
-            mul!(ctx.S[v], factor, transpose(factor))
+            factor = view(ctx.tmp_dd, 1:n, 1:n)
+            _lqr_unpack_psd!(ctx.S[v], factor, θ, r)
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
@@ -1120,8 +1180,8 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         if isempty(r)
             copyto!(ctx.Qc[v][k], ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k])
         else
-            factor = reshape(view(θ, r), n, n)
-            mul!(ctx.Qc[v][k], factor, transpose(factor))
+            factor = view(ctx.tmp_dd, 1:n, 1:n)
+            _lqr_unpack_psd!(ctx.Qc[v][k], factor, θ, r)
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
@@ -1137,7 +1197,8 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
             r = _lqr_blk(p, _LQR_BLOCK_B, v)
             copyto!(ctx.Bu[v], ctx.sms[first(o[_LQR_BLOCK_B][v])].Bu)
             isempty(r) || copyto!(
-                view(ctx.Bu[v], p.brows, p.bcols), reshape(view(θ, r), length(p.brows), length(p.bcols))
+                view(ctx.Bu[v], p.brows, p.bcols),
+                reshape(view(θ, r), length(p.brows), length(p.bcols)),
             )
         end
         for v in 1:(p.nv[_LQR_BLOCK_G])
@@ -1188,17 +1249,20 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             end
         end
         if terminal
-            Psi = ctx.Psi[ui]
-            Qf = Qs[ctx.kf]
-            @views begin
-                Psi[:, xr] .= .-Qf
-                fill!(Psi[:, lr], zero(T))
-                for i in 1:n
-                    Psi[i, n + i] = one(T)
+            for k in 1:(p.K)
+                Psi = ctx.Psi[ui][k]
+                Qf = Qs[k]
+                @views begin
+                    Psi[:, xr] .= .-Qf
+                    fill!(Psi[:, lr], zero(T))
+                    for i in 1:n
+                        Psi[i, n + i] = one(T)
+                    end
+                    Psi[:, d + 1] .= .-ctx.hf[u.v[_LQR_BLOCK_F]]
+                    # Terminal reference: the residual carries +Q_f G_r u_T.
+                    m > 0 &&
+                        mul!(Psi[:, (d + 2):(d + 1 + m)], Qf, ctx.Gref[u.v[_LQR_BLOCK_G]])
                 end
-                Psi[:, d + 1] .= .-ctx.hf[u.v[_LQR_BLOCK_F]]
-                # Terminal reference: the residual carries +Q_f G_r u_T.
-                m > 0 && mul!(Psi[:, (d + 2):(d + 1 + m)], Qf, ctx.Gref[u.v[_LQR_BLOCK_G]])
             end
         end
     end
@@ -1226,6 +1290,7 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     TZ = ctx.tmp_dr
     PO = ctx.tmp_nr
     for (ui, u) in enumerate(ctx.units)
+        ctx.active_q[u.q] || continue
         hs = u.hs
         R = ctx.R[u.q]
         R .+= hs.Yv
@@ -1239,9 +1304,12 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             mul!(R, TZ, transpose(Th), one(T), one(T))
         end
         if terminal
-            Psi = ctx.Psi[ui]
-            mul!(PO, Psi, hs.Omega)
-            mul!(ctx.Rf[u.q], PO, transpose(Psi), one(T), one(T))
+            for k in 1:(p.K)
+                hs.term_n[k] > zero(T) || continue
+                Psi = ctx.Psi[ui][k]
+                mul!(PO, Psi, hs.Omega[k])
+                mul!(ctx.Rf[u.q], PO, transpose(Psi), one(T), one(T))
+            end
         end
     end
     for s in 1:(ctx.nq)
@@ -1283,13 +1351,15 @@ function _lqr_fg!(
     _lqr_assemble!(ctx)
     _lqr_residuals!(ctx)
 
+    Fq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
+    Ffq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
     for s in 1:(ctx.nq)
+        ctx.active_q[s] || continue
         if ctx.profile
             chol = cholesky(Symmetric(ctx.R[s]); check=false)
             issuccess(chol) || return T(Inf)
             fval += T(0.5) * ctx.N_q[s] * logdet(chol)
-            copyto!(ctx.W[s], inv(chol))
-            ctx.W[s] .*= ctx.N_q[s]
+            Fq[s] = chol
         else
             fval += T(0.5) * dot(ctx.Sinv[s], ctx.R[s])
             copyto!(ctx.W[s], ctx.Sinv[s])
@@ -1299,8 +1369,7 @@ function _lqr_fg!(
                 cholf = cholesky(Symmetric(ctx.Rf[s]); check=false)
                 issuccess(cholf) || return T(Inf)
                 fval += T(0.5) * ctx.Nf_q[s] * logdet(cholf)
-                copyto!(ctx.Wf[s], inv(cholf))
-                ctx.Wf[s] .*= ctx.Nf_q[s]
+                Ffq[s] = cholf
             else
                 fval += T(0.5) * dot(ctx.Sfinv[s], ctx.Rf[s])
                 copyto!(ctx.Wf[s], ctx.Sfinv[s])
@@ -1339,13 +1408,19 @@ function _lqr_fg!(
     PO = ctx.tmp_nr
     GP = ctx.tmp_nr2
     for (ui, u) in enumerate(ctx.units)
-        Ws = ctx.W[u.q]
+        ctx.active_q[u.q] || continue
         vA, vS, vQ = u.v[_LQR_BLOCK_A], u.v[_LQR_BLOCK_S], u.v[_LQR_BLOCK_Q]
         vh, vB, vG = u.v[_LQR_BLOCK_H], u.v[_LQR_BLOCK_B], u.v[_LQR_BLOCK_G]
         for k in 1:K
             copyto!(E, u.hs.Xv[k])
             mul!(E, ctx.Theta[ui][k], u.hs.Zw[k], one(T), -one(T))
-            mul!(Gk, Ws, E)
+            if ctx.profile
+                copyto!(Gk, E)
+                ldiv!(Fq[u.q], Gk)
+                Gk .*= ctx.N_q[u.q]
+            else
+                mul!(Gk, ctx.W[u.q], E)
+            end
             @views begin
                 ctx.dA[vA] .+= Gk[xr, xr]
                 ctx.dA[vA] .+= transpose(Gk[lr, lr])
@@ -1368,24 +1443,38 @@ function _lqr_fg!(
             end
         end
         if terminal && ctx.Nf_q[u.q] > zero(T)
-            # ∂/∂Ψ of the terminal term; Ψ = [−Q_f  I  −h_f  Q_f G_r].
-            mul!(PO, ctx.Psi[ui], u.hs.Omega)
-            mul!(GP, ctx.Wf[u.q], PO)
-            @views begin
-                ctx.dQ[vQ][ctx.kf] .-= GP[:, xr]
-                if m > 0
-                    dPu = GP[:, (d + 2):(d + 1 + m)]
-                    mul!(ctx.dQ[vQ][ctx.kf], dPu, transpose(ctx.Gref[vG]), one(T), one(T))
-                    mul!(ctx.dG[vG], ctx.Qc[vQ][ctx.kf], dPu, one(T), one(T))
+            # ∂/∂Ψ_k of each terminal-regime term;
+            # Ψ_k = [−Q_k  I  −h_f  Q_k G_r].
+            for k in 1:K
+                u.hs.term_n[k] > zero(T) || continue
+                mul!(PO, ctx.Psi[ui][k], u.hs.Omega[k])
+                if ctx.profile
+                    copyto!(GP, PO)
+                    ldiv!(Ffq[u.q], GP)
+                    GP .*= ctx.Nf_q[u.q]
+                else
+                    mul!(GP, ctx.Wf[u.q], PO)
                 end
-                ctx.dhf[u.v[_LQR_BLOCK_F]] .-= GP[:, d + 1]
+                @views begin
+                    ctx.dQ[vQ][k] .-= GP[:, xr]
+                    if m > 0
+                        dPu = GP[:, (d + 2):(d + 1 + m)]
+                        mul!(ctx.dQ[vQ][k], dPu, transpose(ctx.Gref[vG]), one(T), one(T))
+                        mul!(ctx.dG[vG], ctx.Qc[vQ][k], dPu, one(T), one(T))
+                    end
+                    ctx.dhf[u.v[_LQR_BLOCK_F]] .-= GP[:, d + 1]
+                end
             end
         end
     end
 
     for a in 1:nA
         # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_aâ»áµ€.
-        copyto!(ctx.tmp_nn, transpose(inv(F[a])))
+        fill!(ctx.tmp_nn, zero(T))
+        for i in 1:n
+            ctx.tmp_nn[i, i] = one(T)
+        end
+        ldiv!(adjoint(F[a]), ctx.tmp_nn)
         ctx.dA[a] .-= ctx.N_A[a] .* ctx.tmp_nn
         r = _lqr_blk(p, _LQR_BLOCK_A, a)
         isempty(r) || copyto!(view(grad, r), vec(ctx.dA[a]))
@@ -1395,26 +1484,20 @@ function _lqr_fg!(
         if !isempty(r)
             # For S = L Lᵀ, dF/dL = (dF/dS + (dF/dS)ᵀ) L.
             _sym!(ctx.tmp_nn, ctx.dS[v])
-            mul!(
-                reshape(view(grad, r), n, n),
-                ctx.tmp_nn,
-                reshape(view(θ, r), n, n),
-                T(2),
-                zero(T),
-            )
+            factor = view(ctx.tmp_dd, 1:n, 1:n)
+            _lqr_unpack_psd!(ctx.S[v], factor, θ, r)
+            mul!(ctx.dS[v], ctx.tmp_nn, factor, T(2), zero(T))
+            _lqr_pack_psd_gradient!(grad, r, ctx.dS[v], factor)
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
         r = _lqr_blk_q(p, v, k)
         if !isempty(r)
             _sym!(ctx.tmp_nn, ctx.dQ[v][k])
-            mul!(
-                reshape(view(grad, r), n, n),
-                ctx.tmp_nn,
-                reshape(view(θ, r), n, n),
-                T(2),
-                zero(T),
-            )
+            factor = view(ctx.tmp_dd, 1:n, 1:n)
+            _lqr_unpack_psd!(ctx.Qc[v][k], factor, θ, r)
+            mul!(ctx.dQ[v][k], ctx.tmp_nn, factor, T(2), zero(T))
+            _lqr_pack_psd_gradient!(grad, r, ctx.dQ[v][k], factor)
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
@@ -1503,7 +1586,24 @@ function _lqr_structure_mstep!(
             if isfinite(f1) && f1 <= f0
                 _lqr_writeback!(ctx, θ1)
                 copyto!(θ0, θ1)
+            else
+                @warn(
+                    "inverse-LQR structural M-step produced no acceptable proposal; " *
+                        "keeping the previous structure",
+                    initial_objective = f0,
+                    proposed_objective = f1,
+                    optimizer_converged = Optim.converged(result),
+                    maxlog = 3,
+                )
             end
+        else
+            @warn(
+                "inverse-LQR structural M-step has a non-finite initial objective; " *
+                    "keeping the previous structure",
+                initial_objective = f0,
+                active_noise_versions = findall(ctx.active_q),
+                maxlog = 3,
+            )
         end
     end
 
@@ -1528,6 +1628,7 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     reach all of them.
     =#
     for s in 1:(ctx.nq)
+        ctx.active_q[s] || continue
         for (c, sm) in enumerate(ctx.sms)
             ctx.q_of[c] == s || continue
             if ctx.N_q[s] > zero(T)
@@ -1704,6 +1805,66 @@ end
 # ============================================================================
 
 """
+    _lqr_current_residuals(sm, hs) -> (R, Rf)
+
+Residual scatters at the model's exact stored parameters. This is the lightweight
+ELBO path: unlike the structural optimizer context it does not repack PSD blocks,
+allocate gradient storage, or reconstruct parameters from an optimization
+vector. `Rf` sums one terminal design against each endpoint regime's statistics.
+"""
+function _lqr_current_residuals(
+    sm::LQRStateModel{T}, hs::LQRSufficientStatistics{T}
+) where {T<:Real}
+    n = _plant_dim(sm)
+    d = 2n
+    K = _nregimes(sm)
+    m = size(sm.Bu, 2)
+    reg = d + 1 + m
+    xr, lr = 1:n, (n + 1):d
+
+    R = copy(hs.Yv)
+    for k in 1:K
+        Th = zeros(T, d, reg)
+        @views begin
+            Th[xr, xr] .= sm.A
+            Th[xr, lr] .= .-sm.S
+            Th[lr, xr] .= sm.Qc[k]
+            Th[lr, lr] .= transpose(sm.A)
+            Th[:, d + 1] .= sm.h
+            if m > 0
+                Bcol = Th[:, (d + 2):reg]
+                Bcol .= sm.Bu
+                mul!(Bcol[lr, :], sm.Qc[k], sm.Gref, -one(T), one(T))
+            end
+        end
+        TX = Th * transpose(hs.Xv[k])
+        R .-= TX
+        R .-= transpose(TX)
+        R .+= Th * hs.Zw[k] * transpose(Th)
+    end
+    Symmetrize!(R)
+
+    Rf = zeros(T, n, n)
+    if sm.terminal
+        for k in 1:K
+            hs.term_n[k] > zero(T) || continue
+            Psi = zeros(T, n, reg)
+            @views begin
+                Psi[:, xr] .= .-sm.Qc[k]
+                for i in 1:n
+                    Psi[i, n + i] = one(T)
+                end
+                Psi[:, d + 1] .= .-sm.hf
+                m > 0 && mul!(Psi[:, (d + 2):reg], sm.Qc[k], sm.Gref)
+            end
+            Rf .+= Psi * hs.Omega[k] * transpose(Psi)
+        end
+        Symmetrize!(Rf)
+    end
+    return R, Rf
+end
+
+"""
     Q_state!(sws, lds, hs) -> T
 
 State-side expected complete-data log-likelihood for an LQR LDS:
@@ -1764,29 +1925,21 @@ function Q_state!(
     =#
     _fill_mixed_blocks!(hs, sm)
 
-    # Transition term, in mixed coordinates, at the model's current parameters.
-    ctx = _LQRMStepCtx(hs, sm, false)
-    θ = zeros(T, _lqr_nparams(ctx))
-    _lqr_pack!(θ, ctx)
-    _lqr_unpack!(ctx, θ)
-    _lqr_assemble!(ctx)
-    _lqr_residuals!(ctx)
+    # Transition term, in mixed coordinates, at the exact current parameters.
+    R, Rf = _lqr_current_residuals(sm, hs)
+    N = sum(hs.nk)
 
-    # One unit and one noise version here: `Q_state!` is always called per cell.
-    if ctx.N_q[1] > zero(T)
+    if N > zero(T)
         Σ_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σ)))
         Q_val +=
-            T(-0.5) * (
-                ctx.N_q[1] * (T(d) * log2π + logdet(Σ_PD) - T(2) * sm.cache.logabsdetA) +
-                dot(ctx.Sinv[1], ctx.R[1])
-            )
+            T(-0.5) *
+            (N * (T(d) * log2π + logdet(Σ_PD) - T(2) * sm.cache.logabsdetA) + tr(Σ_PD \ R))
     end
 
-    if sm.terminal && ctx.Nf_q[1] > zero(T)
+    Nf = sum(hs.term_n)
+    if sm.terminal && Nf > zero(T)
         Σf_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σf)))
-        Q_val +=
-            T(-0.5) *
-            (ctx.Nf_q[1] * (T(n) * log2π + logdet(Σf_PD)) + dot(ctx.Sfinv[1], ctx.Rf[1]))
+        Q_val += T(-0.5) * (Nf * (T(n) * log2π + logdet(Σf_PD)) + tr(Σf_PD \ Rf))
     end
 
     return Q_val

@@ -417,6 +417,7 @@ using SSDTest
             @testset "M-step" begin
                 test_lqr_mstep_objective_and_gradient()
                 test_lqr_mstep_freezing()
+                test_lqr_singular_fitted_psd_rejected()
                 test_lqr_plant_only_inputs()
                 test_lqr_mstep_preserves_structure()
                 test_lqr_em_monotone()
@@ -484,6 +485,7 @@ using SSDTest
             test_slds_lqr_prior_vs_optimal_data()
             test_slds_lqr_rand()
             test_slds_lqr_noise_version_lookup()
+            test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
             test_lqr_pair_slots()
         end

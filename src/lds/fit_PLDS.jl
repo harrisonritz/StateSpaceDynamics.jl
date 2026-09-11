@@ -1039,6 +1039,7 @@ function _fit_laplace!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     monitor=nothing,
+    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
 
@@ -1088,6 +1089,13 @@ function _fit_laplace!(
             return _fit_result(monitor, elbos, plds)
         end
 
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, plds)
+        end
+
         # M-step: update state-side suff-stats from suf, update Poisson emission via LBFGS
         mstep!(plds, suf, tfs, data, sws_pool)
 
@@ -1095,7 +1103,7 @@ function _fit_laplace!(
         prog !== nothing && next!(prog)
 
         # check convergence
-        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if converged
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, plds)
@@ -1338,6 +1346,7 @@ function _fit_plds_grouped!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     monitor=nothing,
+    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
     state = _grouped_fit_state(plds, data, grp, sws_pool)
@@ -1367,6 +1376,13 @@ function _fit_plds_grouped!(
             return _fit_result(monitor, elbos, plds)
         end
 
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, plds)
+        end
+
         _grouped_state_mstep!(
             state.cell_lds,
             _state_sufs(state.sufs),
@@ -1378,7 +1394,7 @@ function _fit_plds_grouped!(
 
         prog !== nothing && next!(prog)
 
-        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if converged
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, plds)

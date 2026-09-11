@@ -640,6 +640,49 @@ function test_slds_lqr_noise_version_lookup()
     return nothing
 end
 
+"""An empty untied noise version contributes no objective or gradient and must
+not make the joint profiled structural objective infinite."""
+function test_slds_lqr_zero_count_noise_version()
+    p, tsteps = 4, 24
+    q1 = [0.25 0.04; 0.04 0.18]
+    q2 = [0.9 0.0; 0.0 0.7]
+    lds1 = hslds_state(q1; p=p)
+    lds2 = hslds_state(q2; p=p)
+    ys = hslds_data(p, tsteps, 3)
+    _, tfs, data, _ = lqr_estep_stats(lds1, ys)
+
+    function weighted(lds, value)
+        hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+        SSD._aggregate_lqr_stats_weighted!(
+            hs, tfs, lds, data, [fill(value, tsteps) for _ in eachindex(ys)]
+        )
+        SSD._fill_mixed_blocks!(hs, lds.state_model)
+        return hs
+    end
+
+    full = weighted(lds1, 1.0)
+    empty = weighted(lds2, 0.0)
+    sms = [lds1.state_model, lds2.state_model]
+    slots = SSD._lqr_block_slots(Symbol[], 2)
+    ctx = SSD._LQRMStepCtx([full, empty], sms, slots, [1, 2], true)
+    @test ctx.active_q == [true, false]
+
+    θ = zeros(ctx.pack.np)
+    SSD._lqr_pack!(θ, ctx)
+    g = similar(θ)
+    f = SSD._lqr_fg!(g, θ, ctx)
+    @test isfinite(f)
+    for b in 1:(SSD._LQR_BLOCK_N)
+        @test all(iszero, g[SSD._lqr_blk(ctx.pack, b, 2)])
+    end
+
+    one_ctx = SSD._LQRMStepCtx(full, lds1.state_model, true)
+    θ1 = zeros(one_ctx.pack.np)
+    SSD._lqr_pack!(θ1, one_ctx)
+    @test f ≈ SSD._lqr_fg!(nothing, θ1, one_ctx) atol = 1e-10
+    return nothing
+end
+
 """
     test_slds_lqr_grouped()
 

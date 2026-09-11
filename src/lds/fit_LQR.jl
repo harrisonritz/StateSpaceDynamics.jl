@@ -122,6 +122,61 @@ function _mask_costate_gram!(
 end
 
 """
+    update_C_d!(lqr_lds, suf, sws)
+
+Constrained Gaussian emission regression for an LQR model. The solve is carried
+out only on columns the emission may observe and the result is embedded into a
+literal-zero full matrix. Restricting `CD_prior` to that same free subspace is
+essential: masking only the data Gram would let a nonzero or densely coupled
+prior recreate costate coefficients.
+"""
+function update_C_d!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, ::SmoothWorkspace{T}
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
+    lds.fit_bool[5] || return nothing
+    regdim = size(suf.obs_xx[].mat, 1)
+    mask = _costate_range(lds)
+    free = mask === nothing ? collect(1:regdim) : setdiff(1:regdim, mask)
+    prior = _restrict_mn_prior(lds.obs_model.CD_prior, free)
+    Vfree = mn_map(Matrix(suf.obs_xx[].mat[free, free]), Matrix(suf.obs_xy[free, :]), prior)
+    V = zeros(T, lds.obs_dim, regdim)
+    V[:, free] .= Vfree
+    _unpack_obs_V!(lds, V)
+    return nothing
+end
+
+# The covariance update and displayed MAP objective must use the same restricted
+# prior as the constrained coefficient update above.
+function _accumulate_cd_prior_scatter!(
+    S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
+    prior = lds.obs_model.CD_prior
+    prior === nothing && return S_res
+    V = _pack_obs_V!(sws.reg.CD, lds)
+    mask = _costate_range(lds)
+    free = mask === nothing ? collect(axes(V, 2)) : setdiff(axes(V, 2), mask)
+    restricted = _restrict_mn_prior(prior, free)
+    Wm = V[:, free] .- restricted.M₀
+    S_res .+= Wm * restricted.Λ * transpose(Wm)
+    return S_res
+end
+
+function _obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
+    om = lds.obs_model
+    total = om.R_prior === nothing ? zero(T) : iw_logprior_term(om.R, om.R_prior)
+    if om.CD_prior !== nothing
+        W = _obs_pack_scratch(lds, sws)
+        _pack_obs_V!(W, lds)
+        mask = _costate_range(lds)
+        free = mask === nothing ? collect(axes(W, 2)) : setdiff(axes(W, 2), mask)
+        total += mn_logprior_term(W[:, free], om.R, _restrict_mn_prior(om.CD_prior, free))
+    end
+    return total
+end
+
+"""
     _freeze_masked_rows!(grad, H, range)
 
 Freeze a block of the Poisson emission's row-wise Newton system: zero the masked
@@ -317,7 +372,6 @@ function elbo!(
     sws::SmoothWorkspace{T},
     total_entropy::T,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
-    _fill_mixed_blocks!(hs, lds.state_model)
     Q_total = Q_state!(sws, lds, hs) + Q_obs!(sws, lds, hs.base)
     prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
     return Q_total + prior_term + total_entropy
@@ -342,7 +396,6 @@ function elbo!(
         total_entropy += fs.entropy
     end
     compute_smooth_constants!(sws_pool[1], lds)
-    _fill_mixed_blocks!(hs, lds.state_model)
     Q_total = Q_state!(sws_pool[1], lds, hs) + _lqr_q_obs(lds, hs, tfs, data, sws_pool)
     prior_term =
         _state_prior_logdensity(lds, sws_pool[1]) + _obs_prior_logdensity(lds, sws_pool[1])
@@ -395,7 +448,8 @@ re-estimates the LQR structure (see `lqr_mstep.jl`). What comes back is
 a plant `A`, a control term `S = B R⁻¹ Bᵀ` and the state cost(s) `Qc` — read
 them with [`lqr_parameters`](@ref).
 
-`depends_on` grouping is not supported for this state model.
+`depends_on` grouping is supported for both structural and observation
+parameters; see [`set_depends_on!`](@ref) for the available blocks.
 
 # Held-out scoring
 
@@ -453,10 +507,23 @@ function fit!(
     )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
-        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds,
+        data,
+        grp;
+        max_iter=max_iter,
+        tol=tol,
+        progress=progress,
+        monitor=monitor,
+        align_final=!_is_free(lds.state_model),
     )
     return _fit_tridiag!(
-        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds,
+        data;
+        max_iter=max_iter,
+        tol=tol,
+        progress=progress,
+        monitor=monitor,
+        align_final=!_is_free(lds.state_model),
     )
 end
 
@@ -665,6 +732,7 @@ function fit!(
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
         monitor=monitor,
+        align_final=!_is_free(lds.state_model),
     )
     return _fit_laplace!(
         lds,
@@ -675,6 +743,7 @@ function fit!(
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
         monitor=monitor,
+        align_final=!_is_free(lds.state_model),
     )
 end
 
@@ -924,12 +993,13 @@ function gradient_batched!(
 
     if sm.terminal
         n = _plant_dim(sm)
+        kf = _regime(sm, tsteps)
         @views begin
             rf = tmp2[1:n, :]
-            mul!(rf, c.Lf, x[:, tsteps, :])
-            has_input && mul!(rf, c.Ftrm, ux[:, tsteps, :], one(T), one(T))
+            mul!(rf, c.Lf[kf], x[:, tsteps, :])
+            has_input && mul!(rf, c.Ftrm[kf], ux[:, tsteps, :], one(T), one(T))
             rf .-= sm.hf
-            mul!(grad[:, tsteps, :], c.LtSinv, rf, -one(T), one(T))
+            mul!(grad[:, tsteps, :], c.LtSinv[kf], rf, -one(T), one(T))
         end
     end
 
