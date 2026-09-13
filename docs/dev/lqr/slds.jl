@@ -124,6 +124,8 @@ function slds_truth(;
     sscale::Float64=1.0,
     obs_noise::Float64=0.05,
     observe_costate::Bool=false,
+    state_noise::Float64=0.02,
+    costate_noise::Float64=1e-4,
     onset_range::UnitRange{Int}=(tsteps ÷ 3):(2tsteps ÷ 3),
 )
     d = 2n
@@ -135,7 +137,7 @@ function slds_truth(;
         A,
         S,
         Qc,
-        Matrix(0.02I, d, d);
+        mixed_noise(n; state=state_noise, costate=costate_noise);
         schedule=sched,
         terminal=terminal,
         Σf=Matrix(0.02I, n, n),
@@ -285,7 +287,8 @@ function fit_slds(
     known_plant::Bool,
     free_gref::Bool,
     stay_init::Float64=0.9,
-    lqr_sig0::Float64=0.05,
+    sig0_state::Float64=0.05,
+    sig0_costate::Float64=1e-4,
     free_noise0::Float64=0.12,
     free_decay0::Float64=0.85,
     init::Symbol=:cold,
@@ -298,7 +301,7 @@ function fit_slds(
         for Q in lqr_sm.Qc
             Q .= Matrix(0.4I, n, n)
         end
-        lqr_sm.Σ .= Matrix(lqr_sig0 * I, d, d)
+        lqr_sm.Σ .= mixed_noise(n; state=sig0_state, costate=sig0_costate)
         lqr_sm.h .= 0
         free_gref && size(lqr_sm.Gref, 2) > 0 && (lqr_sm.Gref .*= -0.3)
         if !known_plant
@@ -370,13 +373,16 @@ function recover_slds(;
     stay::Float64=0.93,
     sscale::Float64=1.0,
     obs_noise::Float64=0.05,
+    state_noise::Float64=0.02,
+    costate_noise::Float64=1e-4,
     observe_costate::Bool=false,
     known_plant::Bool=true,
     free_gref::Bool=(nref > 0),
     max_iter::Int=60,
     smoothing_iters::Int=1,
     stay_init::Float64=0.9,
-    lqr_sig0::Float64=0.05,
+    sig0_state::Float64=0.05,
+    sig0_costate::Float64=1e-4,
     free_noise0::Float64=0.12,
     init::Symbol=:cold,
     fit_noise::Bool=true,
@@ -400,6 +406,8 @@ function recover_slds(;
         sscale=sscale,
         obs_noise=obs_noise,
         observe_costate=observe_costate,
+        state_noise=state_noise,
+        costate_noise=costate_noise,
     )
     uxs = target_inputs(rng, nref, ntrials, tsteps)
     ys, zs, xs = simulate_slds(
@@ -429,7 +437,8 @@ function recover_slds(;
         known_plant=known_plant,
         free_gref=free_gref,
         stay_init=stay_init,
-        lqr_sig0=lqr_sig0,
+        sig0_state=sig0_state,
+        sig0_costate=sig0_costate,
         free_noise0=free_noise0,
         init=init,
         fit_noise=fit_noise,

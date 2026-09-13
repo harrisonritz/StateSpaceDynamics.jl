@@ -24,7 +24,7 @@ assertion that passes.
                          numbers say whether the code runs, not what is true
     --full               the long tier: more seeds, more trials, wider ladders
     --only=a,b           run only these experiments (overview, design, scale,
-                         procedure, switching)
+                         procedure, initialization, switching)
     --gen=rand|lqr|both  which generative mode the parametric sweeps use
                          (default: both for `design`, `lqr` elsewhere)
     --no-figures         tables only
@@ -67,7 +67,9 @@ for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "report.jl", "plo
     include(joinpath(@__DIR__, _f))
 end
 
-const ALL_EXPERIMENTS = ("overview", "design", "scale", "procedure", "switching")
+const ALL_EXPERIMENTS = (
+    "overview", "design", "scale", "procedure", "initialization", "switching"
+)
 
 """
     parse_args(args) -> NamedTuple
@@ -152,6 +154,11 @@ function main(args=String[])
     if "procedure" in opt.only
         for g in _gens(opt.gen, (:lqr,))
             experiment_procedure(cfg; gen=g, figures=opt.figures, free_C=opt.free_C)
+        end
+    end
+    if "initialization" in opt.only
+        for g in _gens(opt.gen, (:lqr,))
+            experiment_initialization(cfg; gen=g, figures=opt.figures, free_C=opt.free_C)
         end
     end
     if "switching" in opt.only

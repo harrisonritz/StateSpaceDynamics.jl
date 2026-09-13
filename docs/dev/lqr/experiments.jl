@@ -59,7 +59,7 @@ function tier(name::Symbol)
         n=3,
         tsteps=25,
         ntrials=400,
-        seeds=1:4,
+        seeds=1:3,
         max_iter=250,
         trial_ladder=[25, 50, 100, 200, 400, 800],
         iter_ladder=[25, 50, 100, 250, 500, 1000],
@@ -576,6 +576,263 @@ function experiment_procedure(cfg; gen::Symbol=:lqr, figures::Bool=true, free_C:
 end
 
 # ---------------------------------------------------------------------------
+# 4b. Initialization: where the fit starts
+# ---------------------------------------------------------------------------
+
+"""
+    experiment_initialization(cfg; ...)
+
+Where to start the fit, searched rather than asserted.
+
+The harness's own default is a heuristic — start `Σ`'s costate block at `1e-4`,
+three orders of magnitude below its state block — and a heuristic in a validation
+harness is a claim that has not been checked. This experiment checks it and its
+neighbourhood.
+
+Why that particular knob is worth a whole experiment: on the optimal path the
+costate is a deterministic function of the state, so the innovation an optimal
+agent produces has rank `n` and the costate half of `Σ` should be near zero.
+Start it isotropic and EM has `n` free directions in which the cost can drift
+without costing the bound anything — which is where these fits go wrong, and why
+a single number chosen before the first iteration can matter more than the
+iteration budget.
+
+Four readings, in increasing cost:
+
+  * a ladder on the costate block, with `Σ` estimated and with `Σ` frozen at the
+    start, which separates "a good place to begin" from "a constraint worth
+    imposing";
+  * a ladder on the state block, the same knob's uninteresting twin, as a
+    control — if recovery moved as much along this axis the story would be about
+    initialization in general rather than about the costate;
+  * a ladder on the initial cost scale `q0`;
+  * a two-axis grid over the costate block and `q0`, since the two are the
+    settings most likely to interact — a cost started too large and a costate
+    innovation started too free are the same mistake seen from two sides.
+"""
+function experiment_initialization(
+    cfg; gen::Symbol=:lqr, figures::Bool=true, free_C::Bool=false
+)
+    n, T, N, mi = cfg.n, cfg.tsteps, cfg.ntrials, cfg.max_iter
+    base = (;
+        n=n,
+        tsteps=T,
+        ntrials=N,
+        max_iter=mi,
+        gen=gen,
+        free_C=free_C,
+        nref=4,
+        terminal=true,
+        onset=_onset(0, T),
+    )
+    cnoise = [1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 5e-2]
+    snoise = [0.005, 0.02, 0.05, 0.2]
+    q0s = [0.05, 0.2, 0.4, 1.0, 4.0]
+    gridq = [0.1, 0.4, 1.6]
+    gridc = [1e-5, 1e-3, 5e-2]
+
+    grid = Any[]
+    for fn in (true, false), c in cnoise
+        push!(grid, (:cn, fn, c) => (; base..., sig0_costate=c, fit_noise=fn))
+    end
+    for v in snoise
+        push!(grid, (:sn, v) => (; base..., sig0_state=v))
+    end
+    for q in q0s
+        push!(grid, (:q0, q) => (; base..., q0=q))
+    end
+    res = cells(recover, grid; seeds=cfg.seeds)
+    #=
+    The grid gets fewer seeds than the ladders on purpose: it is there to show
+    the shape of the surface and where its minimum sits, which a couple of seeds
+    settle, and it costs `length(gridq) * length(gridc)` fits per seed.
+    =#
+    gseeds = cfg.seeds[1:min(2, length(cfg.seeds))]
+    ggrid = [
+        (:g, q, c) => (; base..., q0=q, sig0_costate=c) for q in gridq for c in gridc
+    ]
+    gres = cells(recover, ggrid; seeds=gseeds)
+
+    #=
+    Named combinations, run on *both* generators, because the answer differs
+    between them and that difference is the finding. Drawing from the model,
+    the costate is a quantity to be explained and a loose `Σ_λλ` is right;
+    drawing from an optimal agent, the costate is a deterministic function of the
+    state and a tight one is right. The harness's default serves the second,
+    which is the case the model is for.
+    =#
+    combos = [
+        ("loose Σ_λλ = 5e-2", (; sig0_costate=5e-2)),
+        ("tight Σ_λλ = 1e-4  [default]", (; sig0_costate=1e-4)),
+        ("anneal 5e-2 → 1e-4", (; sig0_costate=1e-4, anneal_costate=5e-2)),
+        ("tight + costate observed", (; sig0_costate=1e-4, observe_costate=true)),
+        ("anneal + costate observed", (; sig0_costate=1e-4, anneal_costate=5e-2, observe_costate=true)),
+        #=
+        `q0 = 0.2` is the truth's own cost scale. It is in the table as an upper
+        bound on what a lucky guess buys, not as a setting anyone can follow: in
+        a real fit you do not know the scale, which is the whole point of the
+        `q0` ladder above showing that the fitted scale barely moves from it.
+        =#
+        ("tight + q0 = 0.2 (the truth's scale)", (; sig0_costate=1e-4, q0=0.2)),
+    ]
+    cgrid = Any[]
+    for g in (:rand, :lqr), (lab, kw) in combos
+        cgrid = push!(cgrid, (:combo, g, lab) => (; base..., gen=g, kw...))
+    end
+    cres = cells(recover, cgrid; seeds=cfg.seeds)
+
+    section(
+        "4b — Where to start: initial conditions and settings — " *
+        "$(gen === :lqr ? "agent" : "model")" *
+        "\n     (4 references, terminal cost and a delay epoch throughout;" *
+        " median over $(nseeds(cfg.seeds)))",
+    )
+    table_header()
+    for fn in (true, false), c in cnoise
+        a = aggregate(res[(:cn, fn, c)])
+        a === nothing && continue
+        report(
+            rpad(@sprintf("Σ_λλ init %.0e, Σ %s", c, fn ? "estimated" : "frozen"), LBLW), a
+        )
+    end
+    println()
+    for v in snoise
+        a = aggregate(res[(:sn, v)])
+        a === nothing && continue
+        report(rpad(@sprintf("Σ_xx init %.3f", v), LBLW), a)
+    end
+    println()
+    for q in q0s
+        a = aggregate(res[(:q0, q)])
+        a === nothing && continue
+        report(rpad(@sprintf("cost init q0 = %.2f", q), LBLW), a)
+    end
+
+    for g in (:rand, :lqr)
+        println()
+        println("   combinations, trials drawn from the $(g === :lqr ? "agent" : "model"):")
+        table_header()
+        for (lab, _) in combos
+            a = aggregate(cres[(:combo, g, lab)])
+            a === nothing && continue
+            report(rpad("  " * lab, LBLW), a)
+        end
+    end
+
+    figures || return (ladders=res, grid=gres, combos=cres)
+    function ser(keyfn, vals, labels, path)
+        return [
+            begin
+                ms = [center(metric(res[keyfn(l, v)], path)) for v in vals]
+                (lab, [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms]))
+            end for (l, lab) in labels
+        ]
+    end
+    sweep_figure(
+        "init_costate_noise_$(gen)";
+        panels=[
+            (
+                "cost  Qc (running)",
+                cnoise,
+                ser(
+                    (l, v) -> (:cn, l, v),
+                    cnoise,
+                    ((true, "Σ estimated"), (false, "Σ frozen at the start")),
+                    r -> r.scores.Qc.rmse,
+                ),
+            ),
+            (
+                "reference map  Gref",
+                cnoise,
+                ser(
+                    (l, v) -> (:cn, l, v),
+                    cnoise,
+                    ((true, "Σ estimated"), (false, "Σ frozen at the start")),
+                    r -> r.scores.Gref.rmse,
+                ),
+            ),
+            (
+                "closed-loop plant",
+                cnoise,
+                ser(
+                    (l, v) -> (:cn, l, v),
+                    cnoise,
+                    ((true, "Σ estimated"), (false, "Σ frozen at the start")),
+                    r -> r.scores.cl.rmse,
+                ),
+            ),
+        ],
+        xlabel="initial costate innovation  Σ_λλ",
+        logx=true,
+        xticks=(cnoise, [@sprintf("%.0e", c) for c in cnoise]),
+        title="The one setting that matters most — $(gen === :lqr ? "agent" : "model")",
+    )
+
+    function one(keyfn, vals, path)
+        ms = [center(metric(res[keyfn(v)], path)) for v in vals]
+        return [("relative RMSE", [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms]))]
+    end
+    sweep_figure(
+        "init_controls_$(gen)";
+        panels=[
+            ("Σ_xx init → Qc", snoise, one(v -> (:sn, v), snoise, r -> r.scores.Qc.rmse)),
+            ("cost init q0 → Qc", q0s, one(v -> (:q0, v), q0s, r -> r.scores.Qc.rmse)),
+            ("cost init q0 → Gref", q0s, one(v -> (:q0, v), q0s, r -> r.scores.Gref.rmse)),
+        ],
+        xlabel="initial value",
+        logx=true,
+        title="The other two initialization axes, as controls",
+    )
+
+    z = [
+        center(metric(gres[(:g, q, c)], r -> r.scores.Qc.rmse))[1] for c in gridc,
+        q in gridq
+    ]
+    zcl = [
+        center(metric(gres[(:g, q, c)], r -> r.scores.cl.rmse))[1] for c in gridc,
+        q in gridq
+    ]
+    for (tag, zz, what) in (
+        ("qc", z, "Qc relative RMSE — the cost's shape"),
+        ("closedloop", zcl, "closed-loop relative RMSE — shape and scale together"),
+    )
+        grid_figure(
+            "init_grid_$(tag)_$(gen)";
+            xs=[@sprintf("%.2f", q) for q in gridq],
+            ys=[@sprintf("%.0e", c) for c in gridc],
+            z=zz,
+            xlabel="initial cost scale  q0",
+            ylabel="initial costate innovation  Σ_λλ",
+            title="$what  ($(nseeds(gseeds)); ringed cell is best)",
+        )
+    end
+
+    labs = [c[1] for c in combos]
+    for g in (:rand, :lqr)
+        dot_figure(
+            "init_combos_$(g)";
+            labels=labs,
+            panels=[
+                (
+                    "cost  Qc (running)",
+                    [center(metric(cres[(:combo, g, l)], r -> r.scores.Qc.rmse))[1] for l in labs],
+                ),
+                (
+                    "reference map  Gref",
+                    [center(metric(cres[(:combo, g, l)], r -> r.scores.Gref.rmse))[1] for l in labs],
+                ),
+                (
+                    "closed-loop plant",
+                    [center(metric(cres[(:combo, g, l)], r -> r.scores.cl.rmse))[1] for l in labs],
+                ),
+            ],
+            title="Initialization combinations — trials from the $(g === :lqr ? "agent" : "model")",
+        )
+    end
+    return (ladders=res, grid=gres, combos=cres)
+end
+
+# ---------------------------------------------------------------------------
 # 5. Switching: one free state, one LQR state
 # ---------------------------------------------------------------------------
 
@@ -604,10 +861,11 @@ function experiment_switching(cfg; figures::Bool=true)
         nref=4,
     )
     # `Σ` pinned at the truth's scale: see the discussion this experiment prints.
-    pinned = (; lqr_sig0=0.02, fit_noise=false)
+    pinned = (; sig0_state=0.02, sig0_costate=1e-4, fit_noise=false)
 
     conds = [
         ("cold start, Σ estimated", base),
+        ("cold start, Σ_λλ init 5e-2", (; base..., sig0_costate=5e-2)),
         ("cold start, Σ pinned", (; base..., pinned...)),
         ("warm start, Σ estimated", (; base..., init=:warm)),
         ("warm start, Σ pinned", (; base..., pinned..., init=:warm)),

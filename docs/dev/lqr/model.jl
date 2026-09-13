@@ -66,6 +66,33 @@ function reference_map(n::Int, nref::Int; radius::Float64=1.5)
 end
 
 """
+    mixed_noise(n; state, costate) -> Matrix (2n × 2n)
+
+The mixed-coordinate innovation covariance, block-diagonal, with the costate
+block far smaller than the state block.
+
+That asymmetry is not a tuning knob dressed up as a default — it is what the
+model is about. On the optimal path the costate is a *deterministic* function of
+the state, `λ_t = P_t x_t + g_t`, so the innovation an optimal agent actually
+produces has rank `n`, not `2n`: the state half carries the plant noise and the
+costate half carries nothing. A full-rank `Σ` contains that only as a limit, and
+the size of its costate block is how far from the limit the model sits. Set it
+comparable to the state block and the fit has `n` free directions of slack in
+which the cost can drift without penalty, which is exactly where these fits go
+wrong.
+
+A small positive value rather than zero: the smoother factorizes `Q^fwd = G Σ Gᵀ`,
+so `Σ` has to stay positive definite.
+"""
+function mixed_noise(n::Int; state::Float64=0.02, costate::Float64=1e-4)
+    d = 2n
+    Σ = zeros(d, d)
+    Σ[1:n, 1:n] .= Matrix(state * I, n, n)
+    Σ[(n + 1):d, (n + 1):d] .= Matrix(costate * I, n, n)
+    return Σ
+end
+
+"""
     cost_bank(n; terminal, onset) -> (Qc, idx)
 
 The cost regimes and where each one sits in `Qc`, given which structural
@@ -152,6 +179,9 @@ The generating model.
   can say anything about — the correlation is undefined and the relative error
   has no denominator. The `h` columns read `--` on every other row for exactly
   that reason.
+- `state_noise`, `costate_noise`: the diagonal of the two blocks of `Σ`. See
+  [`mixed_noise`](@ref) for why the second is three orders of magnitude below
+  the first by default.
 - `observe_costate`: let the emission read the costate half.
 - `free_C`: draw a random readout instead of `[I 0]`, folding the latent-basis
   problem back in.
@@ -171,6 +201,8 @@ function lqr_truth(;
     observe_costate::Bool=false,
     free_C::Bool=false,
     obs_noise::Float64=0.05,
+    state_noise::Float64=0.02,
+    costate_noise::Float64=1e-4,
     rng::AbstractRNG=MersenneTwister(0),
 )
     d = 2n
@@ -183,7 +215,7 @@ function lqr_truth(;
         A,
         S,
         Qc,
-        Matrix(0.02I, d, d);
+        mixed_noise(n; state=state_noise, costate=costate_noise);
         schedule=sched,
         terminal=terminal,
         Σf=Matrix(0.02I, n, n),

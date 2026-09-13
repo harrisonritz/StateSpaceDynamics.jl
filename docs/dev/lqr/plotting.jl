@@ -559,6 +559,81 @@ function dot_figure(
     return save_fig(plt, name)
 end
 
+"""
+    grid_figure(name; xs, ys, z, xlabel, ylabel, title, zlabel) -> path
+
+A two-axis search over settings, drawn as an annotated heatmap.
+
+The value is a *magnitude* — a relative error, which has no meaningful sign and
+no meaningful zero-crossing — so the scale here is **sequential**: one hue, light
+to dark, light meaning "small error". The diverging ramp the parameter figures
+use would be wrong twice over: it would put its neutral midpoint somewhere
+arbitrary and imply that the two arms mean opposite things.
+
+Colour is on a log scale because that is how these errors are spread, but the
+printed value is the number itself, so nothing has to be read off the ramp. The
+best cell is ringed rather than recoloured — recolouring it would break the
+ramp's one job.
+"""
+function grid_figure(
+    name::AbstractString;
+    xs,
+    ys,
+    z,
+    xlabel::String,
+    ylabel::String,
+    title::String="",
+)
+    zz = Matrix{Float64}(z)
+    fin = filter(isfinite, vec(zz))
+    lo = isempty(fin) ? RMSE_FLOOR : max(minimum(fin), RMSE_FLOOR)
+    hi = isempty(fin) ? 1.0 : max(maximum(fin), lo * 1.01)
+    logz = log10.(clamp.(zz, lo, hi))
+    ramp = cgrad(["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#256abf", "#184f95", "#0d366b"])
+    p = heatmap(
+        1:length(xs),
+        1:length(ys),
+        logz;
+        c=ramp,
+        clims=(log10(lo), log10(hi)),
+        yflip=false,
+        colorbar=false,
+        xticks=(1:length(xs), string.(xs)),
+        yticks=(1:length(ys), string.(ys)),
+        xlims=(0.5, length(xs) + 0.5),
+        ylims=(0.5, length(ys) + 0.5),
+        base_attrs(; xlabel=xlabel, ylabel=ylabel, title=title, grid=false)...,
+    )
+    span = log10(hi) - log10(lo)
+    for i in eachindex(ys), j in eachindex(xs)
+        v = zz[i, j]
+        isfinite(v) || continue
+        frac = span <= 0 ? 0.0 : (logz[i, j] - log10(lo)) / span
+        annotate!(p, j, i, text(_cellfmt(v, hi), 7, frac > 0.55 ? :white : INK, :center))
+    end
+    if !isempty(fin)
+        best = argmin(map(v -> isfinite(v) ? v : Inf, zz))
+        scatter!(
+            p,
+            [best[2]],
+            [best[1]];
+            marker=:rect,
+            markersize=22,
+            markeralpha=0,
+            markerstrokecolor="#eb6834",
+            markerstrokewidth=2.5,
+            label="",
+        )
+    end
+    plt = plot(
+        p;
+        size=(120 * length(xs) + 240, 90 * length(ys) + 190),
+        left_margin=6Plots.mm,
+        bottom_margin=6Plots.mm,
+    )
+    return save_fig(plt, name)
+end
+
 # ---------------------------------------------------------------------------
 # Switching figures
 # ---------------------------------------------------------------------------

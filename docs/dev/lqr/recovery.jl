@@ -42,9 +42,27 @@ be fitted back.
 `init` picks how wrong:
 
 - `:cold` — the default, and the one the sweeps use. An isotropic cost that
-  knows nothing about the truth's shape, zero drift, an inflated `Σ`, and (when
-  the reference is estimated) a reference map of the truth's own family at a
-  third the radius and a quarter-turn of phase — wrong, but not *anti*-correct.
+  knows nothing about the truth's shape, zero drift, an inflated *state* noise,
+  and (when the reference is estimated) a reference map of the truth's own family
+  at a third the radius and a quarter-turn of phase — wrong, but not
+  *anti*-correct.
+
+`anneal_costate` runs the fit in two passes: the first from that (loose) costate
+innovation, the second from `sig0_costate` (tight), started at whatever the first
+pass reached. See the comment at the call site for why the two passes identify
+different things.
+
+`q0` is the isotropic scale of the initial cost — the one number that says how
+big the fit thinks the objective is before it has seen anything. `sig0_state`
+and `sig0_costate` set the two blocks of the initial `Σ`, and the
+gap between them is the one piece of the cold start that is deliberately *not*
+uninformative. Started isotropic, `Σ`'s costate block inflates during EM until
+the model has `n` free directions in which the cost can drift at no cost to the
+bound — the failure `experiment_initialization` measures. Starting it at `1e-4`
+says the thing the model already implies: on the optimal path the costate is a
+deterministic function of the state, so its innovation is near zero. It is a
+starting point, not a constraint — the M-step is free to move it, and mostly
+does not.
 - `:warm` — start at the truth. Not a recovery test; it answers the different
   question of whether the generating parameters are even a *stationary point* of
   the objective, which on a misspecified row they are not.
@@ -61,6 +79,9 @@ function fit_model(
     free_h::Bool=true,
     init::Symbol=:cold,
     jitter::Float64=0.0,
+    q0::Float64=0.4,
+    sig0_state::Float64=0.05,
+    sig0_costate::Float64=1e-4,
     rng::AbstractRNG=MersenneTwister(0),
 )
     sm = deepcopy(truth.sm)
@@ -70,14 +91,14 @@ function fit_model(
         for Q in sm.Qc
             if init === :random
                 W = randn(rng, n, n)
-                Q .= Symmetric(0.25 .* Matrix(1.0I, n, n) .+ jitter .* (W * W') ./ n)
+                Q .= Symmetric(q0 .* Matrix(1.0I, n, n) .+ jitter .* (W * W') ./ n)
             else
-                Q .= Matrix(0.4I, n, n)
+                Q .= Matrix(q0 * I, n, n)
                 jitter > 0 && (Q .+= jitter .* Symmetric(randn(rng, n, n)))
                 Q .= Symmetric(Q)
             end
         end
-        sm.Σ .= Matrix(0.05I, d, d)
+        sm.Σ .= mixed_noise(n; state=sig0_state, costate=sig0_costate)
         sm.h .= 0
         if free_gref && size(sm.Gref, 2) > 0
             #=
@@ -129,12 +150,22 @@ One EM run of a prepared initial model against a fixed dataset.
 Freeze the emission when `C = [I 0]`: that is the point of fixing it, and a
 fitted `C` would drift the latent basis out from under the comparison.
 """
-function one_fit(truth::LqrTruth, ys, uxs, sm; free_C::Bool, max_iter::Int, tol::Float64)
+function one_fit(
+    truth::LqrTruth,
+    ys,
+    uxs,
+    sm;
+    free_C::Bool,
+    max_iter::Int,
+    tol::Float64,
+    fit_noise::Bool=true,
+)
     obs_dim = size(truth.C, 1)
     lds = LinearDynamicalSystem(
         sm, GaussianObservationModel(copy(truth.C), copy(truth.R), zeros(obs_dim))
     )
     free_C || (lds.fit_bool[5] = false)
+    lds.fit_bool[4] = fit_noise
     elbos = fit!(lds, ys; ux=uxs, max_iter=max_iter, tol=tol, progress=false)
     return lds, (elbos isa Tuple ? first(elbos) : elbos)
 end
@@ -184,9 +215,17 @@ function recover(;
     mstep_iters::Int=100,
     init::Symbol=:cold,
     restarts::Int=1,
+    q0::Float64=0.4,
+    state_noise::Float64=0.02,
+    costate_noise::Float64=1e-4,
+    sig0_state::Float64=0.05,
+    sig0_costate::Float64=1e-4,
+    anneal_costate::Union{Nothing,Float64}=nothing,
+    fit_noise::Bool=true,
     seed::Int=1,
 )
     rng = MersenneTwister(seed)
+    d = 2n
     truth = lqr_truth(;
         n=n,
         tsteps=tsteps,
@@ -197,6 +236,8 @@ function recover(;
         observe_costate=observe_costate,
         free_C=free_C,
         obs_noise=obs_noise,
+        state_noise=state_noise,
+        costate_noise=costate_noise,
         rng=rng,
     )
     uxs = target_inputs(rng, nref, ntrials, tsteps)
@@ -227,11 +268,21 @@ function recover(;
             =#
             init=(r == 1 ? init : (init === :warm ? :warm : :random)),
             jitter=(r == 1 ? 0.0 : 0.3),
+            q0=q0,
+            sig0_state=sig0_state,
+            sig0_costate=(anneal_costate === nothing ? sig0_costate : anneal_costate),
             rng=MersenneTwister(1000seed + r),
         )
         sm.mstep_iters = mstep_iters
         lds, elbos = one_fit(
-            truth, ys, uxs, sm; free_C=free_C, max_iter=max_iter, tol=tol
+            truth,
+            ys,
+            uxs,
+            sm;
+            free_C=free_C,
+            max_iter=max_iter,
+            tol=tol,
+            fit_noise=fit_noise,
         )
         if best === nothing || elbos[end] > best.elbos[end]
             best = (sm=sm, lds=lds, elbos=elbos)
@@ -239,6 +290,47 @@ function recover(;
     end
     elbos = best.elbos
     fit_sm = best.sm
+    #=
+    Annealing the costate innovation: fit once from a loose `Σ_λλ`, then reset
+    that block to a tight value and fit again from wherever the first pass
+    landed.
+
+    The two starts are good at different things and the ladder above shows it.
+    A loose costate innovation keeps `λ` a quantity the model has to *explain*,
+    which is what identifies the reference — the reference enters only through
+    the costate half of the affine term, so if `Σ_λλ → 0` the smoother can
+    satisfy the costate recursion exactly for any `G_r` and there is nothing left
+    to pin it. A tight one is what identifies the cost's shape, by removing the
+    `n` free directions of slack the cost would otherwise drift along. Doing them
+    in that order asks whether the second pass can keep what the first found.
+    =#
+    if anneal_costate !== nothing
+        sm2 = fit_sm
+        #=
+        The cross-blocks go too, not just the costate block. A fitted `Σ` has
+        state-costate covariance in it, and shrinking the costate variance while
+        leaving that covariance at its old size makes the matrix indefinite —
+        `refresh!` then fails its Cholesky rather than starting a second pass.
+        Rebuilding block-diagonally keeps the fitted process noise and is
+        positive definite whenever that block is.
+        =#
+        @views sm2.Σ[1:n, (n + 1):d] .= 0
+        @views sm2.Σ[(n + 1):d, 1:n] .= 0
+        @views sm2.Σ[(n + 1):d, (n + 1):d] .= Matrix(sig0_costate * I, n, n)
+        refresh!(sm2)
+        _, elbos2 = one_fit(
+            truth,
+            ys,
+            uxs,
+            sm2;
+            free_C=free_C,
+            max_iter=max_iter,
+            tol=tol,
+            fit_noise=fit_noise,
+        )
+        fit_sm = sm2
+        elbos = vcat(elbos, elbos2)
+    end
 
     # Compare in the canonical scale: the cost is identified up to a scalar.
     ref = deepcopy(truth.sm)
