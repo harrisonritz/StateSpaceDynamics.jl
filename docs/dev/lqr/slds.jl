@@ -125,7 +125,27 @@ function slds_truth(;
     obs_noise::Float64=0.05,
     observe_costate::Bool=false,
     state_noise::Float64=0.02,
-    costate_noise::Float64=1e-4,
+    #=
+    Looser than the single-system default (`1e-4`), and deliberately so — this
+    is the one place the two harnesses disagree about the same number.
+
+    For a single inverse-LQR system a tight costate innovation is what removes
+    the `n` directions of slack the cost would otherwise drift along, and the
+    ladder in `experiment_initialization` picks `1e-4` as its optimum. For a
+    *switching* model the same number does the opposite: `γ` is a plug-in scored
+    at the smoothed mean, the smoothed mean never sits exactly on the Riccati
+    graph, and a `Σ_λλ` of `1e-4` therefore makes the LQR state's per-timestep
+    likelihood hopeless at every timestep. The fit puts everything in the free
+    state and `γ` sits at chance — at the *generating* parameters, not only in
+    the fit. Measured: γ at the truth is 0.52 at `1e-4`, 0.56 at `2.5e-3`, 0.74
+    at `1e-2` and 0.81 at `2e-2`.
+
+    So the costate innovation is doing two different jobs. In one system it is
+    slack to be removed; in a switching one it is the tolerance that makes the
+    LQR state selectable at all. `experiment_switching` sweeps it rather than
+    leaving the disagreement implicit.
+    =#
+    costate_noise::Float64=2e-2,
     onset_range::UnitRange{Int}=(tsteps ÷ 3):(2tsteps ÷ 3),
 )
     d = 2n
@@ -288,7 +308,7 @@ function fit_slds(
     free_gref::Bool,
     stay_init::Float64=0.9,
     sig0_state::Float64=0.05,
-    sig0_costate::Float64=1e-4,
+    sig0_costate::Float64=5e-2,
     free_noise0::Float64=0.12,
     free_decay0::Float64=0.85,
     init::Symbol=:cold,
@@ -374,7 +394,7 @@ function recover_slds(;
     sscale::Float64=1.0,
     obs_noise::Float64=0.05,
     state_noise::Float64=0.02,
-    costate_noise::Float64=1e-4,
+    costate_noise::Float64=2e-2,
     observe_costate::Bool=false,
     known_plant::Bool=true,
     free_gref::Bool=(nref > 0),
@@ -382,7 +402,7 @@ function recover_slds(;
     smoothing_iters::Int=1,
     stay_init::Float64=0.9,
     sig0_state::Float64=0.05,
-    sig0_costate::Float64=1e-4,
+    sig0_costate::Float64=5e-2,
     free_noise0::Float64=0.12,
     init::Symbol=:cold,
     fit_noise::Bool=true,

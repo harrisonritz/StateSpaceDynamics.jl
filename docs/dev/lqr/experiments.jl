@@ -305,6 +305,10 @@ So: `Gref` recovery against the number of targets, once with `h` estimated and
 once with `h` frozen at zero. If the account above is right, the two series
 should be far apart at one target and on top of each other by four — and the
 gap, not the level, is the result.
+
+This runs at a loose `Σ_λλ`, against the harness default, because the default is
+what makes the reference unidentifiable in the first place; see the comment on
+the grid below.
 """
 function experiment_reference_identification(
     cfg; gen::Symbol=:rand, figures::Bool=true, free_C::Bool=false
@@ -324,6 +328,18 @@ function experiment_reference_identification(
                 free_C=free_C,
                 nref=r,
                 free_h=fh,
+                #=
+                A *loose* costate innovation here, against the harness default,
+                and the reason is the question being asked. The default `1e-4` is
+                what makes the cost recoverable, and it does that by taking the
+                costate out of play — but the reference lives only in the costate
+                half of the affine term, so under the default neither `Gref` nor
+                the `h` it competes with is identified and the contrast this
+                experiment exists to measure is a comparison of two nulls. The
+                confound is a structural claim about the model; measuring it
+                needs a regime where the parameter is identifiable at all.
+                =#
+                sig0_costate=5e-2,
             ),
         )
     end
@@ -337,6 +353,8 @@ function experiment_reference_identification(
     =#
     section(
         "2b — Is the reference identified? `Gref` against the affine drift `h`" *
+        "\n     (loose Σ_λλ = 5e-2 throughout, not the harness default; see the" *
+        " docstring)" *
         "\n     (every cell is the median over $(nseeds(cfg.seeds)))",
     )
     blocks = (:Qc, :Gref, :S, :Sig, :cl)
@@ -860,12 +878,17 @@ function experiment_switching(cfg; figures::Bool=true)
         terminal=true,
         nref=4,
     )
-    # `Σ` pinned at the truth's scale: see the discussion this experiment prints.
-    pinned = (; sig0_state=0.02, sig0_costate=1e-4, fit_noise=false)
+    #=
+    "Pinned" means `Σ` held at the truth's own two blocks rather than estimated.
+    It is a concession — the fit is told the innovation — and it is in the table
+    because without it nothing else in this section is interpretable: an LQR
+    discrete state with a free `Σ` inflates until it is a second free state, and
+    every row would be reporting that collapse instead of the question asked.
+    =#
+    pinned = (; sig0_state=0.02, sig0_costate=2e-2, fit_noise=false)
 
     conds = [
         ("cold start, Σ estimated", base),
-        ("cold start, Σ_λλ init 5e-2", (; base..., sig0_costate=5e-2)),
         ("cold start, Σ pinned", (; base..., pinned...)),
         ("warm start, Σ estimated", (; base..., init=:warm)),
         ("warm start, Σ pinned", (; base..., pinned..., init=:warm)),
@@ -878,6 +901,16 @@ function experiment_switching(cfg; figures::Bool=true)
         ("Σ pinned, 4× the trials", (; base..., pinned..., ntrials=4s.ntrials)),
         ("Σ pinned, quiet emission", (; base..., pinned..., obs_noise=0.01)),
         ("Σ pinned, plant estimated", (; base..., pinned..., known_plant=false)),
+        #=
+        The costate-innovation ladder, pinned so the number under test is the
+        one being varied. This is where the switching model disagrees with the
+        single-system one: `1e-4` is the single-system optimum and is chance
+        here. `γ (truth)` moves with it, so the collapse is a property of the
+        model rather than of the fit.
+        =#
+        ("Σ pinned, Σ_λλ = 1e-4 (1-system optimum)", (; base..., pinned..., sig0_costate=1e-4, costate_noise=1e-4)),
+        ("Σ pinned, Σ_λλ = 2.5e-3", (; base..., pinned..., sig0_costate=2.5e-3, costate_noise=2.5e-3)),
+        ("Σ pinned, Σ_λλ = 1e-2", (; base..., pinned..., sig0_costate=1e-2, costate_noise=1e-2)),
         ("Σ pinned, `rand` generator", (; base..., pinned..., gen=:rand, sscale=0.25)),
         (
             "Σ pinned, `rand`, plant est.",
