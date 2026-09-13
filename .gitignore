@@ -21,6 +21,9 @@ test/Manifest.toml
 Manifest.toml
 notebooks/Manifest.toml
 
+# Regenerated on every run of docs/dev/lqr/lqr_recovery.jl.
+docs/dev/lqr/figures/
+
 # Specific Julia scripts
 notebooks/profiling.jl
 notebooks/benchmarking.ipynb
