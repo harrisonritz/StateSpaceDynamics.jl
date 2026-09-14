@@ -47,6 +47,11 @@ be fitted back.
   at a third the radius and a quarter-turn of phase — wrong, but not
   *anti*-correct.
 
+`sigma_prior_strength` and `qc_prior_strength` put inverse-Wishart priors on the
+innovation and on the cost instead of relying on where they were started — see
+[`sigma_prior`](@ref) and [`qc_prior`](@ref). `0` (the default) leaves the fit
+unregularized, which is what every sweep outside `experiment_priors` uses.
+
 `anneal_costate` runs the fit in two passes: the first from that (loose) costate
 innovation, the second from `sig0_costate` (tight), started at whatever the first
 pass reached. See the comment at the call site for why the two passes identify
@@ -82,6 +87,9 @@ function fit_model(
     q0::Float64=0.4,
     sig0_state::Float64=0.05,
     sig0_costate::Float64=1e-4,
+    sigma_prior_strength::Float64=0.0,
+    qc_prior_strength::Float64=0.0,
+    qc_prior_scale::Union{Float64,Vector{Float64}}=0.2,
     rng::AbstractRNG=MersenneTwister(0),
 )
     sm = deepcopy(truth.sm)
@@ -124,6 +132,15 @@ function fit_model(
             sm.S .= 1.5 .* truth.sm.S
         end
     end
+    #=
+    Priors go on the *fit*, never on the truth. They are a statement about how
+    the model should be estimated, and putting one on the generating model would
+    quietly change what is being recovered.
+    =#
+    sm.Σ_prior = sigma_prior(
+        n; state=sig0_state, costate=sig0_costate, strength=sigma_prior_strength
+    )
+    sm.Qc_prior = qc_prior(n; scale=qc_prior_scale, strength=qc_prior_strength)
     sm.fit_flags = LQRFitFlags(;
         A=(!known_plant),
         S=(!known_plant),
@@ -221,8 +238,20 @@ function recover(;
     costate_noise::Float64=1e-4,
     sig0_state::Float64=0.05,
     sig0_costate::Float64=1e-4,
+    sigma_prior_strength::Float64=0.0,
+    qc_prior_strength::Float64=0.0,
+    qc_prior_scale::Union{Float64,Vector{Float64}}=0.2,
     anneal_costate::Union{Nothing,Float64}=nothing,
     fit_noise::Bool=true,
+    #=
+    Hold out a fraction of trials, fit on the rest, and report the held-out ELBO
+    per timestep alongside the parameter scores. This is the only quantity in the
+    harness a user could compute without knowing the truth, so it is the only
+    candidate for *selecting* a setting rather than merely scoring one — and
+    whether it selects the same setting the parameter scores prefer is itself a
+    result. Zero (the default) fits everything and reports `NaN`.
+    =#
+    test_frac::Float64=0.0,
     seed::Int=1,
 )
     rng = MersenneTwister(seed)
@@ -252,7 +281,12 @@ function recover(;
         process_noise=process_noise,
         uxs=uxs,
     )
-    truth_elbo = elbo(truth.lds, ys; ux=uxs)
+    ntest = test_frac > 0 ? max(1, round(Int, test_frac * ntrials)) : 0
+    tr_idx = 1:(ntrials - ntest)
+    te_idx = (ntrials - ntest + 1):ntrials
+    ys_fit = ntest > 0 ? ys[tr_idx] : ys
+    ux_fit = (uxs === nothing || ntest == 0) ? uxs : uxs[tr_idx]
+    truth_elbo = elbo(truth.lds, ys_fit; ux=ux_fit)
 
     best = nothing
     for r in 1:restarts
@@ -273,13 +307,16 @@ function recover(;
             q0=q0,
             sig0_state=sig0_state,
             sig0_costate=(anneal_costate === nothing ? sig0_costate : anneal_costate),
+            sigma_prior_strength=sigma_prior_strength,
+            qc_prior_strength=qc_prior_strength,
+            qc_prior_scale=qc_prior_scale,
             rng=MersenneTwister(1000seed + r),
         )
         sm.mstep_iters = mstep_iters
         lds, elbos = one_fit(
             truth,
-            ys,
-            uxs,
+            ys_fit,
+            ux_fit,
             sm;
             free_C=free_C,
             max_iter=max_iter,
@@ -322,8 +359,8 @@ function recover(;
         refresh!(sm2)
         _, elbos2 = one_fit(
             truth,
-            ys,
-            uxs,
+            ys_fit,
+            ux_fit,
             sm2;
             free_C=free_C,
             max_iter=max_iter,
@@ -332,6 +369,25 @@ function recover(;
         )
         fit_sm = sm2
         elbos = vcat(elbos, elbos2)
+    end
+
+    #=
+    The held-out score is taken *before* canonicalization, on the model as
+    fitted: `rescale_costate!` changes the parameters and the emission's costate
+    columns are not rescaled with them, so a likelihood evaluated after it would
+    not be the fitted model's.
+    =#
+    heldout = if ntest > 0
+        fl = LinearDynamicalSystem(
+            fit_sm,
+            GaussianObservationModel(
+                copy(truth.C), copy(truth.R), zeros(size(truth.C, 1))
+            ),
+        )
+        steps = sum(size(y, 2) for y in ys[te_idx])
+        elbo(fl, ys[te_idx]; ux=(uxs === nothing ? nothing : uxs[te_idx])) / steps
+    else
+        NaN
     end
 
     # Compare in the canonical scale: the cost is identified up to a scalar.
@@ -344,6 +400,7 @@ function recover(;
         ),
         elbo=elbos[end],
         truth_elbo=truth_elbo,
+        heldout=heldout,
         iters=length(elbos),
         converged=length(elbos) < max_iter,
         creep=elbo_creep(elbos),

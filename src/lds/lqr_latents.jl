@@ -292,5 +292,34 @@ function _state_prior_logdensity(
     if sm.x0_prior !== nothing
         total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
     end
+    return total + _lqr_structural_logprior(sm)
+end
+
+"""
+    _lqr_structural_logprior(sm) -> T
+
+The `Σ` and `Qc` priors' contribution to the objective EM is monotone in.
+
+Without this the M-step would be maximizing a posterior while the reported bound
+tracked a likelihood, and the two would part company by exactly the amount the
+priors move the parameters — which on a `Σ` prior strong enough to matter is not
+a rounding error. Every site that already adds `P0_prior`'s term adds this one.
+
+The cost prior is counted once per distinct `Qc[k]` array rather than once per
+regime index, so a model whose regimes alias one array (`Qc = [Q, Q]`) does not
+pay for it twice.
+"""
+function _lqr_structural_logprior(sm::LQRStateModel{T}) where {T<:Real}
+    total = zero(T)
+    sm.Σ_prior === nothing || (total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior))
+    if sm.Qc_prior !== nothing && !_is_free(sm)
+        seen = Base.IdSet()
+        for (k, Q) in enumerate(sm.Qc)
+            Q in seen && continue
+            push!(seen, Q)
+            prior = _qc_prior(sm, k)
+            prior === nothing || (total += iw_logprior_term(Matrix{T}(Q), prior))
+        end
+    end
     return total
 end

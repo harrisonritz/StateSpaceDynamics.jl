@@ -115,10 +115,17 @@ The LDS hypothesis, as something to fit: a `:free` model of the same latent
 dimension as the LQR one, started away from anything in particular.
 
 `M` starts as a uniform contraction and `B_u` at zero, so the candidate is told
-nothing about either the dynamics or the targets. Its `fit_flags` leave `M`, `h`
-and `B_u` free — a *reduced-form* input coupling, which is the LDS's way of
-representing a reference and the reason it ends up with more free parameters
-than the LQR it is competing with.
+nothing about either the dynamics or the targets. `B_u` is free — a
+*reduced-form* input coupling, which is the LDS's way of representing a
+reference.
+
+`h` is **frozen at zero**, and that is a design fix rather than a handicap. The
+inputs here are a one-hot target indicator, so their columns sum to one and are
+exactly collinear with a free bias: the regression's Gram is rank-deficient by
+construction, the package ridges it to stay alive and says so, and the
+"parameter" the bias adds is a direction the data cannot see. Freezing it leaves
+the same model with an identified parameterization — `B_u`'s columns already span
+the constant.
 """
 function free_candidate(truth::LqrTruth; noise0::Float64=0.05, decay0::Float64=0.8)
     n = truth.nref >= 0 ? size(truth.C, 2) ÷ 2 : 0
@@ -130,6 +137,7 @@ function free_candidate(truth::LqrTruth; noise0::Float64=0.05, decay0::Float64=0
         Bu=truth.nref > 0 ? zeros(d, truth.nref) : nothing,
         P0=Matrix(0.2I, d, d),
         observe_costate=truth.sm.observe_costate,
+        fit_flags=LQRFitFlags(; h=(truth.nref == 0)),
     )
 end
 
@@ -144,7 +152,9 @@ function nparams(sm, nref::Int)
     d = _state_dim(sm)
     n = d ÷ 2
     tri(k) = k * (k + 1) ÷ 2
-    sm.mode === :free && return d^2 + d + d * nref                 # M, h, Bu
+    # `h` is frozen on the free candidate whenever there is a one-hot input to
+    # be collinear with; see `free_candidate`.
+    sm.mode === :free && return d^2 + (nref == 0 ? d : 0) + d * nref
     return n^2 + tri(n) + length(sm.Qc) * tri(n) + d + n * nref    # A, S, Qc, h, Gref
 end
 

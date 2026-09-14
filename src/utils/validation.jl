@@ -157,6 +157,7 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
         )
     else
         _check_lqr_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+        _normalize_qc_prior(T, sm.Qc_prior, length(sm.Qc), n)
     end
 
     for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))

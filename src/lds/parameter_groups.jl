@@ -1089,6 +1089,8 @@ function _build_variants!(
             sm.mstep_iters,
             sm.P0_prior,
             sm.x0_prior,
+            sm.Σ_prior,
+            sm.Qc_prior,
             nothing,
             nothing,
             LQRCache(T, n, _nregimes(sm), size(sm.Bu, 2)),

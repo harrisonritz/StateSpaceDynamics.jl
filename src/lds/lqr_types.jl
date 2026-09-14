@@ -483,6 +483,20 @@ noisily rather than exactly optimal, a cost that changes within the trial, and
 more trials. This is the well-known ill-posedness of inverse optimal control,
 not an artifact of the parameterization.
 
+## Regularizing the innovation and the cost
+
+`Σ_prior` is an [`IWPrior`](@ref) on the mixed-coordinate innovation. A single
+`Qc_prior::IWPrior` applies the same prior to every cost regime. To regularize
+epochs differently, pass a vector aligned with `Qc`:
+
+```julia
+Qc_prior = [running_prior, nothing, terminal_prior]
+```
+
+Here the middle cost is unregularized, and the last entry applies to the terminal
+cost when `schedule[end] == 3`. The vector length must equal `length(Qc)`; its
+meaning follows cost-regime indices, not the number or order of schedule runs.
+
 # Fields
 - `A::M`: `n × n` plant dynamics. Invertible.
 - `S::M`: `n × n` symmetric `B R⁻¹ Bᵀ` — the control authority weighted by the
@@ -505,6 +519,13 @@ not an artifact of the parameterization.
     (the default) pins the costate columns of `C` at zero.
 - `fit_flags::LQRFitFlags`: which structural parameters move.
 - `mstep_iters::Int`: L-BFGS iterations per M-step.
+- `Σ_prior::Union{Nothing,IWPrior{T}} = nothing`: optional inverse-Wishart prior
+  on the mixed-coordinate innovation. See "Regularizing the innovation and the
+  cost" below.
+- `Qc_prior = nothing`: optional inverse-Wishart prior on the cost matrices.
+  Pass one `IWPrior` to share it across all regimes, or one entry per `Qc`
+  regime (each an `IWPrior` or `nothing`) to specify epoch-specific priors,
+  including the terminal regime. See below.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
 - `cache::LQRCache{T}`: derived forward parameters. Rebuilt by
@@ -540,6 +561,8 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     mstep_iters::Int
     P0_prior::Union{Nothing,IWPrior{T}}
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
+    Σ_prior::Union{Nothing,IWPrior{T}}
+    Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
     cache::LQRCache{T}
@@ -765,6 +788,51 @@ function _check_lqr_structure(
 end
 
 """
+    _normalize_qc_prior(T, prior, K, n)
+
+Validate and normalize the cost-prior specification stored by
+[`LQRStateModel`](@ref). A scalar prior is shared by all `K` cost regimes; a
+vector addresses regimes in `Qc` order and may contain `nothing` for unregularized
+epochs.
+"""
+function _normalize_qc_prior(::Type{T}, prior, K::Int, n::Int) where {T<:Real}
+    prior === nothing && return nothing
+    if prior isa IWPrior{T}
+        size(prior.Ψ) == (n, n) || throw(
+            DimensionMismatchError("LQR Qc_prior scale", (n, n), size(prior.Ψ))
+        )
+        return prior
+    end
+    prior isa AbstractVector || throw(
+        ArgumentError("Qc_prior must be an IWPrior or a vector of IWPrior/nothing entries")
+    )
+    length(prior) == K || throw(
+        DimensionMismatchError("LQR Qc_prior entries", K, length(prior))
+    )
+    out = Vector{Union{Nothing,IWPrior{T}}}(undef, K)
+    for k in 1:K
+        pk = prior[k]
+        if pk === nothing
+            out[k] = nothing
+        elseif pk isa IWPrior{T}
+            size(pk.Ψ) == (n, n) || throw(
+                DimensionMismatchError("LQR Qc_prior[$k] scale", (n, n), size(pk.Ψ))
+            )
+            out[k] = pk
+        else
+            throw(ArgumentError("Qc_prior[$k] must be an IWPrior or nothing"))
+        end
+    end
+    return out
+end
+
+"""Return the inverse-Wishart prior for cost regime `k`, or `nothing`."""
+@inline function _qc_prior(sm::LQRStateModel, k::Int)
+    prior = sm.Qc_prior
+    return prior isa AbstractVector ? prior[k] : prior
+end
+
+"""
     LQRStateModel(A, S, Qc, Σ; kwargs...)
 
 Build an LQR state model from the plant `A` (`n × n`,
@@ -784,6 +852,11 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
 - `x0`, `P0`: prior on `z₁ = [x₁; λ₁]`. Default `0` and `I`.
 - `observe_costate::Bool = false`: let the emission read the costate.
 - `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`: see the type docstring.
+- `Σ_prior`: inverse-Wishart prior on the innovation.
+- `Qc_prior`: one inverse-Wishart prior shared across every cost matrix, or a
+  vector aligned with `Qc` whose entries are inverse-Wishart priors or `nothing`.
+  The last scheduled cost can therefore have its own terminal prior. See
+  "Regularizing the innovation and the cost" on the type.
 
 Everything derived (the symplectic transitions, the forward noise) is built
 here; you never pass it in.
@@ -807,6 +880,8 @@ function LQRStateModel(
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+    Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    Qc_prior=nothing,
 ) where {T<:Real}
     n = size(A, 1)
     d = 2n
@@ -814,6 +889,7 @@ function LQRStateModel(
     sched = collect(Int, schedule)
 
     _check_lqr_structure(A, S, Qc_vec, sched, terminal)
+    Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
 
@@ -873,6 +949,8 @@ function LQRStateModel(
         mstep_iters,
         P0_prior,
         x0_prior,
+        Σ_prior,
+        Qc_prior_value,
         nothing,
         nothing,
         LQRCache(T, n, length(Qc_vec), size(Bu_m, 2)),
@@ -905,9 +983,9 @@ Its M-step is the ordinary closed-form regression, not the constrained one.
 - `Σ`: the `2n × 2n` process noise.
 
 # Keywords
-`h`, `Bu`, `x0`, `P0`, `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior` as for
-the LQR constructor. `Qc`, `Gref`, `schedule`, `terminal`, `Σf` and `hf` are not
-accepted — they have no meaning here.
+`h`, `Bu`, `x0`, `P0`, `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior` and
+`Σ_prior` as for the LQR constructor. `Qc`, `Gref`, `schedule`, `terminal`, `Σf`,
+`hf` and `Qc_prior` are not accepted — they have no meaning here.
 
 # Examples
 ```julia
@@ -933,6 +1011,8 @@ function free_state_model(
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+    Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    Qc_prior=nothing,
 ) where {T<:Real}
     d = size(M, 1)
     size(M, 2) == d ||
@@ -945,6 +1025,8 @@ function free_state_model(
     )
     fit_flags.Bu_rows === nothing ||
         throw(ArgumentError("Bu_rows is supported only in LQR mode"))
+    Qc_prior === nothing ||
+        throw(ArgumentError("Qc_prior has no meaning in :free mode — there is no cost"))
     n = d >> 1
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("free Σ rows", d, size(Σ, 1)))
@@ -986,6 +1068,12 @@ function free_state_model(
         mstep_iters,
         P0_prior,
         x0_prior,
+        Σ_prior,
+        #=
+        A `:free` model has no cost, so a cost prior would have nothing to act
+        on. It is rejected above rather than silently carried.
+        =#
+        nothing,
         nothing,
         nothing,
         LQRCache(T, n, 1, size(Bu_m, 2)),

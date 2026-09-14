@@ -874,11 +874,16 @@ end
 """
     _grouped_state_prior_logdensity(cell_ldss, cell_slot, T) contribution
 
-An LQR model carries only initial-state priors, so its grouped prior term
-is the `P0` and `x0` half of the Gaussian one — there is no Inverse-Wishart term
-on `Σ` (the M-step profiles it out) and no matrix-normal term on the structural
-block, whose entries are shared between `𝓔`'s blocks and so form no free
-regression matrix.
+An LQR model carries initial-state priors plus, optionally, inverse-Wishart
+priors on the innovation `Σ` and on the cost matrices — the latter two through
+[`_lqr_structural_logprior`](@ref). There is still no matrix-normal term on the
+structural block, whose entries are shared between `𝓔`'s blocks and so form no
+free regression matrix.
+
+Structural priors are counted by array identity. This matters when `depends_on`
+varies structure and noise independently: counting both priors on the `Q` slot
+would under-count a varying `Qc` when `Σ` is shared, and over-count a shared
+`Qc` when `Σ` varies.
 """
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
@@ -889,6 +894,23 @@ function _grouped_state_prior_logdensity(
     for u in _slot_representatives(cell_slot[_G_P0])
         sm = ldss[u].state_model
         sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    end
+    seen_sigma = Base.IdSet()
+    seen_qc = Base.IdSet()
+    for lds in ldss
+        sm = lds.state_model
+        if sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
+            push!(seen_sigma, sm.Σ)
+            total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
+        end
+        if sm.Qc_prior !== nothing && !_is_free(sm)
+            for (k, Q) in enumerate(sm.Qc)
+                Q in seen_qc && continue
+                push!(seen_qc, Q)
+                prior = _qc_prior(sm, k)
+                prior === nothing || (total += iw_logprior_term(Matrix{T}(Q), prior))
+            end
+        end
     end
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model

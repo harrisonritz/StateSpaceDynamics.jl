@@ -25,7 +25,7 @@ assertion that passes.
     --full               the long tier: more seeds, more trials, wider ladders
     --only=a,b           run only these experiments (overview, design, scale,
                          procedure, initialization, modelrecovery, goldstandard,
-                         switching)
+                         priors, switching)
     --gen=rand|lqr|both  which generative mode the parametric sweeps use
                          (default: both for `design`, `lqr` elsewhere)
     --no-figures         tables only
@@ -64,7 +64,7 @@ using Random
 const SSD = StateSpaceDynamics
 
 for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "compare.jl",
-           "report.jl", "plotting.jl", "experiments.jl")
+    "report.jl", "plotting.jl", "experiments.jl")
     include(joinpath(@__DIR__, _f))
 end
 
@@ -76,6 +76,7 @@ const ALL_EXPERIMENTS = (
     "initialization",
     "modelrecovery",
     "goldstandard",
+    "priors",
     "switching",
 )
 
@@ -109,7 +110,7 @@ function parse_args(args)
             bad = setdiff(only, ALL_EXPERIMENTS)
             isempty(bad) ||
                 error("--only names unknown experiments: $(join(bad, ", ")); " *
-                      "valid: $(join(ALL_EXPERIMENTS, ", "))")
+                    "valid: $(join(ALL_EXPERIMENTS, ", "))")
         elseif startswith(a, "--gen=")
             g = a[7:end]
             g in ("rand", "lqr", "both") ||
@@ -174,6 +175,9 @@ function main(args=String[])
     end
     if "goldstandard" in opt.only
         experiment_gold_standard(cfg; figures=opt.figures)
+    end
+    if "priors" in opt.only
+        experiment_priors(cfg; figures=opt.figures)
     end
     if "switching" in opt.only
         experiment_switching(cfg; figures=opt.figures)

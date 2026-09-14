@@ -169,7 +169,18 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     R = (R + transpose(R)) / 2
     N = sum(hs.nk)
     obj = -N * log(abs(det(A)))
-    obj += profile ? 0.5 * N * logdet(R) : 0.5 * dot(inv(Symmetric(V.(sm.Σ))), R)
+    if profile
+        if sm.Σ_prior === nothing
+            obj += 0.5 * N * logdet(R)
+        else
+            prior = sm.Σ_prior
+            R = R + V.(prior.Ψ)
+            Neff = N + prior.ν + d + 1
+            obj += 0.5 * Neff * logdet(R)
+        end
+    else
+        obj += 0.5 * dot(inv(Symmetric(V.(sm.Σ))), R)
+    end
     if sm.terminal
         Rf = zeros(V, n, n)
         for k in 1:K
@@ -183,6 +194,14 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
             0.5 * Nf * logdet(Rf)
         else
             0.5 * dot(inv(Symmetric(V.(sm.Σf))), Rf)
+        end
+    end
+    if sm.Qc_prior !== nothing
+        for (k, Q) in enumerate(Qs)
+            prior = SSD._qc_prior(sm, k)
+            prior === nothing && continue
+            w = prior.ν + n + 1
+            obj += 0.5 * (w * logdet(Q) + tr(V.(prior.Ψ) * inv(Q)))
         end
     end
     return obj
@@ -300,6 +319,36 @@ function test_lqr_construction_errors()
     @test_throws SSD.DimensionMismatchError LQRStateModel(A, Sm, Qc, Matrix(0.03I, 3, 3))
     @test_throws SSD.DimensionMismatchError LQRStateModel(A, Sm, Qc, Σ; h=zeros(3))
     @test_throws ArgumentError LQRStateModel(A, Sm, Qc, Σ; mstep_iters=0)
+
+    # Cost priors may be shared or specified in Qc/schedule order, including a
+    # separate terminal prior and unregularized epochs.
+    run_prior = IWPrior(Matrix(0.4I, n, n), 8.0)
+    terminal_prior = IWPrior(Matrix(6.0I, n, n), 12.0)
+    epoch_sm = LQRStateModel(
+        A,
+        Sm,
+        [copy(Qc), 2 .* Qc],
+        Σ;
+        schedule=cost_schedule(3; terminal=true),
+        terminal=true,
+        Qc_prior=[run_prior, terminal_prior],
+    )
+    @test SSD._qc_prior(epoch_sm, 1) === run_prior
+    @test SSD._qc_prior(epoch_sm, 2) === terminal_prior
+    epoch_sm.Qc_prior = [nothing, terminal_prior]
+    @test SSD._qc_prior(epoch_sm, 1) === nothing
+    @test SSD._qc_prior(epoch_sm, 2) === terminal_prior
+    @test_throws SSD.DimensionMismatchError LQRStateModel(
+        A, Sm, [copy(Qc), 2 .* Qc], Σ;
+        schedule=cost_schedule(3; terminal=true), terminal=true, Qc_prior=[run_prior]
+    )
+    @test_throws SSD.DimensionMismatchError LQRStateModel(
+        A, Sm, Qc, Σ; Qc_prior=IWPrior(Matrix(1.0I, n + 1, n + 1), 8.0)
+    )
+    @test_throws ArgumentError LQRStateModel(
+        A, Sm, [copy(Qc), 2 .* Qc], Σ;
+        schedule=cost_schedule(3; terminal=true), terminal=true, Qc_prior=[run_prior, :bad]
+    )
 
     # A non-PD Σ is caught when the model goes into an LDS.
     sm_bad = LQRStateModel(A, Sm, Qc, Σ)
@@ -677,17 +726,44 @@ function test_lqr_mstep_objective_and_gradient()
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
     uxs = [randn(rng, 2, tsteps) for _ in 1:4]
     hs, _, _, _ = lqr_estep_stats(lds, ys; ux=uxs)
+    n = size(sm.A, 1)
+    d = 2n
+    per_epoch_prior = SSD._normalize_qc_prior(
+        Float64,
+        [
+            IWPrior(Matrix(0.2I, n, n), 7.0),
+            nothing,
+            IWPrior(Matrix(1.2I, n, n), 15.0),
+        ],
+        length(sm.Qc),
+        n,
+    )
 
     for profile in (true, false)
-        ctx = SSD._LQRMStepCtx(hs, sm, profile)
-        θ = zeros(ctx.pack.np)
-        SSD._lqr_pack!(θ, ctx)
-        g = similar(θ)
-        f = SSD._lqr_fg!(g, θ, ctx)
-        @test f ≈ lqr_ref_objective(θ, hs, sm, profile) atol = 1e-8
-        g_fd = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
-        @test maximum(abs, g .- g_fd) / max(1.0, maximum(abs, g_fd)) < 1e-8
+        for (sigma_prior, qc_prior) in (
+            (nothing, nothing),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), nothing),
+            (nothing, IWPrior(Matrix(0.4I, n, n), 9.0)),
+            (
+                IWPrior(Matrix(0.3I, d, d), 12.0),
+                IWPrior(Matrix(0.4I, n, n), 9.0),
+            ),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), per_epoch_prior),
+        )
+            sm.Σ_prior = sigma_prior
+            sm.Qc_prior = qc_prior
+            ctx = SSD._LQRMStepCtx(hs, sm, profile)
+            θ = zeros(ctx.pack.np)
+            SSD._lqr_pack!(θ, ctx)
+            g = similar(θ)
+            f = SSD._lqr_fg!(g, θ, ctx)
+            @test f ≈ lqr_ref_objective(θ, hs, sm, profile) atol = 1e-8
+            g_fd = ForwardDiff.gradient(t -> lqr_ref_objective(t, hs, sm, profile), θ)
+            @test maximum(abs, g .- g_fd) / max(1.0, maximum(abs, g_fd)) < 1e-8
+        end
     end
+    sm.Σ_prior = nothing
+    sm.Qc_prior = nothing
 
     # Arbitrary optimizer iterates must remain valid costs/control authority.
     # Also check the gradient away from the initial square-root factors.
@@ -827,6 +903,18 @@ function test_lqr_noise_update_closed_form()
     @test sm.Σ ≈ ctx.R[1] ./ ctx.N_q[1] atol = 1e-12
     @test sm.Σf ≈ ctx.Rf[1] ./ ctx.Nf_q[1] atol = 1e-12
     @test isposdef(Symmetric(Matrix(sm.Σ)))
+
+    # With an inverse-Wishart prior, the profiled optimizer and the covariance
+    # update must use the same posterior mode.
+    sm2, lds2 = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
+    prior = IWPrior(Matrix(0.6I, lds2.latent_dim, lds2.latent_dim), 17.0)
+    sm2.Σ_prior = prior
+    hs2, _, _, _ = lqr_estep_stats(lds2, ys)
+    ctx2 = SSD._LQRMStepCtx(hs2, sm2, true)
+    SSD._lqr_structure_mstep!(ctx2, true, sm2.mstep_iters)
+    SSD._lqr_noise_mstep!(ctx2)
+    expected = (ctx2.R[1] .+ prior.Ψ) ./ (prior.ν + ctx2.N_q[1] + lds2.latent_dim + 1)
+    @test sm2.Σ ≈ expected atol = 1e-12
     return nothing
 end
 
@@ -1510,6 +1598,28 @@ function test_lqr_priors_and_fit_bool()
     @test elbo(lds3, ys) != bare
     fit!(lds3, ys; max_iter=6, progress=false)
     @test isposdef(Symmetric(Matrix(sm3.P0)))
+
+    # Grouped models may vary noise and structure independently. Count each
+    # distinct covariance/cost array once, rather than counting both on the
+    # noise slot (which duplicates this shared cost).
+    sm4, lds4 = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
+    sm5 = deepcopy(sm4)
+    sm5.Qc = sm4.Qc
+    sigma_prior = IWPrior(Matrix(0.7I, d, d), 13.0)
+    qc_prior = IWPrior(Matrix(0.5I, d ÷ 2, d ÷ 2), 11.0)
+    for smi in (sm4, sm5)
+        smi.Σ_prior = sigma_prior
+        smi.Qc_prior = qc_prior
+    end
+    lds5 = LinearDynamicalSystem(sm5, deepcopy(lds4.obs_model))
+    slots = [ones(Int, 2) for _ in 1:6]
+    slots[SSD._G_Q] = [1, 2]
+    got = SSD._grouped_state_prior_logdensity([lds4, lds5], slots, Float64)
+    expected =
+        SSD.iw_logprior_term(sm4.Σ, sigma_prior) +
+        SSD.iw_logprior_term(sm5.Σ, sigma_prior) +
+        SSD.iw_logprior_term(sm4.Qc[1], qc_prior)
+    @test got ≈ expected
     return nothing
 end
 
