@@ -309,6 +309,10 @@ function fit_slds(
     stay_init::Float64=0.9,
     sig0_state::Float64=0.05,
     sig0_costate::Float64=5e-2,
+    sigma_prior_strength::Float64=0.0,
+    sigma_prior_costate::Float64=1e-4,
+    qc_prior_strength::Float64=0.0,
+    qc_prior_scale::Float64=0.2,
     free_noise0::Float64=0.12,
     free_decay0::Float64=0.85,
     init::Symbol=:cold,
@@ -329,6 +333,19 @@ function fit_slds(
             lqr_sm.S .= 1.5 .* truth.lqr_sm.S
         end
     end
+    #=
+    The principled alternative to pinning `Σ`. Pinning is a concession — the fit
+    is told the innovation — and every switching row that works rests on it. A
+    prior says the same thing with a strength attached, and leaves the M-step
+    free to disagree with it where the data insist.
+    =#
+    lqr_sm.Σ_prior = sigma_prior(
+        n;
+        state=0.02,
+        costate=sigma_prior_costate,
+        strength=sigma_prior_strength,
+    )
+    lqr_sm.Qc_prior = qc_prior(n; scale=qc_prior_scale, strength=qc_prior_strength)
     lqr_sm.fit_flags = LQRFitFlags(;
         A=(!known_plant), S=(!known_plant), Gref=free_gref, Bu=false
     )
@@ -403,6 +420,10 @@ function recover_slds(;
     stay_init::Float64=0.9,
     sig0_state::Float64=0.05,
     sig0_costate::Float64=5e-2,
+    sigma_prior_strength::Float64=0.0,
+    sigma_prior_costate::Float64=1e-4,
+    qc_prior_strength::Float64=0.0,
+    qc_prior_scale::Float64=0.2,
     free_noise0::Float64=0.12,
     init::Symbol=:cold,
     fit_noise::Bool=true,
@@ -469,6 +490,10 @@ function recover_slds(;
         stay_init=stay_init,
         sig0_state=sig0_state,
         sig0_costate=sig0_costate,
+        sigma_prior_strength=sigma_prior_strength,
+        sigma_prior_costate=sigma_prior_costate,
+        qc_prior_strength=qc_prior_strength,
+        qc_prior_scale=qc_prior_scale,
         free_noise0=free_noise0,
         init=init,
         fit_noise=fit_noise,

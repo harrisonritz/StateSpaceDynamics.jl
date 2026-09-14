@@ -771,6 +771,13 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     tmp_nr::Matrix{T}                 # n × reg
     tmp_nr2::Matrix{T}                # n × reg
     tmp_nn::Matrix{T}                 # n × n
+    #=
+    Effective transition counts per noise version. Without a `Σ_prior` these are
+    `N_q`; with one they are `ν + N + d + 1`, the posterior's count, and the
+    objective, its gradient weight and the noise M-step all read them from here
+    so the three cannot disagree.
+    =#
+    tmp_neff::Vector{T}               # [noise version]
 end
 
 """
@@ -1046,6 +1053,7 @@ function _LQRMStepCtx(
         Matrix{T}(undef, n, reg),
         Matrix{T}(undef, n, reg),
         Matrix{T}(undef, n, n),
+        zeros(T, nq),
     )
 end
 
@@ -1146,6 +1154,87 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
         isempty(r) || copyto!(view(θ, r), ctx.sms[first(o[_LQR_BLOCK_F][v])].hf)
     end
     return θ
+end
+
+#=============================================================================
+Priors on the innovation and the cost.
+
+Both are inverse-Wishart, and both act where the parameter is actually
+determined rather than as a post-hoc shrinkage.
+
+`Σ_prior` enters through the *profiled* objective. Profiling substitutes the
+noise's own maximizer into the structural objective, so a prior on `Σ` changes
+what that maximizer is: the ML value `R/N` becomes the MAP value
+`(Ψ + R)/(ν + N + d + 1)`, and the term the structural parameters see becomes
+`½(ν + N + d + 1) log det(Ψ + R)` in place of `½N log det R`. The residual weight
+in the gradient follows the same substitution. Changing only the noise update and
+leaving the profiled objective alone would make the two inconsistent and the
+bound non-monotone, which is why it is done here and not in `_lqr_noise_mstep!`
+alone.
+
+`Qc_prior` is an additive penalty on the same objective, since the cost is not
+profiled out: `−log p(Q_k) = ½[(ν + n + 1) log det Q_k + tr(Ψ Q_k⁻¹)]`, with
+gradient `½[(ν + n + 1) Q_k⁻¹ − Q_k⁻¹ Ψ Q_k⁻¹]` accumulated into `dQ` in
+matrix coordinates — the PSD chain rule downstream carries it to `θ`.
+
+Counting: the `Σ` prior is applied once per *noise version* and the cost prior
+once per *block copy*, so a tie that shares one array across discrete states
+counts its prior once rather than once per state.
+=============================================================================#
+
+"""The `Σ` prior in force for noise version `s`, or `nothing`."""
+@inline function _sigma_prior(ctx::_LQRMStepCtx, s::Int)
+    for (c, sm) in enumerate(ctx.sms)
+        ctx.q_of[c] == s && return sm.Σ_prior
+    end
+    return nothing
+end
+
+"""The cost prior in force for copy `v` of the `Qc` block, or `nothing`."""
+@inline function _qc_prior(ctx::_LQRMStepCtx, v::Int)
+    o = ctx.owners[_LQR_BLOCK_Q][v]
+    return isempty(o) ? nothing : ctx.sms[first(o)].Qc_prior
+end
+
+"""
+    _iw_penalty(Q, prior) -> Float64
+
+`−log p(Q)` for `Q ~ IW(Ψ, ν)`, dropping the normalizer, which is constant in
+`Q`. `Inf` if `Q` has left the cone — the optimizer reads that as a rejected step
+rather than as a failure.
+
+Split from its gradient on purpose. `_lqr_fg!` returns early when no gradient was
+asked for, which is the path a line search and any finite-difference check take,
+so a penalty added only in the gradient section would leave the value and the
+gradient describing different objectives. That is not a subtle failure in EM —
+the accept-if-improved guard keeps the *unpenalized* objective monotone and the
+reported bound moves with the prior, so the fit looks healthy while L-BFGS is
+following a gradient its objective does not have.
+"""
+function _iw_penalty(Q::AbstractMatrix{T}, prior) where {T<:Real}
+    n = size(Q, 1)
+    F = cholesky(Symmetric(Q); check=false)
+    issuccess(F) || return T(Inf)
+    w = T(prior.ν) + T(n) + one(T)
+    return T(0.5) * (w * T(2sum(log, diag(F.U))) + dot(inv(F), T.(prior.Ψ)))
+end
+
+"""
+    _iw_penalty_grad!(dQ, Q, prior)
+
+Accumulate `∂(−log p(Q))/∂Q = ½[(ν + n + 1) Q⁻¹ − Q⁻¹ Ψ Q⁻¹]` into `dQ`, in
+matrix coordinates — the PSD chain rule downstream turns it into a gradient with
+respect to the packed factor.
+"""
+function _iw_penalty_grad!(dQ::AbstractMatrix{T}, Q::AbstractMatrix{T}, prior) where {T<:Real}
+    n = size(Q, 1)
+    F = cholesky(Symmetric(Q); check=false)
+    issuccess(F) || return dQ
+    w = T(prior.ν) + T(n) + one(T)
+    Qinv = inv(F)
+    @. dQ += T(0.5) * w * Qinv
+    mul!(dQ, Qinv * T.(prior.Ψ), Qinv, -T(0.5), one(T))
+    return dQ
 end
 
 """
@@ -1353,12 +1442,29 @@ function _lqr_fg!(
 
     Fq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
     Ffq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
+    #=
+    Effective counts per noise version. Without a prior these are the transition
+    counts; with one they are `ν + N + d + 1` and `ctx.R[s]` has already had the
+    prior's scale matrix folded in, so everything downstream — objective,
+    gradient weight and the noise M-step — reads the posterior quantities
+    through the same two names.
+    =#
+    Neff = ctx.tmp_neff
+    for s in 1:(ctx.nq)
+        Neff[s] = ctx.N_q[s]
+        ctx.active_q[s] || continue
+        ctx.profile || continue
+        pr = _sigma_prior(ctx, s)
+        pr === nothing && continue
+        ctx.R[s] .+= T.(pr.Ψ)
+        Neff[s] = T(pr.ν) + ctx.N_q[s] + T(size(ctx.R[s], 1)) + one(T)
+    end
     for s in 1:(ctx.nq)
         ctx.active_q[s] || continue
         if ctx.profile
             chol = cholesky(Symmetric(ctx.R[s]); check=false)
             issuccess(chol) || return T(Inf)
-            fval += T(0.5) * ctx.N_q[s] * logdet(chol)
+            fval += T(0.5) * Neff[s] * logdet(chol)
             Fq[s] = chol
         else
             fval += T(0.5) * dot(ctx.Sinv[s], ctx.R[s])
@@ -1376,6 +1482,20 @@ function _lqr_fg!(
             end
         else
             fill!(ctx.Wf[s], zero(T))
+        end
+    end
+
+    #=
+    The cost prior's *value*, here rather than in the gradient section below,
+    because of the early return on the next line.
+    =#
+    for v in 1:(p.nv[_LQR_BLOCK_Q])
+        pr = _qc_prior(ctx, v)
+        (pr === nothing || isempty(_lqr_blk_q(p, v, 1))) && continue
+        for k in 1:K
+            pen = _iw_penalty(ctx.Qc[v][k], pr)
+            isfinite(pen) || return T(Inf)
+            fval += pen
         end
     end
 
@@ -1417,7 +1537,7 @@ function _lqr_fg!(
             if ctx.profile
                 copyto!(Gk, E)
                 ldiv!(Fq[u.q], Gk)
-                Gk .*= ctx.N_q[u.q]
+                Gk .*= Neff[u.q]
             else
                 mul!(Gk, ctx.W[u.q], E)
             end
@@ -1488,6 +1608,18 @@ function _lqr_fg!(
             _lqr_unpack_psd!(ctx.S[v], factor, θ, r)
             mul!(ctx.dS[v], ctx.tmp_nn, factor, T(2), zero(T))
             _lqr_pack_psd_gradient!(grad, r, ctx.dS[v], factor)
+        end
+    end
+    #=
+    The cost prior's gradient, in matrix coordinates, just before the PSD chain
+    rule below turns `dQ` into a gradient with respect to the packed factor. Its
+    value was added above, before the early return.
+    =#
+    for v in 1:(p.nv[_LQR_BLOCK_Q])
+        pr = _qc_prior(ctx, v)
+        (pr === nothing || isempty(_lqr_blk_q(p, v, 1))) && continue
+        for k in 1:K
+            _iw_penalty_grad!(ctx.dQ[v][k], ctx.Qc[v][k], pr)
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
@@ -1619,6 +1751,17 @@ end
 `Σ_s = R_s/N_s` and `Σ_{f,s} = R_{f,s}/N_{f,s}` — the closed-form maximizers
 given the structural parameters, which is exactly what profiling them out of the
 objective assumed. Units sharing a noise version pool into that version's `R`.
+
+With a `Σ_prior` in force the maximizer becomes the MAP value
+`(Ψ + R_s)/(ν + N_s + d + 1)`, which is the same substitution the profiled
+objective made — the two have to agree or EM is optimizing one thing and
+reporting another. `R_s` arrives here clean: the objective folds `Ψ` into its own
+copy per evaluation and `_lqr_structure_mstep!` recomputes the residuals at the
+accepted parameters before returning, so the fold is applied once, here.
+
+The terminal factor's covariance takes no prior. It is a pseudo-observation's
+noise rather than a process innovation, `Σf → 0` is the hard boundary condition
+it approximates, and shrinking it toward anything would work against that.
 """
 function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     #=
@@ -1631,9 +1774,18 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         ctx.active_q[s] || continue
         for (c, sm) in enumerate(ctx.sms)
             ctx.q_of[c] == s || continue
-            if ctx.N_q[s] > zero(T)
+            pr = sm.Σ_prior
+            if pr === nothing
+                if ctx.N_q[s] > zero(T)
+                    copyto!(sm.Σ, ctx.R[s])
+                    sm.Σ ./= ctx.N_q[s]
+                    Symmetrize!(sm.Σ)
+                end
+            else
+                d = size(sm.Σ, 1)
                 copyto!(sm.Σ, ctx.R[s])
-                sm.Σ ./= ctx.N_q[s]
+                sm.Σ .+= T.(pr.Ψ)
+                sm.Σ ./= T(pr.ν) + ctx.N_q[s] + T(d) + one(T)
                 Symmetrize!(sm.Σ)
             end
             if sm.terminal && ctx.Nf_q[s] > zero(T)

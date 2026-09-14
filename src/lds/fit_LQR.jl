@@ -874,11 +874,15 @@ end
 """
     _grouped_state_prior_logdensity(cell_ldss, cell_slot, T) contribution
 
-An LQR model carries only initial-state priors, so its grouped prior term
-is the `P0` and `x0` half of the Gaussian one — there is no Inverse-Wishart term
-on `Σ` (the M-step profiles it out) and no matrix-normal term on the structural
-block, whose entries are shared between `𝓔`'s blocks and so form no free
-regression matrix.
+An LQR model carries initial-state priors plus, optionally, inverse-Wishart
+priors on the innovation `Σ` and on the cost matrices — the latter two through
+[`_lqr_structural_logprior`](@ref). There is still no matrix-normal term on the
+structural block, whose entries are shared between `𝓔`'s blocks and so form no
+free regression matrix.
+
+The `Σ` prior is counted on the `Q` slot because that is the slot the noise
+version is grouped by, so a tie that shares one `Σ` across cells pays for its
+prior once.
 """
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
@@ -889,6 +893,9 @@ function _grouped_state_prior_logdensity(
     for u in _slot_representatives(cell_slot[_G_P0])
         sm = ldss[u].state_model
         sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    end
+    for u in _slot_representatives(cell_slot[_G_Q])
+        total += _lqr_structural_logprior(ldss[u].state_model)
     end
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model

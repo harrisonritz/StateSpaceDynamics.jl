@@ -118,6 +118,49 @@ function mixed_noise(n::Int; state::Float64=0.02, costate::Float64=1e-4)
 end
 
 """
+    sigma_prior(n; state, costate, strength) -> IWPrior or nothing
+
+An inverse-Wishart prior on the mixed-coordinate innovation, centred on the
+block structure [`mixed_noise`](@ref) describes.
+
+`Ψ = (ν + d + 1) Σ₀` is what puts the prior's *mode* exactly at `Σ₀`, so
+`strength` moves how hard the fit is held there without moving where "there" is.
+That separation is the point: the harness has two ways to say "the costate
+innovation is small" — start it there and hope, or say it as a prior and let the
+M-step trade it off against the data — and the comparison is only meaningful if
+the two name the same target.
+
+`strength = 0` returns `nothing`, the unregularized fit.
+"""
+function sigma_prior(
+    n::Int; state::Float64=0.02, costate::Float64=1e-4, strength::Float64=0.0
+)
+    strength > 0 || return nothing
+    d = 2n
+    Σ₀ = mixed_noise(n; state=state, costate=costate)
+    return IWPrior(; Ψ=(strength + d + 1) .* Σ₀, ν=strength)
+end
+
+"""
+    qc_prior(n; scale, strength) -> IWPrior or nothing
+
+An inverse-Wishart prior on each cost matrix, centred on `scale · I`.
+
+This is the honest version of the initial cost scale. The `q0` ladder shows the
+fitted scale barely moves from where it starts, which means the analysis has a
+prior in it whether or not anyone wrote one down — an infinitely strong one,
+placed by the initialization and invisible in the output. Writing it as a prior
+makes its strength a number a reader can see and a fit can trade against.
+
+`Ψ = (ν + n + 1) · scale · I` puts the mode at `scale · I`; `strength = 0`
+returns `nothing`.
+"""
+function qc_prior(n::Int; scale::Float64=0.2, strength::Float64=0.0)
+    strength > 0 || return nothing
+    return IWPrior(; Ψ=(strength + n + 1) * scale .* Matrix(1.0I, n, n), ν=strength)
+end
+
+"""
     cost_bank(n; terminal, onset) -> (Qc, idx)
 
 The cost regimes and where each one sits in `Qc`, given which structural

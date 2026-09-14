@@ -505,6 +505,11 @@ not an artifact of the parameterization.
     (the default) pins the costate columns of `C` at zero.
 - `fit_flags::LQRFitFlags`: which structural parameters move.
 - `mstep_iters::Int`: L-BFGS iterations per M-step.
+- `Σ_prior::Union{Nothing,IWPrior{T}} = nothing`: optional inverse-Wishart prior
+  on the mixed-coordinate innovation. See "Regularizing the innovation and the
+  cost" below.
+- `Qc_prior::Union{Nothing,IWPrior{T}} = nothing`: optional inverse-Wishart prior
+  on each cost matrix, shared across regimes. See below.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
 - `cache::LQRCache{T}`: derived forward parameters. Rebuilt by
@@ -540,6 +545,8 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     mstep_iters::Int
     P0_prior::Union{Nothing,IWPrior{T}}
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
+    Σ_prior::Union{Nothing,IWPrior{T}}
+    Qc_prior::Union{Nothing,IWPrior{T}}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
     cache::LQRCache{T}
@@ -784,6 +791,8 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
 - `x0`, `P0`: prior on `z₁ = [x₁; λ₁]`. Default `0` and `I`.
 - `observe_costate::Bool = false`: let the emission read the costate.
 - `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`: see the type docstring.
+- `Σ_prior`, `Qc_prior`: inverse-Wishart priors on the innovation and on each
+  cost matrix. See "Regularizing the innovation and the cost" on the type.
 
 Everything derived (the symplectic transitions, the forward noise) is built
 here; you never pass it in.
@@ -807,6 +816,8 @@ function LQRStateModel(
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+    Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    Qc_prior::Union{Nothing,IWPrior{T}}=nothing,
 ) where {T<:Real}
     n = size(A, 1)
     d = 2n
@@ -873,6 +884,8 @@ function LQRStateModel(
         mstep_iters,
         P0_prior,
         x0_prior,
+        Σ_prior,
+        Qc_prior,
         nothing,
         nothing,
         LQRCache(T, n, length(Qc_vec), size(Bu_m, 2)),
@@ -905,9 +918,9 @@ Its M-step is the ordinary closed-form regression, not the constrained one.
 - `Σ`: the `2n × 2n` process noise.
 
 # Keywords
-`h`, `Bu`, `x0`, `P0`, `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior` as for
-the LQR constructor. `Qc`, `Gref`, `schedule`, `terminal`, `Σf` and `hf` are not
-accepted — they have no meaning here.
+`h`, `Bu`, `x0`, `P0`, `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior` and
+`Σ_prior` as for the LQR constructor. `Qc`, `Gref`, `schedule`, `terminal`, `Σf`,
+`hf` and `Qc_prior` are not accepted — they have no meaning here.
 
 # Examples
 ```julia
@@ -933,6 +946,8 @@ function free_state_model(
     mstep_iters::Int=100,
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+    Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    Qc_prior::Union{Nothing,IWPrior{T}}=nothing,
 ) where {T<:Real}
     d = size(M, 1)
     size(M, 2) == d ||
@@ -945,6 +960,8 @@ function free_state_model(
     )
     fit_flags.Bu_rows === nothing ||
         throw(ArgumentError("Bu_rows is supported only in LQR mode"))
+    Qc_prior === nothing ||
+        throw(ArgumentError("Qc_prior has no meaning in :free mode — there is no cost"))
     n = d >> 1
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("free Σ rows", d, size(Σ, 1)))
@@ -986,6 +1003,12 @@ function free_state_model(
         mstep_iters,
         P0_prior,
         x0_prior,
+        Σ_prior,
+        #=
+        A `:free` model has no cost, so a cost prior would have nothing to act
+        on. It is rejected above rather than silently carried.
+        =#
+        nothing,
         nothing,
         nothing,
         LQRCache(T, n, 1, size(Bu_m, 2)),

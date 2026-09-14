@@ -1134,6 +1134,187 @@ function experiment_gold_standard(cfg; figures::Bool=true)
 end
 
 # ---------------------------------------------------------------------------
+# 4e. Priors
+# ---------------------------------------------------------------------------
+
+"""
+    experiment_priors(cfg; ...)
+
+What an explicit prior buys over an initialization that happens to stick.
+
+Two findings motivated the priors this measures. The fitted cost scale barely
+moves from where it starts, so the analysis already *has* a prior on it — an
+infinitely strong one, placed by the initialization and invisible in the output.
+And a switching LQR's innovation, left free, inflates until the LQR state is a
+second free state, which every working switching row avoids by pinning `Σ` at the
+truth — a concession, not a method.
+
+Both are now inverse-Wishart priors in the model rather than harness tricks, so
+this asks the three questions that follow:
+
+  * does a prior on `Σ` make the *initialization* stop mattering? If the answer
+    is yes, the biggest lever in this directory stops being a lever and becomes a
+    modelling choice with a strength attached.
+  * does a prior on the cost pin the scale the data cannot?
+  * does a prior on `Σ` replace pinning it in the switching fit?
+
+Strengths are in the inverse-Wishart's own units: `ν` is a pseudo-count against
+the transitions in the data, so `ν = 100` against 400 trials of 30 timesteps is
+a weak prior and `ν = 10000` a stiff one.
+"""
+function experiment_priors(cfg; figures::Bool=true)
+    T = max(cfg.tsteps, 30)
+    N = cfg.ntrials
+    base = (;
+        n=2,
+        tsteps=T,
+        ntrials=N,
+        nref=8,
+        ring=true,
+        terminal=true,
+        onset=max(2, T ÷ 3),
+        gen=:lqr,
+        max_iter=cfg.max_iter,
+    )
+    νs = [0.0, 1e2, 1e3, 1e4]
+    νq = [0.0, 1e1, 1e2, 1e3]
+
+    #=
+    The `Σ` prior crossed with the *initialization* it is meant to replace. If the
+    prior works, the two starts converge as `ν` grows; if it does not, the loose
+    row stays bad however strong the prior.
+    =#
+    grid = Any[]
+    for ν in νs, sc in (1e-4, 5e-2)
+        push!(
+            grid,
+            (:sig, ν, sc) =>
+                (; base..., sig0_costate=sc, sigma_prior_strength=ν),
+        )
+    end
+    for ν in νq
+        push!(grid, (:qc, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=0.2))
+    end
+    for ν in νq
+        push!(
+            grid,
+            (:both, ν) => (;
+                base...,
+                sigma_prior_strength=1e3,
+                qc_prior_strength=ν,
+                qc_prior_scale=0.2,
+            ),
+        )
+    end
+    res = cells(recover, grid; seeds=cfg.seeds)
+
+    section(
+        "4e — Priors: what they buy over an initialization that sticks" *
+        "\n     (gold-standard configuration; median over $(nseeds(cfg.seeds)))",
+    )
+    blocks = (:Qc, :Qterm, :Gref, :S, :Sig, :cl)
+    table_header(blocks)
+    for sc in (1e-4, 5e-2), ν in νs
+        a = aggregate(res[(:sig, ν, sc)])
+        a === nothing && continue
+        report(
+            rpad(@sprintf("Σ prior ν=%-6g  init Σ_λλ %.0e", ν, sc), LBLW), a; blocks=blocks
+        )
+    end
+    println()
+    for ν in νq
+        a = aggregate(res[(:qc, ν)])
+        a === nothing && continue
+        report(rpad(@sprintf("cost prior ν=%-6g  (at 0.2)", ν), LBLW), a; blocks=blocks)
+    end
+    println()
+    for ν in νq
+        a = aggregate(res[(:both, ν)])
+        a === nothing && continue
+        report(
+            rpad(@sprintf("Σ prior 1e3 + cost prior ν=%-6g", ν), LBLW), a; blocks=blocks
+        )
+    end
+
+    #=
+    The switching half. `Σ` estimated throughout — the question is whether a
+    prior does the job pinning was doing, so pinning it here would answer a
+    different one.
+    =#
+    sl = cfg.slds
+    sbase = (;
+        n=sl.n,
+        tsteps=sl.tsteps,
+        ntrials=sl.ntrials,
+        max_iter=sl.max_iter,
+        gen=:epoch,
+        terminal=true,
+        nref=4,
+    )
+    sconds = [
+        ("Σ estimated, no prior", (; sbase...)),
+        ("Σ estimated, prior ν=1e2", (; sbase..., sigma_prior_strength=1e2, sigma_prior_costate=2e-2)),
+        ("Σ estimated, prior ν=1e3", (; sbase..., sigma_prior_strength=1e3, sigma_prior_costate=2e-2)),
+        ("Σ estimated, prior ν=1e4", (; sbase..., sigma_prior_strength=1e4, sigma_prior_costate=2e-2)),
+        ("Σ pinned (the concession)", (; sbase..., sig0_state=0.02, sig0_costate=2e-2, fit_noise=false)),
+    ]
+    sres = cells(recover_slds, [c[1] => c[2] for c in sconds]; seeds=sl.seeds)
+    println()
+    println("   switching: a prior on Σ against pinning it")
+    table_header(CORE_BLOCKS; tail=SLDS_TAIL)
+    for (lab, _) in sconds
+        a = aggregate_slds(sres[lab])
+        a === nothing && (println(rpad(lab, LBLW), "  FAILED"); continue)
+        report_slds(rpad(lab, LBLW), a)
+    end
+
+    figures || return (single=res, switching=sres)
+    function ser(sc, path)
+        ms = [center(metric(res[(:sig, ν, sc)], path)) for ν in νs]
+        return (
+            sc == 1e-4 ? "init Σ_λλ = 1e-4" : "init Σ_λλ = 5e-2",
+            [m[1] for m in ms],
+            ([m[2] for m in ms], [m[3] for m in ms]),
+        )
+    end
+    xs = [1.0, 1e2, 1e3, 1e4]     # ν = 0 drawn at 1 so a log axis can hold it
+    sweep_figure(
+        "priors_sigma";
+        panels=[
+            (
+                "cost  Qc (running)",
+                xs,
+                [ser(1e-4, r -> r.scores.Qc.rmse), ser(5e-2, r -> r.scores.Qc.rmse)],
+            ),
+            (
+                "closed-loop plant",
+                xs,
+                [ser(1e-4, r -> r.scores.cl.rmse), ser(5e-2, r -> r.scores.cl.rmse)],
+            ),
+            (
+                "innovation  Σ xx",
+                xs,
+                [ser(1e-4, r -> r.scores.Sig.rmse), ser(5e-2, r -> r.scores.Sig.rmse)],
+            ),
+        ],
+        xlabel="Σ prior strength ν  (1 = no prior)",
+        logx=true,
+        xticks=(xs, ["none", "1e2", "1e3", "1e4"]),
+        title="Does a prior on Σ make the initialization stop mattering?",
+    )
+    slabs = [c[1] for c in sconds]
+    have = [l for l in slabs if aggregate_slds(sres[l]) !== nothing]
+    isempty(have) || gamma_figure(
+        "priors_slds_gamma";
+        labels=have,
+        fitted=[center(metric(sres[l], r -> r.gamma.acc))[1] for l in have],
+        reference=[center(metric(sres[l], r -> r.truth_gamma.acc))[1] for l in have],
+        title="A prior on Σ against pinning it ($(sl.ntrials) trials, T = $(sl.tsteps))",
+    )
+    return (single=res, switching=sres)
+end
+
+# ---------------------------------------------------------------------------
 # 5. Switching: one free state, one LQR state
 # ---------------------------------------------------------------------------
 
