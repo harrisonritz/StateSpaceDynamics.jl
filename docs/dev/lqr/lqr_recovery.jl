@@ -64,7 +64,7 @@ using Random
 const SSD = StateSpaceDynamics
 
 for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "compare.jl",
-           "report.jl", "plotting.jl", "experiments.jl")
+    "report.jl", "plotting.jl", "experiments.jl")
     include(joinpath(@__DIR__, _f))
 end
 
@@ -110,7 +110,7 @@ function parse_args(args)
             bad = setdiff(only, ALL_EXPERIMENTS)
             isempty(bad) ||
                 error("--only names unknown experiments: $(join(bad, ", ")); " *
-                      "valid: $(join(ALL_EXPERIMENTS, ", "))")
+                    "valid: $(join(ALL_EXPERIMENTS, ", "))")
         elseif startswith(a, "--gen=")
             g = a[7:end]
             g in ("rand", "lqr", "both") ||
