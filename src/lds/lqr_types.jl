@@ -798,26 +798,23 @@ epochs.
 function _normalize_qc_prior(::Type{T}, prior, K::Int, n::Int) where {T<:Real}
     prior === nothing && return nothing
     if prior isa IWPrior{T}
-        size(prior.Ψ) == (n, n) || throw(
-            DimensionMismatchError("LQR Qc_prior scale", (n, n), size(prior.Ψ))
-        )
+        size(prior.Ψ) == (n, n) ||
+            throw(DimensionMismatchError("LQR Qc_prior scale", (n, n), size(prior.Ψ)))
         return prior
     end
     prior isa AbstractVector || throw(
-        ArgumentError("Qc_prior must be an IWPrior or a vector of IWPrior/nothing entries")
+        ArgumentError("Qc_prior must be an IWPrior or a vector of IWPrior/nothing entries"),
     )
-    length(prior) == K || throw(
-        DimensionMismatchError("LQR Qc_prior entries", K, length(prior))
-    )
+    length(prior) == K ||
+        throw(DimensionMismatchError("LQR Qc_prior entries", K, length(prior)))
     out = Vector{Union{Nothing,IWPrior{T}}}(undef, K)
     for k in 1:K
         pk = prior[k]
         if pk === nothing
             out[k] = nothing
         elseif pk isa IWPrior{T}
-            size(pk.Ψ) == (n, n) || throw(
-                DimensionMismatchError("LQR Qc_prior[$k] scale", (n, n), size(pk.Ψ))
-            )
+            size(pk.Ψ) == (n, n) ||
+                throw(DimensionMismatchError("LQR Qc_prior[$k] scale", (n, n), size(pk.Ψ)))
             out[k] = pk
         else
             throw(ArgumentError("Qc_prior[$k] must be an IWPrior or nothing"))

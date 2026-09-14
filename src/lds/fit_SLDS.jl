@@ -1961,12 +1961,16 @@ function _vem_alternate!(
         elseif num_samples == 1
             fill_logL!(trial -> view(x_samples[trial], :, :, 1))
         else
-            fill!(logL_acc, zero(T))
+            # `logL_acc` is allocated exactly when `num_samples > 1`. Use
+            # `something` to make that invariant explicit to inference while
+            # retaining the no-allocation single-sample path.
+            acc = something(logL_acc)
+            fill!(acc, zero(T))
             for s in 1:num_samples
                 fill_logL!(trial -> view(x_samples[trial], :, :, s))
-                logL_acc .+= dl.logL
+                acc .+= dl.logL
             end
-            dl.logL .= logL_acc .* inv(T(num_samples))
+            dl.logL .= acc .* inv(T(num_samples))
         end
 
         # (2) Update q(z): single batched forward-backward across all trials.

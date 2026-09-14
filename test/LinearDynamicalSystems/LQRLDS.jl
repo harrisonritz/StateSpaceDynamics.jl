@@ -64,7 +64,7 @@ function lqr_fixture(
         observe_costate=observe_costate,
     )
     C = randn(rng, p, d)
-    observe_costate || (C[:, (n + 1):d] .= 0)
+    observe_costate || (C[:, (n+1):d] .= 0)
     om = GaussianObservationModel(C, Matrix(0.08I, p, p), randn(rng, p) .* 0.1)
     return sm, LinearDynamicalSystem(sm, om)
 end
@@ -117,8 +117,8 @@ function lqr_exact_marginal(lds, y; ux=nothing, uy=nothing)
     H = Matrix(
         block_tridgm(
             [Matrix(-btd.H_diag[t]) for t in 1:tsteps],
-            [Matrix(-btd.H_super[i]) for i in 1:(tsteps - 1)],
-            [Matrix(-btd.H_sub[i]) for i in 1:(tsteps - 1)],
+            [Matrix(-btd.H_super[i]) for i in 1:(tsteps-1)],
+            [Matrix(-btd.H_sub[i]) for i in 1:(tsteps-1)],
         ),
     )
     return sum(ll) + 0.5 * d * tsteps * log(2π) - 0.5 * logdet(Symmetric(H))
@@ -242,16 +242,16 @@ function test_lqr_structure()
     # The mixed matrix is what the M-step estimates; check its blocks.
     E = lqr_matrix(sm)
     @test E[1:n, 1:n] ≈ sm.A
-    @test E[1:n, (n + 1):(2n)] ≈ -sm.S
-    @test E[(n + 1):(2n), 1:n] ≈ sm.Qc[1]
-    @test E[(n + 1):(2n), (n + 1):(2n)] ≈ transpose(sm.A)
+    @test E[1:n, (n+1):(2n)] ≈ -sm.S
+    @test E[(n+1):(2n), 1:n] ≈ sm.Qc[1]
+    @test E[(n+1):(2n), (n+1):(2n)] ≈ transpose(sm.A)
 
     # `𝓔` maps [x_t; λ_{t+1}] → [x_{t+1}; λ_t]; `M` maps [x_t; λ_t] →
     # [x_{t+1}; λ_{t+1}]. Both must describe the same solution triple.
     x_t = randn(rng, n)
     lam_next = randn(rng, n)
     v = E * [x_t; lam_next]
-    @test M * [x_t; v[(n + 1):(2n)]] ≈ [v[1:n]; lam_next]
+    @test M * [x_t; v[(n+1):(2n)]] ≈ [v[1:n]; lam_next]
 
     # Noise map and the Jacobian identity the M-step depends on.
     G = sm.cache.G
@@ -277,7 +277,7 @@ function test_lqr_regimes_and_schedule()
     # Every regime gets its own symplectic transition, and each is symplectic.
     for k in 1:3
         @test symplectic_defect(sm, k) < 1e-12
-        @test symplectic_matrix(sm, k)[(size(sm.A, 1) + 1):end, 1:size(sm.A, 1)] ≈
+        @test symplectic_matrix(sm, k)[(size(sm.A, 1)+1):end, 1:size(sm.A, 1)] ≈
             -sm.cache.AinvT * sm.Qc[k]
     end
     @test symplectic_matrix(sm, 1) != symplectic_matrix(sm, 2)
@@ -402,7 +402,7 @@ function test_lqr_refresh_and_utilities()
     M = symplectic_matrix(sm)
     x = randn(rng, n)
     z_next = M * [x; P * x]
-    @test z_next[(n + 1):(2n)] ≈ P * z_next[1:n] atol = 1e-8
+    @test z_next[(n+1):(2n)] ≈ P * z_next[1:n] atol = 1e-8
     @test closed_loop_dynamics(sm; P=P) ≈ (I + sm.S * P) \ sm.A
     @test maximum(abs, eigvals(closed_loop_dynamics(sm; P=P))) < 1
     return nothing
@@ -585,8 +585,8 @@ function test_lqr_gradient_and_hessian()
         H = Matrix(
             block_tridgm(
                 [Matrix(btd.H_diag[t]) for t in 1:tsteps],
-                [Matrix(btd.H_super[i]) for i in 1:(tsteps - 1)],
-                [Matrix(btd.H_sub[i]) for i in 1:(tsteps - 1)],
+                [Matrix(btd.H_super[i]) for i in 1:(tsteps-1)],
+                [Matrix(btd.H_sub[i]) for i in 1:(tsteps-1)],
             ),
         )
         H_fd = ForwardDiff.hessian(objective, vec(x))
@@ -651,16 +651,16 @@ function test_lqr_sufficient_statistics()
         x = fs.x_smooth
         P = fs.p_smooth
         Ptt1 = fs.p_smooth_tt1
-        for t in 1:(tsteps - 1)
+        for t in 1:(tsteps-1)
             k = SSD._regime(sm, t)
             zt = [x[:, t]; 1.0; uxs[n][:, t]]
             Ezz = zt * zt'
             Ezz[1:d, 1:d] .+= P[:, :, t]
             zz[k] .+= Ezz
-            Ezy = zt * x[:, t + 1]'
-            Ezy[1:d, :] .+= Ptt1[:, :, t + 1]'
+            Ezy = zt * x[:, t+1]'
+            Ezy[1:d, :] .+= Ptt1[:, :, t+1]'
             zy[k] .+= Ezy
-            yy[k] .+= x[:, t + 1] * x[:, t + 1]' .+ P[:, :, t + 1]
+            yy[k] .+= x[:, t+1] * x[:, t+1]' .+ P[:, :, t+1]
             nk[k] += 1
         end
         zt = [x[:, tsteps]; 1.0; uxs[n][:, tsteps]]
@@ -688,20 +688,20 @@ function test_lqr_sufficient_statistics()
         x = fs.x_smooth
         P = fs.p_smooth
         Ptt1 = fs.p_smooth_tt1
-        for t in 1:(tsteps - 1)
+        for t in 1:(tsteps-1)
             k = SSD._regime(sm, t)
             # Joint second moment of (z_t, z_{t+1}) with the smoother covariances.
             Ezz_t = x[:, t] * x[:, t]' .+ P[:, :, t]
-            Ezz_n = x[:, t + 1] * x[:, t + 1]' .+ P[:, :, t + 1]
-            Ecross = x[:, t] * x[:, t + 1]' .+ Ptt1[:, :, t + 1]'   # E[z_t z_{t+1}ᵀ]
+            Ezz_n = x[:, t+1] * x[:, t+1]' .+ P[:, :, t+1]
+            Ecross = x[:, t] * x[:, t+1]' .+ Ptt1[:, :, t+1]'   # E[z_t z_{t+1}ᵀ]
             Jt = [Ezz_t Ecross; Ecross' Ezz_n]                       # 2d × 2d
             # w = [x_t; λ_{t+1}], v = [x_{t+1}; λ_t] as selections of [z_t; z_{t+1}]
             Sel_w = zeros(d, 2d)
             Sel_v = zeros(d, 2d)
             Sel_w[1:n, 1:n] .= I(n)
-            Sel_w[(n + 1):d, (d + n + 1):(2d)] .= I(n)
-            Sel_v[1:n, (d + 1):(d + n)] .= I(n)
-            Sel_v[(n + 1):d, (n + 1):d] .= I(n)
+            Sel_w[(n+1):d, (d+n+1):(2d)] .= I(n)
+            Sel_v[1:n, (d+1):(d+n)] .= I(n)
+            Sel_v[(n+1):d, (n+1):d] .= I(n)
             Sww[k] .+= Sel_w * Jt * Sel_w'
             Svw[k] .+= Sel_v * Jt * Sel_w'
             Svv .+= Sel_v * Jt * Sel_v'
@@ -939,7 +939,7 @@ function test_lqr_recovers_parameters()
     Σ = Matrix(Diagonal(fill(0.02, d)))
     sm = LQRStateModel(A, Sm, Qc, Σ; P0=Matrix(0.2I, d, d))
     C = randn(rng, p, d)
-    C[:, (n + 1):d] .= 0
+    C[:, (n+1):d] .= 0
     R = Matrix(0.05I, p, p)
     lds = LinearDynamicalSystem(sm, GaussianObservationModel(C, copy(R), zeros(p)))
     _, ys = rand(rng, lds, fill(tsteps, ntrials))
@@ -978,25 +978,25 @@ function test_lqr_costate_readout_mask()
     sm, lds = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     n = SSD._plant_dim(sm)
     d = lds.latent_dim
-    @test SSD._costate_range(lds) == (n + 1):d
+    @test SSD._costate_range(lds) == (n+1):d
 
     ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
     fit!(lds, ys; max_iter=6, progress=false)
     # `observe_costate = false` means C's costate columns are zero, and the
     # masked emission M-step keeps them there.
-    @test all(iszero, lds.obs_model.C[:, (n + 1):d])
+    @test all(iszero, lds.obs_model.C[:, (n+1):d])
     @test !all(iszero, lds.obs_model.C[:, 1:n])
 
     # A nonzero costate readout supplied by hand is zeroed at entry, with a warning.
-    lds.obs_model.C[:, (n + 1):d] .= 0.3
+    lds.obs_model.C[:, (n+1):d] .= 0.3
     @test_logs (:warn, r"costate columns") match_mode = :any elbo(lds, ys)
-    @test all(iszero, lds.obs_model.C[:, (n + 1):d])
+    @test all(iszero, lds.obs_model.C[:, (n+1):d])
 
     # Opting in leaves the emission free.
     sm2, lds2 = lqr_fixture(rng; nregimes=1, tsteps=tsteps, observe_costate=true)
     @test SSD._costate_range(lds2) === nothing
     fit!(lds2, ys; max_iter=6, progress=false)
-    @test !all(iszero, lds2.obs_model.C[:, (n + 1):d])
+    @test !all(iszero, lds2.obs_model.C[:, (n+1):d])
 
     # A full matrix-normal prior must be restricted to the observable columns.
     # A nonzero masked prior mean and dense cross-column precision previously
@@ -1004,11 +1004,11 @@ function test_lqr_costate_readout_mask()
     sm3, lds3 = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     regdim = d + 1
     M₀ = randn(rng, lds3.obs_dim, regdim)
-    M₀[:, (n + 1):d] .= 5
+    M₀[:, (n+1):d] .= 5
     Λ = Matrix(1.0I, regdim, regdim) .+ 0.1 .* ones(regdim, regdim)
     lds3.obs_model.CD_prior = MNPrior(M₀, Λ)
     fit!(lds3, ys; max_iter=4, progress=false)
-    @test all(iszero, lds3.obs_model.C[:, (n + 1):d])
+    @test all(iszero, lds3.obs_model.C[:, (n+1):d])
     return nothing
 end
 
@@ -1045,7 +1045,7 @@ function test_lqr_masked_fit_matches_reduced_model()
     hs, tfs, data, pool = lqr_estep_stats(lds, ys)
     SSD.update_C_d!(lds, hs.base, pool[1])
     C_masked = copy(lds.obs_model.C)
-    @test all(iszero, C_masked[:, (n + 1):d])
+    @test all(iszero, C_masked[:, (n+1):d])
 
     # Reference: solve the state-only regression by hand from the same statistics.
     Gram = Matrix(hs.base.obs_xx[])
@@ -1053,7 +1053,7 @@ function test_lqr_masked_fit_matches_reduced_model()
     keep = vcat(1:n, d + 1)
     C_ref = transpose(Gram[keep, keep] \ cross[keep, :])
     @test maximum(abs, C_masked[:, 1:n] .- C_ref[:, 1:n]) < 1e-8
-    @test maximum(abs, lds.obs_model.d .- C_ref[:, n + 1]) < 1e-8
+    @test maximum(abs, lds.obs_model.d .- C_ref[:, n+1]) < 1e-8
     return nothing
 end
 
@@ -1065,7 +1065,7 @@ function test_lqr_poisson_emission()
     p = 5
     sm, _ = lqr_fixture(rng; nregimes=2, terminal=true, tsteps=tsteps)
     C = randn(rng, p, d) .* 0.3
-    C[:, (n + 1):d] .= 0
+    C[:, (n+1):d] .= 0
     plds = LinearDynamicalSystem(sm, PoissonObservationModel(C, fill(1.0, p)))
     @test length(plds.fit_bool) == 5
 
@@ -1075,7 +1075,7 @@ function test_lqr_poisson_emission()
     @test els[end] > els[1]
     # The Poisson emission M-step is a constrained maximization, not a
     # projection, so the costate columns never move off zero.
-    @test all(iszero, plds.obs_model.C[:, (n + 1):d])
+    @test all(iszero, plds.obs_model.C[:, (n+1):d])
     @test symplectic_defect(sm, 1) < 1e-9
 
     xs, ps = smooth(plds, ys)
@@ -1093,9 +1093,9 @@ function test_lqr_composite_emission()
     d = 2n
     sm, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     Ck = randn(rng, 3, d)
-    Ck[:, (n + 1):d] .= 0
+    Ck[:, (n+1):d] .= 0
     Cs = randn(rng, 4, d) .* 0.3
-    Cs[:, (n + 1):d] .= 0
+    Cs[:, (n+1):d] .= 0
     lds = LinearDynamicalSystem(
         sm,
         (
@@ -1113,16 +1113,16 @@ function test_lqr_composite_emission()
     els = fit!(lds, ys; max_iter=8, progress=false)
     @test all(isfinite, els)
     @test els[end] > els[1]
-    @test all(iszero, lds.obs_model.kin.C[:, (n + 1):d])
-    @test all(iszero, lds.obs_model.spk.C[:, (n + 1):d])
+    @test all(iszero, lds.obs_model.kin.C[:, (n+1):d])
+    @test all(iszero, lds.obs_model.spk.C[:, (n+1):d])
 
     # An all-Gaussian composite takes the quadratic path, with its own ELBO
     # method; check it against the equivalent stacked single emission.
     sm2, _ = lqr_fixture(rng; nregimes=1, tsteps=tsteps)
     C1 = randn(rng, 3, d)
-    C1[:, (n + 1):d] .= 0
+    C1[:, (n+1):d] .= 0
     C2 = randn(rng, 2, d)
-    C2[:, (n + 1):d] .= 0
+    C2[:, (n+1):d] .= 0
     comp = LinearDynamicalSystem(
         sm2,
         (
@@ -1175,7 +1175,7 @@ function test_lqr_sampling()
     # sampled paths satisfy the terminal condition to within Σf.
     smt, ldst = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=tsteps)
     zt, _ = rand(StableRNG(4), ldst, tsteps)
-    resid = zt[(n + 1):d, end] .- smt.Qc[smt.schedule[end]] * zt[1:n, end] .- smt.hf
+    resid = zt[(n+1):d, end] .- smt.Qc[smt.schedule[end]] * zt[1:n, end] .- smt.hf
     @test norm(resid) < 5 * sqrt(maximum(diag(smt.Σf))) * sqrt(n)
 
     # ... and the conditioning is what keeps the path bounded: the same model
@@ -1198,20 +1198,20 @@ function test_lqr_simulate_lqr()
     # The noiseless rollout must satisfy the LQR recursion exactly.
     z = simulate_lqr(rng, sm, tsteps; process_noise=false, x1=[0.5, -0.3])
     @test size(z) == (2n, tsteps)
-    for t in 1:(tsteps - 1)
+    for t in 1:(tsteps-1)
         E = lqr_matrix(sm, SSD._regime(sm, t))
-        w = [z[1:n, t]; z[(n + 1):(2n), t + 1]]
-        v = [z[1:n, t + 1]; z[(n + 1):(2n), t]]
+        w = [z[1:n, t]; z[(n+1):(2n), t+1]]
+        v = [z[1:n, t+1]; z[(n+1):(2n), t]]
         @test maximum(abs, E * w .- v) < 1e-9
     end
     # ... including the terminal boundary condition.
-    @test maximum(abs, z[(n + 1):(2n), end] .- sm.Qc[sm.schedule[end]] * z[1:n, end]) <
+    @test maximum(abs, z[(n+1):(2n), end] .- sm.Qc[sm.schedule[end]] * z[1:n, end]) <
         1e-10
 
     # The Riccati sweep is what the rollout follows: λ_t = P_t x_t.
     P, g, W = lqr_riccati_sequence(sm, tsteps)
     for t in 1:tsteps
-        @test maximum(abs, z[(n + 1):(2n), t] .- (P[t] * z[1:n, t] .+ g[t])) < 1e-9
+        @test maximum(abs, z[(n+1):(2n), t] .- (P[t] * z[1:n, t] .+ g[t])) < 1e-9
         @test P[t] ≈ transpose(P[t]) atol = 1e-10
     end
     @test P[end] ≈ sm.Qc[sm.schedule[end]]
@@ -1261,17 +1261,17 @@ function test_lqr_tracking_control()
     exactly, with the affine term `[d_t; −Q_t r_t]`. That the costate half
     carries this regime's own cost is the whole point of `Gref`.
     =#
-    for t in 1:(tsteps - 1)
+    for t in 1:(tsteps-1)
         k = SSD._regime(sm, t)
         E = lqr_matrix(sm, k)
-        w = [z[1:n, t]; z[(n + 1):d, t + 1]]
-        v = [z[1:n, t + 1]; z[(n + 1):d, t]]
+        w = [z[1:n, t]; z[(n+1):d, t+1]]
+        v = [z[1:n, t+1]; z[(n+1):d, t]]
         affine = [zeros(n); -Qcs[k] * (Gref * ux[:, t])]
         @test maximum(abs, E * w .+ affine .- v) < 1e-10
     end
     # And the tracking terminal condition λ_T = Q_f (x_T − r_T).
     kT = sched[end]
-    @test maximum(abs, z[(n + 1):d, end] .- Qcs[kT] * (z[1:n, end] .- target)) < 1e-10
+    @test maximum(abs, z[(n+1):d, end] .- Qcs[kT] * (z[1:n, end] .- target)) < 1e-10
 
     # A heavier terminal cost pulls the endpoint onto the target.
     sm_heavy = LQRStateModel(
@@ -1617,8 +1617,8 @@ function test_lqr_priors_and_fit_bool()
     got = SSD._grouped_state_prior_logdensity([lds4, lds5], slots, Float64)
     expected =
         SSD.iw_logprior_term(sm4.Σ, sigma_prior) +
-        SSD.iw_logprior_term(sm5.Σ, sigma_prior) +
-        SSD.iw_logprior_term(sm4.Qc[1], qc_prior)
+            SSD.iw_logprior_term(sm5.Σ, sigma_prior) +
+            SSD.iw_logprior_term(sm4.Qc[1], qc_prior)
     @test got ≈ expected
     return nothing
 end
@@ -1643,7 +1643,7 @@ function test_lqr_ragged_with_schedule()
     # The per-regime transition counts must match the schedule, trial by trial.
     hs, _, _, _ = lqr_estep_stats(lds, ys)
     expected = zeros(3)
-    for t_n in lengths, t in 1:(t_n - 1)
+    for t_n in lengths, t in 1:(t_n-1)
         expected[SSD._regime(sm, t)] += 1
     end
     @test hs.nk ≈ expected

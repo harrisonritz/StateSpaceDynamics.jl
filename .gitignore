@@ -47,3 +47,4 @@ CLAUDE.md
 # Local profiling sandbox (never committed)
 /dev/
 **.cov
+docs/dev/lqr/*/*.png

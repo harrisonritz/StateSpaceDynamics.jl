@@ -1226,7 +1226,9 @@ Accumulate `∂(−log p(Q))/∂Q = ½[(ν + n + 1) Q⁻¹ − Q⁻¹ Ψ Q⁻¹]
 matrix coordinates — the PSD chain rule downstream turns it into a gradient with
 respect to the packed factor.
 """
-function _iw_penalty_grad!(dQ::AbstractMatrix{T}, Q::AbstractMatrix{T}, prior) where {T<:Real}
+function _iw_penalty_grad!(
+    dQ::AbstractMatrix{T}, Q::AbstractMatrix{T}, prior
+) where {T<:Real}
     n = size(Q, 1)
     F = cholesky(Symmetric(Q); check=false)
     issuccess(F) || return dQ
