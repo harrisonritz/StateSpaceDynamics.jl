@@ -126,6 +126,8 @@ the latent-basis problem back in.
 | `gold_standard.png` | the twelve procedures on the gold-standard configuration |
 | `gold_standard_scale.png` | held-out score and closed-loop error against the initial cost scale |
 | `gold_standard_params.png`, `gold_standard_entries.png` | the winning procedure's recovery |
+| `priors_sigma.png` | the `Σ` prior's strength ladder, crossed with the initialization it replaces |
+| `priors_slds_gamma.png` | a prior on `Σ` against pinning it, in the switching fit |
 
 ## The experiments
 
@@ -137,6 +139,7 @@ the latent-basis problem back in.
 | 4 | `procedure` | the fitting procedure rather than the model: iterations, restarts, initialization, inner-loop budget |
 | 4b | `initialization` | where to start: ladders on both blocks of `Σ` and on the initial cost scale, a two-axis grid over them, and a combination table run on both generators |
 | 4c | `modelrecovery` | can you tell an LQR from a plain LDS at all? Three generators, two candidates, held-out ELBO |
+| 4e | `priors` | what an explicit inverse-Wishart prior on `Σ` or on the cost buys over an initialization that happens to stick |
 | 4d | `goldstandard` | one realistic configuration — 3 cost levels, 8 ring targets — searched over twelve fitting procedures, plus whether cross-validation can select the cost scale |
 | 5 | `switching` | the `SLDS` with one free and one LQR state, and its two separate questions — the LQR state's parameters, and the discrete path |
 
@@ -411,25 +414,105 @@ So the scale is genuinely not determined by the data under this observation
 model: it has to come from a prior, an external calibration, or a convention —
 and until it does, only scale-invariant summaries mean anything.
 
+### Priors do the job the initialization was doing silently
+
+Two of the findings above are really the same complaint: a number that matters is
+being set by where the fit starts rather than by anything stated. `LQRStateModel`
+now takes `Σ_prior` and `Qc_prior`, both inverse-Wishart, and the question is
+what they buy. Strengths below are `ν`, a pseudo-count against the ~12,000
+transitions in this configuration — so `ν = 1e2` is a whisper and `ν = 1e5` is
+louder than the data.
+
+**A prior on the cost pins the scale the data cannot.** This is the fix for
+"cross-validation cannot select `q0`":
+
+| cost prior `ν` (mode at 0.2) | 0 | 1e2 | 1e3 | 1e4 | 1e5 |
+|---|---|---|---|---|---|
+| `S` (scale error) | 0.843 | 0.837 | 0.784 | 0.231 | **0.010** |
+| closed-loop | 0.033 | 0.033 | 0.031 | 0.011 | **0.007** |
+
+At full strength it beats the best `q0` anyone could have guessed (0.007 against
+0.011), and — unlike `q0` — its strength is a number in the model rather than an
+artefact of the starting point.
+
+It is doing real work in both directions, which is the test that it is a prior
+and not a fudge. Aimed at the wrong scale (0.6 against a truth of 0.2), it
+degrades the answer monotonically:
+
+| cost prior `ν` (mode at 0.6) | 1e3 | 1e4 | 1e5 |
+|---|---|---|---|
+| `S` | 0.914 | 1.275 | 1.936 |
+| closed-loop | 0.036 | 0.047 | 0.066 |
+
+**A prior on `Σ` replaces pinning it in the switching fit** — the concession
+every working switching row rested on. With `Σ` *estimated* throughout:
+
+| | γ | γ at truth | `Σ xx` | onset |
+|---|---|---|---|---|
+| no prior | 0.144 | 0.824 | 5.748 | 19.2 |
+| prior ν=1e2 | 0.500 | 0.824 | 0.810 | 19.8 |
+| prior ν=1e3 | 0.774 | 0.824 | 0.344 | 8.2 |
+| **prior ν=1e4** | **0.871** | 0.824 | **0.030** | 5.0 |
+| prior ν=1e5 | 0.871 | 0.824 | 0.003 | 5.0 |
+| `Σ` pinned (the concession) | 0.865 | 0.824 | — | 5.5 |
+
+A prior at `ν = 1e4` matches pinning and slightly beats it, while estimating the
+innovation rather than being told it — and it recovers `Σ` itself to 3%. It
+saturates by `1e4`. The LQR state's *cost* is no better for it (0.83–0.95
+throughout): the prior fixes the collapse, not the cost, which still needs the
+two-stage fit.
+
+**What a prior on `Σ` does not do is rescue a bad start.** Crossed with the
+initialization it was meant to replace:
+
+| | `Qc`, init `Σ_λλ` = 1e-4 | `Qc`, init `Σ_λλ` = 5e-2 | closed-loop, loose init |
+|---|---|---|---|
+| ν = 0 | 0.089 | 0.865 / 0.84 | 0.075 |
+| ν = 1e3 | 0.088 | 0.624 / 1.00 | 0.075 |
+| ν = 1e5 | 0.097 | 0.556 / 1.00 | 0.075 |
+
+The prior recovers the cost's *shape* from a loose start (correlation 0.84 → 1.00)
+but never the control problem — the closed-loop error sits at 0.075 whatever the
+strength, against 0.033 from the tight start. On a single system the
+initialization is still the lever; what the prior adds there is `Σ` itself,
+recovered from 4.42 to 1.55.
+
 ### If you are fitting one of these to real data
 
-1. Start `Σ`'s costate block small (`1e-4`) and its state block anywhere.
-2. Choose `q0` deliberately; the fitted cost scale will not move far from it.
-   Read `S`, or better, report the closed loop.
-3. Use two or more distinct reference targets, or freeze `h`. One target
-   identifies nothing about the reference.
-4. Do not spend compute on restarts or on iterations past a few hundred. Spend
-   it on observing more of the latent.
-5. For a switching model, pin or regularize the LQR state's `Σ`, and expect its
-   costate innovation to want a looser value than a single-system fit does.
-6. Do not use the ELBO to choose among fits. Under misspecification it prefers
-   the wrong one, a warm start at the truth walks away, and held-out likelihood
-   cannot select the cost scale either — it prefers whichever fit hedges most.
-7. For a switching model, fit the epochs and the cost in two stages rather than
-   jointly: a loose costate innovation to segment, then the single-system
-   machinery at a tight one on the segments.
-8. Do not claim the data came from an LQR on the strength of a model comparison.
-   Against a plain LDS the comparison only works where the LQR is correctly
+1. **Start `Σ`'s costate block small** (`1e-4`); its state block does not matter.
+   This is the largest single lever here — a 7× difference in cost recovery, and
+   larger than the terminal condition, the references, the iterations or the
+   amount of data.
+2. **State the cost scale as a `Qc_prior`, not as a starting value.** At a
+   strength comparable to the transition count it beats any `q0` you could have
+   guessed, and a misspecified one degrades the answer visibly rather than
+   silently. Left to the initialization the scale is a prior anyway — just an
+   invisible one of infinite strength.
+3. **Report the closed loop.** `(I + S P)⁻¹ A` is invariant to the cost scale and
+   comes back 3–10× better than the cost matrices do. If you must report the
+   cost, report its shape after canonicalization and read `S` for what the scale
+   is doing.
+4. **Use two or more distinct reference targets, or freeze `h`.** One target
+   identifies nothing about the reference; two or more identify its contrasts.
+   Past four, nothing more is bought.
+5. **The reference needs the costate.** It enters only through the costate half
+   of the affine term, so the tight innovation that fixes the cost makes `Gref`
+   unidentifiable. If the reference is the question, observe the costate and
+   anneal; otherwise do not report `Gref` at all.
+6. **Do not spend compute on restarts or on iterations past a few hundred.**
+   Neither changes a printed digit. Spend it on observing more of the latent.
+7. **Do not use a likelihood to choose among fits.** Under misspecification the
+   ELBO prefers the wrong one, a warm start at the truth walks away from it, and
+   held-out likelihood cannot select the cost scale — it prefers whichever fit
+   hedges most.
+8. **For a switching model, put a `Σ_prior` on the LQR state** (`ν` of order the
+   transition count) rather than pinning it: it recovers the epochs as well as
+   being told the innovation does, and recovers `Σ` itself besides. Then fit the
+   epochs and the cost in **two stages** — a loose costate innovation to segment,
+   the single-system machinery at a tight one on the segments — because no single
+   setting recovers both.
+9. **Do not claim the data came from an LQR on the strength of a model
+   comparison.** Against a plain LDS it only works where the LQR is correctly
    specified, which is not the case the model is for.
 
 ## Findings on the package
@@ -489,12 +572,23 @@ converged flag because a flag built on `tol` distinguishes nothing. A relative
 criterion (`|Δ| < tol * |elbo|`), or a stopping rule on the parameters rather
 than the bound, would make `fit!` say something useful about convergence.
 
-### 4. Nothing regularizes an LQR state's `Σ`
+### 4. Nothing regularized an LQR state's `Σ` — now something does
 
-`LQRStateModel` accepts `P0_prior::IWPrior` and `x0_prior::MNPrior`, but there is
-no prior or penalty on the innovation covariance. The switching results below
-turn on exactly that gap: left free, an LQR discrete state's `Σ` inflates until
-the state is a second free state, and the fit collapses onto one regime. An
-inverse-Wishart prior on `Σ` — or the ability to constrain it to a scaled
-identity — would be the difference between a switching inverse-LQR model that
-fits and one that does not.
+`LQRStateModel` accepted `P0_prior::IWPrior` and `x0_prior::MNPrior` but had no
+prior on the innovation covariance or on the cost. The switching results turned
+on exactly that gap: left free, an LQR discrete state's `Σ` inflates until the
+state is a second free state and the fit collapses onto one regime.
+
+**This one is now implemented** rather than reported — `Σ_prior` and `Qc_prior`
+on `LQRStateModel`, acting in the profiled objective, its gradient, the noise
+M-step and the prior log-density. See "Priors do the job the initialization was
+doing silently" above for what they buy. The other three findings stand.
+
+A note on verifying it here: `ForwardDiff` is not installable in this
+environment, so the package's own M-step gradient tests — which differentiate a
+reference objective — could not be run. The substitute was a central-difference
+check of `_lqr_fg!` against its analytic gradient in all four prior
+configurations and both the profiled and unprofiled branches (worst relative
+error 2.1e-9), EM monotonicity in the penalized bound, and a strength ladder
+that moves the fitted `Σ` onto the prior's mode. Run the real suite before
+trusting it further.

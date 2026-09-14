@@ -1176,8 +1176,15 @@ function experiment_priors(cfg; figures::Bool=true)
         gen=:lqr,
         max_iter=cfg.max_iter,
     )
-    νs = [0.0, 1e2, 1e3, 1e4]
-    νq = [0.0, 1e1, 1e2, 1e3]
+    #=
+    Strengths are pseudo-counts against the data, so the ladder has to reach the
+    data's own weight to say anything. The gold-standard configuration has
+    `N × (T − 1)` transitions — about 12,000 here — and a `ν` of 1e3 is under a
+    tenth of that, which is why the first pass at this experiment found the cost
+    prior "too weak to matter" when it was only too small to matter.
+    =#
+    νs = [0.0, 1e2, 1e3, 1e4, 1e5]
+    νq = [0.0, 1e2, 1e3, 1e4, 1e5]
 
     #=
     The `Σ` prior crossed with the *initialization* it is meant to replace. If the
@@ -1195,12 +1202,20 @@ function experiment_priors(cfg; figures::Bool=true)
     for ν in νq
         push!(grid, (:qc, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=0.2))
     end
+    #=
+    The same prior aimed at the wrong scale. A prior that pins the cost is only
+    useful if being wrong about it costs something a reader can see, and this is
+    the row that shows what.
+    =#
+    for ν in (1e3, 1e4, 1e5)
+        push!(grid, (:qcbad, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=0.6))
+    end
     for ν in νq
         push!(
             grid,
             (:both, ν) => (;
                 base...,
-                sigma_prior_strength=1e3,
+                sigma_prior_strength=1e4,
                 qc_prior_strength=ν,
                 qc_prior_scale=0.2,
             ),
@@ -1228,11 +1243,19 @@ function experiment_priors(cfg; figures::Bool=true)
         report(rpad(@sprintf("cost prior ν=%-6g  (at 0.2)", ν), LBLW), a; blocks=blocks)
     end
     println()
+    for ν in (1e3, 1e4, 1e5)
+        a = aggregate(res[(:qcbad, ν)])
+        a === nothing && continue
+        report(
+            rpad(@sprintf("cost prior ν=%-6g  at 0.6 (wrong)", ν), LBLW), a; blocks=blocks
+        )
+    end
+    println()
     for ν in νq
         a = aggregate(res[(:both, ν)])
         a === nothing && continue
         report(
-            rpad(@sprintf("Σ prior 1e3 + cost prior ν=%-6g", ν), LBLW), a; blocks=blocks
+            rpad(@sprintf("Σ prior 1e4 + cost prior ν=%-6g", ν), LBLW), a; blocks=blocks
         )
     end
 
@@ -1256,6 +1279,7 @@ function experiment_priors(cfg; figures::Bool=true)
         ("Σ estimated, prior ν=1e2", (; sbase..., sigma_prior_strength=1e2, sigma_prior_costate=2e-2)),
         ("Σ estimated, prior ν=1e3", (; sbase..., sigma_prior_strength=1e3, sigma_prior_costate=2e-2)),
         ("Σ estimated, prior ν=1e4", (; sbase..., sigma_prior_strength=1e4, sigma_prior_costate=2e-2)),
+        ("Σ estimated, prior ν=1e5", (; sbase..., sigma_prior_strength=1e5, sigma_prior_costate=2e-2)),
         ("Σ pinned (the concession)", (; sbase..., sig0_state=0.02, sig0_costate=2e-2, fit_noise=false)),
     ]
     sres = cells(recover_slds, [c[1] => c[2] for c in sconds]; seeds=sl.seeds)
@@ -1277,7 +1301,7 @@ function experiment_priors(cfg; figures::Bool=true)
             ([m[2] for m in ms], [m[3] for m in ms]),
         )
     end
-    xs = [1.0, 1e2, 1e3, 1e4]     # ν = 0 drawn at 1 so a log axis can hold it
+    xs = [1.0, 1e2, 1e3, 1e4, 1e5]  # ν = 0 drawn at 1 so a log axis can hold it
     sweep_figure(
         "priors_sigma";
         panels=[
@@ -1299,7 +1323,7 @@ function experiment_priors(cfg; figures::Bool=true)
         ],
         xlabel="Σ prior strength ν  (1 = no prior)",
         logx=true,
-        xticks=(xs, ["none", "1e2", "1e3", "1e4"]),
+        xticks=(xs, ["none", "1e2", "1e3", "1e4", "1e5"]),
         title="Does a prior on Σ make the initialization stop mattering?",
     )
     slabs = [c[1] for c in sconds]
