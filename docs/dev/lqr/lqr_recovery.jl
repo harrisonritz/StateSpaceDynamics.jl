@@ -24,7 +24,8 @@ assertion that passes.
                          numbers say whether the code runs, not what is true
     --full               the long tier: more seeds, more trials, wider ladders
     --only=a,b           run only these experiments (overview, design, scale,
-                         procedure, initialization, switching)
+                         procedure, initialization, modelrecovery, goldstandard,
+                         switching)
     --gen=rand|lqr|both  which generative mode the parametric sweeps use
                          (default: both for `design`, `lqr` elsewhere)
     --no-figures         tables only
@@ -62,13 +63,20 @@ using Random
 
 const SSD = StateSpaceDynamics
 
-for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "report.jl", "plotting.jl",
-           "experiments.jl")
+for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "compare.jl",
+           "report.jl", "plotting.jl", "experiments.jl")
     include(joinpath(@__DIR__, _f))
 end
 
 const ALL_EXPERIMENTS = (
-    "overview", "design", "scale", "procedure", "initialization", "switching"
+    "overview",
+    "design",
+    "scale",
+    "procedure",
+    "initialization",
+    "modelrecovery",
+    "goldstandard",
+    "switching",
 )
 
 """
@@ -160,6 +168,12 @@ function main(args=String[])
         for g in _gens(opt.gen, (:lqr,))
             experiment_initialization(cfg; gen=g, figures=opt.figures, free_C=opt.free_C)
         end
+    end
+    if "modelrecovery" in opt.only
+        experiment_model_recovery(cfg; figures=opt.figures)
+    end
+    if "goldstandard" in opt.only
+        experiment_gold_standard(cfg; figures=opt.figures)
     end
     if "switching" in opt.only
         experiment_switching(cfg; figures=opt.figures)

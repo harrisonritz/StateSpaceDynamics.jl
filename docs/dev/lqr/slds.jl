@@ -408,6 +408,16 @@ function recover_slds(;
     fit_noise::Bool=true,
     fit_structure::Bool=true,
     #=
+    Two-stage fitting, and the reason a switching LQR wants it more than a single
+    system does. This section's own ladder shows an inversion: a loose `Σ_λλ` is
+    what lets `γ` find the epochs, a tight one is what identifies the cost, and
+    no single value does both. `anneal_costate` is the obvious response — fit
+    once loose, reset the costate block tight, fit again from there — and it is
+    here to be measured rather than assumed, since the single-system version of
+    the same idea does not work.
+    =#
+    anneal_costate::Union{Nothing,Float64}=nothing,
+    #=
     The posterior read separately from the fit, and read harder. An LQR state's
     forward flow is unstable, so the shared `q(x)` of a switching fit converges
     slowly — `smooth`'s default 100 inner iterations warns rather than converges
@@ -474,6 +484,31 @@ function recover_slds(;
         rng=MersenneTwister(7seed),
     )
     elbos = elbos isa Tuple ? first(elbos) : elbos
+    if anneal_costate !== nothing
+        #=
+        Stage two. The costate block is reset tight and the cross-blocks zeroed —
+        shrinking the variance while leaving the fitted state-costate covariance
+        at its old size makes `Σ` indefinite and `refresh!` fails its Cholesky.
+        Everything else carries over, `γ` included, which is the point: stage one
+        is there to find the epochs and stage two to sharpen the cost given them.
+        =#
+        sm2 = slds.LDSs[LQR_STATE].state_model
+        nn, dd = truth.n, 2 * truth.n
+        @views sm2.Σ[1:nn, (nn + 1):dd] .= 0
+        @views sm2.Σ[(nn + 1):dd, 1:nn] .= 0
+        @views sm2.Σ[(nn + 1):dd, (nn + 1):dd] .= Matrix(anneal_costate * I, nn, nn)
+        refresh!(sm2)
+        e2 = fit!(
+            slds,
+            ys;
+            ux=uxs,
+            max_iter=max_iter,
+            smoothing_iters=smoothing_iters,
+            progress=false,
+            rng=MersenneTwister(11seed),
+        )
+        elbos = vcat(elbos, e2 isa Tuple ? first(e2) : e2)
+    end
     post = smooth(slds, ys; ux=uxs, smoothing_iters=post_iters, progress=false)
 
     fit_lqr = slds.LDSs[LQR_STATE].state_model
@@ -520,6 +555,173 @@ function recover_slds(;
         example=(y=ys[1], z=zs[1], x=xs[1], γ=post.γ[1], γ_truth=truth_post.γ[1]),
         elbos=elbos,
         ntrials=ntrials,
+        tsteps=tsteps,
+    )
+end
+
+# ---------------------------------------------------------------------------
+# Segment-then-fit
+# ---------------------------------------------------------------------------
+
+"""
+    segment_recover(; kwargs...) -> NamedTuple
+
+Decouple the two problems the switching fit conflates: find the epochs, then fit
+the cost *given* them.
+
+The switching results say `γ` and the cost want opposite costate innovations and
+that no single value or staged schedule gets both. That leaves an obvious
+question the joint fit cannot answer — when the cost fails to come back, is it
+because the epochs were wrong, or because a single-system inverse-LQR fit on
+this much data would have failed anyway? This cuts the knot: take a
+segmentation, slice out the LQR-governed timesteps, and hand them to the
+single-system machinery, which the rest of the harness has already characterized.
+
+`source` picks the segmentation:
+
+  * `:oracle` — the true epochs. This is the *ceiling*: whatever it recovers is
+    what perfect discrete-state inference would buy, and whatever it fails to
+    recover is not the switching layer's fault.
+  * `:fit` — the MAP path of a switching fit run at a loose costate innovation,
+    which is the setting that finds epochs. This is the procedure a user could
+    actually run.
+
+The onset is fixed rather than drawn per trial (`onset_range` is a single value),
+because a scheduled LQR model reads its terminal regime off `schedule[T_n]` and
+ragged segments would land different trials on different regimes. Fixing it
+costs the onset-detection question, which the switching table already covers,
+and buys a segment fit that means what it says.
+"""
+function segment_recover(;
+    n::Int=2,
+    tsteps::Int=40,
+    ntrials::Int=150,
+    onset::Int=0,
+    terminal::Bool=true,
+    nref::Int=4,
+    slack::Float64=0.05,
+    obs_noise::Float64=0.05,
+    observe_costate::Bool=false,
+    source::Symbol=:oracle,
+    known_plant::Bool=true,
+    sig0_costate::Float64=1e-4,
+    stage1_costate::Float64=2e-2,
+    max_iter::Int=250,
+    slds_iter::Int=50,
+    seed::Int=1,
+)
+    source in (:oracle, :fit) ||
+        throw(ArgumentError("source must be :oracle or :fit; got :$source"))
+    t_sw = onset == 0 ? max(2, tsteps ÷ 2) : onset
+    rng = MersenneTwister(seed)
+    truth = slds_truth(;
+        n=n,
+        tsteps=tsteps,
+        terminal=terminal,
+        nref=nref,
+        obs_noise=obs_noise,
+        observe_costate=observe_costate,
+        onset_range=t_sw:t_sw,
+    )
+    uxs = target_inputs(rng, nref, ntrials, tsteps)
+    ys, zs, _ = simulate_slds(rng, truth, ntrials; gen=:epoch, slack=slack, uxs=uxs)
+
+    zhat = if source === :oracle
+        zs
+    else
+        slds = fit_slds(
+            truth;
+            known_plant=known_plant,
+            free_gref=(nref > 0),
+            sig0_state=0.02,
+            sig0_costate=stage1_costate,
+            fit_noise=false,
+        )
+        fit!(
+            slds,
+            ys;
+            ux=uxs,
+            max_iter=slds_iter,
+            progress=false,
+            rng=MersenneTwister(7seed),
+        )
+        g = smooth(slds, ys; ux=uxs, smoothing_iters=400, progress=false).γ
+        [[argmax(view(γ, :, t)) for t in 1:tsteps] for γ in g]
+    end
+
+    #=
+    One segment per trial: the LQR-governed tail. Trials whose estimated path
+    never reaches the LQR state, or reaches it too late to leave two timesteps,
+    are dropped — a segment shorter than that has no transition in it and the
+    constructor refuses the schedule. How many were dropped is reported, since a
+    procedure that quietly discards half the data is not the same procedure.
+    =#
+    segs = Matrix{Float64}[]
+    segus = Matrix{Float64}[]
+    starts = Int[]
+    for i in 1:ntrials
+        t0 = findfirst(==(LQR_STATE), zhat[i])
+        (t0 === nothing || t0 > tsteps - 2) && continue
+        # `z_t` selects the transition into `t`, so the segment's first state is t0-1.
+        s0 = max(1, t0 - 1)
+        push!(segs, ys[i][:, s0:tsteps])
+        uxs === nothing || push!(segus, uxs[i][:, s0:tsteps])
+        push!(starts, s0)
+    end
+    #=
+    Zero segments is a result, not an error: it means the stage-one fit put no
+    timestep in the LQR state on any trial, which is the collapse the joint
+    table reports as a `γ` of 0.5. Say that rather than throwing, so a caller can
+    print the reason instead of "FAILED".
+    =#
+    isempty(segs) && return (failed=:no_lqr_segments, source=source, kept=0, ntrials=ntrials)
+    #=
+    Equal-length segments are what make one schedule serve every trial; with a
+    fixed onset and an estimated path that agrees with it, they usually are.
+    Trim to the shortest so the constructor's terminal regime lands on the last
+    entry of every trial.
+    =#
+    L = minimum(size(y, 2) for y in segs)
+    segs = [y[:, (end - L + 1):end] for y in segs]
+    segus = isempty(segus) ? nothing : [u[:, (end - L + 1):end] for u in segus]
+
+    seg_truth = LqrTruth(
+        segment_model(truth, L),
+        truth.C,
+        truth.R,
+        LinearDynamicalSystem(
+            segment_model(truth, L),
+            GaussianObservationModel(
+                copy(truth.C), copy(truth.R), zeros(size(truth.C, 1))
+            ),
+        ),
+        truth.idx,
+        nref,
+        L,
+    )
+    sm = fit_model(
+        seg_truth;
+        known_plant=known_plant,
+        free_gref=(nref > 0),
+        sig0_costate=sig0_costate,
+    )
+    lds, elbos = one_fit(
+        seg_truth, segs, segus, sm; free_C=false, max_iter=max_iter, tol=1e-10
+    )
+    ref = deepcopy(seg_truth.sm)
+    rescale_costate!(ref; target=:trace)
+    rescale_costate!(sm; target=:trace)
+    return (
+        scores=compare(sm, ref, truth.idx; known_plant=known_plant, free_gref=(nref > 0)),
+        source=source,
+        kept=length(segs),
+        ntrials=ntrials,
+        seg_len=L,
+        elbo=elbos[end],
+        truth_elbo=elbo(seg_truth.lds, segs; ux=segus),
+        iters=length(elbos),
+        creep=elbo_creep(elbos),
+        rho=maximum(abs, eigvals(symplectic_matrix(truth.lqr_sm))),
         tsteps=tsteps,
     )
 end

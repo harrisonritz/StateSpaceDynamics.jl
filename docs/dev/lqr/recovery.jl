@@ -216,6 +216,7 @@ function recover(;
     init::Symbol=:cold,
     restarts::Int=1,
     q0::Float64=0.4,
+    ring::Bool=false,
     state_noise::Float64=0.02,
     costate_noise::Float64=1e-4,
     sig0_state::Float64=0.05,
@@ -238,6 +239,7 @@ function recover(;
         obs_noise=obs_noise,
         state_noise=state_noise,
         costate_noise=costate_noise,
+        ring=ring,
         rng=rng,
     )
     uxs = target_inputs(rng, nref, ntrials, tsteps)

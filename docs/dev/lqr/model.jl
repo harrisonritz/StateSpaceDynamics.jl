@@ -56,11 +56,36 @@ more targets vary within the dataset and identify the *contrasts* between
 reference vectors; a terminal factor or a second cost regime is what identifies
 their common level.
 """
-function reference_map(n::Int, nref::Int; radius::Float64=1.5)
+function reference_map(n::Int, nref::Int; radius::Float64=1.5, ring::Bool=false)
     nref == 0 && return zeros(0, 0)
+    (ring || n == 2) && return ring_map(n, nref; radius=radius)
     G = Matrix{Float64}(undef, n, nref)
     for j in 1:nref, i in 1:n
         G[i, j] = radius * cos(2π * (j - 1) / nref + π * (i - 1) / n)
+    end
+    return G
+end
+
+"""
+    ring_map(n, nref; radius) -> Matrix (n × nref)
+
+Targets equally spaced on a circle in the first two state coordinates, zero in
+any others — the centre-out reaching layout, and the geometry the gold-standard
+configuration uses.
+
+A ring is the right default for `n = 2` and worth asking for explicitly above
+it. It makes every target the same distance from the origin and from its
+neighbours, so no target is easier than another and the recovered `Gref` can be
+read as a shape rather than as a list; and it is what the experiment it stands
+in for actually looks like.
+"""
+function ring_map(n::Int, nref::Int; radius::Float64=1.5)
+    n >= 2 || throw(ArgumentError("a ring needs at least two state dimensions"))
+    G = zeros(n, nref)
+    for j in 1:nref
+        θ = 2π * (j - 1) / nref
+        G[1, j] = radius * cos(θ)
+        G[2, j] = radius * sin(θ)
     end
     return G
 end
@@ -203,6 +228,7 @@ function lqr_truth(;
     obs_noise::Float64=0.05,
     state_noise::Float64=0.02,
     costate_noise::Float64=1e-4,
+    ring::Bool=false,
     rng::AbstractRNG=MersenneTwister(0),
 )
     d = 2n
@@ -222,7 +248,7 @@ function lqr_truth(;
         P0=Matrix(0.2I, d, d),
         h=h,
         Bu=nref > 0 ? zeros(d, nref) : nothing,
-        Gref=nref > 0 ? reference_map(n, nref) : nothing,
+        Gref=nref > 0 ? reference_map(n, nref; ring=ring) : nothing,
         observe_costate=observe_costate,
     )
     obs_dim = obs_width(n; free_C=free_C, observe_costate=observe_costate)

@@ -389,6 +389,7 @@ function sweep_figure(
     title::String="",
     ylabel::String="relative RMSE",
     ylog::Bool=true,
+    zeroline::Bool=false,
 )
     ps = Any[]
     for (ptitle, xs, series) in panels
@@ -467,6 +468,12 @@ function sweep_figure(
         Plots' own choice — which on a log axis is the exponent labels this whole
         helper exists to avoid.
         =#
+        #=
+        A rule at zero, for panels whose quantity is a *difference* and whose
+        sign is the answer. Drawn under the series, since it is a reference and
+        not data.
+        =#
+        zeroline && hline!(p, [0.0]; color=INK_MUTED, lw=1.2, label="")
         plot!(p; xticks=xt, yticks=yt, ylims=yl)
         push!(ps, p)
     end
