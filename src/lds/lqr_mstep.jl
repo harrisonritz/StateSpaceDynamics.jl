@@ -1425,6 +1425,20 @@ function _lqr_fg!(
     grad === nothing || fill!(grad, zero(T))
 
     _lqr_unpack!(ctx, θ)
+    # `L*L'` is positive definite in exact arithmetic when the log-diagonal is
+    # finite, but a line search can push a diagonal far enough toward zero that
+    # the materialised Float64 matrix loses rank. Reject that boundary point
+    # before it can be accepted and written back; otherwise the next EM
+    # iteration cannot pack the now-singular fitted block. Frozen singular
+    # blocks remain valid and are deliberately not checked here.
+    for v in 1:(p.nv[_LQR_BLOCK_S])
+        isempty(_lqr_blk(p, _LQR_BLOCK_S, v)) ||
+            isposdef(Symmetric(ctx.S[v])) ||
+            return T(Inf)
+    end
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+        isempty(_lqr_blk_q(p, v, k)) || isposdef(Symmetric(ctx.Qc[v][k])) || return T(Inf)
+    end
 
     fval = zero(T)
     F = Vector{LU{T,Matrix{T},Vector{Int}}}(undef, nA)
