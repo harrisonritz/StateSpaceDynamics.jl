@@ -55,11 +55,11 @@ function joint_loglikelihood!(
     ws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T0,S,O},
     x::AbstractMatrix{T},
-    y::AbstractMatrix{T0},
+    y::Union{AbstractMatrix{T0},NamedTuple},
     ux::Union{Nothing,AbstractMatrix{T0}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T0}}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:GaussianObservationModel{T0}}
-    ll_vec = view(ws.opt.ll_vec, 1:size(y, 2))
+    uy::Union{Nothing,AbstractMatrix{T0},NamedTuple}=nothing,
+) where {T<:Real,T0<:Real,S<:AbstractGaussianStateModel{T0},O<:QuadraticEmission{T0}}
+    ll_vec = view(ws.opt.ll_vec, 1:_ntsteps(y))
     return joint_loglikelihood!(ll_vec, ws, ws.consts, lds, x, y, ux, uy)
 end
 
@@ -70,7 +70,13 @@ function joint_loglikelihood(
     y::AbstractMatrix{YT},
     ux::Union{Nothing,AbstractMatrix{YT}}=nothing,
     uy::Union{Nothing,AbstractMatrix{YT}}=nothing,
-) where {T<:Real,YT<:Real,XT<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {
+    T<:Real,
+    YT<:Real,
+    XT<:Real,
+    S<:AbstractGaussianStateModel{T},
+    O<:GaussianObservationModel{T},
+}
     tsteps = size(y, 2)
     WT = promote_type(T, YT, XT)
     ws = SmoothWorkspace(WT, lds.latent_dim, lds.obs_dim, tsteps)
@@ -85,9 +91,11 @@ observation-independent — its blocks depend only on `A, Q, C, R, P0`
 length. Factored out so the equal-length multi-trial fast path can fill
 blocks without constructing dummy `x`/`y` matrices for `hessian!`.
 =#
-function _fill_hessian_blocks!(sws::SmoothWorkspace{T}, tsteps::Int) where {T<:Real}
+function _fill_hessian_blocks!(
+    sws::SmoothWorkspace{T}, sm::AbstractGaussianStateModel, tsteps::Int
+) where {T<:Real}
     btd = sws.btd
-    _state_hessian_blocks!(btd, sws.consts, tsteps)
+    _state_hessian_blocks!(btd, sws.consts, sm, tsteps)
     for t in 1:tsteps
         btd.H_diag[t] .+= sws.consts.yt_given_xt
     end
@@ -109,6 +117,10 @@ variant see `smooth!`).
 - `ux` / `uy`: optional dynamics / observation input sequences in the same
   shape family as `y`. Required when `size(state_model.B, 2) > 0` /
   `size(obs_model.D, 2) > 0`.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  `depends_on` declared on the models for this call (see the ancillary parameter
+  dependency docs). Needed when this dataset's trial count differs from the one
+  the labels on the model were written for.
 
 # Returns
 For a single-trial (matrix) `y`:
@@ -118,9 +130,15 @@ For a single-trial (matrix) `y`:
 For multi-trial `y`: `Vector`s of the above, one entry per trial.
 """
 function smooth(
-    lds::LinearDynamicalSystem{T,S,O}, y::Observations{T}; ux=nothing, uy=nothing
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    lds::LinearDynamicalSystem{T,S,O},
+    y::CompositeObservations{T};
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = _smooth_data(lds, data)
     return _collect_smooth_output(tfs, y)
 end
@@ -134,11 +152,11 @@ one carries O(D²·T) of block-tridiagonal storage.
 =#
 function _smooth_data(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
-        SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, maximum(data.tsteps)) for
+        SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), maximum(data.tsteps)) for
         _ in 1:npool
     ]
     smooth!(lds, tfs, data, sws_pool)
@@ -181,12 +199,12 @@ exploiting the block tridiagonal structure of the Hessian for efficient solving.
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
-    uy::AbstractMatrix{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
+    uy::Union{AbstractMatrix{T},NamedTuple},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
     btd = sws.btd
 
@@ -220,7 +238,7 @@ function smooth!(
     #=
     SPD path: smoother's negated Hessian is PSD at the MAP, and the
     sub/super blocks are transposes of each other (Hessian is
-    symmetric). At small `latent_dim` (≤ 8) this routes to LAPACK's
+    symmetric). Up to `latent_dim = 32` this routes to LAPACK's
     `pbsv` which is 30-60× faster than the general block-Thomas code.
     =#
     block_tridiagonal_solve_spd!(X0, neg_sub_v, neg_diag_v, neg_super_v, grad_vec, btd)
@@ -245,12 +263,12 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps = size(y, 2)
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps = _ntsteps(y)
     ux = zeros(T, 0, tsteps)
-    uy = zeros(T, 0, tsteps)
+    uy = _zero_uy(lds, tsteps)
     return smooth!(lds, fs, y, sws, ux, uy)
 end
 
@@ -274,14 +292,14 @@ function smooth!(
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     y = data.y
     ux = data.ux
     uy = data.uy
-    ntrials = length(y)
+    ntrials = length(data.tsteps)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], y[1], sws_pool[1], ux[1], uy[1])
+        smooth!(lds, tfs[1], _trial(y, 1), sws_pool[1], ux[1], _trial(uy, 1))
         return tfs
     end
 
@@ -292,8 +310,8 @@ function smooth!(
     `p_smooth` / `p_smooth_tt1` to the shared storage, then do gradient-and-
     solve per trial in parallel.
     =#
-    T1 = size(y[1], 2)
-    all_equal = all(yt -> size(yt, 2) == T1, y)
+    T1 = data.tsteps[1]
+    all_equal = all(==(T1), data.tsteps)
 
     if all_equal
         #=
@@ -336,7 +354,13 @@ function smooth!(
                 sws = sws_pool[i]
                 for trial in lo:hi
                     _smooth_mean_only!(
-                        lds, tfs[trial], y[trial], sws, ux[trial], uy[trial], source_sws
+                        lds,
+                        tfs[trial],
+                        _trial(y, trial),
+                        sws,
+                        ux[trial],
+                        _trial(uy, trial),
+                        source_sws,
                     )
                 end
             end
@@ -355,7 +379,9 @@ function smooth!(
             lo > hi && return nothing
             sws = sws_pool[i]
             for trial in lo:hi
-                smooth!(lds, tfs[trial], y[trial], sws, ux[trial], uy[trial])
+                smooth!(
+                    lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial)
+                )
             end
         end
     end
@@ -374,7 +400,7 @@ identical for every trial because it depends only on the covariances.
 """
 function _precompute_shared_cov!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     D = lds.latent_dim
     btd = sws.btd
     # Hoist `p_smooth_shared` with a concrete eltype so the `Symmetrize!`
@@ -383,7 +409,7 @@ function _precompute_shared_cov!(
     p_smooth_shared = sws.agg.p_smooth_shared::Array{T,3}
 
     compute_smooth_constants!(sws, lds)
-    _fill_hessian_blocks!(sws, tsteps)
+    _fill_hessian_blocks!(sws, lds.state_model, tsteps)
     _negate_blocks!(btd, tsteps)
 
     neg_diag_v = view(btd.neg_diag, 1:tsteps)
@@ -420,7 +446,8 @@ Per-trial Newton step that **assumes**:
 Per-task workspaces copy the constants from `source_sws` (cheap fixed-size
 `copyto!`s) instead of redoing the Cholesky factorizations. When `sws ===
 source_sws` (the task running on the designated workspace), even the copy
-is skipped.
+is skipped. Under a composite emission each member's constants are mirrored
+too — see [`_mirror_smooth_constants!`](@ref).
 
 Computes the gradient (per-trial), then runs `block_tridiagonal_backsubst!`
 against the shared LU cache. No `lu!` and no Cholesky calls happen here —
@@ -429,13 +456,13 @@ those are amortized across all equal-length trials in a single E-step.
 function _smooth_mean_only!(
     lds::LinearDynamicalSystem{T,S,O},
     fs::FilterSmooth{T},
-    y::AbstractMatrix{T},
+    y::Union{AbstractMatrix{T},NamedTuple},
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
-    uy::AbstractMatrix{T},
+    uy::Union{AbstractMatrix{T},NamedTuple},
     source_sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    tsteps, D = size(y, 2), lds.latent_dim
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
 
     #=
@@ -444,7 +471,7 @@ function _smooth_mean_only!(
     task workspace. No-op when `sws === source_sws`.
     =#
     if sws !== source_sws
-        _copy_smooth_constants!(sws.consts, source_sws.consts)
+        _mirror_smooth_constants!(sws, source_sws, lds)
     end
 
     shared_btd = source_sws.btd
@@ -488,7 +515,7 @@ function gradient_batched!(
     y::AbstractArray{T,3},
     ux::AbstractArray{T,3},
     uy::AbstractArray{T,3},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(x, 2)
     A = lds.state_model.A
     b = lds.state_model.b
@@ -608,7 +635,7 @@ cache and `sws.batched.data_valid[] == true` (data was stacked at fit entry).
 """
 function _smooth_mean_only_batched!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     ntrials = length(tfs)
     D = lds.latent_dim
     tsteps = size(tfs[1].x_smooth, 2)
@@ -643,9 +670,9 @@ end
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y)
     return smooth!(lds, tfs, data, sws_pool)
 end
@@ -662,11 +689,11 @@ Gaussian emission update now reads `fs.x_smooth` directly.
 """
 function estep!(
     lds::LinearDynamicalSystem{T,S,O},
-    suf::SufficientStatistics{T},
+    suf::Union{SufficientStatistics{T},NamedTuple},
     tfs::TrialFilterSmooth{T},
     data::Data{T},
     sws_pool::Vector{SmoothWorkspace{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
 
     # smooth each trial
     smooth!(lds, tfs, data, sws_pool)
@@ -689,55 +716,9 @@ function elbo!(
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
     total_entropy::T,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     Q_total = Q_state!(sws, lds, suf) + Q_obs!(sws, lds, suf)
-
-    prior_term = zero(T)
-    if lds.state_model.Q_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.Q, lds.state_model.Q_prior)
-    end
-    if lds.state_model.P0_prior !== nothing
-        prior_term += iw_logprior_term(lds.state_model.P0, lds.state_model.P0_prior)
-    end
-    if lds.state_model.x0_prior !== nothing
-        prior_term += mn_logprior_term(
-            reshape(lds.state_model.x0, :, 1), lds.state_model.P0, lds.state_model.x0_prior
-        )
-    end
-    if lds.obs_model.R_prior !== nothing
-        prior_term += iw_logprior_term(lds.obs_model.R, lds.obs_model.R_prior)
-    end
-
-    #=
-    MN-prior log-prior contributions for [A b B] (dynamics) and [C d D] (obs).
-    Required for ELBO monotonicity under MN priors — the M-step's `mn_map`
-    update + the IW posterior scale modification together maximize the
-    MAP objective, but without this term the displayed ELBO drops the
-    MN-quadratic piece and can appear non-monotone.
-    =#
-    if lds.state_model.AB_prior !== nothing
-        D = lds.latent_dim
-        ux_dim = lds.ux_dim
-        W_ab = view(sws.reg.AB, :, 1:(D + 1 + ux_dim))
-        copyto!(view(W_ab, :, 1:D), lds.state_model.A)
-        copyto!(view(W_ab, :, D + 1), lds.state_model.b)
-        if ux_dim > 0
-            copyto!(view(W_ab, :, (D + 2):(D + 1 + ux_dim)), lds.state_model.B)
-        end
-        prior_term += mn_logprior_term(W_ab, lds.state_model.Q, lds.state_model.AB_prior)
-    end
-    if lds.obs_model.CD_prior !== nothing
-        D = lds.latent_dim
-        uy_dim = lds.uy_dim
-        W_cd = view(sws.reg.CD, :, 1:(D + 1 + uy_dim))
-        copyto!(view(W_cd, :, 1:D), lds.obs_model.C)
-        copyto!(view(W_cd, :, D + 1), lds.obs_model.d)
-        if uy_dim > 0
-            copyto!(view(W_cd, :, (D + 2):(D + 1 + uy_dim)), lds.obs_model.D)
-        end
-        prior_term += mn_logprior_term(W_cd, lds.obs_model.R, lds.obs_model.CD_prior)
-    end
-
+    prior_term = _state_prior_logdensity(lds, sws) + _obs_prior_logdensity(lds, sws)
     return Q_total + prior_term + total_entropy
 end
 
@@ -761,23 +742,37 @@ objective the M-step optimizes).
 - `ux` / `uy`: optional dynamics / observation input sequences in the same
   shape family as `y`. Required when `size(state_model.B, 2) > 0` /
   `size(obs_model.D, 2) > 0`.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  `depends_on` declared on the models for this call (see the ancillary parameter
+  dependency docs). Needed when this dataset's trial count differs from the one
+  the labels on the model were written for.
 
 Returns a scalar.
 """
 function elbo(
-    lds::LinearDynamicalSystem{T,S,O}, y::Observations{T}; ux=nothing, uy=nothing
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    lds::LinearDynamicalSystem{T,S,O},
+    y::CompositeObservations{T};
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    if grp !== nothing
+        sws_pool = _grouped_sws_pool(lds, data)
+        state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
+        return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
+    end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
-    npool = min(Threads.maxthreadid(), length(data.y))
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
             T,
             lds.latent_dim,
-            lds.obs_dim,
+            _ws_obs_dim(lds),
             maximum(data.tsteps);
             ux_dim=lds.ux_dim,
-            uy_dim=lds.uy_dim,
+            uy_dim=_ws_uy_dim(lds),
         ) for _ in 1:npool
     ]
     suf = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -799,7 +794,7 @@ EM iteration after `_aggregate_td_suff_stats!`.
 """
 function mstep!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     update_initial_state_mean!(lds, suf)
     update_initial_state_covariance!(lds, suf, sws)
     update_A_b!(lds, suf, sws)
@@ -831,20 +826,204 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   (each trial `(ux_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
 - `uy`: optional observation-input sequence (same shape family) for the
   obs-side input matrix `D`. Required when `size(obs_model.D, 2) > 0`.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  `depends_on` stored on the state / observation models for this call. Use it
+  to fit or score a dataset whose trial count differs from the one the labels
+  on the model were written for; it may only re-assign trials to groups the
+  model already declares.
+- `y_test`: optional held-out observations, in any shape `y` accepts. When
+  given, the held-out ELBO is scored every `test_every` iterations and `fit!`
+  returns a [`FitTrace`](@ref) instead of a plain `Vector` — a `FitTrace` *is*
+  the training-ELBO vector (same indexing, iteration and plotting), with the
+  held-out trace carried alongside in `.test` / `.test_iters` / `.best_iter`.
+  Scoring happens at the same parameters the training ELBO was just evaluated
+  at, so the two traces are directly comparable iteration by iteration.
+- `ux_test` / `uy_test`: input sequences for the held-out set, matching `y_test`.
+- `depends_on_test`: per-trial group labels for the held-out set, needed when
+  the model is grouped and the test set has a different trial count.
+- `test_every::Int=1`: score the held-out set every this many iterations.
+  Iteration 1 is always scored.
+- `early_stopping::Bool=false`: stop when the held-out ELBO stops improving.
+  Off by default, so passing `y_test` alone only records the trace.
+- `patience::Int=1`: consecutive scored iterations without improvement before
+  stopping. The default of 1 stops on the first decrease.
+- `min_delta::Real=0.0`: how much a held-out ELBO must beat the running best by
+  to count as an improvement.
+- `restore_best::Bool=true`: on an early stop, roll the model back to the
+  parameters that scored best. Applies only when early stopping actually fires;
+  a fit that runs to completion is always left at its final iterate.
+- `test_kwargs::NamedTuple=(;)`: extra keywords forwarded to the scoring
+  [`elbo`](@ref) call, e.g. `(smoothing_iters=20,)` for an SLDS or
+  `(newton_max_iter=10,)` for a Poisson emission.
 
-Returns a `Vector{T}` of ELBO values, one per iteration.
+Returns a `Vector{T}` of ELBO values, one per iteration — or a
+[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
-    y::Observations{T};
+    y::CompositeObservations{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
     ux=nothing,
     uy=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+    y_test=nothing,
+    ux_test=nothing,
+    uy_test=nothing,
+    depends_on_test::Union{Nothing,NamedTuple}=nothing,
+    test_every::Int=1,
+    early_stopping::Bool=false,
+    patience::Int=1,
+    min_delta::Real=0.0,
+    restore_best::Bool=true,
+    test_kwargs::NamedTuple=NamedTuple(),
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux=ux, uy=uy)
-    return _fit_tridiag!(lds, data; max_iter=max_iter, tol=tol, progress=progress)
+    monitor = _holdout_monitor(
+        T,
+        y_test;
+        ux_test=ux_test,
+        uy_test=uy_test,
+        depends_on_test=depends_on_test,
+        test_every=test_every,
+        early_stopping=early_stopping,
+        patience=patience,
+        min_delta=min_delta,
+        restore_best=restore_best,
+        test_kwargs=test_kwargs,
+    )
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    grp === nothing || return _fit_tridiag_grouped!(
+        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+    )
+    return _fit_tridiag!(
+        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+    )
+end
+
+"""
+    _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
+
+One grouped E-step: smooth and aggregate each cell with its own parameters, and
+return the total ELBO.
+
+Each cell runs the ordinary `estep!` on its sub-`Data`, so a cell whose trials
+are equal-length still computes its smoothed covariance once and shares it
+across the cell — the efficiency of same-length epochs is preserved *within*
+each group of labels rather than across the whole dataset (parameters differ
+between cells, so their covariances genuinely differ). The Q-terms are summed
+per cell while the workspace still holds that cell's Cholesky constants; the
+prior terms are added once per distinct parameter version.
+"""
+function _grouped_estep_elbo_gaussian!(
+    state::GroupedFitState{T,L},
+    grp::ParameterGrouping,
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {
+    T<:Real,
+    L<:LinearDynamicalSystem{T,<:AbstractGaussianStateModel{T},<:QuadraticEmission{T}},
+}
+    total = zero(T)
+    for c in 1:(grp.ncells)
+        lds_c = state.cell_lds[c]
+        suf_c = state.sufs[c]
+        cell_pool = _prepare_cell!(sws_pool, state, c)
+        estep!(lds_c, suf_c, state.cell_tfs[c], state.cell_data[c], cell_pool)
+
+        #=
+        `estep!` leaves the cell's constants on `cell_pool[1]` already, but the
+        parallel per-trial fallback reaches that state through a task, so
+        recompute explicitly rather than rely on which chunk ran last.
+        =#
+        compute_smooth_constants!(cell_pool[1], lds_c)
+        total += Q_state!(cell_pool[1], lds_c, _state_suf(suf_c))
+        total += Q_obs!(cell_pool[1], lds_c, suf_c)
+        for fs in state.cell_tfs[c].FilterSmooths
+            total += fs.entropy
+        end
+    end
+    total += _grouped_state_prior_logdensity(state.cell_lds, grp.cell_slot, T)
+    total += _grouped_obs_prior_logdensity(
+        state.cell_lds[1], state.cell_lds, grp.cell_slot, T
+    )
+    return total
+end
+
+"""
+    _fit_tridiag_grouped!(lds, data, grp; max_iter, tol, progress)
+
+EM driver for a Gaussian LDS whose parameters depend on an ancillary variable.
+Identical in structure to [`_fit_tridiag!`](@ref): E-step, ELBO, M-step,
+convergence check — but the E-step runs per cell and the M-step pools each
+cell's sufficient statistics per parameter version.
+"""
+function _fit_tridiag_grouped!(
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    grp::ParameterGrouping;
+    max_iter::Int=100,
+    tol::Float64=1e-6,
+    progress::Bool=true,
+    monitor=nothing,
+    align_final::Bool=false,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    sws_pool = _grouped_sws_pool(lds, data)
+    state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
+    #=
+    The emission M-step regresses per parameter version, and `[C d D]` / `R` are
+    `obs_dim`-shaped, so each cell's own workspace has to be used. With uniform
+    widths every entry is `sws_pool[1]` itself.
+    =#
+    cell_ws1 = [p[1] for p in state.cell_sws]
+    elbos = Vector{T}(undef, max_iter)
+
+    prog = if progress
+        Progress(max_iter; desc="Fitting grouped LDS via EM...", barlen=50, showspeed=true)
+    else
+        nothing
+    end
+
+    for iter in 1:max_iter
+        elbos[iter] = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
+
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
+        _grouped_state_mstep!(
+            state.cell_lds,
+            _state_sufs(state.sufs),
+            grp.cell_slot,
+            sws_pool[1],
+            _state_bufs(state.bufs),
+        )
+        _grouped_obs_mstep!(
+            lds, state.cell_lds, _obs_sufs(state.sufs), grp.cell_slot, cell_ws1, state.bufs
+        )
+
+        prog !== nothing && next!(prog)
+
+        if converged
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+    end
+
+    prog !== nothing && finish!(prog)
+    return _fit_result(monitor, elbos, lds)
 end
 
 function _fit_tridiag!(
@@ -853,7 +1032,9 @@ function _fit_tridiag!(
     max_iter::Int=100,
     tol::Float64=1e-6,
     progress::Bool=true,
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+    monitor=nothing,
+    align_final::Bool=false,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
     elbos = Vector{T}(undef, max_iter)
@@ -864,14 +1045,14 @@ function _fit_tridiag!(
     smoother aliases them to shared storage on every E-step, so per-trial
     allocations of `(D, D, T)` are pure waste at large `N`.
     =#
-    ntrials_total = length(data.y)
+    ntrials_total = length(data.tsteps)
     cov_alias = ntrials_total > 1 && all(t -> t == tsteps_per_trial[1], tsteps_per_trial)
     tfs = initialize_FilterSmooth(
         lds, tsteps_per_trial; cov_alias=cov_alias
     )::TrialFilterSmooth{T}
 
     ux_dim = lds.ux_dim
-    uy_dim = lds.uy_dim
+    uy_dim = _ws_uy_dim(lds)
     #=
     Only `sws_pool[1]` needs the batched mean-pass buffers (used by the
     equal-length cov-cache fast path); the other workspaces back the
@@ -882,15 +1063,15 @@ function _fit_tridiag!(
     sws_pool[1] = SmoothWorkspace(
         T,
         lds.latent_dim,
-        lds.obs_dim,
+        _ws_obs_dim(lds),
         T_max;
         ux_dim=ux_dim,
         uy_dim=uy_dim,
-        ntrials=ntrials_total,
+        ntrials=_batched_ntrials(lds, ntrials_total),
     )
     for i in 2:pool_size
         sws_pool[i] = SmoothWorkspace(
-            T, lds.latent_dim, lds.obs_dim, T_max; ux_dim=ux_dim, uy_dim=uy_dim
+            T, lds.latent_dim, _ws_obs_dim(lds), T_max; ux_dim=ux_dim, uy_dim=uy_dim
         )
     end
 
@@ -917,6 +1098,21 @@ function _fit_tridiag!(
         total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
         elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
+        # Held-out score at the same parameters the training ELBO just used.
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        if _holdout_stop(monitor)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
+        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if align_final && (converged || iter == max_iter)
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
+
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
 
@@ -924,25 +1120,27 @@ function _fit_tridiag!(
         prog !== nothing && next!(prog)
 
         # check convergence
-        if iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        if converged
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
-            return elbos
+            return _fit_result(monitor, elbos, lds)
         end
     end
 
     prog !== nothing && finish!(prog)
-    return elbos
+    return _fit_result(monitor, elbos, lds)
 end
 
 function smooth!(
     lds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
-    y::AbstractVector{<:AbstractMatrix{T}},
-) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    T_max = maximum(size(yt, 2) for yt in y)
+    y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    T_max = maximum(_trial_lengths(y))
     npool = Threads.maxthreadid()
-    sws_pool = [SmoothWorkspace(T, lds.latent_dim, lds.obs_dim, T_max) for _ in 1:npool]
+    sws_pool = [
+        SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), T_max) for _ in 1:npool
+    ]
     return smooth!(lds, tfs, y, sws_pool)
 end
 
@@ -1079,6 +1277,10 @@ see `_filter_cov_pass`. Trial lengths may differ.
 - `ux` / `uy`: optional dynamics / observation input sequences, in the same
   shape family as `y` (matrix, 3-D array, or vector of matrices). Required
   when `size(state_model.B, 2) > 0` / `size(obs_model.D, 2) > 0`.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  `depends_on` declared on the models for this call (see the ancillary parameter
+  dependency docs). Needed when this dataset's trial count differs from the one
+  the labels on the model were written for.
 
 This is the `StatsAPI.loglikelihood` method for the LDS; for the complete-data
 log-likelihood `log p(x, y)` given a trajectory `x`, see `joint_loglikelihood`.
@@ -1087,9 +1289,34 @@ Returns the **total** log-likelihood. Divide by `obs_dim * tsteps * ntrials` for
 per-observation score that is comparable across configurations.
 """
 function StatsAPI.loglikelihood(
-    lds::LinearDynamicalSystem{T,SM,OM}, y::Observations{T}; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::Observations{T};
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
     data = Data(lds, y; ux=ux, uy=uy)
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+
+    #=
+    The filter's covariance pass depends only on the parameters and the trial
+    length, so it is shared across the trials of one cell exactly as it is
+    shared across all trials of an ungrouped model.
+    =#
+    if grp !== nothing
+        total_ll = zero(T)
+        for c in 1:(grp.ncells)
+            trials = grp.cell_trials[c]
+            lds_c = _cell_lds(lds, grp, c)
+            S_chol, K = _filter_cov_pass(lds_c, maximum(data.tsteps[n] for n in trials))
+            for n in trials
+                total_ll += _filter_ll_trial(
+                    lds_c, data.y[n], data.ux[n], data.uy[n], S_chol, K
+                )
+            end
+        end
+        return total_ll
+    end
 
     S_chol, K = _filter_cov_pass(lds, maximum(data.tsteps))
 

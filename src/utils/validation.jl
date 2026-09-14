@@ -112,6 +112,81 @@ function Base.showerror(io::IO, e::NumericalStabilityError)
 end
 
 """
+    _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) where T
+
+Validate a [`LQRStateModel`](@ref): the LQR structure (`A` square and
+invertible, `S` and every `Qc` symmetric, a schedule that indexes real cost
+matrices), the shapes of the mixed-coordinate noise and bias against the doubled
+latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`.
+
+# Throws
+- `DimensionMismatchError`, `NotSymmetricError`, `NotPositiveDefiniteError`,
+  `NumericalStabilityError` (a singular plant), or `ArgumentError` (a bad
+  schedule, or a `depends_on` this model cannot honor)
+"""
+function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) where {T}
+    sm = state_model
+    n = _plant_dim(sm)
+    if latent_dim != 2n
+        throw(DimensionMismatchError("LQR latent_dim (2n)", 2n, latent_dim))
+    end
+
+    #=
+    A `:free` model has no plant, cost or costate to check, and no terminal
+    factor — only the shapes that both modes share. Its transition is checked
+    here instead of by `_check_lqr_structure`, which is about the
+    symplectic form.
+    =#
+    if _is_free(sm)
+        if size(sm.Mfree) != (2n, 2n)
+            throw(DimensionMismatchError("free transition", (2n, 2n), size(sm.Mfree)))
+        end
+        if !isempty(sm.A) || !isempty(sm.S) || !isempty(sm.Qc)
+            throw(
+                ArgumentError(
+                    "a `:free` state model carries no plant or cost, but `A`, `S` or " *
+                    "`Qc` is non-empty. Build it with `free_state_model`.",
+                ),
+            )
+        end
+        sm.terminal && throw(
+            ArgumentError(
+                "a `:free` state model has no costate to pin, so it cannot carry a " *
+                "terminal condition. Use `:lqr` mode for that.",
+            ),
+        )
+    else
+        _check_lqr_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+    end
+
+    for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
+        if size(Σ) != (dim, dim)
+            throw(DimensionMismatchError("LQR $name", (dim, dim), size(Σ)))
+        end
+        if !issymmetric(Σ)
+            throw(NotSymmetricError("LQR $name", maximum(abs.(Σ .- Σ'))))
+        end
+        if !isposdef(Σ)
+            throw(NotPositiveDefiniteError("LQR $name", minimum(eigvals(Σ))))
+        end
+    end
+
+    if length(sm.h) != 2n
+        throw(DimensionMismatchError("LQR h", 2n, length(sm.h)))
+    end
+    if length(sm.x0) != 2n
+        throw(DimensionMismatchError("LQR x0", 2n, length(sm.x0)))
+    end
+    if length(sm.hf) != n
+        throw(DimensionMismatchError("LQR hf", n, length(sm.hf)))
+    end
+    if size(sm.Bu, 1) != 2n
+        throw(DimensionMismatchError("LQR Bu rows", 2n, size(sm.Bu, 1)))
+    end
+    return nothing
+end
+
+"""
     _validate_state_model(state_model::GaussianStateModel{T}, latent_dim::Int) where T
 
 Validate GaussianStateModel parameters. Throws exceptions on validation failure.
@@ -269,11 +344,56 @@ function _validate_obs_model(
     =#
     if any(x -> abs(x) > 50, obs_model.d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
         max_val = maximum(abs.(obs_model.d))
+        println("WARNING: high d")
+        println("\nd:\n $(obs_model.d)")
+        println("\nD:\n $(obs_model.D)")
         throw(
             NumericalStabilityError(
                 "d vector",
                 "contains extremely large/small values (max |d| = $max_val), may cause numerical overflow/underflow",
             ),
+        )
+    end
+
+    return nothing
+end
+
+"""
+    _validate_obs_model(obs_model::CompositeObservationModel, obs_dim, latent_dim)
+
+Validate every member of a composite emission against its own channel count.
+`obs_dim` is the composite's total and is checked against the members' sum; each
+member is then handed its own width, so a per-member shape error names the
+member it came from.
+
+# Throws
+- `DimensionMismatchError`: if the members' widths do not sum to `obs_dim`, or a
+  member's own parameters are inconsistent
+- whatever the member's validator throws, with the member named
+"""
+function _validate_obs_model(
+    obs_model::CompositeObservationModel{T}, obs_dim::Int, latent_dim::Int
+) where {T}
+    models = _models(obs_model)
+    total = 0
+    for (key, m) in pairs(models)
+        p = _obs_dim(m)
+        try
+            _validate_obs_model(m, p, latent_dim)
+        catch err
+            err isa Exception || rethrow()
+            throw(
+                ArgumentError(
+                    "observation model `:$key` is invalid: " * sprint(showerror, err)
+                ),
+            )
+        end
+        total += p
+    end
+
+    if total != obs_dim
+        throw(
+            DimensionMismatchError("composite obs_dim (sum over members)", total, obs_dim)
         )
     end
 
@@ -322,17 +442,28 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     _validate_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
 
     #=
-    Check fit_bool length. The Gaussian path uses length 6 — the regression
-    M-step fits A&b&B and C&d&D jointly.
+    Resolve any ancillary parameter dependencies so a malformed `depends_on`
+    (unknown parameter name, conflicting aliases of one jointly-fitted group,
+    label vectors of unequal length) is reported at construction rather than at
+    the first `fit!`. The resolved value is discarded — the fitting entry points
+    re-resolve it against the actual trial count.
     =#
-    expected_fit_length = lds.obs_model isa PoissonObservationModel ? 5 : 6
+    _resolve_dependence(lds.state_model)
+    _resolve_dependence(lds.obs_model)
+
+    #=
+    Check fit_bool length: four state groups, then one block per observation
+    model (`[C d D]`, plus `R` when that model is Gaussian). Length 6 for a
+    Gaussian LDS, 5 for a Poisson one, `4 + Σₘ blocks` for a composite.
+    =#
+    expected_fit_length = 4 + _obs_nblocks(lds.obs_model)
     if length(lds.fit_bool) != expected_fit_length
         throw(DimensionMismatchError("fit_bool", expected_fit_length, length(lds.fit_bool)))
     end
 
     # Check consistency between inferred and stored dimensions
-    inferred_latent = size(lds.state_model.A, 1)
-    inferred_obs = size(lds.obs_model.C, 1)
+    inferred_latent = _state_latent_dim(lds.state_model)
+    inferred_obs = _obs_dim(lds.obs_model)
 
     if lds.latent_dim != inferred_latent
         throw(
@@ -345,7 +476,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     if lds.obs_dim != inferred_obs
         throw(
             DimensionMismatchError(
-                "obs_dim (stored vs inferred from C)", inferred_obs, lds.obs_dim
+                "obs_dim (stored vs inferred from the emission)", inferred_obs, lds.obs_dim
             ),
         )
     end
@@ -430,10 +561,85 @@ function validate_SLDS(slds::SLDS)
             throw(DimensionMismatchError("LDS[$i].uy_dim", uy_dim, lds.uy_dim))
         end
 
+        #=
+        A composite emission needs no key check here: `SLDS.LDSs` is a
+        `Vector{LinearDynamicalSystem{T,S,O}}` with one concrete `O`, and the
+        member names and order are part of the composite's type — so regimes
+        that disagree cannot be put in the same `SLDS` at all.
+        =#
+
         # This will throw if invalid
         validate_LDS(lds)
     end
 
+    _validate_slds_state_models(slds.LDSs[1].state_model, slds)
+    return nothing
+end
+
+"""
+    _validate_slds_state_models(state_model, slds)
+
+State-model-specific constraints on an `SLDS`'s discrete states, beyond the
+shared dimension checks. A no-op for a model with none.
+"""
+_validate_slds_state_models(::AbstractStateModel, ::SLDS) = nothing
+
+#=
+An inverse-LQR discrete state carries a single cost: in a switching model the
+*discrete state* is the cost epoch, inferred rather than specified, so a
+deterministic schedule inside a state would be a second, competing notion of
+regime nested inside the first. `terminal` and `observe_costate` describe the
+trial and the emission rather than the state, so they must agree across states —
+a factor that applies in some states and not others, or a readout mask only half
+the states impose, is a modelling accident rather than a choice.
+=#
+function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
+    #=
+    `terminal` and `observe_costate` are compared among the *inverse-LQR* states
+    only. A `:free` state has no costate, so neither means anything for it: it
+    carries no terminal condition, and `_costate_range` already returns `nothing`
+    for it whatever its flag says. In a mixed model the readout mask is therefore
+    set by the LQR states, and a free state simply reads whatever coordinates are
+    left to it.
+    =#
+    ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
+    ref === nothing && return nothing
+    sm1 = slds.LDSs[ref].state_model
+    for (i, lds) in enumerate(slds.LDSs)
+        sm = lds.state_model
+        _is_free(sm) && continue
+        if _nregimes(sm) != 1
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: an inverse-LQR discrete state carries one cost matrix, " *
+                    "but this one has $(_nregimes(sm)). In a switching model the " *
+                    "discrete state *is* the cost epoch — inferred instead of given " *
+                    "by `schedule` — so add a discrete state per cost rather than a " *
+                    "schedule within one.",
+                ),
+            )
+        end
+        if sm.terminal != sm1.terminal
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `terminal` is $(sm.terminal) but LDSs[1] has " *
+                    "$(sm1.terminal). The terminal condition is a property of the " *
+                    "trial horizon, not of which state is active, so every discrete " *
+                    "state must agree.",
+                ),
+            )
+        end
+        if sm.observe_costate != sm1.observe_costate
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `observe_costate` is $(sm.observe_costate) but LDSs[1] " *
+                    "has $(sm1.observe_costate). The costate readout mask is applied " *
+                    "to the emission, so states that disagree would zero and fit the " *
+                    "same columns in turn.",
+                ),
+            )
+        end
+    end
     return nothing
 end
 
@@ -514,6 +720,43 @@ end
     cs, expected_dim::Int, tsteps::Int, ::PoissonObservationModel{T}
 ) where {T}
     return _check_ux(cs, expected_dim, tsteps, "uy", T)
+end
+
+#=
+A composite emission takes one input sequence per member, so the canonicalized
+value is a NamedTuple of matrices rather than one matrix. A bare input is the
+shorthand for "these covariates feed every readout" and is checked against each
+member's own `D`; `_member_uy` picks a member's entry apart.
+=#
+@inline function _check_uy(
+    cs, ::Int, tsteps::Int, om::CompositeObservationModel{T}
+) where {T}
+    models = _models(om)
+    return NamedTuple{keys(models)}(
+        map(
+            key ->
+                _check_uy(_member_uy(cs, key), _uy_dim(models[key]), tsteps, models[key]),
+            keys(models),
+        ),
+    )
+end
+
+@inline function _normalize_multitrial_uy(
+    cs, ::Int, tsteps_per_trial, ::Type{T}, om::CompositeObservationModel
+) where {T<:Real}
+    models = _models(om)
+    return NamedTuple{keys(models)}(
+        map(
+            key -> _normalize_multitrial_ux(
+                _member_uy(cs, key),
+                _uy_dim(models[key]),
+                tsteps_per_trial,
+                T,
+                "uy[:$key]",
+            ),
+            keys(models),
+        ),
+    )
 end
 
 function _normalize_multitrial_ux(

@@ -1,13 +1,15 @@
 #=============================================================================
 Poisson Observations
 
-    Emission kernels: observation_loglikelihood!(cc, z, λ, lds, x, y, t[, uy])
-                      observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
-                      observation_hessian!(out, cc, z, λ, lds, x, y, t[, α])
+    Emission kernels: observation_loglikelihood!(cc, z, λ, om, x, y, t[, uy])
+                      observation_gradient!(out, cc, buf, om, x, y, t[, uy])
+                      observation_hessian!(out, cc, z, λ, om, x, y, t[, α])
 
     E-Step: Q_obs!(sws, lds, suf)
 
     M-Step: update_observation_model!(plds, tfs, y, sws_pool, w)
+            — the row-wise Newton solver, in `poisson_emission_mstep.jl`;
+              `_update_observation_model_lbfgs!` below is its reference.
 =============================================================================#
 
 """
@@ -25,6 +27,12 @@ canonical log-link Poisson intercept (free in ℝ). Including the factorial
 term means `calculate_elbo` matches the Laplace-approximation marginal
 log-likelihood at the EM fixed point, instead of being off by a fixed
 data-only constant.
+
+Both `h` and the variance correction `ρ` are formed for the whole trial at once
+(see the batched kernels below), so this is a handful of `gemm`s rather than a
+`tsteps`-long loop of BLAS-2 calls — `ρ` alone is `obs_dim · latent_dim² · tsteps`
+work, and this runs once per trial per EM iteration on top of every M-step
+evaluation.
 """
 function Q_obs!(
     sws::SmoothWorkspace{T},                      # provides the Poisson Q_obs scratch
@@ -34,75 +42,102 @@ function Q_obs!(
     y::AbstractMatrix{T},                         # obs_dim × T
     uy::Union{Nothing,AbstractMatrix}=nothing;    # obs inputs (uy_dim × T) or nothing
     weights::Union{Nothing,AbstractVector{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    d = plds.obs_model.d
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     C = plds.obs_model.C
-    D = plds.obs_model.D
-
-    obs_dim, _ = size(C)
+    obs_dim, latent_dim = size(C)
     tsteps = size(y, 2)
 
-    # workspace buffers
-    h = sws.elbo.h_obs::Vector{T}            # obs_dim
-    rho = sws.elbo.rho_obs::Vector{T}            # obs_dim
-    CP = sws.elbo.CP_obs::Matrix{T}            # obs_dim × state_dim
-    CEz = sws.elbo.CEz_obs::Vector{T}            # obs_dim
+    pb = poisson_batch!(sws, latent_dim, obs_dim, tsteps)
+    Eta = _poisson_linear_predictor!(
+        pb, C, plds.obs_model.d, plds.obs_model.D, E_z, uy, tsteps
+    )
+    Cpair = _poisson_pair_products!(pb, C, obs_dim)
+    Ppack = _poisson_pack_cov!(pb, p_smooth, tsteps)
+
+    # ρ[i, t] = ½ cᵢ' Pₜ cᵢ for the whole trial in one gemm.
+    Rho = view(pb.Lam, 1:obs_dim, 1:tsteps)
+    mul!(Rho, Cpair, Ppack, T(0.5), zero(T))
 
     Q_val = zero(T)
-
-    @views for t in 1:tsteps
-        wt = isnothing(weights) ? one(T) : weights[t]
-
-        Ez_t = E_z[:, t]                 # state_dim
-        P_t = p_smooth[:, :, t]         # state_dim × state_dim
-        y_t = y[:, t]                   # obs_dim
-
-        # CEz = C * Ez_t
-        mul!(CEz, C, Ez_t)
-
-        # h = CEz + d (+ D v_t)
-        @. h = CEz + d
-        if uy !== nothing
-            mul!(h, D, uy[:, t], one(T), one(T))
+    @inbounds for t in 1:tsteps
+        wt = weights === nothing ? one(T) : weights[t]
+        ηcol = view(Eta, :, t)
+        ρcol = view(Rho, :, t)
+        acc = zero(T)
+        @simd for i in 1:obs_dim
+            yi = y[i, t]
+            acc += yi * ηcol[i] - exp(ηcol[i] + ρcol[i]) - _log_factorial(yi)
         end
-
-        # CP = C * P_t
-        mul!(CP, C, P_t)
-
-        # rho[i] = 0.5 * dot(CP[i,:], C[i,:])
-        for i in 1:obs_dim
-            rho[i] = T(0.5) * dot(view(CP, i, :), view(C, i, :))
-        end
-
-        # rho := exp(h + rho)
-        @. rho = exp(h + rho)
-
-        log_fact = zero(T)
-        for i in 1:obs_dim
-            log_fact += loggamma(y_t[i] + one(T))
-        end
-
-        # Q += wt * (dot(y_t, h) - sum(rho) - log_fact)
-        Q_val += wt * (dot(y_t, h) - sum(rho) - log_fact)
+        Q_val += wt * acc
     end
 
     return Q_val
 end
 
-"""
-    update_observation_model!(plds, tfs, y, sws_pool, w; uy=nothing)
+#=
+`log Γ(y+1)` for observed counts. The emission normaliser is data-only — it
+cancels out of every gradient — but it is what makes the reported ELBO the
+Laplace marginal log-likelihood rather than that minus a constant, so it is
+summed on every Q evaluation, over every neuron and bin, once per trial per EM
+iteration. `loggamma` is expensive enough to show up in a profile of the E-step
+at that volume.
 
-Update the observation model parameters `[C d D]` of a PLDS model via LBFGS.
-`uy` is the per-trial vector of observation-input matrices (or `nothing`).
+Counts of 0 and 1 both give exactly zero, and at the bin widths this is used
+with they are the overwhelming majority of the data, so short-circuiting them
+skips almost every call. Anything else goes to `loggamma`, so the result is
+bitwise what the plain call would have given.
+=#
+@inline function _log_factorial(y::T) where {T<:Real}
+    (y == zero(T) || y == one(T)) && return zero(T)
+    return loggamma(y + one(T))
+end
+
 """
-function update_observation_model!(
+    _obs_prior_logdensity(lds, sws) -> T
+
+`log p(θ)` for a Poisson emission's parameters: the matrix-normal term on the
+stacked `[C d D]`.
+
+Unlike the Gaussian counterpart there is no noise covariance to pair the MN
+prior with, so this is the bare quadratic `-½ tr((W - M₀) Λ (W - M₀)')` — exactly
+the penalty the emission M-step objective carries, which is what keeps the
+reported ELBO monotone under the prior. The `Λ`-only and `logdet Λ` constants are
+absorbed into the ELBO's additive constant, as they are on the Gaussian side.
+
+`sws` supplies the scratch for the stacked `[C d D]`; pass `nothing` to allocate
+it.
+"""
+function _obs_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
+    prior = lds.obs_model.CD_prior
+    prior === nothing && return zero(T)
+
+    W_cd = _obs_pack_scratch(lds, sws)
+    _pack_obs_V!(W_cd, lds)
+    Wm = W_cd .- prior.M₀
+    return -T(0.5) * sum(Wm .* (Wm * prior.Λ))
+end
+
+"""
+    _update_observation_model_lbfgs!(plds, tfs, y, sws_pool, w; uy=nothing)
+
+Update the observation model parameters `[C d D]` of a PLDS model via LBFGS over
+all `obs_dim · reg_dim` parameters at once.
+
+Superseded by the row-wise Newton solver in `poisson_emission_mstep.jl`, which
+maximises the same Q-function and is what `update_observation_model!` now calls.
+Kept as the reference implementation the Newton solver is checked against, and
+as a fallback for anyone who wants the old solver's exact iterates.
+"""
+function _update_observation_model_lbfgs!(
     plds::LinearDynamicalSystem{T,S,O},
     tfs::TrialFilterSmooth{T},
     y::AbstractVector{<:AbstractMatrix{T}},
     sws_pool::Vector{SmoothWorkspace{T}},
     w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
     plds.fit_bool[5] || return nothing
 
     sws = sws_pool[1]       # f(params) is sequential; one workspace suffices
@@ -193,8 +228,177 @@ function update_observation_model!(
     return nothing
 end
 
+# ============================================================================
+# Batched (BLAS-3) Poisson emission kernels
+#
+# The per-timestep emission kernels above are the reference implementation and
+# stay the interface a new observation model plugs into. Everything below is
+# the same arithmetic reorganised so the O(obs_dim · latent_dim² · tsteps) work
+# of a whole trial becomes one `gemm` instead of `tsteps` small BLAS-2 calls —
+# which is where a Poisson fit spends most of its time, since `obs_dim` is the
+# neuron count.
+# ============================================================================
+
 """
-    observation_loglikelihood!(cc, z, λ, lds, x, y, t[, uy])
+    _poisson_pair_products!(pb, C, obs_dim)
+
+Fill `pb.Cpair[n, p] = C[n, sym_i[p]] · C[n, sym_j[p]]` for the `nsym` distinct
+entries of the symmetric `latent_dim` block, and return the active view.
+
+This is the only place the emission matrix enters the batched curvature: with
+it, `C' diag(λ_t) C` for every `t` at once is `Cpair' * Λ`.
+"""
+function _poisson_pair_products!(
+    pb::PoissonBatchBuffers{T}, C::AbstractMatrix{T}, obs_dim::Int
+) where {T<:Real}
+    nsym = length(pb.sym_i)
+    Cpair = view(pb.Cpair, 1:obs_dim, 1:nsym)
+    @inbounds for p in 1:nsym
+        Ci = view(C, :, pb.sym_i[p])
+        Cj = view(C, :, pb.sym_j[p])
+        col = view(Cpair, :, p)
+        @simd for n in 1:obs_dim
+            col[n] = Ci[n] * Cj[n]
+        end
+    end
+    return Cpair
+end
+
+"""
+    _poisson_linear_predictor!(pb, C, d, D_obs, x, uy, tsteps) -> view
+
+Whole-trial linear predictor `η[:, t] = C x_t + d + D v_t` as one `gemm`,
+written into `pb.Eta` and returned as an active view.
+"""
+function _poisson_linear_predictor!(
+    pb::PoissonBatchBuffers{T},
+    C::AbstractMatrix{T},
+    d::AbstractVector{T},
+    D_obs::AbstractMatrix{T},
+    x::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+) where {T<:Real}
+    obs_dim = size(C, 1)
+    Eta = view(pb.Eta, 1:obs_dim, 1:tsteps)
+    mul!(Eta, C, view(x, :, 1:tsteps))
+    if uy !== nothing && size(uy, 1) > 0
+        mul!(Eta, D_obs, view(uy, :, 1:tsteps), one(T), one(T))
+    end
+    @inbounds for t in 1:tsteps
+        col = view(Eta, :, t)
+        @simd for i in 1:obs_dim
+            col[i] += d[i]
+        end
+    end
+    return Eta
+end
+
+"""
+    _poisson_pack_cov!(pb, p_smooth, tsteps) -> view
+
+Pack the smoothed covariances into `pb.Ppack[p, t]`, the symmetric-pair form
+that pairs with `Cpair`: the diagonal entries as they are and the
+off-diagonals doubled, so `dot(Cpair[n, :], Ppack[:, t]) == cₙ' P_t cₙ`.
+"""
+function _poisson_pack_cov!(
+    pb::PoissonBatchBuffers{T}, p_smooth::AbstractArray{T,3}, tsteps::Int
+) where {T<:Real}
+    nsym = length(pb.sym_i)
+    Ppack = view(pb.Ppack, 1:nsym, 1:tsteps)
+    @inbounds for t in 1:tsteps, p in 1:nsym
+        i = pb.sym_i[p]
+        j = pb.sym_j[p]
+        Ppack[p, t] = i == j ? p_smooth[i, j, t] : 2 * p_smooth[i, j, t]
+    end
+    return Ppack
+end
+
+"""
+    _poisson_emission_hessian!(btd, pb, obs_model, x, uy, tsteps, weights)
+
+Subtract the Poisson emission curvature `wₜ · C' diag(λₜ) C` from every diagonal
+Hessian block, forming the whole trial in one `gemm` over the
+`nsym = D(D+1)/2` distinct entries of the symmetric block rather than a
+`tsteps`-long loop of `latent_dim² · obs_dim` scalar reductions.
+
+`weights` is `nothing` for a single LDS and the regime's responsibilities
+`γₖ(t)` for one regime of an SLDS — folded into the rates before the `gemm`, so
+the weighted curvature costs the same as the unweighted one. Accumulates, so an
+SLDS sums regimes by calling this once per regime.
+
+Bit-for-bit this is a different summation order than the per-timestep kernel,
+so results agree to rounding rather than exactly; the arithmetic, and the
+`observation_hessian!` contract, are otherwise identical.
+"""
+function _poisson_emission_hessian!(
+    btd::BlockTridiagonalWorkspace{T},
+    pb::PoissonBatchBuffers{T},
+    obs_model::PoissonObservationModel{T},
+    x::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix},
+    tsteps::Int,
+    weights::Union{Nothing,AbstractVector{T}},
+) where {T<:Real}
+    C = obs_model.C
+    obs_dim = size(C, 1)
+    nsym = length(pb.sym_i)
+
+    # λ[:, t] = exp(C x_t + d + D v_t) — the emission curvature's only
+    # dependence on the current iterate — scaled by the timestep's weight.
+    Lam = _poisson_linear_predictor!(pb, C, obs_model.d, obs_model.D, x, uy, tsteps)
+    @inbounds for t in 1:tsteps
+        wt = weights === nothing ? one(T) : weights[t]
+        col = view(Lam, :, t)
+        @simd for i in 1:obs_dim
+            col[i] = wt * exp(col[i])
+        end
+    end
+
+    Cpair = _poisson_pair_products!(pb, C, obs_dim)
+    Hsym = view(pb.Hsym, 1:nsym, 1:tsteps)
+    mul!(Hsym, transpose(Cpair), Lam)
+
+    @inbounds for t in 1:tsteps
+        Ht = btd.H_diag[t]
+        for p in 1:nsym
+            i = pb.sym_i[p]
+            j = pb.sym_j[p]
+            v = Hsym[p, t]
+            Ht[i, j] -= v
+            i == j || (Ht[j, i] -= v)
+        end
+    end
+    return nothing
+end
+
+"""
+    hessian!(sws, plds, x, y[, uy])
+
+Poisson specialisation of the generic `hessian!`: the state-side blocks are
+unchanged, and the emission curvature goes through the batched
+[`_poisson_emission_hessian!`](@ref).
+"""
+function hessian!(
+    sws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    y::AbstractMatrix{T},
+    uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
+    tsteps = size(y, 2)
+    obs_dim, latent_dim = size(lds.obs_model.C)
+
+    _state_hessian_blocks!(sws.btd, sws.consts, lds.state_model, tsteps)
+
+    pb = poisson_batch!(sws, latent_dim, obs_dim, tsteps)
+    _poisson_emission_hessian!(sws.btd, pb, lds.obs_model, x, uy, tsteps, nothing)
+
+    return nothing
+end
+
+"""
+    observation_loglikelihood!(cc, z, λ, obs_model, x, y, t[, uy])
 
 Poisson emission term: with rate `λ = exp(Cx_t + d + D v_t)`,
 `log p(y_t|x_t) = y⋅log(λ) - sum(λ) - sum(log(y!))`. `z` and `λ` are `obs_dim`
@@ -206,19 +410,19 @@ function observation_loglikelihood!(
     ::SmoothConstants{T},
     z::AbstractVector{T},
     λ::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
 
     # z = Cx + d (+ D v) ; λ = exp(z)
     @views mul!(z, C, x[:, t])
     if uy !== nothing
-        @views mul!(z, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(z, om.D, uy[:, t], one(T), one(T))
     end
     z .+= d
     @. λ = exp(z)
@@ -229,7 +433,7 @@ function observation_loglikelihood!(
 end
 
 """
-    observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    observation_gradient!(out, cc, buf, obs_model, x, y, t[, uy])
 
 Poisson emission gradient w.r.t. the latent `x_t`: `out = C'(y_t - λ_t)` with
 `λ_t = exp(Cx_t + d + D v_t)`. The `D v_t` term is constant in `x_t`, so it
@@ -240,24 +444,24 @@ function observation_gradient!(
     out::AbstractVector{T},
     ::SmoothConstants{T},
     buf::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
     @views mul!(buf, C, x[:, t])
     if uy !== nothing
-        @views mul!(buf, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(buf, om.D, uy[:, t], one(T), one(T))
     end
     @views buf .= y[:, t] .- exp.(buf .+ d)
     return mul!(out, C', buf)
 end
 
 """
-    observation_hessian!(out, cc, z, λ, lds, x, y, t[, α, uy])
+    observation_hessian!(out, cc, z, λ, obs_model, x, y, t[, α, uy])
 
 Poisson emission curvature: `out .+= α .* (-C' diag(λ_t) C)` with
 `λ_t = exp(C x_t + d + D v_t)` — independent of `y` for the canonical log link.
@@ -270,20 +474,20 @@ function observation_hessian!(
     ::SmoothConstants{T},
     z::AbstractVector{T},
     λ::AbstractVector{T},
-    lds::LinearDynamicalSystem{T0,S,O},
+    om::PoissonObservationModel{T0},
     x::AbstractMatrix{T},
     y::AbstractMatrix{T0},
     t::Int,
     α::T=one(T),
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:PoissonObservationModel{T0}}
-    C = lds.obs_model.C
-    d = lds.obs_model.d
+) where {T<:Real,T0<:Real}
+    C = om.C
+    d = om.d
     obs_dim, latent_dim = size(C)
 
     @views mul!(z, C, x[:, t])
     if uy !== nothing
-        @views mul!(z, lds.obs_model.D, uy[:, t], one(T), one(T))
+        @views mul!(z, om.D, uy[:, t], one(T), one(T))
     end
     @. λ = exp(z + d)
 

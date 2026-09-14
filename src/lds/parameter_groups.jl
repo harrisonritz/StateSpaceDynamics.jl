@@ -1,0 +1,1772 @@
+#=============================================================================
+Ancillary parameter dependencies (`depends_on`)
+
+`AbstractStateModel` and `AbstractObservationModel` each carry a `depends_on`
+field. When it is `nothing` (the default) the model behaves exactly as before:
+one parameter set shared by every trial, and every entry point takes its
+original ungrouped code path. When it is a `NamedTuple`, the named parameters
+are estimated separately for each group of trials:
+
+    session = [:a, :a, :b, :b, :b]          # one label per trial
+    obs = GaussianObservationModel(C, R, d)
+    obs.depends_on = (C = session, d = session, D = session, R = session)
+
+Trials labelled `:a` then contribute to one `[C d D]` / `R` estimate and trials
+labelled `:b` to another, while the latent dynamics `A`, `b`, `B`, `Q` and the
+initial state `x0`, `P0` stay shared. That is the "stitching" setup for pooling
+recording sessions that observe different neurons in the same animal: latent
+dynamics common to the animal, emission parameters specific to the session.
+
+Keys are literal parameter names. They resolve to the groups `fit_bool` uses,
+because those parameters are fit jointly as one regression:
+
+    :x0             -> initial state mean      (fit_bool[1])
+    :P0             -> initial state cov       (fit_bool[2])
+    :A, :b, :B      -> dynamics [A b B]        (fit_bool[3])
+    :Q              -> process noise           (fit_bool[4])
+    :C, :d, :D      -> emission [C d D]        (fit_bool[5])
+    :R              -> observation noise       (fit_bool[6], Gaussian only)
+
+A name never stands in for its group: `depends_on = (C = session,)` is an error,
+not shorthand for grouping `[C d D]`, because "`C` depends on the session" reads
+as a claim about `C` alone and the regression can only be fitted whole. Name
+every member — `(C = session, d = session, D = session)` — or none. A model with
+no observation input has no `D` to fit, so `(C = session, d = session)` is the
+whole group there. Members given different label vectors are an error too.
+
+Implementation shape: a *cell* is a maximal set of trials sharing every
+parameter — one element of the common refinement of all the label vectors.
+Trials in a cell are governed by a single `LinearDynamicalSystem`, so the E-step
+runs on them completely unchanged (which is what keeps the equal-length
+shared-covariance fast path alive within each group), and only the M-step and
+the ELBO need to know about groups.
+
+This file holds the declaration side of that design: validating `depends_on`,
+resolving it into per-parameter versions, building the `variants` storage, and
+computing the trial partition. The grouped M-step and ELBO that consume the
+partition live in `grouped_em.jl`.
+=============================================================================#
+
+#=
+Any model that carries a `depends_on` field. Spelling it out (rather than
+leaving these helpers untyped) lets inference union-split over the three
+concrete model types instead of dispatching dynamically on `Any`.
+=#
+const DependentModel = Union{AbstractStateModel,AbstractObservationModel}
+
+# Parameter-group ordinals; identical to the `fit_bool` layout, and the index
+# into a `ParameterGrouping`'s `nslots` / `cell_slot`.
+const _G_X0 = 1
+const _G_P0 = 2
+const _G_AB = 3
+const _G_Q = 4
+const _G_CD = 5
+const _G_R = 6
+
+# Canonical group names, ordered to match `fit_bool`. State-model groups occupy
+# `fit_bool` slots 1:4 and observation-model groups slots 5:6 (5:5 for Poisson).
+_group_names(::GaussianStateModel) = (:x0, :P0, :A, :Q)
+#=
+An LQR state model groups on the same four slots the `fit_bool` layout
+uses — `[x0, P0, structure, noise]` — with `:A` naming the whole structural
+block (`A`, `S`, every `Qc`, `h`, `Bu`, `Gref`, `hf`) because that block is one
+joint estimate rather than a set of separable regressions. Freezing individual
+pieces through `LQRFitFlags` still works alongside grouping: a frozen
+parameter is never updated, so every group keeps its starting value and the
+parameter is effectively shared.
+=#
+_group_names(::LQRStateModel) = (:x0, :P0, :A, :Q)
+_group_names(::GaussianObservationModel) = (:C, :R)
+_group_names(::PoissonObservationModel) = (:C,)
+
+#=
+Group membership. `[A b B]` and `[C d D]` are each fit as a single regression,
+so they form one group for `fit_bool` and for the M-step. Parameter *names*
+stay literal, though: naming one member does not stand in for the group. A
+declaration that covers only part of one is rejected (`_require_whole_groups`),
+because "`A` depends on session" reads as a claim about `A` alone while the
+regression can only be fitted whole.
+
+`_param_group` returns `nothing` for a name the model does not own, which is
+what a *shared* `depends_on` needs: a call-site override is one NamedTuple
+resolved against both sub-models, so each has to be able to ignore the other's
+keys rather than reject them.
+=#
+function _param_group(::GaussianStateModel, name::Symbol)
+    name in (:A, :b, :B) && return :A
+    name in (:x0, :P0, :Q) && return name
+    return nothing
+end
+
+#=
+The LQR model's structural block is one joint estimate — the plant, the
+costs and the affine and reference terms are solved together — so it resolves to
+one group, `:structure`, and the two noise matrices to another, `:noise`. The
+canonical group names stay `:A` and `:Q` so the slot ordinals keep lining up
+with the `fit_bool` layout `[x0, P0, structure, noise]`.
+
+A piece of the block may be named on its own, though, and that is not the same
+request: `(Qc = reward,)` groups the *cost* by reward while the plant `A`, the
+control term `S` and the rest stay one array estimated from every trial. It
+resolves to the same group — the cells are the same, and the solve is still one
+joint optimization — because what changes is only how many copies of each block
+the M-step packs, which it already varies per block (see `_LQR_STRUCT_NAMES`).
+
+That is the model an inverse-LQR fit usually wants of a task variable: one arm,
+an objective per condition. Naming `:structure` gives every piece its own copy,
+which says the plant itself changed with the condition.
+
+`LQRFitFlags` freezes pieces within the block, and composes with either:
+a frozen piece keeps its starting value in every group. Freezing and sharing are
+different, though — a shared piece is still fitted, from all the trials at once.
+=#
+function _param_group(sm::LQRStateModel, name::Symbol)
+    name === :structure && return :A
+    name === :noise && return :Q
+    name in (:x0, :P0) && return name
+    #= A `:free` model's transition is one unconstrained matrix with no plant,
+    cost or reference to name, so only the whole block can be grouped there. =#
+    (!_is_free(sm) && name in _LQR_STRUCT_NAMES) && return :A
+    return nothing
+end
+
+function _valid_param_names(sm::LQRStateModel)
+    _is_free(sm) && return ":x0, :P0, :structure, :noise (a `:free` model's " *
+           "transition has no plant, cost or reference to name separately)"
+    return ":x0, :P0, :structure, :noise, and the individual structural blocks " *
+           ":A, :S, :Qc, :h, :Bu, :Gref, :terminal"
+end
+
+#=
+The structural block is the one group `depends_on` may name in part. Its pieces
+are fitted jointly, but jointly is not indivisibly: the M-step packs a separate
+number of copies per block, so "one plant, a cost per group" is a model it
+solves in one pass rather than a split it cannot represent. Every other group on
+this model has a single member, so nothing here can be named in part.
+=#
+function _require_whole_groups(::LQRStateModel, named, context::AbstractString)
+    return nothing
+end
+
+"""
+    _extra_tied_names(state_model) -> Tuple{Vararg{Symbol}}
+
+Names valid for `tied_params` but not for `depends_on`.
+
+An inverse-LQR model's structural block is estimated jointly, so `depends_on`
+offers it under the single name `:structure` — splitting it there would mean one
+variant per group of *every* structural parameter regardless of which was named.
+`tied_params` is different: sharing `A` and `S` across discrete states while
+fitting `Qc` per state is a genuinely useful model, and the switching M-step can
+deliver it by alternating over the two subsets. So the individual blocks are
+accepted there, and only there.
+"""
+_extra_tied_names(::AbstractStateModel) = ()
+_extra_tied_names(::LQRStateModel) = (:A, :S, :Qc, :h, :Bu, :Gref)
+
+#=
+One member each: `:structure` and `:noise` *are* their groups, so a `depends_on`
+naming one is already whole.
+=#
+function _group_members(::LQRStateModel, group::Symbol)
+    return group === :A ? (:structure,) : (group === :Q ? (:noise,) : (group,))
+end
+
+function _param_group(::GaussianObservationModel, name::Symbol)
+    name in (:C, :d, :D) && return :C
+    name === :R && return :R
+    return nothing
+end
+
+function _param_group(::PoissonObservationModel, name::Symbol)
+    name in (:C, :d, :D) && return :C
+    return nothing
+end
+
+"""
+    _group_members(model, group) -> Tuple{Vararg{Symbol}}
+
+The parameters making up one jointly-fitted group *on this model*. A zero-column
+`B` / `D` — the model carries no input of that kind — is not a member: there is
+nothing of it to fit, so requiring the caller to name it would be noise.
+"""
+function _group_members(sm::GaussianStateModel, group::Symbol)
+    group === :A || return (group,)
+    return size(sm.B, 2) > 0 ? (:A, :b, :B) : (:A, :b)
+end
+
+function _group_members(om::GaussianObservationModel, group::Symbol)
+    group === :C || return (group,)
+    return size(om.D, 2) > 0 ? (:C, :d, :D) : (:C, :d)
+end
+
+function _group_members(om::PoissonObservationModel, group::Symbol)
+    group === :C || return (group,)
+    return size(om.D, 2) > 0 ? (:C, :d, :D) : (:C, :d)
+end
+
+_valid_param_names(::GaussianStateModel) = ":x0, :P0, :A, :b, :B, :Q"
+_valid_param_names(::GaussianObservationModel) = ":C, :d, :D, :R"
+function _valid_param_names(::PoissonObservationModel)
+    return ":C, :d, :D (a Poisson emission has no noise covariance)"
+end
+
+#=============================================================================
+Composite emissions
+
+A member's parameters keep their own names; the composite spells them with the
+member appended (`:C_kin`), which is the same spelling `fit_bool` and
+`tied_params` use. Every helper below therefore splits the suffix, delegates to
+the member, and re-suffixes whatever comes back — so `_resolve_dependence`,
+`_build_variants!` and `ParameterGrouping` see a flat list of parameter groups
+and need no notion of members at all.
+
+The resulting group order — every member's groups in the composite's key order,
+after the four state groups — is exactly the `fit_bool` layout, which is what
+lets the grouped M-step index `cell_slot` and `fit_bool` with one ordinal.
+=============================================================================#
+
+function _group_names(c::CompositeObservationModel)
+    names = Symbol[]
+    for key in _obs_keys(c)
+        for g in _group_names(_models(c)[key])
+            push!(names, _suffixed(g, key))
+        end
+    end
+    return Tuple(names)
+end
+
+function _param_group(c::CompositeObservationModel, name::Symbol)
+    split = _split_obs_name(name, _models(c))
+    split === nothing && return nothing
+    group = _param_group(_models(c)[split[2]], split[1])
+    group === nothing && return nothing
+    return _suffixed(group, split[2])
+end
+
+function _group_members(c::CompositeObservationModel, group::Symbol)
+    split = _split_obs_name(group, _models(c))
+    split === nothing && return (group,)
+    key = split[2]
+    return map(m -> _suffixed(m, key), _group_members(_models(c)[key], split[1]))
+end
+
+function _valid_param_names(c::CompositeObservationModel)
+    models = _models(c)
+    parts = String[]
+    for key in keys(models)
+        names = join(
+            (":" * String(_suffixed(n, key)) for n in _all_param_names(models[key])), ", "
+        )
+        push!(parts, "on `:$key`, $names")
+    end
+    return join(parts, "; ")
+end
+
+"""
+    _all_param_names(obs_model) -> Tuple{Vararg{Symbol}}
+
+Every parameter name `depends_on` accepts for a single observation model. Used
+only to build the composite's error message, where each is shown suffixed.
+"""
+_all_param_names(::GaussianObservationModel) = (:C, :d, :D, :R)
+_all_param_names(::PoissonObservationModel) = (:C, :d, :D)
+
+#=
+`group_seeds` is stored on the member that owns the parameters, so seeding goes
+through the member rather than the composite. Spelled out rather than left to
+the immutable-struct `setproperty!` error, which would say nothing useful.
+=#
+function set_group_seeds!(c::CompositeObservationModel, ::Union{Nothing,AbstractDict})
+    return throw(
+        ArgumentError(
+            "set_group_seeds! takes the observation model that owns the parameters, not " *
+            "the composite: the seed keys are group labels and the values name that " *
+            "model's own parameters. Call it on a member, e.g. " *
+            "`set_group_seeds!(obs.$(first(_obs_keys(c))), seeds)`.",
+        ),
+    )
+end
+
+function _param_group_checked(model::DependentModel, name::Symbol)
+    group = _param_group(model, name)
+    group === nothing && throw(
+        ArgumentError(
+            "`:$name` is not a parameter of a $(nameof(typeof(model))); " *
+            "valid names are $(_valid_param_names(model))",
+        ),
+    )
+    return group
+end
+
+"""
+    _require_whole_groups(model, named, context)
+
+Reject a declaration covering only part of a jointly-fitted group. `named` is
+the collection of parameter names the caller supplied; only those this model
+owns are considered, so a NamedTuple shared between the two sub-models still
+validates against each.
+"""
+function _require_whole_groups(model::DependentModel, named, context::AbstractString)
+    owned = [n for n in named if _param_group(model, n) !== nothing]
+    for group in unique(_param_group(model, n) for n in owned)
+        members = _group_members(model, group)
+        missing_members = [m for m in members if !(m in owned)]
+        isempty(missing_members) && continue
+        given = [m for m in members if m in owned]
+        throw(
+            ArgumentError(
+                "$context: $(_join_names(given)) " *
+                "$(length(given) == 1 ? "is" : "are") fitted jointly with " *
+                "$(_join_names(missing_members)) as the single regression " *
+                "`[$(join(String.(members), " "))]`, which cannot be split. Name " *
+                "$(length(missing_members) == 1 ? "it" : "them") too, or drop " *
+                "$(_join_names(given)).",
+            ),
+        )
+    end
+    return nothing
+end
+
+_join_names(names) = join(("`:" * String(n) * "`" for n in names), ", ", " and ")
+
+#=
+Parameter groups that an SLDS always shares across its regimes, whatever the
+caller asks for. Naming one in `tied_params` is accepted and then dropped: it
+keeps the keyword's vocabulary the model's full parameter list without letting
+it imply a choice it does not actually control.
+=#
+const _ALWAYS_TIED = (:x0, :P0)
+
+"""
+    _resolve_tied_params(sm, om, tied_params) -> Vector{Symbol}
+
+Canonicalize the `tied_params` keyword into a deduplicated list of literal
+parameter names. Accepts `nothing`, a single `Symbol`, or an iterable of them,
+and checks each against whichever sub-model owns it.
+
+Names mean themselves: `:A` is `A`, not `[A b B]`. Naming part of a jointly
+fitted regression is a *partial tie*, which the M-step either solves or rejects
+(`_validate_tied_params`) — it never silently widens to the whole group.
+
+`:x0` / `:P0` are accepted and dropped: an SLDS ties its initial state across
+regimes unconditionally (see `_ALWAYS_TIED`).
+"""
+function _resolve_tied_params(
+    sm::AbstractStateModel, om::AbstractObservationModel, tied_params
+)
+    tied_params === nothing && return Symbol[]
+    names = tied_params isa Symbol ? (tied_params,) : tied_params
+
+    out = Symbol[]
+    for name in names
+        name isa Symbol || throw(
+            ArgumentError(
+                "tied_params takes a Symbol or a collection of Symbols; got an entry " *
+                "of type $(typeof(name))",
+            ),
+        )
+        if _param_group(sm, name) === nothing &&
+            _param_group(om, name) === nothing &&
+            !(name in _extra_tied_names(sm))
+            throw(
+                ArgumentError(
+                    "tied_params: `:$name` is not a parameter of this model; valid " *
+                    "names are $(_valid_param_names(sm)) (dynamics) and " *
+                    "$(_valid_param_names(om)) (emission)",
+                ),
+            )
+        end
+        name in _ALWAYS_TIED && continue   # already shared; nothing to request
+        name in out || push!(out, name)
+    end
+    return out
+end
+
+"""
+    _tied_dyn_cols(tied, D, ux_dim) -> Vector{Int}
+    _tied_obs_cols(tied, D, uy_dim) -> Vector{Int}
+
+Columns of the stacked regression (`[A b B]`, `[C d D]`) that `tied` shares
+across regimes. Empty means the regression is free per regime, all of them
+means it is shared whole, and anything between is a partial tie. A named `:B` /
+`:D` the model has no inputs for contributes no columns, so it neither ties
+anything nor makes an otherwise-whole tie partial.
+"""
+function _tied_dyn_cols(tied::AbstractVector{Symbol}, D::Int, ux_dim::Int)
+    cols = Int[]
+    :A in tied && append!(cols, 1:D)
+    :b in tied && push!(cols, D + 1)
+    (:B in tied && ux_dim > 0) && append!(cols, (D + 2):(D + 1 + ux_dim))
+    return sort!(cols)
+end
+
+function _tied_obs_cols(
+    tied::AbstractVector{Symbol}, D::Int, uy_dim::Int, key::Union{Nothing,Symbol}=nothing
+)
+    # A composite's members are named with the member as a suffix, so `key`
+    # selects which member's `:C`/`:d`/`:D` these columns are about.
+    named(p::Symbol) = key === nothing ? p : _suffixed(p, key)
+    cols = Int[]
+    named(:C) in tied && append!(cols, 1:D)
+    named(:d) in tied && push!(cols, D + 1)
+    (named(:D) in tied && uy_dim > 0) && append!(cols, (D + 2):(D + 1 + uy_dim))
+    return sort!(cols)
+end
+
+"""
+    _tied_name(param, key) -> Symbol
+
+How one observation parameter is spelled in `tied_params`: bare for a single
+emission, member-suffixed for a composite.
+"""
+_tied_name(param::Symbol, ::Nothing) = param
+_tied_name(param::Symbol, key::Symbol) = _suffixed(param, key)
+
+"""
+    ParameterDependence
+
+**Internal.** Resolved, model-intrinsic form of a model's `depends_on`: for each
+of the model's parameter groups, whether it varies, the ordered list of distinct
+labels, and the per-trial labels as supplied.
+
+`nslots[g]` is `length(labels[g])` for a varying group and `1` otherwise, so a
+model's `variants` vector always has `prod(nslots)` entries and a variant's index
+is a fixed function of its per-group slot indices — independent of any dataset,
+which is what lets a `depends_on` override re-assign trials without invalidating
+already-fitted parameters.
+"""
+struct ParameterDependence
+    names::Vector{Symbol}
+    varies::Vector{Bool}
+    labels::Vector{Vector{Any}}
+    trial_labels::Vector{Vector{Any}}
+    nslots::Vector{Int}
+end
+
+_any_varies(dep::ParameterDependence) = any(dep.varies)
+
+function _same_labels(a::Vector{Any}, b::Vector{Any})
+    return length(a) == length(b) && all(isequal(a[i], b[i]) for i in eachindex(a))
+end
+
+"""
+    _resolve_dependence(model) -> ParameterDependence
+
+Validate `model.depends_on` and resolve it against the model's parameter groups.
+Throws `ArgumentError` on unknown parameter names, on a jointly fitted group
+named only in part, or on members of one group carrying different label
+vectors, and `DimensionMismatchError` on label vectors of unequal length.
+"""
+function _resolve_dependence(model::DependentModel)
+    names = collect(Symbol, _group_names(model))
+    ngroups = length(names)
+    varies = fill(false, ngroups)
+    labels = [Any[] for _ in 1:ngroups]
+    trial_labels = [Any[] for _ in 1:ngroups]
+    nslots = fill(1, ngroups)
+    dep = ParameterDependence(names, varies, labels, trial_labels, nslots)
+
+    spec = model.depends_on
+    spec === nothing && return dep
+    _require_whole_groups(model, keys(spec), "depends_on")
+
+    #=
+    Track which user-facing key first claimed each group so a conflicting member
+    (`(C = s1, d = s2)`) can report both names rather than silently keeping one.
+    =#
+    claimed = Vector{Symbol}(undef, ngroups)
+    for key in keys(spec)
+        canonical = _param_group_checked(model, key)
+        g = findfirst(isequal(canonical), names)::Int
+        supplied = getproperty(spec, key)
+        supplied isa AbstractVector || throw(
+            ArgumentError(
+                "depends_on[:$key] must be a vector with one label per trial, " *
+                "got a $(typeof(supplied))",
+            ),
+        )
+        isempty(supplied) &&
+            throw(ArgumentError("depends_on[:$key] is empty; expected one label per trial"))
+        current = collect(Any, supplied)
+        if varies[g]
+            _same_labels(current, trial_labels[g]) || throw(
+                ArgumentError(
+                    "depends_on: `:$key` and `:$(claimed[g])` name the same parameter " *
+                    "group (`:$canonical`, fit jointly as one regression) but were " *
+                    "given different label vectors; supply one label vector per group",
+                ),
+            )
+            continue
+        end
+        varies[g] = true
+        claimed[g] = key
+        trial_labels[g] = current
+        labels[g] = collect(Any, unique(current))
+        nslots[g] = length(labels[g])
+    end
+
+    ntrials = 0
+    for g in 1:ngroups
+        varies[g] || continue
+        if ntrials == 0
+            ntrials = length(trial_labels[g])
+        elseif length(trial_labels[g]) != ntrials
+            throw(
+                DimensionMismatchError(
+                    "depends_on[:$(names[g])] length", ntrials, length(trial_labels[g])
+                ),
+            )
+        end
+    end
+
+    return dep
+end
+
+#=
+Mixed-radix (column-major) index of a variant from its per-group slot indices,
+and its inverse. Written out rather than going through `LinearIndices` so the
+`nslots` vector never has to be splatted into a tuple.
+=#
+function _variant_index(nslots::AbstractVector{Int}, slots::AbstractVector{Int})
+    idx = 0
+    for g in length(nslots):-1:1
+        idx = idx * nslots[g] + (slots[g] - 1)
+    end
+    return idx + 1
+end
+
+function _variant_slots(nslots::AbstractVector{Int}, index::Int)
+    slots = Vector{Int}(undef, length(nslots))
+    rest = index - 1
+    for g in eachindex(nslots)
+        slots[g] = rest % nslots[g] + 1
+        rest = rest ÷ nslots[g]
+    end
+    return slots
+end
+
+"""
+    _slot_of(dep, g, label) -> Int
+
+Slot index of `label` within parameter group `g`. Throws when the label was not
+present in the label vector the model was built with — an override may
+re-assign trials to known groups but not introduce new parameter sets.
+"""
+function _slot_of(dep::ParameterDependence, g::Int, label)
+    dep.varies[g] || return 1
+    slot = findfirst(isequal(label), dep.labels[g])
+    slot === nothing && throw(
+        ArgumentError(
+            "depends_on: label $(repr(label)) is not a known group of parameter " *
+            "`:$(dep.names[g])` (known: $(join(map(repr, dep.labels[g]), ", "))). " *
+            "An override may only re-assign trials to existing groups.",
+        ),
+    )
+    return slot::Int
+end
+
+"""
+    _trial_labels_for(dep, g, model, override) -> Vector{Any}
+
+Per-trial labels for group `g`, taken from `override` when it names the group
+(under any of its members' names) and from the model's own `depends_on`
+otherwise.
+"""
+function _trial_labels_for(
+    dep::ParameterDependence, g::Int, model::DependentModel, override
+)
+    if override !== nothing
+        for key in keys(override)
+            _param_group(model, key) === dep.names[g] || continue
+            supplied = getproperty(override, key)
+            supplied isa AbstractVector || throw(
+                ArgumentError(
+                    "depends_on override for `:$key` must be a vector with one label " *
+                    "per trial, got a $(typeof(supplied))",
+                ),
+            )
+            return collect(Any, supplied)
+        end
+    end
+    return dep.trial_labels[g]
+end
+
+# ============================================================================
+# Variant construction. Parameters that do not vary are shared *by reference*
+# across every variant, so one M-step write updates all of them; parameters
+# that do vary get one independent copy per slot, with slot 1 aliasing the base
+# model's own array so `model.C` keeps its original meaning.
+# ============================================================================
+
+_slot_arrays(base, nslots::Int) = [i == 1 ? base : copy(base) for i in 1:nslots]
+
+"""
+    ObsSlotSpec{T}
+
+**Internal.** Per-slot observation shape and data-derived seed for one
+observation-model parameter group. `dims[s]` is slot `s`'s channel count;
+`mean[s]` / `var[s]` are that slot's per-channel statistics, used only to seed
+a slot whose shape differs from the template.
+"""
+struct ObsSlotSpec{T<:Real}
+    dims::Vector{Int}
+    mean::Vector{Vector{T}}
+    var::Vector{Vector{T}}
+end
+
+_spec_dim(::Nothing, slot::Int, fallback::Int) = fallback
+_spec_dim(spec::ObsSlotSpec, slot::Int, ::Int) = spec.dims[slot]
+
+#=============================================================================
+Per-session observation dimensions ("stitching")
+
+`obs_dim` is a property of the `[C d D]` group, not of the model as a whole:
+`C` is `obs_dim × latent_dim`, `d` is `obs_dim`, `D` is `obs_dim × uy_dim` and
+`R` is `obs_dim × obs_dim`. So when sessions observe different numbers of
+channels, every observation-model group has to be constant in `obs_dim` within
+each of its slots. A shared `:R` alongside a per-session `:C` has no
+well-defined size, and is rejected here rather than left to a downstream shape
+error.
+
+The dimensions come from the data: each slot's `obs_dim` is the row count of
+the trials assigned to it. The latent dimension stays shared.
+
+`variants` is indexed by the Cartesian product of every group's slots, so with
+both `:C` and `:R` varying over two sessions it holds four entries while only
+two describe a real cell. Under stitching the two cross terms pair one
+session's `C` with another session's `R` and are therefore inconsistent — but
+they are unreachable: `_cell_lds` only ever indexes `grp.cell_obs`, and both
+groups take their width from the same per-trial data, so every combination an
+occupied cell names has matching `C` and `R` widths.
+=============================================================================#
+
+"""
+    _slot_obs_dims(dep, g, labels_g, obs_dims, template_dim) -> Vector{Int}
+
+Observation dimension of each slot of observation-model group `g`.
+
+`obs_dims[n]` is trial `n`'s channel count. A group that does not vary gets a
+single slot, which then requires every trial to share one dimension.
+"""
+function _slot_obs_dims(
+    dep::ParameterDependence,
+    g::Int,
+    labels_g::AbstractVector,
+    obs_dims::AbstractVector{Int},
+    template_dim::Int,
+)
+    name = dep.names[g]
+    if !dep.varies[g]
+        p = first(obs_dims)
+        for q in obs_dims
+            q == p || throw(
+                ArgumentError(
+                    "observations have $p and $q channels in the same dataset, but " *
+                    "`:$name` is shared across all trials, so it has no well-defined " *
+                    "size. Make `:$name` depend on the same ancillary variable as the " *
+                    "emission, e.g. `depends_on = (C = session, d = session, " *
+                    "R = session)`.",
+                ),
+            )
+        end
+        return [p]
+    end
+
+    dims = Vector{Int}(undef, dep.nslots[g])
+    seen = falses(dep.nslots[g])
+    for (n, label) in enumerate(labels_g)
+        s = _slot_of(dep, g, label)
+        p = obs_dims[n]
+        if !seen[s]
+            dims[s] = p
+            seen[s] = true
+        elseif dims[s] != p
+            throw(
+                ArgumentError(
+                    "trials grouped under `:$name = $(repr(dep.labels[g][s]))` have " *
+                    "differing channel counts ($(dims[s]) and $p). A parameter version " *
+                    "is one matrix, so every trial sharing it must have the same number " *
+                    "of channels.",
+                ),
+            )
+        end
+    end
+
+    # A slot with no trials in this dataset keeps whatever the template implies.
+    for s in eachindex(dims)
+        seen[s] || (dims[s] = template_dim)
+    end
+    return dims
+end
+
+#=
+Initialization of a variant whose shape differs from the template. Same-sized
+slots keep copying the template, so a fit whose sessions happen to agree on
+`obs_dim` is bit-identical to before this feature existed.
+
+A differently-sized slot cannot copy anything, so it is seeded from the data
+it will be fitted to: `d` at the per-channel mean and `R` at the per-channel
+variance put the emission on the right scale immediately, and `C` cycles the
+template's rows so that the loading matrix starts at the template's magnitude
+rather than at zero (which the M-step could not move off of). One M-step
+replaces all three.
+=#
+_obs_stats(::Nothing, p::Int, ::Type{T}) where {T} = (zeros(T, p), ones(T, p))
+
+function _obs_stats(ys::AbstractVector, p::Int, ::Type{T}) where {T}
+    mean_y = zeros(T, p)
+    var_y = zeros(T, p)
+    n = 0
+    for y in ys
+        n += size(y, 2)
+        for t in axes(y, 2), i in 1:p
+            mean_y[i] += y[i, t]
+        end
+    end
+    n == 0 && return (mean_y, fill!(var_y, one(T)))
+    mean_y ./= n
+    for y in ys
+        for t in axes(y, 2), i in 1:p
+            var_y[i] += abs2(y[i, t] - mean_y[i])
+        end
+    end
+    var_y ./= max(n - 1, 1)
+    for i in 1:p
+        var_y[i] > 0 || (var_y[i] = one(T))
+    end
+    return (mean_y, var_y)
+end
+
+"""
+    set_group_seeds!(model, seeds) -> model
+
+Give individual `depends_on` groups their own starting values:
+`Dict(label => (C=..., d=..., D=..., R=...))`, any subset of those keys per
+label. A label with no entry, or an entry naming only some parameters, keeps the
+defaults for the rest.
+
+This matters when the groups observe different channel *sets*. Nothing here
+knows which channel is which, so an unseeded slot starts from the template's
+emission — copied when the widths agree, its rows cycled when they do not. Both
+pair a group's channel with whatever channel sits at the same row of the
+template, which is only right when the groups share one channel list. A caller
+that already knows each group's loadings, because it stitched them onto shared
+factors before building the model, should hand them over here instead.
+
+Seeds are *initial* values: they are read when the per-group variants are built
+and ignored by a later `fit!` that reuses the cached ones, exactly as `model.C`
+is. Shapes are checked against the data when the variants are built — a seed of
+the wrong size is an error, never a silent reshape.
+
+Labels are validated here rather than at fit time, because the cost of a
+mistyped one is invisible: it would simply never be read.
+
+    om.depends_on = (C = session, d = session, D = session)
+    set_group_seeds!(om, Dict(s => (C = loadings[s],) for s in sessions))
+"""
+function set_group_seeds!(model::DependentModel, seeds::Union{Nothing,AbstractDict})
+    if seeds === nothing
+        model.group_seeds = nothing
+        return model
+    end
+    model.depends_on === nothing && throw(
+        ArgumentError(
+            "set_group_seeds! needs `depends_on` to be set first: with no groups there " *
+            "are no labels to seed, and the seeds would never be read",
+        ),
+    )
+    dep = _resolve_dependence(model)
+    known = Set{Any}()
+    for g in eachindex(dep.names)
+        dep.varies[g] && union!(known, dep.labels[g])
+    end
+    for (label, seed) in seeds
+        label in known || throw(
+            ArgumentError(
+                "set_group_seeds!: $(repr(label)) is not a label of any group this " *
+                "model varies; it has $(join(sort!(String[repr(l) for l in known]), ", "))",
+            ),
+        )
+        for name in keys(seed)
+            _param_group_checked(model, name)   # throws on a name the model does not own
+        end
+    end
+    model.group_seeds = seeds
+    return model
+end
+
+"""
+    _group_seed(model, dep, g, slot) -> NamedTuple or nothing
+
+The caller-supplied seed for one slot of observation group `g`, looked up by the
+slot's label. `nothing` whenever no seeds were given, the group does not vary,
+or that label has no entry.
+"""
+function _group_seed(
+    model::AbstractObservationModel, dep::ParameterDependence, g::Int, slot::Int
+)
+    seeds = model.group_seeds
+    seeds === nothing && return nothing
+    dep.varies[g] || return nothing
+    slot <= length(dep.labels[g]) || return nothing
+    return get(seeds, dep.labels[g][slot], nothing)
+end
+
+_seed_entry(::Nothing, ::Symbol) = nothing
+_seed_entry(seed, name::Symbol) = get(seed, name, nothing)
+
+"""
+    _slot_dim(spec, slot, fallback, seed) -> Int
+
+The channel count one observation slot's parameters get. A dataset pins it
+whenever there is one (`spec`), and that always wins. With no dataset in hand
+the caller's seed is the only statement of how many channels that group has, so
+it settles the size instead; the template's width is the fallback, as before.
+
+This is what lets a group's emission be read back — `group_parameter(om, :C,
+label)` — between `set_group_seeds!` and the first fit. Without it a seed
+narrower or wider than the template would be rejected as the wrong shape for a
+slot the template had sized, even though the seed is precisely the thing that
+knows better.
+"""
+function _slot_dim(spec, slot::Int, fallback::Int, seed)
+    spec === nothing || return _spec_dim(spec, slot, fallback)
+    seed === nothing && return fallback
+    C = _seed_entry(seed, :C)
+    C === nothing || return size(C, 1)
+    d = _seed_entry(seed, :d)
+    d === nothing || return length(d)
+    D = _seed_entry(seed, :D)
+    D === nothing || return size(D, 1)
+    return fallback
+end
+
+"""The channel count an `:R` slot gets: as `_slot_dim`, read off the `:R` seed."""
+function _slot_dim_R(spec, slot::Int, fallback::Int, seed)
+    spec === nothing || return _spec_dim(spec, slot, fallback)
+    R = _seed_entry(seed, :R)
+    return R === nothing ? fallback : size(R, 1)
+end
+
+"""Copy a seed into a slot's storage, refusing one that is the wrong shape."""
+function _apply_seed!(out, supplied, name::Symbol, slot::Int)
+    size(out) == size(supplied) || throw(
+        ArgumentError(
+            "group_seeds gave a $(size(supplied)) `:$name` for a slot that needs " *
+            "$(size(out)) (group slot $slot). A seed has to match the channel count " *
+            "the data gives that group and the model's latent/input widths.",
+        ),
+    )
+    copyto!(out, supplied)
+    return out
+end
+
+#=
+Slot 1 aliases the parent's array (as `_slot_arrays` has always done) so the
+model object stays in sync with its first version; every other slot gets its
+own storage. A slot whose shape matches the template is still a plain copy, so
+nothing about the equal-`obs_dim` path changes. A seed is written *into* that
+storage rather than replacing it, which keeps slot 1's aliasing intact.
+=#
+function _slot_storage(base::AbstractMatrix, i::Int, dims::Tuple{Int,Int})
+    size(base) == dims || return similar(base, dims...)
+    return i == 1 ? base : copy(base)
+end
+
+function _slot_storage(base::AbstractVector, i::Int, len::Int)
+    length(base) == len || return similar(base, len)
+    return i == 1 ? base : copy(base)
+end
+
+function _seed_slot_C(base::AbstractMatrix{T}, i::Int, p::Int, seed=nothing) where {T}
+    out = _slot_storage(base, i, (p, size(base, 2)))
+    supplied = _seed_entry(seed, :C)
+    supplied === nothing || return _apply_seed!(out, supplied, :C, i)
+    size(base, 1) == p && return out
+    nrows = size(base, 1)
+    for r in 1:p
+        out[r, :] .= @view base[mod1(r, nrows), :]
+    end
+    return out
+end
+
+function _seed_slot_D(base::AbstractMatrix{T}, i::Int, p::Int, seed=nothing) where {T}
+    out = _slot_storage(base, i, (p, size(base, 2)))
+    supplied = _seed_entry(seed, :D)
+    supplied === nothing || return _apply_seed!(out, supplied, :D, i)
+    size(base, 1) == p && return out
+    return fill!(out, zero(T))
+end
+
+function _seed_slot_d(
+    base::AbstractVector{T},
+    i::Int,
+    p::Int,
+    spec::Union{Nothing,ObsSlotSpec{T}},
+    seed=nothing,
+) where {T}
+    out = _slot_storage(base, i, p)
+    supplied = _seed_entry(seed, :d)
+    supplied === nothing || return _apply_seed!(out, supplied, :d, i)
+    length(base) == p && return out
+    spec === nothing ? fill!(out, zero(T)) : copyto!(out, spec.mean[i])
+    return out
+end
+
+function _seed_slot_R(
+    base::AbstractMatrix{T},
+    j::Int,
+    p::Int,
+    spec::Union{Nothing,ObsSlotSpec{T}},
+    seed=nothing,
+) where {T}
+    out = _slot_storage(base, j, (p, p))
+    supplied = _seed_entry(seed, :R)
+    supplied === nothing || return _apply_seed!(out, supplied, :R, j)
+    size(base, 1) == p && return out
+    fill!(out, zero(T))
+    for k in 1:p
+        out[k, k] = spec === nothing ? one(T) : spec.var[j][k]
+    end
+    return out
+end
+
+"""
+    _slot_obs_prior(prior, p) -> MNPrior or nothing
+
+The `[C d D]` prior one observation slot gets. `M₀` carries one row per channel,
+so a slot whose channel count differs from the template's needs its own copy of
+the prior: sharing the template's would broadcast a `p₀`-row `M₀` against this
+slot's `p`-row `[C d D]` in the emission M-step and in the ELBO's prior term,
+which is a `DimensionMismatch` under stitching whenever the sessions disagree on
+how many units they saw.
+
+Rows are cycled, exactly as `_seed_slot_C` cycles the template's loadings: like
+`C` itself, `M₀` is stated in the template's channel order and nothing here knows
+which of this slot's channels is which. For the ridge that motivates the prior
+(`M₀ = 0`) every row is the same one, so the shrinkage target is untouched.
+"""
+_slot_obs_prior(::Nothing, ::Int) = nothing
+
+function _slot_obs_prior(prior::MNPrior, p::Int)
+    M₀ = prior.M₀
+    nrows = size(M₀, 1)
+    nrows == p && return prior
+    M = similar(M₀, p, size(M₀, 2))
+    for r in 1:p
+        M[r, :] .= @view M₀[mod1(r, nrows), :]
+    end
+    return MNPrior(; M₀=M, Λ=prior.Λ)
+end
+
+#=
+A rebuild is skipped only when the cached variants already have the shapes this
+dataset asks for; otherwise re-fitting the same model against a dataset with
+different channel counts would silently reuse the wrong-sized arrays.
+=#
+function _variants_match(
+    variants::AbstractVector,
+    dep::ParameterDependence,
+    spec_C::Union{Nothing,ObsSlotSpec},
+    spec_R::Union{Nothing,ObsSlotSpec},
+)
+    spec_C === nothing && spec_R === nothing && return true
+    for cell in eachindex(variants)
+        s = _variant_slots(dep.nslots, cell)
+        v = variants[cell]
+        spec_C === nothing || size(v.C, 1) == spec_C.dims[s[1]] || return false
+        if spec_R !== nothing && hasproperty(v, :R)
+            size(v.R, 1) == spec_R.dims[s[2]] || return false
+        end
+    end
+    return true
+end
+
+function _build_variants!(
+    sm::GaussianStateModel{T,M,V}, dep::ParameterDependence
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    ncells = prod(dep.nslots)
+    existing = sm.variants
+    if existing !== nothing && length(existing) == ncells
+        return existing
+    end
+
+    x0s = _slot_arrays(sm.x0, dep.nslots[1])
+    P0s = _slot_arrays(sm.P0, dep.nslots[2])
+    As = _slot_arrays(sm.A, dep.nslots[3])
+    bs = _slot_arrays(sm.b, dep.nslots[3])
+    Bs = _slot_arrays(sm.B, dep.nslots[3])
+    Qs = _slot_arrays(sm.Q, dep.nslots[4])
+
+    variants = Vector{GaussianStateModel{T,M,V}}(undef, ncells)
+    for cell in 1:ncells
+        s = _variant_slots(dep.nslots, cell)
+        variants[cell] = GaussianStateModel{T,M,V}(;
+            A=As[s[3]],
+            Q=Qs[s[4]],
+            b=bs[s[3]],
+            x0=x0s[s[1]],
+            P0=P0s[s[2]],
+            B=Bs[s[3]],
+            Q_prior=sm.Q_prior,
+            P0_prior=sm.P0_prior,
+            AB_prior=sm.AB_prior,
+            x0_prior=sm.x0_prior,
+        )
+    end
+    sm.variants = variants
+    return variants
+end
+
+"""
+    _build_variants!(sm::LQRStateModel, dep)
+
+One model per parameter-group cell. Arrays for a group that does not vary are
+shared **by reference**, so an M-step write through any variant is visible from
+all of them — the same contract as the Gaussian state model.
+
+The structural block refines that by piece. `dep` resolves `(Qc = labels,)` and
+`(structure = labels,)` to the same group and so to the same cells, and
+[`_lqr_struct_varies`](@ref) is what tells the two apart: a piece nobody named
+gets *one* array shared by every variant, exactly as an ungrouped group does, so
+`(Qc = labels,)` gives one plant fitted from all the trials and a cost per group.
+
+The derived cache is the exception: every variant gets its own, because it is a
+function of that variant's parameters (`M_k` depends on its `Qc`). Two variants
+that share every structural array simply end up with equal caches.
+"""
+function _build_variants!(
+    sm::LQRStateModel{T,M,V}, dep::ParameterDependence
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    ncells = prod(dep.nslots)
+    existing = sm.variants
+    if existing !== nothing && length(existing) == ncells
+        return existing
+    end
+
+    x0s = _slot_arrays(sm.x0, dep.nslots[1])
+    P0s = _slot_arrays(sm.P0, dep.nslots[2])
+    #= Slot 3 is the structural block and slot 4 the noise. A structural piece
+    the declaration did not name takes one slot however many the block has, and
+    every variant then reads the same array. =#
+    varies = _lqr_struct_varies(sm)
+    struct_slots(b::Int) = varies[b] ? dep.nslots[3] : 1
+    struct_slot(s::AbstractVector{Int}, b::Int) = varies[b] ? s[3] : 1
+    As = _slot_arrays(sm.A, struct_slots(_LQR_BLOCK_A))
+    Mfrees = _slot_arrays(sm.Mfree, struct_slots(_LQR_BLOCK_A))
+    Ss = _slot_arrays(sm.S, struct_slots(_LQR_BLOCK_S))
+    Qcs = [_slot_arrays(Q, struct_slots(_LQR_BLOCK_Q)) for Q in sm.Qc]
+    hs = _slot_arrays(sm.h, struct_slots(_LQR_BLOCK_H))
+    Bus = _slot_arrays(sm.Bu, struct_slots(_LQR_BLOCK_B))
+    Grefs = _slot_arrays(sm.Gref, struct_slots(_LQR_BLOCK_G))
+    hfs = _slot_arrays(sm.hf, struct_slots(_LQR_BLOCK_F))
+    Σs = _slot_arrays(sm.Σ, dep.nslots[4])
+    Σfs = _slot_arrays(sm.Σf, dep.nslots[4])
+
+    n = _plant_dim(sm)
+    variants = Vector{LQRStateModel{T,M,V}}(undef, ncells)
+    for cell in 1:ncells
+        s = _variant_slots(dep.nslots, cell)
+        v = LQRStateModel{T,M,V}(
+            sm.mode,
+            As[struct_slot(s, _LQR_BLOCK_A)],
+            Mfrees[struct_slot(s, _LQR_BLOCK_A)],
+            Ss[struct_slot(s, _LQR_BLOCK_S)],
+            [Qcs[k][struct_slot(s, _LQR_BLOCK_Q)] for k in eachindex(sm.Qc)],
+            sm.schedule,
+            sm.terminal,
+            Σs[s[4]],
+            hs[struct_slot(s, _LQR_BLOCK_H)],
+            Bus[struct_slot(s, _LQR_BLOCK_B)],
+            Grefs[struct_slot(s, _LQR_BLOCK_G)],
+            Σfs[s[4]],
+            hfs[struct_slot(s, _LQR_BLOCK_F)],
+            x0s[s[1]],
+            P0s[s[2]],
+            sm.observe_costate,
+            sm.fit_flags,
+            sm.mstep_iters,
+            sm.P0_prior,
+            sm.x0_prior,
+            nothing,
+            nothing,
+            LQRCache(T, n, _nregimes(sm), size(sm.Bu, 2)),
+        )
+        refresh!(v)
+        variants[cell] = v
+    end
+    sm.variants = variants
+    return variants
+end
+
+function _build_variants!(
+    om::GaussianObservationModel{T,M,V},
+    dep::ParameterDependence,
+    spec_C::Union{Nothing,ObsSlotSpec{T}}=nothing,
+    spec_R::Union{Nothing,ObsSlotSpec{T}}=nothing,
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    ncells = prod(dep.nslots)
+    existing = om.variants
+    if existing !== nothing &&
+        length(existing) == ncells &&
+        _variants_match(existing, dep, spec_C, spec_R)
+        return existing
+    end
+
+    p0 = size(om.C, 1)
+    seeds_C = [_group_seed(om, dep, 1, i) for i in 1:(dep.nslots[1])]
+    dims_C = [_slot_dim(spec_C, i, p0, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    Cs = [_seed_slot_C(om.C, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
+    ds = [_seed_slot_d(om.d, i, dims_C[i], spec_C, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    Ds = [_seed_slot_D(om.D, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
+    seeds_R = [_group_seed(om, dep, 2, j) for j in 1:(dep.nslots[2])]
+    Rs = [
+        _seed_slot_R(om.R, j, _slot_dim_R(spec_R, j, p0, seeds_R[j]), spec_R, seeds_R[j])
+        for j in 1:(dep.nslots[2])
+    ]
+    CD_priors = [_slot_obs_prior(om.CD_prior, dims_C[i]) for i in 1:(dep.nslots[1])]
+
+    variants = Vector{GaussianObservationModel{T,M,V}}(undef, ncells)
+    for cell in 1:ncells
+        s = _variant_slots(dep.nslots, cell)
+        variants[cell] = GaussianObservationModel{T,M,V}(;
+            C=Cs[s[1]],
+            R=Rs[s[2]],
+            d=ds[s[1]],
+            D=Ds[s[1]],
+            R_prior=om.R_prior,
+            CD_prior=CD_priors[s[1]],
+        )
+    end
+    om.variants = variants
+    return variants
+end
+
+function _build_variants!(
+    om::PoissonObservationModel{T,M,V},
+    dep::ParameterDependence,
+    spec_C::Union{Nothing,ObsSlotSpec{T}}=nothing,
+    ::Union{Nothing,ObsSlotSpec{T}}=nothing,
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    ncells = prod(dep.nslots)
+    existing = om.variants
+    if existing !== nothing &&
+        length(existing) == ncells &&
+        _variants_match(existing, dep, spec_C, nothing)
+        return existing
+    end
+
+    p0 = size(om.C, 1)
+    seeds_C = [_group_seed(om, dep, 1, i) for i in 1:(dep.nslots[1])]
+    dims_C = [_slot_dim(spec_C, i, p0, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    Cs = [_seed_slot_C(om.C, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
+    ds = [_seed_slot_d(om.d, i, dims_C[i], spec_C, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    Ds = [_seed_slot_D(om.D, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
+    CD_priors = [_slot_obs_prior(om.CD_prior, dims_C[i]) for i in 1:(dep.nslots[1])]
+
+    variants = Vector{PoissonObservationModel{T,M,V}}(undef, ncells)
+    for cell in 1:ncells
+        s = _variant_slots(dep.nslots, cell)
+        variants[cell] = PoissonObservationModel{T,M,V}(;
+            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=CD_priors[s[1]]
+        )
+    end
+    om.variants = variants
+    return variants
+end
+
+# ============================================================================
+# Trial partition
+# ============================================================================
+
+#=============================================================================
+Observation-side resolution, member by member
+
+`_resolve_dependence` on a composite gives the *flattened*, key-suffixed view —
+one list of parameter groups whose order matches the `fit_bool` layout, which is
+what `ParameterGrouping` is built from. Variants, per-slot shapes and data-derived
+seeds, though, belong to the member that owns the parameters, so those are
+resolved per member. The helpers below relate the two: `_obs_group_ranges` says
+which flattened groups belong to which member, and everything else is indexed by
+member.
+
+A single observation model is the one-member case throughout, so both go down
+the same path.
+=============================================================================#
+
+"""
+    _obs_member_deps(obs_model) -> Vector{ParameterDependence}
+
+Each observation model's own resolved `depends_on`: one entry for a single
+model, one per member for a composite.
+"""
+_obs_member_deps(om::AbstractObservationModel) = [_resolve_dependence(om)]
+
+function _obs_member_deps(c::CompositeObservationModel)
+    return ParameterDependence[_resolve_dependence(m) for m in values(_models(c))]
+end
+
+"""
+    _obs_group_ranges(obs_model) -> Vector{UnitRange{Int}}
+
+Which flattened observation-group indices belong to each member.
+"""
+_obs_group_ranges(om::AbstractObservationModel) = [1:length(_group_names(om))]
+
+function _obs_group_ranges(c::CompositeObservationModel)
+    ranges = UnitRange{Int}[]
+    offset = 0
+    for m in values(_models(c))
+        n = length(_group_names(m))
+        push!(ranges, (offset + 1):(offset + n))
+        offset += n
+    end
+    return ranges
+end
+
+"""
+    _build_obs_variants!(obs_model, deps, ranges, labels_o, ntrials, y)
+
+Populate every observation model's `variants`, each against its own
+observations — which is what lets one member be stitched across sessions of
+differing channel counts while another is not.
+"""
+function _build_obs_variants!(
+    om::AbstractObservationModel,
+    deps::AbstractVector{ParameterDependence},
+    ::AbstractVector{UnitRange{Int}},
+    labels_o::AbstractVector,
+    ntrials::Int,
+    y,
+)
+    spec_C, spec_R = _obs_slot_specs(om, deps[1], labels_o, ntrials, y)
+    _build_variants!(om, deps[1], spec_C, spec_R)
+    return nothing
+end
+
+function _build_obs_variants!(
+    c::CompositeObservationModel,
+    deps::AbstractVector{ParameterDependence},
+    ranges::AbstractVector{UnitRange{Int}},
+    labels_o::AbstractVector,
+    ntrials::Int,
+    y,
+)
+    models = _models(c)
+    for (m, key) in enumerate(keys(models))
+        y_m = y === nothing ? nothing : y[key]
+        spec_C, spec_R = _obs_slot_specs(
+            models[key], deps[m], labels_o[ranges[m]], ntrials, y_m
+        )
+        _build_variants!(models[key], deps[m], spec_C, spec_R)
+    end
+    return nothing
+end
+
+"""
+    ParameterGrouping
+
+**Internal.** The trial partition induced by a model's `depends_on`, together
+with the per-cell parameter lookups the grouped E/M-steps need.
+
+# Fields
+- `names`: canonical parameter-group names, ordered as `fit_bool`
+- `ncells`: number of occupied cells
+- `trial_cell`: cell index of each trial
+- `cell_trials`: trial indices of each cell
+- `cell_state`: index into the state model's `variants` vector for each cell
+- `cell_obs[m][cell]`: index into observation model `m`'s `variants` vector. A
+  single emission has one entry; a composite has one per member, since members
+  are grouped independently
+- `nslots[g]`: number of distinct versions of parameter group `g`
+- `cell_slot[g][cell]`: which version of group `g` a cell uses
+- `slot_labels[g][slot]`: the user's label for that version (`nothing` when the
+  group does not vary)
+"""
+struct ParameterGrouping
+    names::Vector{Symbol}
+    ncells::Int
+    trial_cell::Vector{Int}
+    cell_trials::Vector{Vector{Int}}
+    cell_state::Vector{Int}
+    cell_obs::Vector{Vector{Int}}
+    nslots::Vector{Int}
+    cell_slot::Vector{Vector{Int}}
+    slot_labels::Vector{Vector{Any}}
+end
+
+"""
+    _validate_override_keys(sm, om, dep_s, dep_o, override)
+
+Reject a call-site `depends_on` that names something neither sub-model owns (a
+typo), or a parameter the model does not declare as varying. An override
+re-assigns trials to existing groups; it cannot introduce a parameter set that
+was never fitted.
+"""
+function _validate_override_keys(
+    sm::DependentModel,
+    om::DependentModel,
+    dep_s::ParameterDependence,
+    dep_o::ParameterDependence,
+    override::Union{Nothing,NamedTuple},
+)
+    override === nothing && return nothing
+    _require_whole_groups(sm, keys(override), "depends_on override")
+    _require_whole_groups(om, keys(override), "depends_on override")
+    for key in keys(override)
+        cs = _param_group(sm, key)
+        co = _param_group(om, key)
+        cs === nothing &&
+            co === nothing &&
+            throw(
+                ArgumentError(
+                    "depends_on override: `:$key` is not a parameter of either sub-model " *
+                    "(state: $(_valid_param_names(sm)); " *
+                    "observation: $(_valid_param_names(om)))",
+                ),
+            )
+        declared =
+            (cs !== nothing && dep_s.varies[findfirst(isequal(cs), dep_s.names)::Int]) ||
+            (co !== nothing && dep_o.varies[findfirst(isequal(co), dep_o.names)::Int])
+        declared || throw(
+            ArgumentError(
+                "depends_on override: `:$key` is not declared as depending on an " *
+                "ancillary variable by the model; an override may only re-assign " *
+                "trials to groups the model already declares",
+            ),
+        )
+    end
+    return nothing
+end
+
+"""
+    parameter_grouping(lds, ntrials; depends_on=nothing)
+
+Build the trial partition for `lds` over `ntrials` trials, or return `nothing`
+when no parameter of either sub-model depends on an ancillary variable.
+
+`depends_on` optionally overrides the label vectors stored on the models, for
+scoring a dataset whose trial count differs from the fitted one.
+"""
+function parameter_grouping(
+    lds::LinearDynamicalSystem,
+    ntrials::Int;
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+    y=nothing,
+)
+    sm = lds.state_model
+    om = lds.obs_model
+    dep_s = _resolve_dependence(sm)
+    dep_o = _resolve_dependence(om)
+
+    #=
+    An override may only re-assign trials to groups the model already knows, so
+    a model with no `depends_on` at all has nothing to override and stays on the
+    ungrouped path.
+    =#
+    if !_any_varies(dep_s) && !_any_varies(dep_o)
+        depends_on === nothing || throw(
+            ArgumentError(
+                "a `depends_on` override was supplied but neither sub-model declares " *
+                "`depends_on`; set it on the model before fitting",
+            ),
+        )
+        return nothing
+    end
+
+    _validate_override_keys(sm, om, dep_s, dep_o, depends_on)
+
+    _build_variants!(sm, dep_s)
+
+    ngroups_s = length(dep_s.names)
+    ngroups_o = length(dep_o.names)
+    ngroups = ngroups_s + ngroups_o
+    names = vcat(dep_s.names, dep_o.names)
+    varies = vcat(dep_s.varies, dep_o.varies)
+
+    # Per-trial labels for every group (state groups first, matching fit_bool).
+    trial_labels = Vector{Vector{Any}}(undef, ngroups)
+    for g in 1:ngroups_s
+        trial_labels[g] = _trial_labels_for(dep_s, g, sm, depends_on)
+    end
+    for g in 1:ngroups_o
+        trial_labels[ngroups_s + g] = _trial_labels_for(dep_o, g, om, depends_on)
+    end
+
+    for g in 1:ngroups
+        varies[g] || continue
+        length(trial_labels[g]) == ntrials || throw(
+            DimensionMismatchError(
+                "depends_on labels for :$(names[g])", ntrials, length(trial_labels[g])
+            ),
+        )
+    end
+
+    #=
+    Observation variants are built after the labels are known, because a
+    stitching dataset fixes each slot's `obs_dim` from the trials assigned to
+    it. `y === nothing`, or a dataset whose trials all have the template's
+    channel count, reproduces the previous shapes exactly.
+
+    A composite emission is resolved member by member: `dep_o` is the flattened,
+    key-suffixed view used for `names` / `cell_slot` / `fit_bool` ordinals, while
+    each member keeps its own `ParameterDependence` and its own `variants`, built
+    against its own observations. `_obs_group_ranges` says which flattened groups
+    belong to which member; for a single observation model there is one member
+    and one range covering everything, so both cases are one code path.
+    =#
+    labels_o = [trial_labels[ngroups_s + g] for g in 1:ngroups_o]
+    member_deps = _obs_member_deps(om)
+    ranges = _obs_group_ranges(om)
+    _build_obs_variants!(om, member_deps, ranges, labels_o, ntrials, y)
+
+    # Per-trial slot indices, then the per-trial variant index of each sub-model.
+    nmembers = length(member_deps)
+    state_idx = Vector{Int}(undef, ntrials)
+    obs_idx = [Vector{Int}(undef, ntrials) for _ in 1:nmembers]
+    s_slots = Vector{Int}(undef, ngroups_s)
+    o_slots = Vector{Int}(undef, ngroups_o)
+    for n in 1:ntrials
+        for g in 1:ngroups_s
+            s_slots[g] = dep_s.varies[g] ? _slot_of(dep_s, g, trial_labels[g][n]) : 1
+        end
+        for g in 1:ngroups_o
+            gg = ngroups_s + g
+            o_slots[g] = dep_o.varies[g] ? _slot_of(dep_o, g, trial_labels[gg][n]) : 1
+        end
+        state_idx[n] = _variant_index(dep_s.nslots, s_slots)
+        for m in 1:nmembers
+            obs_idx[m][n] = _variant_index(member_deps[m].nslots, view(o_slots, ranges[m]))
+        end
+    end
+
+    # Occupied cells, in order of first appearance.
+    trial_cell = Vector{Int}(undef, ntrials)
+    cell_state = Int[]
+    cell_obs = [Int[] for _ in 1:nmembers]
+    cell_trials = Vector{Int}[]
+    for n in 1:ntrials
+        cell = 0
+        for c in eachindex(cell_state)
+            cell_state[c] == state_idx[n] || continue
+            all(m -> cell_obs[m][c] == obs_idx[m][n], 1:nmembers) || continue
+            cell = c
+            break
+        end
+        if cell == 0
+            push!(cell_state, state_idx[n])
+            for m in 1:nmembers
+                push!(cell_obs[m], obs_idx[m][n])
+            end
+            push!(cell_trials, Int[])
+            cell = length(cell_state)
+        end
+        trial_cell[n] = cell
+        push!(cell_trials[cell], n)
+    end
+
+    ncells = length(cell_state)
+    cell_slot = [Vector{Int}(undef, ncells) for _ in 1:ngroups]
+    for c in 1:ncells
+        cs = _variant_slots(dep_s.nslots, cell_state[c])
+        for g in 1:ngroups_s
+            cell_slot[g][c] = cs[g]
+        end
+        for m in 1:nmembers
+            co = _variant_slots(member_deps[m].nslots, cell_obs[m][c])
+            for (i, g) in enumerate(ranges[m])
+                cell_slot[ngroups_s + g][c] = co[i]
+            end
+        end
+    end
+
+    slot_labels = Vector{Vector{Any}}(undef, ngroups)
+    for g in 1:ngroups_s
+        slot_labels[g] = dep_s.varies[g] ? dep_s.labels[g] : Any[nothing]
+    end
+    for g in 1:ngroups_o
+        gg = ngroups_s + g
+        slot_labels[gg] = dep_o.varies[g] ? dep_o.labels[g] : Any[nothing]
+    end
+
+    return ParameterGrouping(
+        names,
+        ncells,
+        trial_cell,
+        cell_trials,
+        cell_state,
+        cell_obs,
+        vcat(dep_s.nslots, dep_o.nslots),
+        cell_slot,
+        slot_labels,
+    )
+end
+
+#=
+`d` is seeded on the emission's natural scale: the per-channel mean for a
+Gaussian emission, its log for a Poisson one (`λ = exp(Cx + d)`).
+=#
+_natural_seed(::GaussianObservationModel, m::AbstractVector) = m
+function _natural_seed(::PoissonObservationModel, m::AbstractVector{T}) where {T<:Real}
+    return T[log(max(mi, eps(T))) for mi in m]
+end
+
+"""
+    _obs_slot_specs(om, dep_o, labels_o, ntrials, y) -> (spec_C, spec_R)
+
+Per-slot observation shapes for this dataset, or `(nothing, nothing)` when
+every trial carries the template's channel count — the ordinary single-`obs_dim`
+case, which must keep its existing arrays untouched.
+"""
+function _obs_slot_specs(
+    om::AbstractObservationModel{T},
+    dep_o::ParameterDependence,
+    labels_o::AbstractVector,
+    ntrials::Int,
+    y,
+) where {T<:Real}
+    y === nothing && return (nothing, nothing)
+    length(y) == ntrials || return (nothing, nothing)
+    obs_dims = [size(yi, 1) for yi in y]
+    p0 = size(om.C, 1)
+    all(isequal(p0), obs_dims) && return (nothing, nothing)
+
+    specs = Vector{ObsSlotSpec{T}}(undef, length(dep_o.names))
+    for g in eachindex(dep_o.names)
+        dims = _slot_obs_dims(dep_o, g, labels_o[g], obs_dims, p0)
+        nslots = length(dims)
+        means = Vector{Vector{T}}(undef, nslots)
+        vars = Vector{Vector{T}}(undef, nslots)
+        for s in 1:nslots
+            trials = [
+                n for n in 1:ntrials if
+                (dep_o.varies[g] ? _slot_of(dep_o, g, labels_o[g][n]) : 1) == s
+            ]
+            m, v = _obs_stats(
+                isempty(trials) ? nothing : [y[n] for n in trials], dims[s], T
+            )
+            means[s] = _natural_seed(om, m)
+            vars[s] = v
+        end
+        specs[g] = ObsSlotSpec{T}(dims, means, vars)
+    end
+    return (specs[1], length(specs) > 1 ? specs[2] : nothing)
+end
+
+"""
+    _has_parameter_dependence(model) -> Bool
+
+Whether a model (or either sub-model of a `LinearDynamicalSystem`) declares a
+`depends_on` that actually varies a parameter.
+"""
+function _has_parameter_dependence(model::DependentModel)
+    model.depends_on === nothing && return false
+    return _any_varies(_resolve_dependence(model))
+end
+
+function _has_parameter_dependence(lds::LinearDynamicalSystem)
+    return _has_parameter_dependence(lds.state_model) ||
+           _has_parameter_dependence(lds.obs_model)
+end
+
+"""
+    _single_trial_group_error(what)
+
+`rand` with a scalar `tsteps` draws one trial, which a grouped model cannot
+assign to a parameter version on its own.
+"""
+function _single_trial_group_error(what::AbstractString)
+    return throw(
+        ArgumentError(
+            "rand(rng, $what, tsteps) samples a single trial, but this model's " *
+            "parameters depend on an ancillary variable — say which group the trial " *
+            "belongs to, e.g. `depends_on = (C=[:session_a], d=[:session_a])`, or " *
+            "sample several trials " *
+            "at once with `rand(rng, $what, fill(tsteps, ntrials))`.",
+        ),
+    )
+end
+
+"""
+    _cell_lds(lds, grp, cell) -> LinearDynamicalSystem
+
+A view of `lds` restricted to one cell: the state and observation model objects
+holding that cell's parameter arrays. Construction is two immutable struct
+allocations — the parameter arrays are shared, never copied — so the existing
+kernels can be run per cell without any group awareness of their own.
+"""
+function _cell_lds(
+    lds::LinearDynamicalSystem{T,S,O}, grp::ParameterGrouping, cell::Int
+) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
+    sm = (lds.state_model.variants::Vector{S})[grp.cell_state[cell]]
+    om = _cell_obs_model(lds.obs_model, grp, cell)::O
+    #=
+    The cell's `obs_dim` comes from its own emission, not from the parent: under
+    stitching each session contributes a different number of channels, and the
+    parent's `obs_dim` is only the template's.
+    =#
+    return LinearDynamicalSystem{T,S,O}(
+        sm, om, lds.latent_dim, _obs_dim(om), lds.ux_dim, lds.uy_dim, lds.fit_bool
+    )
+end
+
+"""
+    _cell_obs_model(obs_model, grp, cell)
+
+The observation model one cell is governed by: the parameter version indexed by
+`grp.cell_obs`. A composite is rebuilt from its members' versions — two small
+struct allocations, with every parameter array shared by reference.
+"""
+function _cell_obs_model(om::AbstractObservationModel, grp::ParameterGrouping, cell::Int)
+    return _variant(om, grp.cell_obs[1][cell])
+end
+
+function _cell_obs_model(
+    om::CompositeObservationModel{T,QUAD,NT}, grp::ParameterGrouping, cell::Int
+) where {T,QUAD,NT}
+    models = _models(om)
+    sub = NamedTuple{keys(models)}(
+        ntuple(m -> _variant(models[m], grp.cell_obs[m][cell]), Val(fieldcount(NT)))
+    )
+    # Inner constructor: the members are this model's own variants, so the key
+    # and element-type checks the outer one runs are already satisfied.
+    return CompositeObservationModel{T,QUAD,NT}(sub)
+end
+
+"""
+    _variant(obs_model, slot)
+
+One parameter version of an observation model, from the `variants` vector
+`_build_variants!` populated.
+"""
+@inline function _variant(
+    om::GaussianObservationModel{T,M,V}, slot::Int
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    return (om.variants::Vector{GaussianObservationModel{T,M,V}})[slot]
+end
+
+@inline function _variant(
+    om::PoissonObservationModel{T,M,V}, slot::Int
+) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
+    return (om.variants::Vector{PoissonObservationModel{T,M,V}})[slot]
+end
+
+"""
+    _cell_ldss(lds, grp) -> Vector{LinearDynamicalSystem}
+
+One `_cell_lds` per occupied cell.
+"""
+function _cell_ldss(
+    lds::LinearDynamicalSystem{T,S,O}, grp::ParameterGrouping
+) where {T<:Real,S<:AbstractStateModel{T},O<:AbstractObservationModel{T}}
+    return [_cell_lds(lds, grp, c) for c in 1:(grp.ncells)]
+end
+
+"""
+    _subset_data(data, trials) -> Data
+
+The sub-`Data` holding only `trials`, sharing the per-trial matrices by
+reference (nothing is copied).
+"""
+function _subset_data(data::Data, trials::AbstractVector{Int})
+    return Data(
+        _subset_obs(data.y, trials),
+        data.ux[trials],
+        _subset_obs(data.uy, trials),
+        data.tsteps[trials],
+    )
+end
+
+# A composite emission's `y` / `uy` are NamedTuples of per-member sequences.
+_subset_obs(v::AbstractVector, trials::AbstractVector{Int}) = v[trials]
+_subset_obs(nt::NamedTuple, trials::AbstractVector{Int}) = map(v -> v[trials], nt)
+
+# ============================================================================
+# Public accessors
+# ============================================================================
+
+"""
+    group_labels(model, name) -> Vector
+
+Distinct labels of the parameter group `name` on a state or observation model,
+in the order their parameter versions are stored. Returns an empty vector when
+that parameter does not depend on an ancillary variable.
+
+```julia
+group_labels(obs_model, :C)   # [:session_a, :session_b]
+```
+
+`[C d D]` is fitted as one regression and grouped as one unit, so the labels are
+a property of the group: `group_labels(m, :d)` is `group_labels(m, :C)`.
+"""
+function group_labels(model::DependentModel, name::Symbol)
+    dep = _resolve_dependence(model)
+    canonical = _param_group_checked(model, name)
+    g = findfirst(isequal(canonical), dep.names)::Int
+    return dep.varies[g] ? copy(dep.labels[g]) : Any[]
+end
+
+"""
+    group_parameter(model, name, label)
+
+The version of parameter `name` fitted from the trials labelled `label`.
+
+```julia
+group_parameter(obs_model, :C, :session_a)   # that session's emission matrix
+group_parameter(obs_model, :d, :session_a)   # its emission bias
+```
+
+Throws when the model declares no dependence for that parameter (read the field
+directly in that case) or when `label` is not one of its groups.
+"""
+function group_parameter(model::DependentModel, name::Symbol, label)
+    return _group_readout(group_variant(model, name, label), name)
+end
+
+"""
+    group_variant(model, name, label) -> model
+
+The whole model version fitted from the trials labelled `label`, of which
+[`group_parameter`](@ref) returns one parameter.
+
+It is an ordinary ungrouped model — its own arrays for the parameters that vary,
+the parent's for the ones that do not — so anything written against a model works
+on it unchanged. That is what a caller wants when the *model* is the unit: one
+group's whole control problem to read a summary off, or the state model to smooth
+a held-out trial of that group with.
+
+`name` selects which grouping is being indexed, exactly as for
+`group_parameter`; when several parameters share a group, any of their names
+picks the same version out.
+"""
+function group_variant(model::DependentModel, name::Symbol, label)
+    dep = _resolve_dependence(model)
+    canonical = _param_group_checked(model, name)
+    g = findfirst(isequal(canonical), dep.names)::Int
+    dep.varies[g] || throw(
+        ArgumentError(
+            "parameter `:$name` of this $(nameof(typeof(model))) does not depend on an " *
+            "ancillary variable; read `model.$name` directly",
+        ),
+    )
+    slots = fill(1, length(dep.nslots))
+    slots[g] = _slot_of(dep, g, label)
+    variants = _build_variants!(model, dep)
+    return variants[_variant_index(dep.nslots, slots)]
+end
+
+"""
+    _group_readout(variant, name)
+
+What `group_parameter` hands back for one group of one variant. Normally the
+field of that name; a group whose user-facing name covers several fields — a
+[`LQRStateModel`](@ref)'s `:structure` and `:noise` — returns the whole
+variant instead, so the caller reads `.A`, `.Qc`, `.Σ` off it.
+"""
+_group_readout(variant, name::Symbol) = getproperty(variant, name)
+
+function _group_readout(variant::LQRStateModel, name::Symbol)
+    name in (:structure, :noise) && return variant
+    return getproperty(variant, name)
+end

@@ -17,13 +17,58 @@ SLDS
 GaussianStateModel
 GaussianObservationModel
 PoissonObservationModel
+CompositeObservationModel
 ```
 
 ```@docs
 ProbabilisticPCA
 AbstractStateModel
+AbstractGaussianStateModel
 AbstractObservationModel
 ```
+
+## Inverse LQR
+
+A state model whose latent is the LQR state–costate pair and whose transition is
+constrained to the symplectic form a linear-quadratic control problem implies, so
+that fitting recovers the plant and the cost function directly.
+
+```@docs
+LQRStateModel
+LQRFitFlags
+cost_schedule
+refresh!
+lqr_parameters
+lqr_matrix
+symplectic_matrix
+symplectic_form
+symplectic_defect
+riccati_solution
+lqr_riccati_sequence
+closed_loop_dynamics
+simulate_lqr
+rescale_costate!
+free_state_model
+plant_dim
+```
+
+### Switching
+
+An [`SLDS`](@ref) whose discrete states are inverse-LQR models switches between
+control problems: the state selects which plant and cost generated the
+transition. Every discrete state shares one continuous latent path, so they all
+carry the same `2n`-dimensional `z = [x; λ]` — the switching is over parameters,
+not over dimension. In a switching model the discrete state *is* the cost epoch,
+inferred rather than given by `schedule`, so each member carries a single cost.
+
+`free_state_model` supplies a state whose transition is unconstrained rather than
+symplectic, which is how a switching model mixes plain linear dynamics with LQR
+dynamics under one concrete state-model type.
+
+`tied_params = [:structure]` shares the joint block `(A, S, Qc, h, Bu, Gref)`
+across discrete states and `[:noise]` shares `Σ`, each fitted jointly from the
+states that use it. Individual blocks may also be named — `[:A, :S]` is one plant
+with a cost per discrete state, the usual reason to switch at all.
 
 ## Priors
 
@@ -37,6 +82,15 @@ MNPrior
 
 ```@docs
 x0_mean_prior
+```
+
+## Ancillary parameter dependencies
+
+```@docs
+group_labels
+group_parameter
+set_group_seeds!
+set_depends_on!
 ```
 
 ## Sampling
@@ -54,12 +108,12 @@ Random.rand(rng::AbstractRNG, ppca::ProbabilisticPCA, n::Int)
 
 ```@docs; canonical = false
 smooth
-fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-fit!(slds::SLDS{T,S,O}, y::StateSpaceDynamics.Observations{T}; max_iter::Int=50, progress::Bool=true) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:StateSpaceDynamics.QuadraticEmission{T}}
+fit!(slds::SLDS{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}; max_iter::Int=50, progress::Bool=true) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
 ```
 
 ```@docs
-fit!(plds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+fit!(plds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:StateSpaceDynamics.NonQuadraticEmission{T}}
 fit!(ppca::ProbabilisticPCA, X::AbstractMatrix{T}, max_iters::Int=100, tol::Float64=1e-6) where {T<:Real}
 ```
 

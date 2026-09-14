@@ -79,6 +79,52 @@ Where ``d`` is a bias term.
 PoissonObservationModel
 ```
 
+## Several observation models at once
+
+One latent process can be measured in more than one way — spike counts *and*
+kinematics, say. Hand `LinearDynamicalSystem` a `NamedTuple` of observation
+models instead of one and they all read out the same latent state, with the
+observations supplied under the same keys:
+
+```julia
+lds = LinearDynamicalSystem(
+    state_model,
+    (kin = GaussianObservationModel(C_kin, R_kin, d_kin),
+     spk = PoissonObservationModel(C_spk, d_spk)),
+)
+
+fit!(lds, (kin = Ykin, spk = Yspk); uy = (kin = Vkin, spk = Vspk))
+```
+
+The members are conditionally independent given the latent path, so
+`log p(y | x) = Σₘ log p(yₘ | x)` and every emission term is a sum over them.
+Each keeps its own channel count, priors, `depends_on`, `group_seeds` and
+`fit_bool` flags; they may be all of one type or mixed.
+
+A member is reached by its key, and a member's parameter by the key-suffixed
+name:
+
+```julia
+lds.obs_model.kin      # the GaussianObservationModel
+lds.obs_model.kin.C
+lds.obs_model.C_kin    # the same array
+```
+
+That suffixed spelling is what the rest of the API uses, so one emission can be
+estimated per session, or frozen, while another is not:
+
+```julia
+set_depends_on!(lds.obs_model, (C_kin = session, d_kin = session, R_kin = session))
+group_parameter(lds.obs_model, :C_kin, :session_a)
+
+LinearDynamicalSystem(state_model, obs; fit_bool = (spk = (C = false,),))
+fit!(slds, y; tied_params = (:C_spk, :d_spk))    # share one readout across regimes
+```
+
+See [`CompositeObservationModel`](@ref) and the
+[multiple observation models tutorial](tutorials/multi_observation_example.md).
+
+
 ## Sampling from Linear Dynamical Systems
 
 You can generate synthetic data from fitted LDS models. Pass a scalar
@@ -171,7 +217,7 @@ Given the latent structure of state-space models, we must rely on either the Exp
     These issues affect **parameter interpretability** but not **predictive performance**; be cautious when interpreting individual entries of ``A``, ``C``, or ``Q``.
 
 ```@docs
-fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}; max_iter::Int=100, tol::Float64=1e-6, progress::Bool=true) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:StateSpaceDynamics.QuadraticEmission{T}}
 ```
 
 ## Inverse-Wishart Priors on Covariances (MAP)
@@ -375,3 +421,104 @@ fit!(lds, Y; max_iter=20, progress=false)
 ```
 
 Any subset works.
+
+## Parameters that depend on an ancillary variable
+
+Both sub-models carry a `depends_on` field. Leaving it `nothing` (the default)
+gives the usual behaviour: one parameter set shared by every trial. Setting it
+to a `NamedTuple` of per-trial label vectors makes the named parameters be
+**estimated separately for each group of trials**.
+
+The motivating case is stitching several recording sessions from one animal.
+The latent dynamics belong to the animal and should be pooled; the emissions
+belong to the session, because each session records a different set of neurons:
+
+```julia
+using LinearAlgebra, Random, StateSpaceDynamics
+
+session = vcat(fill(:day1, 20), fill(:day2, 15))   # one label per trial
+
+gsm = GaussianStateModel(A = A, Q = Q, b = b, x0 = x0, P0 = P0)
+gom = GaussianObservationModel(C = C, R = R, d = d)
+gom.depends_on = (C = session, d = session, D = session, R = session)        # C, d, D and R per session
+
+lds = LinearDynamicalSystem(gsm, gom)
+fit!(lds, Y; max_iter = 50)
+
+group_labels(gom, :C)                # [:day1, :day2]
+group_parameter(gom, :C, :day1)      # that session's emission matrix
+group_parameter(gom, :R, :day2)      # that session's observation noise
+```
+
+### Which names are valid
+
+Keys are literal parameter names. They resolve to the groups `fit_bool` uses,
+because those parameters are fit jointly as one regression:
+
+| Name(s)          | Group                  | `fit_bool` index    |
+|:-----------------|:-----------------------|:--------------------|
+| `:x0`            | initial state mean     | 1                   |
+| `:P0`            | initial state cov      | 2                   |
+| `:A`, `:b`, `:B` | dynamics `[A b B]`     | 3                   |
+| `:Q`             | process noise          | 4                   |
+| `:C`, `:d`, `:D` | emission `[C d D]`     | 5                   |
+| `:R`             | observation noise      | 6 (Gaussian only)   |
+
+A name never stands in for its group. `depends_on = (C = session,)` is an
+error, not shorthand for grouping `[C d D]`: "`C` depends on the session" reads
+as a claim about `C` alone, and the regression can only be fitted whole. Name
+every member of the group or none of them — and members given different label
+vectors are an error too.
+
+A model with no observation input has no `D` to fit, so `(C = session, d =
+session)` is the whole group there; add `D = session` once the model carries a
+`D` with columns.
+
+Labels can be `Symbol`s, integers or strings — anything comparable. Groups are
+ordered by first appearance in the vector set on the model.
+
+Different groups may use different label vectors: `(Q = condition, C = session,
+d = session, D = session)` fits one `Q` per condition and one `[C d D]` per
+session.
+
+### Held-out data
+
+The label vectors live on the model and have one entry per fitted trial, so
+scoring a held-out set with a different trial count needs its own labels.
+`fit!`, `smooth`, `elbo`, `loglikelihood` and `rand` all take a `depends_on`
+keyword that overrides the stored labels for that call:
+
+```julia
+ll = loglikelihood(
+    lds, Y_test;
+    depends_on = (C = session_test, d = session_test, D = session_test,
+                  R = session_test),
+)
+```
+
+An override re-assigns trials to groups the model already declares; it cannot
+introduce a new parameter set.
+
+### Priors, SLDS, and cost
+
+All versions of a parameter share the model's prior (`Q_prior`, `R_prior`,
+`CD_prior`, …), and each version contributes its own log-prior term to the
+ELBO.
+
+A Poisson LDS supports the same field on its emission — `(C = session,)` fits
+one `[C d D]` per session. The Poisson emission is not conjugate, so its M-step
+runs one LBFGS solve per version of `[C d D]`, over the trials of every group
+that shares that version; the state side flows through the pooled sufficient
+statistics exactly as in the Gaussian case.
+
+An `SLDS` supports the same field on each regime's sub-models. The grouping of
+trials is a property of the data, so every regime must declare the same labels;
+only the fitted values differ per regime. `x0` and `P0` stay tied across
+regimes, as they are for an ungrouped SLDS.
+
+Grouping does not give up the efficiency of equal-length epochs. Trials that
+share every parameter form a *cell*, and the smoother computes one covariance
+per cell and shares it across that cell's trials, exactly as it does across all
+trials of an ungrouped model. The expensive `O(D²·T)` workspace storage is
+allocated once and reused across cells, so a grouped fit's memory tracks an
+ungrouped one's rather than growing with the number of sessions.

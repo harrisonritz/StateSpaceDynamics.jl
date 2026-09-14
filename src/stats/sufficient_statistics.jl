@@ -62,7 +62,7 @@ the raw inputs, not on smoother output.
 """
 function _td_init_const_blocks!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -183,7 +183,21 @@ overwrites them each E-step.
 """
 function _initialize_td_sufficient_statistics(
     ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    return _base_td_sufficient_statistics(T, lds, tsteps_per_trial)
+end
+
+"""
+    _base_td_sufficient_statistics(T, lds, tsteps_per_trial) -> SufficientStatistics
+
+The plain-layout allocator, split out from the entry point above so a state
+model with its own statistics type (see `LQRSufficientStatistics`) can
+still get the shared initial-state and emission blocks without reaching through
+`invoke`.
+"""
+function _base_td_sufficient_statistics(
+    ::Type{T}, lds::LinearDynamicalSystem{T,S,O}, tsteps_per_trial::AbstractVector{Int}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     p = lds.obs_dim
     ux_dim = lds.ux_dim
@@ -228,7 +242,7 @@ function _aggregate_td_suff_stats!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -402,10 +416,17 @@ function _aggregate_td_suff_stats!(
     copyto!(suf.obs_xy, td_obs_xy)
 
     suf.init_yy[] = copy(S0_sum)                # see above; not needed to be PDMat
-    suf.dyn_xx[] = PDMat(copy(Szz_Ab))
-    suf.dyn_yy[] = PDMat(copy(Q_sum))
-    suf.obs_xx[] = PDMat(copy(Szz_Cd))
-    suf.obs_yy[] = PDMat(copy(R_sum))
+    # The inverse-LQR state M-step consumes its own per-cost-regime moments,
+    # not this compatibility block. Its regressors can therefore be singular
+    # inside an individual cost epoch (an event-locked step is the common
+    # example) while the joint structural objective remains well-defined.
+    warn_dyn_rank = !(lds.state_model isa LQRStateModel)
+    suf.dyn_xx[] = pd_gram(
+        copy(Szz_Ab); name="dynamics Gram [x b ux]", warn_on_ridge=warn_dyn_rank
+    )
+    suf.dyn_yy[] = pd_gram(copy(Q_sum); name="dynamics scatter")
+    suf.obs_xx[] = pd_gram(copy(Szz_Cd); name="emission Gram [x d uy]")
+    suf.obs_yy[] = pd_gram(copy(R_sum); name="emission scatter")
 
     return suf
 end
@@ -434,7 +455,7 @@ function _aggregate_td_suff_stats_weighted!(
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     y = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -625,10 +646,15 @@ function _aggregate_td_suff_stats_weighted!(
     copyto!(suf.obs_xy, obs_xy)
 
     suf.init_yy[] = copy(init_yy)               # see above
-    suf.dyn_xx[] = PDMat(copy(dyn_xx))
-    suf.dyn_yy[] = PDMat(copy(dyn_yy))
-    suf.obs_xx[] = PDMat(copy(obs_xx))
-    suf.obs_yy[] = PDMat(copy(obs_yy))
+    warn_dyn_rank = !(lds.state_model isa LQRStateModel)
+    suf.dyn_xx[] = pd_gram(
+        copy(dyn_xx);
+        name="regime-weighted dynamics Gram [x b ux]",
+        warn_on_ridge=warn_dyn_rank,
+    )
+    suf.dyn_yy[] = pd_gram(copy(dyn_yy); name="regime-weighted dynamics scatter")
+    suf.obs_xx[] = pd_gram(copy(obs_xx); name="regime-weighted emission Gram [x d uy]")
+    suf.obs_yy[] = pd_gram(copy(obs_yy); name="regime-weighted emission scatter")
 
     return suf
 end

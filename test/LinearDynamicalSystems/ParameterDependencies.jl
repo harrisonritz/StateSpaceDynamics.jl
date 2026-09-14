@@ -1,0 +1,894 @@
+# Ancillary parameter dependencies (`depends_on`): declaring that some
+# parameters are estimated separately per group of trials.
+#
+# The load-bearing correctness check is
+# `test_fully_grouped_matches_independent_fits`: when *every* parameter depends
+# on the session label, a grouped fit over the pooled data must reproduce, to
+# floating point, what independent fits of each session produce. Everything
+# downstream of that (partial grouping, priors, held-out scoring) shares the
+# same machinery.
+
+const PD_LATENT_DIM = 2
+const PD_OBS_DIM = 2
+
+function pd_state_model(::Type{T}=Float64) where {T<:Real}
+    return GaussianStateModel(;
+        A=T[0.92 0.10; -0.10 0.92],
+        Q=Matrix{T}(0.01 * I(PD_LATENT_DIM)),
+        b=zeros(T, PD_LATENT_DIM),
+        x0=zeros(T, PD_LATENT_DIM),
+        P0=Matrix{T}(0.10 * I(PD_LATENT_DIM)),
+    )
+end
+
+function pd_obs_model(::Type{T}=Float64) where {T<:Real}
+    return GaussianObservationModel(;
+        C=T[1.0 0.2; -0.3 1.0], d=zeros(T, PD_OBS_DIM), R=Matrix{T}(0.20 * I(PD_OBS_DIM))
+    )
+end
+
+function pd_lds(sm, om; fit_bool::Vector{Bool}=fill(true, 6))
+    return LinearDynamicalSystem(;
+        state_model=sm,
+        obs_model=om,
+        latent_dim=PD_LATENT_DIM,
+        obs_dim=PD_OBS_DIM,
+        fit_bool=fit_bool,
+    )
+end
+
+pd_fresh_lds() = pd_lds(pd_state_model(), pd_obs_model())
+
+"""
+EM on the MAP objective is monotone in exact arithmetic; allow a relative slack
+so an accumulated rounding error in the ELBO sum is not read as a real decrease.
+"""
+function pd_is_monotone(elbos::AbstractVector)
+    length(elbos) < 2 && return true
+    slack = 1e-8 * max(1.0, maximum(abs, elbos))
+    return all(>=(-slack), diff(elbos))
+end
+
+"""
+Two-session ground truth: shared latent dynamics, session-specific emissions.
+Mirrors the stitching setup — one animal, two recording sessions.
+"""
+function pd_two_session_truth(; ntrials_per_session::Int=6)
+    labels = vcat(fill(:s1, ntrials_per_session), fill(:s2, ntrials_per_session))
+    sm = pd_state_model()
+    om = pd_obs_model()
+    om.depends_on = (C=labels, d=labels, R=labels)
+    lds = pd_lds(sm, om)
+
+    # Session 2 sees different "neurons" and is much noisier.
+    C2 = group_parameter(om, :C, :s2)
+    C2 .= [0.4 -0.9; 1.1 0.5]
+    d2 = group_parameter(om, :d, :s2)
+    d2 .= [0.5, -0.5]
+    R2 = group_parameter(om, :R, :s2)
+    R2 .= Matrix(1.5 * I(PD_OBS_DIM))
+
+    return lds, labels
+end
+
+# ============================================================================
+# Validation
+# ============================================================================
+
+function test_depends_on_validation()
+    om = pd_obs_model()
+
+    om.depends_on = (Z=[:a, :b],)
+    @test_throws ArgumentError SSD._resolve_dependence(om)
+
+    # `[C d]` is fitted as one regression, so its members must agree.
+    om.depends_on = (C=[:a, :b], d=[:a, :a])
+    @test_throws ArgumentError SSD._resolve_dependence(om)
+
+    # Naming part of a jointly fitted group is rejected, not read as the group.
+    om.depends_on = (C=[:a, :b],)
+    @test_throws ArgumentError SSD._resolve_dependence(om)
+    om.depends_on = (d=[:a, :b],)
+    @test_throws ArgumentError SSD._resolve_dependence(om)
+
+    om.depends_on = (C=[:a, :b], d=[:a, :b], R=[:a, :b, :b])
+    @test_throws SSD.DimensionMismatchError SSD._resolve_dependence(om)
+
+    om.depends_on = (C=Symbol[], d=Symbol[])
+    @test_throws ArgumentError SSD._resolve_dependence(om)
+
+    # A Poisson emission has no `R`.
+    pom = PoissonObservationModel(zeros(2, 2), zeros(2))
+    pom.depends_on = (R=[:a, :b],)
+    @test_throws ArgumentError SSD._resolve_dependence(pom)
+
+    # A state model has no `C`.
+    sm = pd_state_model()
+    sm.depends_on = (C=[:a, :b],)
+    @test_throws ArgumentError SSD._resolve_dependence(sm)
+
+    return nothing
+end
+
+"""
+`validate_LDS` resolves both sub-models' `depends_on`, so a malformed
+declaration is reported by the validating positional constructor rather than at
+the first `fit!`. (`LinearDynamicalSystem` is a `@kwdef` struct, so the keyword
+constructor bypasses `validate_LDS` — for `depends_on` exactly as for every
+other field.)
+"""
+function test_depends_on_validated_at_construction()
+    bad_obs = pd_obs_model()
+    bad_obs.depends_on = (nope=[:a, :b],)
+    @test_throws ArgumentError LinearDynamicalSystem(pd_state_model(), bad_obs)
+
+    bad_state = pd_state_model()
+    bad_state.depends_on = (A=[:a, :b], b=[:b, :a])   # one group, two label vectors
+    @test_throws ArgumentError LinearDynamicalSystem(bad_state, pd_obs_model())
+
+    ok_obs = pd_obs_model()
+    ok_obs.depends_on = (C=[:a, :b], d=[:a, :b])
+    @test LinearDynamicalSystem(pd_state_model(), ok_obs) isa LinearDynamicalSystem
+
+    # A model built through the keyword constructor is still rejected when
+    # `validate_LDS` is run on it.
+    @test_throws ArgumentError validate_LDS(pd_lds(pd_state_model(), bad_obs))
+
+    return nothing
+end
+
+function test_depends_on_trial_count_and_override()
+    om = pd_obs_model()
+    om.depends_on = (C=[:a, :a, :b], d=[:a, :a, :b])
+    lds = pd_lds(pd_state_model(), om)
+
+    rng = StableRNG(101)
+    y3 = [randn(rng, PD_OBS_DIM, 25) for _ in 1:3]
+    y2 = y3[1:2]
+
+    # Labels are written for 3 trials; 2 trials is a mismatch.
+    @test_throws SSD.DimensionMismatchError fit!(lds, y2; max_iter=1, progress=false)
+
+    # ... unless the call supplies its own labels.
+    @test fit!(lds, y2; depends_on=(C=[:a, :b], d=[:a, :b]), max_iter=1, progress=false) isa
+        Vector
+
+    # An override may only re-assign trials to groups the model already knows.
+    @test_throws ArgumentError fit!(
+        lds,
+        y3;
+        depends_on=(C=[:a, :a, :unseen], d=[:a, :a, :unseen]),
+        max_iter=1,
+        progress=false,
+    )
+
+    # An override is meaningless without a declared dependence.
+    plain = pd_fresh_lds()
+    @test_throws ArgumentError fit!(
+        plain, y2; depends_on=(C=[:a, :b], d=[:a, :b]), max_iter=1, progress=false
+    )
+
+    # A typo'd override key is rejected rather than silently ignored ...
+    @test_throws ArgumentError fit!(
+        lds,
+        y3;
+        depends_on=(C=[:a, :a, :b], d=[:a, :a, :b], nope=[:a, :a, :b]),
+        max_iter=1,
+        progress=false,
+    )
+    # ... as is naming a parameter the model never declared as grouped.
+    @test_throws ArgumentError fit!(
+        lds,
+        y3;
+        depends_on=(C=[:a, :a, :b], d=[:a, :a, :b], R=[:a, :a, :b]),
+        max_iter=1,
+        progress=false,
+    )
+
+    #=
+    An override is one NamedTuple resolved against *both* sub-models, so keys
+    belonging to the emission must not trip up the state model's resolution.
+    =#
+    sm = pd_state_model()
+    sm.depends_on = (Q=[:a, :a, :b],)
+    om2 = pd_obs_model()
+    om2.depends_on = (C=[:a, :a, :b], d=[:a, :a, :b])
+    both = pd_lds(sm, om2)
+    @test fit!(
+        both,
+        y2;
+        depends_on=(Q=[:a, :b], C=[:a, :b], d=[:a, :b]),
+        max_iter=1,
+        progress=false,
+    ) isa Vector
+
+    return nothing
+end
+
+# ============================================================================
+# Accessors and storage layout
+# ============================================================================
+
+function test_group_accessors_and_aliasing()
+    labels = [:s1, :s1, :s2, :s2]
+    om = pd_obs_model()
+    om.depends_on = (C=labels, d=labels)
+    lds = pd_lds(pd_state_model(), om)
+
+    @test group_labels(om, :C) == [:s1, :s2]
+    @test group_labels(om, :d) == [:s1, :s2]     # alias of the same group
+    @test group_labels(om, :D) == [:s1, :s2]
+    @test isempty(group_labels(om, :R))          # R does not vary
+
+    @test_throws ArgumentError group_parameter(om, :R, :s1)
+    @test_throws ArgumentError group_parameter(om, :C, :nope)
+
+    grp = SSD.parameter_grouping(lds, length(labels))
+    @test grp !== nothing
+    @test grp.ncells == 2
+    @test grp.trial_cell == [1, 1, 2, 2]
+    @test grp.cell_trials == [[1, 2], [3, 4]]
+
+    variants = om.variants
+    @test variants !== nothing
+    @test length(variants) == 2
+    # Slot 1 aliases the base model, so `om.C` keeps its original meaning.
+    @test variants[1].C === om.C
+    @test group_parameter(om, :C, :s1) === om.C
+    # A varying parameter gets one array per group ...
+    @test variants[1].C !== variants[2].C
+    @test variants[1].d !== variants[2].d
+    # ... a fixed one is shared by reference, so a single M-step write covers all.
+    @test variants[1].R === variants[2].R
+    @test variants[1].R === om.R
+
+    return nothing
+end
+
+"""
+A trial's cell is its position in the common refinement of every label vector,
+so parameters may be grouped along different ancillary variables at once.
+"""
+function test_grouping_is_the_join_of_label_vectors()
+    session = [:s1, :s1, :s2, :s2]
+    condition = [:c1, :c2, :c1, :c2]
+    sm = pd_state_model()
+    sm.depends_on = (Q=condition,)
+    om = pd_obs_model()
+    om.depends_on = (C=session, d=session)
+    lds = pd_lds(sm, om)
+
+    grp = SSD.parameter_grouping(lds, 4)
+    # Q varies by condition and C by session, so a cell is one (session,
+    # condition) pair: four singleton cells.
+    @test grp.ncells == 4
+    @test sort(grp.trial_cell) == [1, 2, 3, 4]
+    @test grp.nslots[SSD._G_Q] == 2
+    @test grp.nslots[SSD._G_CD] == 2
+    @test grp.nslots[SSD._G_AB] == 1
+
+    # The trial count must match the label vectors the model was built with.
+    @test_throws SSD.DimensionMismatchError SSD.parameter_grouping(lds, 3)
+
+    return nothing
+end
+
+"""
+An override may re-assign trials to groups the model already declares, but it
+cannot invent a parameter set that was never fitted, and it is meaningless on a
+model that declares nothing.
+"""
+function test_override_key_validation()
+    om = pd_obs_model()
+    om.depends_on = (C=[:a, :a, :b], d=[:a, :a, :b])
+    lds = pd_lds(pd_state_model(), om)
+
+    @test SSD.parameter_grouping(lds, 2; depends_on=(C=[:a, :b], d=[:a, :b])) !== nothing
+    @test_throws ArgumentError SSD.parameter_grouping(
+        lds, 3; depends_on=(C=[:a, :a, :x], d=[:a, :a, :x])
+    )
+    @test_throws ArgumentError SSD.parameter_grouping(lds, 3; depends_on=(nope=[:a],))
+    # `:R` is a real parameter name, but this model does not group by it.
+    @test_throws ArgumentError SSD.parameter_grouping(lds, 3; depends_on=(R=[:a, :b],))
+
+    plain = pd_fresh_lds()
+    @test_throws ArgumentError SSD.parameter_grouping(
+        plain, 2; depends_on=(C=[:a, :b], d=[:a, :b])
+    )
+    @test SSD.parameter_grouping(plain, 2) === nothing
+
+    return nothing
+end
+
+# ============================================================================
+# Equivalences
+# ============================================================================
+
+"""
+A `depends_on` whose labels are all identical adds no parameters, so it must
+reproduce the ungrouped fit.
+"""
+function test_single_group_matches_ungrouped()
+    rng = StableRNG(202)
+    truth = pd_fresh_lds()
+    _, y = rand(rng, truth, fill(40, 5))
+
+    plain = pd_fresh_lds()
+    elbos_plain = fit!(plain, y; max_iter=8, tol=0.0, progress=false)
+
+    om = pd_obs_model()
+    om.depends_on = (C=fill(:only, 5), d=fill(:only, 5), R=fill(:only, 5))
+    grouped = pd_lds(pd_state_model(), om)
+    elbos_grouped = fit!(grouped, y; max_iter=8, tol=0.0, progress=false)
+
+    @test elbos_grouped ≈ elbos_plain
+    @test grouped.obs_model.C ≈ plain.obs_model.C
+    @test grouped.obs_model.R ≈ plain.obs_model.R
+    @test grouped.state_model.A ≈ plain.state_model.A
+    @test grouped.state_model.Q ≈ plain.state_model.Q
+    @test grouped.state_model.x0 ≈ plain.state_model.x0
+
+    return nothing
+end
+
+"""
+When *every* parameter depends on the session, the sessions share nothing, so a
+grouped fit must equal two independent fits — same ELBO trace (summed) and same
+fitted parameters. This is the sharpest check that the per-cell E-step and the
+slot-wise M-step pooling agree with the ordinary path.
+"""
+function test_fully_grouped_matches_independent_fits()
+    rng = StableRNG(303)
+
+    truth1 = pd_fresh_lds()
+    _, y1 = rand(rng, truth1, fill(35, 4))
+
+    truth2 = pd_fresh_lds()
+    truth2.obs_model.C .= [0.3 -1.0; 1.2 0.4]
+    truth2.obs_model.R .= Matrix(0.9 * I(PD_OBS_DIM))
+    truth2.state_model.A .= [0.7 0.3; -0.3 0.7]
+    _, y2 = rand(rng, truth2, fill(35, 4))
+
+    y = vcat(y1, y2)
+    labels = vcat(fill(:s1, 4), fill(:s2, 4))
+
+    fit_kwargs = (; max_iter=6, tol=0.0, progress=false)
+
+    lds1 = pd_fresh_lds()
+    elbos1 = fit!(lds1, y1; fit_kwargs...)
+    lds2 = pd_fresh_lds()
+    elbos2 = fit!(lds2, y2; fit_kwargs...)
+
+    sm = pd_state_model()
+    sm.depends_on = (x0=labels, P0=labels, A=labels, b=labels, Q=labels)
+    om = pd_obs_model()
+    om.depends_on = (C=labels, d=labels, R=labels)
+    grouped = pd_lds(sm, om)
+    elbos_g = fit!(grouped, y; fit_kwargs...)
+
+    @test elbos_g ≈ elbos1 .+ elbos2
+
+    for (label, ref) in ((:s1, lds1), (:s2, lds2))
+        @test group_parameter(grouped.obs_model, :C, label) ≈ ref.obs_model.C
+        @test group_parameter(grouped.obs_model, :d, label) ≈ ref.obs_model.d
+        @test group_parameter(grouped.obs_model, :R, label) ≈ ref.obs_model.R
+        @test group_parameter(grouped.state_model, :A, label) ≈ ref.state_model.A
+        @test group_parameter(grouped.state_model, :b, label) ≈ ref.state_model.b
+        @test group_parameter(grouped.state_model, :Q, label) ≈ ref.state_model.Q
+        @test group_parameter(grouped.state_model, :x0, label) ≈ ref.state_model.x0
+        @test group_parameter(grouped.state_model, :P0, label) ≈ ref.state_model.P0
+    end
+
+    return nothing
+end
+
+"""
+Ragged trial lengths inside a group take the per-trial smoother fallback rather
+than the shared-covariance fast path; the answer must not depend on which.
+"""
+function test_grouped_handles_ragged_trial_lengths()
+    rng = StableRNG(404)
+    lds, labels = pd_two_session_truth(; ntrials_per_session=3)
+    _, y = rand(rng, lds, [30, 41, 27, 33, 30, 38])
+
+    fitted = pd_lds(pd_state_model(), pd_obs_model())
+    fitted.obs_model.depends_on = (C=labels, d=labels, R=labels)
+    elbos = fit!(fitted, y; max_iter=10, tol=0.0, progress=false)
+
+    @test all(isfinite, elbos)
+    @test pd_is_monotone(elbos)
+
+    return nothing
+end
+
+# ============================================================================
+# Fitting behaviour
+# ============================================================================
+
+function test_grouped_elbo_increases_and_recovers_noise()
+    rng = StableRNG(505)
+    truth, labels = pd_two_session_truth(; ntrials_per_session=8)
+    _, y = rand(rng, truth, fill(80, length(labels)))
+
+    fitted = pd_lds(pd_state_model(), pd_obs_model())
+    fitted.obs_model.depends_on = (C=labels, d=labels, R=labels)
+    elbos = fit!(fitted, y; max_iter=60, tol=1e-8, progress=false)
+
+    @test all(isfinite, elbos)
+    @test pd_is_monotone(elbos)
+
+    #=
+    `C` is identifiable only up to a shared linear transform of the latent
+    space, so compare what is identifiable: session 2 was simulated 7.5x
+    noisier, and each session's noise covariance must come back that way rather
+    than being averaged into one.
+    =#
+    R1 = group_parameter(fitted.obs_model, :R, :s1)
+    R2 = group_parameter(fitted.obs_model, :R, :s2)
+    @test isposdef(R1)
+    @test isposdef(R2)
+    @test tr(R2) > 3 * tr(R1)
+
+    # Letting the emissions differ by session must fit at least as well as
+    # forcing them to be shared.
+    shared = pd_fresh_lds()
+    fit!(shared, y; max_iter=60, tol=1e-8, progress=false)
+    @test loglikelihood(fitted, y) > loglikelihood(shared, y)
+
+    return nothing
+end
+
+function test_grouped_smooth_loglikelihood_and_heldout()
+    rng = StableRNG(606)
+    truth, labels = pd_two_session_truth(; ntrials_per_session=4)
+    _, y = rand(rng, truth, fill(45, length(labels)))
+
+    fitted = pd_lds(pd_state_model(), pd_obs_model())
+    fitted.obs_model.depends_on = (C=labels, d=labels, R=labels)
+    fit!(fitted, y; max_iter=15, tol=1e-8, progress=false)
+
+    xs, Ps = smooth(fitted, y)
+    @test length(xs) == length(y)
+    @test size(xs[1]) == (PD_LATENT_DIM, 45)
+    @test size(Ps[1]) == (PD_LATENT_DIM, PD_LATENT_DIM, 45)
+    @test all(x -> all(isfinite, x), xs)
+
+    #=
+    Each cell's smoothed covariance is computed once and shared within the
+    cell, but the two sessions have different emissions, so their covariances
+    must differ — i.e. sharing is per group, not global.
+    =#
+    @test Ps[1] ≈ Ps[2]
+    @test !(Ps[1] ≈ Ps[end])
+
+    @test isfinite(loglikelihood(fitted, y))
+    @test isfinite(elbo(fitted, y))
+
+    # Held-out scoring: a different trial count needs a `depends_on` override.
+    y_new = y[[1, 5, 6]]
+    lab_new = labels[[1, 5, 6]]
+    @test_throws SSD.DimensionMismatchError loglikelihood(fitted, y_new)
+    @test isfinite(
+        loglikelihood(fitted, y_new; depends_on=(C=lab_new, d=lab_new, R=lab_new))
+    )
+    xs_new, _ = smooth(fitted, y_new; depends_on=(C=lab_new, d=lab_new, R=lab_new))
+    @test length(xs_new) == 3
+
+    return nothing
+end
+
+function test_grouped_integer_labels_and_priors()
+    rng = StableRNG(707)
+    labels = [1, 1, 2, 2, 2]          # integers, not Symbols
+    truth = pd_fresh_lds()
+    _, y = rand(rng, truth, fill(40, 5))
+
+    sm = pd_state_model()
+    sm.Q_prior = IWPrior(; Ψ=Matrix(0.01 * I(PD_LATENT_DIM)), ν=6.0)
+    om = pd_obs_model()
+    om.R_prior = IWPrior(; Ψ=Matrix(0.05 * I(PD_OBS_DIM)), ν=6.0)
+    om.depends_on = (C=labels, d=labels, R=labels)
+    fitted = pd_lds(sm, om)
+
+    elbos = fit!(fitted, y; max_iter=25, tol=1e-9, progress=false)
+    @test all(isfinite, elbos)
+    @test pd_is_monotone(elbos)
+
+    @test group_labels(om, :C) == [1, 2]
+    # Each version of `R` gets its own prior term and its own MAP update.
+    @test isposdef(group_parameter(om, :R, 1))
+    @test isposdef(group_parameter(om, :R, 2))
+
+    return nothing
+end
+
+function test_grouped_rand_needs_a_label_for_one_trial()
+    truth, labels = pd_two_session_truth(; ntrials_per_session=2)
+    rng = StableRNG(808)
+
+    # A single trial cannot be assigned to a group on its own.
+    @test_throws ArgumentError rand(rng, truth, 20)
+    x, y = rand(rng, truth, 20; depends_on=(C=[:s2], d=[:s2], R=[:s2]))
+    @test size(y) == (PD_OBS_DIM, 20)
+
+    # Multi-trial sampling uses the model's own labels.
+    _, ys = rand(rng, truth, fill(20, length(labels)))
+    @test length(ys) == length(labels)
+
+    return nothing
+end
+
+# ============================================================================
+# Poisson
+# ============================================================================
+
+function test_grouped_poisson_fit()
+    rng = StableRNG(909)
+    labels = vcat(fill(:s1, 3), fill(:s2, 3))
+
+    sm = pd_state_model()
+    om = PoissonObservationModel([0.6 0.1; -0.2 0.5], [1.0, 0.8])
+    om.depends_on = (C=labels, d=labels)
+    truth = LinearDynamicalSystem(;
+        state_model=sm,
+        obs_model=om,
+        latent_dim=PD_LATENT_DIM,
+        obs_dim=PD_OBS_DIM,
+        fit_bool=fill(true, 5),
+    )
+    C2 = group_parameter(om, :C, :s2)
+    C2 .= [-0.4 0.7; 0.5 -0.3]
+    d2 = group_parameter(om, :d, :s2)
+    d2 .= [0.2, 1.4]
+
+    _, y = rand(rng, truth, fill(40, length(labels)))
+
+    om_fit = PoissonObservationModel([0.5 0.0; 0.0 0.5], [1.0, 1.0])
+    om_fit.depends_on = (C=labels, d=labels)
+    fitted = LinearDynamicalSystem(;
+        state_model=pd_state_model(),
+        obs_model=om_fit,
+        latent_dim=PD_LATENT_DIM,
+        obs_dim=PD_OBS_DIM,
+        fit_bool=fill(true, 5),
+    )
+
+    elbos = fit!(fitted, y; max_iter=8, tol=0.0, progress=false)
+    @test all(isfinite, elbos)
+    @test elbos[end] > elbos[1]
+
+    # The two sessions really did get separate emission parameters.
+    @test !(group_parameter(om_fit, :C, :s1) ≈ group_parameter(om_fit, :C, :s2))
+    @test isfinite(elbo(fitted, y))
+
+    xs, _ = smooth(fitted, y)
+    @test length(xs) == length(y)
+
+    return nothing
+end
+
+# ============================================================================
+# SLDS
+# ============================================================================
+
+function pd_slds(labels; K::Int=2)
+    ldss = map(1:K) do k
+        sm = pd_state_model()
+        sm.A .= k == 1 ? [0.95 0.05; -0.05 0.95] : [0.60 0.30; -0.30 0.60]
+        om = pd_obs_model()
+        if labels !== nothing
+            om.depends_on = (C=labels, d=labels, R=labels)
+        end
+        return pd_lds(sm, om)
+    end
+    A = [0.9 0.1; 0.1 0.9]
+    πₖ = [0.5, 0.5]
+    return SLDS(; A=A, πₖ=πₖ, LDSs=ldss)
+end
+
+function test_grouped_slds_fit()
+    rng = StableRNG(1010)
+    labels = vcat(fill(:s1, 3), fill(:s2, 3))
+
+    truth = pd_slds(labels)
+    for k in 1:2
+        C2 = group_parameter(truth.LDSs[k].obs_model, :C, :s2)
+        C2 .= [0.2 -0.9; 1.0 0.3]
+        R2 = group_parameter(truth.LDSs[k].obs_model, :R, :s2)
+        R2 .= Matrix(1.0 * I(PD_OBS_DIM))
+    end
+    _, _, y = rand(rng, truth, fill(35, length(labels)))
+
+    fitted = pd_slds(labels)
+    elbos = fit!(fitted, y; max_iter=6, progress=false, rng=StableRNG(11))
+    @test length(elbos) == 6
+    @test all(isfinite, elbos)
+
+    # Each regime keeps a separate emission per session.
+    for k in 1:2
+        om = fitted.LDSs[k].obs_model
+        @test !(group_parameter(om, :C, :s1) ≈ group_parameter(om, :C, :s2))
+        @test isposdef(group_parameter(om, :R, :s1))
+        @test isposdef(group_parameter(om, :R, :s2))
+    end
+
+    # x0/P0 stay tied across regimes even when grouped.
+    @test fitted.LDSs[2].state_model.x0 ≈ fitted.LDSs[1].state_model.x0
+    @test fitted.LDSs[2].state_model.P0 ≈ fitted.LDSs[1].state_model.P0
+
+    @test isfinite(elbo(fitted, y; smoothing_iters=5, tol=0))
+
+    return nothing
+end
+
+function test_grouped_slds_tied_params()
+    rng = StableRNG(2020)
+    labels = vcat(fill(:s1, 3), fill(:s2, 3))
+
+    truth = pd_slds(labels)
+    for k in 1:2
+        group_parameter(truth.LDSs[k].obs_model, :C, :s2) .= [0.2 -0.9; 1.0 0.3]
+    end
+    _, _, y = rand(rng, truth, fill(35, length(labels)))
+
+    fitted = pd_slds(labels)
+    # Start the regimes off disagreeing about session 2's emission, so the tie
+    # has something to undo.
+    group_parameter(fitted.LDSs[2].obs_model, :C, :s2) .= [0.9 0.1; -0.2 0.7]
+
+    elbos = fit!(
+        fitted, y; max_iter=5, progress=false, rng=StableRNG(21), tied_params=(:C, :d, :R)
+    )
+    @test all(isfinite, elbos)
+
+    #=
+    The tie is across regimes, not across sessions: each session keeps its own
+    emission, and every regime uses it.
+    =#
+    om1 = fitted.LDSs[1].obs_model
+    om2 = fitted.LDSs[2].obs_model
+    for label in (:s1, :s2)
+        @test group_parameter(om2, :C, label) ≈ group_parameter(om1, :C, label)
+        @test group_parameter(om2, :d, label) ≈ group_parameter(om1, :d, label)
+        @test group_parameter(om2, :R, label) ≈ group_parameter(om1, :R, label)
+    end
+    @test !(group_parameter(om1, :C, :s1) ≈ group_parameter(om1, :C, :s2))
+
+    # Dynamics still differ per regime.
+    @test !(fitted.LDSs[2].state_model.A ≈ fitted.LDSs[1].state_model.A)
+
+    return nothing
+end
+
+"""`pd_slds`'s Poisson twin: same regimes and chain, an emission with no `R`."""
+function pd_poisson_slds(labels; K::Int=2)
+    ldss = map(1:K) do k
+        sm = pd_state_model()
+        sm.A .= k == 1 ? [0.95 0.05; -0.05 0.95] : [0.60 0.30; -0.30 0.60]
+        om = PoissonObservationModel([0.6 0.1; -0.2 0.5], [1.0, 0.8])
+        if labels !== nothing
+            om.depends_on = (C=labels, d=labels)
+        end
+        return LinearDynamicalSystem(;
+            state_model=sm,
+            obs_model=om,
+            latent_dim=PD_LATENT_DIM,
+            obs_dim=PD_OBS_DIM,
+            fit_bool=fill(true, 5),
+        )
+    end
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=ldss)
+end
+
+"""
+A grouped (`depends_on`) SLDS whose emission is Poisson.
+
+Every other grouped-SLDS test here is Gaussian, which is what let the M-step
+read `cell_slot[_G_R]` before branching on the emission type: a Poisson
+emission declares no `R` group, so its `cell_slot` is one entry shorter and
+that index runs off the end — a `BoundsError` out of the first M-step, on any
+such fit. Both the plain grouped fit and the tied one go through it.
+"""
+function test_grouped_poisson_slds_fit()
+    @testset "grouped SLDS with a Poisson emission" begin
+        rng = StableRNG(3030)
+        labels = vcat(fill(:s1, 3), fill(:s2, 3))
+
+        truth = pd_poisson_slds(labels)
+        for k in 1:2
+            group_parameter(truth.LDSs[k].obs_model, :C, :s2) .= [-0.4 0.7; 0.5 -0.3]
+            group_parameter(truth.LDSs[k].obs_model, :d, :s2) .= [0.2, 1.4]
+        end
+        _, _, y = rand(rng, truth, fill(35, length(labels)))
+
+        # Untied: one emission per (regime, session).
+        fitted = pd_poisson_slds(labels)
+        elbos = fit!(fitted, y; max_iter=4, progress=false, rng=StableRNG(31))
+        @test length(elbos) == 4
+        @test all(isfinite, elbos)
+        @test !(
+            group_parameter(fitted.LDSs[1].obs_model, :C, :s1) ≈
+            group_parameter(fitted.LDSs[1].obs_model, :C, :s2)
+        )
+
+        # x0/P0 stay tied across regimes even when grouped.
+        @test fitted.LDSs[2].state_model.x0 ≈ fitted.LDSs[1].state_model.x0
+        @test fitted.LDSs[2].state_model.P0 ≈ fitted.LDSs[1].state_model.P0
+
+        #=
+        Tied: the whole `[C d]` shared across regimes — the usual reading for
+        neural data, and the only tie a Poisson emission admits, since a partial
+        one has no sufficient-statistic form.
+        =#
+        tied = pd_poisson_slds(labels)
+        group_parameter(tied.LDSs[2].obs_model, :C, :s2) .= [0.9 0.1; -0.2 0.7]
+        elbos = fit!(
+            tied, y; max_iter=4, progress=false, rng=StableRNG(32), tied_params=(:C, :d)
+        )
+        @test all(isfinite, elbos)
+        om1, om2 = tied.LDSs[1].obs_model, tied.LDSs[2].obs_model
+        for label in (:s1, :s2)
+            @test group_parameter(om2, :C, label) ≈ group_parameter(om1, :C, label)
+            @test group_parameter(om2, :d, label) ≈ group_parameter(om1, :d, label)
+        end
+        # Tied across regimes, still split across sessions, dynamics still switching.
+        @test !(group_parameter(om1, :C, :s1) ≈ group_parameter(om1, :C, :s2))
+        @test !(tied.LDSs[2].state_model.A ≈ tied.LDSs[1].state_model.A)
+
+        post = smooth(tied, y; smoothing_iters=5, tol=0)
+        @test length(post.γ) == length(y)
+        @test isfinite(post.elbo)
+    end
+    return nothing
+end
+
+function test_tied_gls_regression()
+    @testset "tied GLS regression" begin
+        #=
+        `_tied_gls_regression` is the shared-regression fit for units whose
+        residual covariances differ. The anchor is that it degenerates: with one
+        covariance for every unit, it must return exactly what pooling the
+        statistics and calling `mn_map` returns, prior or no prior. That is what
+        makes the cheap pooled path a special case rather than a second
+        estimator.
+        =#
+        rng = StableRNG(4242)
+        m, p, U = 4, 3, 3
+        Szz = [(X = randn(rng, 20, m); X'X) for _ in 1:U]
+        Szy = [randn(rng, m, p) for _ in 1:U]
+        Σ_shared = fill(Matrix(0.7I(p)) + 0.1 * ones(p, p), U)
+
+        W = StateSpaceDynamics._tied_gls_regression(
+            Szz, Szy, Σ_shared, nothing, Σ_shared[1]
+        )
+        @test W ≈ StateSpaceDynamics.mn_map(sum(Szz), sum(Szy), nothing)
+
+        Λ = (L = randn(rng, m, m); L * L' + m * I)
+        prior = MNPrior(randn(rng, p, m), Matrix(Λ))
+        W_prior = StateSpaceDynamics._tied_gls_regression(
+            Szz, Szy, Σ_shared, prior, Σ_shared[1]
+        )
+        @test W_prior ≈ StateSpaceDynamics.mn_map(sum(Szz), sum(Szy), prior)
+
+        #=
+        With the covariances genuinely different it is a different answer, and
+        the right one: it zeroes the stationarity condition
+        `Σᵤ Σᵤ⁻¹ (Szyᵤ' − W Szzᵤ) + Σ₁⁻¹ (M₀ − W) Λ = 0`, which pooling does not.
+        =#
+        Σ_diff = [Matrix(Diagonal(0.2 .+ rand(rng, p))) for _ in 1:U]
+        W_gls = StateSpaceDynamics._tied_gls_regression(Szz, Szy, Σ_diff, prior, Σ_diff[1])
+        resid = inv(Σ_diff[1]) * ((prior.M₀ - W_gls) * prior.Λ)
+        for u in 1:U
+            resid .+= inv(Σ_diff[u]) * (Szy[u]' - W_gls * Szz[u])
+        end
+        @test maximum(abs, resid) < 1e-8
+        @test !(W_gls ≈ StateSpaceDynamics.mn_map(sum(Szz), sum(Szy), prior))
+    end
+    return nothing
+end
+
+function test_grouped_pooled_regression_under_grouped_noise()
+    @testset "grouped regression with grouped noise" begin
+        #=
+        `R` grouped by session while `[C d D]` is pooled: the shared emission is
+        then a GLS fit, not the pooled ordinary one. The check is the same as
+        everywhere else — EM on the MAP objective is monotone only if the M-step
+        maximizes it.
+        =#
+        rng = StableRNG(777)
+        truth, labels = pd_two_session_truth(; ntrials_per_session=4)
+        _, y = rand(rng, truth, fill(30, length(labels)))
+
+        sm = pd_state_model()
+        om = pd_obs_model()
+        om.depends_on = (R=labels,)          # noise per session, emission pooled
+        fitted = pd_lds(sm, om)
+        elbos = fit!(fitted, y; max_iter=8, progress=false)
+
+        @test all(isfinite, elbos)
+        @test pd_is_monotone(elbos)
+        # One emission over both sessions, two noise covariances.
+        @test length(group_labels(fitted.obs_model, :R)) == 2
+        @test !(
+            group_parameter(fitted.obs_model, :R, :s1) ≈
+            group_parameter(fitted.obs_model, :R, :s2)
+        )
+    end
+    return nothing
+end
+
+function test_grouped_slds_smooth()
+    rng = StableRNG(2021)
+    labels = vcat(fill(:s1, 3), fill(:s2, 3))
+    truth = pd_slds(labels)
+    _, _, y = rand(rng, truth, fill(30, length(labels)))
+
+    # A held-out subset has its own trial count, so it needs its own labels.
+    subset = y[1:4]
+    post = smooth(
+        truth,
+        subset;
+        depends_on=(C=labels[1:4], d=labels[1:4], R=labels[1:4]),
+        smoothing_iters=50,
+        tol=1e-8,
+    )
+    @test length(post.γ) == 4
+    @test length(post.x) == 4
+    @test isfinite(post.elbo)
+    for n in 1:4
+        @test size(post.γ[n]) == (2, size(subset[n], 2))
+        @test all(≈(1.0), vec(sum(post.γ[n]; dims=1)))
+    end
+
+    # Deterministic: no rng in play, so a repeat call agrees exactly.
+    repeat = smooth(
+        truth,
+        subset;
+        depends_on=(C=labels[1:4], d=labels[1:4], R=labels[1:4]),
+        smoothing_iters=50,
+        tol=1e-8,
+    )
+    @test repeat.elbo == post.elbo
+    @test repeat.γ[1] == post.γ[1]
+
+    return nothing
+end
+
+function test_grouped_slds_requires_matching_labels()
+    labels = vcat(fill(:s1, 3), fill(:s2, 3))
+    slds = pd_slds(labels)
+    # Regime 2 disagrees about how trials are grouped.
+    slds.LDSs[2].obs_model.depends_on = (
+        C=vcat(fill(:s1, 4), fill(:s2, 2)), d=vcat(fill(:s1, 4), fill(:s2, 2))
+    )
+    @test_throws ArgumentError SSD._slds_parameter_grouping(slds, 6)
+
+    # A regime that declares nothing at all is also a disagreement.
+    slds2 = pd_slds(labels)
+    slds2.LDSs[2].obs_model.depends_on = nothing
+    @test_throws ArgumentError SSD._slds_parameter_grouping(slds2, 6)
+
+    # No regime declaring anything is simply the ungrouped path.
+    @test SSD._slds_parameter_grouping(pd_slds(nothing), 6) === nothing
+
+    return nothing
+end
+
+# ============================================================================
+# Display
+# ============================================================================
+
+function test_grouped_show()
+    labels = [:s1, :s1, :s2]
+    om = pd_obs_model()
+    om.depends_on = (C=labels, d=labels, R=labels)
+    out = sprint(show, om)
+    @test occursin("Depends on:", out)
+    @test occursin("C, d, D", out)
+    @test occursin(":s2", out)
+
+    plain = sprint(show, pd_obs_model())
+    @test !occursin("Depends on:", plain)
+
+    return nothing
+end

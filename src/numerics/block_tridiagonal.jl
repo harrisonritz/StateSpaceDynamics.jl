@@ -54,7 +54,7 @@ struct BlockTridiagonalWorkspace{T<:Real}
 
     #=
     Banded-format scratch for the SPD `pbsv`-based fast path used when
-    `block_size ≤ 8`. Layout: `(2*block_size, block_size * n_blocks)`
+    `block_size ≤ _PBSV_MAX_BLOCK_SIZE`. Layout: `(2*block_size, block_size * n_blocks)`
     — `ldab = 2D` (one row past `kd+1 = 2D-1+1 = 2D`), one column per
     global matrix column. `pbsv` overwrites this with the Cholesky
     factor on each call, so it gets refilled from the block storage
@@ -435,12 +435,30 @@ end
 """
     block_tridiagonal_inverse_logdet!(p_smooth, p_smooth_tt1, A, B, C, ws)
 
-Compute the block tridiagonal inverse and log-determinant simultaneously.
-Returns the log-determinant of the precision matrix (i.e., logdet of the input matrix).
+Diagonal and first-off-diagonal blocks of `H⁻¹` for a symmetric positive
+definite block-tridiagonal `H`, plus `logdet(H)`. `p_smooth[:, :, i]` receives
+`Σᵢᵢ` and `p_smooth_tt1[:, :, i]` receives `Σᵢ,ᵢ₋₁` (untouched at `i = 1`).
 
-This is more efficient than calling block_tridiagonal_inverse! and gaussian_entropy
-separately, as it computes logdet during the forward sweep without additional
-matrix factorizations.
+One forward sweep, one backward recursion. The forward sweep is the block
+Thomas elimination: `Mᵢ = Bᵢ − Aᵢ₋₁ Dᵢ`, `Dᵢ₊₁ = Mᵢ⁻¹ Cᵢ`, whose Cholesky
+factors are cached in `ws.chol_factors` (both for the log-determinant, which is
+`Σᵢ 2·Σⱼ log Uᵢ[j,j]`, and for `block_tridiagonal_backsubst!` to reuse).
+
+The backward recursion then reads the inverse straight off those factors:
+
+    Σₙₙ    = Mₙ⁻¹
+    Σᵢ,ᵢ₋₁ = −Σᵢᵢ Dᵢ'
+    Σᵢ₋₁,ᵢ₋₁ = Mᵢ₋₁⁻¹ − Dᵢ Σᵢ,ᵢ₋₁
+
+which is the Kalman-smoother covariance recursion in block form, and needs no
+factorisation of its own. The earlier implementation instead ran a second
+(UL) sweep and then factorised `Bᵢ − Aᵢ₋₁Dᵢ − CᵢEᵢ₊₁` once per block — three
+Choleskys per block where this does one. Since the smoother calls this once per
+trial per E-step and it is `O(T · D³)`, that is the dominant cost of a fit at
+larger latent dimensionality.
+
+Symmetry (`Cᵢ = Aᵢ'`) and positive definiteness are assumed, as they already
+were by the Cholesky in the forward sweep.
 """
 function block_tridiagonal_inverse_logdet!(
     p_smooth::AbstractArray{T,3},
@@ -454,21 +472,18 @@ function block_tridiagonal_inverse_logdet!(
     bs = ws.block_size
 
     D = ws.D
-    E = ws.E
-    S = ws.S
     Ibs = ws.Ibs
     Z = ws.Z
 
     fill!(D[1], zero(T))
-    fill!(E[n + 1], zero(T))
 
     # Accumulate log-determinant during forward sweep
     logdet_val = zero(T)
 
     #=
     Forward sweep — caches each Schur complement's Cholesky upper-triangle
-    factor into `ws.chol_factors[i]` so `block_tridiagonal_backsubst!` can
-    reuse them per trial.
+    factor into `ws.chol_factors[i]`, which the backward recursion below and
+    `block_tridiagonal_backsubst!` both read back.
     =#
     for i in 1:n
         Ai = (i == 1) ? Z : A[i - 1]
@@ -487,36 +502,29 @@ function block_tridiagonal_inverse_logdet!(
         ldiv!(D[i + 1], F, Ci)
     end
 
-    # Backward sweep — uses `ws.M` as scratch; not cached (per-trial backsubst
-    # only needs the forward-sweep factors + D arrays).
-    M = ws.M
-    for i in n:-1:1
-        Ci = (i <= length(C)) ? C[i] : Z
-        Ai = (i == 1) ? Z : A[i - 1]
-
-        copyto!(M, B[i])
-        mul!(M, Ci, E[i + 1], -one(T), one(T))
-        F = cholesky!(Symmetric(M, :U))
-        ldiv!(E[i], F, Ai)
-    end
-
-    # Diagonal blocks -> p_smooth[:,:,i] via the SPD closed form
-    # `Σᵢ = (Bᵢ - Aᵢ₋₁·Dᵢ - Cᵢ·Eᵢ₊₁)⁻¹`. 
-    for i in 1:n
-        Ai = (i == 1) ? Z : A[i - 1]
-        Ci = (i <= length(C)) ? C[i] : Z
-
-        copyto!(S, B[i])
-        mul!(S, Ai, D[i], -one(T), one(T))         # S -= Aᵢ₋₁·Dᵢ
-        mul!(S, Ci, E[i + 1], -one(T), one(T))     # S -= Cᵢ·Eᵢ₊₁
-        F = cholesky!(Symmetric(S, :U))
-        @views ldiv!(p_smooth[:, :, i], F, Ibs)
-    end
-
-    # Compute off-diagonal blocks -> p_smooth_tt1[:,:,i] for i=2:n
-    for i in 2:n
-        @views mul!(p_smooth_tt1[:, :, i], E[i], p_smooth[:, :, i - 1])
-        @views p_smooth_tt1[:, :, i] .*= -one(T)
+    #=
+    Backward recursion. Nothing is factorised here: each step solves against a
+    forward-sweep factor and does two block products.
+    =#
+    @views begin
+        copyto!(p_smooth[:, :, n], Ibs)
+        ldiv!(
+            LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[n], 'U', 0),
+            p_smooth[:, :, n],
+        )
+        for i in n:-1:2
+            # Σᵢ,ᵢ₋₁ = −Σᵢᵢ Dᵢ'
+            mul!(
+                p_smooth_tt1[:, :, i], p_smooth[:, :, i], transpose(D[i]), -one(T), zero(T)
+            )
+            # Σᵢ₋₁,ᵢ₋₁ = Mᵢ₋₁⁻¹ − Dᵢ Σᵢ,ᵢ₋₁
+            copyto!(p_smooth[:, :, i - 1], Ibs)
+            ldiv!(
+                LinearAlgebra.Cholesky{T,Matrix{T}}(ws.chol_factors[i - 1], 'U', 0),
+                p_smooth[:, :, i - 1],
+            )
+            mul!(p_smooth[:, :, i - 1], D[i], p_smooth_tt1[:, :, i], -one(T), one(T))
+        end
     end
 
     return logdet_val
@@ -761,7 +769,7 @@ end
 
 #=
 pbsv-based fast path for SPD block-tridiagonal solves at small block
-size. At `bs ≤ 8` the per-block BLAS dispatch overhead in the generic
+size. At small `bs` the per-block BLAS dispatch overhead in the generic
 block-Thomas path dominates over the tiny arithmetic; one packed
 `pbsv` call to LAPACK amortises that overhead and is 30-60× faster.
 =#
@@ -783,6 +791,14 @@ function _block_tridiagonal_solve_pbsv!(
 end
 
 """
+Largest block size for which the packed-banded `pbsv` path beats the general
+block-Thomas solve — see `block_tridiagonal_solve_spd!` for the measurements
+behind the number. The latent dimensionality of an LDS is the block size, so
+this covers the range a state-space model is normally fitted at.
+"""
+const _PBSV_MAX_BLOCK_SIZE = 32
+
+"""
     block_tridiagonal_solve_spd!(x, A, B, C, b, ws)
 
 SPD-specialised solve for symmetric block-tridiagonal systems
@@ -791,13 +807,15 @@ SPD-specialised solve for symmetric block-tridiagonal systems
 matrices at the smoother MAP). Same signature as
 `block_tridiagonal_solve!` so callers can swap in.
 
-At small block sizes (`bs ≤ 8`) and BlasFloat eltypes, packs the upper
-triangle into LAPACK banded format and calls `pbsv` directly — 30-60×
-faster than the general block-Thomas code at that size, because one
-LAPACK call amortises the per-block BLAS dispatch overhead. For
-larger `bs` (where blocked BLAS-3 already efficiently overlaps with
-the arithmetic), or non-BlasFloat eltypes, falls back to the general
-`block_tridiagonal_solve!`.
+For BlasFloat eltypes up to `bs = _PBSV_MAX_BLOCK_SIZE`, packs the upper
+triangle into LAPACK banded format and calls `pbsv` directly. At small `bs`
+that is 30-60× faster than the general block-Thomas code, because one LAPACK
+call amortises the per-block BLAS dispatch overhead; the advantage narrows as
+`bs` grows but does not reverse until the band gets wide (measured on a
+100-block system: 2.1× at `bs = 4`, 1.5× at 16, 1.1× at 32, and slightly
+*slower* by 48, where the banded form's zero fill inside the band starts to
+cost more than the dispatch it saves). Above that, or for non-BlasFloat
+eltypes, falls back to the general `block_tridiagonal_solve!`.
 
 `A` is accepted for signature parity but only used on the fallback
 branch. The pbsv path consults only `B` (diagonal) and `C` (upper
@@ -812,7 +830,7 @@ function block_tridiagonal_solve_spd!(
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
     bs = size(B[1], 1)
-    if T <: Union{Float32,Float64} && bs <= 8
+    if T <: Union{Float32,Float64} && bs <= _PBSV_MAX_BLOCK_SIZE
         return _block_tridiagonal_solve_pbsv!(x, B, C, b, ws)
     end
     return block_tridiagonal_solve!(x, A, B, C, b, ws)

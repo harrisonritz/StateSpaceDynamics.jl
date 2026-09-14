@@ -2,13 +2,13 @@
 Continuous (Linear Gaussian) latents
 
     Log-Likelihood kernels: state_loglikelihood!(cc, dxt, tmp, lds, x, t[, ux])
-                            observation_loglikelihood!(cc, b1, b2, lds, x, y, t[, uy])
+                            observation_loglikelihood!(cc, b1, b2, om, x, y, t[, uy])
                             joint_loglikelihood!(ll, ws, cc, lds, x, y[, ux, uy])
 
-    Gradient kernels:       observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    Gradient kernels:       observation_gradient!(out, cc, buf, om, x, y, t[, uy])
                             gradient!(grad, ws, lds, x, y[, ux, uy])
 
-    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
+    Hessian kernels:        observation_hessian!(out, cc, buf1, buf2, om, x, y, t[, α])
                             hessian!(sws, lds, x, y)
 
     E-Step: Q_state!(sws, lds, suf)
@@ -90,12 +90,14 @@ function state_loglikelihood!(
 end
 
 """
-    observation_loglikelihood!(cc, buf1, buf2, lds, x, y, t[, uy])
+    observation_loglikelihood!(cc, buf1, buf2, obs_model, x, y, t[, uy])
 
 Emission-model contribution `log p(y_t | x_t)` to the complete-data
-log-likelihood at timestep `t`. Dispatches on the observation model type `O`
-(via `lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs
-into `joint_loglikelihood!` by adding a method here.
+log-likelihood at timestep `t`. Dispatches on the observation model, which is
+passed directly rather than through the enclosing `LinearDynamicalSystem` — that
+is what lets a [`CompositeObservationModel`](@ref) call the same kernel once per
+member. A custom observation model plugs into `joint_loglikelihood!` by adding a
+method here.
 
 - `cc`: a [`SmoothConstants`](@ref) with Cholesky factors / normalizers
   (unused by models whose emission term needs no covariance, e.g. Poisson).
@@ -132,7 +134,7 @@ function joint_loglikelihood!(
     y::AbstractMatrix{T0},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,T0<:Real,S<:GaussianStateModel{T0},O<:AbstractObservationModel{T0}}
+) where {T<:Real,T0<:Real,S<:AbstractGaussianStateModel{T0},O<:AbstractObservationModel{T0}}
     tsteps = size(y, 2)
     @assert length(ll) == tsteps
 
@@ -140,7 +142,7 @@ function joint_loglikelihood!(
 
     for t in 1:tsteps
         ll_t = observation_loglikelihood!(
-            cc, opt.temp_dy, opt.temp_solve_R, lds, x, y, t, uy
+            cc, opt.temp_dy, opt.temp_solve_R, lds.obs_model, x, y, t, uy
         )
         ll_t += state_loglikelihood!(cc, opt.temp_dx, opt.temp_solve_Q, lds, x, t, ux)
         ll[t] = ll_t
@@ -150,13 +152,12 @@ function joint_loglikelihood!(
 end
 
 """
-    observation_gradient!(out, cc, buf, lds, x, y, t[, uy])
+    observation_gradient!(out, cc, buf, obs_model, x, y, t[, uy])
 
 Emission-model contribution `∂ log p(y_t | x_t) / ∂x_t` written into `out`
-(length `latent_dim`). Dispatches on the observation model type `O` (via
-`lds::LinearDynamicalSystem{T,S,O}`); a custom observation model plugs into
-`gradient!` (both the single-LDS and the SLDS weighted form) by adding a
-method here.
+(length `latent_dim`). Dispatches on the observation model, passed directly; a
+custom observation model plugs into `gradient!` (both the single-LDS and the
+SLDS weighted form) by adding a method here.
 
 - `cc`: a [`SmoothConstants`](@ref) with Cholesky-derived terms (Gaussian
   uses the cached `C_inv_R = C'R⁻¹`; models without a covariance ignore it).
@@ -191,6 +192,35 @@ function gradient!(
     y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    tsteps = size(x, 2)
+    _state_gradient!(grad, ws, lds, x, ux)
+
+    cc = ws.consts
+    obs_buf = ws.opt.dyt
+    tmp1 = ws.opt.tmp1
+    @views for t in 1:tsteps
+        observation_gradient!(tmp1, cc, obs_buf, lds.obs_model, x, y, t, uy)
+        grad[:, t] .+= tmp1
+    end
+
+    return grad
+end
+
+"""
+    _state_gradient!(grad, ws, lds, x, ux)
+
+Write the state-side (prior + transition) half of the complete-data
+log-likelihood gradient into `grad` — identical for every observation model, so
+`gradient!` and its batched observation-model specialisations share it. Callers
+add the emission term afterwards.
+"""
+function _state_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    x::AbstractMatrix{T},
+    ux::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
 
@@ -201,34 +231,29 @@ function gradient!(
 
     dxt = ws.opt.dxt
     dxt_next = ws.opt.dxt_next
-    obs_buf = ws.opt.dyt
-    tmp1 = ws.opt.tmp1
     tmp2 = ws.opt.tmp2
     tmp3 = ws.opt.tmp3
 
-    # First time step: emission + prior + outgoing factor at t = 2
-    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, 1, uy)
+    # First time step: prior + outgoing factor at t = 2
     @views dxt .= x[:, 1] .- lds.state_model.x0
     mul!(tmp3, neg_P0_inv, dxt)
     _transition_residual!(dxt_next, lds, x, 2, ux)
     mul!(tmp2, A_inv_Q, dxt_next)
-    @views grad[:, 1] .= tmp1 .+ tmp2 .+ tmp3
+    @views grad[:, 1] .= tmp2 .+ tmp3
 
-    # Middle steps: emission + incoming factor at t + outgoing factor at t + 1
+    # Middle steps: incoming factor at t + outgoing factor at t + 1
     @views for t in 2:(tsteps - 1)
-        observation_gradient!(tmp1, cc, obs_buf, lds, x, y, t, uy)
         _transition_residual!(dxt, lds, x, t, ux)
         mul!(tmp3, neg_Q_inv, dxt)
         _transition_residual!(dxt_next, lds, x, t + 1, ux)
         mul!(tmp2, A_inv_Q, dxt_next)
-        grad[:, t] .= tmp1 .+ tmp3 .+ tmp2
+        grad[:, t] .= tmp3 .+ tmp2
     end
 
-    # Last time step: emission + incoming factor at t = T
-    observation_gradient!(tmp1, cc, obs_buf, lds, x, y, tsteps, uy)
+    # Last time step: incoming factor at t = T
     _transition_residual!(dxt, lds, x, tsteps, ux)
     mul!(tmp3, neg_Q_inv, dxt)
-    @views grad[:, tsteps] .= tmp1 .+ tmp3
+    @views grad[:, tsteps] .= tmp3
 
     return grad
 end
@@ -240,13 +265,13 @@ function gradient!(
     y::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     grad = view(ws.opt.grad_buf, :, 1:size(x, 2))
     return gradient!(grad, ws, lds, x, y, ux, uy)
 end
 
 """
-    observation_hessian!(out, cc, buf1, buf2, lds, x, y, t[, α])
+    observation_hessian!(out, cc, buf1, buf2, obs_model, x, y, t[, α])
 
 Emission-model contribution `∂² log p(y_t | x_t) / ∂x_t²` **accumulated** into
 `out` (`latent_dim × latent_dim`) with weight `α`: `out .+= α .* hess_t`. The
@@ -254,9 +279,8 @@ add-with-weight semantics let the same kernel serve both the single-LDS
 `hessian!` (α = 1, `out` pre-filled with the state-side block) and the SLDS
 `hessian!` (α = w[k,t], accumulating across mixture components).
 
-Dispatches on the observation model type `O` (via
-`lds::LinearDynamicalSystem{T,S,O}`) — the curvature companion to
-`observation_gradient!`: a custom observation model plugs into both `hessian!`
+Dispatches on the observation model, passed directly — the curvature companion
+to `observation_gradient!`: a custom observation model plugs into both `hessian!`
 forms by adding a method here, without touching the shared state-side Hessian
 blocks.
 
@@ -276,10 +300,14 @@ follow.
 function observation_hessian! end
 
 """
-    _state_hessian_blocks!(btd, cc, tsteps)
+    _state_hessian_blocks!(btd, cc, state_model, tsteps)
 
 Write the state-side (prior/transition) Hessian blocks — identical for every
-observation model — into `btd.H_diag` / `H_sub` / `H_super`:
+observation model — into `btd.H_diag` / `H_sub` / `H_super`. Dispatches on the
+state model, which is what lets a structured or time-varying transition
+([`LQRStateModel`](@ref)) write per-timestep blocks; the
+[`GaussianStateModel`](@ref) method below ignores it and copies one cached
+template into every position:
 
 - `H_sub[i] = Q⁻¹A`, `H_super[i] = (Q⁻¹A)'` for all i
 - `H_diag[1] = -A'Q⁻¹A - P0⁻¹`
@@ -290,7 +318,9 @@ Overwrites the diagonal blocks — callers add the emission curvature
 afterwards via `observation_hessian!`. Requires `tsteps ≥ 2` (matching the
 Newton smoother's contract).
 """
-function _state_hessian_blocks!(btd, cc::SmoothConstants{T}, tsteps::Int) where {T<:Real}
+function _state_hessian_blocks!(
+    btd, cc::SmoothConstants{T}, ::GaussianStateModel, tsteps::Int
+) where {T<:Real}
     for i in 1:(tsteps - 1)
         copyto!(btd.H_sub[i], cc.H_sub_entry)
         copyto!(btd.H_super[i], cc.H_super_entry)
@@ -330,15 +360,24 @@ function hessian!(
     x::AbstractMatrix{T},
     y::AbstractMatrix{T},
     uy::Union{Nothing,AbstractMatrix}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(y, 2)
     btd = sws.btd
     cc = sws.consts
 
-    _state_hessian_blocks!(btd, cc, tsteps)
+    _state_hessian_blocks!(btd, cc, lds.state_model, tsteps)
     for t in 1:tsteps
         observation_hessian!(
-            btd.H_diag[t], cc, sws.elbo.rho_obs, sws.elbo.h_obs, lds, x, y, t, one(T), uy
+            btd.H_diag[t],
+            cc,
+            sws.elbo.rho_obs,
+            sws.elbo.h_obs,
+            lds.obs_model,
+            x,
+            y,
+            t,
+            one(T),
+            uy,
         )
     end
 
@@ -559,9 +598,69 @@ function Q_state!(
     return Q_val
 end
 
+"""
+    _state_prior_logdensity(lds, sws) -> T
+
+`log p(θ)` for the state-side parameters at their current values: the
+Inverse-Wishart terms for `Q` and `P0`, and the matrix-normal terms for `x0`
+(paired with `P0`) and the stacked dynamics `[A b B]` (paired with `Q`).
+
+The MN terms matter for more than reporting. The M-step's `mn_map` update and
+the IW posterior-scale modification together maximize the MAP objective, so an
+ELBO that dropped the MN quadratic piece could appear non-monotone across EM
+iterations even though nothing was wrong.
+
+`sws` supplies the scratch for the stacked `[A b B]`; pass `nothing` to allocate
+it, which is what callers with no workspace in hand (the SLDS's per-regime prior
+sum) do.
+"""
+function _state_prior_logdensity(
+    lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    total = zero(T)
+
+    sm.Q_prior === nothing || (total += iw_logprior_term(sm.Q, sm.Q_prior))
+    sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    if sm.x0_prior !== nothing
+        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+    end
+    if sm.AB_prior !== nothing
+        W_ab = _dyn_pack_scratch(lds, sws)
+        _pack_dyn_W!(W_ab, lds)
+        total += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
+    end
+
+    return total
+end
+
+"""
+    _dyn_pack_scratch(lds, sws)
+    _obs_pack_scratch(lds, sws)
+
+A `(latent_dim × dyn_reg_dim)` / `(obs_dim × obs_reg_dim)` matrix to pack a
+stacked regression into: a view of the workspace's regression buffer, or a fresh
+allocation when there is no workspace.
+"""
+function _dyn_pack_scratch(lds::LinearDynamicalSystem{T}, sws::SmoothWorkspace{T}) where {T}
+    return view(sws.reg.AB, :, 1:(lds.latent_dim + 1 + lds.ux_dim))
+end
+
+function _dyn_pack_scratch(lds::LinearDynamicalSystem{T}, ::Nothing) where {T}
+    return Matrix{T}(undef, lds.latent_dim, lds.latent_dim + 1 + lds.ux_dim)
+end
+
+function _obs_pack_scratch(lds::LinearDynamicalSystem{T}, sws::SmoothWorkspace{T}) where {T}
+    return view(sws.reg.CD, :, 1:(lds.latent_dim + 1 + lds.uy_dim))
+end
+
+function _obs_pack_scratch(lds::LinearDynamicalSystem{T}, ::Nothing) where {T}
+    return Matrix{T}(undef, lds.obs_dim, lds.latent_dim + 1 + lds.uy_dim)
+end
+
 function update_initial_state_mean!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[1] || return nothing
     x0 = lds.state_model.x0
     x0_prior = lds.state_model.x0_prior
@@ -582,18 +681,24 @@ function update_initial_state_mean!(
     return nothing
 end
 
-function update_initial_state_covariance!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    lds.fit_bool[2] || return nothing
+"""
+    _accumulate_init_scatter!(S0, lds, suf)
+
+Add this model's initial-state scatter `Σγ(x₁-x0)(x₁-x0)' + Σγ P₁` to `S0`.
+
+`S0` is accumulated into rather than overwritten, so a caller fitting one `P0`
+from several models can sum their scatter — each contributing with *its own*
+`x0`. `update_initial_state_covariance!` is the single-model case.
+"""
+function _accumulate_init_scatter!(
+    S0::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = lds.latent_dim
     x0 = lds.state_model.x0
     N = suf.init_n
 
-    S0 = sws.reg.S0_sum                              # D × D scratch
-    copyto!(S0, suf.init_yy[])
+    S0 .+= suf.init_yy[]
 
-    # Scatter of the initial state around x0: S0 = Σγ(x₁-x0)(x₁-x0)' + Σγ P₁.
     # Rank-1 updates inline (BLAS.ger! would need a contiguous μ vector and
     # `view(init_xy, 1, :)` allocates a SubArray header — small but nonzero).
     for j in 1:D
@@ -605,35 +710,71 @@ function update_initial_state_covariance!(
             S0[i, j] += T(N) * x0_i * x0_j - x0_i * μ_j - μ_i * x0_j
         end
     end
+    return S0
+end
 
-    #=
-    Matrix-normal prior on x0 (the mean half of the NIW): fold κ₀(x0-μ₀)(x0-μ₀)'
-    into the IW scale, exactly as update_Q!/update_R! fold in their `Wm Λ Wm'`
-    term. Together with `P0_prior` (the IW half) this yields the NIW posterior
-    scale Ψₙ = Ψ + Σγ(x₁x₁'+P₁) + κ₀μ₀μ₀' - κₙ x0 x0'. `x0` must already hold the
-    NIW mean μₙ here (update_initial_state_mean! runs first in the M-step).
-    =#
+"""
+    _accumulate_x0_prior_scatter!(S0, lds)
+
+Add the mean half of the NIW prior, `κ₀(x0-μ₀)(x0-μ₀)'`, to the IW scale —
+exactly as `update_Q!`/`update_R!` fold in their `Wm Λ Wm'` term. Together with
+`P0_prior` (the IW half) this yields the NIW posterior scale
+`Ψₙ = Ψ + Σγ(x₁x₁'+P₁) + κ₀μ₀μ₀' - κₙ x0 x0'`. `x0` must already hold the NIW
+mean μₙ (`update_initial_state_mean!` runs first in the M-step).
+
+One call per distinct `x0`: when several `x0` versions share a `P0`, each
+contributes its own prior term.
+"""
+function _accumulate_x0_prior_scatter!(
+    S0::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     x0_prior = lds.state_model.x0_prior
-    if x0_prior !== nothing
-        κ₀ = x0_prior.Λ[1, 1]
-        μ₀ = x0_prior.M₀
-        for j in 1:D, i in 1:D
-            S0[i, j] += κ₀ * (x0[i] - μ₀[i, 1]) * (x0[j] - μ₀[j, 1])
-        end
+    x0_prior === nothing && return S0
+    D = lds.latent_dim
+    x0 = lds.state_model.x0
+    κ₀ = x0_prior.Λ[1, 1]
+    μ₀ = x0_prior.M₀
+    for j in 1:D, i in 1:D
+        S0[i, j] += κ₀ * (x0[i] - μ₀[i, 1]) * (x0[j] - μ₀[j, 1])
     end
-    Symmetrize!(S0)
+    return S0
+end
 
+"""
+    _finalize_P0!(lds, S0, N)
+
+Turn an accumulated initial-state scatter into `P0`: MLE `S0 / N`, or the IW MAP
+`(Ψ + S0) / (ν + N + D + 1)` when a `P0_prior` is set.
+"""
+function _finalize_P0!(
+    lds::LinearDynamicalSystem{T,S,O}, S0::AbstractMatrix{T}, N::T
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    D = lds.latent_dim
     if lds.state_model.P0_prior === nothing
-        S0 ./= T(N)
+        S0 ./= N
     else
         Ψ, ν = lds.state_model.P0_prior.Ψ, lds.state_model.P0_prior.ν
         # iw_map inlined: (Ψ + S0) / (ν + N + D + 1)
-        denom = ν + T(N) + T(D + 1)
+        denom = ν + N + T(D + 1)
         for i in eachindex(S0)
             S0[i] = (Ψ[i] + S0[i]) / denom
         end
     end
     copyto!(lds.state_model.P0, S0)
+    return nothing
+end
+
+function update_initial_state_covariance!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    lds.fit_bool[2] || return nothing
+
+    S0 = sws.reg.S0_sum                              # D × D scratch
+    fill!(S0, zero(T))
+    _accumulate_init_scatter!(S0, lds, suf)
+    _accumulate_x0_prior_scatter!(S0, lds)
+    Symmetrize!(S0)
+    _finalize_P0!(lds, S0, T(suf.init_n))
     return nothing
 end
 
@@ -661,6 +802,22 @@ function update_A_b!(
         W = mn_map(suf.dyn_xx[], suf.dyn_xy, AB_prior)
     end
 
+    _unpack_dyn_W!(lds, W)
+    return nothing
+end
+
+"""
+    _unpack_dyn_W!(lds, W)
+
+Write a stacked dynamics regression `W = [A b B]` back into `lds`. The inverse
+of [`_pack_dyn_W!`](@ref); shared by the ordinary M-step and by callers that
+solve for `W` themselves (see `_tied_gls_regression`).
+"""
+function _unpack_dyn_W!(
+    lds::LinearDynamicalSystem{T,S,O}, W::AbstractMatrix{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    D = lds.latent_dim
+    ux_dim = lds.ux_dim
     copyto!(lds.state_model.A, view(W, :, 1:D))
     copyto!(lds.state_model.b, view(W, :, D + 1))
     if ux_dim > 0
@@ -669,27 +826,49 @@ function update_A_b!(
     return nothing
 end
 
-function update_Q!(
-    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
+"""
+    _pack_dyn_W!(W, lds)
+
+Write the stacked dynamics regression `[A b B]` into `W`
+(`latent_dim × (latent_dim + 1 + ux_dim)`).
+"""
+function _pack_dyn_W!(
+    W::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    lds.fit_bool[4] || return nothing
     D = lds.latent_dim
     ux_dim = lds.ux_dim
-
-    # sws.reg.AB is exactly (D × dyn_reg_dim); no view needed.
-    W = sws.reg.AB
     copyto!(view(W, :, 1:D), lds.state_model.A)
     copyto!(view(W, :, D + 1), lds.state_model.b)
     if ux_dim > 0
         copyto!(view(W, :, (D + 2):(D + 1 + ux_dim)), lds.state_model.B)
     end
+    return W
+end
 
-    # Residual scatter S = dyn_yy - W·dyn_xy - dyn_xy'·W' + W·dyn_xx·W'
+"""
+    _accumulate_dyn_scatter!(S_res, lds, suf, sws)
+
+Add this model's dynamics residual scatter
+`dyn_yy - W·dyn_xy - dyn_xy'·W' + W·dyn_xx·W'` (with `W = [A b B]`) to `S_res`.
+
+`S_res` is accumulated into rather than overwritten, so a caller fitting one `Q`
+from several models can sum their scatter — each contributing with its own
+`[A b B]`. Does **not** include the `AB_prior` term: that is one term per
+distinct `[A b B]`, added by `_accumulate_ab_prior_scatter!`.
+"""
+function _accumulate_dyn_scatter!(
+    S_res::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    suf::SufficientStatistics{T},
+    sws::SmoothWorkspace{T},
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    # sws.reg.AB is exactly (D × dyn_reg_dim); no view needed.
+    W = _pack_dyn_W!(sws.reg.AB, lds)
+
     Wxy = sws.elbo.temp                        # D × D scratch (free post-Q_state!)
     mul!(Wxy, W, suf.dyn_xy)
 
-    S_res = sws.reg.Q_sum                      # D × D scratch
-    copyto!(S_res, suf.dyn_yy[].mat)
+    S_res .+= suf.dyn_yy[].mat
     S_res .-= Wxy
     S_res .-= Wxy'
     #=
@@ -714,13 +893,36 @@ function update_Q!(
     copyto!(WL, W)
     BLAS.trmm!('R', 'U', 'T', 'N', one(T), suf.dyn_xx[].chol.factors, WL)
     mul!(S_res, WL, transpose(WL), one(T), one(T))
+    return S_res
+end
 
-    # MN-prior contribution to the IW posterior scale.
+"""
+    _accumulate_ab_prior_scatter!(S_res, lds, sws)
+
+Add the `AB_prior` contribution `Wm Λ Wm'` (`Wm = [A b B] - M₀`) to the IW
+posterior scale of `Q`. One call per distinct `[A b B]`.
+"""
+function _accumulate_ab_prior_scatter!(
+    S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     AB_prior = lds.state_model.AB_prior
-    if AB_prior !== nothing
-        Wm = W .- AB_prior.M₀
-        S_res .+= Wm * AB_prior.Λ * Wm'
-    end
+    AB_prior === nothing && return S_res
+    W = _pack_dyn_W!(sws.reg.AB, lds)
+    Wm = W .- AB_prior.M₀
+    S_res .+= Wm * AB_prior.Λ * Wm'
+    return S_res
+end
+
+"""
+    _finalize_Q!(lds, S_res, N)
+
+Symmetrize an accumulated dynamics residual scatter and turn it into `Q`: MLE
+`S_res / N`, or the IW MAP `(Ψ + S_res) / (ν + N + D + 1)` under a `Q_prior`.
+"""
+function _finalize_Q!(
+    lds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    D = lds.latent_dim
     #=
     Reflect upper → lower so the matrix is exactly symmetric. (`mul!`
     of `WL · WL'` above can give 1-ULP-asymmetric output; mirroring
@@ -733,7 +935,7 @@ function update_Q!(
 
     Q_prior = lds.state_model.Q_prior
     if Q_prior === nothing
-        S_res ./= T(suf.dyn_n)
+        S_res ./= N
     else
         #=
         iw_map(Ψ, ν, S, N, d) = (Ψ + S) / (ν + N + d + 1), inlined to
@@ -742,12 +944,25 @@ function update_Q!(
         `state_model.Q_prior` field), so we assert the concrete type
         locally to keep the loop type-stable.
         =#
-        denom = Q_prior.ν + T(suf.dyn_n) + T(D + 1)
+        denom = Q_prior.ν + N + T(D + 1)
         Ψ = Q_prior.Ψ::Matrix{T}
         for i in eachindex(S_res)
             S_res[i] = (Ψ[i] + S_res[i]) / denom
         end
     end
     copyto!(lds.state_model.Q, S_res)
+    return nothing
+end
+
+function update_Q!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    lds.fit_bool[4] || return nothing
+
+    S_res = sws.reg.Q_sum                      # D × D scratch
+    fill!(S_res, zero(T))
+    _accumulate_dyn_scatter!(S_res, lds, suf, sws)
+    _accumulate_ab_prior_scatter!(S_res, lds, sws)
+    _finalize_Q!(lds, S_res, T(suf.dyn_n))
     return nothing
 end

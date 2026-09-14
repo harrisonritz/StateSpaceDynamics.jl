@@ -31,6 +31,18 @@ using SSDTest
 @testset verbose = true "StateSpaceDynamics.jl" begin
     # Package-wide quality tests
     @testset verbose = true "Package Quality" begin
+        #=
+        `test/Manifest.toml` is gitignored, so a Julia upgrade (or any fresh
+        resolve) can silently re-point StateSpaceDynamics at a *registry*
+        release instead of this working tree. Every API newer than that
+        release then surfaces as an `UndefVarError`/`MethodError` deep in an
+        unrelated testset, and the breakage reads as a code bug rather than
+        an environment one. Fail once, here, with the actual cause instead.
+        =#
+        @testset "Testing this working tree" begin
+            @test normpath(pkgdir(StateSpaceDynamics)) == normpath(dirname(@__DIR__))
+        end
+
         @testset "Aqua.jl" begin
             Aqua.test_all(StateSpaceDynamics; ambiguities=false)
             @test isempty(Test.detect_ambiguities(StateSpaceDynamics))
@@ -142,6 +154,23 @@ using SSDTest
                 test_SLDS_poisson_d_interpretation()
                 test_SLDS_gradient_weight_normalization_poisson()
                 test_SLDS_smooth_infer_poisson()
+                test_SLDS_batched_poisson_hessian()
+            end
+
+            @testset "Tied parameters and posteriors" begin
+                test_SLDS_tied_params_canonicalization()
+                test_SLDS_tied_params_poisson()
+                test_SLDS_tied_params_gaussian()
+                test_SLDS_tied_params_respects_fit_bool()
+                test_SLDS_tied_params_each_group()
+                test_SLDS_tied_params_elbo_monotone()
+                test_SLDS_tied_params_gls_path()
+                test_SLDS_tied_params_x0_P0_noop()
+                test_SLDS_tied_params_frozen_group()
+                test_SLDS_tied_params_partial_errors()
+                test_SLDS_tied_params_partial_prior()
+                test_SLDS_smooth_poisson()
+                test_SLDS_smooth_recovers_regimes()
             end
 
             @testset "Control inputs (ux/uy)" begin
@@ -152,6 +181,7 @@ using SSDTest
                 test_SLDS_hessian_numerical_with_inputs_poisson()
                 test_SLDS_fit_with_inputs_gaussian()
                 test_SLDS_fit_with_inputs_poisson()
+                test_SLDS_poisson_cd_prior_with_inputs()
             end
         end
 
@@ -243,6 +273,11 @@ using SSDTest
 
             @testset "Priors - Poisson LDS" begin
                 test_poisson_map_step_improves_Q()
+                test_poisson_batched_hessian_matches_kernel()
+                test_poisson_qobs_batched_matches_reference()
+                test_poisson_log_factorial()
+                test_poisson_newton_mstep_matches_lbfgs()
+                test_poisson_newton_mstep_zero_count_rows()
                 test_poisson_gradient_shape_and_finiteness()
                 test_poisson_cd_prior_shrink()
                 test_poisson_ab_prior_shrink()
@@ -263,6 +298,246 @@ using SSDTest
                 test_poisson_obs_inputs()
                 test_poisson_map_step_improves_Q()
                 test_poisson_gradient_shape_and_finiteness()
+            end
+        end
+
+        include("LinearDynamicalSystems/ParameterDependencies.jl")
+        @testset "Ancillary parameter dependencies" begin
+            @testset "Validation" begin
+                test_depends_on_validation()
+                test_depends_on_validated_at_construction()
+                test_override_key_validation()
+                test_depends_on_trial_count_and_override()
+            end
+
+            @testset "Accessors and partition" begin
+                test_group_accessors_and_aliasing()
+                test_grouping_is_the_join_of_label_vectors()
+                test_grouped_show()
+            end
+
+            @testset "Equivalences" begin
+                test_single_group_matches_ungrouped()
+                test_fully_grouped_matches_independent_fits()
+                test_grouped_handles_ragged_trial_lengths()
+            end
+
+            @testset "Gaussian fitting" begin
+                test_grouped_elbo_increases_and_recovers_noise()
+                test_grouped_smooth_loglikelihood_and_heldout()
+                test_grouped_integer_labels_and_priors()
+                test_grouped_rand_needs_a_label_for_one_trial()
+            end
+
+            @testset "Poisson fitting" begin
+                test_grouped_poisson_fit()
+            end
+
+            @testset "SLDS fitting" begin
+                test_grouped_slds_fit()
+                test_grouped_slds_tied_params()
+                test_grouped_poisson_slds_fit()
+                test_grouped_slds_smooth()
+                test_tied_gls_regression()
+                test_grouped_pooled_regression_under_grouped_noise()
+                test_grouped_slds_requires_matching_labels()
+            end
+
+            @testset "Trial-parallel execution" begin
+                test_SLDS_batched_poisson_loglikelihood()
+                test_SLDS_batched_poisson_gradient()
+                test_SLDS_smooth_npool_invariant()
+                test_SLDS_fit_reproducibility()
+                test_SLDS_rng_modes()
+            end
+        end
+
+        include("LinearDynamicalSystems/MultiObservation.jl")
+        @testset "Multiple observation models" begin
+            @testset "Construction" begin
+                test_multiobs_construction()
+                test_multiobs_validation()
+                test_multiobs_show()
+            end
+
+            @testset "Equivalences" begin
+                test_multiobs_matches_stacked()
+                test_multiobs_one_em_step_matches_stacked()
+                test_multiobs_single_member_matches_bare()
+            end
+
+            @testset "Mixed emission types" begin
+                test_multiobs_mixed_kernels()
+                test_multiobs_mixed_fit()
+            end
+
+            @testset "Per-member fit_bool, priors and depends_on" begin
+                test_multiobs_fit_bool_per_member()
+                test_multiobs_priors_per_member()
+                test_multiobs_depends_on()
+                test_multiobs_stitching()
+            end
+
+            @testset "Inputs and sampling" begin
+                test_multiobs_observation_inputs()
+                test_multiobs_sampling()
+            end
+
+            @testset "SLDS" begin
+                test_multiobs_slds_validation()
+                test_multiobs_slds_fit()
+                test_multiobs_slds_tied_params()
+                test_multiobs_slds_depends_on()
+            end
+        end
+
+        include("LinearDynamicalSystems/LQRLDS.jl")
+        @testset "LQR LDS" begin
+            @testset "Structure" begin
+                test_lqr_structure()
+                test_lqr_regimes_and_schedule()
+                test_lqr_construction_errors()
+                test_lqr_refresh_and_utilities()
+                test_lqr_rescale_costate()
+            end
+
+            @testset "Free mode" begin
+                test_lqr_free_construction()
+                test_lqr_total_dim_constructor()
+                test_lqr_free_matches_gaussian_lds()
+                test_lqr_free_fit_flags()
+                test_lqr_free_show()
+            end
+
+            @testset "E-step" begin
+                test_lqr_reduces_to_gaussian_lds()
+                test_lqr_multitrial_equivalence()
+                test_lqr_batched_gradient_matches_per_trial()
+                test_lqr_gradient_and_hessian()
+                test_lqr_elbo_matches_exact_marginal()
+                test_lqr_sufficient_statistics()
+                test_lqr_weighted_stats()
+            end
+
+            @testset "M-step" begin
+                test_lqr_mstep_objective_and_gradient()
+                test_lqr_mstep_freezing()
+                test_lqr_singular_fitted_psd_rejected()
+                test_lqr_plant_only_inputs()
+                test_lqr_mstep_preserves_structure()
+                test_lqr_em_monotone()
+                test_lqr_noise_update_closed_form()
+                test_lqr_recovers_parameters()
+            end
+
+            @testset "Emissions, sampling and printing" begin
+                test_lqr_costate_readout_mask()
+                test_lqr_masked_fit_matches_reduced_model()
+                test_lqr_poisson_emission()
+                test_lqr_composite_emission()
+                test_lqr_depends_on()
+                test_lqr_tracking_control()
+                test_lqr_tracking_mstep()
+                test_lqr_gref_columns()
+                test_lqr_ragged_with_schedule()
+                test_lqr_ragged_riccati_terminal()
+                test_lqr_sampling()
+                test_lqr_simulate_lqr()
+                test_lqr_show()
+                test_lqr_priors_and_fit_bool()
+                test_lqr_single_trial_and_edge_cases()
+            end
+        end
+
+        include("LinearDynamicalSystems/TrialELBO.jl")
+        @testset "Per-trial ELBO" begin
+            test_trial_elbos_sum_to_elbo()
+            test_trial_elbos_ragged_and_inputs()
+            test_trial_elbos_single_trial()
+            test_trial_elbos_prior_excluded()
+            test_trial_elbos_rejects_grouping()
+            @testset "LQR latents" begin
+                test_trial_elbos_lqr()
+                test_trial_elbos_lqr_inputs()
+                test_trial_elbos_lqr_rejects_grouping()
+            end
+        end
+
+        include("LinearDynamicalSystems/Holdout.jl")
+        @testset "Held-out ELBO and early stopping" begin
+            test_holdout_non_breaking()
+            test_holdout_matches_standalone_elbo()
+            test_holdout_determinism()
+            test_holdout_test_every()
+            test_holdout_early_stopping()
+            test_holdout_restore_best()
+            test_holdout_composite_emission()
+            test_holdout_grouped()
+            @testset "All model families" begin
+                test_holdout_all_families()
+            end
+        end
+
+        include("LinearDynamicalSystems/LQRSLDS.jl")
+        @testset "Switching inverse-LQR (LQR SLDS)" begin
+            test_slds_lqr_matches_lds()
+            test_slds_lqr_monotone()
+            test_slds_free_matches_gaussian_slds()
+            test_slds_mixed_free_and_lqr()
+            test_slds_lqr_tied()
+            test_slds_lqr_terminal()
+            test_slds_lqr_validation()
+            test_slds_lqr_prior_vs_optimal_data()
+            test_slds_lqr_rand()
+            test_slds_lqr_noise_version_lookup()
+            test_slds_lqr_zero_count_noise_version()
+            test_slds_lqr_grouped()
+            test_lqr_pair_slots()
+        end
+
+        include("LinearDynamicalSystems/Stitching.jl")
+        @testset "Stitching (per-session obs_dim)" begin
+            @testset "Shapes and validation" begin
+                test_stitching_variant_shapes()
+                test_stitching_requires_grouped_R()
+                test_stitching_rejects_mixed_widths_in_slot()
+                test_stitching_data_validation()
+            end
+
+            @testset "Non-breaking" begin
+                test_uniform_obs_dim_is_unchanged()
+            end
+
+            @testset "Group seeds" begin
+                test_group_seeds_replace_slot_seeding()
+                test_group_seeds_keep_slot_one_aliased()
+                test_group_seeds_apply_at_uniform_width()
+                test_group_seeds_validation()
+                test_group_seeds_start_a_stitched_fit_higher()
+            end
+
+            @testset "Workspaces" begin
+                test_cell_workspace_shares_big_buffers()
+                test_grouped_pool_sized_at_widest_session()
+            end
+
+            @testset "Fitting" begin
+                test_stitching_fit_runs_and_improves()
+                test_stitching_smooth_shapes()
+            end
+
+            @testset "SLDS" begin
+                test_stitching_slds_shapes()
+                test_slds_cell_workspace_sharing()
+                test_slds_trial_plan_partitions_by_cell()
+                test_stitching_slds_fit()
+            end
+
+            @testset "CD_prior" begin
+                test_slot_prior_cycles_nonzero_mean()
+                test_stitching_slot_priors_match_width()
+                test_stitching_fit_with_cd_prior()
+                test_stitching_poisson_slds_cd_prior()
             end
         end
     end

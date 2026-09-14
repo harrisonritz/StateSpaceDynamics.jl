@@ -8,7 +8,7 @@ function _sample_trial!(
     obs_params,
     obs_model::GaussianObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = size(x_trial, 2)
 
@@ -53,7 +53,7 @@ function _sample_trial!(
     obs_params,
     obs_model::PoissonObservationModel,
     ux_trial::AbstractMatrix,
-    uy_trial::AbstractMatrix,
+    uy_trial,
 )
     tsteps = size(x_trial, 2)
 
@@ -68,7 +68,7 @@ function _sample_trial!(
                     obs_params.C * x_trial[:, 1] +
                     obs_params.d +
                     obs_params.D * uy_trial[:, 1]
-                )
+                ),
             ),
         )
 
@@ -90,11 +90,99 @@ function _sample_trial!(
                     exp.(
                         obs_params.C * x_trial[:, t] +
                         obs_params.d +
-                        obs_params.D * uy_trial[:, t]
-                    )
+                        obs_params.D * uy_trial[:, t],
+                    ),
                 ),
             )
     end
+end
+
+#=
+Composite emission. The single-model samplers above interleave the two
+recursions (x₁, y₁, x₂, y₂, …); with several emissions there is no one
+interleaving to pick, so the latent path is drawn in full and each member's
+observations are then drawn from it. Both orders give the same distribution —
+`y_m,t` depends only on `x_t` — but not the same draws from a given seed, which
+is why the single-model path is left exactly as it was.
+=#
+function _sample_trial!(
+    rng,
+    x_trial,
+    y_trial,
+    state_params,
+    obs_params::NamedTuple,
+    obs_model::CompositeObservationModel,
+    ux_trial::AbstractMatrix,
+    uy_trial,
+)
+    tsteps = size(x_trial, 2)
+
+    x_trial[:, 1] = rand(rng, MvNormal(state_params.x0, state_params.P0))
+    for t in 2:tsteps
+        x_trial[:, t] = rand(
+            rng,
+            MvNormal(
+                state_params.A * x_trial[:, t - 1] +
+                state_params.b +
+                state_params.B * ux_trial[:, t - 1],
+                state_params.Q,
+            ),
+        )
+    end
+
+    for (i, m) in enumerate(values(_models(obs_model)))
+        _sample_obs!(rng, y_trial[i], obs_params[i], m, x_trial, uy_trial[i])
+    end
+    return nothing
+end
+
+"""
+    _sample_obs!(rng, y, obs_params, obs_model, x, uy)
+
+Draw one member's observations from an already-sampled latent path. Only the
+composite sampler uses this; the single-model samplers keep their interleaved
+recursion.
+"""
+function _sample_obs!(
+    rng, y, obs_params, om::AbstractObservationModel, x::AbstractMatrix, uy::AbstractMatrix
+)
+    @views for t in axes(x, 2)
+        y[:, t] = _draw_obs(rng, om, obs_params, x[:, t], uy[:, t])
+    end
+    return nothing
+end
+
+"""
+    _draw_obs(rng, obs_model, params, x_t, uy_t)
+
+One observation drawn from an emission at a given latent state. Split out so the
+composite samplers — which walk members, and for an SLDS also regimes — do not
+each need their own copy of the two distributions.
+"""
+function _draw_obs(rng, ::GaussianObservationModel, p, x_t, uy_t)
+    return rand(rng, MvNormal(p.C * x_t + p.d + p.D * uy_t, p.R))
+end
+
+function _draw_obs(rng, ::PoissonObservationModel, p, x_t, uy_t)
+    return rand.(rng, Poisson.(exp.(p.C * x_t + p.d + p.D * uy_t)))
+end
+
+"""
+    _alloc_obs(lds, tsteps) -> Matrix or NamedTuple of Matrix
+
+Uninitialized per-trial observation storage shaped for this model's emission.
+"""
+function _alloc_obs(lds::LinearDynamicalSystem{T}, tsteps::Int) where {T<:Real}
+    return Matrix{T}(undef, lds.obs_dim, tsteps)
+end
+
+function _alloc_obs(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
+) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
+    models = _models(lds.obs_model)
+    return NamedTuple{keys(models)}(
+        map(m -> Matrix{T}(undef, _obs_dim(m), tsteps), values(models))
+    )
 end
 
 """
@@ -116,6 +204,10 @@ Optional input sequences:
 - `uy`: same shape for the observation input `D`. Required when
   `size(obs_model.D, 2) > 0`. Supported for both Gaussian and Poisson
   observation models.
+- `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
+  models' stored `depends_on` for this call. When the model declares ancillary
+  parameter dependencies, each trial is sampled from its own group's parameters
+  — which is how you generate a synthetic multi-session dataset.
 """
 function Random.rand(
     rng::AbstractRNG,
@@ -123,18 +215,52 @@ function Random.rand(
     tsteps::Integer;
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    state_params = _extract_state_params(lds.state_model)
-    obs_params = _extract_obs_params(lds.obs_model)
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    if depends_on === nothing && _has_parameter_dependence(lds)
+        _single_trial_group_error("lds")
+    end
+    grp = parameter_grouping(lds, 1; depends_on=depends_on)
+    lds1 = grp === nothing ? lds : _cell_lds(lds, grp, grp.trial_cell[1])
+    state_params = _extract_state_params(lds1.state_model)
+    obs_params = _extract_obs_params(lds1.obs_model)
     Ti = Int(tsteps)
 
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     x = Matrix{T}(undef, lds.latent_dim, Ti)
-    y = Matrix{T}(undef, lds.obs_dim, Ti)
+    y = _alloc_obs(lds, Ti)
     _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, ux_trial, uy_trial)
     return x, y
+end
+
+#=
+Per-trial `(state_params, obs_params)` for a multi-trial draw. Ungrouped, every
+trial points at the same two NamedTuples (which themselves reference the model's
+arrays); grouped, a trial points at its cell's. Either way the sampler is one
+code path.
+=#
+function _per_trial_sample_params(lds::LinearDynamicalSystem, ::Nothing, ntrials::Int)
+    return (
+        fill(_extract_state_params(lds.state_model), ntrials),
+        fill(_extract_obs_params(lds.obs_model), ntrials),
+    )
+end
+
+function _per_trial_sample_params(
+    lds::LinearDynamicalSystem, grp::ParameterGrouping, ntrials::Int
+)
+    cell_state = [
+        _extract_state_params(_cell_lds(lds, grp, c).state_model) for c in 1:(grp.ncells)
+    ]
+    cell_obs = [
+        _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:(grp.ncells)
+    ]
+    return (
+        [cell_state[grp.trial_cell[n]] for n in 1:ntrials],
+        [cell_obs[grp.trial_cell[n]] for n in 1:ntrials],
+    )
 end
 
 function Random.rand(
@@ -143,20 +269,31 @@ function Random.rand(
     tsteps_per_trial::AbstractVector{<:Integer};
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
-    state_params = _extract_state_params(lds.state_model)
-    obs_params = _extract_obs_params(lds.obs_model)
-
+    depends_on::Union{Nothing,NamedTuple}=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     ntrials = length(tsteps_per_trial)
+    grp = parameter_grouping(lds, ntrials; depends_on=depends_on)
+
+    #=
+    Per-trial parameter sets, built in a helper so each name is assigned exactly
+    once here: the sampling loop below captures them in a closure, and a local
+    written from two branches of an `if` is boxed, which OhMyThreads rejects.
+    =#
+    state_params, obs_params = _per_trial_sample_params(lds, grp, ntrials)
+
     x = Vector{Matrix{T}}(undef, ntrials)
-    y = Vector{Matrix{T}}(undef, ntrials)
+    y = Vector{typeof(_alloc_obs(lds, 1))}(undef, ntrials)
     for i in 1:ntrials
         Ti = Int(tsteps_per_trial[i])
         x[i] = Matrix{T}(undef, lds.latent_dim, Ti)
-        y[i] = Matrix{T}(undef, lds.obs_dim, Ti)
+        y[i] = _alloc_obs(lds, Ti)
     end
 
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps_per_trial, T, "ux")
+    #=
+    Under a composite emission `uy_seq` is a NamedTuple of per-member sequences,
+    so a trial is taken out of it with `_trial` rather than by indexing.
+    =#
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps_per_trial, T, lds.obs_model)
 
     # `MersenneTwister` (and most RNG types) is not thread-safe, so sharing
@@ -164,7 +301,14 @@ function Random.rand(
     # gets its own child RNG, indexed by chunk (not `threadid()`).
     if ntrials == 1
         _sample_trial!(
-            rng, x[1], y[1], state_params, obs_params, lds.obs_model, ux_seq[1], uy_seq[1]
+            rng,
+            x[1],
+            y[1],
+            state_params[1],
+            obs_params[1],
+            lds.obs_model,
+            ux_seq[1],
+            _trial(uy_seq, 1),
         )
         return x, y
     end
@@ -183,11 +327,11 @@ function Random.rand(
                 trng,
                 x[trial],
                 y[trial],
-                state_params,
-                obs_params,
+                state_params[trial],
+                obs_params[trial],
                 lds.obs_model,
                 ux_seq[trial],
-                uy_seq[trial],
+                _trial(uy_seq, trial),
             )
         end
     end

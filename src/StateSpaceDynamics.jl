@@ -33,6 +33,9 @@ include("stats/priors.jl")
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
+include("lds/lqr_types.jl")                         # inverse-LQR state model + derived cache
+include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
+include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
 include("utils/show.jl")
 include("utils/validation.jl")
 
@@ -44,15 +47,31 @@ include("stats/null_models.jl")
 
 # latents models (LDS, PLDS, SLDS) + inference machinery (E-step).
 include("lds/continuous_latents.jl")                # state-model Q-term + state M-step
+include("lds/lqr_latents.jl")                       # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
 include("lds/poisson_observations.jl")
+include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
+include("lds/composite_observations.jl")            # several emissions on one latent state
+
+# Grouped (`depends_on`) M-step + ELBO machinery, shared by LDS / PLDS / SLDS.
+include("lds/grouped_em.jl")
 
 # Fitting Functions
 include("lds/fit_LDS.jl")
 include("lds/fit_PLDS.jl")
 include("lds/fit_SLDS.jl")
+
+# Inverse-LQR M-step + driver glue. After the drivers, since it specialises
+# their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
+include("lds/lqr_mstep.jl")
+include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
+include("lds/fit_LQR.jl")
+
+# ELBO split by trial. Last of the LDS files: it dispatches on every state model
+# above, so its signatures need all of their types to exist.
+include("lds/trial_elbo.jl")
 
 # Errors/Exceptions/Validations
 export validate_SLDS, validate_LDS, validate_probvec
@@ -61,10 +80,22 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
-export AbstractStateModel, AbstractObservationModel
+export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
+export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior
 export CovUpdateCache
+export FitTrace
+
+# Inverse LQR
+export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
+export free_state_model, plant_dim
+export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
+export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
+export simulate_lqr, lqr_riccati_sequence
+
+# Ancillary parameter dependencies (`depends_on`)
+export group_labels, group_parameter, group_variant, set_group_seeds!, set_depends_on!
 
 # Utilities
 export block_tridgm
@@ -75,7 +106,7 @@ export info_update!
 export tview
 
 # Common functions
-export rand, smooth, fit!, loglikelihood, elbo, elbo!
+export rand, smooth, fit!, loglikelihood, elbo, elbo!, trial_elbos
 
 export AffineNullModel
 export r2, nobs, nullloglikelihood

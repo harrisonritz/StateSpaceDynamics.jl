@@ -88,7 +88,6 @@ end
 Base.length(f::TrialFilterSmooth) = length(f.FilterSmooths)
 
 mutable struct SufficientStatistics{T<:Real}
-
     #=
     initial conditions. `init_n` is the effective sample count (e.g.
     `ntrials` for unweighted fits; `Σₙ w[n,1]` for SLDS-style soft
@@ -455,6 +454,61 @@ function BatchedBuffers(
 end
 
 """
+    PoissonBatchBuffers{T<:Real}
+
+Scratch for the batched (BLAS-3) Poisson emission kernels: the whole-trial rate
+matrix and the symmetric-pair packing that turns the per-timestep
+`C' diag(λ_t) C` curvature into one `gemm`.
+
+`sym_i` / `sym_j` enumerate the lower triangle `(i ≥ j)` of a `latent_dim`
+block in column-major order, so `Cpair[:, p] = C[:, sym_i[p]] .* C[:, sym_j[p]]`
+and `Hsym[p, t] = Σₙ λ[n, t]·Cpair[n, p]` is the `(sym_i[p], sym_j[p])` entry of
+`C' diag(λ_t) C`. Only the `nsym = D(D+1)/2` distinct entries are formed, which
+also halves the arithmetic relative to the dense `D²` loop.
+
+Sized at construction for the *widest* emission and *longest* trial the
+workspace will see; every kernel takes leading views, so a narrower cell or a
+shorter trial simply uses less of it. Allocated lazily (see
+[`poisson_batch!`](@ref)) because a Gaussian fit never touches these.
+"""
+struct PoissonBatchBuffers{T<:Real}
+    latent_dim::Int
+    obs_dim::Int
+    tsteps::Int
+    sym_i::Vector{Int}
+    sym_j::Vector{Int}
+    Cpair::Matrix{T}          # (obs_dim × nsym)   C[:, i] .* C[:, j]
+    Lam::Matrix{T}            # (obs_dim × tsteps) rates exp(Cx + d + D v [+ ρ])
+    Hsym::Matrix{T}           # (nsym × tsteps)    packed C' diag(λ_t) C
+    Ppack::Matrix{T}          # (nsym × tsteps)    packed P_t (off-diagonals doubled)
+    Eta::Matrix{T}            # (obs_dim × tsteps) linear predictor
+end
+
+function PoissonBatchBuffers(
+    ::Type{T}, latent_dim::Int, obs_dim::Int, tsteps::Int
+) where {T<:Real}
+    sym_i = Int[]
+    sym_j = Int[]
+    for j in 1:latent_dim, i in j:latent_dim
+        push!(sym_i, i)
+        push!(sym_j, j)
+    end
+    nsym = length(sym_i)
+    return PoissonBatchBuffers{T}(
+        latent_dim,
+        obs_dim,
+        tsteps,
+        sym_i,
+        sym_j,
+        zeros(T, obs_dim, nsym),
+        zeros(T, obs_dim, tsteps),
+        zeros(T, nsym, tsteps),
+        zeros(T, nsym, tsteps),
+        zeros(T, obs_dim, tsteps),
+    )
+end
+
+"""
     SmoothWorkspace{T<:Real}
 
 Pre-allocated workspace for the full LDS smoothing + EM pipeline, grouped by
@@ -468,15 +522,29 @@ concern:
 - `agg`: TD sufficient-stats aggregator + shared-covariance storage
 - `batched`: batched mean-pass buffers, or `nothing` (only `sws_pool[1]` of a
   multi-trial equal-length fit carries one)
+- `poisson`: batched Poisson emission scratch, or `nothing` until the first
+  Poisson kernel asks for it (see [`poisson_batch!`](@ref))
+- `obs`: one sub-workspace per member of a [`CompositeObservationModel`](@ref),
+  in the composite's key order, or `nothing` for a single observation model.
+  Attached by [`_attach_obs_workspaces!`](@ref); see there for what is shared.
+  Held as a `Vector` rather than a `NamedTuple` so the element type stays
+  concrete — the composite's own type parameter already carries the keys.
+
+Every field except `batched`, `poisson` and `obs` is `const`. `batched` is reassignable so a
+grouped fit (see `parameter_groups.jl`) can swap in the buffers sized for the group of
+trials it is about to smooth, while sharing the expensive O(D²·T) storage — the
+block-tridiagonal workspace and the shared-covariance cache — across all groups.
 """
-struct SmoothWorkspace{T<:Real}
-    btd::BlockTridiagonalWorkspace{T}
-    consts::SmoothConstants{T}
-    opt::NewtonBuffers{T}
-    reg::RegressionBuffers{T}
-    elbo::ElboBuffers{T}
-    agg::TDAggBuffers{T}
+mutable struct SmoothWorkspace{T<:Real}
+    const btd::BlockTridiagonalWorkspace{T}
+    const consts::SmoothConstants{T}
+    const opt::NewtonBuffers{T}
+    const reg::RegressionBuffers{T}
+    const elbo::ElboBuffers{T}
+    const agg::TDAggBuffers{T}
     batched::Union{Nothing,BatchedBuffers{T}}
+    poisson::Union{Nothing,PoissonBatchBuffers{T}}
+    obs::Union{Nothing,Vector{SmoothWorkspace{T}}}
 end
 
 """
@@ -518,7 +586,121 @@ function SmoothWorkspace(
         ElboBuffers(T, latent_dim, obs_dim),                                                # Buffers for Q_state! / Q_obs! ELBO terms
         TDAggBuffers(T, latent_dim, obs_dim, tsteps; ux_dim=ux_dim, uy_dim=uy_dim),         # Buffers for TD sufficient-statistics aggregator + shared smoothed-covariance storage
         batched,
+        nothing,                                                                            # batched Poisson scratch, allocated on first use
+        nothing,                                                                            # per-observation-model sub-workspaces, attached for a composite
     )
+end
+
+"""
+    _compute_state_constants!(cc, state_model)
+
+Fill the state half of a [`SmoothConstants`](@ref) — everything derived from
+`A`, `Q` and `P0`. Shared by every observation model, since none of it depends
+on the emission.
+"""
+function _compute_state_constants!(
+    cc::SmoothConstants{WT}, sm::GaussianStateModel{T}
+) where {WT<:Real,T<:Real}
+    A = sm.A
+    Q = sm.Q
+    P0 = sm.P0
+    latent_dim = size(A, 1)
+
+    #=
+    Rewrap covariances as PDMats — each PDMat caches its own Cholesky
+    factor internally and is consumed downstream via `cc.X_PD.chol.U`
+    for triangular solves and `logdet(cc.X_PD)` for the normalizer.
+
+    When `WT === T` (the hot path) `convert(Matrix{WT}, M)` returns `M`
+    unchanged — no copy, no alloc. When the constants eltype differs
+    (e.g. `ForwardDiff.Dual` for autodiff `loglikelihood`), constructing
+    the PDMat directly with `WT`-typed factors avoids the
+    `convert(::Type{PDMat{WT}}, ::PDMat{T})` fallback that requires a
+    single-arg `Cholesky{WT}(::Cholesky{T})` method — present in
+    Julia 1.12 but not Julia 1.10's stdlib `LinearAlgebra`.
+    =#
+    Q_w = convert(Matrix{WT}, Q)
+    P0_w = convert(Matrix{WT}, P0)
+    cc.Q_PD = PDMat(Symmetrize!(Q_w))
+    cc.P0_PD = PDMat(Symmetrize!(P0_w))
+    Qchol = cc.Q_PD.chol
+    P0chol = cc.P0_PD.chol
+
+    # tmp_QA = Q^{-1} A
+    copyto!(cc.tmp_QA, A)
+    ldiv!(Qchol, cc.tmp_QA)
+    copyto!(cc.A_inv_Q, cc.tmp_QA')
+
+    # Hessian block templates for the state model
+    copyto!(cc.H_sub_entry, cc.tmp_QA)          # Q^{-1} A
+    copyto!(cc.H_super_entry, cc.tmp_QA')       # (Q^{-1} A)'
+
+    # xt_given_xt_1 = -Q^{-1}
+    copyto!(cc.xt_given_xt_1, cc.I_mat)
+    ldiv!(Qchol, cc.xt_given_xt_1)
+    cc.xt_given_xt_1 .*= -one(T)
+
+    # xt1_given_xt = -A' * (Q^{-1} A)
+    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
+    cc.xt1_given_xt .*= -one(T)
+
+    # x_t = -P0^{-1}
+    copyto!(cc.x_t, cc.I_mat)
+    ldiv!(P0chol, cc.x_t)
+    cc.x_t .*= -one(T)
+
+    # Log-likelihood normalizers (consumed by the likelihood kernels)
+    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
+    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
+
+    return nothing
+end
+
+"""
+    _compute_obs_constants!(cc, obs_model)
+
+Fill the emission half of a [`SmoothConstants`](@ref).
+
+Gaussian: the `R` Cholesky, the derived `C'R⁻¹` and `-C'R⁻¹C` templates, and the
+`-0.5(p·log 2π + logdet R)` normalizer.
+
+Poisson: nothing to cache — the emission terms depend on `x` — so the Gaussian
+slots are zeroed and `cR` set to zero, which also stops a stale value surviving
+an observation-model switch on a reused workspace. `R_PD` keeps its identity
+placeholder.
+"""
+function _compute_obs_constants!(
+    cc::SmoothConstants{WT}, om::GaussianObservationModel{T}
+) where {WT<:Real,T<:Real}
+    C = om.C
+    R = om.R
+    obs_dim = size(C, 1)
+
+    R_w = convert(Matrix{WT}, R)     # see `_compute_state_constants!` for the rationale
+    cc.R_PD = PDMat(Symmetrize!(R_w))
+    Rchol = cc.R_PD.chol
+
+    # tmp_RC = R^{-1} C
+    copyto!(cc.tmp_RC, C)
+    ldiv!(Rchol, cc.tmp_RC)
+    copyto!(cc.C_inv_R, cc.tmp_RC')
+
+    # yt_given_xt = -C' * (R^{-1} C)
+    mul!(cc.yt_given_xt, C', cc.tmp_RC)
+    cc.yt_given_xt .*= -one(T)
+
+    cc.cR = -WT(0.5) * (WT(obs_dim) * log(WT(2π)) + logdet(cc.R_PD))
+
+    return nothing
+end
+
+function _compute_obs_constants!(
+    cc::SmoothConstants{WT}, ::PoissonObservationModel{T}
+) where {WT<:Real,T<:Real}
+    fill!(cc.yt_given_xt, zero(WT))
+    fill!(cc.C_inv_R, zero(WT))
+    cc.cR = zero(WT)
+    return nothing
 end
 
 """
@@ -538,139 +720,23 @@ Dispatches on the observation model type:
 The `SmoothWorkspace` form forwards to the workspace's embedded
 `SmoothConstants`.
 """
+#=
+One method for every (state model, single emission) pair: the two halves already
+dispatch on their own sub-model, so specialising here would only invite
+ambiguities as state and observation models multiply. A composite emission has
+its own method (`composite_observations.jl`), which is strictly more specific.
+=#
 function compute_smooth_constants!(
     cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
-    P0 = lds.state_model.P0
-    C = lds.obs_model.C
-    R = lds.obs_model.R
-
-    #=
-    Rewrap covariances as PDMats — each PDMat caches its own Cholesky
-    factor internally and is consumed downstream via `cc.X_PD.chol.U`
-    for triangular solves and `logdet(cc.X_PD)` for the normalizer.
-
-    When `WT === T` (the hot path) `convert(Matrix{WT}, M)` returns `M`
-    unchanged — no copy, no alloc. When the constants eltype differs
-    (e.g. `ForwardDiff.Dual` for autodiff `loglikelihood`), constructing
-    the PDMat directly with `WT`-typed factors avoids the
-    `convert(::Type{PDMat{WT}}, ::PDMat{T})` fallback that requires a
-    single-arg `Cholesky{WT}(::Cholesky{T})` method — present in
-    Julia 1.12 but not Julia 1.10's stdlib `LinearAlgebra`.
-    =#
-    R_w = convert(Matrix{WT}, R)
-    Q_w = convert(Matrix{WT}, Q)
-    P0_w = convert(Matrix{WT}, P0)
-    cc.R_PD = PDMat(Symmetrize!(R_w))
-    cc.Q_PD = PDMat(Symmetrize!(Q_w))
-    cc.P0_PD = PDMat(Symmetrize!(P0_w))
-    Rchol = cc.R_PD.chol
-    Qchol = cc.Q_PD.chol
-    P0chol = cc.P0_PD.chol
-
-    # tmp_RC = R^{-1} C
-    copyto!(cc.tmp_RC, C)
-    ldiv!(Rchol, cc.tmp_RC)
-    copyto!(cc.C_inv_R, cc.tmp_RC')
-
-    # tmp_QA = Q^{-1} A
-    copyto!(cc.tmp_QA, A)
-    ldiv!(Qchol, cc.tmp_QA)
-    copyto!(cc.A_inv_Q, cc.tmp_QA')
-    copyto!(cc.H_sub_entry, cc.tmp_QA)
-    copyto!(cc.H_super_entry, cc.tmp_QA')
-
-    # yt_given_xt = -C' * (R^{-1} C)
-    mul!(cc.yt_given_xt, C', cc.tmp_RC)
-    cc.yt_given_xt .*= -one(T)
-
-    # xt_given_xt_1 = -Q^{-1}
-    copyto!(cc.xt_given_xt_1, cc.I_mat)
-    ldiv!(Qchol, cc.xt_given_xt_1)
-    cc.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q^{-1} A)
-    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
-    cc.xt1_given_xt .*= -one(T)
-
-    # x_t = -P0^{-1}
-    copyto!(cc.x_t, cc.I_mat)
-    ldiv!(P0chol, cc.x_t)
-    cc.x_t .*= -one(T)
-
-    # Log-likelihood normalizers (consumed by the likelihood kernels)
-    latent_dim = lds.latent_dim
-    obs_dim = lds.obs_dim
-    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
-    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
-    cc.cR = -WT(0.5) * (WT(obs_dim) * log(WT(2π)) + logdet(cc.R_PD))
-
-    return nothing
-end
-
-function compute_smooth_constants!(
-    cc::SmoothConstants{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-    A = lds.state_model.A
-    Q = lds.state_model.Q
-    P0 = lds.state_model.P0
-
-    #=
-    Wrap state-side covariances as PDMats (the Poisson emission has no
-    covariance, so R_PD stays on its identity placeholder). See the
-    Gaussian overload for the `convert` rationale: it's a no-op when
-    `WT === T` and avoids a Julia 1.10 `Cholesky` convert-method gap
-    when `WT !== T` (ForwardDiff path).
-    =#
-    Q_w = convert(Matrix{WT}, Q)
-    P0_w = convert(Matrix{WT}, P0)
-    cc.Q_PD = PDMat(Symmetrize!(Q_w))
-    cc.P0_PD = PDMat(Symmetrize!(P0_w))
-    Q_chol = cc.Q_PD.chol
-    P0_chol = cc.P0_PD.chol
-
-    # Gradient terms: A_inv_Q = (Q_chol \ A)'
-    copyto!(cc.tmp_QA, A)
-    ldiv!(Q_chol, cc.tmp_QA)
-    copyto!(cc.A_inv_Q, cc.tmp_QA')
-
-    # Hessian block templates for state model
-    copyto!(cc.H_sub_entry, cc.tmp_QA)          # Q_chol \ A
-    copyto!(cc.H_super_entry, cc.tmp_QA')       # (Q_chol \ A)'
-
-    # xt_given_xt_1 = -(Q_chol \ I) = -Q^{-1}
-    copyto!(cc.xt_given_xt_1, cc.I_mat)
-    ldiv!(Q_chol, cc.xt_given_xt_1)
-    cc.xt_given_xt_1 .*= -one(T)
-
-    # xt1_given_xt = -A' * (Q_chol \ A)
-    mul!(cc.xt1_given_xt, A', cc.tmp_QA)
-    cc.xt1_given_xt .*= -one(T)
-
-    # x_t = -(P0_chol \ I) = -P0^{-1}
-    copyto!(cc.x_t, cc.I_mat)
-    ldiv!(P0_chol, cc.x_t)
-    cc.x_t .*= -one(T)
-
-    # Emission-side templates are x-dependent for Poisson; zero the cached
-    # Gaussian ones so no stale values survive an observation-model switch.
-    fill!(cc.yt_given_xt, zero(WT))
-    fill!(cc.C_inv_R, zero(WT))
-
-    # Log-likelihood normalizers. No R term for Poisson observations.
-    latent_dim = lds.latent_dim
-    cc.cP0 = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.P0_PD))
-    cc.cQ = -WT(0.5) * (WT(latent_dim) * log(WT(2π)) + logdet(cc.Q_PD))
-    cc.cR = zero(WT)
-
+) where {WT<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    _compute_state_constants!(cc, lds.state_model)
+    _compute_obs_constants!(cc, lds.obs_model)
     return nothing
 end
 
 function compute_smooth_constants!(
     ws::SmoothWorkspace{WT}, lds::LinearDynamicalSystem{T,S,O}
-) where {WT<:Real,T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {WT<:Real,T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     return compute_smooth_constants!(ws.consts, lds)
 end
 
@@ -712,6 +778,30 @@ function _copy_smooth_constants!(
 end
 
 """
+    ObsScratch{T}
+
+One observation model's cached constants and emission-sized scratch, for a
+regime of an SLDS whose emission is a [`CompositeObservationModel`](@ref).
+
+The single-LDS path gets the same thing from a per-member sub-`SmoothWorkspace`;
+an SLDS cannot, because a sub-workspace carries block-tridiagonal storage and
+there would be one per regime *and* member. Only the emission half is ever
+needed — the state constants are the regime's, on `SLDSSmoothWorkspace.consts[k]`
+— so this holds exactly that.
+"""
+struct ObsScratch{T<:Real}
+    consts::SmoothConstants{T}
+    buf1::Vector{T}
+    buf2::Vector{T}
+end
+
+function ObsScratch(::Type{T}, latent_dim::Int, obs_dim::Int) where {T<:Real}
+    return ObsScratch{T}(
+        SmoothConstants(T, latent_dim, obs_dim), zeros(T, obs_dim), zeros(T, obs_dim)
+    )
+end
+
+"""
     SLDSSmoothWorkspace{T}
 
 Workspace for SLDS smoothing that matches the LDS backend shape:
@@ -722,28 +812,63 @@ Workspace for SLDS smoothing that matches the LDS backend shape:
   single-LDS and SLDS paths use one set of field paths
 - `ll_tmp`: per-component log-likelihood scratch; the weighted accumulation
   across components needs a second `tsteps` buffer beside `opt.ll_vec`
-- `H_obs`: one regime's emission curvature for `_add_cov_correction!`; `btd`
-  holds the responsibility-weighted sum.
+- `H_obs`: one regime's un-weighted emission curvature at a single timestep
+  (`latent_dim × latent_dim`), which the weighted [`hessian!`](@ref) never
+  needs to isolate — it scatters straight into `btd.H_diag`
+- `poisson`: batched Poisson scratch, allocated on first use exactly as
+  `SmoothWorkspace`'s is. One buffer serves every regime — the emission
+  curvature is formed and scattered one regime at a time, and each kernel takes
+  leading views, so one buffer grown to the widest emission also serves every
+  member of a composite.
+- `obs`: per-regime, per-member [`ObsScratch`](@ref) for a composite emission,
+  or `nothing` for a single one.
 """
-struct SLDSSmoothWorkspace{T<:Real}
-    btd::BlockTridiagonalWorkspace{T}
-    consts::Vector{SmoothConstants{T}}
-    opt::NewtonBuffers{T}
-    ll_tmp::Vector{T}   # per-component scratch (length tsteps)
-    H_obs::Matrix{T}    # per-component emission curvature (latent_dim × latent_dim)
+mutable struct SLDSSmoothWorkspace{T<:Real}
+    const btd::BlockTridiagonalWorkspace{T}
+    const consts::Vector{SmoothConstants{T}}
+    const opt::NewtonBuffers{T}
+    const ll_tmp::Vector{T}   # per-component scratch (length tsteps)
+    const H_obs::Matrix{T}    # one regime's emission curvature at one t
+    poisson::Union{Nothing,PoissonBatchBuffers{T}}
+    const obs::Union{Nothing,Vector{Vector{ObsScratch{T}}}}  # [regime][member]
+end
+
+"""
+    _slds_obs_scratch(::Type{T}, slds) -> Vector{Vector{ObsScratch{T}}} or nothing
+
+Per-regime, per-member emission scratch for an SLDS with a composite emission;
+`nothing` when every regime has a single observation model.
+"""
+_slds_obs_scratch(::Type{T}, ::SLDS) where {T<:Real} = nothing
+
+function _slds_obs_scratch(
+    ::Type{T}, slds::SLDS{T0,S,O}
+) where {T<:Real,T0<:Real,S<:AbstractStateModel,O<:CompositeObservationModel}
+    latent_dim = slds.LDSs[1].latent_dim
+    return [
+        [ObsScratch(T, latent_dim, _obs_dim(m)) for m in values(_models(lds.obs_model))] for
+        lds in slds.LDSs
+    ]
 end
 
 function SLDSSmoothWorkspace(::Type{T}, slds::SLDS, tsteps::Int) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
-    obs_dim = slds.LDSs[1].obs_dim
+    #=
+    A composite emission keeps everything `obs_dim`-shaped on the per-member
+    scratch below, so the regime-level buffers are built at width zero — the
+    same split the single-LDS workspace makes.
+    =#
+    obs_dim = _ws_obs_dim(slds.LDSs[1])
     K = length(slds.LDSs)
 
     ws = SLDSSmoothWorkspace{T}(
         BlockTridiagonalWorkspace(T, latent_dim, tsteps),
         [SmoothConstants(T, latent_dim, obs_dim) for _ in 1:K],
         NewtonBuffers(T, latent_dim, obs_dim, tsteps),
-        zeros(T, tsteps),                  # ll_tmp
-        zeros(T, latent_dim, latent_dim),  # H_obs
+        zeros(T, tsteps),                # ll_tmp
+        zeros(T, latent_dim, latent_dim), # H_obs
+        nothing,                         # batched Poisson scratch, on first use
+        _slds_obs_scratch(T, slds),      # per-regime, per-member emission scratch
     )
 
     # Cache constants once
@@ -758,10 +883,62 @@ Must be called before the next E-step so that Cholesky factors, Hessian template
 reflect the current Q, R, A, P0.
 """
 function refresh_slds_constants!(ws::SLDSSmoothWorkspace{T}, slds) where {T}
+    obs = ws.obs
     for k in eachindex(slds.LDSs)
-        compute_smooth_constants!(ws.consts[k], slds.LDSs[k])
+        if obs === nothing
+            compute_smooth_constants!(ws.consts[k], slds.LDSs[k])
+        else
+            lds_k = slds.LDSs[k]
+            _compute_composite_constants!(
+                ws.consts[k],
+                [sc.consts for sc in obs[k]],
+                lds_k.state_model,
+                lds_k.obs_model,
+            )
+        end
     end
     return nothing
+end
+
+"""
+    _regime_obs(ws, k)
+
+Regime `k`'s per-member emission scratch, or `nothing` for a single emission.
+"""
+@inline _regime_obs(ws::SLDSSmoothWorkspace, k::Int) =
+    ws.obs === nothing ? nothing : ws.obs[k]
+
+"""
+    poisson_batch!(sws, latent_dim, obs_dim, tsteps) -> PoissonBatchBuffers
+
+The workspace's batched Poisson scratch, grown on demand. Allocated on first
+use rather than in the constructor: a Gaussian fit never calls a Poisson kernel,
+and the buffers are O(obs_dim · tsteps), which is the largest single block a
+workspace holds. Serves the single-LDS and the SLDS workspaces alike.
+
+Reallocates only when the request exceeds what is already there, so within a
+fit this is one allocation on the first Newton step and a field read after.
+"""
+function poisson_batch!(
+    sws::Union{SmoothWorkspace{T},SLDSSmoothWorkspace{T}},
+    latent_dim::Int,
+    obs_dim::Int,
+    tsteps::Int,
+) where {T<:Real}
+    pb = sws.poisson
+    if pb === nothing ||
+        pb.latent_dim != latent_dim ||
+        pb.obs_dim < obs_dim ||
+        pb.tsteps < tsteps
+        pb = PoissonBatchBuffers(
+            T,
+            latent_dim,
+            pb === nothing ? obs_dim : max(obs_dim, pb.obs_dim),
+            pb === nothing ? tsteps : max(tsteps, pb.tsteps),
+        )
+        sws.poisson = pb
+    end
+    return pb
 end
 
 # =============================================================================
@@ -787,7 +964,7 @@ Initialize a per-trial `FilterSmooth` buffer sized for `tsteps` timesteps.
 """
 function initialize_FilterSmooth(
     model::LinearDynamicalSystem{T,S,O}, tsteps::Int; cov_alias::Bool=false
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = model.latent_dim
     if cov_alias
         p_smooth = zeros(T, 0, 0, 0)
@@ -829,7 +1006,7 @@ function initialize_FilterSmooth(
     model::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     cov_alias::Bool=false,
-) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     # if tsteps_per_trial has varying lengths, we can't alias the cov caches to a shared zero-array
     if cov_alias && length(unique(tsteps_per_trial)) != 1
         throw(

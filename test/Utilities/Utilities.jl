@@ -169,6 +169,35 @@ function test_block_tridiagonal_inverse_logdet()
         rows = ((i - 1) * block_size + 1):(i * block_size)
         @test isapprox(p_smooth[:, :, i], Hinv[rows, rows]; atol=1e-8, rtol=0)
     end
+
+    # The first off-diagonal blocks feed the cross-covariance sufficient
+    # statistic, so they are as load-bearing as the diagonal ones.
+    for i in 2:n
+        rows = ((i - 1) * block_size + 1):(i * block_size)
+        cols = ((i - 2) * block_size + 1):((i - 1) * block_size)
+        @test isapprox(p_smooth_tt1[:, :, i], Hinv[rows, cols]; atol=1e-8, rtol=0)
+    end
+
+    # A long, narrow system is the shape the smoother actually runs on, and the
+    # backward recursion accumulates over its whole length.
+    let bs = 4, m = 60
+        A2, B2, C2, H2 = _random_spd_block_tridiag(T, bs, m, MersenneTwister(99))
+        ws2 = StateSpaceDynamics.BlockTridiagonalWorkspace(T, bs, m)
+        ps2 = zeros(T, bs, bs, m)
+        pt2 = zeros(T, bs, bs, m)
+        ld2 = StateSpaceDynamics.block_tridiagonal_inverse_logdet!(
+            ps2, pt2, A2, B2, C2, ws2
+        )
+        H2inv = inv(H2)
+        @test isapprox(ld2, logdet(H2); rtol=1e-10)
+        for i in 1:m
+            rows = ((i - 1) * bs + 1):(i * bs)
+            @test isapprox(ps2[:, :, i], H2inv[rows, rows]; atol=1e-9, rtol=0)
+            i == 1 && continue
+            cols = ((i - 2) * bs + 1):((i - 1) * bs)
+            @test isapprox(pt2[:, :, i], H2inv[rows, cols]; atol=1e-9, rtol=0)
+        end
+    end
 end
 
 function test_block_tridiagonal_solve()

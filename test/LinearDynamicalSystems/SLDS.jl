@@ -1158,12 +1158,8 @@ function test_SLDS_mstep_updates_parameters(; rng=MersenneTwister(0xC0FFEE))
 
     A_old = copy(slds.A)
 
-    data = StateSpaceDynamics.Data(slds.LDSs[1], y)
-    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
-        Float64, slds.LDSs[1], data.tsteps
-    )
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, data, suf, sws; obs_seq=obs_seq, seq_ends=seq_ends
+        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
     )
 
     # Check parameters changed (with high probability)
@@ -1433,12 +1429,12 @@ function test_SLDS_public_elbo(; rng=MersenneTwister(0xE1B0))
         slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
         z, x, y = rand(rng, slds, fill(tsteps, ntrials))
 
-        # Post-fit inference is deterministic.
+        # Deterministic: no rng, so repeated calls agree exactly.
         e = StateSpaceDynamics.elbo(slds, y)
         @test isfinite(e)
         @test e == StateSpaceDynamics.elbo(slds, y)
 
-        # Matrix and one-element vector inputs describe the same trial.
+        # Shape invariance (single trial: matrix == [matrix]).
         e_mat = StateSpaceDynamics.elbo(slds, y[1])
         e_vec = StateSpaceDynamics.elbo(slds, [y[1]])
         @test isapprox(e_mat, e_vec; rtol=1e-10)
@@ -1482,7 +1478,7 @@ function test_SLDS_fit_shapes_and_validation(; rng=MersenneTwister(0xE1B1))
             deepcopy(slds), y_bad; max_iter=1, progress=false
         )
 
-        # SLDS loglikelihood reports the variational bound.
+        # Marginal loglikelihood is intractable for an SLDS, so this is the ELBO.
         @test loglikelihood(slds, y) == StateSpaceDynamics.elbo(slds, y)
     end
     return nothing
@@ -1503,18 +1499,18 @@ function test_SLDS_smooth_infer_basic(; rng=MersenneTwister(0xACE0))
 
     post = smooth(slds, y; smoothing_iters=50, tol=1e-8)
 
-    # Multi-trial input returns one responsibility matrix per trial.
+    # Multi-trial input ⇒ one K × T responsibility matrix per trial.
     @test post.γ isa Vector{Matrix{Float64}}
     @test length(post.γ) == ntrials
     for trial in 1:ntrials
         @test size(post.γ[trial]) == (K, tsteps)
         @test all(isfinite, post.γ[trial])
         @test all(post.γ[trial] .>= 0)
-        # Each column is a probability vector over regimes.
+        # Each column is a probability vector over the K discrete states.
         @test all(isapprox.(sum(post.γ[trial]; dims=1), 1.0; atol=1e-10))
     end
 
-    # Covariances are opt-in.
+    # Smoothed means come back per trial; covariances are opt-in.
     @test post.x isa Vector{Matrix{Float64}}
     @test all(size(post.x[trial]) == (latent_dim, tsteps) for trial in 1:ntrials)
     @test post.p === nothing
@@ -1533,7 +1529,7 @@ function test_SLDS_smooth_infer_shapes(; rng=MersenneTwister(0xACE1))
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
     z, x, y = rand(rng, slds, fill(tsteps, ntrials))
 
-    # A single-trial matrix returns bare arrays.
+    # Single-trial matrix ⇒ bare arrays; wrapping in a vector ⇒ 1-element vectors.
     post_mat = smooth(slds, y[1])
     @test post_mat.γ isa Matrix{Float64}
     @test size(post_mat.γ) == (K, tsteps)
@@ -1547,7 +1543,7 @@ function test_SLDS_smooth_infer_shapes(; rng=MersenneTwister(0xACE1))
     @test post_vec1.x[1] ≈ post_mat.x
     @test post_vec1.elbo ≈ post_mat.elbo
 
-    # 3-D arrays and vectors of matrices agree for equal-length trials.
+    # 3-D array and vector-of-matrices forms agree (equal trial lengths).
     Y3 = cat(y...; dims=3)
     post_v = smooth(slds, y)
     post_a = smooth(slds, Y3)
@@ -1558,7 +1554,7 @@ function test_SLDS_smooth_infer_shapes(; rng=MersenneTwister(0xACE1))
     end
     @test post_v.elbo ≈ post_a.elbo
 
-    # NamedTuple outputs can still be destructured positionally.
+    # Positional destructuring still works, mirroring `smooth(lds, y)`.
     x_out, γ_out = smooth(slds, y[1])
     @test x_out ≈ post_mat.x
     @test γ_out ≈ post_mat.γ
@@ -1576,19 +1572,22 @@ function test_SLDS_smooth_infer_deterministic_and_modes(; rng=MersenneTwister(0x
     slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
     z, x, y = rand(rng, slds, fill(tsteps, 1))
 
-    # Repeated calls are bit-identical.
+    # Deterministic: repeated calls give bit-identical results (no RNG involved).
     p1 = smooth(slds, y[1]; smoothing_iters=50, tol=1e-10)
     p2 = smooth(slds, y[1]; smoothing_iters=50, tol=1e-10)
     @test p1.γ == p2.γ
     @test p1.x == p2.x
     @test p1.elbo == p2.elbo
 
-    # `tol=0` disables early stopping.
+    # tol=0 runs exactly `smoothing_iters` alternations and returns valid γ.
     γ_fixed = smooth(slds, y[1]; smoothing_iters=3, tol=0).γ
     @test size(γ_fixed) == (K, tsteps)
     @test all(isapprox.(sum(γ_fixed; dims=1), 1.0; atol=1e-10))
 
-    # Early stopping and a fixed iteration budget should reach the same fixed point.
+    #=
+    Early-stopping soundness: iterating "until convergence" must land on the
+    same fixed point as running many fixed iterations without a stopping test.
+    =#
     γ_conv = smooth(slds, y[1]; smoothing_iters=500, tol=1e-12).γ
     γ_full = smooth(slds, y[1]; smoothing_iters=500, tol=0).γ
     @test maximum(abs.(γ_conv .- γ_full)) < 1e-8
@@ -1596,7 +1595,7 @@ function test_SLDS_smooth_infer_deterministic_and_modes(; rng=MersenneTwister(0x
 end
 
 function test_SLDS_smooth_infer_K1(; rng=MersenneTwister(0xACE3))
-    # With one regime every responsibility is one.
+    # K = 1: q(z) is degenerate, so every responsibility must be exactly 1.
     latent_dim = 2
     obs_dim = 3
     tsteps = 15
@@ -1615,7 +1614,9 @@ function test_SLDS_smooth_infer_K1(; rng=MersenneTwister(0xACE3))
 end
 
 function test_SLDS_smooth_infer_recovers_distinct_regimes(; rng=MersenneTwister(0xACE4))
-    # Separate the regimes with large, opposite emission offsets.
+    # Two regimes with well-separated emission offsets d so the observation
+    # distributions barely overlap; passing the true (i.e. "fitted") model,
+    # smooth should recover the discrete states almost perfectly.
     K = 2
     latent_dim = 2
     obs_dim = 3
@@ -1626,7 +1627,7 @@ function test_SLDS_smooth_infer_recovers_distinct_regimes(; rng=MersenneTwister(
     b = zeros(latent_dim)
     x0 = zeros(latent_dim)
     P0 = Matrix(1.0 * I(latent_dim))
-    C = Matrix{Float64}(0.1I, obs_dim, latent_dim)
+    C = Matrix{Float64}(0.1I, obs_dim, latent_dim)  # small C: emission dominated by d
     R = Matrix(0.05 * I(obs_dim))
 
     sm1 = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0)
@@ -1649,6 +1650,7 @@ function test_SLDS_smooth_infer_recovers_distinct_regimes(; rng=MersenneTwister(
         fit_bool=fill(true, 6),
     )
 
+    # Sticky discrete transitions so regimes persist over several timesteps.
     A_disc = [0.95 0.05; 0.05 0.95]
     slds = SLDS(; A=A_disc, πₖ=[0.5, 0.5], LDSs=[lds1, lds2])
 
@@ -1674,7 +1676,7 @@ function test_SLDS_smooth_infer_cov_and_elbo(; rng=MersenneTwister(0xACE5))
         slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
         z, x, y = rand(rng, slds, fill(tsteps, ntrials))
 
-        # Covariances are returned only when requested.
+        # Covariances are opt-in, and valid when requested.
         post = smooth(slds, y; smoothing_iters=25, tol=1e-9, return_cov=true)
         @test post.p isa Vector{Array{Float64,3}}
         @test length(post.p) == ntrials
@@ -1687,12 +1689,157 @@ function test_SLDS_smooth_infer_cov_and_elbo(; rng=MersenneTwister(0xACE5))
             end
         end
 
-        # A single trial returns one covariance array rather than a vector.
+        # Single-trial matrix ⇒ bare 3-D array.
         @test smooth(slds, y[1]; return_cov=true).p isa Array{Float64,3}
 
+        #=
+        There is one ELBO implementation: `elbo` is exactly `smooth(...).elbo`
+        under matching settings, and `loglikelihood` is exactly `elbo`.
+        =#
         e = StateSpaceDynamics.elbo(slds, y; smoothing_iters=25, tol=1e-9)
         @test e == post.elbo
         @test loglikelihood(slds, y; smoothing_iters=25, tol=1e-9) == e
+    end
+    return nothing
+end
+
+function test_SLDS_loglikelihood_returns_elbo(; rng=MersenneTwister(0xACE6))
+    @testset "SLDS loglikelihood is the ELBO" begin
+        K = 2
+        latent_dim = 2
+        obs_dim = 3
+        tsteps = 15
+        ntrials = 2
+
+        lds = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=21)
+        slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
+        z, x, y = rand(rng, slds, fill(tsteps, ntrials))
+
+        ll = loglikelihood(slds, y)
+        @test isfinite(ll)
+        @test ll == StateSpaceDynamics.elbo(slds, y)
+
+        #=
+        K=1 Gaussian regime with no priors: q(z) is degenerate and q(x) is the
+        exact posterior, so the bound is tight — it equals the LDS marginal
+        log-likelihood computed by the Kalman filter.
+        =#
+        slds1 = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[deepcopy(lds)])
+        _, _, y1 = rand(rng, slds1, fill(tsteps, ntrials))
+        exact = sum(loglikelihood(lds, y1[trial]) for trial in 1:ntrials)
+        @test isapprox(loglikelihood(slds1, y1), exact; rtol=1e-6)
+    end
+    return nothing
+end
+
+function test_SLDS_fit_smoothing_iters(; rng=MersenneTwister(0xACE7))
+    K = 2
+    latent_dim = 2
+    obs_dim = 3
+    tsteps = 15
+    ntrials = 2
+
+    lds1 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=31)
+    lds2 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=32)
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
+    z, x, y = rand(rng, slds, fill(tsteps, ntrials))
+
+    #=
+    Build a fresh E-step state (storages + warm-start) from a fixed seed, so two
+    runs are comparable. Returns the pieces `estep!` needs.
+    =#
+    function fresh_estep_state(seed)
+        r = MersenneTwister(seed)
+        seq_ends = cumsum(fill(tsteps, ntrials))
+        total_T = last(seq_ends)
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(
+            slds.LDSs[1], fill(tsteps, ntrials)
+        )
+        dl = StateSpaceDynamics.SLDSDiscreteLayer(
+            slds.A, slds.πₖ, zeros(Float64, K, total_T)
+        )
+        fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
+        ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+        xs = [Array{Float64,3}(undef, latent_dim, tsteps, 1) for _ in 1:ntrials]
+        for trial in 1:ntrials
+            StateSpaceDynamics.smooth!(
+                slds,
+                tfs[trial],
+                y[trial],
+                fill(1.0 / K, K, tsteps);
+                ws=ws,
+                x_sample=xs[trial],
+                rng=r,
+            )
+        end
+        return (; r, seq_ends, total_T, tfs, dl, fb, ws, xs)
+    end
+
+    function run_estep!(st, iters)
+        StateSpaceDynamics.estep!(
+            slds,
+            st.tfs,
+            st.fb,
+            st.dl,
+            y,
+            st.xs,
+            st.ws;
+            rng=st.r,
+            obs_seq=collect(1:(st.total_T)),
+            control_seq=fill(nothing, st.total_T),
+            seq_ends=st.seq_ends,
+            smoothing_iters=iters,
+        )
+        return nothing
+    end
+
+    @testset "smoothing_iters" begin
+        #=
+        The alternation is a clean repetition of the single-alternation E-step:
+        `smoothing_iters=2` must land exactly where two successive
+        `smoothing_iters=1` calls do, given the same starting state and rng.
+        =#
+        one_then_one = fresh_estep_state(4242)
+        run_estep!(one_then_one, 1)
+        run_estep!(one_then_one, 1)
+
+        two_at_once = fresh_estep_state(4242)
+        run_estep!(two_at_once, 2)
+
+        @test two_at_once.fb.γ == one_then_one.fb.γ
+        for trial in 1:ntrials
+            @test two_at_once.tfs[trial].x_smooth == one_then_one.tfs[trial].x_smooth
+            @test two_at_once.xs[trial] == one_then_one.xs[trial]
+        end
+
+        # `fit!` threads the option through and still produces a finite trace.
+        e_default = fit!(
+            deepcopy(slds), y; max_iter=3, progress=false, rng=MersenneTwister(99)
+        )
+        e_explicit = fit!(
+            deepcopy(slds),
+            y;
+            max_iter=3,
+            smoothing_iters=1,
+            progress=false,
+            rng=MersenneTwister(99),
+        )
+        @test e_default == e_explicit
+
+        e_multi = fit!(
+            deepcopy(slds),
+            y;
+            max_iter=3,
+            smoothing_iters=3,
+            progress=false,
+            rng=MersenneTwister(99),
+        )
+        @test length(e_multi) == 3
+        @test all(isfinite, e_multi)
+
+        @test_throws ArgumentError fit!(
+            deepcopy(slds), y; max_iter=1, smoothing_iters=0, progress=false
+        )
     end
     return nothing
 end
@@ -1735,7 +1882,9 @@ function test_SLDS_num_samples(; rng=MersenneTwister(0xACEB))
         @test all(isfinite, e4)
         @test e4 != e1          # averaging changes the discrete update
 
-        @test_throws ArgumentError fit!(deepcopy(slds), y; max_iter=1, num_samples=0)
+        @test_throws ArgumentError fit!(
+            deepcopy(slds), y; max_iter=1, num_samples=0, progress=false
+        )
     end
 
     # Hold q(x) fixed and compare the spread across RNG seeds.
@@ -1752,9 +1901,24 @@ function test_SLDS_num_samples(; rng=MersenneTwister(0xACEB))
             )
             fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
             ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, maximum(data.tsteps))
+            # One workspace, one slot: the sequential equivalent of the pooled E-step.
+            pool = StateSpaceDynamics._slds_solo_pool(ws)
+            plan = StateSpaceDynamics._slds_trial_plan(nothing, ntrials, 1)
             xs = [Array{Float64,3}(undef, latent_dim, Ti, S) for Ti in data.tsteps]
-            StateSpaceDynamics._vem_warmstart!(
-                slds, tfs, data.y, ws; ux_seq=data.ux, uy_seq=data.uy, x_samples=xs, rng=r
+            StateSpaceDynamics._slds_warmstart!(
+                slds,
+                nothing,
+                nothing,
+                tfs,
+                data.y,
+                xs,
+                pool,
+                plan,
+                data.tsteps,
+                K;
+                rng=r,
+                ux=data.ux,
+                uy=data.uy,
             )
             StateSpaceDynamics.estep!(
                 slds,
@@ -1768,6 +1932,8 @@ function test_SLDS_num_samples(; rng=MersenneTwister(0xACEB))
                 obs_seq=collect(1:total_T),
                 control_seq=fill(nothing, total_T),
                 seq_ends=seq_ends,
+                ux=data.ux,
+                uy=data.uy,
                 smoothing_iters=1,
             )
             return copy(fb.γ)
@@ -1833,22 +1999,40 @@ function test_SLDS_cov_correction_matches_elbo_hessian(; rng=MersenneTwister(0xA
         dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(K, total_T))
         fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
         ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, maximum(data.tsteps))
+        pool = StateSpaceDynamics._slds_solo_pool(ws)
+        plan = StateSpaceDynamics._slds_trial_plan(nothing, ntrials, 1)
 
-        StateSpaceDynamics._vem_warmstart!(
-            slds, tfs, data.y, ws; ux_seq=data.ux, uy_seq=data.uy
+        # `x_samples = nothing` is the deterministic path, which is the one that
+        # carries the `½ tr(H Σ)` correction being checked here.
+        StateSpaceDynamics._slds_warmstart!(
+            slds,
+            nothing,
+            nothing,
+            tfs,
+            data.y,
+            nothing,
+            pool,
+            plan,
+            data.tsteps,
+            K;
+            ux=data.ux,
+            uy=data.uy,
         )
         StateSpaceDynamics._vem_alternate!(
             slds,
+            nothing,
+            nothing,
             tfs,
             fb,
             dl,
             data.y,
-            ws;
+            pool,
+            plan;
             obs_seq=collect(1:total_T),
             control_seq=fill(nothing, total_T),
             seq_ends=seq_ends,
-            ux_seq=data.ux,
-            uy_seq=data.uy,
+            ux=data.ux,
+            uy=data.uy,
             smoothing_iters=3,
             tol=0.0,
         )
@@ -1946,140 +2130,6 @@ function test_SLDS_smooth_given_w_validation(; rng=MersenneTwister(0xACEA))
     @test_throws DimensionMismatchError smooth(slds, y[1], fill(1.0 / K, K + 1, tsteps))
     @test_throws DimensionMismatchError smooth(slds, y[1], fill(1.0 / K, K, tsteps - 3))
     @test_throws ArgumentError smooth(slds, y[1], fill(5.0, K, tsteps))
-    return nothing
-end
-
-function test_SLDS_loglikelihood_returns_elbo(; rng=MersenneTwister(0xACE6))
-    @testset "SLDS loglikelihood is the ELBO" begin
-        K = 2
-        latent_dim = 2
-        obs_dim = 3
-        tsteps = 15
-        ntrials = 2
-
-        lds = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=21)
-        slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds, deepcopy(lds)])
-        z, x, y = rand(rng, slds, fill(tsteps, ntrials))
-
-        ll = loglikelihood(slds, y)
-        @test isfinite(ll)
-        @test ll == StateSpaceDynamics.elbo(slds, y)
-
-        #=
-        K=1 Gaussian regime with no priors: q(z) is degenerate and q(x) is the
-        exact posterior, so the bound is tight — it equals the LDS marginal
-        log-likelihood computed by the Kalman filter.
-        =#
-        slds1 = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[deepcopy(lds)])
-        _, _, y1 = rand(rng, slds1, fill(tsteps, ntrials))
-        exact = sum(loglikelihood(lds, y1[trial]) for trial in 1:ntrials)
-        @test isapprox(loglikelihood(slds1, y1), exact; rtol=1e-6)
-    end
-    return nothing
-end
-
-function test_SLDS_fit_smoothing_iters(; rng=MersenneTwister(0xACE7))
-    K = 2
-    latent_dim = 2
-    obs_dim = 3
-    tsteps = 15
-    ntrials = 2
-
-    lds1 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=31)
-    lds2 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=32)
-    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[lds1, lds2])
-    z, x, y = rand(rng, slds, fill(tsteps, ntrials))
-
-    # Fixed seeds give both paths the same warm start and samples.
-    function fresh_estep_state(seed)
-        r = MersenneTwister(seed)
-        seq_ends = cumsum(fill(tsteps, ntrials))
-        total_T = last(seq_ends)
-        tfs = StateSpaceDynamics.initialize_FilterSmooth(
-            slds.LDSs[1], fill(tsteps, ntrials)
-        )
-        dl = StateSpaceDynamics.SLDSDiscreteLayer(
-            slds.A, slds.πₖ, zeros(Float64, K, total_T)
-        )
-        fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
-        ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
-        xs = [Array{Float64,3}(undef, latent_dim, tsteps, 1) for _ in 1:ntrials]
-        for trial in 1:ntrials
-            StateSpaceDynamics.smooth!(
-                slds,
-                tfs[trial],
-                y[trial],
-                fill(1.0 / K, K, tsteps);
-                ws=ws,
-                x_sample=xs[trial],
-                rng=r,
-            )
-        end
-        return (; r, seq_ends, total_T, tfs, dl, fb, ws, xs)
-    end
-
-    function run_estep!(st, iters)
-        StateSpaceDynamics.estep!(
-            slds,
-            st.tfs,
-            st.fb,
-            st.dl,
-            y,
-            st.xs,
-            st.ws;
-            rng=st.r,
-            obs_seq=collect(1:(st.total_T)),
-            control_seq=fill(nothing, st.total_T),
-            seq_ends=st.seq_ends,
-            smoothing_iters=iters,
-        )
-        return nothing
-    end
-
-    @testset "smoothing_iters" begin
-        # Two alternations at once equal two successive one-step calls.
-        one_then_one = fresh_estep_state(4242)
-        run_estep!(one_then_one, 1)
-        run_estep!(one_then_one, 1)
-
-        two_at_once = fresh_estep_state(4242)
-        run_estep!(two_at_once, 2)
-
-        @test two_at_once.fb.γ == one_then_one.fb.γ
-        for trial in 1:ntrials
-            @test two_at_once.tfs[trial].x_smooth == one_then_one.tfs[trial].x_smooth
-            @test two_at_once.xs[trial] == one_then_one.xs[trial]
-        end
-
-        # The default remains one alternation.
-        e_default = fit!(
-            deepcopy(slds), y; max_iter=3, progress=false, rng=MersenneTwister(99)
-        )
-        e_explicit = fit!(
-            deepcopy(slds),
-            y;
-            max_iter=3,
-            smoothing_iters=1,
-            progress=false,
-            rng=MersenneTwister(99),
-        )
-        @test e_default == e_explicit
-
-        e_multi = fit!(
-            deepcopy(slds),
-            y;
-            max_iter=3,
-            smoothing_iters=3,
-            progress=false,
-            rng=MersenneTwister(99),
-        )
-        @test length(e_multi) == 3
-        @test all(isfinite, e_multi)
-
-        @test_throws ArgumentError fit!(
-            deepcopy(slds), y; max_iter=1, smoothing_iters=0, progress=false
-        )
-    end
     return nothing
 end
 
@@ -2713,12 +2763,8 @@ function test_SLDS_mstep_updates_parameters_poisson(; rng=MersenneTwister(0xC0FF
         seq_ends=seq_ends,
     )
 
-    data = StateSpaceDynamics.Data(slds.LDSs[1], y)
-    suf = StateSpaceDynamics._initialize_td_sufficient_statistics(
-        Float64, slds.LDSs[1], data.tsteps
-    )
     StateSpaceDynamics.mstep!(
-        slds, tfs, fb_storage, dl, data, suf, sws; obs_seq=obs_seq, seq_ends=seq_ends
+        slds, tfs, fb_storage, dl, y, sws; obs_seq=obs_seq, seq_ends=seq_ends
     )
 
     for k in 1:K
@@ -2884,6 +2930,565 @@ function _make_poisson_input_lds(D, N, ux_dim, uy_dim; seed::Int=0)
     gsm = GaussianStateModel(; A=A, Q=Q, b=b, x0=x0, P0=P0, B=B)
     pom = PoissonObservationModel(; C=C, d=d, D=Dm)
     return LinearDynamicalSystem(gsm, pom; fit_bool=fill(true, 5))
+end
+
+# ============================================================================
+# Tied parameters across regimes (`tied_params`) and the posterior API
+# ============================================================================
+
+"""K regimes with genuinely distinct parameters (not `fill`, which aliases)."""
+function _distinct_poisson_slds(K::Int, latent_dim::Int, obs_dim::Int)
+    ldss = [_make_poisson_lds_dense(latent_dim, obs_dim; seed=10 + k) for k in 1:K]
+    return SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=ldss)
+end
+
+function _distinct_gaussian_slds(K::Int, latent_dim::Int, obs_dim::Int)
+    ldss = [_make_gaussian_lds_dense(latent_dim, obs_dim; seed=20 + k) for k in 1:K]
+    return SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=ldss)
+end
+
+function test_SLDS_batched_poisson_hessian(; rng=MersenneTwister(0x71F7))
+    @testset "batched SLDS Poisson emission Hessian" begin
+        #=
+        The SLDS `hessian!` forms each regime's emission curvature
+        `-γₖ(t)·C' diag(λₜ) C` for the whole trial as one gemm. That has to agree
+        with the per-timestep `observation_hessian!` kernel it replaced, which is
+        still the interface a new observation model implements — and the weights
+        have to land on the right timesteps, which a uniform `γ` would not catch.
+        =#
+        K, latent_dim, obs_dim, tsteps = 3, 4, 8, 12
+        slds = _distinct_poisson_slds(K, latent_dim, obs_dim)
+        x = 0.4 .* randn(rng, latent_dim, tsteps)
+        y = Float64.(rand(rng, 0:3, obs_dim, tsteps))
+        w = rand(rng, K, tsteps)
+        w ./= sum(w; dims=1)
+
+        ref = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+        StateSpaceDynamics.hessian!(ref, slds, x, y, w)
+        #=
+        Undo the batched emission block one regime at a time and put the
+        per-timestep kernel's back, so what is left is exactly the difference
+        between the two emission kernels.
+        =#
+        for k in 1:K, t in 1:tsteps
+            StateSpaceDynamics.observation_hessian!(
+                ref.btd.H_diag[t],
+                ref.consts[k],
+                ref.opt.dyt,
+                ref.opt.temp_dy,
+                slds.LDSs[k].obs_model,
+                x,
+                y,
+                t,
+                -w[k, t],          # negated: removes the batched contribution
+                nothing,
+            )
+            StateSpaceDynamics.observation_hessian!(
+                ref.btd.H_diag[t],
+                ref.consts[k],
+                ref.opt.dyt,
+                ref.opt.temp_dy,
+                slds.LDSs[k].obs_model,
+                x,
+                y,
+                t,
+                w[k, t],
+                nothing,
+            )
+        end
+
+        ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, tsteps)
+        StateSpaceDynamics.hessian!(ws, slds, x, y, w)
+
+        scale = maximum(maximum(abs, H) for H in ref.btd.H_diag)
+        @test maximum(
+            maximum(abs, ref.btd.H_diag[t] .- ws.btd.H_diag[t]) for t in 1:tsteps
+        ) < 1e-10 * scale
+        # Only the diagonal blocks carry emission curvature.
+        @test all(ref.btd.H_sub[i] == ws.btd.H_sub[i] for i in 1:(tsteps - 1))
+        @test all(ref.btd.H_super[i] == ws.btd.H_super[i] for i in 1:(tsteps - 1))
+        @test all(issymmetric(Symmetric(H)) for H in ws.btd.H_diag)
+
+        # `Tsteps == 1` takes its own branch through the state blocks.
+        ws1 = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, 1)
+        StateSpaceDynamics.hessian!(ws1, slds, x[:, 1:1], y[:, 1:1], w[:, 1:1])
+        @test all(isfinite, ws1.btd.H_diag[1])
+        @test issymmetric(Symmetric(ws1.btd.H_diag[1]))
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_poisson(; rng=MersenneTwister(0x71ED))
+    K, latent_dim, obs_dim = 2, 2, 4
+
+    truth = _distinct_poisson_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(25, 4))
+
+    fitted = _distinct_poisson_slds(K, latent_dim, obs_dim)
+    C_start = copy(fitted.LDSs[1].obs_model.C)
+    # The regimes start from different emissions, so a tie that did nothing
+    # would be visible immediately.
+    @test !(fitted.LDSs[2].obs_model.C ≈ fitted.LDSs[1].obs_model.C)
+
+    elbos = fit!(
+        fitted, y; max_iter=4, progress=false, tied_params=(:C, :d), rng=MersenneTwister(1)
+    )
+    @test length(elbos) == 4
+    @test all(isfinite, elbos)
+
+    # One emission for every regime ...
+    for k in 2:K
+        @test fitted.LDSs[k].obs_model.C ≈ fitted.LDSs[1].obs_model.C
+        @test fitted.LDSs[k].obs_model.d ≈ fitted.LDSs[1].obs_model.d
+    end
+    # ... and it was fitted, not merely copied from regime 1's starting values.
+    @test !(fitted.LDSs[1].obs_model.C ≈ C_start)
+
+    # The dynamics still switch.
+    @test !(fitted.LDSs[2].state_model.A ≈ fitted.LDSs[1].state_model.A)
+
+    return nothing
+end
+
+function test_SLDS_tied_params_gaussian(; rng=MersenneTwister(0x71EE))
+    K, latent_dim, obs_dim = 2, 2, 3
+
+    truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(30, 4))
+
+    fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    elbos = fit!(
+        fitted,
+        y;
+        max_iter=4,
+        progress=false,
+        tied_params=(:C, :d, :R),
+        rng=MersenneTwister(2),
+    )
+    @test all(isfinite, elbos)
+
+    for k in 2:K
+        @test fitted.LDSs[k].obs_model.C ≈ fitted.LDSs[1].obs_model.C
+        @test fitted.LDSs[k].obs_model.d ≈ fitted.LDSs[1].obs_model.d
+        # The noise covariance belongs to the emission, so it is tied too.
+        @test fitted.LDSs[k].obs_model.R ≈ fitted.LDSs[1].obs_model.R
+    end
+    @test isposdef(fitted.LDSs[1].obs_model.R)
+
+    return nothing
+end
+
+function test_SLDS_tied_params_respects_fit_bool(; rng=MersenneTwister(0x71EF))
+    K, latent_dim, obs_dim = 2, 2, 3
+
+    truth = _distinct_poisson_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(20, 3))
+
+    frozen = _distinct_poisson_slds(K, latent_dim, obs_dim)
+    for lds in frozen.LDSs
+        lds.fit_bool[5] = false      # [x0, P0, A&b, Q, C&d]
+    end
+    C1, C2 = copy(frozen.LDSs[1].obs_model.C), copy(frozen.LDSs[2].obs_model.C)
+
+    fit!(
+        frozen, y; max_iter=2, progress=false, tied_params=(:C, :d), rng=MersenneTwister(3)
+    )
+
+    # A frozen emission is the caller's, per regime: the tie neither fits it nor
+    # overwrites regime 2's with regime 1's.
+    @test frozen.LDSs[1].obs_model.C ≈ C1
+    @test frozen.LDSs[2].obs_model.C ≈ C2
+
+    return nothing
+end
+
+"""The canonical groups a `tied_params` spec covers (these models carry no inputs)."""
+function _group_of(tied)
+    names = tied isa Symbol ? (tied,) : tied
+    groups = Symbol[]
+    (:A in names && :b in names) && push!(groups, :A)
+    (:C in names && :d in names) && push!(groups, :C)
+    :Q in names && push!(groups, :Q)
+    :R in names && push!(groups, :R)
+    return groups
+end
+
+"""Whether the two regimes agree on one individual parameter."""
+function _regimes_agree_on(slds, name::Symbol)
+    a, b = slds.LDSs[1], slds.LDSs[2]
+    name in (:A, :b, :Q) &&
+        return getfield(a.state_model, name) ≈ getfield(b.state_model, name)
+    return getfield(a.obs_model, name) ≈ getfield(b.obs_model, name)
+end
+
+"""Whether the two regimes agree on one canonical parameter group."""
+function _regimes_agree(slds, group::Symbol)
+    a, b = slds.LDSs[1], slds.LDSs[2]
+    group === :A &&
+        return a.state_model.A ≈ b.state_model.A && a.state_model.b ≈ b.state_model.b
+    group === :Q && return a.state_model.Q ≈ b.state_model.Q
+    group === :C && return a.obs_model.C ≈ b.obs_model.C && a.obs_model.d ≈ b.obs_model.d
+    group === :R && return a.obs_model.R ≈ b.obs_model.R
+    return error("unknown group $group")
+end
+
+function test_SLDS_tied_params_canonicalization()
+    @testset "tied_params names" begin
+        sm = _make_gaussian_lds_dense(2, 3; seed=1).state_model
+        gom = _make_gaussian_lds_dense(2, 3; seed=1).obs_model
+        pom = _make_poisson_lds_dense(2, 3; seed=1).obs_model
+        resolve(om, tp) = StateSpaceDynamics._resolve_tied_params(sm, om, tp)
+
+        @test resolve(gom, nothing) == Symbol[]
+
+        # Names mean themselves: `:C` is `C`, not `[C d D]`.
+        @test resolve(gom, :C) == [:C]
+        @test resolve(gom, :d) == [:d]
+        @test resolve(gom, :A) == [:A]
+        @test resolve(gom, :b) == [:b]
+
+        # Collections, in the caller's order, deduplicated.
+        @test resolve(gom, (:C, :d, :R)) == [:C, :d, :R]
+        @test resolve(gom, [:R, :A]) == [:R, :A]
+        @test resolve(gom, (:C, :C, :d)) == [:C, :d]
+
+        # x0/P0 are always tied, so they are accepted and dropped.
+        @test resolve(gom, :x0) == Symbol[]
+        @test resolve(gom, (:x0, :P0, :Q)) == [:Q]
+
+        # A Poisson emission has no noise covariance.
+        @test resolve(pom, :C) == [:C]
+        @test_throws ArgumentError resolve(pom, :R)
+
+        @test_throws ArgumentError resolve(gom, :nope)
+        @test_throws ArgumentError resolve(gom, ("C",))
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_each_group(; rng=MersenneTwister(0x71F0))
+    @testset "tied_params ties exactly the named group" begin
+        K, latent_dim, obs_dim = 2, 2, 3
+        truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        _, _, y = rand(rng, truth, fill(30, 4))
+
+        # Nothing tied: the regimes were seeded apart and stay apart, so an
+        # agreement below really is the tie and not a coincidence of the fit.
+        free = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        fit!(free, y; max_iter=4, progress=false, rng=MersenneTwister(5))
+        for g in (:A, :Q, :C, :R)
+            @test !_regimes_agree(free, g)
+        end
+
+        for tied in ((:A, :b), :Q, (:C, :d), :R)
+            fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+            elbos = fit!(
+                fitted,
+                y;
+                max_iter=4,
+                progress=false,
+                tied_params=tied,
+                rng=MersenneTwister(5),
+            )
+            @test all(isfinite, elbos)
+            for g in (:A, :Q, :C, :R)
+                @test _regimes_agree(fitted, g) == (g in _group_of(tied))
+            end
+        end
+
+        # Pairs, and the everything-tied case.
+        for tied in ((:A, :b, :Q), (:C, :d, :R), (:A, :b, :Q, :C, :d, :R))
+            fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+            fit!(
+                fitted,
+                y;
+                max_iter=4,
+                progress=false,
+                tied_params=tied,
+                rng=MersenneTwister(5),
+            )
+            for g in (:A, :Q, :C, :R)
+                @test _regimes_agree(fitted, g) == (g in tied)
+            end
+        end
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_elbo_monotone(; rng=MersenneTwister(0x71F1))
+    @testset "tied_params keeps the ELBO monotone" begin
+        #=
+        The load-bearing check on the tied M-step: a tied group is only fitted
+        correctly if it still maximizes the same bound. `:A` and `:C` alone are
+        the generalized-least-squares paths — a pooled ordinary fit would
+        maximize the wrong objective there and show up as a decrease.
+        =#
+        K, latent_dim, obs_dim = 2, 2, 4
+        truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        _, _, y = rand(rng, truth, fill(40, 6))
+
+        for tied in (
+            nothing, :A, :b, :Q, :C, :d, :R, (:A, :b), (:A, :b, :Q), (:C, :d), (:C, :d, :R)
+        )
+            fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+            elbos = fit!(
+                fitted,
+                y;
+                max_iter=10,
+                smoothing_iters=4,
+                progress=false,
+                tied_params=tied,
+                rng=MersenneTwister(7),
+            )
+            slack = 1e-8 * max(1.0, maximum(abs, elbos))
+            @test all(>=(-slack), diff(elbos))
+        end
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_gls_path(; rng=MersenneTwister(0x71F2))
+    @testset "tied regression with per-regime noise" begin
+        K, latent_dim, obs_dim = 2, 2, 3
+        truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        _, _, y = rand(rng, truth, fill(30, 4))
+
+        # `[C d]` shared while `R` still switches: the GLS path.
+        fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        fit!(
+            fitted,
+            y;
+            max_iter=4,
+            progress=false,
+            tied_params=(:C, :d),
+            rng=MersenneTwister(9),
+        )
+        @test _regimes_agree(fitted, :C)
+        @test !_regimes_agree(fitted, :R)
+        for k in 1:K
+            @test isposdef(fitted.LDSs[k].obs_model.R)
+        end
+
+        # `[A b]` shared while `Q` switches.
+        fitted = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        fit!(
+            fitted,
+            y;
+            max_iter=4,
+            progress=false,
+            tied_params=(:A, :b),
+            rng=MersenneTwister(9),
+        )
+        @test _regimes_agree(fitted, :A)
+        @test !_regimes_agree(fitted, :Q)
+        for k in 1:K
+            @test isposdef(fitted.LDSs[k].state_model.Q)
+        end
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_x0_P0_noop(; rng=MersenneTwister(0x71F3))
+    K, latent_dim, obs_dim = 2, 2, 3
+    truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(25, 3))
+
+    plain = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    e1 = fit!(plain, y; max_iter=3, progress=false, rng=MersenneTwister(4))
+
+    named = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    e2 = fit!(
+        named, y; max_iter=3, progress=false, tied_params=(:x0, :P0), rng=MersenneTwister(4)
+    )
+
+    # x0/P0 are tied whatever the caller says, so naming them changes nothing.
+    @test e1 == e2
+    @test named.LDSs[2].state_model.x0 ≈ named.LDSs[1].state_model.x0
+    @test named.LDSs[2].state_model.P0 ≈ named.LDSs[1].state_model.P0
+
+    return nothing
+end
+
+function test_SLDS_tied_params_frozen_group(; rng=MersenneTwister(0x71F4))
+    K, latent_dim, obs_dim = 2, 2, 3
+    truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(25, 3))
+
+    frozen = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    # The helper gives every regime the same `Q`; pull them apart so an
+    # overwrite from regime 1 would actually be visible.
+    frozen.LDSs[1].state_model.Q .= Matrix(0.05 * I(latent_dim))
+    frozen.LDSs[2].state_model.Q .= Matrix(0.20 * I(latent_dim))
+    for lds in frozen.LDSs
+        lds.fit_bool[4] = false      # Q
+    end
+    Q1 = copy(frozen.LDSs[1].state_model.Q)
+    Q2 = copy(frozen.LDSs[2].state_model.Q)
+    @test !(Q1 ≈ Q2)
+
+    fit!(frozen, y; max_iter=3, progress=false, tied_params=:Q, rng=MersenneTwister(6))
+
+    # A frozen group is the caller's, per regime: the tie neither fits it nor
+    # overwrites regime 2's with regime 1's.
+    @test frozen.LDSs[1].state_model.Q ≈ Q1
+    @test frozen.LDSs[2].state_model.Q ≈ Q2
+
+    return nothing
+end
+
+function test_SLDS_tied_params_partial_errors(; rng=MersenneTwister(0x71F5))
+    @testset "tied_params partial ties the M-step cannot fit" begin
+        K, latent_dim, obs_dim = 2, 2, 3
+
+        #=
+        A Poisson `[C d D]` is fitted by LBFGS, not from sufficient statistics,
+        so there is no shared-block solve to run — only the whole regression can
+        be tied.
+        =#
+        pslds = _distinct_poisson_slds(K, latent_dim, obs_dim)
+        _, _, yp = rand(rng, _distinct_poisson_slds(K, latent_dim, obs_dim), fill(20, 3))
+        @test_throws ArgumentError fit!(
+            pslds, yp; max_iter=1, progress=false, tied_params=:C
+        )
+        @test_throws ArgumentError fit!(
+            pslds, yp; max_iter=1, progress=false, tied_params=:d
+        )
+        elbos = fit!(pslds, yp; max_iter=2, progress=false, tied_params=(:C, :d))
+        @test all(isfinite, elbos)
+
+        # `depends_on` already splits the regression per group of trials, so a
+        # partial tie would have to partition columns and cells at once.
+        gslds = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        _, _, y = rand(rng, _distinct_gaussian_slds(K, latent_dim, obs_dim), fill(25, 4))
+        labels = [:s1, :s1, :s2, :s2]
+        for k in 1:K
+            gslds.LDSs[k].obs_model.depends_on = (C=labels, d=labels)
+        end
+        @test_throws ArgumentError fit!(
+            gslds, y; max_iter=1, progress=false, tied_params=:C
+        )
+        @test fit!(gslds, y; max_iter=2, progress=false, tied_params=(:C, :d)) isa Vector
+    end
+    return nothing
+end
+
+function test_SLDS_tied_params_partial_prior(; rng=MersenneTwister(0x71F6))
+    @testset "tied_params partial tie under an MN prior" begin
+        K, latent_dim, obs_dim = 2, 2, 3
+        truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        _, _, y = rand(rng, truth, fill(30, 4))
+
+        m = latent_dim + 1     # [A b], these models carry no dynamics input
+
+        #=
+        A diagonal `Λ` splits between the shared block and the free ones, so the
+        partial tie is available and still maximizes the MAP objective.
+        =#
+        ridge = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        for lds in ridge.LDSs
+            lds.state_model.AB_prior = MNPrior(zeros(latent_dim, m), Matrix(2.0 * I(m)))
+        end
+        elbos = fit!(
+            ridge, y; max_iter=6, progress=false, tied_params=:A, rng=MersenneTwister(3)
+        )
+        slack = 1e-8 * max(1.0, maximum(abs, elbos))
+        @test all(>=(-slack), diff(elbos))
+        # `A` alone is shared; `b` and `Q` are still per regime.
+        @test _regimes_agree_on(ridge, :A)
+        @test !_regimes_agree_on(ridge, :b)
+        @test !_regimes_agree_on(ridge, :Q)
+
+        # A `Λ` coupling the tied column block to the free one has no split.
+        Λ = Matrix(2.0 * I(m))
+        Λ[1, m] = Λ[m, 1] = 0.5
+        coupled = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        for lds in coupled.LDSs
+            lds.state_model.AB_prior = MNPrior(zeros(latent_dim, m), copy(Λ))
+        end
+        @test_throws ArgumentError fit!(
+            coupled, y; max_iter=1, progress=false, tied_params=:A
+        )
+        # Tying the whole regression needs no split, so it is fine.
+        @test fit!(coupled, y; max_iter=2, progress=false, tied_params=(:A, :b)) isa Vector
+    end
+    return nothing
+end
+
+function test_SLDS_smooth_poisson(; rng=MersenneTwister(0x9051))
+    K, latent_dim, obs_dim = 2, 2, 3
+    tsteps, ntrials = 18, 3
+
+    slds = _distinct_poisson_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, slds, fill(tsteps, ntrials))
+
+    A_before = copy(slds.A)
+    C_before = copy(slds.LDSs[1].obs_model.C)
+
+    post = smooth(slds, y; smoothing_iters=5, tol=0, return_cov=true)
+
+    @test length(post.x) == ntrials
+    @test length(post.γ) == ntrials
+    @test isfinite(post.elbo)
+    for n in 1:ntrials
+        @test size(post.x[n]) == (latent_dim, tsteps)
+        @test size(post.p[n]) == (latent_dim, latent_dim, tsteps)
+        @test size(post.γ[n]) == (K, tsteps)
+        @test all(≈(1.0), vec(sum(post.γ[n]; dims=1)))
+        @test all(>=(0.0), post.γ[n])
+        @test all(isfinite, post.x[n])
+    end
+
+    # Reading the posterior leaves the model alone.
+    @test slds.A ≈ A_before
+    @test slds.LDSs[1].obs_model.C ≈ C_before
+
+    return nothing
+end
+
+function test_SLDS_smooth_recovers_regimes(; rng=MersenneTwister(0x9052))
+    #=
+    Regimes separated only by their dynamics — one nearly static, one strongly
+    rotating — with everything else (C, d, R, Q, x0, P0) shared, so the discrete
+    layer has nothing but the transition term to go on.
+
+    The emission noise has to be small relative to the process noise for that to
+    be identifiable at all: `smooth` scores the discrete layer at the *smoothed
+    mean* rather than at a draw from q(x), so when observation noise swamps the
+    latent path the shrunk mean carries too little of the dynamics to tell the
+    two `A`s apart. At `R = 0.01·I` against `Q = 0.05·I` the path is well
+    determined and recovery is essentially exact.
+    =#
+    K, latent_dim, obs_dim = 2, 2, 6
+    lds1 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=31)
+    lds2 = _make_gaussian_lds_dense(latent_dim, obs_dim; seed=31)
+    lds1.state_model.A .= [0.99 0.0; 0.0 0.99]
+    lds2.state_model.A .= [0.0 -0.95; 0.95 0.0]
+    lds1.state_model.Q .= Matrix(0.05 * I(latent_dim))
+    lds2.state_model.Q .= Matrix(0.05 * I(latent_dim))
+    lds1.obs_model.R .= Matrix(0.01 * I(obs_dim))
+    lds2.obs_model.R .= Matrix(0.01 * I(obs_dim))
+    # Sticky chain, so each trial spends long stretches in one regime.
+    slds = SLDS(; A=[0.98 0.02; 0.02 0.98], πₖ=[0.5, 0.5], LDSs=[lds1, lds2])
+
+    z, _, y = rand(rng, slds, fill(60, 4))
+
+    post = smooth(slds, y; smoothing_iters=50, tol=1e-8)
+
+    correct = 0
+    total = 0
+    for n in eachindex(y)
+        assigned = [argmax(view(post.γ[n], :, t)) for t in axes(post.γ[n], 2)]
+        correct += count(assigned .== z[n])
+        total += length(z[n])
+    end
+    @test correct / total > 0.9
+
+    # Both regimes are actually visited, so the score is not a degenerate
+    # all-one-regime guess matching an unbalanced truth.
+    occupancy = sum(sum(post.γ[n]; dims=2) for n in eachindex(y)) ./ total
+    @test all(occupancy .> 0.05)
+
+    return nothing
 end
 
 function test_SLDS_input_dim_validation()
@@ -3113,4 +3718,256 @@ function test_SLDS_fit_with_inputs_poisson(; rng=MersenneTwister(0xC0FFEE))
     @test all(isfinite, elbos)
     @test all(all(isfinite, l.state_model.B) for l in fit_slds.LDSs)
     @test all(all(isfinite, l.obs_model.D) for l in fit_slds.LDSs)
+end
+
+"""
+The `[C d D]` prior on a Poisson SLDS is stated over the whole regression, so
+the ELBO's prior term has to pack the `D` block too. Packing only `[C d]` made
+`W_cd` narrower than `M₀` and the fit died on the first ELBO.
+"""
+function test_SLDS_poisson_cd_prior_with_inputs(; rng=MersenneTwister(0xBEEF))
+    K, D, N, ux_dim, uy_dim = 2, 2, 4, 2, 2
+    tsteps, ntrials, max_iter = 20, 3, 4
+    width = D + 1 + uy_dim
+
+    lds = [_make_poisson_input_lds(D, N, ux_dim, uy_dim; seed=k) for k in 1:K]
+    slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=lds)
+
+    ux = [randn(rng, ux_dim, tsteps) for _ in 1:ntrials]
+    uy = [randn(rng, uy_dim, tsteps) for _ in 1:ntrials]
+    _, _, y = rand(rng, slds, fill(tsteps, ntrials); ux=ux, uy=uy)
+
+    fit_lds = [_make_poisson_input_lds(D, N, ux_dim, uy_dim; seed=200 + k) for k in 1:K]
+    for l in fit_lds
+        l.obs_model.CD_prior = SSD.MNPrior(;
+            M₀=zeros(N, width), Λ=Matrix{Float64}(1e-3I, width, width)
+        )
+    end
+    fit_slds = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=fit_lds)
+
+    @test isfinite(SSD._slds_prior_logdensity(fit_slds))
+    elbos = fit!(fit_slds, y; ux=ux, uy=uy, max_iter=max_iter, progress=false)
+    @test length(elbos) == max_iter
+    @test all(isfinite, elbos)
+    return nothing
+end
+
+# ============================================================================
+# Trial-parallel execution: workspace pool, work partition, reproducibility
+# ============================================================================
+
+"""
+The batched Poisson emission log-density agrees with the per-timestep
+`observation_loglikelihood!` kernel it replaced, and the precomputed
+`-Σ log(y!)` normalizer changes nothing but the arithmetic order.
+"""
+function test_SLDS_batched_poisson_loglikelihood(; rng=MersenneTwister(0x10C))
+    K, D, N, tsteps = 3, 2, 5, 40
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(rng, slds, tsteps)
+    x = 0.3 * randn(rng, D, tsteps)
+    w = _rowstochastic(K)[:, 1:1] * ones(1, tsteps)
+    w ./= sum(w; dims=1)
+
+    ws = SSD.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    ln = SSD._poisson_lognorm_t(y)
+
+    # Precomputed vs. recomputed normalizer: identical inputs, same answer.
+    with_ln = copy(SSD.joint_loglikelihood!(ws, slds, x, y, w, nothing, nothing, ln))
+    without = copy(SSD.joint_loglikelihood!(ws, slds, x, y, w, nothing, nothing, nothing))
+    @test with_ln ≈ without rtol = 1e-12
+
+    # Against the per-timestep reference, regime by regime.
+    for k in 1:K
+        ref = zeros(tsteps)
+        z, λ = zeros(N), zeros(N)
+        for t in 1:tsteps
+            ref[t] = SSD.observation_loglikelihood!(
+                ws.consts[k], z, λ, slds.LDSs[k].obs_model, x, y, t, nothing
+            )
+            ref[t] += SSD.state_loglikelihood!(
+                ws.consts[k], zeros(D), zeros(D), slds.LDSs[k], x, t, nothing
+            )
+        end
+        got = zeros(tsteps)
+        SSD._slds_trial_loglikelihood!(
+            got, ws, ws.consts[k], slds.LDSs[k], x, y, nothing, nothing, ln
+        )
+        @test got ≈ ref rtol = 1e-12
+    end
+    return nothing
+end
+
+"""
+The batched Poisson emission gradient agrees with the per-timestep
+`observation_gradient!` kernel, accumulated with the same responsibilities.
+"""
+function test_SLDS_batched_poisson_gradient(; rng=MersenneTwister(0x11C))
+    K, D, N, tsteps = 3, 2, 5, 40
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(rng, slds, tsteps)
+    x = 0.3 * randn(rng, D, tsteps)
+    w = rand(rng, K, tsteps)
+    w ./= sum(w; dims=1)
+
+    ws = SSD.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    for k in 1:K
+        batched = zeros(D, tsteps)
+        SSD._slds_emission_gradient!(
+            batched,
+            ws,
+            ws.consts[k],
+            slds.LDSs[k],
+            x,
+            y,
+            view(w, k, :),
+            nothing,
+            tsteps,
+            zeros(D),
+            zeros(N),
+        )
+
+        ref = zeros(D, tsteps)
+        tmp, buf = zeros(D), zeros(N)
+        for t in 1:tsteps
+            SSD.observation_gradient!(
+                tmp, ws.consts[k], buf, slds.LDSs[k].obs_model, x, y, t, nothing
+            )
+            @views ref[:, t] .+= w[k, t] .* tmp
+        end
+        @test batched ≈ ref rtol = 1e-12
+    end
+    return nothing
+end
+
+"""
+`smooth` is exactly `npool`-invariant: the per-trial passes are a partition of
+the writes, and the ELBO is summed in trial order.
+"""
+function test_SLDS_smooth_npool_invariant()
+    K, D, N, tsteps, ntrials = 3, 2, 4, 30, 6
+    slds = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(MersenneTwister(0x5A1), slds, fill(tsteps, ntrials))
+
+    base = smooth(slds, y; smoothing_iters=6, tol=0.0, npool=1)
+    for np in (2, 4)
+        got = smooth(slds, y; smoothing_iters=6, tol=0.0, npool=np)
+        @test got.elbo == base.elbo
+        @test all(got.x[i] == base.x[i] for i in eachindex(base.x))
+        @test all(got.γ[i] == base.γ[i] for i in eachindex(base.γ))
+    end
+    # `elbo` / `loglikelihood` read the same alternation.
+    @test elbo(slds, y; smoothing_iters=6, tol=0.0) == base.elbo
+    @test loglikelihood(slds, y; smoothing_iters=6, tol=0.0) == base.elbo
+    return nothing
+end
+
+"""
+`fit!` reproduces exactly at a fixed `npool`, and across `npool` up to the
+rounding the Poisson emission M-step's chunked reduction introduces. A Gaussian
+emission has no such reduction, so it is exact across `npool` too.
+"""
+function test_SLDS_fit_reproducibility()
+    K, D, N, tsteps, ntrials = 2, 2, 4, 30, 8
+    _, _, yP = rand(
+        MersenneTwister(0x5A2), _distinct_poisson_slds(K, D, N), fill(tsteps, ntrials)
+    )
+    _, _, yG = rand(
+        MersenneTwister(0x5A3), _distinct_gaussian_slds(K, D, N), fill(tsteps, ntrials)
+    )
+
+    function trace(mk, y; kw...)
+        return fit!(mk(), y; max_iter=5, progress=false, rng=MersenneTwister(3), kw...)
+    end
+
+    for (mk, y) in (
+        (() -> _distinct_poisson_slds(K, D, N), yP),
+        (() -> _distinct_gaussian_slds(K, D, N), yG),
+    )
+        # Same npool, twice: bit-identical.
+        @test trace(mk, y; npool=4) == trace(mk, y; npool=4)
+        # Across npool: equal to rounding.
+        @test trace(mk, y; npool=1) ≈ trace(mk, y; npool=4) rtol = 1e-8
+    end
+
+    # A Gaussian fit has no chunked emission reduction, so it is exact.
+    mkg = () -> _distinct_gaussian_slds(K, D, N)
+    @test trace(mkg, yG; npool=1) == trace(mkg, yG; npool=4)
+    return nothing
+end
+
+"""
+`rng_mode` is validated, and `:global` — which pre-draws the sequential
+stream — is itself `npool`-invariant up to that same rounding.
+"""
+function test_SLDS_rng_modes()
+    K, D, N, tsteps, ntrials = 2, 2, 4, 30, 6
+    model() = _distinct_poisson_slds(K, D, N)
+    _, _, y = rand(MersenneTwister(0x5A4), model(), fill(tsteps, ntrials))
+
+    g1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:global,
+    )
+    g4 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=4,
+        rng_mode=:global,
+    )
+    @test g1 ≈ g4 rtol = 1e-8
+    @test all(isfinite, g1)
+
+    #=
+    Each alternation consumes exactly one draw off `rng`, so `smoothing_iters`
+    is a clean repetition: `n` alternations in one call land where `n` calls of
+    one alternation do. (`test_SLDS_fit_smoothing_iters` checks this on the
+    E-step directly; this pins it end to end, where a per-call pass index mixed
+    into the seed would silently break it.)
+    =#
+    a = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=1,
+    )
+    b = fit!(
+        model(),
+        y;
+        max_iter=2,
+        smoothing_iters=2,
+        progress=false,
+        rng=MersenneTwister(21),
+        npool=3,
+    )
+    @test a ≈ b rtol = 1e-8
+
+    # The two modes consume the master generator differently, so they are
+    # different fits — both valid.
+    t1 = fit!(
+        model(),
+        y;
+        max_iter=4,
+        progress=false,
+        rng=MersenneTwister(9),
+        npool=1,
+        rng_mode=:trial,
+    )
+    @test all(isfinite, t1)
+
+    @test_throws ArgumentError fit!(
+        model(), y; max_iter=1, progress=false, rng_mode=:nonsense
+    )
+    return nothing
 end
