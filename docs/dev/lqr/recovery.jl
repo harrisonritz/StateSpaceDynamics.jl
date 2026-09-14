@@ -223,6 +223,15 @@ function recover(;
     sig0_costate::Float64=1e-4,
     anneal_costate::Union{Nothing,Float64}=nothing,
     fit_noise::Bool=true,
+    #=
+    Hold out a fraction of trials, fit on the rest, and report the held-out ELBO
+    per timestep alongside the parameter scores. This is the only quantity in the
+    harness a user could compute without knowing the truth, so it is the only
+    candidate for *selecting* a setting rather than merely scoring one — and
+    whether it selects the same setting the parameter scores prefer is itself a
+    result. Zero (the default) fits everything and reports `NaN`.
+    =#
+    test_frac::Float64=0.0,
     seed::Int=1,
 )
     rng = MersenneTwister(seed)
@@ -252,7 +261,12 @@ function recover(;
         process_noise=process_noise,
         uxs=uxs,
     )
-    truth_elbo = elbo(truth.lds, ys; ux=uxs)
+    ntest = test_frac > 0 ? max(1, round(Int, test_frac * ntrials)) : 0
+    tr_idx = 1:(ntrials - ntest)
+    te_idx = (ntrials - ntest + 1):ntrials
+    ys_fit = ntest > 0 ? ys[tr_idx] : ys
+    ux_fit = (uxs === nothing || ntest == 0) ? uxs : uxs[tr_idx]
+    truth_elbo = elbo(truth.lds, ys_fit; ux=ux_fit)
 
     best = nothing
     for r in 1:restarts
@@ -278,8 +292,8 @@ function recover(;
         sm.mstep_iters = mstep_iters
         lds, elbos = one_fit(
             truth,
-            ys,
-            uxs,
+            ys_fit,
+            ux_fit,
             sm;
             free_C=free_C,
             max_iter=max_iter,
@@ -322,8 +336,8 @@ function recover(;
         refresh!(sm2)
         _, elbos2 = one_fit(
             truth,
-            ys,
-            uxs,
+            ys_fit,
+            ux_fit,
             sm2;
             free_C=free_C,
             max_iter=max_iter,
@@ -332,6 +346,25 @@ function recover(;
         )
         fit_sm = sm2
         elbos = vcat(elbos, elbos2)
+    end
+
+    #=
+    The held-out score is taken *before* canonicalization, on the model as
+    fitted: `rescale_costate!` changes the parameters and the emission's costate
+    columns are not rescaled with them, so a likelihood evaluated after it would
+    not be the fitted model's.
+    =#
+    heldout = if ntest > 0
+        fl = LinearDynamicalSystem(
+            fit_sm,
+            GaussianObservationModel(
+                copy(truth.C), copy(truth.R), zeros(size(truth.C, 1))
+            ),
+        )
+        steps = sum(size(y, 2) for y in ys[te_idx])
+        elbo(fl, ys[te_idx]; ux=(uxs === nothing ? nothing : uxs[te_idx])) / steps
+    else
+        NaN
     end
 
     # Compare in the canonical scale: the cost is identified up to a scalar.
@@ -344,6 +377,7 @@ function recover(;
         ),
         elbo=elbos[end],
         truth_elbo=truth_elbo,
+        heldout=heldout,
         iters=length(elbos),
         converged=length(elbos) < max_iter,
         creep=elbo_creep(elbos),

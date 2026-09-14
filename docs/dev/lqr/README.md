@@ -12,14 +12,15 @@ read and writes figures you look at, not an assertion that passes.
 $ julia --project=docs -e 'using Pkg; Pkg.develop(PackageSpec(path=pwd())); Pkg.instantiate()'
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --selftest
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick        # ~3 min
-$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl                # ~40 min
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl                # ~30 min
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --full         # hours
 ```
 
 Useful subsets:
 
 ```console
-$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=design,switching
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=goldstandard
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=modelrecovery,switching
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=procedure --gen=lqr
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --no-figures
 ```
@@ -35,10 +36,11 @@ every run).
 | `model.jl` | the generating models and the data they produce |
 | `scoring.jl` | the metrics — parameter blocks and γ alike |
 | `recovery.jl` | simulate → refit → score, for one system; `selftest` |
-| `slds.jl` | the same for an `SLDS` with one free and one LQR state |
+| `slds.jl` | the same for an `SLDS` with one free and one LQR state, plus segment-then-fit |
+| `compare.jl` | LQR against a plain LDS: the competitor, the generators, held-out scoring |
 | `report.jl` | tables, seed aggregation |
 | `plotting.jl` | figures |
-| `experiments.jl` | the five sweeps |
+| `experiments.jl` | the eight sweeps |
 
 ## What it measures
 
@@ -119,6 +121,11 @@ the latent-basis problem back in.
 | `slds_gamma.png` | discrete-state recovery per condition, against γ at the truth |
 | `slds_trial_*.png` | one trial: observations with the true epoch shaded, and `γ(LQR)` for the fit and for the truth |
 | `slds_params.png` | the LQR discrete state's parameters, truth versus recovery |
+| `slds_segment.png` | segment-then-fit: the cost given the epochs, oracle and fitted |
+| `model_recovery.png` | LQR − LDS held-out ELBO against trials and noise, with a rule at zero |
+| `gold_standard.png` | the twelve procedures on the gold-standard configuration |
+| `gold_standard_scale.png` | held-out score and closed-loop error against the initial cost scale |
+| `gold_standard_params.png`, `gold_standard_entries.png` | the winning procedure's recovery |
 
 ## The experiments
 
@@ -129,6 +136,8 @@ the latent-basis problem back in.
 | 3 | `scale` | how much of the remaining error is sampling error — trials and trial length, so a floor can be told from a slope |
 | 4 | `procedure` | the fitting procedure rather than the model: iterations, restarts, initialization, inner-loop budget |
 | 4b | `initialization` | where to start: ladders on both blocks of `Σ` and on the initial cost scale, a two-axis grid over them, and a combination table run on both generators |
+| 4c | `modelrecovery` | can you tell an LQR from a plain LDS at all? Three generators, two candidates, held-out ELBO |
+| 4d | `goldstandard` | one realistic configuration — 3 cost levels, 8 ring targets — searched over twelve fitting procedures, plus whether cross-validation can select the cost scale |
 | 5 | `switching` | the `SLDS` with one free and one LQR state, and its two separate questions — the LQR state's parameters, and the discrete path |
 
 Every cell of experiments 2–4 is a median over seeds, with the figure's error
@@ -291,6 +300,117 @@ observing the costate: `Qc` 0.036/1.00, terminal cost 0.177/0.98, `Gref`
 0.331/1.00, closed loop 0.034, and the plant `A` to 0.058 when it is estimated
 too — but γ only 0.641.
 
+### Switching LQR is half identifiable, and the two halves fight
+
+With `Σ` pinned at the truth's blocks the `SLDS` finds the epochs about as well
+as the generating parameters do — γ balanced accuracy **0.865** against 0.824 at
+the truth, onset error 5.5 timesteps. Estimating `Σ` instead collapses the fit
+onto one state (γ **0.144**): an LQR discrete state with a free innovation
+inflates until it *is* a second free state.
+
+But the discrete path and the LQR state's parameters want opposite values of the
+same number, and no setting gets both:
+
+| `Σ_λλ` | γ fitted | γ at truth | `Qc` | closed-loop |
+|---|---|---|---|---|
+| 1e-4 (single-system optimum) | 0.498 | 0.523 | **0.104 / 1.00** | **0.038** |
+| 2.5e-3 | 0.497 | 0.555 | 0.125 / 1.00 | 0.025 |
+| 1e-2 | 0.500 | 0.765 | 0.459 / 0.89 | 0.054 |
+| 2e-2 (switching default) | **0.865** | 0.824 | 0.829 / 0.96 | 0.075 |
+
+γ is a plug-in scored at the smoothed posterior mean, and that mean never sits
+exactly on the Riccati graph — so a costate innovation tight enough to identify
+the cost makes the LQR state's per-timestep likelihood hopeless and every
+timestep goes to the free state. Note that γ *at the generating parameters*
+moves with it: this is the model, not the optimizer.
+
+Two-stage fitting inside the joint model half works: annealing to `1e-3` gives
+the best γ in the table (0.899, onset 4.0) without buying the cost, and
+annealing to `1e-4` destroys γ again (0.538).
+
+**What sharpens γ:** a quieter emission (0.958, onset 1.7), longer trials
+(0.944), no reference to estimate (0.927). **What does not:** more trials
+(0.882), and — against expectation — observing the costate (0.625 against 0.982
+at the truth; the fit does not exploit it).
+
+**What would improve it: fit the epochs and the cost in sequence, not jointly.**
+
+| | `Qc` | closed-loop | trials kept |
+|---|---|---|---|
+| joint, `Σ_λλ` tuned for γ | 0.829 | 0.075 | — |
+| oracle segmentation → single-system fit | **0.094** | 0.036 | 150/150 |
+| fitted segmentation (loose stage 1) → fit | 0.181 | 0.044 | 142/150 |
+
+Stage one at a loose `Σ_λλ` finds the epochs; the single-system machinery then
+identifies the cost on the sliced segments, at a tight one. The fitted
+segmentation lands within 2× of the oracle, so **the switching layer is the
+bottleneck, not the LQR identification given the epochs** — and the two-stage
+procedure gets both answers where no joint setting gets either pair.
+
+Best parameters inside the joint fit come from pinning `Σ`, observing the
+costate and annealing: `Qc` 0.037/1.00, terminal cost 0.303/1.00, `Gref`
+0.313/1.00, closed loop 0.035 — with γ still only 0.635.
+
+### Is the model class identifiable? Only where the LQR is correctly specified
+
+Held-out ELBO per timestep, eight ring targets, terminal factor off so the two
+candidates score the same quantity:
+
+| generated by | truth | LQR fit | LDS fit | LQR − LDS | picked |
+|---|---|---|---|---|---|
+| the LQR model's own chain | −0.540 | **−0.547** | −0.657 | +0.112 | LQR ✓ |
+| the LQR *optimal trajectory* | −0.640 | −0.470 | **−0.433** | −0.034 | LDS ✗ |
+| a first-order attractor (LDS) | −0.427 | −0.576 | **−0.429** | −0.145 | LDS ✓ |
+
+The LDS competitor has *more* free parameters (52 against 33), so the LQR's win
+on its own chain is not a win on parsimony.
+
+The middle row is the important one. On optimal-trajectory data — the case the
+model is *for* — both fits beat the generating model, so neither is well
+specified, and the LDS edges it. An optimal path's mixed-coordinate residual is
+zero up to slack rather than a draw from the forward chain, and no amount of
+data repairs that. **You cannot establish "this behaviour was generated by an
+LQR" by model comparison against a linear alternative.** What you can establish
+is the weaker claim the closed loop supports: that the fitted controller
+reproduces the same state dynamics.
+
+### A gold standard for three cost levels and eight ring targets
+
+A centre-out reach: `n = 2`, eight targets equally spaced on a ring, three cost
+levels (near-zero delay, running from onset, terminal at the endpoint), trials
+from an agent that solves it. Twelve procedures, ranked on the closed loop:
+
+| procedure | `Qc` run | `Gref` | `S` (scale) | closed-loop |
+|---|---|---|---|---|
+| **tight `Σ_λλ` + `q0` = 0.2** | **0.050 / 1.00** | 1.041 / 0.01 | 0.206 | **0.011** |
+| tight + 4× iterations | 0.067 / 0.99 | 1.048 | 0.361 | 0.016 |
+| tight + costate observed | 0.141 / 0.98 | 0.801 / 0.60 | 0.383 | 0.020 |
+| default (tight, `q0` = 0.4) | 0.089 / 1.00 | 1.049 / 0.01 | 0.843 | 0.033 |
+| tight + 4 restarts | 0.089 / 1.00 | 1.049 | 0.843 | 0.033 (identical) |
+| loose `Σ_λλ` | 0.865 / 0.84 | 1.415 / −0.67 | 1.000 | 0.075 |
+| anneal + costate observed | 1.000 / 0.50 | **0.102 / 1.00** | 0.582 | 0.053 |
+
+Two blocks are never recovered in any procedure. The **terminal cost** reads
+~1.00 throughout: the endpoint condition constrains one factor at one timestep
+per trial, and that is not enough. The **delay cost** reads 5–12, because it is a
+near-zero regime and its relative error has a near-zero denominator — the fit
+puts a real cost where the truth has almost none.
+
+**And the cost scale cannot be cross-validated.** The obvious rescue for "the
+fitted scale does not move from `q0`" is to select `q0` by held-out likelihood.
+It does not work — the held-out score is monotone in `q0` and prefers the
+smallest value on offer, while the closed-loop error has an interior minimum:
+
+| `q0` | 0.05 | 0.10 | 0.20 | 0.40 | 1.00 | 2.00 |
+|---|---|---|---|---|---|---|
+| held-out / step | **−0.487** | −0.593 | −0.877 | −1.190 | −1.845 | −5.217 |
+| closed-loop rmse | 0.066 | 0.052 | **0.011** | 0.033 | 0.111 | 0.188 |
+
+Under misspecification the likelihood rewards hedging, and a smaller cost hedges.
+So the scale is genuinely not determined by the data under this observation
+model: it has to come from a prior, an external calibration, or a convention —
+and until it does, only scale-invariant summaries mean anything.
+
 ### If you are fitting one of these to real data
 
 1. Start `Σ`'s costate block small (`1e-4`) and its state block anywhere.
@@ -303,7 +423,14 @@ too — but γ only 0.641.
 5. For a switching model, pin or regularize the LQR state's `Σ`, and expect its
    costate innovation to want a looser value than a single-system fit does.
 6. Do not use the ELBO to choose among fits. Under misspecification it prefers
-   the wrong one, and a warm start at the truth walks away.
+   the wrong one, a warm start at the truth walks away, and held-out likelihood
+   cannot select the cost scale either — it prefers whichever fit hedges most.
+7. For a switching model, fit the epochs and the cost in two stages rather than
+   jointly: a loose costate innovation to segment, then the single-system
+   machinery at a tight one on the segments.
+8. Do not claim the data came from an LQR on the strength of a model comparison.
+   Against a plain LDS the comparison only works where the LQR is correctly
+   specified, which is not the case the model is for.
 
 ## Findings on the package
 

@@ -1046,8 +1046,73 @@ function experiment_gold_standard(cfg; figures::Bool=true)
     end
     best === nothing || println("\n   best on closed-loop error: $best  ($(round(best_cl; digits=4)))")
 
-    figures || return res
+    #=
+    Can the cost scale be *selected* rather than guessed? The `q0` ladder says
+    the fitted scale barely moves from its start and that the best start is the
+    truth's own — which is no use to anyone fitting real data. A held-out score
+    is the only quantity here computable without the truth, so this asks whether
+    it ranks `q0` the way the closed-loop error does. If it does, "you cannot
+    guess the scale" becomes "you can cross-validate it".
+    =#
+    q0s = [0.05, 0.1, 0.2, 0.4, 1.0, 2.0]
+    sel = cells(
+        recover,
+        [q => (; base..., q0=q, test_frac=0.3) for q in q0s];
+        seeds=cfg.seeds,
+    )
+    println()
+    println("   selecting the cost scale by cross-validation:")
+    @printf(
+        "%-18s %14s %14s %14s\n", "q0", "held-out/step", "closed-loop", "ELBO − truth"
+    )
+    println("-"^62)
+    bycv, bycl = (-Inf, 0.0), (Inf, 0.0)
+    for q in q0s
+        rs = filter(!isnothing, sel[q])
+        isempty(rs) && continue
+        m(f) = center([Float64(f(r)) for r in rs])[1]
+        ho, cl = m(r -> r.heldout), m(r -> r.scores.cl.rmse)
+        @printf("%-18.2f %14.4f %14.4f %14.1f\n", q, ho, cl, m(r -> r.elbo - r.truth_elbo))
+        isfinite(ho) && ho > bycv[1] && (bycv = (ho, q))
+        isfinite(cl) && cl < bycl[1] && (bycl = (cl, q))
+    end
+    @printf(
+        "   cross-validation picks q0 = %.2f; the closed-loop error is best at q0 = %.2f%s\n",
+        bycv[2],
+        bycl[2],
+        bycv[2] == bycl[2] ? "  — they agree" : "  — they disagree"
+    )
+
+    figures || return (procedures=res, scale=sel)
     labs = [p[1] for p in procedures]
+    sweep_figure(
+        "gold_standard_scale";
+        panels=[
+            (
+                "held-out ELBO per timestep",
+                q0s,
+                [(
+                    "held-out",
+                    [center(metric(sel[q], r -> r.heldout))[1] for q in q0s],
+                    nothing,
+                )],
+            ),
+            (
+                "closed-loop relative RMSE",
+                q0s,
+                [(
+                    "closed-loop",
+                    [center(metric(sel[q], r -> r.scores.cl.rmse))[1] for q in q0s],
+                    nothing,
+                )],
+            ),
+        ],
+        xlabel="initial cost scale  q0",
+        logx=true,
+        ylog=false,
+        ylabel="",
+        title="Can the cost scale be cross-validated?",
+    )
     dot_figure(
         "gold_standard";
         labels=labs,
@@ -1065,7 +1130,7 @@ function experiment_gold_standard(cfg; figures::Bool=true)
             scatter_figure(rs[1], "gold_standard_entries"; title="Gold standard — $best")
         end
     end
-    return res
+    return (procedures=res, scale=sel)
 end
 
 # ---------------------------------------------------------------------------
