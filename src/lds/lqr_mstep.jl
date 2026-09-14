@@ -1928,13 +1928,118 @@ current value, which is the ordinary partial least-squares update
 function _free_state_mstep!(
     lds::LinearDynamicalSystem{T,S,O}, hs::LQRSufficientStatistics{T}
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    _free_state_mstep!([lds], [hs])
+    return nothing
+end
+
+"""
+    _free_state_mstep!(ldss, hss)
+
+The same update over several **units** — the `(discrete state, cell)` pairs a
+`depends_on` switching fit aggregates into — whose models may hold the *same*
+arrays.
+
+One unit per call is wrong as soon as any array is shared: each call writes
+`Mfree` / `h` / `B_u` / `Σ` outright, so a shared array ends the M-step holding
+the last unit's estimate rather than the estimate from every trial that
+parameter was fitted from. The sufficient statistics are additive, so the fix is
+to pool them: units that hold the same array get one solve over their summed
+statistics, which is exactly what the LQR states' packed M-step does through its
+slot vectors. Which units share what is read off array identity — the same
+convention [`_lqr_shares_block`](@ref) uses, and set up by `_build_variants!`,
+which shares a piece across cells by reference precisely when the declaration
+left it out.
+
+`Σ` is partitioned on its own, since `depends_on` groups the noise separately
+from the structure: each version's scatter is summed at each unit's *own* `Θ`.
+"""
+function _free_state_mstep!(
+    ldss::AbstractVector, hss::AbstractVector{<:LQRSufficientStatistics{T}}
+) where {T<:Real}
+    isempty(ldss) && return nothing
+    sms = [lds.state_model for lds in ldss]
+
+    #= `[M | h | B_u]` is one regression, so the three have to split the units
+    the same way. Splitting only part of it is a generalized least-squares
+    problem this closed form does not solve — the same partial-tie restriction
+    the switching M-step states for `[A b B]` — so refuse rather than return a
+    number that looks like an answer. =#
+    versions = _alias_partition(sms, sm -> sm.Mfree)
+    for (name, part) in ((:h, sm -> sm.h), (:Bu, sm -> sm.Bu))
+        _alias_partition(sms, part) == versions || throw(
+            ArgumentError(
+                "a `:free` state's `[M | h | B_u]` is fitted as one regression, so " *
+                "`depends_on` must group `:A`, `:h` and `:Bu` together or not at " *
+                "all; `:$name` splits its trials differently from `:A`. Name " *
+                "`:structure` to group the whole block.",
+            ),
+        )
+    end
+
+    thetas = Vector{Matrix{T}}(undef, length(sms))
+    for units in versions
+        Theta = _free_theta_pooled(ldss, hss, units)
+        for u in units
+            thetas[u] = Theta
+        end
+        #= Once per version, through any member: they alias the same arrays. =#
+        _write_free_theta!(sms[first(units)], Theta)
+    end
+
+    for units in _alias_partition(sms, sm -> sm.Σ)
+        _free_noise_mstep!(ldss, hss, thetas, units)
+    end
+    return nothing
+end
+
+"""
+    _alias_partition(models, part) -> Vector{Vector{Int}}
+
+The units of `models` grouped by which array `part` returns, compared by
+identity: one entry per distinct array, holding the indices that share it, in
+first-appearance order. Two partitions are `==` exactly when they split the
+units the same way.
+"""
+function _alias_partition(models::AbstractVector, part)
+    groups = Vector{Vector{Int}}()
+    arrays = Any[]
+    for (i, model) in enumerate(models)
+        arr = part(model)
+        slot = findfirst(a -> a === arr, arrays)
+        if slot === nothing
+            push!(arrays, arr)
+            push!(groups, [i])
+        else
+            push!(groups[slot], i)
+        end
+    end
+    return groups
+end
+
+"""
+    _free_theta_pooled(ldss, hss, units) -> Matrix
+
+The partial least-squares solve for one version of `[M | h | B_u]`, over the
+summed statistics of the units sharing it.
+"""
+function _free_theta_pooled(
+    ldss::AbstractVector, hss::AbstractVector{<:LQRSufficientStatistics{T}},
+    units::AbstractVector{Int},
+) where {T<:Real}
+    lds = ldss[first(units)]
     sm = lds.state_model
     d = _state_latent_dim(sm)
     m = size(sm.Bu, 2)
     reg = d + 1 + m
-    Sww = hs.zz[1]
-    Svw = Matrix{T}(transpose(hs.zy[1]))
-    N = T(hs.nk[1])
+
+    Sww = zeros(T, reg, reg)
+    Svw = zeros(T, d, reg)
+    N = zero(T)
+    for u in units
+        Sww .+= hss[u].zz[1]
+        Svw .+= transpose(hss[u].zy[1])
+        N += T(hss[u].nk[1])
+    end
 
     ff = sm.fit_flags
     free_cols = Int[]
@@ -1951,17 +2056,45 @@ function _free_state_mstep!(
         # Θ_free Gm = rhs  ⇒  Gm Θ_freeᵀ = rhsᵀ, and Gm is symmetric.
         Theta[:, free_cols] .= transpose(Gm.chol \ Matrix{T}(transpose(rhs)))
     end
+    return Theta
+end
 
-    if lds.fit_bool[4] && N > zero(T)
-        R = _free_residual_scatter(Theta, hs)
-        R ./= N
-        copyto!(sm.Σ, R)
+"""
+    _free_noise_mstep!(ldss, hss, thetas, units)
+
+`Σ` for one version, as the residual scatter of every unit sharing it —
+each at its own `Θ`, since the structure may be grouped differently — over
+their total transition count.
+"""
+function _free_noise_mstep!(
+    ldss::AbstractVector, hss::AbstractVector{<:LQRSufficientStatistics{T}},
+    thetas::AbstractVector{Matrix{T}}, units::AbstractVector{Int},
+) where {T<:Real}
+    lds = ldss[first(units)]
+    lds.fit_bool[4] || return nothing
+    sm = lds.state_model
+    d = _state_latent_dim(sm)
+    R = zeros(T, d, d)
+    N = zero(T)
+    for u in units
+        hss[u].nk[1] > zero(T) || continue
+        R .+= _free_residual_scatter(thetas[u], hss[u])
+        N += T(hss[u].nk[1])
     end
+    N > zero(T) || return nothing
+    R ./= N
+    copyto!(sm.Σ, R)
+    return nothing
+end
 
+"""Write one solved `Θ` back into the arrays its version's models share."""
+function _write_free_theta!(sm::LQRStateModel{T}, Theta::AbstractMatrix{T}) where {T<:Real}
+    d = _state_latent_dim(sm)
+    m = size(sm.Bu, 2)
     @views begin
         copyto!(sm.Mfree, Theta[:, 1:d])
         copyto!(sm.h, Theta[:, d + 1])
-        m > 0 && copyto!(sm.Bu, Theta[:, (d + 2):reg])
+        m > 0 && copyto!(sm.Bu, Theta[:, (d + 2):(d + 1 + m)])
     end
     return nothing
 end

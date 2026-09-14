@@ -65,6 +65,21 @@ function tier(name::Symbol)
         iter_ladder=[25, 50, 100, 250, 500, 1000],
         slds=(n=2, tsteps=40, ntrials=150, seeds=1:1, max_iter=50),
     )
+    # The scale of the smoulder-reward analysis. This tier is opt-in because a
+    # single Poisson fit sees 15 million counts and the recovery suite runs
+    # several fits. `--smoulder` selects only the experiments that use it.
+    name === :smoulder && return (
+        n=12,
+        tsteps=100,
+        ntrials=500,
+        seeds=1:3,
+        max_iter=100,
+        trial_ladder=[250, 500],
+        iter_ladder=[25, 50, 100],
+        obs_dim=150,
+        rewards=3,
+        slds=(n=12, tsteps=100, ntrials=500, seeds=1:2, max_iter=50),
+    )
     return throw(ArgumentError("unknown tier :$name"))
 end
 
@@ -83,8 +98,7 @@ const STRUCTURE_SERIES = (
 """Resolve the sentinel `onset = 0` to "a delay covering the first third"."""
 _onset(o::Int, tsteps::Int) = o == 0 ? max(2, tsteps ÷ 3) : o
 
-structure_kwargs(spec, tsteps) =
-    (terminal=spec.terminal, onset=_onset(spec.onset, tsteps))
+structure_kwargs(spec, tsteps) = (terminal=spec.terminal, onset=_onset(spec.onset, tsteps))
 
 # ---------------------------------------------------------------------------
 # 1. Overview
@@ -275,7 +289,10 @@ function experiment_design(cfg; gen::Symbol=:lqr, figures::Bool=true, free_C::Bo
         series = Any[]
         for (si, (slabel, _)) in enumerate(STRUCTURE_SERIES)
             ms = [center(metric(res[keyfn(si, r)], path)) for r in xs]
-            push!(series, (slabel, [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms])))
+            push!(
+                series,
+                (slabel, [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms])),
+            )
         end
         push!(panels, (mlabel, xs, series))
     end
@@ -512,14 +529,7 @@ function experiment_procedure(cfg; gen::Symbol=:lqr, figures::Bool=true, free_C:
     n, T, N = cfg.n, cfg.tsteps, cfg.ntrials
     onset = _onset(0, T)
     base = (;
-        n=n,
-        tsteps=T,
-        ntrials=N,
-        gen=gen,
-        free_C=free_C,
-        nref=4,
-        terminal=true,
-        onset=onset,
+        n=n, tsteps=T, ntrials=N, gen=gen, free_C=free_C, nref=4, terminal=true, onset=onset
     )
     iters = cfg.iter_ladder
     grid = [(:iter, m) => (; base..., max_iter=m) for m in iters]
@@ -666,9 +676,7 @@ function experiment_initialization(
     settle, and it costs `length(gridq) * length(gridc)` fits per seed.
     =#
     gseeds = cfg.seeds[1:min(2, length(cfg.seeds))]
-    ggrid = [
-        (:g, q, c) => (; base..., q0=q, sig0_costate=c) for q in gridq for c in gridc
-    ]
+    ggrid = [(:g, q, c) => (; base..., q0=q, sig0_costate=c) for q in gridq for c in gridc]
     gres = cells(recover, ggrid; seeds=gseeds)
 
     #=
@@ -684,7 +692,10 @@ function experiment_initialization(
         ("tight Σ_λλ = 1e-4  [default]", (; sig0_costate=1e-4)),
         ("anneal 5e-2 → 1e-4", (; sig0_costate=1e-4, anneal_costate=5e-2)),
         ("tight + costate observed", (; sig0_costate=1e-4, observe_costate=true)),
-        ("anneal + costate observed", (; sig0_costate=1e-4, anneal_costate=5e-2, observe_costate=true)),
+        (
+            "anneal + costate observed",
+            (; sig0_costate=1e-4, anneal_costate=5e-2, observe_costate=true),
+        ),
         #=
         `q0 = 0.2` is the truth's own cost scale. It is in the table as an upper
         bound on what a lucky guess buys, not as a setting anyone can follow: in
@@ -788,7 +799,9 @@ function experiment_initialization(
 
     function one(keyfn, vals, path)
         ms = [center(metric(res[keyfn(v)], path)) for v in vals]
-        return [("relative RMSE", [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms]))]
+        return [(
+            "relative RMSE", [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms])
+        )]
     end
     sweep_figure(
         "init_controls_$(gen)";
@@ -803,12 +816,12 @@ function experiment_initialization(
     )
 
     z = [
-        center(metric(gres[(:g, q, c)], r -> r.scores.Qc.rmse))[1] for c in gridc,
-        q in gridq
+        center(metric(gres[(:g, q, c)], r -> r.scores.Qc.rmse))[1] for
+        c in gridc, q in gridq
     ]
     zcl = [
-        center(metric(gres[(:g, q, c)], r -> r.scores.cl.rmse))[1] for c in gridc,
-        q in gridq
+        center(metric(gres[(:g, q, c)], r -> r.scores.cl.rmse))[1] for
+        c in gridc, q in gridq
     ]
     for (tag, zz, what) in (
         ("qc", z, "Qc relative RMSE — the cost's shape"),
@@ -833,15 +846,24 @@ function experiment_initialization(
             panels=[
                 (
                     "cost  Qc (running)",
-                    [center(metric(cres[(:combo, g, l)], r -> r.scores.Qc.rmse))[1] for l in labs],
+                    [
+                        center(metric(cres[(:combo, g, l)], r -> r.scores.Qc.rmse))[1] for
+                        l in labs
+                    ],
                 ),
                 (
                     "reference map  Gref",
-                    [center(metric(cres[(:combo, g, l)], r -> r.scores.Gref.rmse))[1] for l in labs],
+                    [
+                        center(metric(cres[(:combo, g, l)], r -> r.scores.Gref.rmse))[1] for
+                        l in labs
+                    ],
                 ),
                 (
                     "closed-loop plant",
-                    [center(metric(cres[(:combo, g, l)], r -> r.scores.cl.rmse))[1] for l in labs],
+                    [
+                        center(metric(cres[(:combo, g, l)], r -> r.scores.cl.rmse))[1] for
+                        l in labs
+                    ],
                 ),
             ],
             title="Initialization combinations — trials from the $(g === :lqr ? "agent" : "model")",
@@ -948,11 +970,7 @@ function experiment_model_recovery(cfg; figures::Bool=true)
         return [
             begin
                 ms = [center(metric(res[keyfn(g, v)], r -> r.delta)) for v in vals]
-                (
-                    string(g),
-                    [m[1] for m in ms],
-                    ([m[2] for m in ms], [m[3] for m in ms]),
-                )
+                (string(g), [m[1] for m in ms], ([m[2] for m in ms], [m[3] for m in ms]))
             end for g in gens
         ]
     end
@@ -1022,10 +1040,15 @@ function experiment_gold_standard(cfg; figures::Bool=true)
         ("tight + Σ held at the start", (; fit_noise=false)),
         ("anneal 5e-2 → 1e-4", (; sig0_costate=1e-4, anneal_costate=5e-2)),
         ("tight + costate observed", (; observe_costate=true)),
-        ("anneal + costate observed", (; sig0_costate=1e-4, anneal_costate=5e-2, observe_costate=true)),
+        (
+            "anneal + costate observed",
+            (; sig0_costate=1e-4, anneal_costate=5e-2, observe_costate=true),
+        ),
         ("tight, plant estimated too", (; known_plant=false)),
     ]
-    res = cells(recover, [(p[1] => (; base..., p[2]...)) for p in procedures]; seeds=cfg.seeds)
+    res = cells(
+        recover, [(p[1] => (; base..., p[2]...)) for p in procedures]; seeds=cfg.seeds
+    )
 
     section(
         "4d — Gold standard: 3 cost levels, 8 targets on a ring" *
@@ -1044,7 +1067,8 @@ function experiment_gold_standard(cfg; figures::Bool=true)
             best, best_cl = lab, c
         end
     end
-    best === nothing || println("\n   best on closed-loop error: $best  ($(round(best_cl; digits=4)))")
+    best === nothing ||
+        println("\n   best on closed-loop error: $best  ($(round(best_cl; digits=4)))")
 
     #=
     Can the cost scale be *selected* rather than guessed? The `q0` ladder says
@@ -1056,15 +1080,11 @@ function experiment_gold_standard(cfg; figures::Bool=true)
     =#
     q0s = [0.05, 0.1, 0.2, 0.4, 1.0, 2.0]
     sel = cells(
-        recover,
-        [q => (; base..., q0=q, test_frac=0.3) for q in q0s];
-        seeds=cfg.seeds,
+        recover, [q => (; base..., q0=q, test_frac=0.3) for q in q0s]; seeds=cfg.seeds
     )
     println()
     println("   selecting the cost scale by cross-validation:")
-    @printf(
-        "%-18s %14s %14s %14s\n", "q0", "held-out/step", "closed-loop", "ELBO − truth"
-    )
+    @printf("%-18s %14s %14s %14s\n", "q0", "held-out/step", "closed-loop", "ELBO − truth")
     println("-"^62)
     bycv, bycl = (-Inf, 0.0), (Inf, 0.0)
     for q in q0s
@@ -1117,9 +1137,18 @@ function experiment_gold_standard(cfg; figures::Bool=true)
         "gold_standard";
         labels=labs,
         panels=[
-            ("closed-loop plant", [center(metric(res[l], r -> r.scores.cl.rmse))[1] for l in labs]),
-            ("cost  Qc (running)", [center(metric(res[l], r -> r.scores.Qc.rmse))[1] for l in labs]),
-            ("reference map  Gref", [center(metric(res[l], r -> r.scores.Gref.rmse))[1] for l in labs]),
+            (
+                "closed-loop plant",
+                [center(metric(res[l], r -> r.scores.cl.rmse))[1] for l in labs],
+            ),
+            (
+                "cost  Qc (running)",
+                [center(metric(res[l], r -> r.scores.Qc.rmse))[1] for l in labs],
+            ),
+            (
+                "reference map  Gref",
+                [center(metric(res[l], r -> r.scores.Gref.rmse))[1] for l in labs],
+            ),
         ],
         title="3 cost levels, 8 ring targets — which fitting procedure wins",
     )
@@ -1194,11 +1223,7 @@ function experiment_priors(cfg; figures::Bool=true)
     =#
     grid = Any[]
     for ν in νs, sc in (1e-4, 5e-2)
-        push!(
-            grid,
-            (:sig, ν, sc) =>
-                (; base..., sig0_costate=sc, sigma_prior_strength=ν),
-        )
+        push!(grid, (:sig, ν, sc) => (; base..., sig0_costate=sc, sigma_prior_strength=ν))
     end
     for ν in νq
         push!(grid, (:qc, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=q_modes))
@@ -1209,7 +1234,11 @@ function experiment_priors(cfg; figures::Bool=true)
     the row that shows what.
     =#
     for ν in (1e3, 1e4, 1e5)
-        push!(grid, (:qcbad, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=[0.6, 0.02, 3.0]))
+        push!(
+            grid,
+            (:qcbad, ν) =>
+                (; base..., qc_prior_strength=ν, qc_prior_scale=[0.6, 0.02, 3.0]),
+        )
     end
     for ν in νq
         push!(
@@ -1241,7 +1270,9 @@ function experiment_priors(cfg; figures::Bool=true)
     for ν in νq
         a = aggregate(res[(:qc, ν)])
         a === nothing && continue
-        report(rpad(@sprintf("cost prior ν=%-6g  (epoch modes)", ν), LBLW), a; blocks=blocks)
+        report(
+            rpad(@sprintf("cost prior ν=%-6g  (epoch modes)", ν), LBLW), a; blocks=blocks
+        )
     end
     println()
     for ν in (1e3, 1e4, 1e5)
@@ -1255,9 +1286,7 @@ function experiment_priors(cfg; figures::Bool=true)
     for ν in νq
         a = aggregate(res[(:both, ν)])
         a === nothing && continue
-        report(
-            rpad(@sprintf("Σ prior 1e4 + cost prior ν=%-6g", ν), LBLW), a; blocks=blocks
-        )
+        report(rpad(@sprintf("Σ prior 1e4 + cost prior ν=%-6g", ν), LBLW), a; blocks=blocks)
     end
 
     #=
@@ -1278,10 +1307,22 @@ function experiment_priors(cfg; figures::Bool=true)
     sq_modes = [0.2, 3.0]  # running, terminal
     sconds = [
         ("Σ estimated, no prior", (; sbase...)),
-        ("Σ estimated, prior ν=1e2", (; sbase..., sigma_prior_strength=1e2, sigma_prior_costate=2e-2)),
-        ("Σ estimated, prior ν=1e3", (; sbase..., sigma_prior_strength=1e3, sigma_prior_costate=2e-2)),
-        ("Σ estimated, prior ν=1e4", (; sbase..., sigma_prior_strength=1e4, sigma_prior_costate=2e-2)),
-        ("Σ estimated, prior ν=1e5", (; sbase..., sigma_prior_strength=1e5, sigma_prior_costate=2e-2)),
+        (
+            "Σ estimated, prior ν=1e2",
+            (; sbase..., sigma_prior_strength=1e2, sigma_prior_costate=2e-2),
+        ),
+        (
+            "Σ estimated, prior ν=1e3",
+            (; sbase..., sigma_prior_strength=1e3, sigma_prior_costate=2e-2),
+        ),
+        (
+            "Σ estimated, prior ν=1e4",
+            (; sbase..., sigma_prior_strength=1e4, sigma_prior_costate=2e-2),
+        ),
+        (
+            "Σ estimated, prior ν=1e5",
+            (; sbase..., sigma_prior_strength=1e5, sigma_prior_costate=2e-2),
+        ),
         ("Qc prior ν=1e3", (; sbase..., qc_prior_strength=1e3, qc_prior_scale=sq_modes)),
         ("Qc prior ν=1e4", (; sbase..., qc_prior_strength=1e4, qc_prior_scale=sq_modes)),
         ("Qc prior ν=1e5", (; sbase..., qc_prior_strength=1e5, qc_prior_scale=sq_modes)),
@@ -1315,7 +1356,10 @@ function experiment_priors(cfg; figures::Bool=true)
                 qc_prior_scale=sq_modes,
             ),
         ),
-        ("Σ pinned (the concession)", (; sbase..., sig0_state=0.02, sig0_costate=2e-2, fit_noise=false)),
+        (
+            "Σ pinned (the concession)",
+            (; sbase..., sig0_state=0.02, sig0_costate=2e-2, fit_noise=false),
+        ),
     ]
     sres = cells(recover_slds, [c[1] => c[2] for c in sconds]; seeds=sl.seeds)
     println()
@@ -1431,9 +1475,18 @@ function experiment_switching(cfg; figures::Bool=true)
         here. `γ (truth)` moves with it, so the collapse is a property of the
         model rather than of the fit.
         =#
-        ("Σ pinned, Σ_λλ = 1e-4 (1-system optimum)", (; base..., pinned..., sig0_costate=1e-4, costate_noise=1e-4)),
-        ("Σ pinned, Σ_λλ = 2.5e-3", (; base..., pinned..., sig0_costate=2.5e-3, costate_noise=2.5e-3)),
-        ("Σ pinned, Σ_λλ = 1e-2", (; base..., pinned..., sig0_costate=1e-2, costate_noise=1e-2)),
+        (
+            "Σ pinned, Σ_λλ = 1e-4 (1-system optimum)",
+            (; base..., pinned..., sig0_costate=1e-4, costate_noise=1e-4),
+        ),
+        (
+            "Σ pinned, Σ_λλ = 2.5e-3",
+            (; base..., pinned..., sig0_costate=2.5e-3, costate_noise=2.5e-3),
+        ),
+        (
+            "Σ pinned, Σ_λλ = 1e-2",
+            (; base..., pinned..., sig0_costate=1e-2, costate_noise=1e-2),
+        ),
         #=
         Two-stage fits. The ladder above says `γ` and the cost want opposite
         costate innovations, so the obvious response is to do both in turn. It
@@ -1507,9 +1560,11 @@ function experiment_switching(cfg; figures::Bool=true)
         ok = [r for r in rs if r !== nothing && !haskey(r, :failed)]
         segres[(src, oc)] = ok
         if isempty(ok)
-            reason = any(r -> r !== nothing && haskey(r, :failed), rs) ?
-                "no LQR segments — the stage-one fit put every timestep in the free state" :
+            reason = if any(r -> r !== nothing && haskey(r, :failed), rs)
+                "no LQR segments — the stage-one fit put every timestep in the free state"
+            else
                 "FAILED"
+            end
             println(rpad(lab, LBLW), "  ", reason)
             continue
         end
@@ -1533,7 +1588,9 @@ function experiment_switching(cfg; figures::Bool=true)
         reference=[center(metric(res[l], r -> r.truth_gamma.acc))[1] for l in have],
         title="Recovering the discrete path ($(s.ntrials) trials, T = $(s.tsteps))",
     )
-    shown = ("cold start, Σ estimated", "cold start, Σ pinned", "costate observed, Σ pinned")
+    shown = (
+        "cold start, Σ estimated", "cold start, Σ pinned", "costate observed, Σ pinned"
+    )
     for l in shown
         rs = filter(!isnothing, get(res, l, Any[]))
         isempty(rs) && continue
@@ -1559,8 +1616,8 @@ function experiment_switching(cfg; figures::Bool=true)
     of estimating the epochs and the cost at the same time.
     =#
     segqc = [
-        (string(src, oc ? " + costate" : ""), aggregate(segres[(src, oc)]))
-        for src in (:oracle, :fit) for oc in (false, true)
+        (string(src, oc ? " + costate" : ""), aggregate(segres[(src, oc)])) for
+        src in (:oracle, :fit) for oc in (false, true)
     ]
     keep = [(l, a) for (l, a) in segqc if a !== nothing]
     isempty(keep) || dot_figure(

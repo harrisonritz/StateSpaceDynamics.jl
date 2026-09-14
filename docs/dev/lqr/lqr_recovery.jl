@@ -6,6 +6,7 @@ Run it:
     julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl
     julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick
     julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --full --only=design,switching
+    julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder
 
 The `docs` environment needs the local package dev'd in, which is the same thing
 CI does before building the docs:
@@ -23,9 +24,13 @@ assertion that passes.
     --quick              a ~2-minute smoke test; one seed per cell, so its
                          numbers say whether the code runs, not what is true
     --full               the long tier: more seeds, more trials, wider ladders
+    --smoulder           the requested 12-plant-dim, 500-trial, 100-bin,
+                         150-neuron Poisson tier; defaults to the three
+                         smoulder experiments only
     --only=a,b           run only these experiments (overview, design, scale,
                          procedure, initialization, modelrecovery, goldstandard,
-                         priors, switching)
+                         priors, switching, smoulder-lqr, smoulder-gref,
+                         smoulder-slqr)
     --gen=rand|lqr|both  which generative mode the parametric sweeps use
                          (default: both for `design`, `lqr` elsewhere)
     --no-figures         tables only
@@ -42,6 +47,7 @@ assertion that passes.
     plotting.jl     figures (PNG, into `figures/`, gitignored)
     report.jl       tables
     experiments.jl  the five sweeps
+    smoulder.jl     grouped Poisson LQR/SLQR recovery at the task's scale
 
 ## The design decision worth knowing
 
@@ -60,15 +66,25 @@ using StateSpaceDynamics
 using LinearAlgebra
 using Printf
 using Random
+using Distributions
 
 const SSD = StateSpaceDynamics
 
-for _f in ("scoring.jl", "model.jl", "recovery.jl", "slds.jl", "compare.jl",
-    "report.jl", "plotting.jl", "experiments.jl")
+for _f in (
+    "scoring.jl",
+    "model.jl",
+    "recovery.jl",
+    "slds.jl",
+    "compare.jl",
+    "report.jl",
+    "plotting.jl",
+    "experiments.jl",
+    "smoulder.jl",
+)
     include(joinpath(@__DIR__, _f))
 end
 
-const ALL_EXPERIMENTS = (
+const DEFAULT_EXPERIMENTS = (
     "overview",
     "design",
     "scale",
@@ -80,6 +96,12 @@ const ALL_EXPERIMENTS = (
     "switching",
 )
 
+const ALL_EXPERIMENTS = (
+    DEFAULT_EXPERIMENTS..., "smoulder-lqr", "smoulder-gref", "smoulder-slqr"
+)
+
+const SMOULDER_EXPERIMENTS = ("smoulder-lqr", "smoulder-gref", "smoulder-slqr")
+
 """
     parse_args(args) -> NamedTuple
 
@@ -89,11 +111,12 @@ turns into a two-hour smoke test.
 """
 function parse_args(args)
     tier_name = :default
-    only = collect(ALL_EXPERIMENTS)
+    only = collect(DEFAULT_EXPERIMENTS)
     figures = true
     free_C = false
     gen = :both
     self = false
+    only_given = false
     for a in args
         if a == "--quick"
             tier_name = :quick
@@ -101,25 +124,29 @@ function parse_args(args)
             self = true
         elseif a == "--full"
             tier_name = :full
+        elseif a == "--smoulder"
+            tier_name = :smoulder
         elseif a == "--no-figures"
             figures = false
         elseif a == "--free-C"
             free_C = true
         elseif startswith(a, "--only=")
+            only_given = true
             only = split(a[8:end], ',')
             bad = setdiff(only, ALL_EXPERIMENTS)
-            isempty(bad) ||
-                error("--only names unknown experiments: $(join(bad, ", ")); " *
-                    "valid: $(join(ALL_EXPERIMENTS, ", "))")
+            isempty(bad) || error(
+                "--only names unknown experiments: $(join(bad, ", ")); " *
+                "valid: $(join(ALL_EXPERIMENTS, ", "))",
+            )
         elseif startswith(a, "--gen=")
             g = a[7:end]
-            g in ("rand", "lqr", "both") ||
-                error("--gen must be rand, lqr or both; got $g")
+            g in ("rand", "lqr", "both") || error("--gen must be rand, lqr or both; got $g")
             gen = Symbol(g)
         else
             error("unknown flag $a; see the header of $(@__FILE__)")
         end
     end
+    tier_name === :smoulder && !only_given && (only = collect(SMOULDER_EXPERIMENTS))
     return (
         tier=tier_name, only=only, figures=figures, free_C=free_C, gen=gen, selftest=self
     )
@@ -129,7 +156,7 @@ _gens(gen, default) = gen === :both ? default : (gen,)
 
 function main(args=String[])
     opt = parse_args(args)
-    opt.selftest && return (selftest(); nothing)
+    opt.selftest && return (selftest(); smoulder_selftest(); nothing)
     cfg = tier(opt.tier)
     t0 = time()
 
@@ -139,8 +166,11 @@ function main(args=String[])
     println("plant / trial  n = ", cfg.n, ", T = ", cfg.tsteps, ", N = ", cfg.ntrials)
     println(
         "emission      ",
-        opt.free_C ? "random readout (latent basis also unidentified)" :
-        "C = [I 0] (state observed directly)",
+        if opt.free_C
+            "random readout (latent basis also unidentified)"
+        else
+            "C = [I 0] (state observed directly)"
+        end,
     )
     opt.figures && println("figures       ", figdir())
 
@@ -181,6 +211,15 @@ function main(args=String[])
     end
     if "switching" in opt.only
         experiment_switching(cfg; figures=opt.figures)
+    end
+    if "smoulder-lqr" in opt.only
+        experiment_smoulder_lqr(cfg; figures=opt.figures)
+    end
+    if "smoulder-gref" in opt.only
+        experiment_smoulder_gref(cfg; figures=opt.figures)
+    end
+    if "smoulder-slqr" in opt.only
+        experiment_smoulder_slqr(cfg; figures=opt.figures)
     end
 
     @printf("\nelapsed: %.1f min\n", (time() - t0) / 60)
@@ -233,6 +272,13 @@ function reading_guide()
     to the cost scale, and so the best single summary of whether the fit found the same
     control *problem*; it reads `--` when the fitted cost admits no stabilizing Riccati
     solution, which is itself a result.
+
+    The smoulder tables add raw and `align` columns. The latter estimate an
+    orthogonal state-basis map from the fitted and true Poisson loadings, then
+    apply that same map to `A`, `S`, every reward-specific running/terminal
+    `Qc`, the closed loop, and `Gref`. `G'G` is the target Gram matrix and is
+    rotation-invariant. A bad raw `Gref` with good aligned `Gref` and `G'G` is a
+    coordinate-gauge result, not failed recovery of target geometry.
 
     `Δelbo` is the fit's ELBO minus the ELBO at the generating parameters: a few nats is
     ordinary finite-sample slack, a large positive number means the model prefers

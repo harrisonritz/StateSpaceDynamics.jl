@@ -119,20 +119,27 @@ which says the plant itself changed with the condition.
 `LQRFitFlags` freezes pieces within the block, and composes with either:
 a frozen piece keeps its starting value in every group. Freezing and sharing are
 different, though — a shared piece is still fitted, from all the trials at once.
+
+A `:free` model takes the same names, and they mean the same thing: naming a
+piece gives that piece a copy per group. It simply has fewer pieces — its
+transition is one unconstrained matrix, so `:A` (or `:structure`) groups it,
+`:h` and `:Bu` group the affine and input terms, and `:S`, `:Qc`, `:Gref`,
+`:terminal` name nothing it holds and so vary nothing. That is not a loophole
+but the reason the names are accepted here: inside an `SLDS` every regime must
+declare the same labels, so a free discrete state sitting beside an LQR one
+fitted with `(Qc = reward,)` has to be able to say so too — and on the free
+state it correctly says "and none of *my* parameters split by reward", which
+keeps its dynamics one estimate pooled over every group.
 =#
-function _param_group(sm::LQRStateModel, name::Symbol)
+function _param_group(::LQRStateModel, name::Symbol)
     name === :structure && return :A
     name === :noise && return :Q
     name in (:x0, :P0) && return name
-    #= A `:free` model's transition is one unconstrained matrix with no plant,
-    cost or reference to name, so only the whole block can be grouped there. =#
-    (!_is_free(sm) && name in _LQR_STRUCT_NAMES) && return :A
+    name in _LQR_STRUCT_NAMES && return :A
     return nothing
 end
 
-function _valid_param_names(sm::LQRStateModel)
-    _is_free(sm) && return ":x0, :P0, :structure, :noise (a `:free` model's " *
-           "transition has no plant, cost or reference to name separately)"
+function _valid_param_names(::LQRStateModel)
     return ":x0, :P0, :structure, :noise, and the individual structural blocks " *
            ":A, :S, :Qc, :h, :Bu, :Gref, :terminal"
 end

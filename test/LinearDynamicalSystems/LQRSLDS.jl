@@ -802,3 +802,79 @@ function test_lqr_pair_slots()
     @test SSD._lqr_pair_slots([3, 3, 7, 7], [2, 5, 2, 5]) == [1, 2, 3, 4]
     return nothing
 end
+
+#=
+A `:free` discrete state beside a grouped LQR one. The SLDS requires every
+regime to declare the same labels, so the free state has to accept the names its
+LQR neighbour groups by — and on a free state `(Qc = labels,)` names nothing it
+holds, so its dynamics stay ONE array across the groups. That array has to end
+the M-step at the estimate pooled over every group, not at whichever group was
+updated last: with a declaration that varies nothing either state actually
+holds, one M-step must reproduce the ungrouped fit exactly.
+=#
+function test_slds_lqr_grouped_free_state_pools()
+    n, T, N = 2, 20, 24
+    A = [0.95 0.10; -0.05 0.90]
+    S = Matrix(0.15I, n, n)
+    Qc = Matrix(0.20I, n, n)
+    Σ = Matrix(Diagonal([0.02, 0.02, 0.02, 0.02]))
+    emission() = GaussianObservationModel(;
+        C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
+    )
+    function lqr_lds()
+        sm = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
+            terminal=true, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        return LinearDynamicalSystem(sm, emission())
+    end
+    function free_lds()
+        seed = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
+            terminal=false, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        sm = SSD.free_state_model(
+            Matrix(SSD.symplectic_matrix(seed, 1)), Matrix(seed.cache.Qfwd);
+            h=Vector(seed.cache.bfwd), x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        return LinearDynamicalSystem(sm, emission())
+    end
+
+    rng = StableRNG(7)
+    y = [0.5 .* randn(rng, n, T) for _ in 1:N]
+    labels = [isodd(i) ? "lo" : "hi" for i in 1:N]
+    for i in 1:N
+        isodd(i) || (y[i] .*= 3.0)   # groups that differ, so last-wins cannot pass
+    end
+
+    function fitted(dep)
+        slds = SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=[lqr_lds(), free_lds()])
+        if dep !== nothing
+            for lds in slds.LDSs
+                lds.state_model.depends_on = dep
+            end
+        end
+        # `max_iter = 2` is exactly one M-step: the last iteration only scores.
+        fit!(slds, y; max_iter=2, progress=false, rng=StableRNG(3),
+            tied_params=[:A, :S, :C, :R])
+        return slds
+    end
+
+    # Both models accept the declaration; this used to throw on the free state.
+    plain = fitted(nothing)
+    grouped = fitted((Gref=labels,))   # ux_dim = 0: splits nothing either holds
+    rel(a, b) = norm(a .- b) / max(norm(a), eps())
+    fp, fg = plain.LDSs[2].state_model, grouped.LDSs[2].state_model
+    @test rel(fp.Mfree, fg.Mfree) < 1e-10
+    @test rel(fp.h, fg.h) < 1e-10
+    @test rel(fp.Σ, fg.Σ) < 1e-10
+    lp, lg = plain.LDSs[1].state_model, grouped.LDSs[1].state_model
+    @test rel(lp.A, lg.A) < 1e-6
+    @test rel(lp.Qc[1], lg.Qc[1]) < 1e-6
+
+    # A real grouping: the LQR cost splits, the free state's dynamics do not.
+    split = fitted((Qc=labels,))
+    free = split.LDSs[2].state_model.variants
+    @test all(v -> v.Mfree === free[1].Mfree && v.Σ === free[1].Σ, free)
+    costs = split.LDSs[1].state_model.variants
+    @test !(costs[1].Qc[1] === costs[2].Qc[1])
+
+    # A partial split of the free regression is refused rather than guessed.
+    @test_throws ArgumentError fitted((h=labels,))
+    return nothing
+end

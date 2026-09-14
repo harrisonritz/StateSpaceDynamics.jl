@@ -23,6 +23,8 @@ $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=goldstandard
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=modelrecovery,switching
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=procedure --gen=lqr
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --no-figures
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder --only=smoulder-gref
 ```
 
 Figures land in `docs/dev/lqr/figures/` (gitignored — they are regenerated on
@@ -41,6 +43,55 @@ every run).
 | `report.jl` | tables, seed aggregation |
 | `plotting.jl` | figures |
 | `experiments.jl` | the eight sweeps |
+| `smoulder.jl` | grouped Poisson recovery matched to the smoulder-reward task |
+
+## Smoulder-reward recovery suite
+
+`--smoulder` selects an opt-in tier with a 12-dimensional LQR plant (24 latent
+state-costate dimensions), 1,000 trials, 100 bins per trial, 150 Poisson
+channels, eight centre-out targets, and three known reward labels. It runs only
+the three experiments below unless `--only` says otherwise:
+
+| name | question |
+|---|---|
+| `smoulder-lqr` | Which cost scale, costate-noise initialization, explicit `Σ`/`Qc` prior, emission initialization, and known-plant control best recover grouped costs? |
+| `smoulder-gref` | Is poor raw `Gref` recovery merely latent rotation? |
+| `smoulder-slqr` | Can a two-state Poisson SLQR recover a generated free/delay → controlled/reach transition while keeping reward known? |
+
+There is deliberately no session variable and no emission grouping in these
+experiments. Only `Qc` depends on the known reward label. Since the terminal
+cost is the last member of `Qc`, both running and terminal costs get one copy
+per reward, while `A`, `S`, `Gref`, `Σ`, and the Poisson emission are shared.
+
+The full suite is expensive: each fit processes 15 million counts, and the
+initialization/prior sweep contains multiple fits over each seed. Use
+`--quick --only=smoulder-lqr,smoulder-gref,smoulder-slqr` as a smoke test before
+submitting `--smoulder` as a threaded batch job.
+
+### Reading the `Gref` audit
+
+When the Poisson loading is fitted, plant coordinates have an orthogonal gauge.
+If `x_true = T*x_fit`, consistency requires transforming all control parameters:
+
+```math
+A^* = T A T^\top,\quad S^* = T S T^\top,\quad
+Q_k^* = T Q_k T^\top,\quad G_{ref}^* = T G_{ref}.
+```
+
+The audit estimates `T` by orthogonal Procrustes from the fitted and true
+state-loading columns. It reports raw and aligned errors for the complete
+parameter set, plus `Gref'Gref`, which preserves target lengths and pairwise
+angles without choosing a gauge. Rotating `Gref` alone is not a valid recovery
+assessment: it would put the reference in a different coordinate system from
+the plant and costs.
+
+It also reports a full least-squares linear alignment. The more general change
+of coordinates uses `x_true = T*x_fit` and `lambda_true = T^{-T}lambda_fit`, so
+`A`, `S`, and `Gref` transform as above while
+`Q_k^* = T^{-T}Q_kT^{-1}`. If Procrustes and the full map agree and the latter's
+`T'T` is near identity, the ambiguity is only rotational. If only the full map
+works, the fit also contains latent scaling or shear and `Gref'Gref` is not an
+invariant assessment.
 
 ## What it measures
 

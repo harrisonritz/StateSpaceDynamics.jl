@@ -4397,10 +4397,15 @@ function _grouped_slds_state_mstep!(
         _fill_mixed_blocks!(unit_suf[u], sms[u])
     end
 
-    # A `:free` state is an ordinary regression, updated on its own.
-    for u in eachindex(sms)
-        if _is_free(sms[u])
-            _free_state_mstep!(unit_lds[u], unit_suf[u])
+    #= A `:free` state is an ordinary regression, so it is updated outside the
+    constrained context. Over the whole set of free units at once, though, not
+    one at a time: a free state whose declaration leaves its own pieces out
+    holds ONE array across every cell, and a per-unit write would leave it at
+    the last cell's estimate instead of the one pooled over all of them. =#
+    free = [u for u in eachindex(sms) if _is_free(sms[u])]
+    if !isempty(free)
+        _free_state_mstep!(unit_lds[free], unit_suf[free])
+        for u in free
             refresh!(sms[u])
         end
     end
