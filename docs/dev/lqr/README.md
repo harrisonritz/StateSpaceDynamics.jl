@@ -127,7 +127,7 @@ the latent-basis problem back in.
 | `gold_standard_scale.png` | held-out score and closed-loop error against the initial cost scale |
 | `gold_standard_params.png`, `gold_standard_entries.png` | the winning procedure's recovery |
 | `priors_sigma.png` | the `Σ` prior's strength ladder, crossed with the initialization it replaces |
-| `priors_slds_gamma.png` | a prior on `Σ` against pinning it, in the switching fit |
+| `priors_slds_gamma.png` | `Σ`-only, `Qc`-only and combined priors against pinning `Σ`, in the switching fit |
 
 ## The experiments
 
@@ -426,23 +426,24 @@ louder than the data.
 **A prior on the cost pins the scale the data cannot.** This is the fix for
 "cross-validation cannot select `q0`":
 
-| cost prior `ν` (mode at 0.2) | 0 | 1e2 | 1e3 | 1e4 | 1e5 |
+| cost prior `ν` (per-epoch modes) | 0 | 1e2 | 1e3 | 1e4 | 1e5 |
 |---|---|---|---|---|---|
-| `S` (scale error) | 0.843 | 0.837 | 0.784 | 0.231 | **0.010** |
-| closed-loop | 0.033 | 0.033 | 0.031 | 0.011 | **0.007** |
+| `S` (scale error) | 0.842 | 0.845 | 0.785 | 0.139 | **0.010** |
+| terminal `Qc` | 1.000 | 0.775 | 0.549 | 0.116 | **0.006** |
+| closed-loop | 0.033 | 0.033 | 0.031 | 0.015 | **0.007** |
 
 At full strength it beats the best `q0` anyone could have guessed (0.007 against
 0.011), and — unlike `q0` — its strength is a number in the model rather than an
 artefact of the starting point.
 
 It is doing real work in both directions, which is the test that it is a prior
-and not a fudge. Aimed at the wrong scale (0.6 against a truth of 0.2), it
-degrades the answer monotonically:
+and not a fudge. Moving only the running-cost mode to 0.6 against a truth of 0.2
+degrades the answer:
 
 | cost prior `ν` (mode at 0.6) | 1e3 | 1e4 | 1e5 |
 |---|---|---|---|
-| `S` | 0.914 | 1.275 | 1.936 |
-| closed-loop | 0.036 | 0.047 | 0.066 |
+| `S` | 0.895 | 1.072 | 1.939 |
+| closed-loop | 0.035 | 0.042 | 0.066 |
 
 **A prior on `Σ` replaces pinning it in the switching fit** — the concession
 every working switching row rested on. With `Σ` *estimated* throughout:
@@ -461,6 +462,31 @@ innovation rather than being told it — and it recovers `Σ` itself to 3%. It
 saturates by `1e4`. The LQR state's *cost* is no better for it (0.83–0.95
 throughout): the prior fixes the collapse, not the cost, which still needs the
 two-stage fit.
+
+**The `Qc` prior fixes the continuous control problem in the switching fit, but
+not the switching problem.** The new switching cross-check makes that separation
+visible (default tier; the switching tier has one seed):
+
+| switching fit | `Qc` run | `Qc` terminal | `S` scale | `Σ xx` | closed-loop | γ | onset |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| no prior | 0.817 | 0.997 | 0.995 | 5.730 | 0.075 | 0.142 | 19.2 |
+| `Σ` prior `ν=1e4` | 0.945 | 2.994 | 0.994 | **0.030** | 0.075 | **0.870** | **5.0** |
+| `Qc` prior `ν=1e4` | **0.107** | 0.012 | 0.011 | 6.383 | **0.007** | 0.272 | 19.2 |
+| both, `ν=1e4` | **0.107** | **0.009** | **0.009** | **0.014** | **0.007** | 0.500 | 19.8 |
+
+Thus neither prior improves every notion of recovery. `Σ` regularization is
+the discrete-state lever; `Qc` regularization is the cost-scale/control-problem
+lever. Combining them recovers the continuous parameters but changes the
+competition with the free state enough that the epoch fit falls back to chance.
+Do not read good parameter recovery as evidence that the discrete path recovered,
+or vice versa.
+
+`Qc_prior` now accepts a vector aligned with `Qc`, with `nothing` for any epoch
+that should remain unregularized. These rows use modes `[0.2, 0.02, 3.0]` for
+running, delay and terminal costs in the single-system fit and `[0.2, 3.0]` for
+running and terminal costs in the switching fit. That removes the old shared-mode
+artifact: at `ν=1e4`, terminal-cost error falls from about 0.93 to 0.012 in the
+switching model, and to 0.009 when combined with the `Σ` prior.
 
 **What a prior on `Σ` does not do is rescue a bad start.** Crossed with the
 initialization it was meant to replace:
@@ -505,9 +531,11 @@ recovered from 4.42 to 1.55.
    ELBO prefers the wrong one, a warm start at the truth walks away from it, and
    held-out likelihood cannot select the cost scale — it prefers whichever fit
    hedges most.
-8. **For a switching model, put a `Σ_prior` on the LQR state** (`ν` of order the
-   transition count) rather than pinning it: it recovers the epochs as well as
-   being told the innovation does, and recovers `Σ` itself besides. Then fit the
+8. **For a switching model, choose the prior for the question you care about.**
+   A `Σ_prior` with `ν` of order the transition count recovers the epochs and
+   `Σ`; a `Qc_prior` recovers the cost scale and closed loop. Combining them did
+   not recover the epochs in this experiment, so it is not a free improvement.
+   Then fit the
    epochs and the cost in **two stages** — a loose costate innovation to segment,
    the single-system machinery at a tight one on the segments — because no single
    setting recovers both.
@@ -584,11 +612,11 @@ on `LQRStateModel`, acting in the profiled objective, its gradient, the noise
 M-step and the prior log-density. See "Priors do the job the initialization was
 doing silently" above for what they buy. The other three findings stand.
 
-A note on verifying it here: `ForwardDiff` is not installable in this
-environment, so the package's own M-step gradient tests — which differentiate a
-reference objective — could not be run. The substitute was a central-difference
-check of `_lqr_fg!` against its analytic gradient in all four prior
-configurations and both the profiled and unprofiled branches (worst relative
-error 2.1e-9), EM monotonicity in the penalized bound, and a strength ladder
-that moves the fitted `Σ` onto the prior's mode. Run the real suite before
-trusting it further.
+The M-step tests now differentiate an independent reference objective with
+`ForwardDiff` for no, shared, combined, and per-epoch priors in both the profiled and
+fixed-noise branches. They also check the closed-form posterior mode for `Σ`,
+the prior contribution to the ELBO, and counting when grouped structure and
+noise vary independently. That last check exposed and fixed an ELBO bug: the
+grouped path had counted both structural priors according to the noise groups,
+which under-counted varying `Qc` or over-counted shared `Qc`. The focused prior
+suite passes 61/61.

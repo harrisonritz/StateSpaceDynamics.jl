@@ -314,10 +314,11 @@ function _lqr_structural_logprior(sm::LQRStateModel{T}) where {T<:Real}
     sm.Σ_prior === nothing || (total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior))
     if sm.Qc_prior !== nothing && !_is_free(sm)
         seen = Base.IdSet()
-        for Q in sm.Qc
+        for (k, Q) in enumerate(sm.Qc)
             Q in seen && continue
             push!(seen, Q)
-            total += iw_logprior_term(Matrix{T}(Q), sm.Qc_prior)
+            prior = _qc_prior(sm, k)
+            prior === nothing || (total += iw_logprior_term(Matrix{T}(Q), prior))
         end
     end
     return total

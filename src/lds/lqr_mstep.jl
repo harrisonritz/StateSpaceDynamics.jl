@@ -1177,9 +1177,9 @@ profiled out: `−log p(Q_k) = ½[(ν + n + 1) log det Q_k + tr(Ψ Q_k⁻¹)]`, 
 gradient `½[(ν + n + 1) Q_k⁻¹ − Q_k⁻¹ Ψ Q_k⁻¹]` accumulated into `dQ` in
 matrix coordinates — the PSD chain rule downstream carries it to `θ`.
 
-Counting: the `Σ` prior is applied once per *noise version* and the cost prior
-once per *block copy*, so a tie that shares one array across discrete states
-counts its prior once rather than once per state.
+Counting: the `Σ` prior is applied once per *noise version* and each epoch's
+cost prior once per *block copy*, so a tie that shares one array across discrete
+states counts its prior once rather than once per state.
 =============================================================================#
 
 """The `Σ` prior in force for noise version `s`, or `nothing`."""
@@ -1190,10 +1190,10 @@ counts its prior once rather than once per state.
     return nothing
 end
 
-"""The cost prior in force for copy `v` of the `Qc` block, or `nothing`."""
-@inline function _qc_prior(ctx::_LQRMStepCtx, v::Int)
+"""The cost prior in force for regime `k` of copy `v`, or `nothing`."""
+@inline function _qc_prior(ctx::_LQRMStepCtx, v::Int, k::Int)
     o = ctx.owners[_LQR_BLOCK_Q][v]
-    return isempty(o) ? nothing : ctx.sms[first(o)].Qc_prior
+    return isempty(o) ? nothing : _qc_prior(ctx.sms[first(o)], k)
 end
 
 """
@@ -1489,10 +1489,9 @@ function _lqr_fg!(
     The cost prior's *value*, here rather than in the gradient section below,
     because of the early return on the next line.
     =#
-    for v in 1:(p.nv[_LQR_BLOCK_Q])
-        pr = _qc_prior(ctx, v)
-        (pr === nothing || isempty(_lqr_blk_q(p, v, 1))) && continue
-        for k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+        pr = _qc_prior(ctx, v, k)
+        if pr !== nothing && !isempty(_lqr_blk_q(p, v, k))
             pen = _iw_penalty(ctx.Qc[v][k], pr)
             isfinite(pen) || return T(Inf)
             fval += pen
@@ -1615,10 +1614,9 @@ function _lqr_fg!(
     rule below turns `dQ` into a gradient with respect to the packed factor. Its
     value was added above, before the early return.
     =#
-    for v in 1:(p.nv[_LQR_BLOCK_Q])
-        pr = _qc_prior(ctx, v)
-        (pr === nothing || isempty(_lqr_blk_q(p, v, 1))) && continue
-        for k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+        pr = _qc_prior(ctx, v, k)
+        if pr !== nothing && !isempty(_lqr_blk_q(p, v, k))
             _iw_penalty_grad!(ctx.dQ[v][k], ctx.Qc[v][k], pr)
         end
     end

@@ -1185,6 +1185,7 @@ function experiment_priors(cfg; figures::Bool=true)
     =#
     νs = [0.0, 1e2, 1e3, 1e4, 1e5]
     νq = [0.0, 1e2, 1e3, 1e4, 1e5]
+    q_modes = [0.2, 0.02, 3.0]  # running, delay, terminal
 
     #=
     The `Σ` prior crossed with the *initialization* it is meant to replace. If the
@@ -1200,7 +1201,7 @@ function experiment_priors(cfg; figures::Bool=true)
         )
     end
     for ν in νq
-        push!(grid, (:qc, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=0.2))
+        push!(grid, (:qc, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=q_modes))
     end
     #=
     The same prior aimed at the wrong scale. A prior that pins the cost is only
@@ -1208,7 +1209,7 @@ function experiment_priors(cfg; figures::Bool=true)
     the row that shows what.
     =#
     for ν in (1e3, 1e4, 1e5)
-        push!(grid, (:qcbad, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=0.6))
+        push!(grid, (:qcbad, ν) => (; base..., qc_prior_strength=ν, qc_prior_scale=[0.6, 0.02, 3.0]))
     end
     for ν in νq
         push!(
@@ -1217,7 +1218,7 @@ function experiment_priors(cfg; figures::Bool=true)
                 base...,
                 sigma_prior_strength=1e4,
                 qc_prior_strength=ν,
-                qc_prior_scale=0.2,
+                qc_prior_scale=q_modes,
             ),
         )
     end
@@ -1240,14 +1241,14 @@ function experiment_priors(cfg; figures::Bool=true)
     for ν in νq
         a = aggregate(res[(:qc, ν)])
         a === nothing && continue
-        report(rpad(@sprintf("cost prior ν=%-6g  (at 0.2)", ν), LBLW), a; blocks=blocks)
+        report(rpad(@sprintf("cost prior ν=%-6g  (epoch modes)", ν), LBLW), a; blocks=blocks)
     end
     println()
     for ν in (1e3, 1e4, 1e5)
         a = aggregate(res[(:qcbad, ν)])
         a === nothing && continue
         report(
-            rpad(@sprintf("cost prior ν=%-6g  at 0.6 (wrong)", ν), LBLW), a; blocks=blocks
+            rpad(@sprintf("cost prior ν=%-6g  run=0.6 (wrong)", ν), LBLW), a; blocks=blocks
         )
     end
     println()
@@ -1260,9 +1261,9 @@ function experiment_priors(cfg; figures::Bool=true)
     end
 
     #=
-    The switching half. `Σ` estimated throughout — the question is whether a
-    prior does the job pinning was doing, so pinning it here would answer a
-    different one.
+    The switching half. `Σ` is estimated throughout the prior rows. Cross the
+    useful `Σ` strength with the cost prior so this section asks about both
+    parameter priors, not only whether regularizing `Σ` replaces pinning it.
     =#
     sl = cfg.slds
     sbase = (;
@@ -1274,17 +1275,51 @@ function experiment_priors(cfg; figures::Bool=true)
         terminal=true,
         nref=4,
     )
+    sq_modes = [0.2, 3.0]  # running, terminal
     sconds = [
         ("Σ estimated, no prior", (; sbase...)),
         ("Σ estimated, prior ν=1e2", (; sbase..., sigma_prior_strength=1e2, sigma_prior_costate=2e-2)),
         ("Σ estimated, prior ν=1e3", (; sbase..., sigma_prior_strength=1e3, sigma_prior_costate=2e-2)),
         ("Σ estimated, prior ν=1e4", (; sbase..., sigma_prior_strength=1e4, sigma_prior_costate=2e-2)),
         ("Σ estimated, prior ν=1e5", (; sbase..., sigma_prior_strength=1e5, sigma_prior_costate=2e-2)),
+        ("Qc prior ν=1e3", (; sbase..., qc_prior_strength=1e3, qc_prior_scale=sq_modes)),
+        ("Qc prior ν=1e4", (; sbase..., qc_prior_strength=1e4, qc_prior_scale=sq_modes)),
+        ("Qc prior ν=1e5", (; sbase..., qc_prior_strength=1e5, qc_prior_scale=sq_modes)),
+        (
+            "Σ ν=1e4 + Qc ν=1e3",
+            (;
+                sbase...,
+                sigma_prior_strength=1e4,
+                sigma_prior_costate=2e-2,
+                qc_prior_strength=1e3,
+                qc_prior_scale=sq_modes,
+            ),
+        ),
+        (
+            "Σ ν=1e4 + Qc ν=1e4",
+            (;
+                sbase...,
+                sigma_prior_strength=1e4,
+                sigma_prior_costate=2e-2,
+                qc_prior_strength=1e4,
+                qc_prior_scale=sq_modes,
+            ),
+        ),
+        (
+            "Σ ν=1e4 + Qc ν=1e5",
+            (;
+                sbase...,
+                sigma_prior_strength=1e4,
+                sigma_prior_costate=2e-2,
+                qc_prior_strength=1e5,
+                qc_prior_scale=sq_modes,
+            ),
+        ),
         ("Σ pinned (the concession)", (; sbase..., sig0_state=0.02, sig0_costate=2e-2, fit_noise=false)),
     ]
     sres = cells(recover_slds, [c[1] => c[2] for c in sconds]; seeds=sl.seeds)
     println()
-    println("   switching: a prior on Σ against pinning it")
+    println("   switching: Σ and Qc priors, against pinning Σ")
     table_header(CORE_BLOCKS; tail=SLDS_TAIL)
     for (lab, _) in sconds
         a = aggregate_slds(sres[lab])
@@ -1333,7 +1368,7 @@ function experiment_priors(cfg; figures::Bool=true)
         labels=have,
         fitted=[center(metric(sres[l], r -> r.gamma.acc))[1] for l in have],
         reference=[center(metric(sres[l], r -> r.truth_gamma.acc))[1] for l in have],
-        title="A prior on Σ against pinning it ($(sl.ntrials) trials, T = $(sl.tsteps))",
+        title="Σ and Qc priors in the switching fit ($(sl.ntrials) trials, T = $(sl.tsteps))",
     )
     return (single=res, switching=sres)
 end

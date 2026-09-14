@@ -142,9 +142,12 @@ function sigma_prior(
 end
 
 """
-    qc_prior(n; scale, strength) -> IWPrior or nothing
+    qc_prior(n; scale, strength) -> IWPrior, vector of priors, or nothing
 
-An inverse-Wishart prior on each cost matrix, centred on `scale · I`.
+An inverse-Wishart prior on cost matrices, centred on `scale · I`. A scalar
+`scale` returns one prior to share across regimes. A vector returns one prior per
+`Qc` epoch in schedule order, so running, delay, and terminal costs can have
+different modes.
 
 This is the honest version of the initial cost scale. The `q0` ladder shows the
 fitted scale barely moves from where it starts, which means the analysis has a
@@ -155,9 +158,19 @@ makes its strength a number a reader can see and a fit can trade against.
 `Ψ = (ν + n + 1) · scale · I` puts the mode at `scale · I`; `strength = 0`
 returns `nothing`.
 """
-function qc_prior(n::Int; scale::Float64=0.2, strength::Float64=0.0)
+function qc_prior(
+    n::Int; scale::Union{Real,AbstractVector{<:Real}}=0.2, strength::Float64=0.0
+)
     strength > 0 || return nothing
-    return IWPrior(; Ψ=(strength + n + 1) * scale .* Matrix(1.0I, n, n), ν=strength)
+    make(s) = IWPrior(;
+        Ψ=(strength + n + 1) * Float64(s) .* Matrix(1.0I, n, n), ν=strength
+    )
+    scale isa Real && return make(scale)
+    out = Vector{Union{Nothing,IWPrior{Float64}}}(undef, length(scale))
+    for k in eachindex(scale)
+        out[k] = make(scale[k])
+    end
+    return out
 end
 
 """

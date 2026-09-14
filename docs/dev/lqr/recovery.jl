@@ -89,7 +89,7 @@ function fit_model(
     sig0_costate::Float64=1e-4,
     sigma_prior_strength::Float64=0.0,
     qc_prior_strength::Float64=0.0,
-    qc_prior_scale::Float64=0.2,
+    qc_prior_scale::Union{Float64,Vector{Float64}}=0.2,
     rng::AbstractRNG=MersenneTwister(0),
 )
     sm = deepcopy(truth.sm)
@@ -240,7 +240,7 @@ function recover(;
     sig0_costate::Float64=1e-4,
     sigma_prior_strength::Float64=0.0,
     qc_prior_strength::Float64=0.0,
-    qc_prior_scale::Float64=0.2,
+    qc_prior_scale::Union{Float64,Vector{Float64}}=0.2,
     anneal_costate::Union{Nothing,Float64}=nothing,
     fit_noise::Bool=true,
     #=
