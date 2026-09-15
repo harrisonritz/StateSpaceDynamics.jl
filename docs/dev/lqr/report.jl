@@ -116,6 +116,7 @@ function report(label, r; blocks=CORE_BLOCKS, note::String="")
         r.rho,
         note
     )
+    report_gauge(r)
     return nothing
 end
 
@@ -149,6 +150,24 @@ function report_slds(label, r; blocks=CORE_BLOCKS, note::String="")
         r.stay_fit,
         r.elbo - r.truth_elbo,
         note
+    )
+    report_gauge(r)
+    return nothing
+end
+
+"""Print the latent-gauge audit when the emission actually moved its basis."""
+function report_gauge(r)
+    hasproperty(r, :gauge) || return nothing
+    g = r.gauge
+    g === nothing && return nothing
+    raw, proc, lin = g.raw.Gref.rmse, g.procrustes.Gref.rmse, g.linear.Gref.rmse
+    isfinite(raw) || return nothing
+    moved = g.maps.nonorthogonality > 1e-6 || g.C.procrustes.rmse > 1e-6
+    moved || return nothing
+    @printf(
+        "   gauge: Gref raw/proc/linear %.3f / %.3f / %.3f; G'G %.3f; C proc/linear %.3f / %.3f; nonorth %.3f\n",
+        raw, proc, lin, g.Ggram.rmse, g.C.procrustes.rmse,
+        g.C.linear.rmse, g.maps.nonorthogonality,
     )
     return nothing
 end
@@ -201,6 +220,7 @@ function aggregate(rs)
         end,
     )
     m(f) = center([Float64(f(r)) for r in good])[1]
+    gauge = hasproperty(good[1], :gauge) ? aggregate_gauge(good) : nothing
     return (
         scores=sc,
         elbo=m(r -> r.elbo),
@@ -209,6 +229,27 @@ function aggregate(rs)
         creep=m(r -> r.creep),
         rho=m(r -> r.rho),
         nseeds=length(good),
+        gauge=gauge,
+    )
+end
+
+function aggregate_gauge(good)
+    m(f) = center([Float64(f(r)) for r in good])[1]
+    blocks = keys(good[1].gauge.raw)
+    branch(which) = NamedTuple{blocks}(map(blocks) do b
+        (rmse=m(r -> getproperty(getproperty(r.gauge, which), b).rmse),
+         corr=m(r -> getproperty(getproperty(r.gauge, which), b).corr))
+    end)
+    return (
+        raw=branch(:raw), procrustes=branch(:procrustes), linear=branch(:linear),
+        Ggram=(rmse=m(r -> r.gauge.Ggram.rmse), corr=m(r -> r.gauge.Ggram.corr)),
+        maps=(nonorthogonality=m(r -> r.gauge.maps.nonorthogonality),),
+        C=(
+            procrustes=(rmse=m(r -> r.gauge.C.procrustes.rmse),
+                        corr=m(r -> r.gauge.C.procrustes.corr)),
+            linear=(rmse=m(r -> r.gauge.C.linear.rmse),
+                    corr=m(r -> r.gauge.C.linear.corr)),
+        ),
     )
 end
 

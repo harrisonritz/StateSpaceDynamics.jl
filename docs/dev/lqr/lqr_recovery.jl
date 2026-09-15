@@ -273,8 +273,9 @@ function reading_guide()
     control *problem*; it reads `--` when the fitted cost admits no stabilizing Riccati
     solution, which is itself a result.
 
-    The smoulder tables add raw and `align` columns. The latter estimate an
-    orthogonal state-basis map from the fitted and true Poisson loadings, then
+    Recovery results with a reference also carry a `gauge` audit, and tables
+    print it whenever the emission basis moved. The audit estimates an
+    orthogonal state-basis map from the fitted and true emission loadings, then
     apply that same map to `A`, `S`, every reward-specific running/terminal
     `Qc`, the closed loop, and `Gref`. `G'G` is the target Gram matrix and is
     rotation-invariant. A bad raw `Gref` with good aligned `Gref` and `G'G` is a

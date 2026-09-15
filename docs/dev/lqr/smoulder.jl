@@ -61,15 +61,16 @@ function transformed_scores(fs, rs, Cf, Cr, rewards, T)
     invT = inv(T)
     fv = [group_variant(fs, :Qc, r) for r in rewards]
     rv = [group_variant(rs, :Qc, r) for r in rewards]
+    c = plant_dim(fs) / tr(invT' * fv[1].Qc[1] * invT)
     return (
         Qc=score_worst(
-            [invT' * v.Qc[1] * invT for v in fv], [v.Qc[1] for v in rv]; sym=true
+            [c .* (invT' * v.Qc[1] * invT) for v in fv], [v.Qc[1] for v in rv]; sym=true
         ),
         Qterm=score_worst(
-            [invT' * v.Qc[end] * invT for v in fv], [v.Qc[end] for v in rv]; sym=true
+            [c .* (invT' * v.Qc[end] * invT) for v in fv], [v.Qc[end] for v in rv]; sym=true
         ),
         A=score(T*fs.A*invT, rs.A),
-        S=score(T*fs.S*T', rs.S; sym=true),
+        S=score((T*fs.S*T') ./ c, rs.S; sym=true),
         Gref=score(T*fs.Gref, rs.Gref),
         cl=score_worst(
             [T*closed_loop_dynamics(v)*invT for v in fv],

@@ -541,15 +541,14 @@ function recover_slds(;
     rescale_costate!(ref_lqr; target=:trace)
     rescale_costate!(fit_lqr; target=:trace)
     γ = gamma_scores(post.γ, zs; K=2)
+    gauge = gauge_compare(
+        fit_lqr, ref_lqr, truth.idx,
+        slds.LDSs[LQR_STATE].obs_model.C, truth.C;
+        known_plant=known_plant, free_gref=free_gref, free_noise=fit_noise,
+    )
     return (
-        scores=compare(
-            fit_lqr,
-            ref_lqr,
-            truth.idx;
-            known_plant=known_plant,
-            free_gref=free_gref,
-            free_noise=fit_noise,
-        ),
+        scores=gauge.raw,
+        gauge=gauge,
         #=
         Only the state block of the free transition is scored. The costate block
         is unobserved under `C = [I 0]` and unconstrained by the model, so a
@@ -736,8 +735,13 @@ function segment_recover(;
     ref = deepcopy(seg_truth.sm)
     rescale_costate!(ref; target=:trace)
     rescale_costate!(sm; target=:trace)
+    gauge = gauge_compare(
+        sm, ref, truth.idx, lds.obs_model.C, seg_truth.C;
+        known_plant=known_plant, free_gref=(nref > 0),
+    )
     return (
-        scores=compare(sm, ref, truth.idx; known_plant=known_plant, free_gref=(nref > 0)),
+        scores=gauge.raw,
+        gauge=gauge,
         source=source,
         kept=length(segs),
         ntrials=ntrials,

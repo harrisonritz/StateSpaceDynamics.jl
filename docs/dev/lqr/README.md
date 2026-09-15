@@ -108,16 +108,24 @@ policy. That one is invariant to the cost scale, so it is the best single
 summary of whether the fit found the same control *problem* even when it did not
 find the same cost matrices.
 
+Every ordinary LQR and SLQR recovery result also carries a `gauge` field with
+raw, orthogonal-Procrustes, and full-linear versions of all parameter scores.
+When a fitted emission moves the latent basis (notably under `--free-C`), table
+rows print a compact second line with the three `Gref` errors, the target Gram
+error, emission-alignment residuals, and the linear map's non-orthogonality.
+Fixed `[I 0]` emissions reduce these checks to the raw score and omit the
+redundant extra line.
+
 The switching section adds the discrete-state question, scored separately:
 balanced MAP accuracy, mean posterior mass on the true state, per-timestep
 cross-entropy, and the switch-time error in timesteps. Each condition also
 reports **γ at the generating parameters**, which is the reference the fit is
 read against — on a mixed free/LQR system that reference is nowhere near 1.
 
-`--selftest` checks the two properties the whole comparison rests on: a model
-scored against itself is exactly `0 / 1` on every block, and rescaling a model's
-costate by an arbitrary factor and re-canonicalizing returns it to the same
-place.
+`--selftest` checks the properties the whole comparison rests on: identity,
+costate-scale invariance, exact recovery after a coherent orthogonal rotation,
+and exact recovery after a coherent non-orthogonal scale/shear. The last two
+transform every affected parameter, not `Gref` alone.
 
 ## One number to know before running anything
 

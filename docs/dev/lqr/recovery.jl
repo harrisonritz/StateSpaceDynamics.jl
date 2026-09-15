@@ -329,6 +329,7 @@ function recover(;
     end
     elbos = best.elbos
     fit_sm = best.sm
+    fit_lds = best.lds
     #=
     Annealing the costate innovation: fit once from a loose `Σ_λλ`, then reset
     that block to a tight value and fit again from wherever the first pass
@@ -357,7 +358,7 @@ function recover(;
         @views sm2.Σ[(n + 1):d, 1:n] .= 0
         @views sm2.Σ[(n + 1):d, (n + 1):d] .= Matrix(sig0_costate * I, n, n)
         refresh!(sm2)
-        _, elbos2 = one_fit(
+        fit_lds, elbos2 = one_fit(
             truth,
             ys_fit,
             ux_fit,
@@ -394,10 +395,13 @@ function recover(;
     ref = deepcopy(truth.sm)
     rescale_costate!(ref; target=:trace)
     rescale_costate!(fit_sm; target=:trace)
+    gauge = gauge_compare(
+        fit_sm, ref, truth.idx, fit_lds.obs_model.C, truth.C;
+        known_plant=known_plant, free_gref=free_gref, free_noise=fit_noise,
+    )
     return (
-        scores=compare(
-            fit_sm, ref, truth.idx; known_plant=known_plant, free_gref=free_gref
-        ),
+        scores=gauge.raw,
+        gauge=gauge,
         elbo=elbos[end],
         truth_elbo=truth_elbo,
         heldout=heldout,
@@ -408,6 +412,7 @@ function recover(;
         rho=maximum(abs, eigvals(symplectic_matrix(truth.sm))),
         defect=symplectic_defect(fit_sm),
         fit_sm=fit_sm,
+        fit_C=copy(fit_lds.obs_model.C),
         ref_sm=ref,
         idx=truth.idx,
         elbos=elbos,
@@ -457,16 +462,88 @@ function selftest(; verbose::Bool=true)
     shifted = deepcopy(truth.sm)
     rescale_costate!(shifted, 7.3)
     rescale_costate!(shifted; target=:trace)
-    inv = compare(shifted, ref, truth.idx; known_plant=false, free_gref=true)
+    scale_inv = compare(shifted, ref, truth.idx; known_plant=false, free_gref=true)
     worst_inv = maximum(
-        k -> (v = getfield(inv, k); isnan(v.rmse) ? 0.0 : abs(v.rmse)), keys(inv)
+        k -> (v = getfield(scale_inv, k); isnan(v.rmse) ? 0.0 : abs(v.rmse)),
+        keys(scale_inv),
     )
 
-    ok = worst_id <= 1e-10 && worst_inv <= 1e-8
+    # A complete state-basis rotation must look wrong raw and exact after the
+    # same map is applied to every structural parameter. This catches the
+    # tempting but invalid shortcut of rotating `Gref` alone.
+    W = Matrix(qr(randn(MersenneTwister(991), 3, 3)).Q)
+    rotated = deepcopy(ref)
+    rotated.A .= W' * ref.A * W
+    rotated.S .= W' * ref.S * W
+    rotated.Gref .= W' * ref.Gref
+    for k in eachindex(rotated.Qc)
+        rotated.Qc[k] .= W' * ref.Qc[k] * W
+    end
+    D = zeros(6, 6)
+    D[1:3, 1:3] .= W'
+    D[4:6, 4:6] .= W'
+    rotated.h .= D * ref.h
+    rotated.Σ .= D * ref.Σ * D'
+    refresh!(rotated)
+    Crot = truth.C * D'
+    gauge = gauge_compare(
+        rotated, ref, truth.idx, Crot, truth.C;
+        known_plant=false, free_gref=true,
+    )
+    worst_gauge = maximum(
+        b -> begin
+            v = getfield(gauge.procrustes, b)
+            isnan(v.rmse) ? 0.0 : v.rmse
+        end,
+        keys(gauge.procrustes),
+    )
+
+    # The full-linear branch is not a differently spelled Procrustes call. A
+    # scale/shear is an exact LQR gauge too, with the costate transforming by
+    # the inverse transpose. It should fail the orthogonal check and pass the
+    # general one after trace canonicalization is reapplied.
+    Tlin = W * Diagonal([0.55, 1.25, 1.8])
+    invT = inv(Tlin)
+    sheared = deepcopy(ref)
+    sheared.A .= invT * ref.A * Tlin
+    sheared.S .= invT * ref.S * invT'
+    sheared.Gref .= invT * ref.Gref
+    for k in eachindex(sheared.Qc)
+        sheared.Qc[k] .= Tlin' * ref.Qc[k] * Tlin
+    end
+    E = zeros(6, 6)
+    E[1:3, 1:3] .= invT
+    E[4:6, 4:6] .= Tlin'
+    sheared.h .= E * ref.h
+    sheared.Σ .= E * ref.Σ * E'
+    refresh!(sheared)
+    rescale_costate!(sheared; target=:trace)
+    Dlin = zeros(6, 6)
+    Dlin[1:3, 1:3] .= Tlin
+    Dlin[4:6, 4:6] .= invT'
+    linear_gauge = gauge_compare(
+        sheared, ref, truth.idx, truth.C*Dlin, truth.C;
+        known_plant=false, free_gref=true,
+    )
+    worst_linear = maximum(
+        b -> begin
+            v = getfield(linear_gauge.linear, b)
+            isnan(v.rmse) ? 0.0 : v.rmse
+        end,
+        keys(linear_gauge.linear),
+    )
+
+    ok = worst_id <= 1e-10 && worst_inv <= 1e-8 &&
+         gauge.raw.Gref.rmse > 0.1 && worst_gauge <= 1e-8 &&
+         linear_gauge.procrustes.Gref.rmse > 0.1 && worst_linear <= 1e-8
     if verbose
         @printf("selftest  identity: worst block rmse %.3g  (want 0)\n", worst_id)
         @printf("selftest  rescale invariance: worst block rmse %.3g  (want ~1e-16)\n",
                 worst_inv)
+        @printf("selftest  gauge alignment: worst block rmse %.3g  (want ~1e-16)\n",
+                worst_gauge)
+        @printf("selftest  linear gauge: worst block rmse %.3g  (want ~1e-16)\n",
+                worst_linear)
         println("selftest  ", ok ? "PASS" : "FAIL")
     end
     return ok

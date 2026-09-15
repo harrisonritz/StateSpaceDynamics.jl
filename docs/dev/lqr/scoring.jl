@@ -142,6 +142,97 @@ function compare(
 end
 
 # ---------------------------------------------------------------------------
+# Latent-coordinate gauge checks
+# ---------------------------------------------------------------------------
+
+"""
+    gauge_maps(Cfit, Cref, n)
+
+Estimate the map `x_ref = T*x_fit` from `Cfit ≈ Cref*T`, once with an
+orthogonal Procrustes constraint and once as a full least-squares map. The
+second is diagnostic: LQR coordinates admit a general invertible gauge, with
+the costate transforming contragrediently, even though PCA/FA initialization
+often reduces the practical ambiguity to a rotation.
+"""
+function gauge_maps(Cfit::AbstractMatrix, Cref::AbstractMatrix, n::Int)
+    X, Y = Matrix(view(Cref, :, 1:n)), Matrix(view(Cfit, :, 1:n))
+    F = svd(X'Y)
+    proc = F.U * F.Vt
+    linear = X \ Y
+    return (procrustes=proc, linear=linear,
+        nonorthogonality=norm(linear'linear - I) / sqrt(n))
+end
+
+function _gauge_compare(fit, ref, idx, T; known_plant::Bool, free_gref::Bool,
+                        free_noise::Bool=true)
+    n = plant_dim(fit)
+    invT = inv(T)
+    mapped_Q(i) = invT' * fit.Qc[i] * invT
+    # Reapply the same trace convention after a non-orthogonal basis change.
+    c = n / tr(mapped_Q(idx.run))
+    reg(i) = i === nothing ? NOSCORE : score(c .* mapped_Q(i), ref.Qc[i]; sym=true)
+    clf = closed_loop_or_nothing(fit)
+    clr = closed_loop_or_nothing(ref)
+    hfit = vcat(T * fit.h[1:n], c .* (invT' * fit.h[(n + 1):(2n)]))
+    return (
+        Qc=reg(idx.run),
+        Qdel=reg(idx.delay),
+        Qterm=reg(idx.term),
+        A=known_plant ? NOSCORE : score(T*fit.A*invT, ref.A),
+        S=score((T*fit.S*T') ./ c, ref.S; sym=true),
+        Gref=(free_gref && size(ref.Gref, 2) > 0) ? score(T*fit.Gref, ref.Gref) : NOSCORE,
+        Sig=free_noise ? score(T*_state_block(fit.Σ)*T', _state_block(ref.Σ); sym=true) : NOSCORE,
+        h=score(hfit, ref.h),
+        cl=(clf === nothing || clr === nothing) ? NOSCORE : score(T*clf*invT, clr),
+    )
+end
+
+_gauge_noscores() = (
+    Qc=NOSCORE, Qdel=NOSCORE, Qterm=NOSCORE, A=NOSCORE, S=NOSCORE,
+    Gref=NOSCORE, Sig=NOSCORE, h=NOSCORE, cl=NOSCORE,
+)
+
+
+"""
+    gauge_compare(fit, ref, idx, Cfit, Cref; ...) -> NamedTuple
+
+Raw, Procrustes-aligned, and full-linear parameter recovery. All parameter
+blocks are transformed consistently; in particular `Gref` is never rotated by
+itself. `Ggram` scores `Gref'Gref`, which is invariant only to the orthogonal
+gauge. If the full-linear score improves over Procrustes, the mismatch includes
+scale/shear and is not "only a rotation."
+"""
+function gauge_compare(fit, ref, idx, Cfit, Cref; known_plant::Bool,
+        free_gref::Bool=false, free_noise::Bool=true)
+    maps = gauge_maps(Cfit, Cref, plant_dim(fit))
+    hasref = free_gref && size(ref.Gref, 2) > 0
+    sv = svdvals(maps.linear)
+    linear_valid = !isempty(sv) && minimum(sv) > sqrt(eps(eltype(sv))) * maximum(sv)
+    linear_scores = linear_valid ? _gauge_compare(
+        fit, ref, idx, maps.linear;
+        known_plant=known_plant, free_gref=free_gref, free_noise=free_noise,
+    ) : _gauge_noscores()
+    return (
+        raw=compare(fit, ref, idx; known_plant=known_plant,
+            free_gref=free_gref, free_noise=free_noise),
+        procrustes=_gauge_compare(fit, ref, idx, maps.procrustes;
+            known_plant=known_plant, free_gref=free_gref, free_noise=free_noise),
+        linear=linear_scores,
+        Ggram=hasref ? score(fit.Gref'fit.Gref, ref.Gref'ref.Gref; sym=true) : NOSCORE,
+        maps=maps,
+        C=(
+            procrustes=score(Cfit[:, 1:plant_dim(fit)]*maps.procrustes',
+                Cref[:, 1:plant_dim(fit)]),
+            linear=linear_valid ? score(
+                Cfit[:, 1:plant_dim(fit)]*inv(maps.linear),
+                Cref[:, 1:plant_dim(fit)],
+            ) : NOSCORE,
+        ),
+        linear_valid=linear_valid,
+    )
+end
+
+# ---------------------------------------------------------------------------
 # Discrete-state (γ) scoring
 #
 # The SLDS adds a question the single-system harness does not have: did the fit
