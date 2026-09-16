@@ -2014,6 +2014,112 @@ function test_lqr_plant_only_inputs()
     return nothing
 end
 
+function test_lqr_terminal_regime_pin()
+    rng = StableRNG(51)
+    #=
+    `terminal_regime` pins which cost the terminal factor is written against.
+
+    It exists for ragged data. The schedule is one vector indexed by within-trial
+    timestep, so `schedule[end] == nregimes` marks the last step of the *longest*
+    trial only; every shorter trial ends under whatever running cost its own
+    length lands on, and the dedicated terminal cost is then fitted from the
+    maximal-length trials alone. Pinning puts every trial's last step on the same
+    cost whatever its length, and must leave the transitions exactly as they were.
+    =#
+    tsteps = 18
+    lengths = [12, 18, 15]
+
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
+    @test sm.terminal_regime == 0                       # off unless asked for
+
+    # The default: only the 18-bin trial reaches the terminal regime.
+    @test SSD._terminal_regime(sm, 18) == 3
+    @test SSD._terminal_regime(sm, 12) == SSD._regime(sm, 12) != 3
+
+    pinned, pinned_lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
+    pinned.terminal_regime = 3
+    refresh!(pinned)
+    for t_n in lengths
+        @test SSD._terminal_regime(pinned, t_n) == 3    # whatever the length
+    end
+    # Transitions are not the terminal factor and must be untouched by the pin.
+    @test all(SSD._regime(pinned, t) == SSD._regime(sm, t) for t in 1:(tsteps - 1))
+
+    #=
+    The claim that matters: which `Qc` the M-step's terminal sufficient
+    statistics are attributed to. By default they are split across regimes by
+    trial length; pinned, all of them land on regime 3.
+    =#
+    ys = [randn(rng, lds.obs_dim, t) .* 0.4 for t in lengths]
+
+    hs_default, _, _, _ = lqr_estep_stats(lds, ys)
+    expected = zeros(3)
+    for t_n in lengths
+        expected[SSD._regime(sm, t_n)] += 1
+    end
+    @test hs_default.term_n ≈ expected
+    @test expected[3] == 1                              # one of three trials
+
+    hs_pinned, _, _, _ = lqr_estep_stats(pinned_lds, ys)
+    @test hs_pinned.term_n ≈ [0.0, 0.0, 3.0]            # all of them
+    @test sum(hs_pinned.term_n) ≈ sum(hs_default.term_n)
+    # Transition statistics are the same either way.
+    @test hs_pinned.nk ≈ hs_default.nk
+
+    # And the Riccati sweep writes the pinned cost at the boundary.
+    P, _, _ = lqr_riccati_sequence(pinned, 12)
+    @test P[end] ≈ pinned.Qc[3]
+
+    # EM still runs, and still climbs.
+    els = fit!(pinned_lds, ys; max_iter=8, progress=false)
+    @test minimum(diff(els)) > -1e-8
+    @test all(isfinite, els)
+    return nothing
+end
+
+function test_lqr_terminal_regime_errors()
+    rng = StableRNG(52)
+    A = [0.96 0.07; -0.05 0.93]
+    Sm = [0.06 0.01; 0.01 0.05]
+    Qc = [Matrix(0.2I, 2, 2), Matrix(0.6I, 2, 2), Matrix(1.1I, 2, 2)]
+    Σ = Matrix(0.03I, 4, 4)
+    sched = cost_schedule(10; terminal=true, onset=5, nregimes=3)
+
+    # Pinning a cost for a terminal factor that does not exist.
+    @test_throws ArgumentError LQRStateModel(
+        A, Sm, Qc, Σ; schedule=sched, terminal=false, terminal_regime=2
+    )
+    # Pinning a cost index that does not exist.
+    @test_throws ArgumentError LQRStateModel(
+        A, Sm, Qc, Σ; schedule=sched, terminal=true, terminal_regime=4
+    )
+    @test_throws ArgumentError LQRStateModel(
+        A, Sm, Qc, Σ; schedule=sched, terminal=true, terminal_regime=-1
+    )
+    # Zero is always allowed: it is the default, "follow the schedule".
+    sm = LQRStateModel(A, Sm, Qc, Σ; schedule=sched, terminal=true, terminal_regime=0)
+    @test sm.terminal_regime == 0
+
+    #=
+    A regime reached only as a pinned terminal *is* used, so the "never used by
+    the schedule" warning must not fire for it — that warning would be telling
+    the user to drop exactly the cost they asked to fit. The schedule here points
+    every transition at regime 1, so regime 2 is reached only as the pin.
+    =#
+    two = [Matrix(0.2I, 2, 2), Matrix(0.6I, 2, 2)]
+    running_only = ones(Int, 10)
+    pinned = @test_logs LQRStateModel(
+        A, Sm, two, Σ; schedule=running_only, terminal=true, terminal_regime=2
+    )
+    @test pinned.terminal_regime == 2
+    @test SSD._terminal_regime(pinned, 7) == 2
+    # Without the pin the same model warns, because then nothing reaches Qc[2].
+    @test_logs (:warn, r"Qc\[2\] is never used") LQRStateModel(
+        A, Sm, two, Σ; schedule=running_only, terminal=true
+    )
+    return nothing
+end
+
 function test_lqr_ragged_riccati_terminal()
     rng = StableRNG(92)
     sm, _ = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=18, onset=10, ux_dim=2)

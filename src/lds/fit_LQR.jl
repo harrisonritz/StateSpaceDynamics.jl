@@ -1015,7 +1015,7 @@ function gradient_batched!(
 
     if sm.terminal
         n = _plant_dim(sm)
-        kf = _regime(sm, tsteps)
+        kf = _terminal_regime(sm, tsteps)
         @views begin
             rf = tmp2[1:n, :]
             mul!(rf, c.Lf[kf], x[:, tsteps, :])

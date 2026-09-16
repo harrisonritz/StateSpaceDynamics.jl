@@ -504,6 +504,15 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
 - `Qc::Vector{M}`: `K` symmetric `n × n` state-cost matrices.
 - `schedule::Vector{Int}`: per-timestep cost index, or empty for a single cost.
 - `terminal::Bool`: whether the terminal costate factor is active.
+- `terminal_regime::Int`: which cost the terminal factor is written against.
+    `0` (the default) means "whatever the schedule says at this trial's own last
+    timestep", `schedule[T_trial]`. A positive `k` pins it to `Qc[k]` for every
+    trial whatever its length. The default is the only behaviour that existed
+    before this field, and is what every equal-length dataset wants. It is
+    *ragged* data that needs the override: `schedule[end]` marks the last index
+    of the **longest** trial, so with a dedicated terminal regime a shorter trial
+    ends under a running cost instead, and the terminal cost is fitted from the
+    maximal-length trials alone. See [`cost_schedule`](@ref).
 - `Σ::M`: `2n × 2n` positive-definite mixed-coordinate innovation covariance.
 - `h::V`: `2n` mixed-coordinate bias. Its costate half is `−Q x*` for a
     tracking target `x*`.
@@ -548,6 +557,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     Qc::Vector{M}
     schedule::Vector{Int}
     terminal::Bool
+    terminal_regime::Int
     Σ::M
     h::V
     Bu::M
@@ -660,6 +670,26 @@ when the schedule is empty (a single cost everywhere).
 end
 
 """
+    _terminal_regime(sm, tsteps) -> Int
+
+Cost index the terminal factor of a trial of length `tsteps` is written against.
+
+`schedule[tsteps]` unless `sm.terminal_regime` is set, which pins it. The pinned
+form is what a ragged dataset needs: the schedule is one vector indexed by
+timestep, so `schedule[tsteps] == nregimes` can hold for exactly one trial
+length, and on an event-edged window that can be a handful of trials out of
+thousands — leaving the terminal cost fitted from those alone while every other
+trial ends under a running cost.
+
+One `Int` compare on a branch taken once per trial, not once per timestep, so
+the default path costs nothing measurable.
+"""
+@inline function _terminal_regime(sm::LQRStateModel, tsteps::Int)
+    k = sm.terminal_regime
+    return k > 0 ? k : _regime(sm, tsteps)
+end
+
+"""
     cost_schedule(tsteps; terminal=false, onset=1, nregimes=terminal ? 2 : 1)
 
 Build the per-timestep cost index vector for the common shapes.
@@ -716,6 +746,7 @@ function _check_lqr_structure(
     Qc::AbstractVector{<:AbstractMatrix{T}},
     schedule::AbstractVector{Int},
     terminal::Bool,
+    terminal_regime::Int=0,
 ) where {T<:Real}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatchError("LQR A columns", n, size(A, 2)))
@@ -775,7 +806,10 @@ function _check_lqr_structure(
         the last entry is read only when there is a terminal factor.
         =#
         used = Set(view(schedule, 1:(length(schedule) - 1)))
-        terminal && push!(used, schedule[end])
+        # A pinned terminal cost is reached by every trial's last step rather
+        # than by any schedule entry, so it is used even when nothing points at
+        # it -- and warning that it is not would be exactly backwards.
+        terminal && push!(used, terminal_regime > 0 ? terminal_regime : schedule[end])
         for k in 1:K
             k in used || @warn(
                 "Qc[$k] is never used by the cost schedule, so the M-step cannot move " *
@@ -865,6 +899,7 @@ function LQRStateModel(
     Σ::AbstractMatrix{T};
     schedule::AbstractVector{<:Integer}=Int[],
     terminal::Bool=false,
+    terminal_regime::Integer=0,
     Σf::Union{Nothing,AbstractMatrix{T}}=nothing,
     hf::Union{Nothing,AbstractVector{T}}=nothing,
     h::Union{Nothing,AbstractVector{T}}=nothing,
@@ -885,7 +920,28 @@ function LQRStateModel(
     Qc_vec = Qc isa AbstractMatrix ? [Qc] : collect(Qc)
     sched = collect(Int, schedule)
 
-    _check_lqr_structure(A, S, Qc_vec, sched, terminal)
+    term_k = Int(terminal_regime)
+    _check_lqr_structure(A, S, Qc_vec, sched, terminal, term_k)
+    #=
+    Pinning the terminal cost only means anything when there is a terminal
+    factor to pin, and it has to name a cost that exists. Both are mistakes
+    worth catching at construction rather than as an out-of-bounds index deep
+    in a gradient.
+    =#
+    if term_k != 0
+        terminal || throw(
+            ArgumentError(
+                "terminal_regime = $term_k pins the cost of a terminal factor, " *
+                "but `terminal` is false, so there is no terminal factor",
+            ),
+        )
+        1 <= term_k <= length(Qc_vec) || throw(
+            ArgumentError(
+                "terminal_regime must be 0 (follow the schedule) or a cost index " *
+                "in 1:$(length(Qc_vec)); got $term_k",
+            ),
+        )
+    end
     Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
@@ -933,6 +989,7 @@ function LQRStateModel(
         Qc_vec,
         sched,
         terminal,
+        term_k,
         Σ,
         h_v,
         Bu_m,
@@ -1052,6 +1109,7 @@ function free_state_model(
         MT[],
         Int[],
         false,
+        0,
         Σ,
         h_v,
         Bu_m,
@@ -1695,7 +1753,7 @@ function lqr_riccati_sequence(
     has_input = size(ux_mat, 1) > 0
 
     if sm.terminal
-        kT = _regime(sm, tsteps)
+        kT = _terminal_regime(sm, tsteps)
         copyto!(P[tsteps], sm.Qc[kT])
         copyto!(g[tsteps], sm.hf)
         # Terminal reference: λ_T = Q_f(x_T − r_T) + h_f, so g_T = h_f − Q_f r_T.

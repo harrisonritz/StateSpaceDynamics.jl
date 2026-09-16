@@ -1083,6 +1083,7 @@ function _build_variants!(
             [Qcs[k][struct_slot(s, _LQR_BLOCK_Q)] for k in eachindex(sm.Qc)],
             sm.schedule,
             sm.terminal,
+            sm.terminal_regime,
             Σs[s[4]],
             hs[struct_slot(s, _LQR_BLOCK_H)],
             Bus[struct_slot(s, _LQR_BLOCK_B)],

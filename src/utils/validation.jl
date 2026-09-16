@@ -156,7 +156,9 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
             ),
         )
     else
-        _check_lqr_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+        _check_lqr_structure(
+            sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal, sm.terminal_regime
+        )
         _normalize_qc_prior(T, sm.Qc_prior, length(sm.Qc), n)
     end
 
@@ -627,6 +629,17 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
                     "$(sm1.terminal). The terminal condition is a property of the " *
                     "trial horizon, not of which state is active, so every discrete " *
                     "state must agree.",
+                ),
+            )
+        end
+        if sm.terminal_regime != sm1.terminal_regime
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `terminal_regime` is $(sm.terminal_regime) but " *
+                    "LDSs[1] has $(sm1.terminal_regime). Which cost the terminal " *
+                    "factor is written against is a property of the trial horizon, " *
+                    "not of which state is active, so every discrete state must " *
+                    "agree.",
                 ),
             )
         end

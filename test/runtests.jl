@@ -441,6 +441,8 @@ using SSDTest
                 test_lqr_gref_columns()
                 test_lqr_ragged_with_schedule()
                 test_lqr_ragged_riccati_terminal()
+                test_lqr_terminal_regime_pin()
+                test_lqr_terminal_regime_errors()
                 test_lqr_sampling()
                 test_lqr_simulate_lqr()
                 test_lqr_show()

@@ -144,6 +144,12 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
         )
     end
     println(io, gap, "  terminal factor: $(lqr_sm.terminal)")
+    lqr_sm.terminal_regime > 0 && println(
+        io,
+        gap,
+        "  terminal cost:   Qc[$(lqr_sm.terminal_regime)] pinned " *
+        "(every trial's own last step, whatever its length)",
+    )
 
     println(io, gap, " Noise (mixed coordinates on [x_{t+1}; λ_t]):")
     println(io, gap, "  size(Σ)  = ($(size(lqr_sm.Σ,1)), $(size(lqr_sm.Σ,2)))")

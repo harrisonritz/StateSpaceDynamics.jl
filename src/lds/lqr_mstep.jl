@@ -252,7 +252,7 @@ function _aggregate_lqr_stats!(
         `+Q_f G_r u_T`.
         =#
         if sm.terminal
-            kT = _regime(sm, T_n)
+            kT = _terminal_regime(sm, T_n)
             term_zz = hs.term_zz[kT]
             xT = tview(x, :, T_n)
             BLAS.ger!(one(T), xT, xT, tview(term_zz, 1:d, 1:d))
@@ -422,7 +422,7 @@ function _aggregate_lqr_stats_weighted!(
         if sm.terminal
             wT = w[T_n]::T
             if !iszero(wT)
-                kT = _regime(sm, T_n)
+                kT = _terminal_regime(sm, T_n)
                 term_zz = hs.term_zz[kT]
                 xT = tview(x, :, T_n)
                 BLAS.ger!(wT, xT, xT, tview(term_zz, 1:d, 1:d))
@@ -2082,7 +2082,14 @@ function _free_noise_mstep!(
         N += T(hss[u].nk[1])
     end
     N > zero(T) || return nothing
-    R ./= N
+    pr = sm.Σ_prior
+    if pr === nothing
+        R ./= N
+    else
+        R .+= T.(pr.Ψ)
+        R ./= T(pr.ν) + N + T(d) + one(T)
+    end
+    Symmetrize!(R)
     copyto!(sm.Σ, R)
     return nothing
 end
