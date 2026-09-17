@@ -689,3 +689,83 @@ function test_slot_prior_cycles_nonzero_mean()
     @test narrow.M₀ == M₀[[1], :]
     return nothing
 end
+
+#=============================================================================
+Sampling
+=============================================================================#
+
+"""
+A grouped draw sizes each trial's observations from *that trial's* group.
+
+This is the "generate a synthetic multi-session dataset" case `rand`'s
+`depends_on` keyword exists for, and it is exactly where a template-sized
+allocation goes wrong: every trial used to be allocated at the parent's
+`obs_dim`, which throws for a session of any other width and would silently
+mis-pair channels for one that happens to match.
+"""
+function test_grouped_rand_sizes_trials_by_group()
+    ntrials, tsteps, p1, p2 = 4, 80, 3, 5
+    labels = vcat(fill(:a, ntrials), fill(:b, ntrials))
+    lds = st_grouped_lds(p1)
+    om = lds.obs_model
+    om.depends_on = (C=labels, d=labels, R=labels)
+
+    C_b = randn(StableRNG(51), p2, ST_LATENT_DIM)
+    set_group_seeds!(om, Dict(:b => (C=C_b, d=zeros(p2), R=Matrix{Float64}(0.1I, p2, p2))))
+
+    x, y = rand(StableRNG(52), lds, fill(tsteps, length(labels)); depends_on=om.depends_on)
+    @test length(y) == length(labels)
+    @test all(size(xi) == (ST_LATENT_DIM, tsteps) for xi in x)
+    @test [size(yi, 1) for yi in y] == vcat(fill(p1, ntrials), fill(p2, ntrials))
+    @test all(size(yi, 2) == tsteps for yi in y)
+
+    #=
+    The draw is from the group's own emission, not the template's. Regressing a
+    group's observations on its latents recovers its own `C`; the widths already
+    rule out a swap here, so the check that matters is that the *values* are the
+    group's, which a template-wide copy would fail even at matched widths.
+    =#
+    for (trials, C) in ((1:ntrials, om.C), ((ntrials + 1):(2 * ntrials), C_b))
+        X = reduce(hcat, x[trials])
+        Y = reduce(hcat, y[trials])
+        @test norm((Y / X) - C) < 0.25 * norm(C)
+    end
+
+    # One trial at a time takes the same path and must agree on the widths.
+    for (i, label) in enumerate(labels)
+        _, yi = rand(
+            StableRNG(60 + i), lds, tsteps; depends_on=(C=[label], d=[label], R=[label])
+        )
+        @test size(yi, 1) == (label === :a ? p1 : p2)
+    end
+    return nothing
+end
+
+"""
+The same, for a switching model: a regime's emission is the session's.
+"""
+function test_grouped_slds_rand_sizes_trials_by_group()
+    ntrials, tsteps, p1, p2 = 3, 15, 3, 4
+    labels = vcat(fill(:s1, ntrials), fill(:s2, ntrials))
+    slds = st_slds(labels; p_template=p1)
+    seeds = Dict(
+        :s2 => (
+            C=randn(StableRNG(53), p2, ST_LATENT_DIM),
+            d=zeros(p2),
+            R=Matrix{Float64}(0.1I, p2, p2),
+        ),
+    )
+    for lds in slds.LDSs
+        set_group_seeds!(lds.obs_model, seeds)
+    end
+
+    depends_on = (C=labels, d=labels, R=labels)
+    z, x, y = rand(StableRNG(54), slds, fill(tsteps, length(labels)); depends_on=depends_on)
+    @test length(z) == length(x) == length(y) == length(labels)
+    @test [size(yi, 1) for yi in y] == vcat(fill(p1, ntrials), fill(p2, ntrials))
+    @test all(all(1 .<= zi .<= length(slds.LDSs)) for zi in z)
+
+    _, _, y1 = rand(StableRNG(55), slds, tsteps; depends_on=(C=[:s2], d=[:s2], R=[:s2]))
+    @test size(y1, 1) == p2
+    return nothing
+end

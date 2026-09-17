@@ -536,6 +536,11 @@ using SSDTest
                 test_stitching_slds_fit()
             end
 
+            @testset "Sampling" begin
+                test_grouped_rand_sizes_trials_by_group()
+                test_grouped_slds_rand_sizes_trials_by_group()
+            end
+
             @testset "CD_prior" begin
                 test_slot_prior_cycles_nonzero_mean()
                 test_stitching_slot_priors_match_width()

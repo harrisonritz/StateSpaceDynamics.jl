@@ -87,7 +87,6 @@ function Random.rand(
 
     z = Vector{Int}(undef, Ti)
     x = Matrix{T}(undef, latent_dim, Ti)
-    y = _alloc_obs(lds1, Ti)
 
     if depends_on === nothing && _has_parameter_dependence(lds1)
         _single_trial_group_error("slds")
@@ -98,6 +97,11 @@ function Random.rand(
     else
         _slds_cell_sldss(slds, grp)[grp.trial_cell[1]].LDSs
     end
+
+    # Sized from the trial's own cell, not the template: `depends_on` groups may
+    # observe different channel sets, and then `lds1.obs_dim` is only the first
+    # group's.
+    y = _alloc_obs(regimes[1], Ti)
 
     _warn_slds_unstable_rollout(slds, Ti)
     state_params = [_extract_state_params(lds.state_model) for lds in regimes]
@@ -150,6 +154,8 @@ function Random.rand(
         base_obs = [_extract_obs_params(lds.obs_model) for lds in slds.LDSs]
         state_of = fill(base_state, ntrials)
         obs_of = fill(base_obs, ntrials)
+        # Every trial reads the same emission, so the template sizes them all.
+        alloc_of = fill(lds1, ntrials)
     else
         cell_slds = _slds_cell_sldss(slds, grp)
         cell_state = [
@@ -160,13 +166,15 @@ function Random.rand(
         ]
         state_of = [cell_state[grp.trial_cell[n]] for n in 1:ntrials]
         obs_of = [cell_obs[grp.trial_cell[n]] for n in 1:ntrials]
+        # A group's channel count, not the template's — as in the LDS sampler.
+        alloc_of = [cell_slds[grp.trial_cell[n]].LDSs[1] for n in 1:ntrials]
     end
 
     for trial in 1:ntrials
         Ti = Int(tsteps_per_trial[trial])
         z[trial] = Vector{Int}(undef, Ti)
         x[trial] = Matrix{T}(undef, latent_dim, Ti)
-        y[trial] = _alloc_obs(lds1, Ti)
+        y[trial] = _alloc_obs(alloc_of[trial], Ti)
         _sample_slds_trial!(
             rng,
             z[trial],
