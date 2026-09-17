@@ -2083,7 +2083,14 @@ function _free_noise_mstep!(
         N += T(hss[u].nk[1])
     end
     N > zero(T) || return nothing
-    R ./= N
+    pr = sm.Σ_prior
+    if pr === nothing
+        R ./= N
+    else
+        R .+= T.(pr.Ψ)
+        R ./= T(pr.ν) + N + T(d) + one(T)
+    end
+    Symmetrize!(R)
     copyto!(sm.Σ, R)
     @warn "diagnostic free noise" N=N sigma_min=minimum(eigvals(Symmetric(R))) sigma_max=maximum(eigvals(Symmetric(R)))
     return nothing

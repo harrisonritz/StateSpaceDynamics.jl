@@ -1835,6 +1835,24 @@ function test_lqr_free_matches_gaussian_lds()
         @test maximum(abs, ldsG.state_model.b .- ldsF.state_model.h) < 1e-10
         ux_dim > 0 && @test maximum(abs, ldsG.state_model.B .- ldsF.state_model.Bu) < 1e-10
     end
+
+    # The free-state covariance uses the same inverse-Wishart MAP update as the
+    # constrained LQR path. Merely storing the prior on the model is not enough:
+    # omitting it here lets a switching state's covariance collapse even when the
+    # caller explicitly supplied pseudo-transitions to prevent that boundary.
+    rng = StableRNG(4343)
+    _, lds = free_pair(rng)
+    ys = [randn(StableRNG(120 + i), lds.obs_dim, 20) .* 0.4 for i in 1:4]
+    hs, _, _, _ = lqr_estep_stats(lds, ys)
+    sm = lds.state_model
+    d = lds.latent_dim
+    prior = IWPrior(Matrix(0.7I, d, d), 13.0)
+    sm.Σ_prior = prior
+    Theta = SSD._free_theta_pooled([lds], [hs], [1])
+    R = SSD._free_residual_scatter(Theta, hs)
+    expected = (R + prior.Ψ) / (prior.ν + hs.nk[1] + d + 1)
+    SSD._free_state_mstep!(lds, hs)
+    @test sm.Σ ≈ expected atol = 1e-10
     return nothing
 end
 
