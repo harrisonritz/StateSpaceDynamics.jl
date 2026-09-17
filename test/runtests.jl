@@ -381,6 +381,7 @@ using SSDTest
             @testset "Inputs and sampling" begin
                 test_multiobs_observation_inputs()
                 test_multiobs_sampling()
+                test_multiobs_sampling_with_inputs()
             end
 
             @testset "SLDS" begin

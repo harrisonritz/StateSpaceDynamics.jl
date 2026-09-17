@@ -203,7 +203,9 @@ Optional input sequences:
   of per-trial matrices. Required when `size(state_model.B, 2) > 0`.
 - `uy`: same shape for the observation input `D`. Required when
   `size(obs_model.D, 2) > 0`. Supported for both Gaussian and Poisson
-  observation models.
+  observation models. Under a composite emission it is a `NamedTuple` of
+  per-member sequences instead, keyed by member; a member with no input of its
+  own is simply absent from it.
 - `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
   models' stored `depends_on` for this call. When the model declares ancillary
   parameter dependencies, each trial is sampled from its own group's parameters
@@ -214,7 +216,10 @@ function Random.rand(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps::Integer;
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    #= A composite emission takes its members' inputs as a NamedTuple keyed by
+    member, exactly as the SLDS sampler and `fit!` do; `_check_uy` dispatches on
+    the emission to pull each member's out. =#
+    uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     if depends_on === nothing && _has_parameter_dependence(lds)
@@ -276,7 +281,9 @@ function Random.rand(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    # As the single-trial method: a NamedTuple of per-member sequences under a
+    # composite emission, one sequence otherwise.
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     ntrials = length(tsteps_per_trial)
