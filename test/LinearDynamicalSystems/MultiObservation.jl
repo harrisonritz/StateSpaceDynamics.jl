@@ -549,6 +549,43 @@ function test_multiobs_sampling()
     return nothing
 end
 
+"""
+A member with its own `D` is sampled with its own input, handed over as the same
+per-member `NamedTuple` `fit!` and `smooth` take.
+"""
+function test_multiobs_sampling_with_inputs()
+    @testset "sampling with per-member inputs" begin
+        rng = StableRNG(909)
+        ntrials, tsteps = 4, 24
+        kin = GaussianObservationModel(;
+            C=randn(rng, 3, MO_LATENT_DIM),
+            # Small enough that the input term dominates the residual below,
+            # which is what makes that check about `D` rather than about noise.
+            R=Matrix(0.005I, 3, 3),
+            d=zeros(3),
+            D=randn(rng, 3, 2),
+        )
+        spk = mo_poisson(5; seed=2)          # no input of its own
+        lds = LinearDynamicalSystem(mo_state_model(), (kin=kin, spk=spk))
+
+        vkin = [randn(rng, 2, tsteps) for _ in 1:ntrials]
+        xs, ys = rand(StableRNG(11), lds, fill(tsteps, ntrials); uy=(kin=vkin,))
+        @test length(ys) == ntrials
+        @test all(size(t.kin) == (3, tsteps) for t in ys)
+        @test all(size(t.spk) == (5, tsteps) for t in ys)
+
+        # The input reached `D`: with this little observation noise, the member's
+        # residual about `C x` is the input term rather than zero.
+        residual = reduce(hcat, (ys[i].kin .- kin.C * xs[i] for i in 1:ntrials))
+        @test norm(residual - kin.D * reduce(hcat, vkin)) < 0.15 * norm(residual)
+
+        # And a single trial takes the same shape.
+        x1, y1 = rand(StableRNG(12), lds, tsteps; uy=(kin=vkin[1],))
+        @test size(y1.kin) == (3, tsteps) && size(x1) == (MO_LATENT_DIM, tsteps)
+    end
+    return nothing
+end
+
 """The composite prints its members, and `fit_bool` names them."""
 function test_multiobs_show()
     @testset "display" begin

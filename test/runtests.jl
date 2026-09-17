@@ -381,6 +381,7 @@ using SSDTest
             @testset "Inputs and sampling" begin
                 test_multiobs_observation_inputs()
                 test_multiobs_sampling()
+                test_multiobs_sampling_with_inputs()
             end
 
             @testset "SLDS" begin
@@ -534,6 +535,11 @@ using SSDTest
                 test_slds_cell_workspace_sharing()
                 test_slds_trial_plan_partitions_by_cell()
                 test_stitching_slds_fit()
+            end
+
+            @testset "Sampling" begin
+                test_grouped_rand_sizes_trials_by_group()
+                test_grouped_slds_rand_sizes_trials_by_group()
             end
 
             @testset "CD_prior" begin

@@ -203,7 +203,9 @@ Optional input sequences:
   of per-trial matrices. Required when `size(state_model.B, 2) > 0`.
 - `uy`: same shape for the observation input `D`. Required when
   `size(obs_model.D, 2) > 0`. Supported for both Gaussian and Poisson
-  observation models.
+  observation models. Under a composite emission it is a `NamedTuple` of
+  per-member sequences instead, keyed by member; a member with no input of its
+  own is simply absent from it.
 - `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
   models' stored `depends_on` for this call. When the model declares ancillary
   parameter dependencies, each trial is sampled from its own group's parameters
@@ -214,7 +216,10 @@ function Random.rand(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps::Integer;
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
-    uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    #= A composite emission takes its members' inputs as a NamedTuple keyed by
+    member, exactly as the SLDS sampler and `fit!` do; `_check_uy` dispatches on
+    the emission to pull each member's out. =#
+    uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     if depends_on === nothing && _has_parameter_dependence(lds)
@@ -230,36 +235,44 @@ function Random.rand(
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     x = Matrix{T}(undef, lds.latent_dim, Ti)
-    y = _alloc_obs(lds, Ti)
-    _sample_trial!(rng, x, y, state_params, obs_params, lds.obs_model, ux_trial, uy_trial)
+    # Sized from the trial's own cell: a grouped model's channel count is the
+    # group's, not the template's (see `_per_trial_sample_params`).
+    y = _alloc_obs(lds1, Ti)
+    _sample_trial!(rng, x, y, state_params, obs_params, lds1.obs_model, ux_trial, uy_trial)
     return x, y
 end
 
 #=
-Per-trial `(state_params, obs_params)` for a multi-trial draw. Ungrouped, every
-trial points at the same two NamedTuples (which themselves reference the model's
-arrays); grouped, a trial points at its cell's. Either way the sampler is one
-code path.
+Per-trial `(state_params, obs_params, alloc_lds)` for a multi-trial draw.
+Ungrouped, every trial points at the same two NamedTuples (which themselves
+reference the model's arrays); grouped, a trial points at its cell's. Either way
+the sampler is one code path.
+
+`alloc_lds` is the model a trial's observation storage is sized from. It is the
+trial's own cell rather than the parent whenever the groups are grouped, because
+`depends_on` groups may observe *different channel sets* — which is the whole
+reason for seeding them separately — and then the parent's `obs_dim` is only the
+template group's. Sizing every trial from it silently mis-shapes the draw for a
+group of equal width and throws for one of any other.
 =#
 function _per_trial_sample_params(lds::LinearDynamicalSystem, ::Nothing, ntrials::Int)
     return (
         fill(_extract_state_params(lds.state_model), ntrials),
         fill(_extract_obs_params(lds.obs_model), ntrials),
+        fill(lds, ntrials),
     )
 end
 
 function _per_trial_sample_params(
     lds::LinearDynamicalSystem, grp::ParameterGrouping, ntrials::Int
 )
-    cell_state = [
-        _extract_state_params(_cell_lds(lds, grp, c).state_model) for c in 1:(grp.ncells)
-    ]
-    cell_obs = [
-        _extract_obs_params(_cell_lds(lds, grp, c).obs_model) for c in 1:(grp.ncells)
-    ]
+    cell_lds = [_cell_lds(lds, grp, c) for c in 1:(grp.ncells)]
+    cell_state = [_extract_state_params(l.state_model) for l in cell_lds]
+    cell_obs = [_extract_obs_params(l.obs_model) for l in cell_lds]
     return (
         [cell_state[grp.trial_cell[n]] for n in 1:ntrials],
         [cell_obs[grp.trial_cell[n]] for n in 1:ntrials],
+        [cell_lds[grp.trial_cell[n]] for n in 1:ntrials],
     )
 end
 
@@ -268,7 +281,9 @@ function Random.rand(
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
-    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    # As the single-trial method: a NamedTuple of per-member sequences under a
+    # composite emission, one sequence otherwise.
+    uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     ntrials = length(tsteps_per_trial)
@@ -279,14 +294,14 @@ function Random.rand(
     once here: the sampling loop below captures them in a closure, and a local
     written from two branches of an `if` is boxed, which OhMyThreads rejects.
     =#
-    state_params, obs_params = _per_trial_sample_params(lds, grp, ntrials)
+    state_params, obs_params, alloc_lds = _per_trial_sample_params(lds, grp, ntrials)
 
     x = Vector{Matrix{T}}(undef, ntrials)
     y = Vector{typeof(_alloc_obs(lds, 1))}(undef, ntrials)
     for i in 1:ntrials
         Ti = Int(tsteps_per_trial[i])
         x[i] = Matrix{T}(undef, lds.latent_dim, Ti)
-        y[i] = _alloc_obs(lds, Ti)
+        y[i] = _alloc_obs(alloc_lds[i], Ti)
     end
 
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps_per_trial, T, "ux")
