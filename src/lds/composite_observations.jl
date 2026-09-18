@@ -1330,6 +1330,9 @@ function StatsAPI.loglikelihood(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
+    if _has_warped_member(lds.obs_model)
+        return _spline_composite_loglikelihood(lds, y, ux, uy)
+    end
     data = Data(lds, y; ux=ux, uy=uy)
     ntrials = length(data.tsteps)
 

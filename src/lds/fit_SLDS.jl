@@ -1257,6 +1257,14 @@ function smooth(
     npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    #= A warped emission is smoothed on its embedding; see `fit_slds_spline.jl`. =#
+    if _slds_is_warped(slds)
+        depends_on === nothing ||
+            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+        return _slds_spline_smooth(
+            slds, y, ux, uy, smoothing_iters, tol, return_cov, progress, npool
+        )
+    end
     #=
     Same setup as `fit!`, minus the M-step workspaces: `Data` validates and
     canonicalizes the observation / input shapes, the grouping resolves
@@ -1265,6 +1273,23 @@ function smooth(
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
+    #=
+    A warped emission fits on its embedding. `target` stays the model the caller
+    holds (and the one the held-out monitor scores and restores); everything
+    below runs on the shadow `SLDS`, whose Gaussian regimes share this model's
+    arrays, and on the shadow `Data` holding `z = g(y)`. The warp is shared
+    across regimes, so the change-of-variables term is regime-independent and
+    `q(z)` is unaffected — see `fit_slds_spline.jl`.
+    =#
+    target = slds
+    dataful = data
+    spline_state = _slds_spline_state(slds, data)
+    if spline_state !== nothing
+        depends_on === nothing ||
+            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+        slds = spline_state.shadow
+        data = spline_state.sdata
+    end
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -1989,13 +2014,29 @@ function _vem_alternate!(
             pinfs = [count(==(T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             ninfs = [count(==(-T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             first_bad = findfirst(x -> !isfinite(x), dl.logL)
-            sample_bad = x_samples === nothing ? -1 : sum(count(x -> !isfinite(x), xs) for xs in x_samples)
-            sample_max = x_samples === nothing ? T(NaN) : maximum(maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for xs in x_samples)
-            error("diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max")
+            sample_bad = if x_samples === nothing
+                -1
+            else
+                sum(count(x -> !isfinite(x), xs) for xs in x_samples)
+            end
+            sample_max = if x_samples === nothing
+                T(NaN)
+            else
+                maximum(
+                maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for xs in x_samples
+            )
+            end
+            error(
+                "diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max",
+            )
         end
-        if !all(isfinite, dl.A) || !all(isfinite, dl.πₖ) ||
-           any(iszero, vec(sum(dl.A; dims=2))) || iszero(sum(dl.πₖ))
-            error("diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)")
+        if !all(isfinite, dl.A) ||
+            !all(isfinite, dl.πₖ) ||
+            any(iszero, vec(sum(dl.A; dims=2))) ||
+            iszero(sum(dl.πₖ))
+            error(
+                "diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)",
+            )
         end
 
         # (2) Update q(z): single batched forward-backward across all trials.
@@ -3405,6 +3446,7 @@ function fit!(
     max_iter::Int=50,
     smoothing_iters::Int=1,
     num_samples::Int=1,
+    spline_iters::Int=25,
     progress::Bool=true,
     rng::AbstractRNG=Random.default_rng(),
     rng_mode::Symbol=:trial,
@@ -3447,6 +3489,23 @@ function fit!(
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
+    #=
+    A warped emission fits on its embedding. `target` stays the model the caller
+    holds (and the one the held-out monitor scores and restores); everything
+    below runs on the shadow `SLDS`, whose Gaussian regimes share this model's
+    arrays, and on the shadow `Data` holding `z = g(y)`. The warp is shared
+    across regimes, so the change-of-variables term is regime-independent and
+    `q(z)` is unaffected — see `fit_slds_spline.jl`.
+    =#
+    target = slds
+    dataful = data
+    spline_state = _slds_spline_state(slds, data)
+    if spline_state !== nothing
+        depends_on === nothing ||
+            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+        slds = spline_state.shadow
+        data = spline_state.sdata
+    end
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -3609,6 +3668,8 @@ function fit!(
     )
 
     for iter in 1:max_iter
+        # The warp moved in the previous M-step, so refresh `z = g(y)` in place.
+        spline_state === nothing || _slds_spline_embed!(spline_state, dataful)
         #=
         E-step: fill q(z) from the current samples, run forward-backward,
         re-smooth q(x), and draw the next samples for the following iteration.
@@ -3648,17 +3709,21 @@ function fit!(
                 uy=uy_seq,
                 lognorm=lognorm,
             )
+            if spline_state !== nothing
+                elbos[iter] +=
+                    spline_state.logjac[] + _slds_spline_logprior(T, spline_state)
+            end
 
             #=
             Held-out score at the same parameters the training ELBO just used.
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
-                return _fit_result(monitor, elbos, slds)
+                return _fit_result(monitor, elbos, target)
             end
             if align_final && iter == max_iter
                 prog !== nothing && next!(prog)
@@ -3687,6 +3752,16 @@ function fit!(
             )
             # Every slot, not just the first: the ungrouped passes read the
             # cached constants without refreshing them.
+            #=
+            CM-step for the shared warp, after the regimes' own updates: it
+            conditions on the `(C_k, d_k, R_k)` just written and on the
+            responsibilities the E-step produced.
+            =#
+            if spline_state !== nothing
+                _slds_spline_mstep!(
+                    spline_state, tfs, fb_storage, seq_ends; spline_iters=spline_iters
+                )
+            end
             refresh_slds_pool!(pool, slds)
         else
             grouping = grp::ParameterGrouping
@@ -3732,11 +3807,11 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
-                return _fit_result(monitor, elbos, slds)
+                return _fit_result(monitor, elbos, target)
             end
             if align_final && iter == max_iter
                 prog !== nothing && next!(prog)
@@ -3769,7 +3844,7 @@ function fit!(
     if prog !== nothing
         finish!(prog)
     end
-    return _fit_result(monitor, elbos, slds)
+    return _fit_result(monitor, elbos, target)
 end
 
 # ============================================================================

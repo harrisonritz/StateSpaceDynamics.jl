@@ -17,7 +17,29 @@ SLDS
 GaussianStateModel
 GaussianObservationModel
 PoissonObservationModel
+SplineGaussianObservationModel
 CompositeObservationModel
+```
+
+## Monotonic splines
+
+The normalizing-flow layer of a [`SplineGaussianObservationModel`](@ref): a
+strictly increasing, analytically invertible rational-quadratic spline per
+observation channel. Usable on its own as a parameter transformation.
+
+```@docs; canonical = false
+MonotonicWarp
+warp_forward
+warp_inverse
+warp_apply!
+warp_unapply!
+warp_bounds
+warp_channels
+warp_bins
+warp_nparams
+is_identity_warp
+refresh_knots!
+copy_warp!
 ```
 
 ```@docs

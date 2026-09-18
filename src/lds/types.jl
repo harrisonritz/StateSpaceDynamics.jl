@@ -712,14 +712,27 @@ end
 _uy_dim(c::CompositeObservationModel) = sum(_uy_dim, values(_models(c)))
 
 """
+    _obs_block_names(obs_model) -> Tuple{Vararg{Symbol}}
+
+The `fit_bool` slots an observation model declares, in order: `(:C, :R)` for a
+Gaussian emission, `(:C,)` for a Poisson one (no noise covariance), and
+`(:C, :R, :spline)` for a spline-Gaussian one (the warp is fitted separately
+from `[C d D]`, so freezing it recovers the linear model).
+
+This is the single place a new emission says how many parameter blocks it has
+and what to call them; `_obs_nblocks`, `_fit_bool_keys` and
+`_write_obs_fit_bool!` all read it.
+"""
+_obs_block_names(::GaussianObservationModel) = (:C, :R)
+_obs_block_names(::PoissonObservationModel) = (:C,)
+
+"""
     _obs_nblocks(obs_model) -> Int
 
-How many `fit_bool` slots an observation model occupies: 2 for a Gaussian
-emission (`[C&d&D]` and `R`), 1 for a Poisson one (no noise covariance), and the
-sum over members for a composite.
+How many `fit_bool` slots an observation model occupies — the length of its
+[`_obs_block_names`](@ref), or the sum over members for a composite.
 """
-_obs_nblocks(::GaussianObservationModel) = 2
-_obs_nblocks(::PoissonObservationModel) = 1
+_obs_nblocks(om::AbstractObservationModel) = length(_obs_block_names(om))
 _obs_nblocks(c::CompositeObservationModel) = sum(_obs_nblocks, values(_models(c)))
 
 """
@@ -757,7 +770,7 @@ _default_fit_bool(om::AbstractObservationModel) = fill(true, 4 + _obs_nblocks(om
 
 # Names the keyword `fit_bool` form accepts, for the error message on a typo.
 function _fit_bool_keys(om::AbstractObservationModel)
-    return (:x0, :P0, :A, :Q, :C, :R)[1:(4 + _obs_nblocks(om))]
+    return (:x0, :P0, :A, :Q, _obs_block_names(om)...)
 end
 
 function _fit_bool_keys(c::CompositeObservationModel)
@@ -765,7 +778,7 @@ function _fit_bool_keys(c::CompositeObservationModel)
     names = Symbol[:x0, :P0, :A, :Q]
     for key in keys(models)
         push!(names, key)
-        for param in (:C, :R)[1:_obs_nblocks(models[key])]
+        for param in _obs_block_names(models[key])
             push!(names, _suffixed(param, key))
         end
     end
@@ -831,10 +844,10 @@ function _apply_obs_fit_bool!(
             )
             _write_obs_fit_bool!(slice, models[key], nested)
         end
-        haskey(spec, _suffixed(:C, key)) && (slice[1] = spec[_suffixed(:C, key)])
-        length(slice) > 1 &&
-            haskey(spec, _suffixed(:R, key)) &&
-            (slice[2] = spec[_suffixed(:R, key)])
+        for (i, param) in enumerate(_obs_block_names(models[key]))
+            flat = _suffixed(param, key)
+            haskey(spec, flat) && (slice[i] = spec[flat])
+        end
     end
     return fb
 end
@@ -843,13 +856,14 @@ end
     _write_obs_fit_bool!(slice, obs_model, spec)
 
 Write one observation model's flags into its own block of `fit_bool`, indexed
-relative to that block: `[C&d&D]` first and, for a Gaussian emission, `R` second.
+relative to that block and named by its [`_obs_block_names`](@ref).
 """
 function _write_obs_fit_bool!(
-    slice::AbstractVector{Bool}, ::AbstractObservationModel, spec::NamedTuple
+    slice::AbstractVector{Bool}, om::AbstractObservationModel, spec::NamedTuple
 )
-    haskey(spec, :C) && (slice[1] = spec[:C])
-    length(slice) > 1 && haskey(spec, :R) && (slice[2] = spec[:R])
+    for (i, name) in enumerate(_obs_block_names(om))
+        haskey(spec, name) && (slice[i] = spec[name])
+    end
     return slice
 end
 
