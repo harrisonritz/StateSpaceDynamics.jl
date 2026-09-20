@@ -176,10 +176,16 @@ end
 #=
 Softmax with the bin floor folded in, written into `out`. Subtracting the max
 keeps `exp` in range for the wide logits a stalled line search can propose.
+
+The arguments are not tied to one element type in the signature. They always
+*are* one at a call site — they are columns of the same warp — but writing it
+that way makes the method unresolvable when a caller is analysed with an
+abstractly-typed `MonotonicWarp`, because the element type of a `view` into a
+`Matrix{T}` field then widens. Inference at the real call site still sees the
+concrete types, so nothing is lost.
 =#
-function _floored_softmax!(
-    out::AbstractVector{T}, θ::AbstractVector{T}, min_bin::T
-) where {T<:Real}
+function _floored_softmax!(out::AbstractVector, θ::AbstractVector, min_bin::Real)
+    T = eltype(out)
     K = length(θ)
     m = θ[1]
     @inbounds for k in 2:K
@@ -590,13 +596,16 @@ constant shift in that vector, which is exactly why the last knot (pinned at
 `hi`, and contributing the same amount to every entry) needs no special case.
 =#
 function _accumulate_logit_grad!(
-    out::AbstractVector{T},
-    gknot::AbstractVector{T},
-    σ::AbstractVector{T},
-    work::AbstractVector{T},
-    width::T,
-    min_bin::T,
-) where {T<:Real}
+    out::AbstractVector,
+    gknot::AbstractVector,
+    σ::AbstractVector,
+    work::AbstractVector,
+    width::Real,
+    min_bin::Real,
+)
+    # Element types are left off the signature for the reason given on
+    # `_floored_softmax!` above.
+    T = eltype(σ)
     K = length(σ)
     scale = width * (one(T) - K * min_bin)
 

@@ -152,8 +152,14 @@ Base.@kwdef mutable struct SplineGaussianObservationModel{
     warp::MonotonicWarp{T}
     D::M = zeros(eltype(C), size(C, 1), 0)
     R_structure::Symbol = :diagonal
-    spline_ridge::T = T(1e-3)
-    R_floor::T = zero(T)
+    #=
+    Defaults are taken through `eltype(C)` rather than `T`: the keyword
+    constructor generated for the *unparameterized* spelling
+    `SplineGaussianObservationModel(; C = ..., ...)` has no `T` bound, so a
+    default that calls `T` is an `UndefVarError` there. `D` above does the same.
+    =#
+    spline_ridge::T = eltype(C)(1e-3)
+    R_floor::T = zero(eltype(C))
     R_prior::Union{Nothing,IWPrior{T}} = nothing
     CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
     depends_on::Union{Nothing,NamedTuple} = nothing

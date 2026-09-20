@@ -396,7 +396,14 @@ function _slds_spline_smooth(
     npool::Int,
 ) where {T<:Real}
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    #=
+    `_slds_spline_state` returns `nothing` for an unwarped model, and every
+    caller reaches here only after `_slds_is_warped`. Assert it rather than
+    leaving the rest of the function to work through a `Union{Nothing,…}`.
+    =#
     state = _slds_spline_state(slds, data)
+    state === nothing &&
+        throw(ArgumentError("this SLDS carries no warp; use the ordinary `smooth`"))
     out = smooth(
         state.shadow,
         state.sdata.y;

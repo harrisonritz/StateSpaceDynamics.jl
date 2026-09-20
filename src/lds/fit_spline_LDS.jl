@@ -330,7 +330,15 @@ function _fit_spline!(
         )
     end
 
-    suf = _initialize_td_sufficient_statistics(T, glds, tsteps_per_trial)
+    #=
+    An inverse-LQR state model would return its own statistics type here,
+    which the closed-form emission updates cannot read. `_reject_spline_lqr`
+    has already refused that combination; this pins it for the reader and
+    for inference alike.
+    =#
+    suf = _initialize_td_sufficient_statistics(
+        T, glds, tsteps_per_trial
+    )::SufficientStatistics{T}
 
     ctx = _SplineMStepCtx(lds.obs_model, data.y, emb.mu)
     nθ = warp_nparams(lds.obs_model.warp)

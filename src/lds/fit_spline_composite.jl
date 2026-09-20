@@ -296,7 +296,8 @@ function _fit_spline_composite!(
         ) for _ in 1:pool_size
     ]
 
-    suf = _initialize_td_sufficient_statistics(T, glds, tsteps_per_trial)
+    # As in `_fit_spline!`: an inverse-LQR state is refused before we get here.
+    suf = _initialize_td_sufficient_statistics(T, glds, tsteps_per_trial)::NamedTuple
 
     prog = if progress
         Progress(
@@ -386,7 +387,8 @@ function _spline_composite_elbo(
             uy_dim=_ws_uy_dim(glds),
         ) for _ in 1:npool
     ]
-    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)
+    # As in `_fit_spline!`: an inverse-LQR state is refused before we get here.
+    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)::NamedTuple
     _td_init_const_blocks!(sws_pool[1], glds, sdata)
     estep!(glds, suf, tfs, sdata, sws_pool)
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
@@ -458,7 +460,8 @@ function _fit_spline_laplace!(
         ) for _ in 1:npool
     ]
 
-    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)
+    # As in `_fit_spline!`: an inverse-LQR state is refused before we get here.
+    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)::NamedTuple
     elbos = Vector{T}(undef, max_iter)
 
     prog = if progress
@@ -557,7 +560,8 @@ function _spline_composite_elbo_laplace(
             uy_dim=_ws_uy_dim(glds),
         ) for _ in 1:npool
     ]
-    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)
+    # As in `_fit_spline!`: an inverse-LQR state is refused before we get here.
+    suf = _initialize_td_sufficient_statistics(T, glds, data.tsteps)::NamedTuple
     _td_init_const_blocks!(sws_pool[1], glds, sdata)
     estep!(glds, suf, tfs, sdata, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return elbo!(glds, suf, tfs, sdata, sws_pool) +
