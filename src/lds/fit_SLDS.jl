@@ -2014,29 +2014,13 @@ function _vem_alternate!(
             pinfs = [count(==(T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             ninfs = [count(==(-T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             first_bad = findfirst(x -> !isfinite(x), dl.logL)
-            sample_bad = if x_samples === nothing
-                -1
-            else
-                sum(count(x -> !isfinite(x), xs) for xs in x_samples)
-            end
-            sample_max = if x_samples === nothing
-                T(NaN)
-            else
-                maximum(
-                maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for xs in x_samples
-            )
-            end
-            error(
-                "diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max",
-            )
+            sample_bad = x_samples === nothing ? -1 : sum(count(x -> !isfinite(x), xs) for xs in x_samples)
+            sample_max = x_samples === nothing ? T(NaN) : maximum(maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for xs in x_samples)
+            error("diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max")
         end
-        if !all(isfinite, dl.A) ||
-            !all(isfinite, dl.πₖ) ||
-            any(iszero, vec(sum(dl.A; dims=2))) ||
-            iszero(sum(dl.πₖ))
-            error(
-                "diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)",
-            )
+        if !all(isfinite, dl.A) || !all(isfinite, dl.πₖ) ||
+           any(iszero, vec(sum(dl.A; dims=2))) || iszero(sum(dl.πₖ))
+            error("diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)")
         end
 
         # (2) Update q(z): single batched forward-backward across all trials.

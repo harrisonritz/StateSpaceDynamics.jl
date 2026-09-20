@@ -24,6 +24,17 @@ here, and each has a sharp test:
 
 const SG_LATENT = 2
 
+#=
+ECM is monotone, but the ELBO is a sum of terms of the trace's own magnitude, so
+"non-decreasing" has to be judged relative to that scale rather than in absolute
+nats — near convergence the true increments shrink below the summation's own
+rounding.
+=#
+function sg_nondecreasing(el; rtol=1e-8)
+    scale = max(1.0, maximum(abs, el))
+    return all(diff(collect(el)) .>= -rtol * scale)
+end
+
 function sg_state_model(::Type{T}=Float64; θ=0.15, r=0.96) where {T<:Real}
     return GaussianStateModel(
         T.(r * [cos(θ) -sin(θ); sin(θ) cos(θ)]),
@@ -526,7 +537,7 @@ function test_spline_elbo_monotone()
     # ECM: both conditional maximizations increase the same Q, and the warp step
     # is accepted only when it improves — so this is monotone, not merely
     # non-decreasing on average.
-    @test all(diff(el) .>= -1e-8)
+    @test sg_nondecreasing(el)
     @test el[end] > el[1]
     return nothing
 end
@@ -631,7 +642,7 @@ function test_spline_inputs_and_ragged_trials()
     lds = LinearDynamicalSystem(sg_state_model(), om)
     @test lds.uy_dim == uy_dim
     el = fit!(lds, Y; uy=V, max_iter=12, progress=false)
-    @test all(diff(el) .>= -1e-8)
+    @test sg_nondecreasing(el)
     @test elbo(lds, Y; uy=V) ≈ loglikelihood(lds, Y; uy=V) rtol = 1e-9
 
     xs, Ps = smooth(lds, Y; uy=V)
@@ -683,7 +694,7 @@ function test_spline_holdout_and_early_stopping()
     @test length(tr.test) == length(tr.test_iters)
     @test all(isfinite, tr.test)
     # A FitTrace behaves as the training-ELBO vector.
-    @test all(diff(tr.train) .>= -1e-8)
+    @test sg_nondecreasing(tr.train)
     return nothing
 end
 
@@ -741,7 +752,7 @@ function test_spline_composite_fit()
     @test length(lds.fit_bool) == 4 + 3 + 2
 
     el = fit!(lds, Y; max_iter=30, tol=1e-10, progress=false)
-    @test all(diff(el) .>= -1e-8)
+    @test sg_nondecreasing(el)
     @test elbo(lds, Y) ≈ loglikelihood(lds, Y) rtol = 1e-8
     @test !is_identity_warp(lds.obs_model.kin.warp)
     # The warped member keeps its diagonal R; the plain Gaussian member does not.

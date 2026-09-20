@@ -203,7 +203,6 @@ function _slds_spline_state(slds::SLDS{T}, data::Data{T}) where {T<:Real}
     _slds_share_warps!(slds)
 
     K = length(slds.LDSs)
-    ntrials = length(data.tsteps)
     shadow = _slds_gaussian_shadow(slds)
 
     gamma = [[zeros(T, Ti) for Ti in data.tsteps] for _ in 1:K]
