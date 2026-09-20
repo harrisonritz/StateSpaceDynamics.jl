@@ -581,6 +581,94 @@ function test_spline_recovers_warp_and_beats_linear()
     return nothing
 end
 
+#=
+The central claim: smoothing a spline model is *exactly* smoothing the
+corresponding Gaussian model on the pre-embedded observations. The warp enters
+the emission density only through a term that does not involve `x`, so the
+posterior over the latent path is untouched by it. Check that against an
+explicitly embedded dataset rather than trusting the driver.
+=#
+function test_spline_smooth_equals_gaussian_on_embedded()
+    rng = StableRNG(69)
+    p = 4
+    lds_true = sg_true_model(; p=p, seed=18)
+    _, Y = rand(StableRNG(70), lds_true, [45, 60])
+
+    om = SplineGaussianObservationModel(
+        randn(rng, p, SG_LATENT),
+        Matrix(Diagonal(0.2 .+ rand(rng, p))),
+        randn(rng, p);
+        y=Y,
+        n_bins=5,
+        spline_ridge=0.0,
+    )
+    SSD.warp_unpack!(om.warp, 0.7 .* randn(rng, warp_nparams(om.warp)))
+    lds = LinearDynamicalSystem(sg_state_model(), om)
+
+    # Embed by hand, and build the plain Gaussian model over the same arrays.
+    Z = [similar(yt) for yt in Y]
+    logjac = sum(warp_apply!(Z[n], om.warp, Y[n]) for n in eachindex(Y))
+    lds_g = LinearDynamicalSystem(
+        lds.state_model, GaussianObservationModel(om.C, om.R, om.d)
+    )
+
+    xs, Ps = smooth(lds, Y)
+    xg, Pg = smooth(lds_g, Z)
+    for n in eachindex(Y)
+        @test xs[n] ≈ xg[n] rtol = 1e-12
+        @test Ps[n] ≈ Pg[n] rtol = 1e-12
+    end
+
+    # And the log-densities differ by exactly the change of variables.
+    @test loglikelihood(lds, Y) ≈ loglikelihood(lds_g, Z) + logjac rtol = 1e-10
+    @test elbo(lds, Y) ≈ elbo(lds_g, Z) + logjac rtol = 1e-10
+    @test trial_elbos(lds, Y) ≈
+        trial_elbos(lds_g, Z) .+ [
+        sum(warp_forward(om.warp, j, Y[n][j, t])[2] for t in axes(Y[n], 2), j in 1:p) for
+        n in eachindex(Y)
+    ] rtol = 1e-10
+    return nothing
+end
+
+#=
+A partial maximization of the warp objective is still a valid generalized-EM
+step, so a one-iteration L-BFGS budget must keep the trace monotone — it only
+makes it climb more slowly.
+=#
+function test_spline_partial_warp_maximization_still_monotone()
+    p = 4
+    lds_true = sg_true_model(; p=p, seed=19)
+    _, Y = rand(StableRNG(71), lds_true, fill(60, 6))
+
+    slow = sg_init_model(Y; p=p, seed=19, n_bins=5)
+    el_slow = fit!(slow, Y; max_iter=30, tol=1e-12, spline_iters=1, progress=false)
+    @test sg_nondecreasing(el_slow)
+    @test !is_identity_warp(slow.obs_model.warp)
+
+    fast = sg_init_model(Y; p=p, seed=19, n_bins=5)
+    el_fast = fit!(fast, Y; max_iter=30, tol=1e-12, spline_iters=25, progress=false)
+    @test sg_nondecreasing(el_fast)
+    # More budget per step cannot end up worse at the same iteration count.
+    @test el_fast[end] >= el_slow[end] - 1e-6 * abs(el_fast[end])
+    return nothing
+end
+
+function test_warp_bin_lookup()
+    w = MonotonicWarp([-2.0], [2.0]; n_bins=4)
+    K = warp_bins(w)
+    @test SSD.warp_bin(w, 1, -2.5) == 0          # below the interval
+    @test SSD.warp_bin(w, 1, 2.5) == 0           # above it
+    @test SSD.warp_bin(w, 1, -2.0) == 0          # the endpoints are the tails
+    @test SSD.warp_bin(w, 1, 2.0) == 0
+    for k in 1:K
+        mid = (w.pX[k, 1] + w.pX[k + 1, 1]) / 2
+        @test SSD.warp_bin(w, 1, mid) == k
+        # A point exactly on an interior knot belongs to the bin it opens.
+        k == 1 || @test SSD.warp_bin(w, 1, w.pX[k, 1]) == k
+    end
+    return nothing
+end
+
 function test_spline_R_structure()
     p = 4
     lds_true = sg_true_model(; p=p, seed=9)

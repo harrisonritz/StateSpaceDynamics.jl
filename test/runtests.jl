@@ -364,6 +364,7 @@ using SSDTest
                 test_warp_bounds_and_construction_errors()
                 test_warp_pack_roundtrip()
                 test_warp_copy_shape_mismatch()
+                test_warp_bin_lookup()
                 test_warp_apply_block()
             end
 
@@ -388,6 +389,8 @@ using SSDTest
                 test_spline_elbo_monotone()
                 test_spline_recovers_warp_and_beats_linear()
                 test_spline_R_structure()
+                test_spline_smooth_equals_gaussian_on_embedded()
+                test_spline_partial_warp_maximization_still_monotone()
                 test_spline_fit_bool_freezes()
                 test_spline_inputs_and_ragged_trials()
                 test_spline_single_trial_matrix_shapes()
