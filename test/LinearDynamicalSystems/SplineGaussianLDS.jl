@@ -1026,21 +1026,52 @@ function test_spline_priors_shift_the_fit()
     return nothing
 end
 
+#=
+An inverse-LQR state is fitted by its own *structural* M-step; the spline driver
+runs the generic Gaussian state updates, which would silently discard the
+symplectic constraint. Every entry point that could reach that combination must
+refuse it instead.
+
+`LQRStateModel`'s latent is the state-costate pair `[x; λ]`, so the process
+noise and the emission are sized at `2n`, not `n`.
+=#
 function test_spline_lqr_state_model_rejected()
     rng = StableRNG(68)
-    n, p = 2, 2
-    A = 0.5 .* rand(rng, n, n)
-    S = Matrix(0.15I, n, n)
-    Qc = Matrix(0.2I, n, n)
-    Σ = Matrix(0.02I, n, n)
-    sm = LQRStateModel(A, S, [Qc], Σ; terminal=true, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+    n, p = 2, 3
+    d = 2n
+    A = [0.96 0.07; -0.05 0.93]
+    Sm = [0.06 0.01; 0.01 0.05]
+    Qc = [0.25 0.04; 0.04 0.18]
+    Σ = Matrix(Diagonal(fill(0.03, d)))
+    sm = LQRStateModel(A, Sm, Qc, Σ)
+    @test SSD._state_latent_dim(sm) == d
+
     Y = [randn(rng, p, 30) for _ in 1:3]
     om = SplineGaussianObservationModel(
-        randn(rng, p, 2n), Matrix(1.0I, p, p), zeros(p); y=Y, n_bins=4
+        randn(rng, p, d), Matrix(1.0I, p, p), zeros(p); y=Y, n_bins=4
     )
     lds = LinearDynamicalSystem(sm, om)
     @test_throws ArgumentError fit!(lds, Y; max_iter=2, progress=false)
     @test_throws ArgumentError elbo(lds, Y)
+    @test_throws ArgumentError smooth(lds, Y)
+    @test_throws ArgumentError trial_elbos(lds, Y)
+
+    # The same combination inside a composite, which reaches the LQR drivers.
+    om_c = SplineGaussianObservationModel(
+        randn(rng, p, d), Matrix(1.0I, p, p), zeros(p); y=Y, n_bins=4
+    )
+    om_g = GaussianObservationModel(randn(rng, p, d), Matrix(1.0I, p, p), zeros(p))
+    lds_c = LinearDynamicalSystem(sm, (warped=om_c, plain=om_g))
+    Yc = (warped=Y, plain=[randn(rng, p, 30) for _ in 1:3])
+    @test_throws ArgumentError fit!(lds_c, Yc; max_iter=2, progress=false)
+    @test_throws ArgumentError elbo(lds_c, Yc)
+
+    # An unwarped model with the same state is of course still fine.
+    lds_ok = LinearDynamicalSystem(
+        LQRStateModel(A, Sm, Qc, Σ),
+        GaussianObservationModel(randn(rng, p, d), Matrix(1.0I, p, p), zeros(p)),
+    )
+    @test elbo(lds_ok, Y) isa Real
     return nothing
 end
 

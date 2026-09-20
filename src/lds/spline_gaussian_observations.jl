@@ -297,9 +297,18 @@ time instead of by dispatch.
 """
 _has_warped_member(::AbstractObservationModel) = false
 _has_warped_member(::SplineGaussianObservationModel) = true
-function _has_warped_member(c::CompositeObservationModel)
-    return any(_has_warped_member, values(_models(c)))
+
+#=
+Unrolled over the (heterogeneous, statically-sized) tuple of members so the
+result is a compile-time constant, exactly as `_all_quadratic` is: `any` over
+`values(models)` would leave it an abstract-tuple reduction.
+=#
+_any_warped(::Tuple{}) = false
+function _any_warped(models::Tuple)
+    return _has_warped_member(first(models)) || _any_warped(Base.tail(models))
 end
+
+_has_warped_member(c::CompositeObservationModel) = _any_warped(values(_models(c)))
 
 _group_names(::SplineGaussianObservationModel) = (:C, :R, :spline)
 _all_param_names(::SplineGaussianObservationModel) = (:C, :d, :D, :R, :warp)
