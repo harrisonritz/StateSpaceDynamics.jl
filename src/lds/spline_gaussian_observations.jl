@@ -104,9 +104,19 @@ ECM algorithm.
     diagonal-restricted one, `R_jj = (Ψ_jj + S_jj) / (ν + n + p + 1)`.
 - `CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: matrix-normal prior
     on the stacked `[C d D]`, exactly as for a Gaussian emission.
-- `depends_on`, `group_seeds`, `variants`: per-group parameter machinery, as on
-    the other emissions. Each group gets its own warp as well as its own
-    `[C d D]` / `R`.
+- `depends_on`, `group_seeds`, `variants`: present for interface parity with the
+    other emissions, but grouping is **not** supported here — see below.
+
+# Unsupported combinations
+Both are refused with a clear error rather than silently approximated:
+
+- `depends_on` parameter grouping. A group would need its own warp to be
+  coherent with this package's session stitching (groups may observe different
+  channel sets), which the grouped M-step does not build. Fit each group
+  separately.
+- An [`LQRStateModel`](@ref). Its state M-step is structural (it constrains the
+  transition to the symplectic form a control problem implies), and the spline
+  driver runs the generic Gaussian state updates, which would discard that.
 
 # Identifiability
 The warp's interval endpoints are pinned to the diagonal and the map is the

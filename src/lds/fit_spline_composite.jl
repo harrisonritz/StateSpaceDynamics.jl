@@ -117,6 +117,7 @@ member's own channel count.
 function _spline_sites(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
+    _reject_spline_lqr(lds)
     c = lds.obs_model
     models = _models(c)
     sites = Any[]
@@ -562,4 +563,53 @@ function _spline_composite_elbo_laplace(
     return elbo!(glds, suf, tfs, sdata, sws_pool) +
            logjac +
            _spline_sites_logprior(T, sites)
+end
+
+"""
+    _spline_trial_logjac(T, sites, data, ntrials) -> Vector{T}
+
+Each trial's own change-of-variables term, summed over warped members.
+
+The embedding pass keeps only the dataset total, but a per-trial ELBO has to be
+exact for `sum(trial_elbos) + log p(θ) == elbo` to hold, so this re-walks the raw
+observations trial by trial.
+"""
+function _spline_trial_logjac(
+    ::Type{T}, sites::AbstractVector, data::Data{T}, ntrials::Int
+) where {T<:Real}
+    out = zeros(T, ntrials)
+    for site in sites
+        y_m = _member_y(data.y, site.key)
+        p_m = warp_channels(site.om.warp)
+        for n in 1:ntrials
+            yn = y_m[n]
+            acc = zero(T)
+            @inbounds for t in axes(yn, 2), j in 1:p_m
+                acc += warp_forward(site.om.warp, j, yn[j, t])[2]
+            end
+            out[n] += acc
+        end
+    end
+    return out
+end
+
+"""
+    _spline_composite_trial_elbos(lds, y, ux, uy; kwargs...) -> Vector
+
+`trial_elbos` for a composite with a warped member: the shadow model's per-trial
+contributions on the embedded scale, plus each trial's own log-Jacobian. The
+parameter log-prior (IW/MN terms and the warp ridge) belongs to no trial and is
+excluded, exactly as for every other emission.
+"""
+function _spline_composite_trial_elbos(
+    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy; kwargs...
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
+    _reject_spline_grouping(lds)
+    data = Data(lds, y; ux=ux, uy=uy)
+    glds = _gaussian_shadow(lds)
+    sites = _spline_sites(lds, data)
+    sdata = _spline_shadow_data(data, sites)
+    _spline_embed_sites!(sites, data)
+    per_trial = trial_elbos(glds, sdata.y; ux=sdata.ux, uy=sdata.uy, kwargs...)
+    return per_trial .+ _spline_trial_logjac(T, sites, data, length(data.tsteps))
 end

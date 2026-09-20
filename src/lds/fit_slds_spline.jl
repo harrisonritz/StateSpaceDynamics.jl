@@ -199,6 +199,9 @@ no warp. Also performs the initial embedding, so the warm start already sees
 """
 function _slds_spline_state(slds::SLDS{T}, data::Data{T}) where {T<:Real}
     _slds_is_warped(slds) || return nothing
+    for l in slds.LDSs
+        _reject_spline_lqr(l)
+    end
     _reject_spline_grouping(slds.LDSs[1])
     _slds_share_warps!(slds)
 

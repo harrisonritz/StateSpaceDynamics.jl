@@ -199,8 +199,11 @@ nonlinear manifold. The shared warp also makes the change-of-variables term
 regime-independent, so it cancels out of the discrete posterior and the warp's
 CM-step becomes a responsibility-weighted mixture fit.
 
-`depends_on` parameter grouping is not supported for this emission; fit each
-group separately.
+Two combinations are refused rather than approximated. `depends_on` parameter
+grouping would need a warp per group to be coherent with this package's session
+stitching (groups may observe different channel sets), so fit each group
+separately. And an [`LQRStateModel`](@ref) is fitted by its own *structural*
+M-step, which the spline driver's generic state updates would discard.
 
 The knot layout (`pX`, `pY`, `dYdX`, with identity tails and endpoints on the
 diagonal) is the same one [MonotonicSplines.jl](https://github.com/bat/MonotonicSplines.jl)

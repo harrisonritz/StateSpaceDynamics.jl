@@ -35,10 +35,30 @@ Gaussian system, and the embedding buffers already filled at the current warp.
 function _spline_setup(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:SplineGaussianObservationModel{T}}
+    _reject_spline_lqr(lds)
     glds = _gaussian_shadow(lds)
     emb = SplineEmbedding(data, lds.obs_dim)
     _embed!(emb, lds.obs_model.warp, data)
     return glds, emb
+end
+
+#=
+An inverse-LQR state model constrains its transition to the symplectic form a
+control problem implies, and is fitted by its own structural M-step
+(`lqr_mstep.jl`) rather than by the generic `update_A_b!` / `update_Q!` the
+spline driver calls. Running the generic updates on it would silently discard
+that structure, so refuse instead.
+=#
+function _reject_spline_lqr(lds::LinearDynamicalSystem)
+    (lds.state_model isa LQRStateModel && _has_warped_member(lds.obs_model)) && throw(
+        ArgumentError(
+            "a SplineGaussianObservationModel is not supported with an " *
+            "LQRStateModel: the inverse-LQR state M-step is structural, and the " *
+            "spline driver runs the generic Gaussian state updates. Use a " *
+            "GaussianStateModel, or a GaussianObservationModel.",
+        ),
+    )
+    return nothing
 end
 
 #=

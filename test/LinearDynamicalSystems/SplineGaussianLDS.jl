@@ -710,6 +710,261 @@ function test_spline_grouping_is_rejected()
     return nothing
 end
 
+#=
+The whole implementation rests on the shadow emission sharing the spline model's
+arrays: every M-step write goes through a `GaussianObservationModel` built over
+the same `C`, `R`, `d`, `D`, and is expected to land back here with no copy.
+Assert that directly rather than only through a fit.
+=#
+function test_spline_gaussian_shadow_shares_arrays()
+    rng = StableRNG(62)
+    p = 3
+    Y = randn(rng, p, 30)
+    om = SplineGaussianObservationModel(
+        randn(rng, p, SG_LATENT),
+        Matrix(1.0I, p, p),
+        zeros(p);
+        y=Y,
+        n_bins=4,
+        D=randn(rng, p, 2),
+    )
+    g = SSD._gaussian_shadow(om)
+    @test g isa GaussianObservationModel
+    @test g.C === om.C
+    @test g.R === om.R
+    @test g.d === om.d
+    @test g.D === om.D
+    g.C[1, 1] = 99.0
+    g.R[2, 2] = 7.0
+    @test om.C[1, 1] == 99.0
+    @test om.R[2, 2] == 7.0
+
+    # And at the system level, including the truncated fit_bool.
+    lds = LinearDynamicalSystem(
+        sg_state_model(), om; fit_bool=(C=false, R=true, spline=false)
+    )
+    glds = SSD._gaussian_shadow(lds)
+    @test glds.state_model === lds.state_model
+    @test length(glds.fit_bool) == 6
+    @test glds.fit_bool == lds.fit_bool[1:6]
+    return nothing
+end
+
+#=
+The diagonal-restricted IW MAP has the same denominator as the unrestricted one,
+so when the scatter and the prior scale are both diagonal the two updates must
+agree exactly. That pins the formula against the package's own `iw_map` instead
+of against a transcription of it.
+=#
+function test_spline_diagonal_R_matches_iw_map()
+    rng = StableRNG(63)
+    p = 4
+    Y = randn(rng, p, 30)
+    C = randn(rng, p, SG_LATENT)
+    d = zeros(p)
+    S_diag = Diagonal(0.5 .+ rand(rng, p))
+    N = 17.0
+
+    function fitted_R(structure, prior)
+        om = SplineGaussianObservationModel(
+            copy(C),
+            Matrix(1.0I, p, p),
+            copy(d);
+            y=Y,
+            n_bins=4,
+            R_structure=structure,
+            R_prior=prior,
+            R_floor=0.0,
+        )
+        glds = SSD._gaussian_shadow(LinearDynamicalSystem(sg_state_model(), om))
+        S = Matrix(S_diag)
+        if structure === :diagonal
+            SSD._finalize_R_diag!(glds, S, N)
+        else
+            SSD._finalize_R!(glds, S, N)
+        end
+        return copy(om.R)
+    end
+
+    @test fitted_R(:diagonal, nothing) ≈ Matrix(S_diag) ./ N
+    @test fitted_R(:diagonal, nothing) ≈ fitted_R(:full, nothing)
+
+    Ψ = Matrix(Diagonal(0.2 .+ rand(rng, p)))
+    ν = 9.0
+    prior = IWPrior(; Ψ=Ψ, ν=ν)
+    Rd = fitted_R(:diagonal, prior)
+    @test Rd ≈ fitted_R(:full, prior)
+    @test diag(Rd) ≈ (diag(Ψ) .+ diag(S_diag)) ./ (ν + N + p + 1)
+
+    # With an off-diagonal scatter the two genuinely differ, and the diagonal
+    # update ignores the off-diagonal mass rather than folding it in.
+    S_full = Matrix(S_diag) .+ 0.1
+    om = SplineGaussianObservationModel(
+        copy(C), Matrix(1.0I, p, p), copy(d); y=Y, n_bins=4, R_floor=0.0
+    )
+    glds = SSD._gaussian_shadow(LinearDynamicalSystem(sg_state_model(), om))
+    SSD._finalize_R_diag!(glds, copy(S_full), N)
+    @test om.R ≈ Diagonal(diag(S_full) ./ N)
+    return nothing
+end
+
+#=
+The likelihood is unbounded above (a warp that interpolates the prediction
+drives a channel's residual to zero), so `R_floor` is the numerical stop. Check
+it binds, keeps `R` factorizable, and says so.
+=#
+function test_spline_R_floor_binds_and_warns()
+    rng = StableRNG(64)
+    p = 3
+    Y = randn(rng, p, 40)
+    om = SplineGaussianObservationModel(
+        randn(rng, p, SG_LATENT),
+        Matrix(1.0I, p, p),
+        zeros(p);
+        y=Y,
+        n_bins=4,
+        R_floor=5.0,          # far above any residual these data can produce
+    )
+    lds = LinearDynamicalSystem(sg_state_model(), om)
+    @test_logs (:warn,) match_mode = :any fit!(lds, Y; max_iter=3, progress=false)
+    @test all(>=(5.0), diag(om.R))
+    @test isposdef(om.R)
+
+    # A floor of 0 is off, and is the raw constructor's default.
+    om0 = SplineGaussianObservationModel{Float64,Matrix{Float64},Vector{Float64}}(;
+        C=randn(rng, p, SG_LATENT),
+        R=Matrix(1.0I, p, p),
+        d=zeros(p),
+        warp=MonotonicWarp(fill(-1.0, p), fill(1.0, p); n_bins=4),
+    )
+    @test om0.R_floor == 0.0
+    @test SSD._apply_R_floor!(copy(om0.R), 0.0) ≈ om0.R
+    return nothing
+end
+
+function test_spline_three_dim_observations()
+    p, Ti, N = 3, 40, 5
+    lds_true = sg_true_model(; p=p, seed=16)
+    _, Ylist = rand(StableRNG(65), lds_true, fill(Ti, N))
+    Y3 = Array{Float64,3}(undef, p, Ti, N)
+    for n in 1:N
+        Y3[:, :, n] .= Ylist[n]
+    end
+
+    lds3 = sg_init_model(Y3; p=p, seed=16, n_bins=5)
+    el3 = fit!(lds3, Y3; max_iter=10, progress=false)
+    lds_v = sg_init_model(Ylist; p=p, seed=16, n_bins=5)
+    el_v = fit!(lds_v, Ylist; max_iter=10, progress=false)
+
+    # The two layouts are the same dataset, so the fits must agree exactly.
+    @test el3 ≈ el_v rtol = 1e-12
+    @test lds3.obs_model.C ≈ lds_v.obs_model.C rtol = 1e-12
+    @test lds3.obs_model.warp.θh ≈ lds_v.obs_model.warp.θh rtol = 1e-10
+
+    xs, Ps = smooth(lds3, Y3)
+    @test length(xs) == N && size(xs[1]) == (SG_LATENT, Ti)
+    @test length(trial_elbos(lds3, Y3)) == N
+    return nothing
+end
+
+function test_spline_float32()
+    rng = StableRNG(66)
+    p, Ti = 3, 40
+    Y = [randn(rng, Float32, p, Ti) for _ in 1:3]
+    om = SplineGaussianObservationModel(
+        randn(rng, Float32, p, SG_LATENT),
+        Matrix{Float32}(1.0I, p, p),
+        zeros(Float32, p);
+        y=Y,
+        n_bins=4,
+        spline_ridge=0.0f0,
+    )
+    @test om isa SplineGaussianObservationModel{Float32}
+    @test om.warp isa MonotonicWarp{Float32}
+    sm = GaussianStateModel(
+        Matrix{Float32}(0.9I, SG_LATENT, SG_LATENT),
+        Matrix{Float32}(0.1I, SG_LATENT, SG_LATENT),
+        zeros(Float32, SG_LATENT),
+        zeros(Float32, SG_LATENT),
+        Matrix{Float32}(1.0I, SG_LATENT, SG_LATENT),
+    )
+    lds = LinearDynamicalSystem(sm, om)
+    el = fit!(lds, Y; max_iter=6, progress=false)
+    @test eltype(el) === Float32
+    @test all(isfinite, el)
+    @test eltype(om.warp.θh) === Float32
+    @test eltype(om.R) === Float32
+    return nothing
+end
+
+function test_spline_priors_shift_the_fit()
+    p = 4
+    lds_true = sg_true_model(; p=p, seed=17)
+    _, Y = rand(StableRNG(67), lds_true, fill(60, 5))
+
+    plain = sg_init_model(Y; p=p, seed=17, n_bins=5)
+    fit!(plain, Y; max_iter=15, progress=false)
+
+    #=
+    A strong IW prior inflates `R`, with a floor that follows from the MAP
+    formula alone: `R_jj = (Ψ_jj + S_jj)/(ν + N + p + 1) ≥ Ψ_jj/(ν + N + p + 1)`,
+    where `N` is the total number of observed timesteps.
+    =#
+    Ψ = Matrix(50.0I, p, p)
+    ν = 200.0
+    prior = IWPrior(; Ψ=Ψ, ν=ν)
+    shrunk = sg_init_model(Y; p=p, seed=17, n_bins=5, R_prior=prior)
+    fit!(shrunk, Y; max_iter=15, progress=false)
+    N = sum(size(yt, 2) for yt in Y)
+    @test all(diag(shrunk.obs_model.R) .>= 50.0 / (ν + N + p + 1))
+    @test all(diag(shrunk.obs_model.R) .> diag(plain.obs_model.R))
+
+    #=
+    And the prior's log-density must be exactly what separates the ELBO from the
+    marginal log-likelihood — nothing else is set here, so the gap is the IW term
+    alone.
+    =#
+    @test elbo(shrunk, Y) - loglikelihood(shrunk, Y) ≈
+        SSD.iw_logprior_term(shrunk.obs_model.R, prior) rtol = 1e-9
+
+    # The warp ridge shrinks the warp toward the identity.
+    loose = sg_init_model(Y; p=p, seed=17, n_bins=5)
+    fit!(loose, Y; max_iter=25, progress=false)
+    tight = sg_init_model(Y; p=p, seed=17, n_bins=5)
+    tight.obs_model.spline_ridge = 50.0
+    fit!(tight, Y; max_iter=25, progress=false)
+    norm_of(m) = sum(abs2, m.obs_model.warp.θh) + sum(abs2, m.obs_model.warp.θw)
+    @test norm_of(tight) < norm_of(loose)
+    return nothing
+end
+
+function test_spline_lqr_state_model_rejected()
+    rng = StableRNG(68)
+    n, p = 2, 2
+    A = 0.5 .* rand(rng, n, n)
+    S = Matrix(0.15I, n, n)
+    Qc = Matrix(0.2I, n, n)
+    Σ = Matrix(0.02I, n, n)
+    sm = LQRStateModel(A, S, [Qc], Σ; terminal=true, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+    Y = [randn(rng, p, 30) for _ in 1:3]
+    om = SplineGaussianObservationModel(
+        randn(rng, p, 2n), Matrix(1.0I, p, p), zeros(p); y=Y, n_bins=4
+    )
+    lds = LinearDynamicalSystem(sm, om)
+    @test_throws ArgumentError fit!(lds, Y; max_iter=2, progress=false)
+    @test_throws ArgumentError elbo(lds, Y)
+    return nothing
+end
+
+function test_warp_copy_shape_mismatch()
+    a = MonotonicWarp([-1.0], [1.0]; n_bins=4)
+    b = MonotonicWarp([-1.0], [1.0]; n_bins=6)
+    c = MonotonicWarp([-1.0, -1.0], [1.0, 1.0]; n_bins=4)
+    @test_throws DimensionMismatch copy_warp!(a, b)
+    @test_throws DimensionMismatch copy_warp!(a, c)
+    return nothing
+end
+
 # ============================================================================
 # Composite emissions
 # ============================================================================
@@ -769,6 +1024,30 @@ function test_spline_composite_fit()
         gf = [warp_forward(lds.obs_model.kin.warp, j, v)[1] for v in grid]
         @test cor(gt, gf) > 0.9
     end
+    return nothing
+end
+
+function test_spline_composite_trial_elbos()
+    rng = StableRNG(78)
+    pk, pa, k = 3, 3, SG_LATENT
+    Y = (kin=[randn(rng, pk, 35) for _ in 1:4], aux=[randn(rng, pa, 35) for _ in 1:4])
+    om_k = SplineGaussianObservationModel(
+        randn(rng, pk, k),
+        Matrix(1.0I, pk, pk),
+        zeros(pk);
+        y=Y.kin,
+        n_bins=4,
+        spline_ridge=0.0,
+    )
+    om_a = GaussianObservationModel(randn(rng, pa, k), Matrix(1.0I, pa, pa), zeros(pa))
+    lds = LinearDynamicalSystem(sg_state_model(), (kin=om_k, aux=om_a))
+    fit!(lds, Y; max_iter=10, progress=false)
+
+    te = trial_elbos(lds, Y)
+    @test length(te) == 4
+    # Had `trial_elbos` scored the raw observations instead of the embedding,
+    # this would miss the change-of-variables term entirely.
+    @test sum(te) ≈ elbo(lds, Y) rtol = 1e-8
     return nothing
 end
 

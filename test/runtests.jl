@@ -363,6 +363,7 @@ using SSDTest
                 test_spline_mixture_objective_gradient()
                 test_warp_bounds_and_construction_errors()
                 test_warp_pack_roundtrip()
+                test_warp_copy_shape_mismatch()
                 test_warp_apply_block()
             end
 
@@ -393,10 +394,21 @@ using SSDTest
                 test_spline_sampling_roundtrip()
                 test_spline_holdout_and_early_stopping()
                 test_spline_grouping_is_rejected()
+                test_spline_lqr_state_model_rejected()
+                test_spline_three_dim_observations()
+                test_spline_float32()
+            end
+
+            @testset "Shadow emission, R structure and priors" begin
+                test_spline_gaussian_shadow_shares_arrays()
+                test_spline_diagonal_R_matches_iw_map()
+                test_spline_R_floor_binds_and_warns()
+                test_spline_priors_shift_the_fit()
             end
 
             @testset "Composite emissions" begin
                 test_spline_composite_fit()
+                test_spline_composite_trial_elbos()
                 test_spline_composite_fit_bool()
                 test_spline_composite_with_poisson()
             end
