@@ -135,11 +135,16 @@ Maximization, not a variational approximation:
    ``Q``, ``[C\ d\ D]`` and ``R`` from the sufficient statistics of ``z``. With
    ``g`` fixed the Jacobian is a constant and drops out.
 3. **CM-step 2.** L-BFGS on the spline parameters ``\phi`` with everything else
-   fixed. Writing ``\hat\mu_t = C\hat x_t + d + D v_t`` for the smoothed emission
-   mean and ``R = LL^\top``, the expectation over ``q`` separates as
-   ``\mathbb{E}_q\|g(y_t) - \mu_t\|^2_{R^{-1}} = \|L^{-1}(g(y_t) - \hat\mu_t)\|^2
-   + \operatorname{tr}(R^{-1} C \Sigma_t C^\top)``, and the trace is constant in
-   ``\phi``. So the warp objective
+   fixed. Write ``\hat\mu_t = C\hat x_t + d + D v_t`` for the smoothed emission
+   mean and ``R = LL^\top``. The expectation over ``q`` then separates,
+
+```math
+\mathbb{E}_q\big\|g(y_t) - \mu_t\big\|^2_{R^{-1}}
+   = \big\|L^{-1}\big(g(y_t) - \hat\mu_t\big)\big\|^2
+   + \operatorname{tr}\!\big(R^{-1} C \Sigma_t C^\top\big)
+```
+
+   and the trace is constant in ``\phi``. So the warp objective
 
 ```math
 \mathcal{Q}(\phi) = -\tfrac12 \sum_{n,t} \big\|L^{-1}\big(g_\phi(y_{nt}) -
