@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`SplineGaussianObservationModel`: manifold discovery by a monotonic
+  normalizing flow.** A Gaussian emission composed with a learned, element-wise,
+  strictly increasing warp,
+
+  ```
+  y_t = g⁻¹(z_t),   z_t | x_t ~ N(C x_t + d + D v_t, R)
+  ```
+
+  where each `g_j` is a monotonic rational-quadratic spline. With `C` of size
+  `p × k` and `k < p`, `z` concentrates near a `k`-dimensional affine subspace
+  and `y = g⁻¹(z)` traces a curved `k`-manifold in observation space. One layer
+  of element-wise warps is exactly a Gaussian-copula (nonparanormal) LDS:
+  arbitrary continuous per-channel marginals — rectification, saturation, skew,
+  heavy tails — over linear-Gaussian latent dynamics. It does not mix channels,
+  which is what keeps each `g_j` a directly interpretable per-channel
+  nonlinearity.
+
+  Fitting is *exact* Expectation Conditional Maximization, not a variational
+  approximation. Hold `g` fixed and `z = g(y)` is data, so the model in `z` is an
+  ordinary linear-Gaussian SSM and the smoother gives the true posterior; the
+  log-Jacobian does not involve `x` at all. `[C d D]` and `R` then come from the
+  usual closed-form updates. The warp's own step is a second conditional
+  maximization: because
+  `E_q‖g(y_t) - μ_t‖²_{R⁻¹} = ‖L⁻¹(g(y_t) - μ̂_t)‖² + tr(R⁻¹ C Σ_t C')` and the
+  trace is constant in the spline parameters, its objective is exactly a
+  normalizing-flow MLE against a Gaussian base centred on the smoothed
+  prediction — only the smoothed *mean* enters. Both steps increase the same
+  `Q(θ, q)` and the warp step is accepted only when it strictly improves, so the
+  observed-data log-likelihood is non-decreasing.
+
+  All spline parameters start at zero, which is *exactly* the identity map: a
+  fresh spline emission is the corresponding linear-Gaussian emission, and
+  `fit_bool = (spline = false,)` freezes it there — the natural baseline to
+  compare a warped fit against. `elbo`, `loglikelihood` and `trial_elbos` all
+  report on the observation scale (they include `Σ log g'`), so a spline fit's
+  held-out score is directly comparable with a plain Gaussian LDS fit.
+
+  Supported as a standalone emission, as a member of a
+  `CompositeObservationModel` (alongside Gaussian *or* Poisson readouts), and in
+  an `SLDS`, where the warp is shared across regimes — a per-channel distortion
+  is a property of the measurement, not of the regime, and sharing it makes the
+  change-of-variables term cancel out of the discrete posterior. Not supported
+  with `depends_on` grouping or an `LQRStateModel`; both raise a clear error.
+
+  The warp is also usable on its own as a parameter transformation, via
+  `MonotonicWarp` and `warp_forward` / `warp_inverse` / `warp_apply!`. Its knot
+  layout matches `MonotonicSplines.jl`'s `RQSpline`, so a fitted channel can be
+  handed straight to that package, but no dependency is added: the M-step uses
+  hand-derived analytic gradients (checked against `ForwardDiff` in the tests)
+  rather than automatic differentiation.
+
 ### Changed
 - **The inverse optimal control model now uses LQR naming throughout.** Use
   `LQRStateModel`, `LQRFitFlags`, and `lqr_matrix`; source files, internal
