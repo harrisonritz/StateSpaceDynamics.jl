@@ -918,6 +918,33 @@ function test_spline_R_floor_binds_and_warns()
     @test all(>=(5.0), diag(om.R))
     @test isposdef(om.R)
 
+    #=
+    Both keyword spellings must work. The defaults for `spline_ridge` and
+    `R_floor` are taken through `eltype(C)` precisely because the
+    unparameterized form binds no `T`, and writing them as `T(...)` made that
+    form an `UndefVarError`.
+    =#
+    om_bare = SplineGaussianObservationModel(;
+        C=randn(rng, p, SG_LATENT),
+        R=Matrix(1.0I, p, p),
+        d=zeros(p),
+        warp=MonotonicWarp(fill(-1.0, p), fill(1.0, p); n_bins=4),
+    )
+    @test om_bare.spline_ridge == 1e-3
+    @test om_bare.R_floor == 0.0
+    @test om_bare.spline_ridge isa Float64
+    @test om_bare.R_structure === :diagonal
+
+    om_f32 = SplineGaussianObservationModel(;
+        C=randn(rng, Float32, p, SG_LATENT),
+        R=Matrix{Float32}(1.0I, p, p),
+        d=zeros(Float32, p),
+        warp=MonotonicWarp(fill(-1.0f0, p), fill(1.0f0, p); n_bins=4),
+    )
+    @test om_f32 isa SplineGaussianObservationModel{Float32}
+    @test om_f32.spline_ridge isa Float32
+    @test om_f32.R_floor isa Float32
+
     # A floor of 0 is off, and is the raw constructor's default.
     om0 = SplineGaussianObservationModel{Float64,Matrix{Float64},Vector{Float64}}(;
         C=randn(rng, p, SG_LATENT),
