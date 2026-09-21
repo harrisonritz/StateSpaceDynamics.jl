@@ -78,6 +78,15 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     const Xv::Vector{Matrix{T}}
     const Yv::Matrix{T}
     const Omega::Vector{Matrix{T}}
+    #=
+    The distinct terminal designs among the aggregated trials, and how many
+    trials each covers. `log Z` depends on a trial only through its inputs and
+    its horizon, so a task design repeated across a session is integrated once.
+    Deduplicated here rather than at use: the aggregator sees each trial once,
+    while the objective is evaluated many times per M-step.
+    =#
+    const terminal_inputs::Vector{Matrix{T}}
+    const terminal_counts::Vector{T}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -126,6 +135,8 @@ function _wrap_lqr_suff_stats(
         [zeros(T, d, reg) for _ in 1:K],
         zeros(T, d, d),
         [zeros(T, d + 1 + m, d + 1 + m) for _ in 1:K],
+        Matrix{T}[],
+        T[],
     )
 end
 
@@ -194,6 +205,23 @@ function _aggregate_lqr_stats!(
     for k in 1:K
         fill!(hs.term_zz[k], zero(T))
         hs.term_n[k] = zero(T)
+    end
+
+    empty!(hs.terminal_inputs)
+    empty!(hs.terminal_counts)
+    if sm.terminal && sm.condition_terminal
+        index = Dict{Matrix{T},Int}()
+        for i in trials
+            u = data.ux[i]
+            slot = get(index, u, 0)
+            if slot == 0
+                push!(hs.terminal_inputs, Matrix{T}(u))
+                push!(hs.terminal_counts, one(T))
+                index[hs.terminal_inputs[end]] = length(hs.terminal_inputs)
+            else
+                hs.terminal_counts[slot] += one(T)
+            end
+        end
     end
 
     for trial in trials
@@ -1823,6 +1851,10 @@ function _lqr_state_mstep!(
     hs::LQRSufficientStatistics{T},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    if lds.state_model.terminal && lds.state_model.condition_terminal
+        _lqr_conditional_mstep!([lds], [hs], [ones(Int, 1) for _ in 1:4])
+        return nothing
+    end
     base = _state_suf(hs.base)
     update_initial_state_mean!(lds, base)
     update_initial_state_covariance!(lds, base, sws)
@@ -2023,7 +2055,8 @@ The partial least-squares solve for one version of `[M | h | B_u]`, over the
 summed statistics of the units sharing it.
 """
 function _free_theta_pooled(
-    ldss::AbstractVector, hss::AbstractVector{<:LQRSufficientStatistics{T}},
+    ldss::AbstractVector,
+    hss::AbstractVector{<:LQRSufficientStatistics{T}},
     units::AbstractVector{Int},
 ) where {T<:Real}
     lds = ldss[first(units)]
@@ -2055,7 +2088,9 @@ function _free_theta_pooled(
         Gm = pd_gram(Matrix{T}(Sww[free_cols, free_cols]); name="free dynamics Gram")
         # Θ_free Gm = rhs  ⇒  Gm Θ_freeᵀ = rhsᵀ, and Gm is symmetric.
         Theta[:, free_cols] .= transpose(Gm.chol \ Matrix{T}(transpose(rhs)))
-        @warn "diagnostic free regression" N=N gram_cond=cond(Sww[free_cols, free_cols]) theta_max=maximum(abs, Theta) rho=maximum(abs, eigvals(Theta[:, 1:d]))
+        @warn "diagnostic free regression" N = N gram_cond = cond(Sww[free_cols, free_cols]) theta_max = maximum(
+            abs, Theta
+        ) rho = maximum(abs, eigvals(Theta[:, 1:d]))
     end
     return Theta
 end
@@ -2068,8 +2103,10 @@ each at its own `Θ`, since the structure may be grouped differently — over
 their total transition count.
 """
 function _free_noise_mstep!(
-    ldss::AbstractVector, hss::AbstractVector{<:LQRSufficientStatistics{T}},
-    thetas::AbstractVector{Matrix{T}}, units::AbstractVector{Int},
+    ldss::AbstractVector,
+    hss::AbstractVector{<:LQRSufficientStatistics{T}},
+    thetas::AbstractVector{Matrix{T}},
+    units::AbstractVector{Int},
 ) where {T<:Real}
     lds = ldss[first(units)]
     lds.fit_bool[4] || return nothing
@@ -2092,7 +2129,9 @@ function _free_noise_mstep!(
     end
     Symmetrize!(R)
     copyto!(sm.Σ, R)
-    @warn "diagnostic free noise" N=N sigma_min=minimum(eigvals(Symmetric(R))) sigma_max=maximum(eigvals(Symmetric(R)))
+    @warn "diagnostic free noise" N = N sigma_min = minimum(eigvals(Symmetric(R))) sigma_max = maximum(
+        eigvals(Symmetric(R))
+    )
     return nothing
 end
 
@@ -2196,7 +2235,7 @@ drift from the objective EM is actually improving.
 Fills the mixed blocks itself, so it is safe to call directly on freshly
 aggregated statistics.
 """
-function Q_state!(
+function _lqr_joint_Q_state!(
     sws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
     hs::LQRSufficientStatistics{T},

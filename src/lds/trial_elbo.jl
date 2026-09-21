@@ -362,9 +362,13 @@ end
 
 Per-trial ELBO contributions of an LQR LDS with a quadratic
 emission. The smoother is exact on `z = [x; λ]`, so with no parameter priors
-each entry is that trial's exact marginal log-density — of `y` jointly with the
-terminal pseudo-observation when the model carries one, which is what
-[`loglikelihood`](@ref) reports too.
+each entry is that trial's exact marginal log-density — the same quantity
+[`loglikelihood`](@ref) reports, split by trial.
+
+With a terminal factor that means `log p(y | terminal = 0)` per trial by
+default, since the terminal normalizer is itself a product over trials and each
+trial's own factor is subtracted here. Set `condition_terminal = false` on the
+state model for the joint `log p(y, terminal = 0)` instead.
 """
 function trial_elbos(
     lds::LinearDynamicalSystem{T,S,O},

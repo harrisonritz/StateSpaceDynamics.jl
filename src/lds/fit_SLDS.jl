@@ -1230,7 +1230,7 @@ held-out data.
   count, so it needs its own label vectors.
 
 # Returns
-A `NamedTuple` `(; x, γ, elbo, trial_elbo, p)`. For a single-trial matrix `y`, `x` is
+A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
@@ -1238,6 +1238,12 @@ always a scalar, and `p` is `nothing` unless `return_cov=true`.
 `trial_elbo` is each trial's contribution to `elbo`, always a `Vector` with one entry
 per trial (a single-trial `y` included). It sums to `elbo` up to the parameter
 log-prior, which belongs to no trial — see [`trial_elbos`](@ref).
+
+`terminal_logz` is the terminal normalizer already subtracted from `elbo` when the
+inverse-LQR discrete states condition on their terminal factor, and zero otherwise. It
+is reported because it is a *variational estimate* for a switching model, which makes
+`elbo` a difference of two bounds rather than a bound: read the two together before
+attributing a score gap to fit quality. See [`terminal_logz`](@ref).
 
 Because a converged alternation is expensive, `smooth` returns everything it computed in
 one call — read its `elbo` / `trial_elbo` fields rather than calling [`elbo`](@ref) or
@@ -1381,6 +1387,28 @@ function smooth(
         ),
         _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T)
     end
+    #=
+    Terminal conditioning, per trial so the vector stays the per-trial split of
+    the returned total. A grouped fit would need one probe per cell, which is
+    not built yet, so refuse rather than quietly report the joint score.
+    =#
+    terminal_logz = zero(T)
+    if grp === nothing
+        logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends)
+        if logz !== nothing
+            trial_elbo = trial_elbo .- logz
+            terminal_logz = sum(logz)
+        end
+    elseif _slds_condition_terminal(slds)
+        throw(
+            ArgumentError(
+                "terminal conditioning is not implemented for grouped switching fits: " *
+                "each cell has its own parameters and so its own normalizer. Fit the " *
+                "cells separately, or set `condition_terminal=false` on every " *
+                "inverse-LQR discrete state to score the joint objective instead.",
+            ),
+        )
+    end
     total_elbo = sum(trial_elbo) + prior_logdensity
 
     γ_trials = Vector{Matrix{T}}(undef, ntrials)
@@ -1394,7 +1422,7 @@ function smooth(
     end
 
     return _collect_slds_smooth_output(
-        x_trials, γ_trials, p_trials, total_elbo, trial_elbo, y
+        x_trials, γ_trials, p_trials, total_elbo, trial_elbo, y, terminal_logz
     )
 end
 
@@ -1408,18 +1436,23 @@ matrix. Its whole point is to be indexed by trial, and unwrapped to a scalar it
 would be indistinguishable from `elbo` — which for one trial and no priors is
 the same number.
 =#
-function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, ::AbstractMatrix)
+function _collect_slds_smooth_output(
+    x, γ, p, total_elbo, trial_elbo, ::AbstractMatrix, terminal_logz
+)
     return (;
         x=x[1],
         γ=γ[1],
         elbo=total_elbo,
         trial_elbo=trial_elbo,
         p=(p === nothing ? nothing : p[1]),
+        terminal_logz=terminal_logz,
     )
 end
 
-function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, _)
-    return (; x=x, γ=γ, elbo=total_elbo, trial_elbo=trial_elbo, p=p)
+function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, _, terminal_logz)
+    return (;
+        x=x, γ=γ, elbo=total_elbo, trial_elbo=trial_elbo, p=p, terminal_logz=terminal_logz
+    )
 end
 
 # ============================================================================
@@ -1989,13 +2022,30 @@ function _vem_alternate!(
             pinfs = [count(==(T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             ninfs = [count(==(-T(Inf)), view(dl.logL, k, :)) for k in 1:K]
             first_bad = findfirst(x -> !isfinite(x), dl.logL)
-            sample_bad = x_samples === nothing ? -1 : sum(count(x -> !isfinite(x), xs) for xs in x_samples)
-            sample_max = x_samples === nothing ? T(NaN) : maximum(maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for xs in x_samples)
-            error("diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max")
+            sample_bad = if x_samples === nothing
+                -1
+            else
+                sum(count(x -> !isfinite(x), xs) for xs in x_samples)
+            end
+            sample_max = if x_samples === nothing
+                T(NaN)
+            else
+                maximum(
+                    maximum(abs, filter(isfinite, vec(xs)); init=zero(T)) for
+                    xs in x_samples
+                )
+            end
+            error(
+                "diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max",
+            )
         end
-        if !all(isfinite, dl.A) || !all(isfinite, dl.πₖ) ||
-           any(iszero, vec(sum(dl.A; dims=2))) || iszero(sum(dl.πₖ))
-            error("diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)")
+        if !all(isfinite, dl.A) ||
+            !all(isfinite, dl.πₖ) ||
+            any(iszero, vec(sum(dl.A; dims=2))) ||
+            iszero(sum(dl.πₖ))
+            error(
+                "diagnostic: invalid discrete chain at VEM iteration $iter; A=$(dl.A), pi=$(dl.πₖ)",
+            )
         end
 
         # (2) Update q(z): single batched forward-backward across all trials.
@@ -2353,7 +2403,16 @@ function elbo!(
     per_trial = _slds_trial_elbos(
         slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
     )
-    return sum(per_trial) + _slds_prior_logdensity(slds)
+    total = sum(per_trial) + _slds_prior_logdensity(slds)
+    #=
+    Terminal conditioning: report `log p(y | terminal = 0)`, not the joint. The
+    normalizer is a variational estimate (see `slds_lqr_terminal.jl`), so this
+    total is a difference of two bounds rather than a bound; `terminal_logz`
+    returns the subtracted half on its own.
+    =#
+    logz = _slds_terminal_trial_logz(slds, ux, seq_ends)
+    logz === nothing || (total -= sum(logz))
+    return total
 end
 
 """
@@ -2916,8 +2975,11 @@ function _slds_state_mstep!(
     bufs,
     K::Int,
     D::Int,
-    ux_dim::Int,
+    ux_dim::Int;
+    terminal_probe=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    terminal_probe === nothing ||
+        throw(ArgumentError("terminal conditioning needs inverse-LQR discrete states"))
     dyn_cols = _tied_dyn_cols(tied, D, ux_dim)
     slots_ab = _slds_update_regression!(
         _DynBlock(), ldss, sf_state, dyn_cols, slots_q, sws, bufs, K
@@ -3024,8 +3086,32 @@ function mstep!(
     how many distinct regressions there are, so a partial tie counts as `K` of
     them — every regime's stacked matrix differs, in its free columns.
     =#
+    #=
+    The terminal-conditioned objective needs the prior's own terminal-conditioned
+    moments, which come from one E-step on a zero-loading copy of this model.
+    Run it once here, at θ\u2032: the inner L-BFGS holds that posterior fixed, exactly
+    as it holds the data posterior fixed, so both halves of the surrogate are
+    tight at the same point.
+    =#
+    terminal_probe = if _slds_condition_terminal(slds)
+        pr = _slqr_terminal_probe(slds, dat.ux)
+        _slqr_sync_probe!(pr, slds)
+        _slqr_probe_estep!(pr)
+    else
+        nothing
+    end
+
     _slds_state_mstep!(
-        slds.LDSs, sf_state, tied, slots_q, sws, _state_bufs(bf), K, D, lds1.ux_dim
+        slds.LDSs,
+        sf_state,
+        tied,
+        slots_q,
+        sws,
+        _state_bufs(bf),
+        K,
+        D,
+        lds1.ux_dim;
+        terminal_probe=terminal_probe,
     )
 
     #=
@@ -3068,7 +3154,9 @@ function mstep!(
     copyto!(suf.init_xy, init_xy)
     suf.init_yy[] = init_yy
     suf.init_n = init_n
-    _update_shared_initial_state!(slds, suf, sws; scratch=init_scratch)
+    # Already fitted, against `log Z`, by the conditional state M-step above.
+    terminal_probe === nothing &&
+        _update_shared_initial_state!(slds, suf, sws; scratch=init_scratch)
 
     return nothing
 end

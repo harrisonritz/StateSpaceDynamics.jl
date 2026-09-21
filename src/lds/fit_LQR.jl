@@ -841,6 +841,10 @@ function _grouped_state_mstep!(
     sws::SmoothWorkspace{T},
     bufs::GroupedSufBuffers,
 ) where {T<:Real,S<:LQRStateModel{T}}
+    if ldss[1].state_model.terminal && ldss[1].state_model.condition_terminal
+        _lqr_conditional_mstep!(ldss, sufs, slots)
+        return nothing
+    end
     base = [_state_suf(suf.base) for suf in sufs]
     _grouped_update_x0!(ldss, base, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, base, slots[_G_P0], slots[_G_X0], sws)

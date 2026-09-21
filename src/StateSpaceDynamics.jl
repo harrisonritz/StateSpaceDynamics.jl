@@ -68,6 +68,8 @@ include("lds/fit_SLDS.jl")
 include("lds/lqr_mstep.jl")
 include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_LQR.jl")
+include("lds/lqr_terminal.jl")
+include("lds/slds_lqr_terminal.jl")
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.
@@ -92,7 +94,7 @@ export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
 export free_state_model, plant_dim
 export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
-export simulate_lqr, lqr_riccati_sequence
+export simulate_lqr, lqr_riccati_sequence, terminal_logz
 
 # Ancillary parameter dependencies (`depends_on`)
 export group_labels, group_parameter, group_variant, set_group_seeds!, set_depends_on!

@@ -406,11 +406,7 @@ cost regimes, or a terminal factor, separate them.
 
 When `terminal` is set, `λ_T = Q_{k_T} x_T` enters as a **soft pseudo-observation**
 — `0 = λ_T − Q_{k_T} x_T − h_f + ε_f`, `ε_f ~ N(0, Σ_f)`, with `Σ_f → 0` the hard
-boundary condition. It is a factor of the emission, not of the chain: the model
-is the proper joint `p(z) p(y | z) p(y^{term} | z_T)`, `elbo` and `loglikelihood`
-report `log p(y, y^{term} = 0)`, and no extra normalizer is involved.
-
-Two consequences are worth stating plainly.
+boundary condition.
 
 *It is what makes the model well-behaved.* A symplectic matrix has reciprocal
 eigenvalue pairs, so the forward transition is unstable by construction and the
@@ -419,15 +415,51 @@ removes exactly the unstable directions — that is what a boundary condition do
 to a two-point boundary value problem — so the posterior, and `rand`'s
 terminal-conditioned draw, stay bounded.
 
-*It is a conditioning event, so recovery from `rand` output is biased.* `rand`
-draws `p(z, y | y^{term} = 0)`, which is what trials actually look like, while the
-fitted objective is `p(y, y^{term} = 0)`; the two differ by `p(y^{term} = 0 | θ)`,
-which depends on the parameters. Maximizing the latter on data drawn from the
-former is therefore a selection effect, not an unbiased estimator, and a
-self-consistency recovery check will not land on the generating parameters. When
-that matters, encode the terminal cost as the last *regime of the transition
-schedule* instead (`terminal = false`, and give the final transitions their own
-`Qc`): that model is a proper directed chain and recovers its own parameters.
+*It is a conditioning event, and `condition_terminal` decides whether the score
+treats it as one.* The pseudo-observation defines the joint
+`p(z) p(y | z) p(y^{term} | z_T)`, but trials are not drawn from that joint. They
+are drawn from it **given** `y^{term} = 0` — which is what `rand` produces, and
+what a reach that ends on target is. The two differ by `p(y^{term} = 0 | θ)`, a
+function of the parameters.
+
+With `condition_terminal = true` (the default) `elbo` and `loglikelihood` report
+
+```math
+\\log p(y \\mid y^{term} = 0, θ)
+  = \\log p(y, y^{term} = 0 \\mid θ) - \\log p(y^{term} = 0 \\mid θ),
+```
+
+and the M-step optimizes the same quantity. The normalizer is computed exactly,
+by backward square-root Gaussian integration over the whole chain, so EM stays
+monotone on the conditional objective: `−Q(θ | θ′) + log Z(θ)` majorizes it and
+touches it at `θ′`.
+
+The subtraction is not cosmetic. Three things it fixes:
+
+- **Dimension.** A plant/costate pair the emission never reads still contributes
+  its own terminal log-density to the joint score, so a sweep over plant
+  dimension scored on the joint is partly a sweep of that density. Under
+  conditioning the unused pair cancels exactly, in numerator and denominator
+  alike.
+- **Gauge.** The inverse-optimal-control rescaling
+  `(λ, S, Q, h, Σ_f, h_f) → (cλ, c⁻¹S, cQ, …, c²Σ_f, c h_f)` leaves the plant
+  posterior alone but moves the joint score by `−n log|c|` per trial, which is
+  unbounded above as `c → 0` when no prior pins the scale. It leaves the
+  whitened terminal residual untouched, so the conditional score is exactly
+  invariant — see [`rescale_costate!`](@ref).
+- **Recovery.** `rand` draws `p(z, y | y^{term} = 0)`. Maximizing the joint on
+  those draws is a selection effect rather than an estimator, and a
+  self-consistency check will not land on the generating parameters. The
+  conditional objective is the likelihood of the process that produced them.
+
+Set `condition_terminal = false` to score and fit the joint
+`log p(y, y^{term} = 0)` instead. That is what fits made before this option
+existed report, and what the exactly-solvable regression tests compare against;
+it is also the cheaper objective, since no normalizer is evaluated.
+
+A switching model's normalizer sums over `K^T` discrete paths and has no exact
+form. It is estimated variationally instead, and reported separately by
+[`terminal_logz`](@ref) so the approximation stays auditable.
 
 ## Grouping (`depends_on`)
 
@@ -558,6 +590,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     schedule::Vector{Int}
     terminal::Bool
     terminal_regime::Int
+    condition_terminal::Bool
     Σ::M
     h::V
     Bu::M
@@ -900,6 +933,7 @@ function LQRStateModel(
     schedule::AbstractVector{<:Integer}=Int[],
     terminal::Bool=false,
     terminal_regime::Integer=0,
+    condition_terminal::Bool=true,
     Σf::Union{Nothing,AbstractMatrix{T}}=nothing,
     hf::Union{Nothing,AbstractVector{T}}=nothing,
     h::Union{Nothing,AbstractVector{T}}=nothing,
@@ -990,6 +1024,7 @@ function LQRStateModel(
         sched,
         terminal,
         term_k,
+        condition_terminal,
         Σ,
         h_v,
         Bu_m,
@@ -1110,6 +1145,7 @@ function free_state_model(
         Int[],
         false,
         0,
+        false,
         Σ,
         h_v,
         Bu_m,
@@ -1563,8 +1599,22 @@ end
     rescale_costate!(sm; target=:trace) -> sm
 
 Apply the inverse-optimal-control scale transformation
-`(λ, S, Q, h, Σ, …) → (cλ, c⁻¹S, cQ, …)`, which leaves the state dynamics — and
-hence the fit — unchanged, and put the model in a canonical scale.
+`(λ, S, Q, h, Σ, …) → (cλ, c⁻¹S, cQ, …)`, which preserves the plant dynamics,
+and put the model in a canonical scale.
+
+What it preserves depends on the score. With the emission transformed as
+described below, and no parameter priors:
+
+- no terminal factor: the marginal likelihood is unchanged;
+- a terminal factor, `condition_terminal = true`: the conditional score is
+  unchanged, exactly. `Σf → c²Σf` and `hf → c·hf` are part of the
+  transformation, so the *whitened* terminal residual — and therefore the
+  conditioning event — does not move;
+- a terminal factor, `condition_terminal = false`: the joint log-density shifts
+  by `-n * log(abs(c))` per trial, because only the `|Σf|^{-1/2}` factor
+  survives the whitening. That direction is unbounded above as `c → 0`.
+
+Parameter-prior penalties can change in any of these cases.
 
 With `target = :trace` the scale is chosen so that `tr(Qc[1]) == n`; with
 `target = :opnorm`, so that the largest absolute eigenvalue of `Qc[1]` is 1.

@@ -189,12 +189,40 @@ function _slds_state_mstep!(
     _,
     K::Int,
     ::Int,
-    ::Int,
+    ::Int;
+    terminal_probe=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sms = [lds.state_model for lds in ldss]
 
     for k in 1:K
         _fill_mixed_blocks!(sf_state[k], sms[k])
+    end
+
+    #=
+    Terminal conditioning replaces the whole state-side update, initial state
+    included: `x0` and `P0` enter `log Z` as surely as the dynamics do, so the
+    pooled conjugate update the caller would otherwise run afterwards is solving
+    the wrong problem. The caller skips it when a probe is supplied.
+    =#
+    if terminal_probe !== nothing
+        any(_is_free, sms) && throw(
+            ArgumentError(
+                "terminal conditioning is not implemented for a switching model that " *
+                "mixes `:free` and inverse-LQR discrete states: the shared initial " *
+                "state would be fitted from the inverse-LQR regimes alone. Use " *
+                "inverse-LQR states throughout, or set `condition_terminal=false`.",
+            ),
+        )
+        qslots = (:noise in tied) ? ones(Int, K) : collect(1:K)
+        _lqr_conditional_mstep!(
+            ldss,
+            sf_state,
+            [ones(Int, K), ones(Int, K), collect(1:K), qslots],
+            _lqr_block_slots(tied, K),
+            _SLQRNormalizer(terminal_probe),
+        )
+        foreach(refresh!, sms)
+        return collect(1:K)
     end
 
     #=

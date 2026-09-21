@@ -358,6 +358,15 @@ function test_slds_lqr_terminal()
     p, tsteps, ntrials = 4, 30, 5
     slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p, terminal=true)
     @test all(lds.state_model.terminal for lds in slds.LDSs)
+    #=
+    On the joint objective, where the M-step is a genuine minorant and the trace
+    is therefore monotone. The conditional default divides by a variational
+    normalizer, which is a surrogate rather than a majorant and may dip; that is
+    `test_slds_lqr_terminal_conditioning`'s business.
+    =#
+    for lds in slds.LDSs
+        lds.state_model.condition_terminal = false
+    end
 
     ys = hslds_data(p, tsteps, ntrials)
     elbos = _trace(fit!(slds, ys; max_iter=10, progress=false, rng=StableRNG(7)))
@@ -374,6 +383,72 @@ function test_slds_lqr_terminal()
     xT = res.x[1][:, end]
     resid = xT[3:4] .- sm.Qc[end] * xT[1:2] .- sm.hf
     @test norm(resid) < 10 * norm(xT[3:4]) + 1e-6
+    return nothing
+end
+
+"""Terminal conditioning through the switching path.
+
+`log p(terminal = 0)` has no exact form for a switching model, so it is
+estimated by running the E-step on a zero-loading copy. `K = 1` is where that
+estimate has nothing to approximate — the discrete layer is degenerate and the
+continuous smoother is exact — so it is the case that can check the variational
+route against the closed form the non-switching model uses.
+"""
+function test_slds_lqr_terminal_conditioning()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+
+    lds = hslds_state(Qc; p=p, terminal=true)
+    slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p, terminal=true)])
+    @test SSD._slds_condition_terminal(slds)
+
+    exact = ntrials * SSD._lqr_terminal_logz(lds.state_model, zeros(0, tsteps))
+    @test terminal_logz(slds, ys) ≈ exact rtol = 1e-8
+    # And the conditional score itself agrees with the non-switching one.
+    @test elbo(slds, ys) ≈ elbo(lds, ys) atol = 1e-6
+    @test smooth(slds, ys).terminal_logz ≈ exact rtol = 1e-8
+
+    # Joint and conditional differ by exactly that normalizer.
+    joint = SSD.terminal_logz(slds, ys)
+    conditional = elbo(slds, ys)
+    for member in slds.LDSs
+        member.state_model.condition_terminal = false
+    end
+    @test !SSD._slds_condition_terminal(slds)
+    @test elbo(slds, ys) ≈ conditional + joint atol = 1e-6
+    @test terminal_logz(slds, ys) == 0
+    for member in slds.LDSs
+        member.state_model.condition_terminal = true
+    end
+
+    #=
+    The costate gauge moves the joint score by `-N n log|c|` and leaves the
+    conditional one alone. The emission here reads no costate, so nothing else
+    has to be rescaled alongside it.
+    =#
+    before = elbo(slds, ys)
+    rescale_costate!(slds.LDSs[1].state_model, 2.5)
+    @test elbo(slds, ys) ≈ before atol = 1e-6
+
+    # States carrying a terminal factor must agree on whether it is conditioned.
+    mixed = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    mixed.LDSs[2].state_model.condition_terminal = false
+    @test_throws ArgumentError SSD._slds_condition_terminal(mixed)
+
+    # K = 2 fits on the conditional objective and improves on it.
+    two = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    els = _trace(fit!(two, ys; max_iter=8, progress=false, rng=StableRNG(7)))
+    @test all(isfinite, els)
+    @test els[end] > els[1]
+    #=
+    Not `> -1e-6` as on the joint objective: subtracting a variational estimate
+    of `log Z` gives a difference of two bounds, which no argument makes a
+    majorant, so a step may lose ground. What it may not do is lose ground
+    comparable to the progress the fit makes.
+    =#
+    @test minimum(diff(els)) > -0.05 * (els[end] - els[1])
+    @test terminal_logz(two, ys) < 0
     return nothing
 end
 
@@ -818,20 +893,48 @@ function test_slds_lqr_grouped_free_state_pools()
     S = Matrix(0.15I, n, n)
     Qc = Matrix(0.20I, n, n)
     Σ = Matrix(Diagonal([0.02, 0.02, 0.02, 0.02]))
-    emission() = GaussianObservationModel(;
-        C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
-    )
+    function emission()
+        return GaussianObservationModel(;
+            C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
+        )
+    end
     function lqr_lds()
-        sm = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
-            terminal=true, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        sm = LQRStateModel(
+            copy(A),
+            copy(S),
+            [copy(Qc)],
+            copy(Σ);
+            terminal=true,
+            #=
+            What is under test here is how a `:free` state pools with an
+            inverse-LQR one, and terminal conditioning is refused for that
+            mixture — the shared initial state would be fitted from the
+            inverse-LQR regimes alone. Score the joint objective so the pooling
+            is what the test exercises.
+            =#
+            condition_terminal=false,
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         return LinearDynamicalSystem(sm, emission())
     end
     function free_lds()
-        seed = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
-            terminal=false, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        seed = LQRStateModel(
+            copy(A),
+            copy(S),
+            [copy(Qc)],
+            copy(Σ);
+            terminal=false,
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         sm = SSD.free_state_model(
-            Matrix(SSD.symplectic_matrix(seed, 1)), Matrix(seed.cache.Qfwd);
-            h=Vector(seed.cache.bfwd), x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+            Matrix(SSD.symplectic_matrix(seed, 1)),
+            Matrix(seed.cache.Qfwd);
+            h=Vector(seed.cache.bfwd),
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         return LinearDynamicalSystem(sm, emission())
     end
 
@@ -850,8 +953,14 @@ function test_slds_lqr_grouped_free_state_pools()
             end
         end
         # `max_iter = 2` is exactly one M-step: the last iteration only scores.
-        fit!(slds, y; max_iter=2, progress=false, rng=StableRNG(3),
-            tied_params=[:A, :S, :C, :R])
+        fit!(
+            slds,
+            y;
+            max_iter=2,
+            progress=false,
+            rng=StableRNG(3),
+            tied_params=[:A, :S, :C, :R],
+        )
         return slds
     end
 

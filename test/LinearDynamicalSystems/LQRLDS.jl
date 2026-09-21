@@ -31,6 +31,7 @@ function lqr_fixture(
     ux_dim::Int=0,
     observe_costate::Bool=false,
     onset::Int=1,
+    condition_terminal::Bool=true,
 )
     d = 2n
     A = n == 2 ? [0.96 0.07; -0.05 0.93] : Matrix(0.95I, n, n) + 0.02 .* randn(rng, n, n)
@@ -55,6 +56,7 @@ function lqr_fixture(
         Σ;
         schedule=sched,
         terminal=terminal,
+        condition_terminal=condition_terminal,
         Σf=Matrix(0.04I, n, n),
         hf=terminal ? randn(rng, n) .* 0.05 : nothing,
         h=randn(rng, d) .* 0.05,
@@ -122,6 +124,38 @@ function lqr_exact_marginal(lds, y; ux=nothing, uy=nothing)
         ),
     )
     return sum(ll) + 0.5 * d * tsteps * log(2π) - 0.5 * logdet(Symmetric(H))
+end
+
+"""Independent `log p(terminal = 0 | inputs)` by *forward* moment propagation.
+
+The implementation under test integrates backwards in square-root form, so this
+reference shares no code path with it: it rolls the unconditioned chain's mean
+and covariance forward to `T` and evaluates one dense Gaussian density there.
+Correct for horizons short enough that the forward covariance stays finite,
+which is the regime this reference is used in.
+"""
+function lqr_terminal_logz_reference(sm, ux, tsteps, ::Type{V}=Float64) where {V}
+    n = SSD._plant_dim(sm)
+    c = sm.cache
+    mu = Vector{V}(sm.x0)
+    P = Matrix{V}(sm.P0)
+    Q = Matrix{V}(c.Qfwd)
+    u = Matrix{V}(ux)
+    for t in 1:(tsteps - 1)
+        k = SSD._regime(sm, t)
+        b = Vector{V}(c.bfwd)
+        size(c.Bfwd[k], 2) > 0 && (b += Matrix{V}(c.Bfwd[k]) * u[:, t])
+        M = Matrix{V}(c.M[k])
+        mu = M * mu + b
+        P = M * P * transpose(M) + Q
+    end
+    kf = SSD._terminal_regime(sm, tsteps)
+    Lf = Matrix{V}(c.Lf[kf])
+    target = Vector{V}(sm.hf)
+    size(c.Ftrm[kf], 2) > 0 && (target -= Matrix{V}(c.Ftrm[kf]) * u[:, tsteps])
+    S = Symmetric(Lf * P * transpose(Lf) + Matrix{V}(sm.Σf))
+    r = target - Lf * mu
+    return -V(0.5) * (n * log(V(2) * V(pi)) + logdet(S) + dot(r, S \ r))
 end
 
 """Independent re-derivation of the structural M-step objective, generic in the
@@ -468,6 +502,167 @@ function test_lqr_rescale_costate()
     return nothing
 end
 
+"""`_lqr_terminal_logz` against an independent forward-moment reference.
+
+Also pins the relationship the whole conditional objective rests on: with
+`condition_terminal` set, the reported score is the joint score minus this
+normalizer, exactly.
+"""
+function test_lqr_terminal_normalizer()
+    rng = StableRNG(97)
+    # `cost_schedule` derives the regime count: onset > 1 adds a pre-onset epoch,
+    # and the terminal factor always adds one of its own.
+    for (nregimes, ux_dim, onset, tsteps) in
+        ((2, 0, 1, 2), (2, 0, 1, 7), (3, 2, 5, 11), (3, 3, 4, 20))
+        sm, lds = lqr_fixture(
+            rng;
+            terminal=true,
+            nregimes=nregimes,
+            tsteps=tsteps,
+            ux_dim=ux_dim,
+            onset=onset,
+            condition_terminal=false,
+        )
+        ux = ux_dim > 0 ? randn(rng, ux_dim, tsteps) : zeros(0, tsteps)
+        # A nonzero reference gain exercises the `Ftrm` term of the target.
+        if ux_dim > 0
+            sm.Gref .= randn(rng, size(sm.Gref)...) .* 0.3
+            SSD.refresh!(sm)
+        end
+        SSD._prepare_lqr!(lds, [tsteps])
+        @test SSD._lqr_terminal_logz(sm, ux) ≈ lqr_terminal_logz_reference(sm, ux, tsteps) atol =
+            1e-9
+
+        # The conditional score is the joint score minus exactly that number.
+        y = randn(rng, lds.obs_dim, tsteps) .* 0.4
+        uxarg = ux_dim > 0 ? ux : nothing
+        joint = elbo(lds, y; ux=uxarg)
+        sm.condition_terminal = true
+        @test elbo(lds, y; ux=uxarg) ≈ joint - SSD._lqr_terminal_logz(sm, ux) atol = 1e-9
+        sm.condition_terminal = false
+    end
+
+    #=
+    The reason for integrating backwards at all. A symplectic transition has
+    reciprocal eigenvalues, so the forward covariance of a long chain overflows
+    Float64 while the terminal density itself stays perfectly ordinary. The
+    reference above cannot reach this case; the implementation must.
+    =#
+    n = 1
+    sm = LQRStateModel(
+        fill(0.35, 1, 1),                 # ‖A⁻¹‖ ≫ 1: the costate block explodes
+        fill(0.05, 1, 1),
+        [fill(0.2, 1, 1)],
+        Matrix(0.03I, 2, 2);
+        terminal=true,
+        condition_terminal=false,
+        Σf=Matrix(0.04I, n, n),
+        P0=Matrix(0.25I, 2, 2),
+    )
+    SSD.refresh!(sm)
+    long = 200
+    @test maximum(abs, SSD.symplectic_matrix(sm)) > 2      # genuinely explosive
+    value = SSD._lqr_terminal_logz(sm, zeros(0, long))
+    @test isfinite(value)
+    #=
+    Float64 forward propagation of the same chain reaches ~1e182 by the endpoint
+    and its symmetric eigenvalues straddle zero there, so the dense reference
+    above cannot referee this case — `logdet` on it does not merely lose
+    precision, it reports a negative determinant.
+    =#
+    P = Matrix{Float64}(sm.P0)
+    M = symplectic_matrix(sm)
+    for _ in 2:long
+        P = M * P * transpose(M) + Matrix(sm.cache.Qfwd)
+    end
+    @test maximum(abs, P) > 1e150
+    @test minimum(eigvals(Symmetric(P))) < 0
+    # At 512 bits it does not, and it agrees with the square-root integration.
+    reference = setprecision(BigFloat, 512) do
+        return lqr_terminal_logz_reference(sm, zeros(0, long), long, BigFloat)
+    end
+    @test isfinite(reference)
+    @test value ≈ Float64(reference) rtol = 1e-9
+    return nothing
+end
+
+"""Dimension and costate gauge: what the joint score confounds and the
+conditional score does not.
+
+The joint score `log p(y, terminal = 0)` moves when the model gains a plant
+dimension the emission never reads, and moves again under the inverse-optimal-
+control rescaling that leaves the plant posterior alone. Neither is a change in
+how well the model explains `y`, which is why a dimension sweep run on that
+score is not a comparison of fits. Conditioning removes both exactly.
+"""
+function test_lqr_dimension_and_terminal_score()
+    y = reshape([0.2, -0.1, 0.3, 0.0, -0.2, 0.1], 1, :)
+    T = size(y, 2)
+    function model(n, terminal; condition=true)
+        sm = LQRStateModel(
+            Matrix(0.95I, n, n),
+            Matrix(0.05I, n, n),
+            [Matrix(0.2I, n, n)],
+            Matrix(0.03I, 2n, 2n);
+            terminal=terminal,
+            condition_terminal=condition,
+            Σf=Matrix(0.04I, n, n),
+            P0=Matrix(0.25I, 2n, 2n),
+        )
+        C = zeros(1, 2n)
+        C[1, 1] = 1.0
+        return LinearDynamicalSystem(
+            sm, GaussianObservationModel(C, fill(0.08, 1, 1), zeros(1))
+        )
+    end
+    # Without a terminal factor the unused pair already integrates out.
+    @test elbo(model(2, false), y) ≈ elbo(model(1, false), y) atol = 1e-8
+
+    # --- the joint score, which is what the dimension sweep was scored on ---
+    small = model(1, true; condition=false)
+    large = model(2, true; condition=false)
+    # Independently propagate the unobserved pair's prior to the endpoint.
+    sm = small.state_model
+    M, Q = symplectic_matrix(sm), sm.cache.Qfwd
+    P = copy(sm.P0)
+    for _ in 2:T
+        P = M * P * M' + Q
+    end
+    H = hcat(-sm.Qc[1], ones(1, 1))
+    variance = only(H * P * H' + sm.Σf)
+    terminal_logdensity = -0.5 * log(2π * variance)
+    @test elbo(large, y) - elbo(small, y) ≈ terminal_logdensity atol = 1e-8
+
+    ys = [y, y]
+    before = elbo(large, ys)
+    x_before, _ = smooth(large, ys)
+    rescale_costate!(large.state_model, 2.5)
+    @test elbo(large, ys) - before ≈ -length(ys) * 2 * log(2.5) atol = 1e-8
+    x_after, _ = smooth(large, ys)
+    @test x_after[1][1:2, :] ≈ x_before[1][1:2, :] atol = 1e-8
+
+    # --- the conditional score: both confounds vanish, to machine precision ---
+    csmall, clarge = model(1, true), model(2, true)
+    @test elbo(clarge, y) ≈ elbo(csmall, y) atol = 1e-10
+    @test elbo(clarge, ys) ≈ elbo(csmall, ys) atol = 1e-10
+
+    #=
+    `rescale_costate!` already sends `Σf → c²Σf` and `hf → c·hf`, so the whitened
+    terminal residual — and hence the conditioning event — is untouched. The
+    invariance is therefore exact, not approximate.
+    =#
+    gauged = elbo(clarge, ys)
+    rescale_costate!(clarge.state_model, 2.5)
+    @test elbo(clarge, ys) ≈ gauged atol = 1e-10
+    xg_after, _ = smooth(clarge, ys)
+    @test xg_after[1][1:2, :] ≈ x_before[1][1:2, :] atol = 1e-8
+
+    # A negative gauge is a symmetry too, and conditioning is blind to it.
+    rescale_costate!(clarge.state_model, -0.4)
+    @test elbo(clarge, ys) ≈ gauged atol = 1e-10
+    return nothing
+end
+
 # ---------------------------------------------------------------------------
 # E-step: equivalence to an explicit 2n Gaussian LDS
 # ---------------------------------------------------------------------------
@@ -620,6 +815,12 @@ function test_lqr_elbo_matches_exact_marginal()
             tsteps=tsteps,
             ux_dim=ux_dim,
             onset=onset,
+            #= The reference is the *joint* marginal `log p(y, terminal = 0)`:
+            it comes from the same Laplace/Gaussian factorization the model
+            writes down, and knows nothing of the terminal normalizer. Compare
+            against the joint score here, and against the conditional one
+            below. =#
+            condition_terminal=false,
         )
         y = randn(rng, lds.obs_dim, tsteps) .* 0.4
         ux = ux_dim > 0 ? randn(rng, ux_dim, tsteps) : nothing
@@ -633,6 +834,20 @@ function test_lqr_elbo_matches_exact_marginal()
         =#
         @test elbo(lds, y; ux=ux) ≈ exact atol = 1e-7
         @test loglikelihood(lds, y; ux=ux) ≈ exact atol = 1e-7
+
+        #=
+        And with conditioning on, the same two entry points report the exact
+        conditional marginal `log p(y | terminal = 0)` — the joint reference
+        above less a normalizer computed by forward moment propagation, which
+        shares no code with the backward square-root integration under test.
+        =#
+        terminal || continue
+        sm.condition_terminal = true
+        u = ux === nothing ? zeros(0, tsteps) : ux
+        conditional = exact - lqr_terminal_logz_reference(sm, u, tsteps)
+        @test elbo(lds, y; ux=ux) ≈ conditional atol = 1e-7
+        @test loglikelihood(lds, y; ux=ux) ≈ conditional atol = 1e-7
+        sm.condition_terminal = false
     end
     return nothing
 end
@@ -890,6 +1105,58 @@ function test_lqr_em_monotone()
         # The returned parameters are the ones scored by the final trace entry.
         @test els[end] ≈ elbo(lds, ys; ux=uxs) atol = 1e-7
     end
+    return nothing
+end
+
+"""The terminal-conditioned M-step's gradient, against central differences.
+
+Worth checking by hand because it is assembled from three pieces that cannot be
+read off one expression: `_lqr_fg!` on the data statistics, the same routine on
+the probe's terminal-conditioned prior moments (Fisher's identity for
+`∂ log Z / ∂θ`), and closed forms for the `Σ`, `Σf`, `x0` and `P0` blocks that
+the structural objective holds fixed. A sign error in any one of them still
+leaves a plausible-looking objective.
+"""
+function test_lqr_conditional_mstep_gradient()
+    rng = StableRNG(88)
+    tsteps, ux_dim = 9, 2
+    sm, lds = lqr_fixture(
+        rng;
+        terminal=true,
+        nregimes=3,
+        tsteps=tsteps,
+        ux_dim=ux_dim,
+        onset=5,
+        condition_terminal=true,
+    )
+    sm.Gref .= randn(rng, size(sm.Gref)...) .* 0.3
+    refresh!(sm)
+    ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:4]
+    # Two designs, each shared by two trials: exercises the dedup and the counts.
+    pair = [randn(rng, ux_dim, tsteps) for _ in 1:2]
+    uxs = [pair[1], pair[2], pair[1], pair[2]]
+    hs, _, _, _ = lqr_estep_stats(lds, ys; ux=uxs)
+    @test length(SSD._lqr_terminal_designs(hs)) == 2
+    @test hs.terminal_counts == [2.0, 2.0]
+
+    slots = [ones(Int, 1) for _ in 1:4]
+    problem = SSD._lqr_conditional_problem([lds], [hs], slots)
+    θ = copy(problem.theta)
+    @test !isempty(θ)
+    analytic = zeros(length(θ))
+    @test isfinite(problem.evaluate!(analytic, copy(θ)))
+
+    fd = similar(analytic)
+    for i in eachindex(θ)
+        step = 1e-6 * max(1.0, abs(θ[i]))
+        up, down = copy(θ), copy(θ)
+        up[i] += step
+        down[i] -= step
+        fd[i] =
+            (problem.evaluate!(nothing, up) - problem.evaluate!(nothing, down)) / (2 * step)
+    end
+    problem.write!(θ)          # leave the model where it started
+    @test maximum(abs, analytic .- fd) / max(1.0, maximum(abs, fd)) < 1e-7
     return nothing
 end
 
@@ -1354,9 +1621,18 @@ function test_lqr_tracking_mstep()
     @test sm.Gref != G0
     @test minimum(diff(els2)) > -1e-8
 
-    # The ELBO still matches the exact Laplace normalizer with tracking on.
-    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ lqr_exact_marginal(lds, ys[1]; ux=uxs[1]) atol =
-        1e-7
+    #=
+    The ELBO still matches the exact Laplace normalizer with tracking on — less
+    the terminal normalizer, which `Gref` also enters (through `Ftrm`, the
+    terminal residual's reference term), so this checks the tracking gain on
+    both sides of the conditional score at once.
+    =#
+    exact = lqr_exact_marginal(lds, ys[1]; ux=uxs[1])
+    logz = lqr_terminal_logz_reference(sm, uxs[1], tsteps)
+    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ exact - logz atol = 1e-7
+    sm.condition_terminal = false
+    @test elbo(lds, ys[1]; ux=uxs[1]) ≈ exact atol = 1e-7
+    sm.condition_terminal = true
     return nothing
 end
 
@@ -1399,8 +1675,15 @@ function test_lqr_gref_columns()
     @test maximum(abs, elsA .- elsB) < 1e-10
     @test smA.Gref ≈ smB.Gref
 
-    # And the restricted model is nested inside the free one.
-    @test last(els) <= last(elsB) + 1e-8
+    #=
+    And the restricted model is nested inside the free one — at the optimum.
+    After a fixed number of generalized-EM steps neither run is there (the free
+    one is still gaining ~4e-2 per iteration here), and the free problem has more
+    coordinates to move, so it can be behind on the path while being ahead at
+    convergence; by iteration 40 the sign flips on its own. Bound the violation
+    by how far from a stationary point the free run still is.
+    =#
+    @test last(els) <= last(elsB) + last(diff(elsB))
 
     # Freezing wins over narrowing, and the flags validate against the width.
     smC, ldsC, ysC, uxsC = fixture([2, 3])
@@ -2054,7 +2337,9 @@ function test_lqr_terminal_regime_pin()
     @test SSD._terminal_regime(sm, 18) == 3
     @test SSD._terminal_regime(sm, 12) == SSD._regime(sm, 12) != 3
 
-    pinned, pinned_lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11)
+    pinned, pinned_lds = lqr_fixture(
+        rng; terminal=true, nregimes=3, tsteps=tsteps, onset=11
+    )
     pinned.terminal_regime = 3
     refresh!(pinned)
     for t_n in lengths

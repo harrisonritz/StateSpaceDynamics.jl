@@ -400,6 +400,8 @@ using SSDTest
                 test_lqr_construction_errors()
                 test_lqr_refresh_and_utilities()
                 test_lqr_rescale_costate()
+                test_lqr_terminal_normalizer()
+                test_lqr_dimension_and_terminal_score()
             end
 
             @testset "Free mode" begin
@@ -427,6 +429,7 @@ using SSDTest
                 test_lqr_plant_only_inputs()
                 test_lqr_mstep_preserves_structure()
                 test_lqr_em_monotone()
+                test_lqr_conditional_mstep_gradient()
                 test_lqr_noise_update_closed_form()
                 test_lqr_recovers_parameters()
             end
@@ -489,6 +492,7 @@ using SSDTest
             test_slds_mixed_free_and_lqr()
             test_slds_lqr_tied()
             test_slds_lqr_terminal()
+            test_slds_lqr_terminal_conditioning()
             test_slds_lqr_validation()
             test_slds_lqr_prior_vs_optimal_data()
             test_slds_lqr_rand()

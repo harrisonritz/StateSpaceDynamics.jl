@@ -1084,6 +1084,7 @@ function _build_variants!(
             sm.schedule,
             sm.terminal,
             sm.terminal_regime,
+            sm.condition_terminal,
             Σs[s[4]],
             hs[struct_slot(s, _LQR_BLOCK_H)],
             Bus[struct_slot(s, _LQR_BLOCK_B)],
