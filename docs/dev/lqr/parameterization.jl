@@ -20,6 +20,11 @@ Sections (`--only=` selects a comma-separated subset):
   terminal   the Riccati Jacobian Ψ, checked against finite differences, and the
              backward decay of terminal-cost information
   reference  where a reference perturbation lands, in time and in observed rows
+  shaping    the exact equivalence class of costs: potentials on range(B)^⊥
+  subspace   the control subspace from the closed loop, and what optimality adds;
+             the inverse least squares, its invariants and its conditioning
+  sweeps     the feedforward against a direct QP solve, and the reverse-mode
+             gradient of both sweeps against central differences
   switching  γ at the generating parameters, delay-then-reach, matched to slds.jl
   fit        end-to-end recovery, swept over the initial cost scale (slow)
 
@@ -55,8 +60,8 @@ end
 """
 Running and terminal costs, both PSD with genuine off-diagonal structure so that
 an entrywise correlation is a meaningful score. The overall size is set so the
-reach lands within ~10 % of the target radius in `T` steps against `R = I` —
-below that the agent undershoots and the task is not a reach.
+agent reaches the target in `T` steps against `R = I`; well below it the agent
+undershoots and the task is not a reach.
 """
 function true_costs()
     Lrun  = 10 * [20.0 0 0 0; 3.0 18.0 0 0; 2.0 -1.0 6.0 0; -1.5 2.0 1.0 5.0]
@@ -124,7 +129,9 @@ function affine_sweep(A::Matrix{Float64}, B::Matrix{Float64}, R::Matrix{Float64}
     @inbounds for t in (T-1):-1:1
         kf[t] = -(Fs[t] \ (B' * b[t+1]))
         Acl   = A - B * K[t]
-        b[t]  = -Qs[sched[t]] * r + Acl' * (P[t+1] * B * kf[t] + b[t+1]) + K[t]' * R * kf[t]
+        # λ_t = P_t x_t + b_t; the P B k and K'R k terms cancel exactly (Φ'P B = K'R),
+        # leaving b_t = −Q_t r + Φ_tᵀ b_{t+1}. Checked against a direct QP solve.
+        b[t]  = -Qs[sched[t]] * r + Acl' * b[t+1]
     end
     return kf
 end
@@ -494,6 +501,217 @@ function section_switching()
 end
 
 # =========================================================================
+function section_shaping()
+    section("shaping — an exact equivalence class of costs")
+    st = setup(); Qs = true_costs(); A, B = st.A, st.B
+    N = nullspace(Matrix(B'))                  # basis of range(B)^⊥
+    X = [3.0e4 -1.1e4; -1.1e4 5.0e4]           # an arbitrary symmetric potential
+    M = N*X*N'
+    println("For N spanning range(B)^⊥, Nᵀ Φ_t = Nᵀ(A − B K_t) = Nᵀ A for every t: control")
+    println("cannot move the unactuated components in one step. So the potential x'Mx with")
+    println("M = N X Nᵀ can be added to the cost-to-go at every step without changing any")
+    println("decision — potential-based reward shaping, restricted to that subspace:")
+    println("    Q_term → Q_term + M,     every running Q_k → Q_k + M − AᵀMA")
+    @printf("  dimension of the class: (n − m)(n − m + 1)/2 = %d here; ‖BᵀM‖ = %.1e\n",
+            size(N, 2)*(size(N, 2) + 1) ÷ 2, norm(B'*M))
+    Qsh = [Qs[1] + M - A'*M*A, Qs[2] + M]
+    for (j, r) in enumerate(st.refs[1:3])
+        K0, P0, F0 = riccati_gain(A, B, st.R, Qs, st.sched)
+        K1, P1, F1 = riccati_gain(A, B, st.R, Qsh, st.sched)
+        k0 = affine_sweep(A, B, st.R, Qs, st.sched, K0, P0, F0, r)
+        k1 = affine_sweep(A, B, st.R, Qsh, st.sched, K1, P1, F1, r)
+        @printf("  target %d: max ‖ΔK_t‖/‖K_t‖ = %.1e, max ‖Δk_t‖/‖k_t‖ = %.1e, max ‖ΔP_t − M‖/‖M‖ = %.1e\n",
+                j, maximum(t -> norm(K1[t]-K0[t])/norm(K0[t]), 1:st.T-1),
+                maximum(t -> norm(k1[t]-k0[t])/max(norm(k0[t]), 1e-300), 1:st.T-1),
+                maximum(t -> norm(P1[t]-P0[t]-M)/norm(M), 1:st.T))
+    end
+    @printf("  (the shift is not small: ‖ΔQ_term‖/‖Q_term‖ = %.2f, ‖ΔQ_run‖/‖Q_run‖ = %.2f)\n",
+            norm(M)/norm(Qs[2]), norm(M - A'*M*A)/norm(Qs[1]))
+    println()
+    println("Gains are unchanged, so every feedback signature — trial-to-trial variability,")
+    println("responses to UNEXPECTED perturbations, max-ent control noise (which sees P only")
+    println("through BᵀPB) — is blind to it. The feedforward is unchanged for any reference")
+    println("with Nᵀ(A r − r) = 0, i.e. a target at rest. What breaks it is a reference or an")
+    println("ANTICIPATED disturbance d_t with Nᵀ(A r + d_t − r) ≠ 0:")
+    rv = [0.12, 0.0, 0.3, 0.0]                  # a target specified with a velocity
+    K0, P0, F0 = riccati_gain(A, B, st.R, Qs, st.sched)
+    K1, P1, F1 = riccati_gain(A, B, st.R, Qsh, st.sched)
+    k0 = affine_sweep(A, B, st.R, Qs, st.sched, K0, P0, F0, rv)
+    k1 = affine_sweep(A, B, st.R, Qsh, st.sched, K1, P1, F1, rv)
+    @printf("  target with velocity: ‖Nᵀ(A r − r)‖ = %.3g, max ‖Δk_t‖/‖k_t‖ = %.2e\n",
+            norm(N'*(A*rv - rv)), maximum(t -> norm(k1[t]-k0[t])/norm(k0[t]), 1:st.T-1))
+    println()
+    println("A single cost regime has no such freedom (it would need M = M − AᵀMA, so AᵀMA = 0,")
+    println("so M = 0). The class needs a terminal cost distinct from the running one — which")
+    println("is exactly the configuration in which README.md finds the terminal cost never")
+    println("recovered. That finding is this equivalence class, not a shortage of data.")
+end
+
+# =========================================================================
+function section_subspace()
+    section("subspace — what the closed loop identifies, and what optimality adds")
+    st = setup(); Qs = true_costs(); A, B, R = st.A, st.B, st.R
+    K, P, _ = riccati_gain(A, B, R, Qs, st.sched)
+    Phi = [A - B*K[t] for t in 1:(st.T-1)]
+    Dm = hcat([Phi[t] - Phi[end] for t in 1:(st.T-2)]...)
+    sv = svdvals(Dm)
+    println("Φ_t − Φ_s = −B (K_t − K_s), so the time variation of the closed loop spans range(B).")
+    println("  singular values of [Φ_t − Φ_{T−1}]_t : ", join(round.(sv, sigdigits = 3), ", "))
+    U = svd(Dm).U[:, 1:size(B, 2)]
+    @printf("  principal angles between the recovered subspace and range(B): %s rad\n",
+            join(round.(acos.(clamp.(svdvals(U'*Matrix(qr(B).Q)[:, 1:size(B, 2)]), -1, 1)), sigdigits = 2), ", "))
+    @printf("  max_t ‖(I − BB⁺)(Φ_t − A)‖ = %.1e — the unactuated part of A is read directly\n",
+            maximum(t -> norm((I - B*pinv(B))*(Phi[t] - A)), 1:(st.T-1)))
+    println("  => the NUMBER of effective control channels and their directions are identified")
+    println("     from a closed-loop fit with no optimality assumption, provided the gains vary")
+    println("     over the trial (a finite horizon, or several cost regimes).")
+    println()
+    println("What remains: A − B K_t = (A + B D) − B (K_t + D) for any constant D. Only the")
+    println("optimality structure can separate intrinsic dynamics from a constant feedback.")
+    println("Inverse-optimality least squares for Q at plant A + εBD (linear in Q):")
+    println("    R K_t = Bᵀ P_{t+1}(Q) Φ_t,    P_t = Q_t + K_tᵀ R K_t + Φ_tᵀ P_{t+1} Φ_t")
+    n = st.n; K_reg = length(Qs); nq = n*(n+1) ÷ 2
+    unvec(q) = (Qv = [zeros(n, n) for _ in 1:K_reg]; j = 1;
+                for k in 1:K_reg, c in 1:n, r in c:n; Qv[k][r, c] = q[j]; Qv[k][c, r] = q[j]; j += 1 end; Qv)
+    function resid(q, Kd, tset)
+        Qv = unvec(q); Pt = Vector{Matrix{Float64}}(undef, st.T); Pt[st.T] = Qv[st.sched[st.T]]
+        for t in (st.T-1):-1:1
+            Pt[t] = Qv[st.sched[t]] + Kd[t]'*R*Kd[t] + Phi[t]'*Pt[t+1]*Phi[t]
+        end
+        return vcat([vec(R*Kd[t] - B'*Pt[t+1]*Phi[t]) for t in tset]...)
+    end
+    function ls(Kd, tset)
+        c = resid(zeros(nq*K_reg), Kd, tset)
+        Mj = hcat([resid(Matrix{Float64}(I, nq*K_reg, nq*K_reg)[:, j], Kd, tset) - c for j in 1:nq*K_reg]...)
+        q = -(Mj \ c)
+        return norm(Mj*q + c)/norm(vcat([vec(R*Kd[t]) for t in tset]...)), Mj
+    end
+    D0 = randn(MersenneTwister(5), size(B, 2), n); D0 .*= 0.1*norm(K[1])/norm(D0)
+    for (label, tset) in (("all 29 steps (gains vary)", 1:(st.T-1)),
+                          ("t ≤ 12 only (gains near stationary)", 1:12))
+        @printf("  %-38s", label)
+        for ε in (0.0, 0.1, 1.0)
+            rr, _ = ls([K[t] + ε*D0 for t in 1:(st.T-1)], tset)
+            @printf("  ε=%-4s residual %-9.2e", ε, rr)
+        end
+        println()
+    end
+    println("  => a constant feedback offset IS rejected by optimality, but ~8x more weakly when")
+    println("     the gains are near stationary. Identify A from uncontrolled epochs if you can.")
+    _, Mg = ls(K, 1:(st.T-1))
+    scl = [norm(Mg[:, j]) for j in 1:size(Mg, 2)]
+    svn = svdvals(Mg ./ scl')
+    @printf("\n  rank of the stationarity equations in Q: %d of %d; three smallest normalized σ: %s\n",
+            count(>(1e-8), svn), nq*K_reg, join(round.(svn[end-2:end], sigdigits = 2), ", "))
+    println("  => the missing three are exactly the shaping class above: the least squares")
+    println("     recovers Q only modulo it, so it must be gauge-fixed before it can initialize.")
+    c0 = resid(zeros(nq*K_reg), K, 1:(st.T-1))
+    Qh = unvec(-(Mg \ c0))
+    inv_run(Qr, Qt) = Qr - Qt + A'*Qt*A
+    @printf("\n  raw least-squares cost: ‖Q̂_run − Q_run‖/‖Q_run‖ = %.2f, ‖Q̂_term − Q_term‖/‖Q_term‖ = %.2f\n",
+            norm(Qh[1] - Qs[1])/norm(Qs[1]), norm(Qh[2] - Qs[2])/norm(Qs[2]))
+    @printf("  shaping invariants:     ‖Bᵀ(Q̂_term − Q_term)‖/‖BᵀQ_term‖ = %.1e, ‖Q̃̂ − Q̃‖/‖Q̃‖ = %.1e\n",
+            norm(B'*(Qh[2] - Qs[2]))/norm(B'*Qs[2]),
+            norm(inv_run(Qh[1], Qh[2]) - inv_run(Qs[1], Qs[2]))/norm(inv_run(Qs[1], Qs[2])))
+    println("    (Q̃ = Q_run − Q_term + AᵀQ_term A; both are unchanged by every shaping move)")
+    println("  conditioning — relative noise on the gains vs error in the invariant Q̃:")
+    for sd in (1e-3, 1e-2, 5e-2)
+        rng = MersenneTwister(9); errs = Float64[]
+        for _ in 1:20
+            Kn = [K[t] + sd*norm(K[t])*randn(rng, size(K[t])...)/sqrt(length(K[t])) for t in 1:(st.T-1)]
+            Phin = [A - B*Kn[t] for t in 1:(st.T-1)]
+            function resn(q)
+                Qv = unvec(q); Pt = Vector{Matrix{Float64}}(undef, st.T); Pt[st.T] = Qv[st.sched[st.T]]
+                for t in (st.T-1):-1:1
+                    Pt[t] = Qv[st.sched[t]] + Kn[t]'*R*Kn[t] + Phin[t]'*Pt[t+1]*Phin[t]
+                end
+                return vcat([vec(R*Kn[t] - B'*Pt[t+1]*Phin[t]) for t in 1:(st.T-1)]...)
+            end
+            cn = resn(zeros(nq*K_reg))
+            Mn = hcat([resn(Matrix{Float64}(I, nq*K_reg, nq*K_reg)[:, j]) - cn for j in 1:nq*K_reg]...)
+            Qn = unvec(-(Mn \ cn))
+            push!(errs, norm(inv_run(Qn[1], Qn[2]) - inv_run(Qs[1], Qs[2]))/norm(inv_run(Qs[1], Qs[2])))
+        end
+        @printf("    gain noise %.0e  →  median invariant error %.3g\n", sd, sort(errs)[10])
+    end
+    println("  => an initializer that needs a precise structure fit, not an estimator.")
+end
+
+# =========================================================================
+function section_sweeps()
+    section("sweeps — the feedforward against a QP, and the reverse-mode gradient")
+    st = setup(); Qs = true_costs(); A, B, R = st.A, st.B, st.R
+    r = st.refs[1]; n, m, T = st.n, st.m, st.T
+    K, P, Fs = riccati_gain(A, B, R, Qs, st.sched); k = affine_sweep(A, B, R, Qs, st.sched, K, P, Fs, r)
+    cost(X, U) = sum(0.5*(X[:, t] - r)'*Qs[st.sched[t]]*(X[:, t] - r) + 0.5*U[:, t]'*R*U[:, t] for t in 1:(T-1)) +
+                 0.5*(X[:, T] - r)'*Qs[st.sched[T]]*(X[:, T] - r)
+    X = zeros(n, T); U = zeros(m, T-1)
+    for t in 1:(T-1); U[:, t] = -K[t]*X[:, t] + k[t]; X[:, t+1] = A*X[:, t] + B*U[:, t]; end
+    # direct QP over the open-loop controls from x₁ = 0 (noiseless ⇒ the same optimum)
+    Gx = [zeros(n, m*(T-1)) for _ in 1:T]
+    for t in 2:T; Gx[t] = A*Gx[t-1]; Gx[t][:, (t-2)*m+1:(t-1)*m] += B; end
+    H = kron(Matrix{Float64}(I, T-1, T-1), R); g = zeros(m*(T-1))
+    for t in 1:T; Q = Qs[st.sched[t]]; H += Gx[t]'*Q*Gx[t]; g += Gx[t]'*Q*(-r); end
+    uq = -(Symmetric(H) \ g); Xq = hcat([Gx[t]*uq for t in 1:T]...)
+    @printf("  sweep: cost %.6g, |x_T − r| = %.3g    QP: cost %.6g, |x_T − r| = %.3g\n",
+            cost(X, U), norm(X[1:2, end] - r[1:2]), cost(Xq, reshape(uq, m, T-1)), norm(Xq[1:2, end] - r[1:2]))
+    println("  (the recursion b_t = −Q_t r + Φ_tᵀ b_{t+1} is the QP optimum; an earlier version")
+    println("   of this script carried a spurious 2KᵀRk term and cost 16 % more)")
+
+    # reverse-mode gradient of both sweeps, on a random problem with three regimes
+    rng = MersenneTwister(4); n2, m2, T2 = 4, 2, 12
+    A2 = I + 0.1*randn(rng, n2, n2); B2 = randn(rng, n2, m2)
+    R2 = Matrix(Symmetric(I + 0.2*(x = randn(rng, m2, m2); x*x')))
+    Q2 = [(L = randn(rng, n2, n2); Matrix(Symmetric(L*L'))) for _ in 1:3]
+    sc2 = vcat(fill(1, 6), fill(2, T2 - 7), 3); r2 = randn(rng, n2)
+    W = [randn(rng, n2, n2) for _ in 1:(T2-1)]; w = [randn(rng, m2) for _ in 1:(T2-1)]
+    V = randn(rng, n2, n2); v = randn(rng, n2)
+    function fwd(Aq, Bq, Rq, Qq, rq)
+        Kq, Pq, Fq = riccati_gain(Aq, Bq, Rq, Qq, sc2)
+        bq = Vector{Vector{Float64}}(undef, T2); bq[T2] = -Qq[sc2[T2]]*rq
+        for t in (T2-1):-1:1; bq[t] = -Qq[sc2[t]]*rq + (Aq - Bq*Kq[t])'*bq[t+1]; end
+        kq = affine_sweep(Aq, Bq, Rq, Qq, sc2, Kq, Pq, Fq, rq)
+        return (; K = Kq, P = Pq, G = [Matrix(Fq[t]) for t in 1:(T2-1)], b = bq, k = kq,
+                Phi = [Aq - Bq*Kq[t] for t in 1:(T2-1)])
+    end
+    loss(f) = sum(dot(W[t], f.Phi[t]) + dot(w[t], f.k[t]) for t in 1:(T2-1)) + dot(V, f.P[1]) + dot(v, f.b[1])
+    symm(X) = (X + X')/2
+    f = fwd(A2, B2, R2, Q2, r2)
+    Ab = zeros(n2, n2); Bb = zeros(n2, m2); Rb = zeros(m2, m2); Qb = [zeros(n2, n2) for _ in 1:3]; rb = zeros(n2)
+    Pb = [zeros(n2, n2) for _ in 1:T2]; bb = [zeros(n2) for _ in 1:T2]; Pb[1] = symm(V); bb[1] = copy(v)
+    for t in 1:(T2-1)
+        P1 = f.P[t+1]; Ph = f.Phi[t]; Kt = f.K[t]; G = f.G[t]; kq = sc2[t]
+        Qb[kq] .-= symm(bb[t]*r2'); rb .-= Q2[kq]*bb[t]
+        Phib = W[t] + f.b[t+1]*bb[t]'; bb[t+1] .+= Ph*bb[t]
+        z = G \ w[t]; bb[t+1] .-= B2*z; Bb .-= f.b[t+1]*z'; Gb = -symm(z*f.k[t]')
+        Qb[kq] .+= Pb[t]; Rb .+= Kt*Pb[t]*Kt'
+        Ab .+= 2*P1*Ph*Pb[t]; Bb .-= 2*P1*Ph*Pb[t]*Kt'; Pb[t+1] .+= Ph*Pb[t]*Ph'
+        Ab .+= Phib; Bb .-= Phib*Kt'; Z = G \ (-B2'*Phib)
+        Bb .+= P1*Ph*Z' - P1*B2*Z*Kt'; Pb[t+1] .+= symm(B2*Z*Ph'); Ab .+= P1*B2*Z; Rb .-= symm(Z*Kt')
+        Rb .+= Gb; Bb .+= 2*P1*B2*Gb; Pb[t+1] .+= B2*Gb*B2'
+    end
+    kT = sc2[T2]; Qb[kT] .+= Pb[T2]; Qb[kT] .-= symm(bb[T2]*r2'); rb .-= Q2[kT]*bb[T2]
+    h = 1e-6
+    fd(pert) = (loss(pert(h)) - loss(pert(-h)))/(2h)
+    worst(G, pert) = maximum(i -> abs(fd(s_ -> pert(i, s_)) - G[i])/max(1.0, abs(fd(s_ -> pert(i, s_)))),
+                             CartesianIndices(G))
+    symworst(G, M, mk) = maximum(filter(i -> i[1] <= i[2], collect(CartesianIndices(G)))) do i
+        j = CartesianIndex(i[2], i[1]); ga = j == i ? G[i] : G[i] + G[j]
+        d = fd(s_ -> (Mp = copy(M); Mp[i] += s_; j != i && (Mp[j] += s_); mk(Mp)))
+        abs(d - ga)/max(1.0, abs(d))
+    end
+    println("\n  reverse-mode gradient vs central differences (n=4, m=2, T=12, three regimes):")
+    @printf("    A %.1e   B %.1e   R %.1e", worst(Ab, (i, s_) -> (Ap = copy(A2); Ap[i] += s_; fwd(Ap, B2, R2, Q2, r2))),
+            worst(Bb, (i, s_) -> (Bp = copy(B2); Bp[i] += s_; fwd(A2, Bp, R2, Q2, r2))),
+            symworst(symm(Rb), R2, Rp -> fwd(A2, B2, Rp, Q2, r2)))
+    for q in 1:3
+        @printf("   Q[%d] %.1e", q, symworst(symm(Qb[q]), Q2[q], Qp -> (Qv = copy(Q2); Qv[q] = Qp; fwd(A2, B2, R2, Qv, r2))))
+    end
+    @printf("   r %.1e\n", worst(rb, (i, s_) -> (rp = copy(r2); rp[i] += s_; fwd(A2, B2, R2, Q2, rp))))
+    println("  => the M-step gradient needs no AD and no implicit solve.")
+end
+
+# =========================================================================
 # fit: end-to-end recovery, swept over the initial cost scale
 # =========================================================================
 ntri(n) = n*(n+1) ÷ 2
@@ -599,34 +817,29 @@ function section_fit()
         flush(stdout)
     end
     println()
-    println("Read three things here, in order of importance.")
-    println(" 1. The warm start at the truth STAYS there: nll moves by 9e-4/step and every")
-    println("    block holds. The closed-loop likelihood is correctly specified for this")
-    println("    agent, so the truth is (to sampling noise) a stationary point. README.md")
-    println("    reports the opposite for the mixed-coordinate fit — a warm start at the")
-    println("    truth ends at Qc 0.394, and the ELBO ranks the cold start best.")
-    println(" 2. A start near the right scale recovers the cost AND the reference at once")
-    println("    (Gref 0.025/1.00), under a position-only emission that never sees velocity.")
-    println("    There is no reference/cost trade to make.")
-    println(" 3. A start far from the right scale FAILS, and that is an optimizer problem,")
-    println("    not an identification one (§profile shows the scale has real curvature).")
-    println("    Q_k and Gref enter the feedforward only through the product Q_k Gref, so a")
-    println("    badly scaled cost can be traded against a badly scaled reference along a")
-    println("    long valley. Initialize from an estimated closed loop (family C), or")
-    println("    separate the cost's scale from its shape in the parameterization.")
-    println(" 4. The likelihood RANKS the fits correctly: order the rows by nll and by")
-    println("    closed-loop error and you get the same permutation (rank correlation 1.00")
-    println("    over five fits). README.md recommendation #7 — do not use a likelihood to")
-    println("    choose among fits — is sound advice about a misspecified model, not a fact")
-    println("    about inverse control. Once the generating process is in the class, the")
-    println("    likelihood recovers its ordinary job and restarts are worth paying for.")
-    println("Q_term is ~1.0 in the cold-start rows, as §terminal predicts, and its")
-    println("correlation never exceeds 0.68 — unrecovered, not merely mis-scaled.")
+    println("Four readings.")
+    println(" 1. The warm start at the truth STAYS there: the objective moves by ~1e-3 per")
+    println("    step and every block holds, so the truth is a stationary point. README.md")
+    println("    reports the opposite for the mixed-coordinate fit (Qc 0.394 from the truth).")
+    println(" 2. Every cold start recovers the reference and the cost's SHAPE (correlation")
+    println("    0.93-0.98), under an emission that never sees velocity.")
+    println(" 3. The cost's SCALE is set by the start: far starts end tens of times too")
+    println("    large, because over-scaling costs almost no likelihood (--only=profile).")
+    println("    Take the scale from a prior or from behavioural variability, or report only")
+    println("    scale-free quantities.")
+    println(" 4. The likelihood separates the converged (warm) fit from every cold start by")
+    println("    100+ nats, but does NOT rank the unconverged cold starts by accuracy: they")
+    println("    are unconverged along the shallow direction, not alternative optima.")
+    println("Q_term stays near 1.0 from cold starts and holds only at the warm start, where")
+    println("it simply does not move: its unactuated block is the flat shaping class")
+    println("(--only=shaping).")
 end
 
 for (name, f) in (("geometry", section_geometry), ("gauge", section_gauge),
                   ("profile", section_profile), ("terminal", section_terminal),
-                  ("reference", section_reference), ("switching", section_switching),
+                  ("reference", section_reference), ("shaping", section_shaping),
+                  ("subspace", section_subspace), ("sweeps", section_sweeps),
+                  ("switching", section_switching),
                   ("fit", section_fit))
     want(name) && f()
 end

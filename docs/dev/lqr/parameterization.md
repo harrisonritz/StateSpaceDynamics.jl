@@ -57,27 +57,27 @@ harness's own failures:
 
 | harness finding | closed-loop parameterization |
 |---|---|
-| "the cost scale cannot be cross-validated" (held-out score monotone in `q0`) | exact marginal likelihood has a sharp interior maximum at the true scale |
-| `Gref` 1.04 / corr 0.01 in the best cost-recovering procedure | reference perturbations spread over 15.6 of 30 timesteps, 36 % in observed coordinates |
+| "the cost scale cannot be cross-validated" (held-out score monotone in `q0`) | with `R` pinned the exact likelihood has an interior maximum at the true scale — but a shallow one, roughly ×0.65 to ×1.9 at 95 % even with everything else known |
+| `Gref` 1.04 / corr 0.01 in the best cost-recovering procedure | reference perturbations spread over 15.1 of 30 timesteps, 38 % in observed coordinates |
 | γ at truth is a function of `Σ_λλ` (0.52 → 0.83), and γ and the cost want opposite values | no `Σ_λλ` exists; γ at truth 0.875, onset error 3.7 steps, no trade-off |
 | "a warm start *at the truth* ends at `Qc` 0.394" — EM walks away from the generating parameters | the truth is a stationary point: 400 L-BFGS iterations move the objective by 9e-4/step and every block holds |
-| "do not use a likelihood to choose among fits"; four restarts change nothing | the likelihood ranks five fits in exactly closed-loop-error order (rank correlation 1.00), so restarts are worth paying for |
-| terminal cost never recovered (rel. err ≈ 1.00) | **also not recovered** — this one is a property of the problem, not the estimator |
+| "do not use a likelihood to choose among fits"; four restarts change nothing | the likelihood separates the converged fit from every cold start by 115–290 nats, but does not rank unconverged fits by accuracy — the advice stands in practice |
+| terminal cost never recovered (rel. err ≈ 1.00) | **also not recovered**, and now explained: an exact shaping equivalence on the unactuated subspace (§2.4), a property of the control problem under any parameterization |
 | `rand` diverges; sampling needs a dense `(dT)²` solve | forward chain contracts in the cost-to-go metric; sampling is `O(T n²)` |
 | latent dimension `2n` (24 for the smoulder plant), plus an exact terminal-normalizer sweep | latent dimension `n` (12), no normalizer — smoother blocks shrink `(2n)³/n³ = 8×`, against one added `O(Tn³)` Riccati sweep per parameter update |
 
 The price is a non-convex M-step, and it is a real price. It is a *cheap*
 non-convex step — the Riccati Jacobian is closed form (§3.1), so a gradient
-costs one extra backward sweep and no implicit solve — but §2.5 shows the
-40-line reference implementation here falling into a `Q·Gref` valley when it is
-started far from the right cost scale. That is an optimizer problem rather than
-an identification one (§2.1 shows the curvature is there), and the remedy is a
-data-driven initializer, which is what family **C** is for. Given that the
-harness already reports that restarts change nothing, that the ELBO misranks
-fits, and that EM walks away from the truth, trading an exactly-solved step in
-the wrong objective for an approximately-solved step in the right one is still
-the correct direction — but it moves the difficulty into initialization rather
-than removing it.
+costs one extra backward sweep and no implicit solve — but §2.5 shows cold
+starts drifting along the shallow scale direction of §2.1 and ending 65–78× off,
+with the closed loop 6–10 % wrong, while a warm start holds to 1 %. The objective
+is right and hard to optimize from a bad start. The remedy is a data-driven
+initializer (family **C**, and `implementation-plan.md` §6) together with a
+scale that comes from a prior or from behavioural variability. Given that the
+harness already reports that EM walks away from the truth, trading an
+exactly-solved step in the wrong objective for an approximately-solved step in
+the right one is still the correct direction — but it moves the difficulty into
+initialization rather than removing it.
 
 ---
 
@@ -175,7 +175,7 @@ and an emission that reads **position only** — so velocity is unobserved, whic
 is a strictly harder observation model than the `C = [I 0]` the harness uses by
 default.
 
-### 2.1 The cost scale is a gauge orbit, not a hard estimation problem
+### 2.1 The cost scale: an exact gauge when `S` is free, a shallow one when it is not
 
 `rescale_costate!`'s docstring states the invariance exactly:
 `(λ, S, Q, h, Σ, Σf, hf) → (cλ, c⁻¹S, cQ, …)` leaves the conditional score
@@ -188,59 +188,83 @@ default.
 ```
 
 So whenever `S` and `Σ` are both in the fit, the cost scale is an **exact flat
-direction of the objective being maximized**. The harness's `q0` table is not
-measuring a weakly identified parameter; it is reporting where on a gauge orbit
-the optimizer happened to stop, which is why held-out likelihood cannot select
-it and cross-validation "does not work". *No amount of data ever will.*
+direction of the objective being maximized**. On rows where `S` is fitted, the
+harness's `q0` table is reporting where on a gauge orbit the optimizer happened
+to stop, which is why held-out likelihood cannot select it. *No amount of data
+will.*
 
-Pin the gauge — hold `R` fixed (equivalently `tr S`) — and the same scale
-direction is not flat at all:
+Pin the gauge — hold `R` fixed (equivalently `tr S`) — and the direction is no
+longer exactly flat:
 
 ```
 === The cost-scale direction:  Q -> cQ,  with R = I held fixed ===
 c       d|K_1|/|K_1|    rho(A-BK_1)   d mean path (rel)  endpoint |x_T - r|
-0.25    0.1719          0.8505        0.2399             0.03005
-0.5     0.0719          0.8509        0.1269             0.02016
-1.0     0.0             0.8511        0.0                0.01235
-2.0     0.0455          0.8512        0.1071             0.0071
-4.0     0.0716          0.8512        0.1794             0.00398
+0.25    0.1719          0.8505        0.0669             0.00043
+0.5     0.0719          0.8509        0.0271             0.00042
+1.0     0.0             0.8511        0.0                0.00041
+2.0     0.0455          0.8512        0.0167             0.00041
+4.0     0.0716          0.8512        0.0261             0.00041
 ```
 
-Two things to read here. First, the scale moves the *mean trajectory* by 10–24 %
-over a 16-fold range while barely moving `ρ(A − BK)` at all (0.8505 → 0.8512) —
-so the closed-loop summary the harness (rightly) prefers for its scale
-invariance is precisely the statistic that cannot see the scale. Second, the
-information is real. Profiling the **exact** marginal likelihood along the
-scale ray, everything else held at the truth, 400 trials of `T = 30` observed
-in position only:
+The gains move by 5–17 % over a 16-fold range. **The observable mean barely
+does**: 3–7 %, and the endpoint not at all — an optimal controller with a strong
+terminal cost reaches the target whatever the cost's overall size, and what the
+scale changes is only the shape of the transient. The closed-loop spectral
+radius moves in the fourth digit, so the summary the harness (rightly) prefers
+for its scale invariance is also the one that cannot see the scale. Profiling the
+**exact** marginal likelihood along the ray, everything else held at the truth,
+400 trials of `T = 30` observed in position only:
 
 ```
 c         loglik/step    deficit vs c=1
-0.0625    6.081383       -0.723916
-0.25      6.580309       -0.224990
-0.71      6.794283       -0.011016
+0.0625    6.772054       -0.033245
+0.25      6.801343       -0.003955
+0.5       6.804665       -0.000634
+0.71      6.805172       -0.000127
 1.00      6.805299        0.000000   <- argmax
-1.41      6.795331       -0.009967
-4.00      6.717553       -0.087746
-16.0      6.646036       -0.159263
+1.41      6.805241       -0.000058
+2.0       6.805103       -0.000196
+4.0       6.804808       -0.000491
+16.0      6.804475       -0.000824
 ```
 
-An interior maximum at the true scale, with a deficit of 0.72 nats per timestep
-at `c = 1/16` — thousands of nats over the 12,000 timesteps of the dataset.
-**The cost scale is strongly identified. It was never a data problem.**
+An interior maximum exactly at the true scale — so pinning `R` does convert an
+exact gauge into an identified parameter. But a **shallow** one. Over the 12,000
+timesteps of this dataset, halving the cost costs 7.6 nats and doubling it only
+2.4; the 95 % profile interval is roughly `c ∈ (0.65, 1.9)`, and that is with
+every other parameter known. Over-scaling is especially cheap — a 16-fold
+over-scale costs 10 nats — because the closed loop saturates as the cost grows.
+
+> **Correction.** An earlier version of this section reported a deficit of
+> 0.72 nats per step at `c = 1/16` and concluded that "the cost scale is strongly
+> identified; it was never a data problem". That came from a sign error in the
+> feedforward sweep of `parameterization.jl` (the affine recursion carried a
+> spurious `2KᵀRk` term), which made the endpoint error depend on the cost scale
+> and so manufactured most of the curvature. The package's own
+> `lqr_riccati_sequence` was never affected. With the sweep corrected and checked
+> against a direct QP solve, the right conclusion is weaker: **the scale is
+> identified in principle and poorly in practice**, which is much closer to what
+> `README.md` observed than this section first claimed. §2.5 shows the practical
+> consequence.
+
+Two things follow. First, on rows where `S` is fitted the scale is a pure gauge
+and must be fixed by convention; pinning `R` is the right convention. Second,
+even with `R` pinned, the scale should come from somewhere other than the
+feedback structure when it matters: a `Qc_prior`, the max-ent tie to behavioural
+variability (§3.2), or a design whose references move the transient enough to
+constrain it — and when none is available, **report only scale-invariant
+quantities**.
 
 Why does the scale drift even on `README.md`'s *known-plant* rows, where `S` is
-frozen and the gauge is formally closed? Because with `S` fixed the Riccati
-equation `P = Q + AᵀP(I + SP)⁻¹A` is **not** homogeneous in `Q`, so the
-homogeneous rescaling `(λ, Q) → (cλ, cQ)` no longer lands on a solution — it
-leaves a residual in `E`'s *first* row, `x_{t+1} − A x_t + S λ_{t+1}`. That
-residual is penalized by `Σ_xx⁻¹`, and `Σ_xx` is free — so a scale error can be
-absorbed into inflated state process noise instead of showing up in the cost.
-That is a mechanism rather than a measurement, but it is consistent with the
-harness's own numbers: `README.md` reports `Σ` recovered at **4.42** relative
-error without a prior, 1.55 with one. In the closed-loop parameterization there is no
-free `λ` path to rescale, so a scale error has nowhere to go but into `K_t` and
-the observed mean.
+frozen and the gauge is formally closed? Partly for the reason above — the
+curvature is small. And partly because with `S` fixed the Riccati equation
+`P = Q + AᵀP(I + SP)⁻¹A` is not homogeneous in `Q`, so the rescaling
+`(λ, Q) → (cλ, cQ)` leaves a residual in `E`'s first row,
+`x_{t+1} − A x_t + S λ_{t+1}`, which is penalized by `Σ_xx⁻¹` — and `Σ_xx` is
+free, so a scale error can be absorbed into inflated state process noise. That
+is a mechanism rather than a measurement, but it is consistent with `README.md`
+reporting `Σ` recovered at **4.42** relative error without a prior and 1.55 with
+one.
 
 ### 2.2 The reference lives in the wrong coordinate
 
@@ -260,8 +284,8 @@ which shifts the state mean directly. Perturbing one target by 10 %:
 === Where the REFERENCE leaves its fingerprint (one target -> 1.1 x) ===
    t:            1      4      7     10     13     16     19     22     25     28
    rel d:      0.0    0.1    0.1    0.1    0.1    0.1    0.1    0.1    0.1    0.1
-   participation ratio: 15.6 of 30
-   share of the perturbation in the OBSERVED (position) rows: 36.1 %
+   participation ratio: 15.1 of 30
+   share of the perturbation in the OBSERVED (position) rows: 38.1 %
 ```
 
 A 10 % change in the reference moves the trajectory by 10 % at essentially every
@@ -311,125 +335,136 @@ not by decay rate.
 
 ### 2.4 What does **not** improve: the terminal cost
 
-I expected the closed loop to fix this, on the reasoning that `Q_T` propagates
-backward through the whole Riccati sweep rather than entering one factor at one
-timestep. **That reasoning is wrong, and the measurement says so.** Perturbing
-`Q_term` by 20 % and tracking the mean state:
+`README.md` finds that "`Qc term` reads ~1.00 in every condition". An earlier
+version of this section attributed that to information decay — the terminal cost
+being forgotten backwards through a contracting Riccati sweep — and recommended
+design fixes. **Most of that was wrong.** The dominant cause is an exact
+equivalence class of costs, and no design of the kind first recommended touches
+it.
+
+**Potential-based shaping on the unactuated subspace.** Let `N` span
+`range(B)^⊥`. Because `NᵀB = 0`, `NᵀΦ_t = Nᵀ(A − BK_t) = NᵀA` for every `t`:
+control cannot move the unactuated components in one step. So for any symmetric
+`X`, with `M = N X Nᵀ`,
+
+```math
+Q_{\text{term}} \;\to\; Q_{\text{term}} + M,
+\qquad
+Q_k \;\to\; Q_k + M - A^\top M A \quad\text{for every running regime } k
+```
+
+shifts every cost-to-go by exactly `P_t → P_t + M`, which `Bᵀ` annihilates — so
+no gain changes, and for any reference at rest (`Nᵀ(Ar − r) = 0`) no feedforward
+changes either. It is the LQ instance of potential-based reward shaping, confined
+to the subspace where a quadratic potential stays inside the model family.
+Verified by construction (`--only=shaping`):
+
+```
+target 1: max ‖ΔK_t‖/‖K_t‖ = 4.3e-16, max ‖Δk_t‖/‖k_t‖ = 1.1e-15, max ‖ΔP_t − M‖/‖M‖ = 1.4e-15
+(the shift is not small: ‖ΔQ_term‖/‖Q_term‖ = 0.03, ‖ΔQ_run‖/‖Q_run‖ = 0.08)
+```
+
+and independently by rank (`--only=subspace`): the stationarity equations that
+determine `Q` from the gains have rank 17 of 20, with three normalized singular
+values at `1e-11` against a gap to `1e-3` — the same three at `T = 6`, `10` and
+`30`, so it is not decay. The missing three are this class, of dimension
+`(n − m)(n − m + 1)/2`. For this plant that is the terminal **position** block —
+the endpoint-accuracy term, the one a reaching study most wants.
+
+What that means for the design fixes first proposed here:
+
+* **Observing velocity does not help** — the equivalence leaves the whole
+  trajectory distribution unchanged, so no emission can see it.
+* **Shortening the horizon does not help** — the class exists at every `T`.
+* **Unexpected perturbations do not help** — they probe the feedback gains,
+  which are invariant.
+* **What breaks it** is a reference, or an *anticipated* disturbance `d_t`, with
+  `Nᵀ(A r + d_t − r) ≠ 0` — a target specified with a velocity changes the
+  feedforward by 8.8 % under the same shaping. So does a design with a single
+  cost regime: the class needs a terminal cost distinct from the running one.
+
+Everything outside the class is weakly identified for the reason the earlier
+version gave. Perturbing `Q_term` by 20 %, the part that survives lands on the
+mean state thinly (relative change ≤ 0.0013) but not only at the end:
 
 ```
    t:            1      4      7     10     13     16     19     22     25     28
-   rel d:      0.0 0.0001 0.0001 0.0002 0.0003 0.0004 0.0004 0.0005 0.0037 0.0684
-   share of the squared perturbation at t = T alone: 0.11 %
-   participation ratio: 1.23 of 30 timesteps
+   rel d:      0.0    0.0    0.0 0.0001 0.0001 0.0002 0.0003 0.0005 0.0008 0.0013
+   participation ratio 7.39 of 30;  share in observed rows 10.5 %
 ```
 
-Participation ratio 1.23 against the mixed-coordinate model's 1.00 — a marginal
-improvement, not a fix. And the fingerprint lands in the wrong coordinates:
-only **0.1–2.9 %** of it falls in the observed position rows, the rest in
-endpoint velocity, which a position-only emission never sees.
+and more of the trial carries it when the running cost is weaker (participation
+ratio 19.3 at `Q_run = 0`, 6.5 at `10 × Q_run`). Information about `Q_s` still
+reaches `P_t` only through the contracting product `Ψ_{t,s} = Φ_{s−1}⋯Φ_t`
+(§3.1), whose squared norm falls five orders of magnitude over 28 steps.
 
-The reason is the exact Riccati Jacobian (§3.1): information about `Q_s` reaches
-`P_t` through `Ψ_{t,s} = Φ_{s-1}⋯Φ_t`, and `Φ` is a contraction. Measured:
+So: **report the terminal cost only through shaping invariants** —
+`Bᵀ Q_term` and `Q̃_k = Q_k − Q_term + Aᵀ Q_term A`, both unchanged by the class
+(§3.4 shows the least squares recovers them to `1e-11` at the truth) — and treat
+the unactuated block as a convention unless the design includes a reference or
+a predictable disturbance that the passive dynamics cannot follow. This holds for
+the Hamiltonian parameterization too, since the class is a property of the
+control problem rather than of any model of it.
 
-```
-t     ||Psi_{t,T}||^2   relative to t = T-1
-29    3.71              1.0
-24    0.12              0.0323
-15    0.00521           0.00141
-1     6.36e-5           1.71e-5
-```
-
-Five orders of magnitude over 28 steps. A terminal cost is **forgotten backwards
-at the closed-loop rate**, and how far back it is felt depends on the
-running/terminal balance rather than on the estimator:
-
-```
-Q_run scale   participation ratio   share in observed rows
-0.0           2.57                  2.7 %
-0.1           1.56                  0.1 %
-1.0           1.23                  0.1 %
-10.0          1.30                  2.9 %
-```
-
-So `README.md`'s "`Qc term` reads ~1.00 in every condition" is not a defect of
-the Hamiltonian parameterization. It is a property of the control problem, and
-the remedies are experimental rather than statistical: observe the endpoint
-velocity, shorten the horizon toward the closed-loop time constant, or vary `T`
-across trials so that the Riccati transient is sampled at different phases.
-Reporting the terminal cost as unidentified, as the harness already does, is
-the right call under any parameterization.
-
-### 2.5 End to end: the objective is right, the optimizer needs a starting point
+### 2.5 End to end: the objective is right; the scale is set by the start
 
 Fitting all 39 parameters — two cost matrices, eight reference vectors, three
 noise scalars, plant known — by direct gradient ascent on the **exact** marginal
 likelihood. 400 trials of `T = 30`, position only, 400 L-BFGS iterations.
-Truth sits at `nll/step = -6.805299`.
+The truth sits at `nll/step = −6.805299`.
 
 | start | `Qrun` rmse/corr | `Qterm` rmse/corr | scale err | `Gref` rmse/corr | closed-loop | nll/step |
 |---|---|---|---|---|---|---|
-| `q0` = 0.05 | 2.09 / −0.185 | 0.977 / 0.955 | 0.799 | 748 / 0.997 | 0.9346 | −6.6887 |
-| `q0` = 1.0 | 1.19e12 / 0.930 | 3.01e8 / −0.058 | 1.34e12 | 0.185 / 0.992 | 0.3621 | −6.7202 |
-| `q0` = 100 | **0.229 / 0.972** | 0.992 / 0.673 | **0.133** | **0.025 / 1.000** | **0.0276** | −6.7870 |
-| `q0` = 10 000 | 72.7 / 0.975 | 0.681 / 0.671 | 72.5 | 0.137 / 1.000 | 0.0997 | −6.7844 |
-| warm start at the truth | 0.00377 / 1.000 | 4.13e-5 / 1.000 | 3.4e-5 | 0.0104 / 1.000 | 0.0111 | **−6.8062** |
+| `q0` = 0.05 | 68.7 / 0.934 | 1.00 / −0.109 | 68.8 | 0.0393 / 1.000 | 0.0641 | −6.7818 |
+| `q0` = 1.0 | 77.5 / 0.976 | 1.00 / −0.194 | 77.5 | 0.0156 / 1.000 | 0.0754 | −6.7966 |
+| `q0` = 100 | **0.333 / 0.979** | 0.992 / 0.668 | **0.289** | 0.0157 / 1.000 | 0.0648 | −6.7908 |
+| `q0` = 10 000 | 64.7 / 0.980 | 0.685 / 0.663 | 65.5 | 0.0164 / 1.000 | 0.0964 | −6.7954 |
+| warm start at the truth | 0.00374 / 1.000 | 9.2e-5 / 1.000 | 0.0027 | 0.0093 / 1.000 | 0.0089 | **−6.8062** |
 
 (The truth's `tr Qrun` is 8.1e4, and `q0` enters through a Cholesky diagonal, so
 `q0 ≈ 200` is the start that matches the truth's scale.)
 
+> **Correction.** An earlier version of this table came from runs with the
+> feedforward sign error described in §2.1. It showed the reference landing
+> 748× too large from a cold start — a "`Q · Gref` valley" — and read the
+> likelihood as ranking all five fits in exactly their order of accuracy. Both
+> were artefacts. The corrected readings follow.
+
 **1. The warm start at the truth stays there.** 400 iterations move the objective
-by 9e-4 per step and every block holds: `Qrun` 0.0038, `Gref` 0.0104, closed loop
-0.0111, scale error below 5e-5. That is what correct specification looks like —
-the generating parameters are, to sampling noise, a stationary point of the
-likelihood. `README.md` reports the opposite for the mixed-coordinate fit: "a
-warm start *at the truth* ends at `Qc` 0.394: EM walks away from the generating
-parameters", and "the ELBO ranks the cold start best every time".
+by `9e-4` per step and every block holds. The generating parameters are, to
+sampling noise, a stationary point — the opposite of `README.md`'s finding that a
+warm start at the truth walks to `Qc` 0.394. As before, `Qterm` holding at
+`9e-5` shows only that it did not move: §2.4's shaping class is exactly flat.
 
-One caveat on reading that row: `Qterm` and the scale showing `<5e-5` means they
-*did not move*, not that they were *found*. For a block with almost no gradient —
-and §2.4 says the terminal cost is such a block — staying put is uninformative. A
-warm start demonstrates stationarity, not identifiability; §2.1's profile is what
-demonstrates identifiability, and it does so only for the scale.
+**2. Every cold start recovers the reference and the cost's shape.** `Gref` to
+0.016–0.039 at correlation 1.00, and `Qrun` at correlation 0.93–0.98, from starts
+spanning five orders of magnitude, under an emission that never sees velocity.
+The reference/cost trade-off of the mixed-coordinate model does not appear.
 
-**2. A start near the right scale recovers the cost and the reference together.**
-`Qrun` 0.229 / corr 0.972 and `Gref` 0.025 / corr **1.000**, simultaneously,
-under an emission that never sees velocity. Compare the gold-standard table in
-`README.md`, whose best cost procedure reads `Gref` 1.041 / corr **0.01** and
-whose best `Gref` procedure reads `Qc` 1.000 / corr 0.50. The mixed-coordinate
-model has to choose; this one does not. Its `Qrun` (0.229) is worse than the
-harness's best (0.050) — on a harder observation model, from a cold start, with
-finite-difference gradients — but it gets the reference for free.
+**3. The cost's scale is set by where the fit starts.** Three of four cold starts
+end 65–78× too large; only the start near the right scale stays near it (0.29).
+That is §2.1's shallow profile in action: over-scaling costs almost no
+likelihood, so nothing pulls the fit back. It is also, in substance, what
+`README.md` reported for the mixed-coordinate model — and this section's earlier
+claim that pinning `R` fixes it was wrong. Pinning `R` makes the scale
+identifiable; it does not make it well identified. Take it from a prior or from
+behavioural variability (§3.2), or report only scale-free quantities.
 
-**3. A start far from the right scale fails, and that is an optimizer problem.**
-§2.1 established that the scale has real curvature, so this is not
-identification. The mechanism is visible in the table: `Q_k` and `Gref` enter the
-feedforward only through the product `Q_k Gref`, so at `q0 = 0.05` the fit ends
-with a cost 5× too small and a reference **748×** too large at correlation 0.997
-— the shape of the reference is right and its scale has absorbed the cost's. Two
-remedies, either of which suffices: initialize from an estimated closed loop
-(family **C**, §3.4), or separate the cost's scale from its shape in the
-parameterization so the valley is not axis-aligned with the search.
+**4. The likelihood picks out the converged fit, and ranks nothing else.** Every
+cold start sits 0.010–0.024 nats per step below the warm start — 115 to 290 nats
+over the dataset — so none is an alternative optimum; they are unconverged along
+the shallow direction. Among them, the likelihood order (`q0` = 1, 10 000, 100,
+0.05) is close to the *reverse* of their closed-loop accuracy (0.05, 100, 1,
+10 000). So the likelihood is a sound guide to which fit has converged, and no
+guide to which unconverged fit is closest. `README.md`'s advice not to rank fits
+by likelihood therefore stands in practice here too — not because the objective
+is wrong, but because cold starts do not reach its optimum in a practical budget.
 
-**4. The likelihood ranks the fits correctly — all five of them.** Order the rows
-by `nll/step` and by closed-loop error and you get the same permutation:
+The closed loop is 6.4–9.6 % from the truth in every cold start, against 0.9 %
+at the warm start: the shallow scale direction costs accuracy in the gains, not
+only in the cost's size. The remedy is the initialization in §3.4 and in
+`implementation-plan.md` §6, together with a scale that comes from somewhere.
 
-| | warm | `q0`=100 | `q0`=10 000 | `q0`=1.0 | `q0`=0.05 |
-|---|---|---|---|---|---|
-| nll/step | −6.8062 | −6.7870 | −6.7844 | −6.7202 | −6.6887 |
-| closed-loop | 0.0111 | 0.0276 | 0.0997 | 0.3621 | 0.9346 |
-
-Rank correlation 1.00 over five fits. This is worth flagging because it
-contradicts `README.md` recommendation #7 — "do not use a likelihood to choose
-among fits… under misspecification the ELBO prefers the wrong one" — and it
-contradicts it *for the stated reason*. That recommendation is sound advice
-about a misspecified model; it is not a fact about inverse control. Once the
-generating process is inside the model class, the likelihood recovers its
-ordinary job, and restarts become worth spending compute on (`README.md` finds
-four restarts change nothing, because the bound could not rank them).
-
-`Qterm` reads ≈1.0 in the two cold-start rows that get anywhere near the right
-scale, exactly as §2.4 predicts — and note that its *correlation* never exceeds
-0.68 in any cold start, so it is not merely mis-scaled but unrecovered.
 
 ---
 
@@ -633,6 +668,27 @@ things follow that the current approach cannot deliver:
 * **A data-driven initializer** for A, replacing `q0` — which, per §2.1, is
   currently an invisible prior of infinite strength.
 
+**Measured, and two corrections to the above.** The stationarity equations are
+indeed linear in the cost once the gains are fixed — `P_t` is affine in `Q` given
+`{K_t, Φ_t}` — so the least squares needs no SDP solver. But they have a null
+space, exactly the shaping class of §2.4, so the raw solution is wrong
+(`‖Q̂_run − Q_run‖/‖Q_run‖ = 2.8` at the truth, and indefinite) while its shaping
+invariants are right to `3e-11`, the error being a pure shaping move (`--only=subspace`). The
+problem must be gauge-fixed before it initializes anything. And it is poorly
+conditioned: 1 % relative noise in the gains becomes 20 % error in the invariant
+`Q_k − Q_term + AᵀQ_termA`, and 5 % becomes 81 %. So stage 2 is an initializer
+that needs a precise stage 1, not an estimator in its own right; the likelihood
+fit that follows is what weights the equations properly.
+
+The same equations answer a question the closed loop alone cannot: whether a
+constant feedback offset could masquerade as intrinsic dynamics
+(`A − BK_t = (A + BD) − B(K_t + D)`). It cannot — no cost makes the offset gains
+optimal for the offset plant — but the rejection is about 8× weaker when only
+near-stationary gains are available (`--only=subspace`). And the control
+subspace itself falls out with no optimality assumption at all: the time
+variation `Φ_t − Φ_s = −B(K_t − K_s)` spans `range(B)`, recovered here with
+singular values `18.3, 11.7, 3e-16, 9e-18` and zero principal angle.
+
 The limitations are the usual two-stage ones: stage-1 uncertainty does not
 propagate (bootstrap, or run A from the stage-2 solution), and a stationary `K`
 identifies the cost only up to the cone. Where the agent really is
@@ -691,10 +747,10 @@ downsides directly.
 | suboptimality modelled as | costate innovation | control noise `Ξ` | `Ξ = [β(R+BᵗPB)]⁻¹` | trajectory temperature | stage-1 residual |
 | optimal agent in the class? | no (measure-zero limit) | yes (`Ξ → 0`) | yes | yes | yes |
 | cost M-step | **closed form**, linear | non-convex, closed-form gradient | same | **concave** (SDP) | linear + PSD (SDP) |
-| cold-start conditioning | scale pinned by `q0`, which is flat | a `Q·Gref` valley; wants a C-style init (§2.5) | same | same | convex — no initializer needed |
+| cold-start conditioning | scale pinned by `q0`, which is flat | scale drifts along a shallow direction (§2.5); wants a C-style init or a scale prior | shallow, but max-ent ties the scale to variability | same | convex — no initializer needed |
 | cost scale | exact gauge; needs a prior | identified (§2.1) | identified, plus variability | identified | reported as a cone |
 | reference `Gref` | trades against the cost | identified with the cost | same | same | in stage 1 |
-| terminal cost | not identified | **not identified** | same | same | same |
+| terminal cost | not identified | unactuated block: exact shaping class; rest: weak | same | same | same, as a cone |
 | switching | γ vs cost trade-off in `Σ_λλ` | ordinary regime comparison | same | same | n/a |
 | plant vs cost | opaque; regime contrasts only | `(I−BB⁺)A` identified outright | same | `S` confounded with `Σ_x` | explicit |
 | horizon assumption | none | required | required | required | none (stationary) |
@@ -708,9 +764,11 @@ downsides directly.
 * **The scale is a gauge.** Some normalization is always required. What differs
   is whether you *state* it (`R = I`, `tr S` fixed, `tr Qc[1] = n`) or discover
   after the fact that `q0` was a prior of infinite strength.
-* **The terminal cost.** Geometric backward decay at the closed-loop rate
-  (§2.4), five orders of magnitude over 28 steps, and the residue lands on
-  endpoint velocity. Fix it in the experiment, not the estimator.
+* **The terminal cost's unactuated block.** An exact shaping equivalence of
+  dimension `(n − m)(n − m + 1)/2` (§2.4). Report `Bᵀ Q_term` and
+  `Q_k − Q_term + Aᵀ Q_term A`, which are invariant; treat the rest as a
+  convention unless a reference or anticipated disturbance moves against the
+  passive dynamics. What lies outside the class is weakly identified by decay.
 * **The latent gauge under a free `C`.** Intrinsic to partial observation; keep
   the Procrustes/linear audit exactly as it is.
 * **A stationary agent.** If `K` is constant, only the inverse-optimality cone
@@ -753,6 +811,8 @@ verdicts are independent of the code under review. Sections:
 | `--only=profile` | the exact marginal likelihood along the cost-scale ray |
 | `--only=terminal` | the Riccati Jacobian `Ψ`, its finite-difference check, and the backward decay of terminal-cost information |
 | `--only=reference` | where a reference perturbation lands, in time and in observed coordinates |
+| `--only=shaping` | the exact shaping class of costs, constructed and checked (§2.4) |
+| `--only=subspace` | the control subspace from the closed loop; the constant-feedback offset; the rank of the inverse-optimality equations (§3.4) |
 | `--only=switching` | γ at the generating parameters for a matched delay-then-reach design |
 | `--only=fit` | end-to-end recovery under the closed-loop parameterization, swept over the initial cost scale |
 

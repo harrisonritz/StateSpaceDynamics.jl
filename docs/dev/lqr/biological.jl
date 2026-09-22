@@ -70,7 +70,7 @@ function sweep(r::Vector{Float64}; Aq = A, Sq = S, Qq = Qs)
         Acl   = Aq - B*K[t]
         Pt    = Qq[SCHED[t]] + K[t]'*Rc*K[t] + Acl'*P[t+1]*Acl
         P[t]  = (Pt + Pt')/2
-        b[t]  = -Qq[SCHED[t]]*r + Acl'*(P[t+1]*B*kf[t] + b[t+1]) + K[t]'*Rc*kf[t]
+        b[t]  = -Qq[SCHED[t]]*r + Acl'*b[t+1]      # b_t = −Q_t r + Φ_tᵀ b_{t+1}
     end
     return K, kf, P, Fs
 end
