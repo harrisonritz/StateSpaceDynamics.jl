@@ -48,6 +48,7 @@ every run).
 | `parameterization.jl` | the measurements behind it — self-contained, imports nothing from `src/` |
 | `biological.md` | the same question for a system that may only be *approximately* control-like |
 | `biological.jl` | its measurements — also self-contained |
+| `implementation-plan.md` | the plan that follows from both: a closed-loop state model for noisy, approximately optimal neural systems |
 
 `parameterization.md` is the one file here that is not a recovery sweep. It
 takes the findings below as given and asks the prior question: whether the
