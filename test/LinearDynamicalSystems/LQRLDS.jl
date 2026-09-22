@@ -1195,7 +1195,9 @@ function test_lqr_rejectable_failures()
 
     # A composite is rejectable only when every member is.
     @test SSD._lqr_rejectable(CompositeException([PosDefException(1), LAPACKException(3)]))
-    @test !SSD._lqr_rejectable(CompositeException([PosDefException(1), ErrorException("x")]))
+    @test !SSD._lqr_rejectable(
+        CompositeException([PosDefException(1), ErrorException("x")])
+    )
     @test !SSD._lqr_rejectable(CompositeException([]))
     return nothing
 end

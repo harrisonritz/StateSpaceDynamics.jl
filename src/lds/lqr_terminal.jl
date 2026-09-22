@@ -548,8 +548,8 @@ function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
         write!(theta)
         (err isa LineSearchException || _lqr_rejectable(err)) || rethrow()
         @warn "terminal-conditioned M-step made no progress: every trial point the " *
-              "line search visited was numerically out of reach. The fit continues " *
-              "at the incoming parameters." exception = (err, catch_backtrace()) maxlog = 3
+            "line search visited was numerically out of reach. The fit continues " *
+            "at the incoming parameters." exception = (err, catch_backtrace()) maxlog = 3
     end
     return nothing
 end
