@@ -366,24 +366,47 @@ sees. **If the emission does not span the control directions, suboptimality is
 not identified at any sample size.** For neural data that is the design
 question: does the recorded population span the directions that drive behaviour?
 
-**Plant noise and slack compete in the same slot,** so what separates them is
-shape and time course. `σ_x²I` is isotropic and constant. `SSᵀ` is rank-`r` and
-constant, and in the Riccati-graph model both terms are sandwiched by the *same*
-`W_{t+1}`, so they share a time course and differ only in shape — which is why
-that row fails. `B Ξ_t Bᵀ` is rank-`r` and **time-varying through `P_{t+1}`**,
-which is a signature constant plant noise cannot mimic. That is a concrete
-argument for the max-ent tying (`parameterization.md` §3.2) over a free slack:
-tying the control noise to `R` and `P` does not just remove a parameter, it
-creates the time course that makes the parameter estimable.
+**Plant noise and slack compete in the same slot,** so what could separate them
+is shape or time course. `σ_x²I` is isotropic and constant; `SSᵀ` and `BΞ_tBᵀ`
+are rank-`r`. In the Riccati-graph model both terms are sandwiched by the *same*
+`W_{t+1}`, so they share a time course and differ only in shape. `BΞ_tBᵀ` is
+additionally time-varying through `P_{t+1}`.
 
-**The caution:** these rows compare the two models at the same *nominal* scalar,
-which is not the same observable effect — the max-ent term is roughly 4× larger
-here, so part of the contrast is power rather than structure. So the table establishes the structural points (range, time course,
-emission coverage) but is not a clean power comparison between the two slack
-models. `biological.jl --only=threshold` sweeps the slack magnitude to locate
-the detection threshold for a given design; run it on your own configuration
-before concluding that a fitted `ρ` near zero means "optimal" rather than
-"underpowered".
+That difference looked decisive in the table above. **It is not.** The table
+compares the two models at the same *nominal* scalar, which is nowhere near the
+same observable effect: at `σ_ν = 1` the max-ent term carries 86 % of the
+innovation variance and the Riccati term carries 0.02 %. Sweeping the magnitude
+instead, and scoring on the share the data can actually see,
+
+```math
+\varphi = \frac{\text{slack contribution to the innovation variance}}{\text{total innovation variance}},
+```
+
+| model | emission | true `φ` → | 0.003 | 0.025 | 0.14 | 0.35 | 0.86 | 0.98 |
+|---|---|---|---|---|---|---|---|---|
+| Riccati slack | position only | fit `φ` | 0.42 | 0.42 | 0.42 | — | — | — |
+| Riccati slack | full state | fit `φ` | 0.015 | 0.038 | **0.166** | — | — | — |
+| max-ent noise | position only | fit `φ` | — | — | — | 0.955 | 0.967 | 0.987 |
+| max-ent noise | full state | fit `φ` | — | — | — | 0.461 | **0.854** | **0.982** |
+
+**At matched `φ` the max-ent tying has no advantage in this design** — the
+Riccati slack recovers `φ = 0.14` to within 19 %, while max-ent recovers
+`φ = 0.35` only to within 32 %. The earlier row was a power artifact, and the
+correct reading is simpler than "time course":
+
+* **what governs detectability is `φ`, and whether the emission spans
+  `range(B)`** — not which slack model is used;
+* with a full-state emission this design (400 trials, `T = 30`, observation
+  noise 0.006) resolves `φ ≳ 0.15` to about 20 % and `φ ≳ 0.85` to about 5 %;
+* with a position-only emission nothing is resolved until the slack almost
+  completely dominates (`φ > 0.98`).
+
+The max-ent tying is still worth having — it removes a free parameter and reads
+as an inverse temperature — but **it is not what makes suboptimality
+measurable.** Observing the control directions is.
+
+Run `biological.jl --only=threshold` on your own configuration before concluding
+that a fitted `ρ` near zero means "optimal" rather than "underpowered".
 
 ---
 
@@ -417,8 +440,10 @@ mechanisms with opposite meanings, so its fitted value answers neither question.
    before interpreting a small `ρ`.
 4. **Take §4, §9, §10, §11, §12, §15 and §17 from the proposal now.** They are
    backend-independent and several are things you would otherwise get wrong.
-5. **Fit level 3′ when trial-to-trial variability is signal.** The Riccati time
-   course in `Ξ_t` is what makes the slack estimable (§4).
+5. **Fit level 3′ for parsimony and interpretation, not for identifiability.**
+   The max-ent tying removes a parameter and reads as an inverse temperature,
+   but §4 measures no detectability advantage at matched `φ`. What buys
+   detectability is an emission that spans `range(B)`.
 6. **Defer the constrained KKT backend until you have a reason to prefer the
    open-loop hypothesis** — level 3 fitting badly, with residuals showing
    anticipatory rather than corrective structure. Then build it, because it is
