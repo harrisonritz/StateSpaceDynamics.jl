@@ -34,6 +34,10 @@ const ONLY = let
     a = filter(s -> startswith(s, "--only="), ARGS)
     isempty(a) ? nothing : Set(split(split(a[1], "=")[2], ","))
 end
+# `--quick` shrinks the only expensive section (`fit`) to a smoke test: it checks
+# that the code path runs and the table is well formed, not that anything is
+# recovered. Every number in `parameterization.md` comes from a full run.
+const QUICK = "--quick" in ARGS
 want(s) = ONLY === nothing || s in ONLY
 section(t) = (println(); println("="^78); println(t); println("="^78))
 
@@ -79,28 +83,56 @@ function setup(; T = 30, ntarget = 8, radius = 0.12, observe = :position)
 end
 
 """
-Backward Riccati sweep and its companion affine sweep, for
+Backward Riccati sweep for
 
   min  Σ_{t<T} ½[(x_t-r)'Q_{k(t)}(x_t-r) + u'Ru] + ½(x_T-r)'Q_{k(T)}(x_T-r).
 
-Returns `(K, kff, P)` with the optimal policy `u_t = -K_t x_t + kff_t`.
+Returns `(K, P, Fs)`: the feedback gains, the cost-to-go matrices, and the
+factorizations of `R + B'P_{t+1}B` for the affine sweep to reuse.
+
+**None of this depends on the reference.** The feedback half of an LQR tracking
+policy is target-independent; only the feedforward is not. So this sweep runs
+once per parameter evaluation and [`affine_sweep`](@ref) runs once per target,
+which is an `8×` saving at eight targets and is also the honest way to write it.
 """
-function riccati(A, B, R, Qs, sched::Vector{Int}, r::Vector{Float64})
-    T = length(sched); n = size(A, 1)
-    P = Vector{Matrix{Float64}}(undef, T); b = Vector{Vector{Float64}}(undef, T)
-    K = Vector{Matrix{Float64}}(undef, T-1); kf = Vector{Vector{Float64}}(undef, T-1)
-    QT = Qs[sched[T]]; P[T] = QT; b[T] = -QT * r
+function riccati_gain(A::Matrix{Float64}, B::Matrix{Float64}, R::Matrix{Float64},
+                      Qs::Vector{Matrix{Float64}}, sched::Vector{Int})
+    T = length(sched)
+    P = Vector{Matrix{Float64}}(undef, T)
+    K = Vector{Matrix{Float64}}(undef, T-1)
+    Fs = Vector{Cholesky{Float64,Matrix{Float64}}}(undef, T-1)
+    P[T] = Qs[sched[T]]
     @inbounds for t in (T-1):-1:1
         Q = Qs[sched[t]]
-        F = cholesky(Symmetric(R + B' * P[t+1] * B))
-        K[t]  = F \ (B' * P[t+1] * A)
-        kf[t] = -(F \ (B' * b[t+1]))
+        Fs[t] = cholesky(Symmetric(R + B' * P[t+1] * B))
+        K[t]  = Fs[t] \ (B' * P[t+1] * A)
         Acl   = A - B * K[t]
-        P[t]  = Q + K[t]' * R * K[t] + Acl' * P[t+1] * Acl
-        P[t]  = (P[t] + P[t]') / 2
-        b[t]  = -Q * r + Acl' * (P[t+1] * B * kf[t] + b[t+1]) + K[t]' * R * kf[t]
+        Pt    = Q + K[t]' * R * K[t] + Acl' * P[t+1] * Acl
+        P[t]  = (Pt + Pt') / 2
     end
-    return K, kf, P
+    return K, P, Fs
+end
+
+"The feedforward `kff` for one reference, given the sweep above. `O(T n²)`."
+function affine_sweep(A::Matrix{Float64}, B::Matrix{Float64}, R::Matrix{Float64},
+                      Qs::Vector{Matrix{Float64}}, sched::Vector{Int},
+                      K, P, Fs, r::Vector{Float64})
+    T = length(sched)
+    b = Vector{Vector{Float64}}(undef, T)
+    kf = Vector{Vector{Float64}}(undef, T-1)
+    b[T] = -Qs[sched[T]] * r
+    @inbounds for t in (T-1):-1:1
+        kf[t] = -(Fs[t] \ (B' * b[t+1]))
+        Acl   = A - B * K[t]
+        b[t]  = -Qs[sched[t]] * r + Acl' * (P[t+1] * B * kf[t] + b[t+1]) + K[t]' * R * kf[t]
+    end
+    return kf
+end
+
+"`(K, kff, P)` for one reference — the convenience wrapper the diagnostics use."
+function riccati(A, B, R, Qs, sched::Vector{Int}, r::Vector{Float64})
+    K, P, Fs = riccati_gain(A, B, R, Qs, sched)
+    return K, affine_sweep(A, B, R, Qs, sched, K, P, Fs, r), P
 end
 
 "Closed-loop forward roll with plant noise `Lx` and control noise `Lu` (factors)."
@@ -142,9 +174,10 @@ over ~40 parameters affordable.
 """
 function loglik(st::Setup, Qs, refs, Sig_w, sig_y2, Ys, tg; A = st.A, B = st.B)
     T, n, p = st.T, st.n, st.p
-    K, _, _ = riccati(A, B, st.R, Qs, st.sched, zeros(n))
+    K, P, Fs = riccati_gain(A, B, st.R, Qs, st.sched)
     Acl  = [A - B * K[t] for t in 1:(T-1)]
-    inps = [[B * riccati(A, B, st.R, Qs, st.sched, r)[2][t] for t in 1:(T-1)] for r in refs]
+    inps = [[B * kf[t] for t in 1:(T-1)]
+            for kf in (affine_sweep(A, B, st.R, Qs, st.sched, K, P, Fs, r) for r in refs)]
 
     Sy = sig_y2 * Matrix{Float64}(I, p, p)
     Gain = Vector{Matrix{Float64}}(undef, T)
@@ -189,7 +222,7 @@ function gen(rng, st::Setup, Qs; ntrial = 400, sig_x = 0.004, sig_u = 0.25, sig_
 end
 
 # =========================================================================
-section_geometry = function ()
+function section_geometry()
     section("geometry — the symplectic flow, its stable manifold, and the contraction")
     st = setup(); Qs = true_costs()
     K, _, P = riccati(st.A, st.B, st.R, Qs, st.sched, zeros(st.n))
@@ -225,7 +258,7 @@ section_geometry = function ()
     println("     parameterises the whole 2n-dim flow and conditions its way back.")
 end
 
-section_gauge = function ()
+function section_gauge()
     section("gauge — the cost scale is an exact flat direction only when S is free")
     st = setup(); Qs = true_costs()
     mp(Q, r, R = st.R) = (kk = riccati(st.A, st.B, R, Q, st.sched, r);
@@ -254,7 +287,7 @@ section_gauge = function ()
     println("     gauge orbit, so no objective and no amount of data can locate it.")
 end
 
-section_profile = function ()
+function section_profile()
     section("profile — the exact marginal likelihood along the cost-scale ray")
     st = setup(); Qs = true_costs()
     sx, su, sy = 0.004, 0.25, 0.006
@@ -276,7 +309,7 @@ section_profile = function ()
     println("   held-out score is monotone in q0 and prefers the smallest value offered.")
 end
 
-section_terminal = function ()
+function section_terminal()
     section("terminal — the Riccati Jacobian, and how far back a cost is felt")
     st = setup(); Qs = true_costs()
     K, _, P = riccati(st.A, st.B, st.R, Qs, st.sched, zeros(st.n))
@@ -325,7 +358,7 @@ section_terminal = function ()
     println("   backwards at the closed-loop rate; fix it in the design, not the model.")
 end
 
-section_reference = function ()
+function section_reference()
     section("reference — the feedforward puts it in the observed coordinates")
     st = setup(); Qs = true_costs()
     mp(r) = (kk = riccati(st.A, st.B, st.R, Qs, st.sched, r);
@@ -349,7 +382,7 @@ end
 # =========================================================================
 logsumexp2(a, b) = (m = max(a, b); m == -Inf ? -Inf : m + log(exp(a-m) + exp(b-m)))
 
-section_switching = function ()
+function section_switching()
     section("switching — γ at the generating parameters, delay-then-reach")
     n, T, NTRIAL, STAY = 2, 30, 120, 0.93
     Ap = [0.96 0.05; -0.04 0.96]                       # model.jl `plant(2)`
@@ -466,57 +499,96 @@ end
 ntri(n) = n*(n+1) ÷ 2
 lower_tri!(L, v) = (k = 1; for j in 1:size(L,1), i in j:size(L,1); L[i,j] = v[k]; k += 1 end; L)
 
-section_fit = function ()
+#=
+Everything the objective needs, in one concretely typed struct.
+
+This is not tidiness. When `unpack` and the objective are closures capturing a
+dozen locals of a section function, Julia cannot infer their return types, every
+small matrix operation dispatches dynamically, and the fit runs about an order
+of magnitude slower — measured at 3.5e9 allocations before this was hoisted out.
+=#
+struct FitSpec
+    st::Setup
+    Ys::Vector{Matrix{Float64}}
+    tg::Vector{Int}
+    per::Float64
+    ntg::Int
+    n::Int
+    k::Int
+    np::Int
+end
+
+function fit_unpack(sp::FitSpec, v::Vector{Float64})
+    n, k, ntg = sp.n, sp.k, sp.ntg
+    L1 = lower_tri!(zeros(n, n), view(v, 1:k))
+    L2 = lower_tri!(zeros(n, n), view(v, (k+1):2k))
+    Qs = [Matrix(Symmetric(L1*L1')), Matrix(Symmetric(L2*L2'))]
+    off = 2k
+    refs = [[v[off+2j-1], v[off+2j], 0.0, 0.0] for j in 1:ntg]
+    off += 2*ntg
+    ex, eu, ey = exp(v[off+1]), exp(v[off+2]), exp(v[off+3])
+    Sw = ex^2*Matrix{Float64}(I, n, n) + eu^2*(sp.st.B*sp.st.B')
+    return Qs, refs, Sw, ey^2
+end
+
+function fit_nll(sp::FitSpec, v::Vector{Float64})
+    Qs, refs, Sw, sy2 = fit_unpack(sp, v)
+    try
+        return -sp.per * loglik(sp.st, Qs, refs, Sw, sy2, sp.Ys, sp.tg)
+    catch
+        return 1e8
+    end
+end
+
+"A cold start: isotropic costs at scale `q0`, references at zero."
+function fit_start(sp::FitSpec, q0::Float64)
+    n, k, ntg = sp.n, sp.k, sp.ntg
+    v = zeros(sp.np); d = sqrt(q0)*10
+    for o in (0, k)
+        j = 1
+        for c in 1:n, r in c:n; v[o+j] = (r == c ? d : 0.0); j += 1 end
+    end
+    v[2k+2*ntg+1] = log(0.01); v[2k+2*ntg+2] = log(0.5); v[2k+2*ntg+3] = log(0.01)
+    return v
+end
+
+function section_fit()
     section("fit — end-to-end recovery, swept over the initial cost scale")
     st = setup(); Qs = true_costs()
     sx, su, sy = 0.004, 0.25, 0.006
-    Ys, tg = gen(MersenneTwister(20240922), st, Qs; ntrial = 400,
+    ntrial, iters = QUICK ? (100, 40) : (400, 400)
+    Ys, tg = gen(MersenneTwister(20240922), st, Qs; ntrial = ntrial,
                  sig_x = sx, sig_u = su, sig_y = sy)
     n, k = st.n, ntri(st.n); ntg = length(st.refs); np = 2k + 2*ntg + 3
+    sp = FitSpec(st, Ys, tg, 1/(length(Ys)*st.T), ntg, n, k, np)
+    QUICK && println("--quick: $(ntrial) trials, $(iters) iterations — a smoke test, not a result.")
 
-    function unpack(v)
-        L1 = lower_tri!(zeros(n, n), view(v, 1:k)); L2 = lower_tri!(zeros(n, n), view(v, k+1:2k))
-        Q = [Matrix(Symmetric(L1*L1')), Matrix(Symmetric(L2*L2'))]
-        off = 2k
-        refs = [[v[off+2j-1], v[off+2j], 0.0, 0.0] for j in 1:ntg]
-        off += 2*ntg
-        ex, eu, ey = exp(v[off+1]), exp(v[off+2]), exp(v[off+3])
-        return Q, refs, ex^2*Matrix{Float64}(I,n,n) + eu^2*(st.B*st.B'), ey^2
-    end
-    function start(q0)
-        v = zeros(np); d = sqrt(q0)*10
-        for o in (0, k); j = 1
-            for c in 1:n, r in c:n; v[o+j] = (r == c ? d : 0.0); j += 1 end
-        end
-        v[2k+2*ntg+1] = log(0.01); v[2k+2*ntg+2] = log(0.5); v[2k+2*ntg+3] = log(0.01)
-        return v
-    end
     packL(L) = (v = zeros(k); j = 1; for c in 1:n, r in c:n; v[j] = L[r, c]; j += 1 end; v)
     vtruth = vcat(packL(cholesky(Symmetric(Qs[1])).L), packL(cholesky(Symmetric(Qs[2])).L),
                   vcat([r[1:2] for r in st.refs]...), [log(sx), log(su), log(sy)])
     cl(Q, A = st.A) = A - st.B*riccati(A, st.B, st.R, Q, st.sched, zeros(n))[1][1]
     rt = vcat([r[1:2] for r in st.refs]...)
-    per = 1/(length(Ys)*st.T)
+    per = sp.per
 
     @printf("%d parameters fitted (known plant: 2 cost matrices, %d references, 3 noise scalars)\n",
             np, ntg)
     @printf("truth: tr(Qrun) = %.1f, tr(Qterm) = %.1f, nll/step = %.6f\n",
             tr(Qs[1]), tr(Qs[2]),
             -per*loglik(st, Qs, st.refs, sx^2*Matrix(I,n,n) + su^2*(st.B*st.B'), sy^2, Ys, tg))
-    f = function (v)
-        Q, refs, Sw, sy2 = unpack(v)
-        try; return -per*loglik(st, Q, refs, Sw, sy2, Ys, tg); catch; return 1e8 end
-    end
+    flush(stdout)
+    f = v -> fit_nll(sp, v)
     sc(x) = @sprintf("%.3g", x)
     pair(a, b) = string(sc(a), "/", round(b, digits=3))
     @printf("\n%-22s %-16s %-16s %-10s %-14s %-12s %s\n", "start", "Qrun rmse/corr",
             "Qterm rmse/corr", "scale err", "Gref rmse/corr", "closed-loop", "nll/step")
-    runs = vcat([("q0 = $(q0)", start(q0)) for q0 in [0.05, 1.0, 100.0, 10_000.0]],
+    grid = QUICK ? [0.05, 100.0] : [0.05, 1.0, 100.0, 10_000.0]
+    runs = vcat([("q0 = $(q0)", fit_start(sp, q0)) for q0 in grid],
                 [("warm start at truth", copy(vtruth))])
     for (label, v0) in runs
         res = Optim.optimize(f, v0, LBFGS(linesearch = BackTracking()),
-                             Optim.Options(iterations = 400, g_abstol = 1e-10))
-        Q, refs, _, _ = unpack(Optim.minimizer(res))
+                             Optim.Options(iterations = iters, g_abstol = 1e-10,
+                                           f_reltol = 1e-14))
+        Q, refs, _, _ = fit_unpack(sp, Optim.minimizer(res))
         rf = vcat([r[1:2] for r in refs]...)
         @printf("%-22s %-16s %-16s %-10s %-14s %-12.4f %.6f\n", label,
                 pair(relrmse(utri(Q[1]), utri(Qs[1])), pearson(utri(Q[1]), utri(Qs[1]))),
