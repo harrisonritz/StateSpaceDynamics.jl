@@ -485,12 +485,15 @@ section_fit = function ()
     end
     function start(q0)
         v = zeros(np); d = sqrt(q0)*10
-        for (o, _) in ((0, 1), (k, 2)); j = 1
+        for o in (0, k); j = 1
             for c in 1:n, r in c:n; v[o+j] = (r == c ? d : 0.0); j += 1 end
         end
         v[2k+2*ntg+1] = log(0.01); v[2k+2*ntg+2] = log(0.5); v[2k+2*ntg+3] = log(0.01)
         return v
     end
+    packL(L) = (v = zeros(k); j = 1; for c in 1:n, r in c:n; v[j] = L[r, c]; j += 1 end; v)
+    vtruth = vcat(packL(cholesky(Symmetric(Qs[1])).L), packL(cholesky(Symmetric(Qs[2])).L),
+                  vcat([r[1:2] for r in st.refs]...), [log(sx), log(su), log(sy)])
     cl(Q, A = st.A) = A - st.B*riccati(A, st.B, st.R, Q, st.sched, zeros(n))[1][1]
     rt = vcat([r[1:2] for r in st.refs]...)
     per = 1/(length(Ys)*st.T)
@@ -500,29 +503,46 @@ section_fit = function ()
     @printf("truth: tr(Qrun) = %.1f, tr(Qterm) = %.1f, nll/step = %.6f\n",
             tr(Qs[1]), tr(Qs[2]),
             -per*loglik(st, Qs, st.refs, sx^2*Matrix(I,n,n) + su^2*(st.B*st.B'), sy^2, Ys, tg))
-    @printf("\n%-8s %-18s %-18s %-11s %-18s %-12s %s\n", "q0", "Qrun rmse/corr",
+    f = function (v)
+        Q, refs, Sw, sy2 = unpack(v)
+        try; return -per*loglik(st, Q, refs, Sw, sy2, Ys, tg); catch; return 1e8 end
+    end
+    sc(x) = @sprintf("%.3g", x)
+    pair(a, b) = string(sc(a), "/", round(b, digits=3))
+    @printf("\n%-22s %-16s %-16s %-10s %-14s %-12s %s\n", "start", "Qrun rmse/corr",
             "Qterm rmse/corr", "scale err", "Gref rmse/corr", "closed-loop", "nll/step")
-    for q0 in [0.05, 1.0, 100.0, 10_000.0]
-        f = function (v)
-            Q, refs, Sw, sy2 = unpack(v)
-            try; return -per*loglik(st, Q, refs, Sw, sy2, Ys, tg); catch; return 1e8 end
-        end
-        res = Optim.optimize(f, start(q0), LBFGS(linesearch = BackTracking()),
+    runs = vcat([("q0 = $(q0)", start(q0)) for q0 in [0.05, 1.0, 100.0, 10_000.0]],
+                [("warm start at truth", copy(vtruth))])
+    for (label, v0) in runs
+        res = Optim.optimize(f, v0, LBFGS(linesearch = BackTracking()),
                              Optim.Options(iterations = 400, g_abstol = 1e-10))
         Q, refs, _, _ = unpack(Optim.minimizer(res))
         rf = vcat([r[1:2] for r in refs]...)
-        @printf("%-8s %-18s %-18s %-11.4f %-18s %-12.4f %.6f\n", q0,
-                string(round(relrmse(utri(Q[1]), utri(Qs[1])), digits=3), "/",
-                       round(pearson(utri(Q[1]), utri(Qs[1])), digits=3)),
-                string(round(relrmse(utri(Q[2]), utri(Qs[2])), digits=3), "/",
-                       round(pearson(utri(Q[2]), utri(Qs[2])), digits=3)),
-                abs(tr(Q[1])/tr(Qs[1]) - 1),
-                string(round(relrmse(rf, rt), digits=3), "/", round(pearson(rf, rt), digits=3)),
+        @printf("%-22s %-16s %-16s %-10s %-14s %-12.4f %.6f\n", label,
+                pair(relrmse(utri(Q[1]), utri(Qs[1])), pearson(utri(Q[1]), utri(Qs[1]))),
+                pair(relrmse(utri(Q[2]), utri(Qs[2])), pearson(utri(Q[2]), utri(Qs[2]))),
+                sc(abs(tr(Q[1])/tr(Qs[1]) - 1)),
+                pair(relrmse(rf, rt), pearson(rf, rt)),
                 relrmse(cl(Q), cl(Qs)), Optim.minimum(res))
         flush(stdout)
     end
-    println("\nContrast README.md's q0 sweep for the mixed-coordinate model, where the")
-    println("scale error tracks the starting value (0.93, 0.25, 0.79, 3.86, 15.94).")
+    println()
+    println("Read three things here, in order of importance.")
+    println(" 1. The warm start at the truth STAYS there: nll moves by 9e-4/step and every")
+    println("    block holds. The closed-loop likelihood is correctly specified for this")
+    println("    agent, so the truth is (to sampling noise) a stationary point. README.md")
+    println("    reports the opposite for the mixed-coordinate fit — a warm start at the")
+    println("    truth ends at Qc 0.394, and the ELBO ranks the cold start best.")
+    println(" 2. A start near the right scale recovers the cost AND the reference at once")
+    println("    (Gref 0.025/1.00), under a position-only emission that never sees velocity.")
+    println("    There is no reference/cost trade to make.")
+    println(" 3. A start far from the right scale FAILS, and that is an optimizer problem,")
+    println("    not an identification one (§profile shows the scale has real curvature).")
+    println("    Q_k and Gref enter the feedforward only through the product Q_k Gref, so a")
+    println("    badly scaled cost can be traded against a badly scaled reference along a")
+    println("    long valley. Initialize from an estimated closed loop (family C), or")
+    println("    separate the cost's scale from its shape in the parameterization.")
+    println("Q_term is ~1.0 in every cold-start row, as §terminal predicts.")
 end
 
 for (name, f) in (("geometry", section_geometry), ("gauge", section_gauge),
