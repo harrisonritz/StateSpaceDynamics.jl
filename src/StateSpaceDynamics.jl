@@ -9,7 +9,7 @@ using Random
 using SparseArrays
 
 using Optim: Optim, optimize, LBFGS
-using LineSearches: HagerZhang
+using LineSearches: HagerZhang, LineSearchException
 using ProgressMeter: Progress, next!, finish!
 using SpecialFunctions: loggamma
 using Statistics: mean

@@ -430,6 +430,7 @@ using SSDTest
                 test_lqr_mstep_preserves_structure()
                 test_lqr_em_monotone()
                 test_lqr_conditional_mstep_gradient()
+                test_lqr_rejectable_failures()
                 test_lqr_noise_update_closed_form()
                 test_lqr_recovers_parameters()
             end

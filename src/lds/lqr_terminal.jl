@@ -189,6 +189,29 @@ function _terminal_probe_stats!(b::_LQRExactNormalizer, sms)
     return ([p.hs for p in b.probes], [p.lds.state_model for p in b.probes])
 end
 
+"""
+    _lqr_rejectable(err) -> Bool
+
+Whether `err` is a numerical failure at one point — something a line search
+should answer by rejecting that point — rather than a bug that must surface.
+
+Unwraps the task wrappers on the way down. The probe's smoother runs its trials
+through `tforeach`, so a LAPACK failure inside one arrives as a
+`TaskFailedException` around the real cause, and a predicate that only matched
+the leaf types would let a perfectly ordinary rejected step kill the whole fit.
+"""
+function _lqr_rejectable(err)
+    err isa PosDefException && return true
+    err isa SingularException && return true
+    err isa LAPACKException && return true
+    err isa NumericalStabilityError && return true
+    err isa DomainError && return true
+    err isa TaskFailedException && return _lqr_rejectable(err.task.result)
+    err isa CompositeException &&
+        return !isempty(err.exceptions) && all(_lqr_rejectable, err.exceptions)
+    return false
+end
+
 """Build a joint conditional generalized M-step, including initial/noise blocks.
 No covariance is profiled out: its formerly conjugate optimum is invalid after
 subtracting log Z. Grouped parameter versions are packed and differentiated once."""
@@ -418,10 +441,7 @@ function _lqr_conditional_problem(
             end
             return value
         catch err
-            if err isa PosDefException ||
-                err isa SingularException ||
-                err isa NumericalStabilityError ||
-                err isa LAPACKException
+            if _lqr_rejectable(err)
                 gradient === nothing || fill!(gradient, zero(T))
                 return T(Inf)
             end
@@ -466,17 +486,33 @@ function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
     (; theta, evaluate!, write!) = problem
     isempty(theta) && return nothing
     T = eltype(theta)
-    initial = evaluate!(nothing, theta)
-    isfinite(initial) || error("Non-finite initial terminal-conditioned M-step objective")
+    #=
+    Evaluated *with* a gradient, so the probe runs here at θ\u2032 rather than first
+    being exercised somewhere inside the line search. A probe that cannot be
+    smoothed at the incoming parameters makes every later evaluation infinite
+    too, and the M-step would then quietly accept `theta` and report nothing —
+    a fit that silently stops updating its state parameters. Fail here instead,
+    and say what to do about it.
+    =#
+    cached_grad = similar(theta)
+    initial = evaluate!(cached_grad, theta)
+    isfinite(initial) || error(
+        "the terminal-conditioned M-step objective is not finite at the current " *
+        "parameters. Its normalizer is smoothed on a copy of the model carrying no " *
+        "observations, which is the hardest case for the Laplace smoother: an " *
+        "unstable symplectic transition, a near-singular `Sigma`, or a cost far from " *
+        "its prior mode can all put that chain out of reach. Tighten the `Sigma` / " *
+        "`Qc` priors, shorten the trials, or fit the joint objective instead by " *
+        "setting `condition_terminal = false`.",
+    )
     #=
     One `evaluate!` produces the value and the gradient together, and its
     expensive half is the probe smoothing behind the Fisher-identity gradient.
     Optim asks for the two through separate callbacks, so memoize the last point:
     a line search that evaluates both at the same θ then pays for one pass.
     =#
-    seen = fill(T(NaN), length(theta))
-    cached_grad = similar(theta)
-    cached_value = Ref(T(NaN))
+    seen = copy(theta)
+    cached_value = Ref(initial)
     function refresh!(x)
         seen == x && return cached_value[]
         copyto!(seen, x)
@@ -500,9 +536,20 @@ function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
         proposal = Optim.minimizer(result)
         final = evaluate!(nothing, proposal)
         write!(isfinite(final) && final <= initial ? proposal : theta)
-    catch
+    catch err
+        #=
+        A line search that cannot bracket a decrease — because every trial point
+        it tried put the probe's chain out of reach — is this M-step declining to
+        move, not a broken fit. Generalized EM tolerates that: the E-step runs
+        again next iteration from the same parameters and the ELBO is unchanged
+        rather than worse. Anything that is not a numerical failure at a point
+        still surfaces.
+        =#
         write!(theta)
-        rethrow()
+        (err isa LineSearchException || _lqr_rejectable(err)) || rethrow()
+        @warn "terminal-conditioned M-step made no progress: every trial point the " *
+              "line search visited was numerically out of reach. The fit continues " *
+              "at the incoming parameters." exception = (err, catch_backtrace()) maxlog = 3
     end
     return nothing
 end

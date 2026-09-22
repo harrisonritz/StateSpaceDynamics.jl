@@ -1160,6 +1160,46 @@ function test_lqr_conditional_mstep_gradient()
     return nothing
 end
 
+"""A numerical failure at one point is a rejected step, not a dead fit.
+
+The normalizer's probe is smoothed on a model carrying no observations, which
+is the one place in the package where the Laplace smoother has nothing but the
+prior and the terminal factor to work with. A line search walking into a
+parameter set that chain cannot be factored at must come back as `Inf`, and the
+exception has to be recognised through the task wrapper `tforeach` puts around
+it — a predicate matching only the leaf types would let an ordinary rejected
+step take the whole fit down.
+"""
+function test_lqr_rejectable_failures()
+    @test SSD._lqr_rejectable(PosDefException(1))
+    @test SSD._lqr_rejectable(SingularException(1))
+    @test SSD._lqr_rejectable(LAPACKException(1604))
+    @test !SSD._lqr_rejectable(ArgumentError("a real bug"))
+    @test !SSD._lqr_rejectable(MethodError(sin, (1, 2)))
+
+    # Through the wrapper the threaded smoother raises.
+    wrapped = try
+        fetch(Threads.@spawn throw(LAPACKException(1604)))
+    catch err
+        err
+    end
+    @test wrapped isa TaskFailedException
+    @test SSD._lqr_rejectable(wrapped)
+
+    bug = try
+        fetch(Threads.@spawn throw(ArgumentError("a real bug")))
+    catch err
+        err
+    end
+    @test !SSD._lqr_rejectable(bug)
+
+    # A composite is rejectable only when every member is.
+    @test SSD._lqr_rejectable(CompositeException([PosDefException(1), LAPACKException(3)]))
+    @test !SSD._lqr_rejectable(CompositeException([PosDefException(1), ErrorException("x")]))
+    @test !SSD._lqr_rejectable(CompositeException([]))
+    return nothing
+end
+
 function test_lqr_noise_update_closed_form()
     rng = StableRNG(35)
     tsteps = 14

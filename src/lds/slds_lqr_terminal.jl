@@ -90,6 +90,14 @@ mutable struct _SLQRProbe{T<:Real,SL,PL,PP,FB,LN,DS,SF}
     design_of::Vector{Int}
     per_design::Vector{T}
     sufs::Vector{SF}
+    #=
+    The probe's own stream. Both `_slds_warmstart!` and `_vem_alternate!` default
+    to `Random.default_rng()`, and a normalizer that drew from the global stream
+    would make the surrounding fit depend on how many numbers everything else had
+    already taken — reproducible runs are the whole reason the discrete layer is
+    scored deterministically in the first place.
+    =#
+    rng::Random.Xoshiro
     smoothing_iters::Int
     logz::T
     started::Bool
@@ -162,6 +170,7 @@ function _slqr_terminal_probe(
         design_of,
         fill(T(NaN), length(designs)),
         sufs,
+        Random.Xoshiro(0x5109),
         smoothing_iters,
         T(NaN),
         false,
@@ -217,6 +226,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
             probe.plan,
             probe.data.tsteps,
             length(probe.slds.LDSs);
+            rng=probe.rng,
             ux=probe.data.ux,
             uy=probe.data.uy,
             lognorm=probe.lognorm,
@@ -240,6 +250,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         uy=probe.data.uy,
         lognorm=probe.lognorm,
         smoothing_iters=probe.smoothing_iters,
+        rng=probe.rng,
     )
     per_design = _slds_trial_elbos(
         probe.slds,
