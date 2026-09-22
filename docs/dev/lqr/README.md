@@ -44,6 +44,16 @@ every run).
 | `plotting.jl` | figures |
 | `experiments.jl` | the eight sweeps |
 | `smoulder.jl` | grouped Poisson recovery matched to the smoulder-reward task |
+| `parameterization.md` | a design review: is the mixed-coordinate model the right parameterization? |
+| `parameterization.jl` | the measurements behind it — self-contained, imports nothing from `src/` |
+
+`parameterization.md` is the one file here that is not a recovery sweep. It
+takes the findings below as given and asks the prior question: whether the
+mixed-coordinate (Hamiltonian) latent is the right way to write the inverse
+control problem in the first place, and what the alternatives buy. Several of
+the harder findings below — the cost scale, the reference/cost trade, the
+`Σ_λλ` inversion in the switching fit — turn out to be properties of the
+parameterization rather than of the data.
 
 ## Smoulder-reward recovery suite
 
