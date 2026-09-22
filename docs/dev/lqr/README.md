@@ -46,6 +46,8 @@ every run).
 | `smoulder.jl` | grouped Poisson recovery matched to the smoulder-reward task |
 | `parameterization.md` | a design review: is the mixed-coordinate model the right parameterization? |
 | `parameterization.jl` | the measurements behind it — self-contained, imports nothing from `src/` |
+| `biological.md` | the same question for a system that may only be *approximately* control-like |
+| `biological.jl` | its measurements — also self-contained |
 
 `parameterization.md` is the one file here that is not a recovery sweep. It
 takes the findings below as given and asks the prior question: whether the
@@ -54,6 +56,15 @@ control problem in the first place, and what the alternatives buy. Several of
 the harder findings below — the cost scale, the reference/cost trade, the
 `Σ_λλ` inversion in the switching fit — turn out to be properties of the
 parameterization rather than of the data.
+
+`biological.md` drops the premise that the data came from a controller at all,
+which is the situation for neural data, and asks what can still be claimed. Its
+central measurement is that `Σ_λλ` does **not** measure suboptimality: an
+exactly optimal agent under plant noise already violates the adjoint recursion
+by a large, systematic amount, while the Riccati-graph relation it *doesn't*
+violate is the one that responds to suboptimality alone. It also evaluates
+fixing `S`, constraining `Σ`'s costate block, and an equality-constrained KKT
+backend.
 
 ## Smoulder-reward recovery suite
 
