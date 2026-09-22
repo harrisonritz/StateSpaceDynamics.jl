@@ -61,6 +61,7 @@ harness's own failures:
 | `Gref` 1.04 / corr 0.01 in the best cost-recovering procedure | reference perturbations spread over 15.6 of 30 timesteps, 36 % in observed coordinates |
 | γ at truth is a function of `Σ_λλ` (0.52 → 0.83), and γ and the cost want opposite values | no `Σ_λλ` exists; γ at truth 0.875, onset error 3.7 steps, no trade-off |
 | "a warm start *at the truth* ends at `Qc` 0.394" — EM walks away from the generating parameters | the truth is a stationary point: 400 L-BFGS iterations move the objective by 9e-4/step and every block holds |
+| "do not use a likelihood to choose among fits"; four restarts change nothing | the likelihood ranks five fits in exactly closed-loop-error order (rank correlation 1.00), so restarts are worth paying for |
 | terminal cost never recovered (rel. err ≈ 1.00) | **also not recovered** — this one is a property of the problem, not the estimator |
 | `rand` diverges; sampling needs a dense `(dT)²` solve | forward chain contracts in the cost-to-go metric; sampling is `O(T n²)` |
 | latent dimension `2n` (24 for the smoulder plant), plus an exact terminal-normalizer sweep | latent dimension `n` (12), no normalizer — smoother blocks shrink `(2n)³/n³ = 8×`, against one added `O(Tn³)` Riccati sweep per parameter update |
@@ -367,14 +368,14 @@ Truth sits at `nll/step = -6.805299`.
 
 | start | `Qrun` rmse/corr | `Qterm` rmse/corr | scale err | `Gref` rmse/corr | closed-loop | nll/step |
 |---|---|---|---|---|---|---|
-| `q0` = 0.05 | 2.09 / −0.185 | 0.977 / 0.955 | 0.799 | 748 / 0.997 | 0.935 | −6.6887 |
-| `q0` = 1.0 | 1.2e12 / 0.930 | 3.0e8 / −0.058 | 1.3e12 | 0.185 / 0.992 | 0.362 | −6.7202 |
+| `q0` = 0.05 | 2.09 / −0.185 | 0.977 / 0.955 | 0.799 | 748 / 0.997 | 0.9346 | −6.6887 |
+| `q0` = 1.0 | 1.19e12 / 0.930 | 3.01e8 / −0.058 | 1.34e12 | 0.185 / 0.992 | 0.3621 | −6.7202 |
 | `q0` = 100 | **0.229 / 0.972** | 0.992 / 0.673 | **0.133** | **0.025 / 1.000** | **0.0276** | −6.7870 |
-| warm start at the truth | 0.0038 / 1.000 | <5e-5 / 1.000 | <5e-5 | 0.0104 / 1.000 | 0.0111 | **−6.8062** |
+| `q0` = 10 000 | 72.7 / 0.975 | 0.681 / 0.671 | 72.5 | 0.137 / 1.000 | 0.0997 | −6.7844 |
+| warm start at the truth | 0.00377 / 1.000 | 4.13e-5 / 1.000 | 3.4e-5 | 0.0104 / 1.000 | 0.0111 | **−6.8062** |
 
-(The truth's `tr Qrun` is 8.1e4, and the `q0` grid enters through a Cholesky
-diagonal, so `q0 ≈ 200` is the start that matches the truth's scale. Digits shift
-with the stopping rule; the three readings are what is robust.)
+(The truth's `tr Qrun` is 8.1e4, and `q0` enters through a Cholesky diagonal, so
+`q0 ≈ 200` is the start that matches the truth's scale.)
 
 **1. The warm start at the truth stays there.** 400 iterations move the objective
 by 9e-4 per step and every block holds: `Qrun` 0.0038, `Gref` 0.0104, closed loop
@@ -409,7 +410,26 @@ remedies, either of which suffices: initialize from an estimated closed loop
 (family **C**, §3.4), or separate the cost's scale from its shape in the
 parameterization so the valley is not axis-aligned with the search.
 
-`Qterm` reads ≈1.0 in every cold-start row, exactly as §2.4 predicts.
+**4. The likelihood ranks the fits correctly — all five of them.** Order the rows
+by `nll/step` and by closed-loop error and you get the same permutation:
+
+| | warm | `q0`=100 | `q0`=10 000 | `q0`=1.0 | `q0`=0.05 |
+|---|---|---|---|---|---|
+| nll/step | −6.8062 | −6.7870 | −6.7844 | −6.7202 | −6.6887 |
+| closed-loop | 0.0111 | 0.0276 | 0.0997 | 0.3621 | 0.9346 |
+
+Rank correlation 1.00 over five fits. This is worth flagging because it
+contradicts `README.md` recommendation #7 — "do not use a likelihood to choose
+among fits… under misspecification the ELBO prefers the wrong one" — and it
+contradicts it *for the stated reason*. That recommendation is sound advice
+about a misspecified model; it is not a fact about inverse control. Once the
+generating process is inside the model class, the likelihood recovers its
+ordinary job, and restarts become worth spending compute on (`README.md` finds
+four restarts change nothing, because the bound could not rank them).
+
+`Qterm` reads ≈1.0 in the two cold-start rows that get anywhere near the right
+scale, exactly as §2.4 predicts — and note that its *correlation* never exceeds
+0.68 in any cold start, so it is not merely mis-scaled but unrecovered.
 
 ---
 

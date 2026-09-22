@@ -614,7 +614,14 @@ function section_fit()
     println("    badly scaled cost can be traded against a badly scaled reference along a")
     println("    long valley. Initialize from an estimated closed loop (family C), or")
     println("    separate the cost's scale from its shape in the parameterization.")
-    println("Q_term is ~1.0 in every cold-start row, as §terminal predicts.")
+    println(" 4. The likelihood RANKS the fits correctly: order the rows by nll and by")
+    println("    closed-loop error and you get the same permutation (rank correlation 1.00")
+    println("    over five fits). README.md recommendation #7 — do not use a likelihood to")
+    println("    choose among fits — is sound advice about a misspecified model, not a fact")
+    println("    about inverse control. Once the generating process is in the class, the")
+    println("    likelihood recovers its ordinary job and restarts are worth paying for.")
+    println("Q_term is ~1.0 in the cold-start rows, as §terminal predicts, and its")
+    println("correlation never exceeds 0.68 — unrecovered, not merely mis-scaled.")
 end
 
 for (name, f) in (("geometry", section_geometry), ("gauge", section_gauge),
