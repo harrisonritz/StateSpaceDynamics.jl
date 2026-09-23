@@ -226,10 +226,21 @@ function test_slds_mixed_free_and_lqr()
     @test slds.LDSs[2].state_model.mode === :free
     @test slds.LDSs[1].latent_dim == slds.LDSs[2].latent_dim   # one shared latent path
 
+    #=
+    Monotone only up to the E-step's Monte Carlo noise, which one sample leaves
+    at a few tenths of a nat: enough to show as a decrease once the fit nears
+    its optimum (it does on half the seeds tried). Four samples separate what
+    the M-step does from that noise.
+    =#
     ys = hslds_data(p, tsteps, ntrials)
-    elbos = _trace(fit!(slds, ys; max_iter=12, progress=false, rng=StableRNG(7)))
+    elbos = _trace(
+        fit!(slds, ys; max_iter=12, progress=false, rng=StableRNG(7), num_samples=4)
+    )
     @test minimum(diff(elbos)) > -1e-6
     @test all(isfinite, elbos)
+    # The free state reads what the LQR state reads, which is not its costate.
+    @test !slds.LDSs[2].state_model.observe_costate
+    @test iszero(slds.LDSs[2].obs_model.C[:, 3:4])
 
     # Each state kept its own kind of parameterization.
     @test symplectic_defect(slds.LDSs[1].state_model) < 1e-10
