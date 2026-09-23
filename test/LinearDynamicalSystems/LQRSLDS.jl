@@ -558,13 +558,8 @@ function test_slds_lqr_terminal_chain_step()
         @test all(≈(1), sum(two.A; dims=2)) && sum(two.πₖ) ≈ 1
         @test all(>=(0), two.A) && all(>=(0), two.πₖ)
         current && @test probe.logz ≈ terminal_logz(two, ys) rtol = 1e-10
-        push!(proposals, if two.A ≈ A_bw
-            :baum_welch
-        elseif current
-            :gradient
-        else
-            :none
-        end)
+        kept = two.A ≈ A_bw ? :baum_welch : :gradient
+        push!(proposals, current ? kept : :none)
     end
     @test proposals == [:baum_welch, :gradient, :baum_welch]
     return nothing
