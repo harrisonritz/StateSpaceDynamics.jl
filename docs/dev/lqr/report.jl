@@ -103,7 +103,7 @@ so every row would read `NO` and the column would distinguish nothing. Below
 ~1e-3 nats/iteration the parameters are flat to three decimals; above ~1e-1 the
 row is reporting the iteration budget as much as the data.
 """
-function report(label, r; blocks=CORE_BLOCKS, note::String="")
+function report(label, r; blocks=CORE_BLOCKS, note::String="", reference_audit::Bool=false)
     print(rpad(label, LBLW))
     for b in blocks
         print(cell(getfield(r.scores, b)))
@@ -117,6 +117,7 @@ function report(label, r; blocks=CORE_BLOCKS, note::String="")
         note
     )
     report_gauge(r)
+    reference_audit && report_reference_audit(r)
     return nothing
 end
 
@@ -172,6 +173,46 @@ function report_gauge(r)
     return nothing
 end
 
+"""Print geometry and structural-identifiability diagnostics for `Gref`."""
+function report_reference_audit(r)
+    hasproperty(r, :gauge) || return nothing
+    g = r.gauge
+    g === nothing && return nothing
+    geom = g.reference
+    isfinite(geom.raw.raw.rmse) || return nothing
+    moved = g.maps.nonorthogonality > 1e-6 || g.C.procrustes.rmse > 1e-6
+    if moved
+        @printf(
+            "   reference: G raw/proc/linear %.3f / %.3f / %.3f; contrasts proc/linear %.3f / %.3f; distances(proc) %.3f; centroid(proc) %.3f\n",
+            geom.raw.raw.rmse, geom.procrustes.raw.rmse, geom.linear.raw.rmse,
+            geom.procrustes.contrasts.rmse, geom.linear.contrasts.rmse,
+            geom.procrustes.distances.rmse, geom.procrustes.centroid,
+        )
+    else
+        @printf(
+            "   reference: basis fixed; G %.3f; contrasts %.3f; distances %.3f; centroid %.3f\n",
+            geom.raw.raw.rmse, geom.raw.contrasts.rmse,
+            geom.raw.distances.rmse, geom.raw.centroid,
+        )
+    end
+    if hasproperty(r, :reference_design) && r.reference_design !== nothing
+        d = r.reference_design
+        tr = r.reference_translation
+        @printf(
+            "              design rank %d/%d (affine nullity %d); common-origin translation nullity %d/%d\n",
+            d.rank, d.columns, d.affine_nullity, tr.nullity, tr.rank + tr.nullity,
+        )
+    end
+    if hasproperty(r, :reference_initial) && isfinite(r.reference_initial.rmse)
+        @printf(
+            "              initialization error %.3f; movement raw/contrasts %.3f / %.3f\n",
+            r.reference_initial.rmse, r.reference_movement.raw,
+            r.reference_movement.contrasts,
+        )
+    end
+    return nothing
+end
+
 """
     run_row(printer, label, f, kwargs; note) -> result or nothing
 
@@ -221,6 +262,19 @@ function aggregate(rs)
     )
     m(f) = center([Float64(f(r)) for r in good])[1]
     gauge = hasproperty(good[1], :gauge) ? aggregate_gauge(good) : nothing
+    reference_design = hasproperty(good[1], :reference_design) ?
+                       good[1].reference_design : nothing
+    reference_translation = hasproperty(good[1], :reference_translation) ? (
+        rank=round(Int, m(r -> r.reference_translation.rank)),
+        nullity=round(Int, m(r -> r.reference_translation.nullity)),
+    ) : nothing
+    reference_initial = hasproperty(good[1], :reference_initial) ? (
+        rmse=m(r -> r.reference_initial.rmse), corr=m(r -> r.reference_initial.corr),
+    ) : NOSCORE
+    reference_movement = hasproperty(good[1], :reference_movement) ? (
+        raw=m(r -> r.reference_movement.raw),
+        contrasts=m(r -> r.reference_movement.contrasts),
+    ) : (raw=NaN, contrasts=NaN)
     return (
         scores=sc,
         elbo=m(r -> r.elbo),
@@ -230,6 +284,10 @@ function aggregate(rs)
         rho=m(r -> r.rho),
         nseeds=length(good),
         gauge=gauge,
+        reference_design=reference_design,
+        reference_translation=reference_translation,
+        reference_initial=reference_initial,
+        reference_movement=reference_movement,
     )
 end
 
@@ -240,9 +298,20 @@ function aggregate_gauge(good)
         (rmse=m(r -> getproperty(getproperty(r.gauge, which), b).rmse),
          corr=m(r -> getproperty(getproperty(r.gauge, which), b).corr))
     end)
+    geometry(which) = (
+        raw=(rmse=m(r -> getproperty(r.gauge.reference, which).raw.rmse),
+             corr=m(r -> getproperty(r.gauge.reference, which).raw.corr)),
+        contrasts=(rmse=m(r -> getproperty(r.gauge.reference, which).contrasts.rmse),
+                   corr=m(r -> getproperty(r.gauge.reference, which).contrasts.corr)),
+        distances=(rmse=m(r -> getproperty(r.gauge.reference, which).distances.rmse),
+                   corr=m(r -> getproperty(r.gauge.reference, which).distances.corr)),
+        centroid=m(r -> getproperty(r.gauge.reference, which).centroid),
+    )
     return (
         raw=branch(:raw), procrustes=branch(:procrustes), linear=branch(:linear),
         Ggram=(rmse=m(r -> r.gauge.Ggram.rmse), corr=m(r -> r.gauge.Ggram.corr)),
+        reference=(raw=geometry(:raw), procrustes=geometry(:procrustes),
+                   linear=geometry(:linear)),
         maps=(nonorthogonality=m(r -> r.gauge.maps.nonorthogonality),),
         C=(
             procrustes=(rmse=m(r -> r.gauge.C.procrustes.rmse),

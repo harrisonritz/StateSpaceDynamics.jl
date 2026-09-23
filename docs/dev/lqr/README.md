@@ -22,6 +22,7 @@ Useful subsets:
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=goldstandard
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=modelrecovery,switching
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=procedure --gen=lqr
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=reference-audit
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --no-figures
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder --only=smoulder-gref
@@ -49,6 +50,7 @@ every run).
 | `biological.md` | the same question for a system that may only be *approximately* control-like |
 | `biological.jl` | its measurements — also self-contained |
 | `implementation-plan.md` | the plan that follows from both: a closed-loop state model for noisy, approximately optimal neural systems |
+| `reference_audit.jl` | target-column matching, marginal-likelihood curvature, exact EM-step checks, paired costate controls |
 
 `parameterization.md` is the one file here that is not a recovery sweep. It
 takes the findings below as given and asks the prior question: whether the
@@ -84,6 +86,9 @@ There is deliberately no session variable and no emission grouping in these
 experiments. Only `Qc` depends on the known reward label. Since the terminal
 cost is the last member of `Qc`, both running and terminal costs get one copy
 per reward, while `A`, `S`, `Gref`, `Σ`, and the Poisson emission are shared.
+Because the target input is one-hot, `h` is frozen at zero in every fitted
+smoulder model; otherwise it duplicates the input intercept and leaves the
+reference origin free to drift along the gauge.
 
 The full suite is expensive: each fit processes 15 million counts, and the
 initialization/prior sweep contains multiple fits over each seed. Use
@@ -91,6 +96,17 @@ initialization/prior sweep contains multiple fits over each seed. Use
 submitting `--smoulder` as a threaded batch job.
 
 ### Reading the `Gref` audit
+
+The ordinary Gaussian harness uses fixed `C = [I 0]`, so its state-coordinate
+map is the identity and a separate Procrustes line would repeat the raw score.
+The explicit fitted-loading audit is an opt-in smoulder experiment; run its
+quick-sized version with:
+
+```console
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=smoulder-gref
+```
+
+(`--smoulder --only=smoulder-gref` selects the full smoulder dimensions.)
 
 When the Poisson loading is fitted, plant coordinates have an orthogonal gauge.
 If `x_true = T*x_fit`, consistency requires transforming all control parameters:
@@ -114,6 +130,18 @@ of coordinates uses `x_true = T*x_fit` and `lambda_true = T^{-T}lambda_fit`, so
 `T'T` is near identity, the ambiguity is only rotational. If only the full map
 works, the fit also contains latent scaling or shear and `Gref'Gref` is not an
 invariant assessment.
+
+There is a separate reference-origin gauge even when `C` is known. For one-hot
+target codes, `sum(u) = 1`, so a common shift of every reference column can be
+absorbed by the costate intercept. The diagnostic therefore also reports
+centred reference contrasts, pairwise target distances, the rank/nullity of the
+augmented design `[1; u]`, and the number of common-translation directions left
+unidentified after accounting for the active cost matrices and whether `h` and
+`hf` are fitted. It also prints the initialization error and how far `Gref`
+actually moved, which distinguishes a fitted answer from a starting value that
+the EM iterations barely updated. Pairwise distances are invariant to
+both an orthogonal latent rotation and a common reference translation;
+`Gref'Gref` is not translation invariant.
 
 ## What it measures
 
@@ -183,6 +211,12 @@ latent basis, and the cost given the latents — and mixing them tells you nothi
 about either. `observe_costate` widens the readout to `C = I`; `--free-C` folds
 the latent-basis problem back in.
 
+Whenever a fitted model has reference-input columns, the harness freezes `h` at
+zero by default. The one-hot `u_r` columns sum to one, so a free affine drift is
+an exactly redundant intercept. The `h estimated` rows in experiment 2b and the
+overview, procedure, and gold-standard controls opt back into that degeneracy
+deliberately.
+
 ## Figures
 
 | file | what it shows |
@@ -235,6 +269,17 @@ per cell would mostly report which seed it got.
 From the default tier: `n = 3`, `T = 25`, `N = 400` trials, 3 seeds, medians.
 Rerun it — these will drift, and the point of the harness is that they can be
 re-measured rather than remembered.
+
+**These tables predate two harness changes and have not been rerun since.**
+They were measured when every fit estimated `h`, including fits with one-hot
+reference inputs; the harness now freezes `h` whenever there is a reference
+input. Almost every experiment has one, so treat the rows below as
+measured under the old default. The exceptions are the two tables that set `h`
+explicitly — experiment 2b's `h estimated` / `h frozen` columns and the
+reference-permutation audit — and runs with `nref = 0`. They were also measured
+before the package conditioned on the terminal event by default
+(`condition_terminal = true`), so terminal-condition rows scored the joint
+`p(y, terminal = 0)` rather than today's conditional objective.
 
 ### The control problem comes back; the cost that induces it comes back less well
 
@@ -306,9 +351,9 @@ to `1e-6`. Restarts fail because the ELBO ranks the cold start best every time �
 under misspecification the bound is not a guide to recovery. And a warm start
 *at the truth* ends at `Qc` 0.394: EM walks away from the generating parameters.
 
-### One reference target is confounded with the affine drift; two are not
+### One reference has no contrasts; several identify contrasts, not the origin
 
-At a loose `Σ_λλ`, where the reference is identifiable at all (`rand`):
+At a loose `Σ_λλ`, where the reference contrasts can move (`rand`):
 
 | targets | `Gref`, `h` estimated | `Gref`, `h` frozen at 0 |
 |---|---|---|
@@ -317,24 +362,102 @@ At a loose `Σ_λλ`, where the reference is identifiable at all (`rand`):
 | 4 | 0.077 / 1.00 | 0.078 / 1.00 |
 | 8 | 0.076 / 1.00 | 0.078 / 1.00 |
 
-Exactly the structure the model's own documentation implies. With one target the
-input never varies, `−Q₁ G_r u` is a constant, and the costate half of `h` is
-another one; freezing `h` at its true value recovers the reference 5.6×
-better. From two targets on, the contrasts identify it and `h` is irrelevant.
-Past four targets nothing more is bought.
+With one target the input never varies, `−Q₁ G_r u` is a constant, and the
+costate half of `h` is another one; freezing `h` at its true value recovers the
+reference 5.6× better. From two targets on, the contrasts are identified and,
+for this zero-centred truth and zero-centred initialization, the raw score also
+looks identified. That does **not** identify the common origin: with one active
+running cost, `Gref → Gref + δ1'` and `h_λ → h_λ + Qδ` are the same model for
+any `δ`. The old raw metric silently selected the initialization's origin.
+The new contrast/distance and translation-nullity diagnostics make that visible.
 
-### The reference lives in the costate, so it needs the costate
+### The apparent reference permutation is retained initialization
 
-The tight costate innovation that fixes the cost destroys the reference: `Gref`
-goes from 0.077/1.00 to ~1.05/0.02. As `Σ_λλ → 0` the smoother can satisfy the
-costate recursion for *any* `G_r`, so nothing pins it. Annealing — fit loose,
-then tighten — does not rescue it: it reverts to the loose answer. What does
-work is observing the costate, and there annealing becomes the best setting
-found anywhere (`Gref` 0.022 / 1.00 drawing from the model, 0.104 / 1.00 from
-the agent).
+For the three-dimensional cosine truth with four targets, the cold start is
+exactly `G0 = Gtrue[:, [2,3,4,1]] / 3`. A fit that barely moves therefore looks
+like a column permutation. Reordering its columns `[4,1,2,3]` recovers the
+orientation, but leaves the one-third radius; rescaling `Gref` is not a costate
+scale gauge. The heatmap and entry scatter preserve column order correctly.
 
-**This is a genuine trade, not a tuning failure.** The default serves the cost;
-if the reference is what you care about, start loose and observe the costate.
+Target identity is observed through the one-hot input. Permuting `Gref` alone
+changes the model; permuting the input rows by the same permutation restores
+it. Fixing `C` does not need to resolve target-label switching, because those
+labels were never latent. In the forward dynamics the reference changes the
+state mean through `−S A^{-T} Q_k Gref u_t`; for the nonsingular known plant
+and costs used here this already conveys reference information to state-only
+observations.
+
+Run the focused audit with:
+
+```console
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=reference-audit
+```
+
+It reports the best column matching and a separate radius correction, checks
+likelihood changes with/without relabelling the inputs, and computes the exact
+quadratic marginal-likelihood optimum in `Gref` with other parameters fixed.
+It also checks a Gref-only EM step against an independent quadratic solution
+and compares observed versus complete-data information. The figure
+`reference_permutation_audit.png` includes the initialization explicitly.
+
+For one paired quick-tier dataset (60 trials, 20 bins, 120 reported iterations,
+fixed `C`, fixed `h`, terminal + delay), the relative `Gref` errors are:
+
+| observations | costate-noise initialization | Gref error |
+|---|---|---:|
+| state | tight (`1e-4`) | 1.0254 |
+| state | loose (`5e-2`) | 0.1341 |
+| state + costate | tight (`1e-4`) | 0.9843 |
+| state + costate | loose (`5e-2`) | 0.0206 |
+
+All four arms fit and score `log p(y | terminal = 0)`, the package default
+(`condition_terminal = true`) and the likelihood of what the terminal-conditioned
+sampler draws. An earlier run of this audit, against a package that still fitted
+the joint `p(y, terminal = 0)`, put the state/loose arm at 7.85: that failure was
+the objective mismatch, and it is gone.
+
+The state/tight fit moves just 0.038 truth-RMS units from initialization.
+Column matching alone leaves error 0.681; matching plus a factor of 3.087
+reduces it to 0.110. Yet permuting its columns alone **improves** the log
+likelihood by 206.2 nats, while also relabelling inputs preserves it within
+`7e-12`. Its Gref information matrix has rank 12/12, and optimizing Gref
+directly at the fitted nuisance parameters gains 382.0 nats. This is evidence
+of an unfinished optimization, not a permutation degeneracy.
+
+The tight costate innovation makes the complete-data objective much stiffer
+than the marginal likelihood: costates inferred under the current reference
+resist changing that reference in the next M-step. At the state/tight fit,
+ideal Gref-only EM removes only 6.9e-5 to 5.8e-4 of the error per iteration
+along its eigenmodes, with nuisance parameters held fixed; at the state/loose fit
+it removes 0.087 to 0.35. A small step or ELBO increment therefore does not
+demonstrate lack of information. Earlier wording here claimed that tight noise
+made the reference unidentified; the marginal-likelihood audit contradicts that
+claim. The implemented Gref-only M-step, which carries the terminal normalizer
+`−log Z`, agrees with the independently computed exact update to `3.1e-9`
+relative error in this arm.
+
+With all nuisance parameters fixed at truth, the conditional likelihood has
+rank 12/12 and recovers `Gref` to error 0.0288 using state observations alone,
+or 0.0165 with costate observations. Scoring the joint instead would give 0.0726
+and 0.0240. These oracle controls establish information about Gref given those
+parameters; they do not establish global identifiability of every jointly
+fitted block.
+
+The movement diagnostic confirms that the tight arms' `~1.0` is substantially the
+cold start, whose error is 1.054. In the quick smoulder fixed-`C`, fixed-`h`
+control (`--quick --only=smoulder-gref`, row `truth C, fixed`) the
+initialization error is 0.650, the final raw and centred-contrast errors are both
+0.632, and `Gref` moves only 0.024 truth-RMS units. Its pairwise-distance error
+is 0.864 while its centroid error is 0.003. Thus neither a latent rotation nor
+the reference-origin gauge explains that fit: the target geometry itself stayed
+near its initialization.
+
+In this paired dataset the costate-noise start matters more than observing the
+costate: from a tight start `Gref` barely moves with or without costate
+observations, while from a loose start it comes back either way, and costate
+observations then improve it from 0.134 to 0.021. This is one dataset and one
+seed. The historical gold-standard sweep found good results with costate observations and
+annealing (`Gref` 0.022 / 1.00 drawing from the model, 0.104 / 1.00 from the agent).
 
 ### Terminal conditions and multiple references buy less than expected
 
@@ -446,7 +569,7 @@ candidates score the same quantity:
 | the LQR *optimal trajectory* | −0.640 | −0.470 | **−0.433** | −0.034 | LDS ✗ |
 | a first-order attractor (LDS) | −0.427 | −0.576 | **−0.429** | −0.145 | LDS ✓ |
 
-The LDS competitor has *more* free parameters (52 against 33), so the LQR's win
+The LDS competitor has *more* free parameters (48 against 29), so the LQR's win
 on its own chain is not a win on parsimony.
 
 The middle row is the important one. On optimal-trajectory data — the case the
@@ -599,13 +722,19 @@ recovered from 4.42 to 1.55.
    comes back 3–10× better than the cost matrices do. If you must report the
    cost, report its shape after canonicalization and read `S` for what the scale
    is doing.
-4. **Use two or more distinct reference targets, or freeze `h`.** One target
-   identifies nothing about the reference; two or more identify its contrasts.
-   Past four, nothing more is bought.
-5. **The reference needs the costate.** It enters only through the costate half
-   of the affine term, so the tight innovation that fixes the cost makes `Gref`
-   unidentifiable. If the reference is the question, observe the costate and
-   anneal; otherwise do not report `Gref` at all.
+4. **Use two or more distinct reference targets, and choose an origin.** One
+   target has no reference contrast; two or more identify contrasts. Freeze
+   `h`, impose a centring constraint on `Gref`, or use genuinely different
+   running costs with a shared `h` if the common reference origin matters.
+   A terminal factor with a fitted `hf` does not choose the origin. Past four
+   targets, nothing more is bought here.
+5. **Before reporting `Gref`, check that it moved.** The likelihood carries
+   information about the reference from state observations alone, but at the
+   tight costate innovation that serves the cost, EM corrects well under 1% of
+   the `Gref` error per iteration, so the reported map is mostly its
+   initialization. Read the movement diagnostic first. If the reference is the
+   question, observe the costate and start loose (then anneal); otherwise do not
+   report `Gref` at all.
 6. **Do not spend compute on restarts or on iterations past a few hundred.**
    Neither changes a printed digit. Spend it on observing more of the latent.
 7. **Do not use a likelihood to choose among fits.** Under misspecification the

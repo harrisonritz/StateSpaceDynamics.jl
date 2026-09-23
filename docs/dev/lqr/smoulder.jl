@@ -62,6 +62,12 @@ function transformed_scores(fs, rs, Cf, Cr, rewards, T)
     fv = [group_variant(fs, :Qc, r) for r in rewards]
     rv = [group_variant(rs, :Qc, r) for r in rewards]
     c = plant_dim(fs) / tr(invT' * fv[1].Qc[1] * invT)
+    geometry = reference_geometry(fs.Gref, rs.Gref, T)
+    fit_cl = [closed_loop_or_nothing(v) for v in fv]
+    ref_cl = [closed_loop_or_nothing(v) for v in rv]
+    cl = any(isnothing, fit_cl) || any(isnothing, ref_cl) ? NOSCORE : score_worst(
+        [T*M*invT for M in fit_cl], ref_cl,
+    )
     return (
         Qc=score_worst(
             [c .* (invT' * v.Qc[1] * invT) for v in fv], [v.Qc[1] for v in rv]; sym=true
@@ -71,11 +77,11 @@ function transformed_scores(fs, rs, Cf, Cr, rewards, T)
         ),
         A=score(T*fs.A*invT, rs.A),
         S=score((T*fs.S*T') ./ c, rs.S; sym=true),
-        Gref=score(T*fs.Gref, rs.Gref),
-        cl=score_worst(
-            [T*closed_loop_dynamics(v)*invT for v in fv],
-            [closed_loop_dynamics(v) for v in rv],
-        ),
+        Gref=geometry.raw,
+        Gcenter=geometry.contrasts,
+        Gdist=geometry.distances,
+        Gcentroid=(rmse=geometry.centroid, corr=NaN),
+        cl=cl,
         C=score(view(Cf, :, 1:size(T, 1))*invT, view(Cr, :, 1:size(T, 1))),
     )
 end
@@ -95,15 +101,18 @@ function smoulder_scores(fit_lds, ref_lds, rewards)
     rv = [group_variant(rs, :Qc, r) for r in rewards]
     raw_run = score_worst([v.Qc[1] for v in fv], [v.Qc[1] for v in rv]; sym=true)
     raw_term = score_worst([v.Qc[end] for v in fv], [v.Qc[end] for v in rv]; sym=true)
-    raw_cl = score_worst(
-        [closed_loop_dynamics(v) for v in fv],
-        [closed_loop_dynamics(v) for v in rv],
-    )
+    fit_cl = [closed_loop_or_nothing(v) for v in fv]
+    ref_cl = [closed_loop_or_nothing(v) for v in rv]
+    raw_cl = any(isnothing, fit_cl) || any(isnothing, ref_cl) ? NOSCORE :
+             score_worst(fit_cl, ref_cl)
     Gf, Gr = fs.Gref, rs.Gref
+    raw_geometry = reference_geometry(Gf, Gr)
     return (
         raw=(
             Qc=raw_run, Qterm=raw_term, A=score(fs.A, rs.A),
-            S=score(fs.S, rs.S; sym=true), Gref=score(Gf, Gr), cl=raw_cl,
+            S=score(fs.S, rs.S; sym=true), Gref=raw_geometry.raw,
+            Gcenter=raw_geometry.contrasts, Gdist=raw_geometry.distances,
+            Gcentroid=(rmse=raw_geometry.centroid, corr=NaN), cl=raw_cl,
             C=score(view(fit.obs_model.C, :, 1:n), view(ref.obs_model.C, :, 1:n)),
         ),
         aligned=transformed_scores(fs, rs, fit.obs_model.C, ref.obs_model.C, rewards, T),
@@ -247,7 +256,9 @@ function smoulder_fit_model(truth, ys; emission_init::Symbol=:pca,
         schedule=copy(ref.schedule), terminal=true, Σf=copy(ref.Σf),
         P0=Matrix(0.2I, 2n, 2n), Bu=zeros(2n, ntargets),
         Gref=0.35 .* ring_map(n, ntargets), observe_costate=false,
-        fit_flags=LQRFitFlags(A=!known_plant, S=!known_plant, Bu=false, Gref=true),
+        fit_flags=LQRFitFlags(
+            A=!known_plant, S=!known_plant, h=false, Bu=false, Gref=true
+        ),
     )
     set_depends_on!(sm, (Qc=truth.rewards,))
     sm.Σ_prior = sigma_prior(
@@ -295,25 +306,43 @@ function recover_smoulder_lqr(; n::Int=12, tsteps::Int=100, ntrials::Int=1000,
         known_plant=known_plant, q0=q0, sig0_costate=sig0_costate,
         sigma_prior_strength=sigma_prior_strength,
         qc_prior_strength=qc_prior_strength, fit_emission=fit_emission, seed=seed)
+    initial_gref = copy(fit.state_model.Gref)
     trace = fit!(fit, ys; ux=truth.uxs, max_iter=max_iter, tol=1e-5,
         newton_max_iter=10, newton_tol=1e-5, progress=false)
+    design = reference_design_audit(truth.uxs)
+    variants = [group_variant(truth.lds.state_model, :Qc, r) for r in 1:nrewards]
     return (scores=smoulder_scores(fit, truth.lds, 1:nrewards),
             elbos=collect(trace), fit=fit, truth=truth.lds,
-            rewards=truth.rewards)
+            rewards=truth.rewards, reference_design=design,
+            reference_translation=reference_translation_audit(variants, design),
+            reference_initial=score(initial_gref, truth.lds.state_model.Gref),
+            reference_movement=reference_movement(
+                fit.state_model.Gref, initial_gref, truth.lds.state_model.Gref))
 end
 
 function print_smoulder_header()
-    @printf("%-30s %8s %8s %8s %8s %8s %8s %8s\n",
+    @printf("%-30s %8s %8s %8s %8s %8s %8s %8s %8s %8s %8s\n",
         "condition", "Q raw", "Q proc", "Q linear", "Gr raw", "Gr proc",
-        "Gr linear", "G'G")
-    println("-"^98)
+        "Gr linear", "Gr ctr", "pairdist", "centroid", "G'G")
+    println("-"^125)
 end
 
 function print_smoulder_row(label, r)
     s = r.scores
-    @printf("%-30s %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f\n", label,
+    @printf("%-30s %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f %8.3f\n", label,
         s.raw.Qc.rmse, s.aligned.Qc.rmse, s.linear.Qc.rmse, s.raw.Gref.rmse,
-        s.aligned.Gref.rmse, s.linear.Gref.rmse, s.Ggram.rmse)
+        s.aligned.Gref.rmse, s.linear.Gref.rmse, s.aligned.Gcenter.rmse,
+        s.aligned.Gdist.rmse, s.aligned.Gcentroid.rmse, s.Ggram.rmse)
+    if hasproperty(r, :reference_design) && r.reference_design !== nothing
+        d, tr = r.reference_design, r.reference_translation
+        @printf("   design rank %d/%d; affine nullity %d; common-origin nullity %d/%d\n",
+            d.rank, d.columns, d.affine_nullity, tr.nullity, tr.rank + tr.nullity)
+    end
+    if hasproperty(r, :reference_initial)
+        @printf("   initialization error %.3f; movement raw/contrasts %.3f / %.3f\n",
+            r.reference_initial.rmse, r.reference_movement.raw,
+            r.reference_movement.contrasts)
+    end
 end
 
 function aggregate_smoulder(rs)
@@ -328,9 +357,20 @@ function aggregate_smoulder(rs)
     raw = NamedTuple{blocks}(map(b -> pair(:raw, b), blocks))
     aligned = NamedTuple{blocks}(map(b -> pair(:aligned, b), blocks))
     linear = NamedTuple{blocks}(map(b -> pair(:linear, b), blocks))
-    return (scores=(raw=raw, aligned=aligned, linear=linear,
+    out = (scores=(raw=raw, aligned=aligned, linear=linear,
         Ggram=(rmse=med(r -> r.scores.Ggram.rmse),
-               corr=med(r -> r.scores.Ggram.corr))),)
+               corr=med(r -> r.scores.Ggram.corr))),
+        reference_design=good[1].reference_design,
+        reference_translation=(
+            rank=round(Int, med(r -> r.reference_translation.rank)),
+            nullity=round(Int, med(r -> r.reference_translation.nullity)),
+        ))
+    hasproperty(good[1], :reference_initial) || return out
+    return (out...,
+        reference_initial=(rmse=med(r -> r.reference_initial.rmse),
+                           corr=med(r -> r.reference_initial.corr)),
+        reference_movement=(raw=med(r -> r.reference_movement.raw),
+                            contrasts=med(r -> r.reference_movement.contrasts)))
 end
 
 """Initialization and prior sweep on known reward-dependent costs."""
@@ -394,11 +434,15 @@ function experiment_smoulder_gref(cfg; figures::Bool=true)
     end
     refresh!(fsm)
     exact = smoulder_scores(fake, truth.lds, 1:c.rewards)
+    exact_design = reference_design_audit(truth.uxs)
+    exact_variants = [group_variant(truth.lds.state_model, :Qc, r) for r in 1:c.rewards]
+    exact_row = (scores=exact, reference_design=exact_design,
+        reference_translation=reference_translation_audit(exact_variants, exact_design))
 
     section("6b — Gref gauge audit")
     println("An exact rotation leaves the model unchanged but makes raw parameters disagree:")
     print_smoulder_header()
-    print_smoulder_row("exact rotated representation", (scores=exact,))
+    print_smoulder_row("exact rotated representation", exact_row)
     @printf("   emission Procrustes residual: %.3e\n", exact.aligned.C.rmse)
     @printf("   full-linear residual: %.3e; non-orthogonality: %.3e\n",
         exact.linear.C.rmse, exact.nonorthogonality)
@@ -484,7 +528,7 @@ function smoulder_slqr_fit(truth, ys; sig0_costate::Float64=2e-2,
     M, Q = free_drift(n; decay=0.88, costate_decay=0.8, noise=0.12)
     free = free_state_model(M, Q; P0=Matrix(0.2I, 2n, 2n),
         Bu=zeros(2n, size(base.state_model.Gref, 2)), observe_costate=false,
-        fit_flags=LQRFitFlags(Bu=false))
+        fit_flags=LQRFitFlags(h=false, Bu=false))
     set_depends_on!(free, (Qc=truth.rewards,))
     om1 = deepcopy(base.obs_model); om2 = deepcopy(base.obs_model)
     l1 = LinearDynamicalSystem(base.state_model, om1)
@@ -504,13 +548,21 @@ function recover_smoulder_slqr(; n::Int=12, tsteps::Int=100, ntrials::Int=1000,
     slds = smoulder_slqr_fit(truth, ys; sig0_costate=sig0_costate,
         sigma_prior_strength=sigma_prior_strength,
         qc_prior_strength=qc_prior_strength, fit_noise=fit_noise)
+    initial_gref = copy(slds.LDSs[LQR_STATE].state_model.Gref)
     trace = fit!(slds, ys; ux=truth.uxs, max_iter=max_iter, smoothing_iters=2,
         progress=false, rng=MersenneTwister(300seed), tied_params=(:C, :d))
     post = smooth(slds, ys; ux=truth.uxs, smoothing_iters=100, progress=false)
     fitlds = slds.LDSs[LQR_STATE]
+    design = reference_design_audit(truth.uxs)
+    variants = [group_variant(truth.lds.state_model, :Qc, r) for r in 1:nrewards]
     return (scores=smoulder_scores(fitlds, truth.lds, 1:nrewards),
         gamma=gamma_scores(post.γ, zs; K=2), onset=onset_error(post.γ, zs;
-            lqr_state=LQR_STATE), elbos=collect(trace), fit=slds, truth=truth.lds)
+            lqr_state=LQR_STATE), elbos=collect(trace), fit=slds, truth=truth.lds,
+        reference_design=design,
+        reference_translation=reference_translation_audit(variants, design),
+        reference_initial=score(initial_gref, truth.lds.state_model.Gref),
+        reference_movement=reference_movement(
+            fitlds.state_model.Gref, initial_gref, truth.lds.state_model.Gref))
 end
 
 function experiment_smoulder_slqr(cfg; figures::Bool=true)
@@ -560,6 +612,8 @@ function smoulder_selftest()
     @assert vs[1].Gref === vs[2].Gref === vs[3].Gref
     @assert !(vs[1].Qc[1] ≈ vs[2].Qc[1])
     @assert !(vs[1].Qc[end] ≈ vs[2].Qc[end])
+    fit = smoulder_fit_model(truth, Matrix{Float64}[]; emission_init=:truth)
+    @assert !fit.state_model.fit_flags.h
 
     W = random_orthogonal(MersenneTwister(910), 3)
     rotated = deepcopy(truth.lds)
@@ -585,6 +639,8 @@ function smoulder_selftest()
     @assert sc.aligned.S.rmse < 1e-10
     @assert sc.aligned.cl.rmse < 1e-10
     @assert sc.Ggram.rmse < 1e-10
+    @assert sc.aligned.Gcenter.rmse < 1e-10
+    @assert sc.aligned.Gdist.rmse < 1e-10
     println("smoulder selftest passed")
     return nothing
 end

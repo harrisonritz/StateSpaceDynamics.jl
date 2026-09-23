@@ -163,7 +163,7 @@ function experiment_overview(cfg; figures::Bool=true, free_C::Bool=false)
         report,
         "  with 4 references",
         recover,
-        (; base..., drift=true, nref=4);
+        (; base..., drift=true, nref=4, free_h=true);
         blocks=(:Qc, :Gref, :S, :h, :cl),
     )
 
@@ -242,9 +242,10 @@ and that several cost regimes or a terminal factor separate them. Freezing `B_u`
 removes that particular collision, but a weaker version of it survives — with a
 single reference the input never varies, so `−Q₁ G_r u` is a constant and
 competes with the affine drift `h`. Two or more targets identify the *contrasts*
-between reference vectors; something that breaks the within-trial symmetry
-identifies their common level. The factorial is the experiment that says whether
-that is true and by how much.
+between reference vectors. Their common level remains gauge-dependent unless a
+second active running cost with shared `h`, a fixed `h`, or an explicit centring
+constraint pins it; a terminal factor with fitted `hf` does not. The factorial
+is the experiment that says how much each structural feature buys in practice.
 """
 function experiment_design(cfg; gen::Symbol=:lqr, figures::Bool=true, free_C::Bool=false)
     n, T, N, mi = cfg.n, cfg.tsteps, cfg.ntrials, cfg.max_iter
@@ -319,9 +320,9 @@ data separates them. With two or more targets the term varies across trials, and
 the contrasts between reference vectors are identified whatever `h` does.
 
 So: `Gref` recovery against the number of targets, once with `h` estimated and
-once with `h` frozen at zero. If the account above is right, the two series
-should be far apart at one target and on top of each other by four — and the
-gap, not the level, is the result.
+once with `h` frozen at zero. The audit below each raw row separates centred
+contrasts and pairwise distances from the common origin, and reports both the
+augmented input-design nullity and the remaining LQR translation nullity.
 
 This runs at a loose `Σ_λλ`, against the harness default, because the default is
 what makes the reference unidentifiable in the first place; see the comment on
@@ -380,7 +381,8 @@ function experiment_reference_identification(
         a = aggregate(res[(fh, r)])
         a === nothing && continue
         report(
-            rpad("$(r) refs, h $(fh ? "estimated" : "frozen at 0")", LBLW), a; blocks=blocks
+            rpad("$(r) refs, h $(fh ? "estimated" : "frozen at 0")", LBLW), a;
+            blocks=blocks, reference_audit=true,
         )
     end
 
@@ -406,7 +408,7 @@ function experiment_reference_identification(
         ],
         xlabel="distinct reference targets",
         xticks=(refs, string.(refs)),
-        title="One reference is confounded with the drift; several are not — " *
+        title="Several references identify contrasts; the origin needs a constraint — " *
               "$(gen === :lqr ? "agent" : "model")",
     )
     return res
@@ -543,7 +545,7 @@ function experiment_procedure(cfg; gen::Symbol=:lqr, figures::Bool=true, free_C:
         ("inner M-step 25 iters", (; base..., max_iter=mi, mstep_iters=25)),
         ("inner M-step 400 iters", (; base..., max_iter=mi, mstep_iters=400)),
         ("loose tol (1e-6)", (; base..., max_iter=mi, tol=1e-6)),
-        ("affine drift h frozen at 0", (; base..., max_iter=mi, free_h=false)),
+        ("affine drift h estimated", (; base..., max_iter=mi, free_h=true)),
         ("plant estimated too", (; base..., max_iter=mi, known_plant=false)),
         ("4× the EM budget", (; base..., max_iter=4mi)),
         ("costate observed", (; base..., max_iter=mi, observe_costate=true)),
@@ -1036,7 +1038,7 @@ function experiment_gold_standard(cfg; figures::Bool=true)
         ("tight + q0 = 0.1", (; q0=0.1)),
         ("tight + 4 restarts", (; restarts=4)),
         ("tight + 4× iterations", (; max_iter=4cfg.max_iter)),
-        ("tight + h frozen at 0", (; free_h=false)),
+        ("tight + h estimated", (; free_h=true)),
         ("tight + Σ held at the start", (; fit_noise=false)),
         ("anneal 5e-2 → 1e-4", (; sig0_costate=1e-4, anneal_costate=5e-2)),
         ("tight + costate observed", (; observe_costate=true)),
