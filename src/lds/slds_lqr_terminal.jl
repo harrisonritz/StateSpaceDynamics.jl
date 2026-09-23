@@ -29,6 +29,9 @@ so its discrete posterior is driven by the dynamics alone and settles quickly.
 =#
 const _SLQR_PROBE_ITERS = 20
 
+# Seed of the probe's own stream; see `_SLQRProbe.rng` and `_slqr_restart!`.
+const _SLQR_PROBE_SEED = 0x5109
+
 """
     _slds_condition_terminal(slds) -> Bool
 
@@ -170,7 +173,7 @@ function _slqr_terminal_probe(
         design_of,
         fill(T(NaN), length(designs)),
         sufs,
-        Random.Xoshiro(0x5109),
+        Random.Xoshiro(_SLQR_PROBE_SEED),
         smoothing_iters,
         T(NaN),
         false,
@@ -214,6 +217,13 @@ probe's own observation density.
 """
 function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
     _prepare_slds!(probe.slds, probe.data.tsteps)
+    #=
+    The pool caches each member's smoother constants from whenever they were
+    last computed, and the smoother reads them without looking at the model. A
+    probe built fresh never notices; one smoothed again after its parameters
+    moved would smooth under the old ones and score under the new.
+    =#
+    refresh_slds_pool!(probe.pool, probe.slds)
     if !probe.started
         _slds_warmstart!(
             probe.slds,
@@ -287,6 +297,24 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
     return probe
 end
 
+"""
+    _slqr_restart!(probe) -> probe
+
+Return the probe to the state it was built in, so that its next E-step is the
+one a freshly built probe would run: warm start included, and the stream
+reseeded.
+
+`log Z-hat` is a function of the parameters only if every evaluation starts
+from the same place. The reported score builds its probe fresh, so an M-step
+that judges proposals with a probe carried over from the last point it visited
+would be judging them on a different number.
+"""
+function _slqr_restart!(probe::_SLQRProbe)
+    probe.started = false
+    Random.seed!(probe.rng, _SLQR_PROBE_SEED)
+    return probe
+end
+
 # --- normalizer-backend interface, shared with the non-switching M-step -----
 
 #=
@@ -299,7 +327,22 @@ the live parameters over, and keep the probe's nulled priors — the data side
 already carries those, and counting them on both sides would cancel them.
 =#
 function _terminal_probe_stats!(b::_SLQRNormalizer, sms)
-    probe = b.probe
+    sufs, psms = _slqr_copy_lqr_params!(b.probe, sms)
+    for (target, hs) in zip(psms, sufs)
+        _fill_mixed_blocks!(hs, target)
+    end
+    return (sufs, psms)
+end
+
+"""
+    _slqr_copy_lqr_params!(probe, sms) -> (sufs, psms)
+
+Copy the M-step's inverse-LQR state parameters onto the matching probe members
+and return those members with their statistics. `sms` holds only the
+inverse-LQR states, in discrete-state order, which is how the M-step context
+collects them.
+"""
+function _slqr_copy_lqr_params!(probe::_SLQRProbe, sms)
     lqr = [
         k for k in eachindex(probe.slds.LDSs) if
         probe.slds.LDSs[k].state_model isa LQRStateModel &&
@@ -310,7 +353,7 @@ function _terminal_probe_stats!(b::_SLQRNormalizer, sms)
     length(psms) == length(sms) || error(
         "terminal probe has $(length(psms)) inverse-LQR states, model has $(length(sms))",
     )
-    for (target, source, hs) in zip(psms, sms, sufs)
+    for (target, source) in zip(psms, sms)
         for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
             copyto!(getproperty(target, key), getproperty(source, key))
         end
@@ -318,9 +361,29 @@ function _terminal_probe_stats!(b::_SLQRNormalizer, sms)
             copyto!(target.Qc[k], source.Qc[k])
         end
         refresh!(target)
-        _fill_mixed_blocks!(hs, target)
     end
     return (sufs, psms)
+end
+
+#=
+The number the fit trace divides by, at the M-step's current parameters: the
+probe restarted and smoothed exactly as `_slds_terminal_trial_logz` smooths a
+fresh one. That is one probe E-step per call, which is why only the acceptance
+check asks for it. A chain the probe cannot factor at these parameters throws,
+and the caller's rejectable-error handling turns that into a rejected point.
+=#
+function _terminal_score_logz(b::_SLQRNormalizer, sms)
+    _slqr_copy_lqr_params!(b.probe, sms)
+    _slqr_restart!(b.probe)
+    _slqr_probe_estep!(b.probe)
+    return b.probe.logz
+end
+
+# The surrogate reads the probe's statistics and nothing else of its posterior.
+_terminal_save(b::_SLQRNormalizer) = deepcopy(b.probe.sufs)
+function _terminal_restore!(b::_SLQRNormalizer, saved)
+    copyto!(b.probe.sufs, saved)
+    return nothing
 end
 
 """

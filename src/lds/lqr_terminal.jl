@@ -150,6 +150,15 @@ posterior, which is tight at `θ′` and has the right gradient there, but is a
 surrogate rather than a majorant — hence [`_slds_terminal_report`](@ref), which
 reports the joint ELBO and the normalizer separately so the approximation stays
 visible in the fit trace.
+
+It is worse than "not a majorant": holding the probe posterior `r` fixed makes
+its term a *lower* bound on `log Z(θ)`, so the surrogate under-states `f` away
+from `θ′`, and wherever the probe's weighted scatter exceeds the data's the
+difference `-Q_data + Q_probe` is unbounded below — a line search follows it
+into a singular `Σ`. The inner optimizer may therefore only *propose*; what
+decides is [`_lqr_accept_conditional!`](@ref), against the normalizer
+re-evaluated at the proposal ([`_terminal_score_logz`](@ref)), which for the
+switching backend means re-smoothing the probe there.
 =#
 struct _LQRExactNormalizer{P}
     probes::P
@@ -179,6 +188,33 @@ function _terminal_extra_value(b::_LQRExactNormalizer, sms)
 end
 
 _terminal_extra_value(::_SLQRNormalizer, sms) = zero(eltype(sms[1].A))
+
+"""
+    _terminal_score_logz(backend, sms) -> T
+
+`log Z` at the models' *current* parameters, obtained the same way the reported
+score obtains it — the number a proposal is accepted or rejected on.
+
+For the exact backend that is the Gaussian integral itself. For the switching
+one it is a fresh probe E-step, which also moves the probe's posterior to these
+parameters; [`_terminal_save`](@ref) / [`_terminal_restore!`](@ref) are how a
+caller that still needs the old posterior gets it back.
+"""
+_terminal_score_logz(b::_LQRExactNormalizer, sms) = _terminal_extra_value(b, sms)
+
+"""Whether the score can differ from the surrogate's value at all. It cannot
+when `log Z` is exact, and a caller may then skip computing it twice."""
+_terminal_rescores(::_LQRExactNormalizer) = false
+_terminal_rescores(::_SLQRNormalizer) = true
+
+"""
+    _terminal_save(backend) / _terminal_restore!(backend, saved)
+
+Whatever of the backend's state the surrogate reads and scoring overwrites. The
+exact backend recomputes its probe moments at every point, so has none.
+"""
+_terminal_save(::_LQRExactNormalizer) = nothing
+_terminal_restore!(::_LQRExactNormalizer, ::Nothing) = nothing
 
 """Terminal-conditioned prior moments at the current parameters."""
 function _terminal_probe_stats!(b::_LQRExactNormalizer, sms)
@@ -293,7 +329,18 @@ function _lqr_conditional_problem(
         _lqr_refresh_precision!(ctx)
         return nothing
     end
-    function evaluate!(gradient, theta)
+    #=
+    `score = true` evaluates the objective the step is judged on rather than the
+    one the line search descends: `-Q_data` in full, plus `log Z` from
+    `_terminal_score_logz`. Under the exact backend the two coincide. Under the
+    switching one the probe's fixed-posterior density drops out and the probe is
+    re-smoothed at `theta` instead — value only, since that is all a judgement
+    needs.
+    =#
+    function evaluate!(gradient, theta; score::Bool=false)
+        score &&
+            gradient !== nothing &&
+            throw(ArgumentError("the acceptance score has no gradient"))
         gradient === nothing || fill!(gradient, zero(T))
         try
             write!(theta)
@@ -307,7 +354,8 @@ function _lqr_conditional_problem(
             value. A value-only call under an exact normalizer does not need it,
             and skipping it there is what keeps the acceptance check cheap.
             =#
-            want_probe = gradient !== nothing || probe_weight
+            weighted = probe_weight && !score
+            want_probe = !score && (gradient !== nothing || probe_weight)
             psufs, psms =
                 want_probe ? _terminal_probe_stats!(backend, sms) : (nothing, nothing)
             negative = if want_probe
@@ -346,19 +394,23 @@ function _lqr_conditional_problem(
                 chol_Σ = cholesky(Symmetric(sm.Σ); check=false)
                 chol_Σf = cholesky(Symmetric(sm.Σf); check=false)
                 (issuccess(chol_Σ) && issuccess(chol_Σf)) || return T(Inf)
-                wN = probe_weight ? netN(s) : ctx.N_q[s]
-                wNf = probe_weight ? netNf(s) : ctx.Nf_q[s]
+                wN = weighted ? netN(s) : ctx.N_q[s]
+                wNf = weighted ? netNf(s) : ctx.Nf_q[s]
                 value += T(0.5) * (wN * logdet(chol_Σ) + wNf * logdet(chol_Σf))
                 sm.Σ_prior === nothing || (value += _iw_penalty(sm.Σ, sm.Σ_prior))
             end
-            value += _terminal_extra_value(backend, sms)
+            value += if score
+                _terminal_score_logz(backend, sms)
+            else
+                _terminal_extra_value(backend, sms)
+            end
             # Initial state and its priors, including cross-group x0/P0 pairs.
             for (c, (sm, hs)) in enumerate(zip(sms, sufs))
                 base = _state_suf(hs.base)
                 mu = vec(base.init_xy)
                 count = T(base.init_n)
                 yy = copy(base.init_yy[])
-                if probe_weight
+                if weighted
                     b = _state_suf(psufs[c].base)
                     mu -= vec(b.init_xy)
                     count -= T(b.init_n)
@@ -448,7 +500,21 @@ function _lqr_conditional_problem(
             rethrow()
         end
     end
-    return (; theta, evaluate!, write!)
+    #=
+    Scoring re-smooths a switching probe, and the surrogate reads the posterior
+    that probe was smoothed with at θ′. Put it back afterwards, so the two can be
+    called in any order: every surrogate value stays the one the line search saw.
+    =#
+    function score!(theta)
+        saved = _terminal_save(backend)
+        try
+            return evaluate!(nothing, theta; score=true)
+        finally
+            _terminal_restore!(backend, saved)
+        end
+    end
+    rescores = _terminal_rescores(backend)
+    return (; theta, evaluate!, write!, score!, rescores)
 end
 
 """
@@ -460,7 +526,13 @@ Generalized M-step for the terminal-conditioned objective.
 `Q` minorizes the joint, and `log Z` is exact rather than bounded, so the sum is a
 genuine majorant that touches the true objective at `θ\u2032`. Decreasing it therefore
 decreases the *conditional* negative log-likelihood, and EM stays monotone on the
-objective the model now reports. A proposal that does not decrease it is dropped.
+objective the model now reports.
+
+The line search descends the backend's surrogate; the step is judged by
+[`_lqr_accept_conditional!`](@ref), which also re-evaluates `log Z` at each
+candidate. The two agree under an exact normalizer. Under the switching one they
+do not, and a proposal they reject is backtracked toward `θ\u2032` rather than
+dropped outright.
 """
 function _lqr_conditional_mstep!(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,<:LQRStateModel{T}}},
@@ -483,9 +555,8 @@ function _lqr_conditional_mstep!(
 end
 
 function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
-    (; theta, evaluate!, write!) = problem
+    (; theta, evaluate!) = problem
     isempty(theta) && return nothing
-    T = eltype(theta)
     #=
     Evaluated *with* a gradient, so the probe runs here at θ\u2032 rather than first
     being exercised somewhere inside the line search. A probe that cannot be
@@ -496,7 +567,9 @@ function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
     =#
     cached_grad = similar(theta)
     initial = evaluate!(cached_grad, theta)
-    isfinite(initial) || error(
+    gradient = copy(cached_grad)
+    baseline = isfinite(initial) && problem.rescores ? problem.score!(theta) : initial
+    isfinite(baseline) || error(
         "the terminal-conditioned M-step objective is not finite at the current " *
         "parameters. Its normalizer is smoothed on a copy of the model carrying no " *
         "observations, which is the hardest case for the Laplace smoother: an " *
@@ -531,25 +604,102 @@ function _lqr_conditional_mstep!(problem::NamedTuple, ldss::AbstractVector)
         f_reltol=1e-12,
         x_abstol=1e-10,
     )
-    try
-        result = optimize(f_obj, g_obj!, theta, LBFGS(; linesearch=HagerZhang()), options)
-        proposal = Optim.minimizer(result)
-        final = evaluate!(nothing, proposal)
-        write!(isfinite(final) && final <= initial ? proposal : theta)
+    #=
+    A line search that cannot bracket a decrease — because every trial point it
+    tried put the probe's chain out of reach — leaves no proposal, but not
+    nothing to do: the steepest-descent fallback in the acceptance step is still
+    open. Anything that is not a numerical failure at a point still surfaces.
+    =#
+    failure = nothing
+    proposal = try
+        Optim.minimizer(
+            optimize(f_obj, g_obj!, theta, LBFGS(; linesearch=HagerZhang()), options)
+        )
     catch err
-        #=
-        A line search that cannot bracket a decrease — because every trial point
-        it tried put the probe's chain out of reach — is this M-step declining to
-        move, not a broken fit. Generalized EM tolerates that: the E-step runs
-        again next iteration from the same parameters and the ELBO is unchanged
-        rather than worse. Anything that is not a numerical failure at a point
-        still surfaces.
-        =#
-        write!(theta)
         (err isa LineSearchException || _lqr_rejectable(err)) || rethrow()
+        failure = (err, catch_backtrace())
+        theta
+    end
+    moved = _lqr_accept_conditional!(problem, proposal, (initial, baseline), gradient)
+    #=
+    Declining to move is legitimate generalized EM — the E-step runs again from
+    the same parameters and the objective is unchanged rather than worse — but
+    after a failed line search it is worth saying why.
+    =#
+    if !moved && failure !== nothing
         @warn "terminal-conditioned M-step made no progress: every trial point the " *
-              "line search visited was numerically out of reach. The fit continues " *
-              "at the incoming parameters." exception = (err, catch_backtrace()) maxlog = 3
+            "line search visited was numerically out of reach. The fit continues " *
+            "at the incoming parameters." exception = failure maxlog = 3
     end
     return nothing
+end
+
+#=
+Halvings `_lqr_accept_conditional!` tries along each of its two directions
+before keeping `θ′`. The surrogate is unbounded below under the switching
+normalizer, so the L-BFGS proposal can sit arbitrarily far out: eight halvings
+reach 1/256 of that step. The steepest-descent fallback starts at unit length in
+the packed coordinates, a large move already, and twelve reach ~2.4e-4.
+=#
+const _LQR_ACCEPT_HALVINGS = 8
+const _LQR_DESCENT_HALVINGS = 12
+
+"""
+    _lqr_accept_conditional!(problem, proposal, (initial, baseline), gradient) -> Bool
+
+Move to the first candidate that improves the terminal-conditioned objective,
+or stay at `θ′ = problem.theta` if none does. Returns whether the parameters moved.
+
+Candidates are the halvings of the step toward `proposal` (the L-BFGS
+minimizer of the surrogate), then the halvings of a steepest-descent step along
+`-gradient`, the surrogate's gradient at `θ′`.
+
+A candidate is accepted when the surrogate does not exceed its value at `θ′`
+(`initial`) *and* the score does not exceed its (`baseline`). Both replace
+`log Z` by a lower bound — the surrogate by the probe's bound at the posterior
+it was smoothed with at `θ′`, the score by a fresh one — so the true objective is
+at least the larger of the two, and a candidate either one rejects is one the
+evidence says is no better. The surrogate is checked first because it costs no
+smoothing. Under an exact normalizer the two coincide and only one is computed.
+
+The fallback is what makes the step reliable. Its direction is the score's own
+descent direction, because at a stationary probe posterior the surrogate's
+gradient equals the score's (Danskin), so unless `θ′` is stationary a short
+enough step along it improves both. The L-BFGS proposal carries no such
+guarantee: minimizing a surrogate that is unbounded below can end in a direction
+that ascends from `θ′`.
+"""
+function _lqr_accept_conditional!(
+    problem::NamedTuple, proposal::AbstractVector, (initial, baseline), gradient
+)
+    (; theta, evaluate!, write!, score!, rescores) = problem
+    T = eltype(theta)
+    candidate = similar(theta)
+    function accepted(step)
+        candidate .= theta .+ step
+        surrogate = evaluate!(nothing, candidate)
+        (isfinite(surrogate) && surrogate <= initial) || return false
+        rescores || return true
+        value = score!(candidate)
+        return isfinite(value) && value <= baseline
+    end
+    function search!(step, halvings)
+        for _ in 0:halvings
+            accepted(step) && return true
+            step ./= 2
+        end
+        return false
+    end
+
+    step = proposal .- theta
+    moved = any(!iszero, step) && search!(step, _LQR_ACCEPT_HALVINGS)
+    if !moved
+        slope = norm(gradient)
+        moved =
+            isfinite(slope) &&
+            slope > 0 &&
+            search!(gradient .* (-one(T) / slope), _LQR_DESCENT_HALVINGS)
+    end
+    write!(moved ? candidate : theta)
+    return moved
 end

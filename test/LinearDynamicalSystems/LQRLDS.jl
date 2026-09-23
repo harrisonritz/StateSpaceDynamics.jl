@@ -1160,6 +1160,72 @@ function test_lqr_conditional_mstep_gradient()
     return nothing
 end
 
+"""The terminal-conditioned M-step moves only to a point both of its estimates
+call an improvement, and falls back to steepest descent when the optimizer's
+proposal climbs.
+
+A synthetic problem stands in for the real one. Its surrogate is unbounded
+below along `θ₂`, as the switching surrogate is wherever the probe's scatter
+exceeds the data's; its score shares the surrogate's gradient at `θ′ = 0` (as
+the real score does, at a stationary probe posterior) but rises along `θ₂`. An
+optimizer run on that surrogate ends far out along `θ₂`, where every halving
+back toward `θ′` still climbs the score.
+"""
+function test_lqr_conditional_acceptance()
+    written = Ref(Float64[])
+    function problem(surrogate, score; rescores=true)
+        theta = [0.0, 0.0]
+        evaluate!(_, θ) = surrogate(θ)
+        write!(θ) = (written[] = copy(θ); nothing)
+        score!(θ) = score(θ)
+        return (; theta, evaluate!, write!, score!, rescores)
+    end
+    s(θ) = θ[1] - 10 * θ[2]^2
+    J(θ) = θ[1] + θ[2]^2
+    ∇ = [1.0, 0.0]          # both s and J, at θ′
+    at_start = (0.0, 0.0)   # (surrogate, score) at θ′
+
+    # Every halving of the runaway proposal lowers s and raises J: the
+    # fallback's unit steepest-descent step is what gets taken.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [0.0, 50.0], at_start, ∇)
+    @test written[] == [-1.0, 0.0]
+
+    # A proposal both estimates call an improvement is taken whole.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [-0.5, 0.1], at_start, ∇)
+    @test written[] == [-0.5, 0.1]
+
+    # No proposal at all (a failed line search hands back θ′): straight to the fallback.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [0.0, 0.0], at_start, ∇)
+    @test written[] == [-1.0, 0.0]
+
+    #=
+    A score improvement the surrogate contradicts is refused. Both replace
+    `log Z` with a lower bound, so the objective is at least the larger of the
+    two, and here the surrogate's is the larger everywhere but θ′. At a
+    stationary θ′ there is no fallback either, and the M-step stays put.
+    =#
+    bowl(θ) = sum(abs2, θ)
+    @test !SSD._lqr_accept_conditional!(
+        problem(bowl, θ -> -1.0 - abs(θ[1])), [1.0, 1.0], at_start, [0.0, 0.0]
+    )
+    @test written[] == [0.0, 0.0]
+
+    # A non-finite candidate is a rejected one, on either estimate.
+    wall(θ) = θ[1] < -0.3 ? Inf : s(θ)
+    @test SSD._lqr_accept_conditional!(problem(wall, J), [0.0, 50.0], at_start, ∇)
+    @test written[] == [-0.25, 0.0]
+    @test SSD._lqr_accept_conditional!(
+        problem(s, θ -> θ[1] < -0.3 ? NaN : J(θ)), [0.0, 50.0], at_start, ∇
+    )
+    @test written[] == [-0.25, 0.0]
+
+    # With an exact normalizer the two coincide, and the score is never computed.
+    exact = problem(s, _ -> error("scored under an exact normalizer"); rescores=false)
+    @test SSD._lqr_accept_conditional!(exact, [-0.5, 0.0], at_start, ∇)
+    @test written[] == [-0.5, 0.0]
+    return nothing
+end
+
 """A numerical failure at one point is a rejected step, not a dead fit.
 
 The normalizer's probe is smoothed on a model carrying no observations, which
@@ -1195,7 +1261,9 @@ function test_lqr_rejectable_failures()
 
     # A composite is rejectable only when every member is.
     @test SSD._lqr_rejectable(CompositeException([PosDefException(1), LAPACKException(3)]))
-    @test !SSD._lqr_rejectable(CompositeException([PosDefException(1), ErrorException("x")]))
+    @test !SSD._lqr_rejectable(
+        CompositeException([PosDefException(1), ErrorException("x")])
+    )
     @test !SSD._lqr_rejectable(CompositeException([]))
     return nothing
 end

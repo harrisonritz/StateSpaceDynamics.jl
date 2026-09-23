@@ -459,13 +459,115 @@ function test_slds_lqr_terminal_conditioning()
     @test all(isfinite, els)
     @test els[end] > els[1]
     #=
-    Not `> -1e-6` as on the joint objective: subtracting a variational estimate
-    of `log Z` gives a difference of two bounds, which no argument makes a
-    majorant, so a step may lose ground. What it may not do is lose ground
-    comparable to the progress the fit makes.
+    Not `> -1e-6` as on the joint objective. The state M-step only accepts a
+    point that improves the scored objective, but the discrete-transition
+    update ignores what the transition matrix does to `log Z`, and the E-step
+    is Monte Carlo. What the fit may not do is lose ground comparable to the
+    progress it makes.
     =#
     @test minimum(diff(els)) > -0.05 * (els[end] - els[1])
     @test terminal_logz(two, ys) < 0
+    #=
+    The regression this fixture caught: the fixed-posterior surrogate is
+    unbounded below wherever the probe's scatter exceeds the data's, and an
+    M-step that trusted it drove a state's `Σ` singular within three iterations.
+    =#
+    for lds in two.LDSs
+        @test minimum(eigvals(Symmetric(lds.state_model.Σ))) > 1e-3
+    end
+    return nothing
+end
+
+"""Re-smoothing the switching normalizer's probe after its parameters move must
+give what a probe built fresh at those parameters gives.
+
+The probe's workspace pool caches each member's smoother constants. A probe
+smoothed once, at the parameters it was built with, never notices; the M-step's
+acceptance check re-smooths it at every candidate, and a stale pool there
+smoothed under the old parameters while scoring under the new — a score whose
+slope disagreed with the exact normalizer's everywhere but at the start.
+"""
+function test_slds_lqr_probe_resmoothing()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    single = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p, terminal=true)])
+    switching = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    for slds in (single, switching)
+        data = SSD.Data(slds.LDSs[1], ys)
+        probe = SSD._slqr_terminal_probe(slds, data.ux)
+        SSD._slqr_sync_probe!(probe, slds)
+        SSD._slqr_probe_estep!(probe)
+        backend = SSD._SLQRNormalizer(probe)
+        start = probe.logz
+
+        moved = deepcopy(slds)
+        for lds in moved.LDSs
+            sm = lds.state_model
+            sm.Σ .*= 1.3
+            sm.Qc[1] .*= 0.8
+            refresh!(sm)
+        end
+        sms = [lds.state_model for lds in moved.LDSs]
+        reused = SSD._terminal_score_logz(backend, sms)
+        @test abs(reused - start) > 0.1         # the move is not a no-op ...
+        @test reused ≈ terminal_logz(moved, ys) rtol = 1e-10   # ... and is seen
+        if length(sms) == 1
+            exact = ntrials * SSD._lqr_terminal_logz(sms[1], zeros(0, tsteps))
+            @test reused ≈ exact rtol = 1e-8
+        end
+        # And back: the reused probe returns to exactly where it started.
+        back = SSD._terminal_score_logz(backend, [lds.state_model for lds in slds.LDSs])
+        @test back ≈ start rtol = 1e-12
+    end
+    return nothing
+end
+
+"""The switching surrogate the M-step descends has the scored objective's
+gradient at the point it was built.
+
+The surrogate holds the probe's posterior fixed, and at a stationary posterior
+that costs nothing to first order (Danskin): its gradient is the gradient of the
+freshly re-smoothed score. That is what lets the acceptance step's
+steepest-descent fallback promise an improvement, so it is checked here against
+central differences of the score itself, for two discrete states. Scoring
+re-smooths the probe, so the check also confirms that doing so leaves the
+surrogate exactly as it was.
+"""
+function test_slds_lqr_conditional_score_gradient()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    K = length(slds.LDSs)
+    data = SSD.Data(slds.LDSs[1], ys)
+    # Any valid per-state statistics serve as the data side: the identity under
+    # test is about the normalizer, which the data side does not touch.
+    sufs = [first(lqr_estep_stats(lds, ys)) for lds in slds.LDSs]
+    probe = SSD._slqr_terminal_probe(slds, data.ux)
+    SSD._slqr_sync_probe!(probe, slds)
+    SSD._slqr_probe_estep!(probe)
+    problem = SSD._lqr_conditional_problem(
+        slds.LDSs,
+        sufs,
+        [ones(Int, K), ones(Int, K), collect(1:K), collect(1:K)],
+        SSD._lqr_block_slots(Symbol[], K),
+        SSD._SLQRNormalizer(probe),
+    )
+    @test problem.rescores
+    θ = copy(problem.theta)
+    ∇ = similar(θ)
+    @test isfinite(problem.evaluate!(∇, θ))
+    before = problem.evaluate!(nothing, θ)
+
+    rng = StableRNG(5)
+    for _ in 1:3
+        d = normalize(randn(rng, length(θ)))
+        ε = 1e-5
+        fd = (problem.score!(θ .+ ε .* d) - problem.score!(θ .- ε .* d)) / (2ε)
+        @test fd ≈ dot(∇, d) rtol = 1e-6
+    end
+    @test problem.evaluate!(nothing, θ) == before
+    problem.write!(θ)          # leave the model where it started
     return nothing
 end
 
