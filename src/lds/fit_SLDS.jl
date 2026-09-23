@@ -1191,7 +1191,7 @@ end
 
 """
     smooth(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
-           return_cov=false, progress=false, depends_on=nothing)
+           return_cov=false, progress=false, depends_on=nothing, tied_params=nothing)
 
 Infer the joint posterior of a **fitted** `SLDS` with the parameters held fixed: the
 continuous states `q(x)`, the discrete responsibilities `γₜ(k) = q(zₜ = k)`, and the
@@ -1230,6 +1230,10 @@ held-out data.
 - `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
   `depends_on` declared on the regimes for this call. A held-out set has its own trial
   count, so it needs its own label vectors.
+- `tied_params`: the groups the model's regimes share, as passed to [`fit!`](@ref).
+  It changes only the parameter log-prior in `elbo`: a shared group's prior is
+  counted once rather than once per regime, which is the objective `fit!` with the
+  same `tied_params` reports. No effect without priors.
 
 # Returns
 A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz)`. For a single-trial matrix `y`, `x` is
@@ -1264,7 +1268,11 @@ function smooth(
     progress::Bool=false,
     npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    tied_params=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+    tied = _resolve_tied_params(
+        slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
+    )
     #=
     Same setup as `fit!`, minus the M-step workspaces: `Data` validates and
     canonicalizes the observation / input shapes, the grouping resolves
@@ -1371,7 +1379,7 @@ function smooth(
             uy=uy_seq,
             lognorm=lognorm,
         ),
-        _slds_prior_logdensity(slds)
+        _slds_prior_logdensity(slds, tied)
     else
         _slds_trial_elbos(
             (cell_slds::Vector)[1],
@@ -1387,7 +1395,7 @@ function smooth(
             uy=uy_seq,
             lognorm=lognorm,
         ),
-        _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T)
+        _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T, tied)
     end
     #=
     Terminal conditioning, per trial so the vector stays the per-trial split of
@@ -2223,24 +2231,132 @@ end
 end
 
 """
-    _slds_prior_logdensity(slds)
+    _slds_prior_logdensity(slds, tied=Symbol[])
 
-Sum of the per-regime parameter log-prior contributions, via the shared
-[`_state_prior_logdensity`](@ref) and [`_obs_prior_logdensity`](@ref): IW on
-`Q`/`P0`/`R`, MN on `[A b B]`/`[C d D]`, and the MN-only `[C d D]` term for
-Poisson emissions that matches their M-step objective. A composite emission sums
-over its members. Zero when no priors are set.
+`log p(θ)` for a switching model: IW on `Q`/`P0`/`R` (and an LQR state's `Σ` and
+`Qc`), MN on `[A b B]`/`[C d D]`/`x0`, and the MN-only `[C d D]` term for Poisson
+emissions that matches their M-step objective. A composite emission sums over
+its members. Zero when no priors are set.
 
-Needed so the ELBO tracks the same MAP objective the M-step optimizes; without it
-the displayed ELBO can appear non-monotone under priors.
+Each prior is counted once per distinct *version* of its parameter — once for a
+group tied across the discrete states, whose M-step fits one shared value under
+one prior, and once for the initial state, which is always shared — so the ELBO
+tracks the same MAP objective the M-step optimizes. Counting per state instead
+adds `(K − 1) · log p(θ_tied)`, which moves as the shared value moves and can
+make the trace non-monotone.
 """
-function _slds_prior_logdensity(slds::SLDS{T}) where {T<:Real}
-    prior_term = zero(T)
-    for lds in slds.LDSs
-        prior_term += _state_prior_logdensity(lds, nothing)
-        prior_term += _obs_prior_logdensity(lds, nothing)
+function _slds_prior_logdensity(
+    slds::SLDS{T}, tied::AbstractVector{Symbol}=Symbol[]
+) where {T<:Real}
+    lds1 = slds.LDSs[1]
+    # One cell: every group's per-cell slot is 1. The emission's groups follow the
+    # four state groups, so the last emission ordinal is the group count.
+    cell_slot = [[1] for _ in 1:last(last(_obs_slot_ordinals(lds1.obs_model)))]
+    return _slds_units_prior_logdensity(slds.LDSs, cell_slot, length(slds.LDSs), tied, T)
+end
+
+"""
+    _slds_units_prior_logdensity(unit_lds, cell_slot, K, tied, T)
+
+The prior over the `K · ncells` regime-major `(regime, cell)` units: the
+grouped model's per-version prior terms, with each group's versions combining
+its per-cell slots and its tie across regimes exactly as the M-step combines
+them ([`_slds_unit_slots`](@ref)). An ungrouped model is the one-cell case.
+"""
+function _slds_units_prior_logdensity(
+    unit_lds::AbstractVector,
+    cell_slot::AbstractVector{Vector{Int}},
+    K::Int,
+    tied::AbstractVector{Symbol},
+    ::Type{T},
+) where {T<:Real}
+    lds1 = unit_lds[1]
+    slots = _slds_unit_slots(lds1, cell_slot, K, tied)
+    state = _slds_state_prior_logdensity(lds1.state_model, unit_lds, slots, K, tied, T)
+    return state + _grouped_obs_prior_logdensity(lds1, unit_lds, slots, T)
+end
+
+"""
+    _slds_unit_slots(lds1, cell_slot, K, tied) -> Vector{Vector{Int}}
+
+For every parameter group, in `cell_slot`'s layout, the version each of the
+`K · ncells` regime-major units uses. `x0`/`P0` are always shared across
+regimes. A stacked regression counts as tied only when it is tied whole: a
+partial tie leaves each regime a matrix of its own, and its noise update counts
+each one's prior.
+"""
+function _slds_unit_slots(
+    lds1::LinearDynamicalSystem,
+    cell_slot::AbstractVector{Vector{Int}},
+    K::Int,
+    tied::AbstractVector{Symbol},
+)
+    D = lds1.latent_dim
+    tie_dyn = length(_tied_dyn_cols(tied, D, lds1.ux_dim)) == D + 1 + lds1.ux_dim
+    tie_state = (true, true, tie_dyn, :Q in tied)
+    out = [
+        _grouped_unit_slots(cell_slot[g], K, g <= 4 ? tie_state[g] : false) for
+        g in eachindex(cell_slot)
+    ]
+    om = lds1.obs_model
+    keys = om isa CompositeObservationModel ? collect(_obs_keys(om)) : [nothing]
+    for (ord, key) in zip(_obs_slot_ordinals(om), keys)
+        member = key === nothing ? lds1 : _obs_view(lds1, key)
+        whole = D + 1 + member.uy_dim
+        tie_obs = length(_tied_obs_cols(tied, D, member.uy_dim, key)) == whole
+        out[ord[1]] = _grouped_unit_slots(cell_slot[ord[1]], K, tie_obs)
+        if length(ord) > 1
+            tie_r = _tied_name(:R, key) in tied
+            out[ord[2]] = _grouped_unit_slots(cell_slot[ord[2]], K, tie_r)
+        end
     end
-    return prior_term
+    return out
+end
+
+function _slds_state_prior_logdensity(
+    ::AbstractStateModel,
+    unit_lds::AbstractVector,
+    slots::AbstractVector{Vector{Int}},
+    ::Int,
+    ::AbstractVector{Symbol},
+    ::Type{T},
+) where {T<:Real}
+    return _grouped_state_prior_logdensity(unit_lds, slots, T)
+end
+
+#=
+An inverse-LQR state's `Σ` and `Qc` priors are not slot-indexed: its ties are
+over named blocks (`_lqr_block_slots`), `Σ` shared by `:noise` and the cost by
+`:Qc` or `:structure`, and a shared block is written back into every state
+rather than aliased. So each regime's cells are counted by array identity as a
+grouped LQR model counts them, and a regime after the first inverse-LQR one skips
+whichever of the two is tied. A `:free` state's `Σ` is its own whatever the tie:
+it is fitted on its own, outside the constrained step.
+=#
+function _slds_state_prior_logdensity(
+    ::LQRStateModel,
+    unit_lds::AbstractVector,
+    slots::AbstractVector{Vector{Int}},
+    K::Int,
+    tied::AbstractVector{Symbol},
+    ::Type{T},
+) where {T<:Real}
+    ncells = length(unit_lds) ÷ K
+    regime(k) = view(unit_lds, ((k - 1) * ncells + 1):(k * ncells))
+    tie_noise = :noise in tied
+    tie_cost = :structure in tied || :Qc in tied
+    first_lqr = findfirst(k -> !_is_free(regime(k)[1].state_model), 1:K)
+    total = _grouped_state_prior_logdensity(unit_lds, slots, T; sigma=false, qc=false)
+    for k in 1:K
+        free = _is_free(regime(k)[1].state_model)
+        sigma = free || !tie_noise || k == first_lqr
+        qc = !free && (!tie_cost || k == first_lqr)
+        (sigma || qc) || continue
+        total += _grouped_state_prior_logdensity(
+            regime(k), slots, T; init=false, sigma=sigma, qc=qc
+        )
+    end
+    return total
 end
 
 """
@@ -2401,11 +2517,12 @@ function elbo!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     per_trial = _slds_trial_elbos(
         slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
     )
-    total = sum(per_trial) + _slds_prior_logdensity(slds)
+    total = sum(per_trial) + _slds_prior_logdensity(slds, tied)
     #=
     Terminal conditioning: report `log p(y | terminal = 0)`, not the joint. The
     normalizer is a variational estimate (see `slds_lqr_terminal.jl`), so this
@@ -2434,6 +2551,7 @@ function elbo!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return elbo!(
         slds,
@@ -2446,6 +2564,7 @@ function elbo!(
         ux=ux,
         uy=uy,
         lognorm=lognorm,
+        tied=tied,
     )
 end
 
@@ -2520,14 +2639,14 @@ end
 
 """
     elbo(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
-         progress=false, depends_on=nothing)
+         progress=false, depends_on=nothing, tied_params=nothing)
 
 Evidence lower bound of an `SLDS` at the current parameters — the `elbo` field of
 [`smooth`](@ref)`(slds, y)`, which infers `q(x)` and `q(z)` by deterministic
 coordinate ascent before evaluating the bound. Deterministic and reproducible.
 
 Accepts the same observation and input forms as [`smooth`](@ref), and the same
-`smoothing_iters` / `tol` controls over the alternation. Returns a scalar.
+`smoothing_iters` / `tol` / `tied_params` keywords. Returns a scalar.
 
 If you also want the posteriors that produced it, call [`smooth`](@ref) once and read
 its `elbo` field rather than paying for the alternation twice.
@@ -2543,6 +2662,7 @@ function elbo(
     tol::Real=1e-6,
     progress::Bool=false,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    tied_params=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return smooth(
         slds,
@@ -2554,6 +2674,7 @@ function elbo(
         return_cov=false,
         progress=progress,
         depends_on=depends_on,
+        tied_params=tied_params,
     ).elbo
 end
 
@@ -3541,7 +3662,8 @@ function fit!(
         patience=patience,
         min_delta=min_delta,
         restore_best=restore_best,
-        test_kwargs=test_kwargs,
+        # The held-out score counts a shared group's prior as the trace does.
+        test_kwargs=merge((; tied_params=tied_params), test_kwargs),
     )
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
@@ -3753,6 +3875,7 @@ function fit!(
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
+                tied=tied,
             )
 
             #=
@@ -3831,6 +3954,7 @@ function fit!(
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
+                tied=tied,
             )
 
             #=
@@ -4165,23 +4289,21 @@ function _estep_grouped!(
 end
 
 """
-    _grouped_slds_prior_logdensity(cell_slds, grp, T)
+    _grouped_slds_prior_logdensity(cell_slds, grp, T, tied=Symbol[])
 
-`log p(θ)` for a grouped SLDS: the per-regime terms of
-[`_slds_prior_logdensity`](@ref), counted once per distinct parameter version
-instead of once per regime.
+`log p(θ)` for a grouped SLDS: the terms of [`_slds_prior_logdensity`](@ref),
+counted once per distinct parameter version, across cells and — for a tied
+group, or the initial state — across regimes.
 """
 function _grouped_slds_prior_logdensity(
-    cell_slds::AbstractVector, grp::ParameterGrouping, ::Type{T}
+    cell_slds::AbstractVector,
+    grp::ParameterGrouping,
+    ::Type{T},
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
-    total = zero(T)
-    for k in 1:K
-        ldss = [cell_slds[c].LDSs[k] for c in 1:(grp.ncells)]
-        total += _grouped_state_prior_logdensity(ldss, grp.cell_slot, T)
-        total += _grouped_obs_prior_logdensity(ldss[1], ldss, grp.cell_slot, T)
-    end
-    return total
+    unit_lds = [cell_slds[c].LDSs[k] for k in 1:K for c in 1:(grp.ncells)]
+    return _slds_units_prior_logdensity(unit_lds, grp.cell_slot, K, tied, T)
 end
 
 """
@@ -4202,6 +4324,7 @@ function _elbo_grouped!(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real}
     per_trial = _slds_trial_elbos(
         cell_slds[1],
@@ -4217,7 +4340,7 @@ function _elbo_grouped!(
         uy,
         lognorm,
     )
-    return sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T)
+    return sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
 end
 
 """

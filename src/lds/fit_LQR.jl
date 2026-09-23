@@ -918,26 +918,35 @@ Structural priors are counted by array identity. This matters when `depends_on`
 varies structure and noise independently: counting both priors on the `Q` slot
 would under-count a varying `Qc` when `Σ` is shared, and over-count a shared
 `Qc` when `Σ` varies.
+
+`init`, `sigma` and `qc` switch the initial-state, `Σ` and `Qc` terms off, for a
+switching model whose ties share a block across states that do not alias it
+(see `_slds_state_prior_logdensity`).
 """
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
     cell_slot::AbstractVector{Vector{Int}},
-    ::Type{T},
+    ::Type{T};
+    init::Bool=true,
+    sigma::Bool=true,
+    qc::Bool=true,
 ) where {T<:Real,S<:LQRStateModel{T}}
     total = zero(T)
-    for u in _slot_representatives(cell_slot[_G_P0])
-        sm = ldss[u].state_model
-        sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    if init
+        for u in _slot_representatives(cell_slot[_G_P0])
+            sm = ldss[u].state_model
+            sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+        end
     end
     seen_sigma = Base.IdSet()
     seen_qc = Base.IdSet()
     for lds in ldss
         sm = lds.state_model
-        if sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
+        if sigma && sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
             push!(seen_sigma, sm.Σ)
             total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
         end
-        if sm.Qc_prior !== nothing && !_is_free(sm)
+        if qc && sm.Qc_prior !== nothing && !_is_free(sm)
             for (k, Q) in enumerate(sm.Qc)
                 Q in seen_qc && continue
                 push!(seen_qc, Q)
@@ -946,6 +955,7 @@ function _grouped_state_prior_logdensity(
             end
         end
     end
+    init || return total
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model
         if sm.x0_prior !== nothing

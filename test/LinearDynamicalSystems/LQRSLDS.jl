@@ -207,6 +207,34 @@ function test_slds_free_matches_gaussian_slds()
     return nothing
 end
 
+"""An inverse-LQR state's `Σ` is shared by `:noise` and its cost by `:structure`
+(or `:Qc`); each tie makes that prior one term instead of one per state, as the
+constrained M-step fits it. Two identical states with both tied are one model and
+score as it does; the initial state's prior counts once whatever is tied."""
+function test_slds_lqr_tied_prior_counted_once()
+    function with_priors()
+        lds = hslds_state([0.25 0.04; 0.04 0.18])
+        sm = lds.state_model
+        sm.Σ_prior = IWPrior(; Ψ=Matrix(0.1I, 4, 4), ν=8.0)
+        sm.Qc_prior = IWPrior(; Ψ=Matrix(0.2I, 2, 2), ν=5.0)
+        sm.P0_prior = IWPrior(; Ψ=Matrix(0.3I, 4, 4), ν=7.0)
+        return lds
+    end
+    y = hslds_data(4, 35, 5)
+    lds = with_priors()
+    slds = SLDS(; A=[0.9 0.1; 0.2 0.8], πₖ=[0.5, 0.5], LDSs=[with_priors(), with_priors()])
+    sm = lds.state_model
+    σ = SSD.iw_logprior_term(Matrix(sm.Σ), sm.Σ_prior)
+    qc = SSD._lqr_structural_logprior(sm) - σ
+    e = elbo(lds, y)
+    @test elbo(slds, y; tied_params=[:structure, :noise]) ≈ e rtol = 1e-10
+    @test elbo(slds, y; tied_params=[:noise]) - e ≈ qc rtol = 1e-8
+    @test elbo(slds, y; tied_params=[:structure]) - e ≈ σ rtol = 1e-8
+    @test elbo(slds, y; tied_params=[:Qc]) - e ≈ σ rtol = 1e-8
+    @test elbo(slds, y) - e ≈ σ + qc rtol = 1e-8
+    return nothing
+end
+
 """Mixing an unconstrained state with an inverse-LQR one in a single switching
 model — the configuration `:free` mode exists for. Each keeps its own kind of
 update: the LQR state stays symplectic, the free one does not have to."""

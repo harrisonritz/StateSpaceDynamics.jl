@@ -166,6 +166,7 @@ using SSDTest
                 test_SLDS_tied_params_elbo_monotone()
                 test_SLDS_tied_params_gls_path()
                 test_SLDS_tied_params_order_invariant()
+                test_SLDS_tied_prior_counted_once()
                 test_SLDS_tied_params_x0_P0_noop()
                 test_SLDS_tied_params_frozen_group()
                 test_SLDS_tied_params_partial_errors()
@@ -516,6 +517,7 @@ using SSDTest
             test_slds_lqr_grouped()
             test_slds_lqr_grouped_free_state_pools()
             test_slds_lqr_tied_emission_mask()
+            test_slds_lqr_tied_prior_counted_once()
             test_lqr_pair_slots()
         end
 

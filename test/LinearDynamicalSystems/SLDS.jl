@@ -3333,6 +3333,55 @@ function test_SLDS_tied_params_order_invariant(; rng=MersenneTwister(0x71F6))
     return nothing
 end
 
+"""
+A group tied across regimes is one parameter with one prior, and the initial
+state is always shared, so the ELBO counts each of those priors once — the
+objective the M-step fits. Two identical regimes with every group tied are one
+LDS, and must score exactly as that LDS does, priors and all. Untied, each
+regime's regression and noise priors count again; the initial state's still
+counts once.
+"""
+function test_SLDS_tied_prior_counted_once()
+    function with_priors()
+        lds = _make_gaussian_lds_dense(2, 3; seed=21)
+        sm, om = lds.state_model, lds.obs_model
+        sm.Q_prior = StateSpaceDynamics.IWPrior(; Ψ=Matrix(0.5I, 2, 2), ν=6.0)
+        sm.P0_prior = StateSpaceDynamics.IWPrior(; Ψ=Matrix(1.0I, 2, 2), ν=5.0)
+        sm.AB_prior = StateSpaceDynamics.MNPrior(; M₀=zeros(2, 3), Λ=Matrix(2.0I, 3, 3))
+        sm.x0_prior = StateSpaceDynamics.MNPrior(; M₀=zeros(2, 1), Λ=Matrix(1.0I, 1, 1))
+        om.R_prior = StateSpaceDynamics.IWPrior(; Ψ=Matrix(0.5I, 3, 3), ν=7.0)
+        om.CD_prior = StateSpaceDynamics.MNPrior(; M₀=zeros(3, 3), Λ=Matrix(1.0I, 3, 3))
+        return lds
+    end
+    lds = with_priors()
+    _, _, y = rand(StableRNG(3), _distinct_gaussian_slds(2, 2, 3), fill(40, 4))
+    slds = SLDS(; A=[0.8 0.2; 0.3 0.7], πₖ=[0.6, 0.4], LDSs=[with_priors(), with_priors()])
+    all_tied = (:A, :b, :Q, :C, :d, :R)
+
+    e_lds = elbo(lds, y)
+    @test elbo(slds, y; tied_params=all_tied) ≈ e_lds rtol = 1e-10
+    # The fit reports the same objective at its starting point.
+    trace = fit!(deepcopy(slds), y; max_iter=1, progress=false, tied_params=all_tied)
+    @test trace[1] ≈ e_lds rtol = 1e-10
+
+    sm, om = lds.state_model, lds.obs_model
+    W_ab = StateSpaceDynamics._pack_dyn_W!(zeros(2, 3), lds)
+    W_cd = StateSpaceDynamics._pack_obs_V!(zeros(3, 3), lds)
+    per_regime =
+        StateSpaceDynamics.iw_logprior_term(sm.Q, sm.Q_prior) +
+        StateSpaceDynamics.mn_logprior_term(W_ab, sm.Q, sm.AB_prior) +
+        StateSpaceDynamics.iw_logprior_term(om.R, om.R_prior) +
+        StateSpaceDynamics.mn_logprior_term(W_cd, om.R, om.CD_prior)
+    @test elbo(slds, y) - e_lds ≈ per_regime rtol = 1e-8
+    # Tying the emission alone takes its priors out of the second count.
+    emission =
+        StateSpaceDynamics.iw_logprior_term(om.R, om.R_prior) +
+        StateSpaceDynamics.mn_logprior_term(W_cd, om.R, om.CD_prior)
+    @test elbo(slds, y; tied_params=(:C, :d, :R)) - e_lds ≈ per_regime - emission rtol =
+        1e-8
+    return nothing
+end
+
 function test_SLDS_tied_params_x0_P0_noop(; rng=MersenneTwister(0x71F3))
     K, latent_dim, obs_dim = 2, 2, 3
     truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
