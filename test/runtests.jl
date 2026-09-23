@@ -70,6 +70,7 @@ using SSDTest
                 test_valid_SLDS_nonstochastic_rows_and_invalid_Z0()
                 test_valid_SLDS_mixed_observation_model_types()
                 test_valid_SLDS_inconsistent_latent_or_obs_dims()
+                test_SLDS_entry_points_validate()
                 test_SLDS_sampling_gaussian()
                 test_SLDS_sampling_poisson()
                 test_SLDS_deterministic_transitions()

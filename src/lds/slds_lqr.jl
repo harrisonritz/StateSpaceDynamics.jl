@@ -83,13 +83,14 @@ when the emission is not allowed to see it.
 Called before any parallel section, since the cache is shared by every trial
 workspace. A no-op for a state model with no cache to refresh.
 
-Also where the state-model rules of [`validate_SLDS`](@ref) are enforced, and a
-`:free` state's costate readout matched to the inverse-LQR states' (see
-[`_match_costate_readout!`](@ref)), so a fit, a smooth, a score and `rand` all
-see the same model.
+Also where [`validate_SLDS`](@ref) runs — the chain is a proper distribution, the
+regimes agree on their dimensions, each regime is a valid model, and the
+state-model rules hold — and where a `:free` state's costate readout is matched
+to the inverse-LQR states' (see [`_match_costate_readout!`](@ref)), so a fit, a
+smooth, a score and `rand` all see the same, valid model.
 """
 function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
-    _validate_slds_state_models(slds.LDSs[1].state_model, slds)
+    validate_SLDS(slds)
     _match_costate_readout!(slds)
     for lds in slds.LDSs
         _prepare_slds_regime!(lds, tsteps)

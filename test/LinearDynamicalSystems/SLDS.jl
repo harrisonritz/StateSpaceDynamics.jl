@@ -291,6 +291,39 @@ function test_valid_SLDS_inconsistent_latent_or_obs_dims(; rng=MersenneTwister(0
     @test_throws DimensionMismatchError validate_SLDS(s_bad_obs)
 end
 
+"""Every entry point validates the model first. `fit!` used to accept an improper
+chain, score its first iteration under it and renormalize it silently in the
+M-step; `rand` failed inside `Categorical`; mismatched regimes failed wherever a
+shape first disagreed."""
+function test_SLDS_entry_points_validate()
+    K = 2
+    lds = _make_gaussian_lds_dense(2, 3; seed=21)
+    good = SLDS(; A=_rowstochastic(K), πₖ=_probvec(K), LDSs=[deepcopy(lds) for _ in 1:K])
+    _, _, y = rand(StableRNG(4), good, fill(15, 2))
+    improper_π = SLDS(; A=_rowstochastic(K), πₖ=[0.7, 0.7], LDSs=deepcopy(good.LDSs))
+    A_bad = [0.9 0.3; 0.1 0.9]
+    improper_A = SLDS(; A=A_bad, πₖ=_probvec(K), LDSs=deepcopy(good.LDSs))
+    mismatched = SLDS(;
+        A=_rowstochastic(K),
+        πₖ=_probvec(K),
+        LDSs=[_make_gaussian_lds(2, 3), _make_gaussian_lds(2, 4)],
+    )
+    for (bad, err) in (
+        (improper_π, InvalidProbabilityVectorError),
+        (improper_A, InvalidProbabilityVectorError),
+        (mismatched, DimensionMismatchError),
+    )
+        @test_throws err fit!(deepcopy(bad), y; max_iter=1, progress=false)
+        @test_throws err smooth(bad, y)
+        @test_throws err elbo(bad, y)
+        @test_throws err rand(StableRNG(1), bad, 5)
+        @test_throws err rand(StableRNG(1), bad, [5, 6])
+    end
+    # A valid model is untouched by the check.
+    @test fit!(deepcopy(good), y; max_iter=1, progress=false) isa AbstractVector
+    return nothing
+end
+
 function test_SLDS_sampling_gaussian(; rng=MersenneTwister(0xC0FFEE))
     K = 3
     lds = _make_gaussian_lds(2, 4)
