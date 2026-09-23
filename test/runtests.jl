@@ -486,6 +486,12 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/Convergence.jl")
+        @testset "EM stopping rule" begin
+            test_em_converged_rule()
+            test_em_relative_tolerance()
+        end
+
         include("LinearDynamicalSystems/LQRSLDS.jl")
         @testset "Switching inverse-LQR (LQR SLDS)" begin
             test_slds_lqr_matches_lds()

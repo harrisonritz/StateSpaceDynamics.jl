@@ -475,6 +475,7 @@ function fit!(
     };
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     ux=nothing,
     uy=nothing,
@@ -512,6 +513,7 @@ function fit!(
         grp;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         monitor=monitor,
         align_final=!_is_free(lds.state_model),
@@ -521,6 +523,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         monitor=monitor,
         align_final=!_is_free(lds.state_model),
@@ -691,6 +694,7 @@ function fit!(
     uy=nothing,
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -728,6 +732,7 @@ function fit!(
         grp;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
@@ -739,6 +744,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,

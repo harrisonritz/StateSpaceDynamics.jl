@@ -919,7 +919,10 @@ Fit a Poisson LDS via Laplace-EM.
   with `uy_dim` rows. Required when `size(obs_model.D, 2) > 0`; `nothing`
   (default) means no inputs.
 - `max_iter`: maximum EM iterations
-- `tol`: convergence tolerance on ELBO change
+- `tol`: convergence tolerance on the ELBO change between iterations, absolute
+- `rtol = 0.0`: the same, relative to the ELBO's magnitude; the fit stops once the
+  change is below `max(tol, rtol * |ELBO|)`, so the default is the absolute test
+  alone
 - `progress`: show progress bar
 - `newton_max_iter`: Newton iterations per E-step inner solve
 - `newton_tol`: Newton convergence tolerance
@@ -962,6 +965,7 @@ function fit!(
     uy=nothing,
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -998,6 +1002,7 @@ function fit!(
         grp;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
@@ -1008,6 +1013,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
@@ -1029,6 +1035,7 @@ function _fit_laplace!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -1083,7 +1090,7 @@ function _fit_laplace!(
             return _fit_result(monitor, elbos, plds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1336,6 +1343,7 @@ function _fit_plds_grouped!(
     grp::ParameterGrouping;
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -1370,7 +1378,7 @@ function _fit_plds_grouped!(
             return _fit_result(monitor, elbos, plds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
