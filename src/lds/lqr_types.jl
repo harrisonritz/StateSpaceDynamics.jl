@@ -397,6 +397,17 @@ selection: freeze it at `I` with `LQRFitFlags(; Gref = false)`. Pass task
 regressors instead (a target identity, say) and `G_r` is estimated, mapping them
 to the reference the agent was actually steering toward.
 
+If those regressors have a constant sum — one-hot target indicators are the
+standard case — the reference origin needs its own constraint. With one active
+running cost and fitted affine drift, for example,
+`G_r → G_r + δ1ᵀ` and `h_λ → h_λ + Qδ` leave the model unchanged. Multiple
+targets identify their contrasts, not this common translation. When an
+absolute reference origin is required, freeze `h` (`LQRFitFlags(; h = false)`),
+supply genuinely different active running costs that share one `h`, or impose
+the origin yourself — for instance by reporting only the centred columns of
+`G_r`, since no fit flag constrains them to sum to zero. A terminal factor does
+not fix the origin when its offset `h_f` is also fitted.
+
 With `K = 1` and no terminal factor, `B_u`'s costate rows and `-Q_1 G_r` both map
 the input into the costate and are not separately identified; freeze one. Several
 cost regimes, or a terminal factor, separate them.
