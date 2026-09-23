@@ -588,6 +588,16 @@ using SSDTest
         @testset "Covariance info-form update" begin
             test_info_update()
         end
+
+        include("Utilities/Riccati.jl")
+        @testset "Riccati sweeps" begin
+            test_riccati_simulate_lqr_matches_qp()
+            test_riccati_matches_lqr_riccati_sequence()
+            test_riccati_adjoint()
+            test_riccati_adjoint_accumulates()
+            test_riccati_preallocated()
+            test_riccati_errors()
+        end
     end
 
     # Conjugate-prior helpers (IW / MN MAP + log-prior terms)
