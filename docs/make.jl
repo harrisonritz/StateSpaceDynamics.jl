@@ -40,6 +40,9 @@ makedocs(;
         prettyurls = get(ENV, "CI", "false") == "true",
         repolink = "https://github.com/depasquale-lab/StateSpaceDynamics.jl",
         assets = ["assets/custom.css"],
+        # The API page carries every exported docstring (`checkdocs = :exports`),
+        # which puts it near Documenter's default 200 KiB limit on one page.
+        size_threshold = 400 * 2^10,
     ),
     pages=[
         "Home" => "index.md",

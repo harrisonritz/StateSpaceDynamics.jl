@@ -475,8 +475,8 @@ Suf-based Poisson ELBO. Mirrors the Gaussian TD path's split:
 * observation-side Q-term per-trial via the existing Poisson `Q_obs!`,
   which is irreducibly non-conjugate (no aggregator equivalent),
 * posterior entropy from `tfs[trial].entropy` (filled by `smooth!`),
-* the parameter log-priors, via the shared [`_state_prior_logdensity`](@ref)
-  and the Poisson [`_obs_prior_logdensity`](@ref) — the same terms the Gaussian
+* the parameter log-priors, via the shared `_state_prior_logdensity`
+  and the Poisson `_obs_prior_logdensity` — the same terms the Gaussian
   path uses on the state side, and the bare MN quadratic on `[C d D]` that
   matches the emission M-step objective.
 """
@@ -932,7 +932,7 @@ Fit a Poisson LDS via Laplace-EM.
   `(newton_max_iter=10,)` for a Poisson emission.
 
 Returns a `Vector{T}` of ELBO values, one per iteration — or a
-[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
+[`FitTrace`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     plds::LinearDynamicalSystem{T,S,O},

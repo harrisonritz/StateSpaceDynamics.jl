@@ -863,7 +863,7 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   `(newton_max_iter=10,)` for a Poisson emission.
 
 Returns a `Vector{T}` of ELBO values, one per iteration — or a
-[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
+[`FitTrace`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},

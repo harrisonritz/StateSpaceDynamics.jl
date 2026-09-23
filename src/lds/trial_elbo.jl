@@ -13,7 +13,7 @@ log-prior, which belongs to no trial:
     sum(trial_elbos(m, y)) + log p(θ) == elbo(m, y)
 
 `log p(θ)` is zero unless IW/MN priors are set, in which case it is
-[`_state_prior_logdensity`](@ref) + [`_obs_prior_logdensity`](@ref) (summed over
+`_state_prior_logdensity` + `_obs_prior_logdensity` (summed over
 regimes for an SLDS). It is left out of the per-trial vector deliberately: a MAP
 penalty on the parameters is not a property of any one trial, and splitting it
 across trials would make the per-trial numbers depend on how many trials came
