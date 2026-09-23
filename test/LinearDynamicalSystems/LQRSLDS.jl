@@ -722,6 +722,139 @@ function test_slds_lqr_prior_vs_optimal_data()
     return nothing
 end
 
+"""A state whose own terminal cost differs from its running cost, and a `:free`
+state beside it — the pair a delay-then-reach model uses."""
+function hslds_terminal_pair(p, tsteps; terminal_first=true)
+    n = 2
+    C = randn(StableRNG(11), p, 2n)
+    C[:, (n + 1):end] .= 0
+    obs() = GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+    lqr = LQRStateModel(
+        [0.96 0.07; -0.05 0.93],
+        [0.06 0.01; 0.01 0.05],
+        [[0.25 0.04; 0.04 0.18], [2.0 0.0; 0.0 1.5]],
+        Matrix(0.05I, 2n, 2n);
+        schedule=cost_schedule(tsteps; terminal=true),
+        terminal=true,
+        condition_terminal=false,
+        Σf=Matrix(0.02I, n, n),
+        P0=Matrix(0.3I, 2n, 2n),
+    )
+    free = free_state_model(
+        0.9 * Matrix(1.0I, 2n, 2n), Matrix(0.05I, 2n, 2n); P0=Matrix(0.3I, 2n, 2n)
+    )
+    members = [LinearDynamicalSystem(lqr, obs()), LinearDynamicalSystem(free, obs())]
+    terminal_first || reverse!(members)
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=members)
+end
+
+"""The order the discrete states are listed in is a labelling, not a model.
+
+An inverse-LQR state with its own terminal cost carries two cost regimes and a
+`:free` state one. The responsibility-weighted statistics used to be allocated
+as `K` copies of whatever the *first* state needed, so listing the free state
+first under-sized the LQR state's per-regime blocks and the fit died with a
+`BoundsError` — the other order worked by accident. Both must fit, and to the
+same model: exactly for the free state and the chain, and for the LQR state up
+to where its structural optimizer stops in the cost's flat direction, which
+flips with the last bit of the data (see `test_slds_lqr_grouped_free_state_pools`).
+"""
+function test_slds_lqr_state_order()
+    p, tsteps = 4, 20
+    ys = hslds_data(p, tsteps, 4)
+    function fitted(terminal_first)
+        slds = hslds_terminal_pair(p, tsteps; terminal_first=terminal_first)
+        # One M-step: the final iteration only scores.
+        e = _trace(fit!(slds, ys; max_iter=2, progress=false, rng=StableRNG(1)))
+        return slds, e
+    end
+    a, ea = fitted(true)
+    b, eb = fitted(false)
+    @test maximum(abs, ea .- eb) < 1e-2
+    @test maximum(abs, a.A .- b.A[[2, 1], [2, 1]]) < 1e-10
+    @test maximum(abs, a.LDSs[2].state_model.Mfree .- b.LDSs[1].state_model.Mfree) < 1e-10
+
+    la, lb = a.LDSs[1].state_model, b.LDSs[2].state_model
+    rel(x, y) = norm(x .- y) / norm(x)
+    @test norm(la.Qc[2] .- [2.0 0.0; 0.0 1.5]) > 0.1     # the terminal cost was fitted
+    @test rel(la.A, lb.A) < 1e-3
+    @test rel(la.S, lb.S) < 2e-2
+    @test rel(la.Qc[1], lb.Qc[1]) < 2e-2
+    @test rel(la.Qc[2], lb.Qc[2]) < 2e-2
+    return nothing
+end
+
+"""`rand` rolls each inverse-LQR state's own transition cost, and every entry
+point refuses a state whose schedule switches costs within a trial.
+
+The sampler used to hand back `cache.M[1]` whatever the schedule said, while the
+smoother and M-step honoured it — silently a different model. A separate
+terminal cost is not a switch (it is read only by the terminal factor), so a
+state whose transitions all follow cost 2 and whose terminal step is written
+against cost 1 must roll `M[2]`.
+"""
+function test_slds_lqr_rand_schedules()
+    p, tsteps = 4, 20
+    A = [0.96 0.07; -0.05 0.93]
+    S = [0.06 0.01; 0.01 0.05]
+    Σ = Matrix(0.05I, 4, 4)
+    C = randn(StableRNG(11), p, 4)
+    C[:, 3:4] .= 0
+    obs() = GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+    partner() = hslds_state([0.9 0.0; 0.0 0.7]; p=p, C=C, terminal=true)
+
+    flipped = LQRStateModel(
+        copy(A),
+        copy(S),
+        [[2.0 0.0; 0.0 1.5], [0.25 0.04; 0.04 0.18]],
+        copy(Σ);
+        schedule=vcat(fill(2, tsteps - 1), 1),
+        terminal=true,
+        Σf=Matrix(0.02I, 2, 2),
+        P0=Matrix(0.3I, 4, 4),
+    )
+    @test SSD._slds_transition_regimes(flipped) == [2]
+    @test SSD._extract_state_params(flipped).A === flipped.cache.M[2]
+    @test flipped.cache.M[2] != flipped.cache.M[1]
+    ok = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[LinearDynamicalSystem(flipped, obs()), partner()],
+    )
+    @test validate_SLDS(ok) === nothing
+    z, x, y = rand(StableRNG(3), ok, tsteps)
+    @test size(x) == (4, tsteps) && all(isfinite, x) && all(isfinite, y)
+
+    # The usual terminal pair passes too, in either order.
+    @test validate_SLDS(hslds_terminal_pair(p, tsteps)) === nothing
+    @test validate_SLDS(hslds_terminal_pair(p, tsteps; terminal_first=false)) === nothing
+
+    # A cost switch inside a state is refused wherever the model is used.
+    switching = LQRStateModel(
+        copy(A),
+        copy(S),
+        [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]],
+        copy(Σ);
+        schedule=cost_schedule(tsteps; onset=8),
+        P0=Matrix(0.3I, 4, 4),
+    )
+    @test SSD._slds_transition_regimes(switching) == [1, 2]
+    bad = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[
+            LinearDynamicalSystem(switching, obs()),
+            hslds_state([0.9 0.0; 0.0 0.7]; p=p, C=C),
+        ],
+    )
+    ys = hslds_data(p, tsteps, 2)
+    @test_throws ArgumentError rand(StableRNG(3), bad, tsteps)
+    @test_throws ArgumentError rand(StableRNG(3), bad, [tsteps, tsteps])
+    @test_throws ArgumentError fit!(bad, ys; max_iter=2, progress=false)
+    @test_throws ArgumentError smooth(bad, ys)
+    return nothing
+end
+
 """`rand` must draw from the model it is given, which for an inverse-LQR state
 means the *forward* chain `z_{t+1} = M z_t + G h + ε`, `ε ~ N(0, GΣGᵀ)` — the
 density inference uses, not the optimal trajectory `simulate_lqr` follows.

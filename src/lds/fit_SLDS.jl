@@ -103,6 +103,7 @@ function Random.rand(
     # group's.
     y = _alloc_obs(regimes[1], Ti)
 
+    _validate_slds_state_models(lds1.state_model, slds)
     _warn_slds_unstable_rollout(slds, Ti)
     state_params = [_extract_state_params(lds.state_model) for lds in regimes]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
@@ -147,6 +148,7 @@ function Random.rand(
     Per-trial, per-regime parameter sets: one entry per trial, each a vector
     over regimes. Ungrouped, every trial shares the same vector.
     =#
+    _validate_slds_state_models(lds1.state_model, slds)
     _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on)
     if grp === nothing
@@ -3038,7 +3040,7 @@ function mstep!(
     interleaved with the aggregation the way a fully per-regime M-step can.
     =#
     sf = if sufs === nothing
-        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], dat.tsteps) for _ in 1:K]
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[k], dat.tsteps) for k in 1:K]
     else
         sufs
     end
@@ -3614,7 +3616,7 @@ function fit!(
     replaces a per-iteration `deepcopy` of a whole sub-model.
     =#
     mstep_sufs = if grp === nothing
-        [_initialize_td_sufficient_statistics(T, slds.LDSs[1], tsteps_per_trial) for _ in 1:K]
+        [_initialize_td_sufficient_statistics(T, slds.LDSs[k], tsteps_per_trial) for k in 1:K]
     else
         nothing
     end

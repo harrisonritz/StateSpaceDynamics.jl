@@ -154,7 +154,7 @@ function _slqr_terminal_probe(
     fb = _make_slds_fb_storage(dl, seq_ends)
     pool = _slds_workspace_pool(probe_slds, nothing, T_max, ntrials; npool=1)
     plan = _slds_trial_plan(nothing, ntrials, length(pool.slots))
-    sufs = [_initialize_td_sufficient_statistics(T, members[1], data.tsteps) for _ in 1:K]
+    sufs = [_initialize_td_sufficient_statistics(T, members[k], data.tsteps) for k in 1:K]
     return _SLQRProbe(
         probe_slds,
         data,

@@ -506,6 +506,8 @@ using SSDTest
             test_slds_lqr_validation()
             test_slds_lqr_prior_vs_optimal_data()
             test_slds_lqr_rand()
+            test_slds_lqr_state_order()
+            test_slds_lqr_rand_schedules()
             test_slds_lqr_noise_version_lookup()
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
