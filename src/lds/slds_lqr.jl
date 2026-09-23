@@ -186,7 +186,7 @@ function _slds_state_mstep!(
     tied::AbstractVector{Symbol},
     ::AbstractVector{Int},
     ::SmoothWorkspace{T},
-    _,
+    ::Any,               # not `_`: Julia 1.10 cannot lower `_` beside keywords
     K::Int,
     ::Int,
     ::Int;
