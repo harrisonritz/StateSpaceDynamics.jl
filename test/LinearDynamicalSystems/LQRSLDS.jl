@@ -67,34 +67,51 @@ function test_slds_lqr_matches_lds()
     p, tsteps, ntrials = 4, 35, 5
     ys = hslds_data(p, tsteps, ntrials)
     Qc = [0.25 0.04; 0.04 0.18]
-
-    lds = hslds_state(Qc; p=p)
-    slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p)])
-
-    e_lds = _trace(fit!(lds, ys; max_iter=10, tol=1e-14))
-    e_slds = _trace(fit!(slds, ys; max_iter=10, progress=false, rng=StableRNG(7)))
-
-    @test length(e_lds) == length(e_slds)
-    # Both paths now use the same sufficient-statistic accumulation at K=1.
-    # Their outer optimizers still stop independently, and the unpinned
-    # inverse-LQR cost scale is deliberately flat; compare at a tolerance that
-    # is tight on the objective's scale without mistaking gauge drift for a
-    # different estimator.
-    @test maximum(abs, e_lds .- e_slds) < 1e-2
+    function fit_both(iters)
+        lds = hslds_state(Qc; p=p)
+        slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p)])
+        e_lds = _trace(fit!(lds, ys; max_iter=iters, tol=1e-14))
+        e_slds = _trace(fit!(slds, ys; max_iter=iters, progress=false, rng=StableRNG(7)))
+        return lds, slds, e_lds, e_slds
+    end
 
     #=
-    The structural step is L-BFGS on a profiled objective and stops on its own
-    tolerance, so ten iterations of the two paths agree to ~1e-6 rather than to
-    machine precision. The ELBO match above is the tight claim; these confirm the
-    agreement is in every parameter, not just the bound.
+    One M-step (the final iteration is scored, not updated): the sharp check.
+    Both paths start from identical statistics, so a leak is an O(1)
+    difference here, while agreement is limited only by the structural
+    L-BFGS stopping on its own tolerance — measured at ~1e-7.
     =#
+    lds, slds, e_lds, e_slds = fit_both(2)
     a, b = lds.state_model, slds.LDSs[1].state_model
-    @test maximum(abs, a.A .- b.A) < 1e-4
-    @test maximum(abs, a.S .- b.S) < 1e-4
-    @test maximum(abs, a.Qc[1] .- b.Qc[1]) < 1e-2
-    @test maximum(abs, a.Σ .- b.Σ) < 1e-4
-    @test maximum(abs, a.x0 .- b.x0) < 2e-3
-    @test maximum(abs, lds.obs_model.C .- slds.LDSs[1].obs_model.C) < 2e-4
+    @test maximum(abs, a.Qc[1] .- Qc) > 1e-2      # the M-step moved something
+    @test maximum(abs, e_lds .- e_slds) < 1e-5
+    for key in (:A, :S, :Σ, :x0, :P0, :h)
+        @test maximum(abs, getproperty(a, key) .- getproperty(b, key)) < 1e-6
+    end
+    @test maximum(abs, a.Qc[1] .- b.Qc[1]) < 1e-6
+    for key in (:C, :R, :d)
+        @test maximum(
+            abs, getproperty(lds.obs_model, key) .- getproperty(slds.LDSs[1].obs_model, key)
+        ) < 1e-6
+    end
+
+    #=
+    Ten iterations: from the second M-step on, the two structural optimizers
+    stop at different points of the objective's flattest direction — the cost
+    scale, along which `Qc` drifts by ~6% while the loop gain `S P` agrees to
+    ~1e-5 — and the traces separate by ~1e-2 nats in a fit gaining ~200. So
+    what is compared is what the data identify: the closed loop and the loop
+    gain, the noise, the emission and the bound, not the raw cost.
+    =#
+    lds, slds, e_lds, e_slds = fit_both(10)
+    a, b = lds.state_model, slds.LDSs[1].state_model
+    @test length(e_lds) == length(e_slds)
+    @test maximum(abs, e_lds .- e_slds) < 5e-2
+    @test maximum(abs, closed_loop_dynamics(a) .- closed_loop_dynamics(b)) < 1e-3
+    @test maximum(abs, a.S * riccati_solution(a) .- b.S * riccati_solution(b)) < 1e-3
+    @test maximum(abs, a.A .- b.A) < 1e-3
+    @test maximum(abs, a.Σ .- b.Σ) < 1e-3
+    @test maximum(abs, lds.obs_model.C .- slds.LDSs[1].obs_model.C) < 1e-3
 
     # `observe_costate` is off, so the emission may never read the costate half.
     # Without the mask on the switching side these columns fill in silently.
@@ -972,9 +989,18 @@ function test_slds_lqr_grouped_free_state_pools()
     @test rel(fp.Mfree, fg.Mfree) < 1e-10
     @test rel(fp.h, fg.h) < 1e-10
     @test rel(fp.Σ, fg.Σ) < 1e-10
+    #=
+    The inverse-LQR state cannot be held to the same standard, and not because
+    the paths differ: its structural M-step stops at a point in the cost's flat
+    direction that flips with the last bit of the data. Scaling `y` by
+    `1 + 1e-15` moves one M-step's `A` by ~3e-5 and `Qc` by ~2.5e-3 on one
+    Julia version and by nothing on another. A pooling that dropped or
+    double-counted a cell moves them by tens of percent.
+    =#
     lp, lg = plain.LDSs[1].state_model, grouped.LDSs[1].state_model
-    @test rel(lp.A, lg.A) < 1e-6
-    @test rel(lp.Qc[1], lg.Qc[1]) < 1e-6
+    @test rel(lp.A, lg.A) < 1e-3
+    @test rel(closed_loop_dynamics(lp), closed_loop_dynamics(lg)) < 1e-3
+    @test rel(lp.Qc[1], lg.Qc[1]) < 2e-2
 
     # A real grouping: the LQR cost splits, the free state's dynamics do not.
     split = fitted((Qc=labels,))
