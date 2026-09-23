@@ -3288,6 +3288,51 @@ function test_SLDS_tied_params_gls_path(; rng=MersenneTwister(0x71F2))
     return nothing
 end
 
+"""
+Listing the regimes in the other order is a relabelling, so a tied fit must not
+notice. A whole tie is fitted onto the first regime and copied out, and the noise
+update after it forms each regime's residual scatter from that regime's own
+regression matrix. That scatter used to be taken before the copy, from the other
+regimes' previous `[C d]` / `[A b]`, so `R` / `Q` depended on which regime came
+first. Checked with the noise tied (the pooled solve) and switching (the GLS one).
+The start already agrees on the tied groups: the fit gives every regime the first
+one's values before its first E-step, so a start that disagrees is two models.
+"""
+function test_SLDS_tied_params_order_invariant(; rng=MersenneTwister(0x71F6))
+    K, latent_dim, obs_dim = 2, 2, 3
+    truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+    _, _, y = rand(rng, truth, fill(30, 4))
+    swap = [2, 1]
+    function fitted(tied, order)
+        start = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        lds1 = start.LDSs[1]
+        names = StateSpaceDynamics._resolve_tied_params(
+            lds1.state_model, lds1.obs_model, tied
+        )
+        StateSpaceDynamics._broadcast_tied_params!(start, names)
+        slds = SLDS(;
+            A=start.A[order, order], πₖ=start.πₖ[order], LDSs=deepcopy(start.LDSs[order])
+        )
+        elbos = fit!(
+            slds, y; max_iter=3, progress=false, tied_params=tied, rng=MersenneTwister(5)
+        )
+        return slds, elbos
+    end
+    for tied in ((:C, :d), (:C, :d, :R), (:A, :b), (:A, :b, :Q))
+        a, ea = fitted(tied, 1:K)
+        b, eb = fitted(tied, swap)
+        @test eb ≈ ea rtol = 1e-10
+        for k in 1:K
+            la, lb = a.LDSs[k], b.LDSs[swap[k]]
+            @test lb.obs_model.R ≈ la.obs_model.R rtol = 1e-8
+            @test lb.state_model.Q ≈ la.state_model.Q rtol = 1e-8
+            @test lb.obs_model.C ≈ la.obs_model.C rtol = 1e-8
+            @test lb.state_model.A ≈ la.state_model.A rtol = 1e-8
+        end
+    end
+    return nothing
+end
+
 function test_SLDS_tied_params_x0_P0_noop(; rng=MersenneTwister(0x71F3))
     K, latent_dim, obs_dim = 2, 2, 3
     truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)

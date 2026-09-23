@@ -878,8 +878,7 @@ function _grouped_update_A_b!(
         if _shared_noise(slots_q, units)
             # One `Q` over these units ⇒ it divides out and pooled OLS is exact.
             update_A_b!(lds, _pool_dyn!(bufs, sufs, units), sws)
-        else
-            lds.fit_bool[_G_AB] || continue
+        elseif lds.fit_bool[_G_AB]
             W = _tied_gls_regression(
                 [sufs[u].dyn_xx[].mat for u in units],
                 [sufs[u].dyn_xy for u in units],
@@ -889,6 +888,47 @@ function _grouped_update_A_b!(
             )
             _unpack_dyn_W!(lds, W)
         end
+        _share_slot_dyn!(ldss, units)
+    end
+    return nothing
+end
+
+#=
+A slot's version is fitted onto its first unit. The `depends_on` cells of one
+model alias a slot's arrays, so that write is the whole update, but an `SLDS`'s
+regimes hold arrays of their own. So the value is copied onto the slot's other
+units here, before the noise update, which forms each unit's residual scatter
+from that unit's own regression matrix; otherwise a tie's `Q` / `R` would be
+fitted from the other regimes' previous `[A b B]` / `[C d D]`, and the fit would
+depend on the order of the regimes. `_broadcast_tied_params!` makes the same copy
+at the end of the M-step, gated on the same `fit_bool`.
+=#
+function _share_slot_dyn!(ldss::AbstractVector, units::AbstractVector{Int})
+    src = ldss[units[1]]
+    W = nothing
+    for u in @view units[2:end]
+        dst = ldss[u]
+        (dst.state_model.A === src.state_model.A || !dst.fit_bool[_G_AB]) && continue
+        if W === nothing
+            D = src.latent_dim
+            W = _pack_dyn_W!(similar(src.state_model.A, D, D + 1 + src.ux_dim), src)
+        end
+        _unpack_dyn_W!(dst, W)
+    end
+    return nothing
+end
+
+function _share_slot_obs!(ldss::AbstractVector, units::AbstractVector{Int})
+    src = ldss[units[1]]
+    V = nothing
+    for u in @view units[2:end]
+        dst = ldss[u]
+        (dst.obs_model.C === src.obs_model.C || !dst.fit_bool[_G_CD]) && continue
+        if V === nothing
+            V = similar(src.obs_model.C, src.obs_dim, src.latent_dim + 1 + src.uy_dim)
+            _pack_obs_V!(V, src)
+        end
+        _unpack_obs_V!(dst, V)
     end
     return nothing
 end
@@ -941,8 +981,7 @@ function _grouped_update_C_d!(
             update_C_d!(
                 lds, _pool_obs!(bufs, sufs, units), _unit_ws(unit_sws, sws, units[1])
             )
-        else
-            lds.fit_bool[_G_CD] || continue
+        elseif lds.fit_bool[_G_CD]
             mask = _costate_range(lds)
             free_cols = if mask === nothing
                 nothing
@@ -960,6 +999,7 @@ function _grouped_update_C_d!(
             )
             _unpack_obs_V!(lds, V)
         end
+        _share_slot_obs!(ldss, units)
     end
     return nothing
 end

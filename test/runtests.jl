@@ -165,6 +165,7 @@ using SSDTest
                 test_SLDS_tied_params_each_group()
                 test_SLDS_tied_params_elbo_monotone()
                 test_SLDS_tied_params_gls_path()
+                test_SLDS_tied_params_order_invariant()
                 test_SLDS_tied_params_x0_P0_noop()
                 test_SLDS_tied_params_frozen_group()
                 test_SLDS_tied_params_partial_errors()
