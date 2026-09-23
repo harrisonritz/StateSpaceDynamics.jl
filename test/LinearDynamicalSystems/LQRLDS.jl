@@ -2323,7 +2323,8 @@ function test_lqr_free_matches_gaussian_lds()
     Theta = SSD._free_theta_pooled([lds], [hs], [1])
     R = SSD._free_residual_scatter(Theta, hs)
     expected = (R + prior.Ψ) / (prior.ν + hs.nk[1] + d + 1)
-    SSD._free_state_mstep!(lds, hs)
+    # Its diagnostics are `@debug`, not a warning on every M-step.
+    @test_logs min_level = Base.CoreLogging.Warn SSD._free_state_mstep!(lds, hs)
     @test sm.Σ ≈ expected atol = 1e-10
     return nothing
 end

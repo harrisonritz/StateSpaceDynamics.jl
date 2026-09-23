@@ -2088,7 +2088,9 @@ function _free_theta_pooled(
         Gm = pd_gram(Matrix{T}(Sww[free_cols, free_cols]); name="free dynamics Gram")
         # Θ_free Gm = rhs  ⇒  Gm Θ_freeᵀ = rhsᵀ, and Gm is symmetric.
         Theta[:, free_cols] .= transpose(Gm.chol \ Matrix{T}(transpose(rhs)))
-        @warn "diagnostic free regression" N = N gram_cond = cond(Sww[free_cols, free_cols]) theta_max = maximum(
+        # Off unless debug logging is on for the package; the arguments are not
+        # evaluated otherwise, so the `cond` and `eigvals` cost nothing.
+        @debug "free regression" N = N gram_cond = cond(Sww[free_cols, free_cols]) theta_max = maximum(
             abs, Theta
         ) rho = maximum(abs, eigvals(Theta[:, 1:d]))
     end
@@ -2129,7 +2131,7 @@ function _free_noise_mstep!(
     end
     Symmetrize!(R)
     copyto!(sm.Σ, R)
-    @warn "diagnostic free noise" N = N sigma_min = minimum(eigvals(Symmetric(R))) sigma_max = maximum(
+    @debug "free noise" N = N sigma_min = minimum(eigvals(Symmetric(R))) sigma_max = maximum(
         eigvals(Symmetric(R))
     )
     return nothing
