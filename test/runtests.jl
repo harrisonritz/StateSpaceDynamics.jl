@@ -239,6 +239,7 @@ using SSDTest
             test_lds_with_B_input_equivalent_to_bias()
             test_td_fit_with_latent_input()
             test_td_sampling_zero_input_matches_no_input()
+            test_multitrial_rand_is_per_trial()
             test_td_fit_missing_u_errors()
             test_marginal_loglikelihood()
             test_marginal_ll_matches_naive_filter()

@@ -629,7 +629,7 @@ recovered from 4.42 to 1.55.
 Things this harness turned up that are about `src/`, not about the models it
 fits. The directory is a measuring instrument, so the fixes live in `src/` and
 `test/`; each entry says where. #1–#3 were closed by milestone M0 of
-[`implementation-plan.md`](implementation-plan.md), #4 earlier, #5 and #6 after
+[`implementation-plan.md`](implementation-plan.md), #4 earlier, #5–#7 after
 it.
 
 ### 1. An `SLDS` mis-sizes its weighted sufficient statistics when the discrete states differ in regime count
@@ -772,3 +772,21 @@ state's structural M-step is an L-BFGS solve along a nearly flat cost-scale
 direction, and its stopping point moves the ELBO by ~1e-3 nats under a 1e-14
 relative change in the data — the same amount the regime order moves it. That
 is the optimizer, not the model; see the concerns under "Remaining concerns".
+
+### 7. A multi-trial `rand` depended on the thread layout
+
+The `LDS` sampler split `rng` into `min(ntrials, Threads.maxthreadid())`
+`MersenneTwister` children, one per chunk of trials, so the same seed gave
+different data on different thread counts. Julia 1.12+ starts one interactive
+thread by default, which put `maxthreadid()` at 2 on 1.13 and 1 on 1.10 in the
+same CI configuration. `MersenneTwister`'s integer seeding also changed between
+those versions.
+
+**Fixed.** Each trial now draws from a `Xoshiro` of its own, seeded with the
+trial's `UInt64` off `rng`, drawn in trial order before anything is sampled.
+A trial's data depend on `rng` and its index alone: the same at `maxthreadid()`
+1, 2 and 8, and the same on 1.10 and 1.13 (`Xoshiro`'s seeded stream agrees
+across them) to the last bit of the BLAS. `test_multitrial_rand_is_per_trial`
+pins trial `i` to the single-trial draw from its seed. The `SLDS` and LQR
+samplers draw serially from `rng` and were never affected. This changes the
+data every multi-trial `rand` call produces for a given seed.

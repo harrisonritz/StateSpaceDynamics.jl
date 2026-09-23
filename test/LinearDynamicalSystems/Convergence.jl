@@ -3,10 +3,9 @@ The EM stopping rule: `|ΔELBO| < max(tol, rtol · |ELBO|)`, with `rtol = 0` by
 default so that the absolute test alone is what every existing call gets.
 =#
 
-"""Four trials drawn one at a time. The multi-trial `rand` splits its stream over
-`Threads.maxthreadid()` chunks, so its draws depend on the thread layout (and
-Julia 1.12+ adds an interactive thread by default); these stopping points
-should not."""
+"""Four trials, each drawn from a seed of its own. (The multi-trial `rand` no
+longer depends on the thread layout either, but these stopping points were
+tuned on these draws.)"""
 function convergence_draws(model, seed)
     return [rand(StableRNG(seed + i), model, 60)[2] for i in 1:4]
 end
