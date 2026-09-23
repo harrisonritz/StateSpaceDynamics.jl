@@ -623,7 +623,14 @@ function test_poisson_obs_inputs(; rng=MersenneTwister(0xD0B5))
         @test_throws ArgumentError elbo(plds, Y)
         @test_throws ArgumentError fit!(deepcopy(plds), Y; progress=false)
 
-        # Laplace-EM ELBO monotone and D is learned from a zero init.
+        #=
+        Laplace-EM improves and D is learned from a zero init. Not monotone to
+        1e-6: the Laplace E-step is approximate, and once the fit is near its
+        optimum the trace wobbles at that approximation's resolution (on Julia
+        1.10's draw of this fixture, fourteen steps dip, the largest by 8e-3
+        nats, against a 305-nat gain). A dip must stay small next to the
+        progress.
+        =#
         plds0 = LinearDynamicalSystem(
             GaussianStateModel(;
                 A=0.5 * Matrix{Float64}(I, Dl, Dl),
@@ -635,7 +642,9 @@ function test_poisson_obs_inputs(; rng=MersenneTwister(0xD0B5))
             PoissonObservationModel(; C=0.1 * randn(rng, P, Dl), d=zeros(P), D=zeros(P, V)),
         )
         elbos = fit!(plds0, Y; uy=uy, max_iter=50, progress=false)
-        @test minimum(diff(elbos)) >= -1e-6
+        gain = elbos[end] - elbos[1]
+        @test gain > 0
+        @test minimum(diff(elbos)) >= -1e-4 * gain
         @test norm(plds0.obs_model.D) > 1e-3
     end
     return nothing
