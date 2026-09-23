@@ -29,7 +29,7 @@ assertion that passes.
                          smoulder experiments only
     --only=a,b           run only these experiments (overview, design, scale,
                          procedure, initialization, modelrecovery, goldstandard,
-                         priors, switching, smoulder-lqr, smoulder-gref,
+                         priors, switching, reference-audit, smoulder-lqr, smoulder-gref,
                          smoulder-slqr)
     --gen=rand|lqr|both  which generative mode the parametric sweeps use
                          (default: both for `design`, `lqr` elsewhere)
@@ -48,6 +48,7 @@ assertion that passes.
     report.jl       tables
     experiments.jl  the five sweeps
     smoulder.jl     grouped Poisson LQR/SLQR recovery at the task's scale
+    reference_audit.jl  labelled-target likelihood and EM convergence diagnostics
 
 ## The design decision worth knowing
 
@@ -80,6 +81,7 @@ for _f in (
     "plotting.jl",
     "experiments.jl",
     "smoulder.jl",
+    "reference_audit.jl",
 )
     include(joinpath(@__DIR__, _f))
 end
@@ -97,7 +99,7 @@ const DEFAULT_EXPERIMENTS = (
 )
 
 const ALL_EXPERIMENTS = (
-    DEFAULT_EXPERIMENTS..., "smoulder-lqr", "smoulder-gref", "smoulder-slqr"
+    DEFAULT_EXPERIMENTS..., "reference-audit", "smoulder-lqr", "smoulder-gref", "smoulder-slqr"
 )
 
 const SMOULDER_EXPERIMENTS = ("smoulder-lqr", "smoulder-gref", "smoulder-slqr")
@@ -156,7 +158,7 @@ _gens(gen, default) = gen === :both ? default : (gen,)
 
 function main(args=String[])
     opt = parse_args(args)
-    opt.selftest && return (selftest(); smoulder_selftest(); nothing)
+    opt.selftest && return (selftest(); smoulder_selftest(); reference_audit_selftest(); nothing)
     cfg = tier(opt.tier)
     t0 = time()
 
@@ -176,6 +178,10 @@ function main(args=String[])
 
     if "overview" in opt.only
         experiment_overview(cfg; figures=opt.figures, free_C=opt.free_C)
+    end
+    if "reference-audit" in opt.only
+        opt.free_C && error("reference-audit requires fixed C; omit --free-C")
+        experiment_reference_audit(cfg; figures=opt.figures)
     end
     if "design" in opt.only
         for g in _gens(opt.gen, (:rand, :lqr))
@@ -273,13 +279,17 @@ function reading_guide()
     control *problem*; it reads `--` when the fitted cost admits no stabilizing Riccati
     solution, which is itself a result.
 
-    Recovery results with a reference also carry a `gauge` audit, and tables
-    print it whenever the emission basis moved. The audit estimates an
+    Recovery results with a reference also carry a `gauge` audit. Tables print
+    its coordinate branch whenever the emission basis moved; the dedicated
+    reference-identification and smoulder-Gref sections additionally print
+    reference-geometry and design-rank diagnostics. The audit estimates an
     orthogonal state-basis map from the fitted and true emission loadings, then
     apply that same map to `A`, `S`, every reward-specific running/terminal
-    `Qc`, the closed loop, and `Gref`. `G'G` is the target Gram matrix and is
-    rotation-invariant. A bad raw `Gref` with good aligned `Gref` and `G'G` is a
-    coordinate-gauge result, not failed recovery of target geometry.
+    `Qc`, the closed loop, and `Gref`. Centred contrasts and pairwise target
+    distances remove the separate common-origin gauge; the latter are also
+    rotation-invariant. The augmented-design and translation nullities say
+    whether that origin is identified at all. `G'G` is rotation-invariant but
+    is not invariant to a common target translation.
 
     `Δelbo` is the fit's ELBO minus the ELBO at the generating parameters: a few nats is
     ordinary finite-sample slack, a large positive number means the model prefers
@@ -299,11 +309,12 @@ function reading_guide()
     probability, and the quickest tell for a collapsed fit: everything in one state
     reports a `stay` near 1 and a `γ acc` near 0.5.
 
-    Section 1 draws from the model, where recovery is a well-posed estimation question;
-    its terminal row is the exception, and is expected to look bad. The terminal factor
-    is a conditioning event, so `rand` draws the conditioned path distribution while the
-    objective is the joint, and maximizing the latter on the former is a selection
-    effect rather than an estimator. Section 2 draws from the control problem's actual
+    Section 1 draws from the model, where recovery is a well-posed estimation question.
+    That includes its terminal row: the terminal factor is a conditioning event, `rand`
+    draws the conditioned path distribution, and the package's default objective
+    (`condition_terminal = true`) is that same conditional likelihood. Fitting the joint
+    instead (`condition_terminal = false`) on those draws is a selection effect rather
+    than an estimator. Section 2 draws from the control problem's actual
     optimum, which is the case the model is for and the harder one; at `slack = 0` the
     agent is exactly optimal, its innovation is rank `n` and time-varying while the
     model's `Σ` is full rank and constant, and the row is allowed to fail outright.

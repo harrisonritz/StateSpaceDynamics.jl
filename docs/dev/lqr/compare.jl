@@ -18,7 +18,7 @@ thing that differs is the transition:
     input entering through a free `B_u`.
 
 The LDS is the *harder* competitor it looks: with a free `B_u` it has more free
-parameters than the LQR (62 against 46 at `n = 2` with eight targets), so a
+parameters than the LQR (48 against 29 at `n = 2` with eight targets), so a
 win for the LQR on held-out data is not a win on parsimony alone.
 
 ## The three generators
@@ -152,10 +152,11 @@ function nparams(sm, nref::Int)
     d = _state_dim(sm)
     n = d ÷ 2
     tri(k) = k * (k + 1) ÷ 2
-    # `h` is frozen on the free candidate whenever there is a one-hot input to
-    # be collinear with; see `free_candidate`.
+    # `h` is frozen on both candidates whenever there is a one-hot input to be
+    # collinear with; see `free_candidate` and `fit_model`.
     sm.mode === :free && return d^2 + (nref == 0 ? d : 0) + d * nref
-    return n^2 + tri(n) + length(sm.Qc) * tri(n) + d + n * nref    # A, S, Qc, h, Gref
+    return n^2 + tri(n) + length(sm.Qc) * tri(n) +
+           (nref == 0 ? d : 0) + n * nref                         # A, S, Qc, h, Gref
 end
 
 _state_dim(sm) = size(sm.Σ, 1)

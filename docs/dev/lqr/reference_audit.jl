@@ -30,7 +30,14 @@ function reference_permutation_audit(Gfit, Gtruth; max_columns::Int=8)
     return best[]
 end
 
-"""Log evidence of the terminal event, before conditioning on observations."""
+"""
+    reference_terminal_evidence(lds, uxs)
+
+Log evidence of the terminal event, `Σ log p(terminal = 0 | θ, u)`, before
+conditioning on observations. The package computes the same normalizer by
+backward square-root integration; this forward pass is kept as an independent
+check on it, and supplies the normalizer's curvature to [`reference_em_audit`](@ref).
+"""
 function reference_terminal_evidence(lds, uxs)
     sm = lds.state_model
     sm.terminal || return 0.0
@@ -44,7 +51,7 @@ function reference_terminal_evidence(lds, uxs)
             mu = M * mu + sm.cache.bfwd + sm.cache.Bfwd[k] * u[:, t]
             V = M * V * M' + Matrix(sm.cache.Qfwd)
         end
-        k = SSD._regime(sm, T)
+        k = SSD._terminal_regime(sm, T)
         L = sm.cache.Lf[k]
         r = L * mu - sm.hf + sm.cache.Ftrm[k] * u[:, T]
         W = Symmetric(L * V * L' + Matrix(sm.Σf))
@@ -53,34 +60,13 @@ function reference_terminal_evidence(lds, uxs)
     return total
 end
 
-"""
-    reference_likelihood_profile(lds, ys, uxs; conditional=false, step=0.25)
-
-With all other parameters fixed, the Gaussian marginal log likelihood is an
-exact quadratic in `vec(Gref)`. Recover its observed information and unique
-optimum by central differences. This integrates out costates and bypasses EM;
-it distinguishes slow EM from an actually flat reference likelihood. The
-input model is copied. This small diagnostic is not a general fitting method.
-
-For terminal-conditioned samples, `conditional=true` subtracts the terminal
-event's evidence from the package's joint objective. Both objectives are useful
-but must not be confused when assessing the sampler's recovery.
-"""
-function reference_likelihood_profile(lds, ys, uxs; conditional::Bool=false, step=0.25)
-    lds.obs_model isa GaussianObservationModel ||
-        throw(ArgumentError("quadratic reference audit requires Gaussian observations"))
-    step > 0 || throw(ArgumentError("finite-difference step must be positive"))
-    work = deepcopy(lds)
-    sm = work.state_model
-    g = vec(copy(sm.Gref))
+#=
+Value, gradient and negative Hessian of `value` at `g` by central differences.
+Every objective audited here is an exact quadratic in `vec(Gref)` (the reference
+moves means, never covariances), so the differences are exact up to rounding.
+=#
+function _quadratic_information(value, g, step)
     p = length(g)
-    0 < p <= 32 || throw(ArgumentError("quadratic audit requires 1:32 Gref entries"))
-    function value(v)
-        sm.Gref .= reshape(v, size(sm.Gref))
-        refresh!(sm)
-        ll = elbo(work, ys; ux=uxs)
-        return conditional ? ll - reference_terminal_evidence(work, uxs) : ll
-    end
     base = value(g)
     grad, H = zeros(p), zeros(p, p)
     E = Matrix(step * I, p, p)
@@ -94,6 +80,46 @@ function reference_likelihood_profile(lds, ys, uxs; conditional::Bool=false, ste
                 value(g-a+b) + value(g-a-b)) / (4step^2)
         end
     end
+    return base, grad, H
+end
+
+# Evaluate `f(work)` at a copy of `lds` whose `Gref` is set from `v`.
+function _gref_evaluator(f, lds)
+    work = deepcopy(lds)
+    sm = work.state_model
+    return v -> begin
+        sm.Gref .= reshape(v, size(sm.Gref))
+        refresh!(sm)
+        f(work)
+    end
+end
+
+"""
+    reference_likelihood_profile(lds, ys, uxs; conditional=true, step=0.25)
+
+With all other parameters fixed, the Gaussian marginal log likelihood is an
+exact quadratic in `vec(Gref)`. Recover its observed information and unique
+optimum by central differences. This integrates out costates and bypasses EM;
+it distinguishes slow EM from an actually flat reference likelihood. The
+input model is copied. This small diagnostic is not a general fitting method.
+
+For a terminal model, `conditional` sets the copy's `condition_terminal`:
+`true` scores `log p(y | terminal = 0)` — the package default, what EM maximizes,
+and the likelihood of the terminal-conditioned sampler's draws — and `false`
+scores the joint `log p(y, terminal = 0)`. Without a terminal factor they agree.
+"""
+function reference_likelihood_profile(lds, ys, uxs; conditional::Bool=true, step=0.25)
+    lds.obs_model isa GaussianObservationModel ||
+        throw(ArgumentError("quadratic reference audit requires Gaussian observations"))
+    step > 0 || throw(ArgumentError("finite-difference step must be positive"))
+    g = vec(copy(lds.state_model.Gref))
+    p = length(g)
+    0 < p <= 32 || throw(ArgumentError("quadratic audit requires 1:32 Gref entries"))
+    value = _gref_evaluator(lds) do work
+        work.state_model.condition_terminal = conditional
+        elbo(work, ys; ux=uxs)
+    end
+    base, grad, H = _quadratic_information(value, g, step)
     ev = eigvals(Symmetric(H))
     cutoff = max(maximum(abs, ev) * 1e-7, 1e-8)
     r = count(>(cutoff), ev)
@@ -103,20 +129,28 @@ function reference_likelihood_profile(lds, ys, uxs; conditional::Bool=false, ste
     delta = step .* sin.(1:p)
     residual = abs(value(g + delta) - (base + dot(grad, delta) - dot(delta, H * delta)/2))
     return (; rank=r, dimension=p, eigenvalues=ev, information=H, gradient=grad,
-        optimum=reshape(optimum, size(sm.Gref)), gain, quadratic_residual=residual)
+        optimum=reshape(optimum, size(lds.state_model.Gref)), gain,
+        quadratic_residual=residual, conditional=(conditional && lds.state_model.terminal))
 end
 
 """
 Check one Gref-only EM step against its exact quadratic solution. The complete
 information uses the mixed-coordinate residual, independently of the M-step's
-packed objective. For fixed nuisance parameters, the predicted update is
-`I_complete \\ gradient(log p(y, terminal))`. Generalized eigenvalues of observed
-versus complete information quantify the fraction of error removed per ideal
-EM step along each eigenmode; a tiny fraction predicts slow EM even when the
-marginal likelihood has a unique, well-determined maximum.
+packed objective. When the terminal event is conditioned on, the M-step
+maximizes `Q(θ | θ′) − Σ log Z(θ)`, so the normalizer's own curvature — from the
+independent [`reference_terminal_evidence`](@ref) — is subtracted. For fixed
+nuisance parameters the predicted update is `I_mstep \\ gradient`, the gradient
+being that of the objective EM ascends (Fisher's identity). Generalized
+eigenvalues of observed versus M-step information quantify the fraction of error
+removed per ideal EM step along each eigenmode; a tiny fraction predicts slow EM
+even when the marginal likelihood has a unique, well-determined maximum.
 """
-function reference_em_audit(lds, ys, uxs, profile)
+function reference_em_audit(lds, ys, uxs, profile; step=0.25)
     sm = lds.state_model
+    conditioned = sm.terminal && sm.condition_terminal
+    profile.conditional == conditioned || throw(ArgumentError(
+        "profile objective (conditional=$(profile.conditional)) is not the one EM " *
+        "ascends (conditional=$conditioned)"))
     n, m = size(sm.Gref)
     W = inv(Matrix(sm.Σ))[(n+1):2n, (n+1):2n]
     complete = zeros(n*m, n*m)
@@ -127,11 +161,20 @@ function reference_em_audit(lds, ys, uxs, profile)
             complete .+= kron(u[:, t] * u[:, t]', Q' * W * Q)
         end
         if sm.terminal
-            Q = sm.Qc[SSD._regime(sm, T)]
+            Q = sm.Qc[SSD._terminal_regime(sm, T)]
             complete .+= kron(u[:, T] * u[:, T]', Q' * (Matrix(sm.Σf) \ Q))
         end
     end
-    delta = Symmetric(complete) \ profile.gradient
+    normalizer = if conditioned
+        _quadratic_information(
+            _gref_evaluator(w -> reference_terminal_evidence(w, uxs), lds),
+            vec(copy(sm.Gref)), step,
+        )[3]
+    else
+        zeros(n*m, n*m)
+    end
+    mstep = Symmetric(complete - normalizer)
+    delta = mstep \ profile.gradient
     work = deepcopy(lds)
     work.fit_bool .= false
     work.fit_bool[3] = true
@@ -140,7 +183,7 @@ function reference_em_audit(lds, ys, uxs, profile)
     # LQR fit! includes a final E-step: two reported iterations mean one M-step.
     fit!(work, ys; ux=uxs, max_iter=2, tol=0.0, progress=false)
     actual = vec(work.state_model.Gref - sm.Gref)
-    fractions = eigvals(Symmetric(profile.information), Symmetric(complete))
+    fractions = eigvals(Symmetric(profile.information), mstep)
     return (; step_relative_error=norm(actual-delta)/max(norm(delta), 1e-12),
         fractions, predicted_step=delta, actual_step=actual)
 end
@@ -176,7 +219,45 @@ function reference_audit_selftest(; verbose::Bool=true)
     @assert em.step_relative_error < 1e-3
     @assert all(0 .< em.fractions .< 1)
     @assert probe.state_model.Gref == G0
-    verbose && println("reference audit selftest: PASS (labels, quadratic likelihood, exact EM step)")
+
+    #=
+    Terminal conditioning. The joint and conditional objectives differ by exactly
+    the terminal evidence, computed three ways: the package's two `elbo`s, the
+    package's normalizer, and the independent forward pass. The profiles must
+    then differ by the normalizer's curvature, and the conditional EM step —
+    whose M-step carries `−log Z` — must still match its quadratic prediction.
+    =#
+    tt = lqr_truth(; n=3, nref=4, tsteps=6, terminal=true, onset=3)
+    trng = MersenneTwister(23)
+    tus = target_inputs(trng, 4, 8, 6)
+    tys = simulate(trng, tt, 8; uxs=tus)
+    tprobe = deepcopy(tt.lds)
+    tprobe.state_model.Gref .= fit_model(tt; known_plant=true, free_gref=true).Gref
+    refresh!(tprobe.state_model)
+    @assert tprobe.state_model.condition_terminal
+    joint_model = deepcopy(tprobe)
+    joint_model.state_model.condition_terminal = false
+    evidence = reference_terminal_evidence(tprobe, tus)
+    @assert evidence < 0
+    @assert isapprox(elbo(joint_model, tys; ux=tus) - elbo(tprobe, tys; ux=tus),
+        evidence; atol=1e-8, rtol=0)
+    @assert isapprox(sum(u -> SSD._lqr_terminal_logz(tprobe.state_model, u), tus),
+        evidence; atol=1e-8, rtol=0)
+    pc = reference_likelihood_profile(tprobe, tys, tus; conditional=true)
+    pj = reference_likelihood_profile(tprobe, tys, tus; conditional=false)
+    @assert pc.conditional && !pj.conditional
+    @assert pc.rank == pj.rank == 12
+    @assert max(pc.quadratic_residual, pj.quadratic_residual) < 1e-5
+    Hz = _quadratic_information(
+        _gref_evaluator(w -> reference_terminal_evidence(w, tus), tprobe),
+        vec(copy(tprobe.state_model.Gref)), 0.25,
+    )[3]
+    @assert norm(pj.information - pc.information - Hz) <= 1e-6 * norm(pj.information)
+    tem = reference_em_audit(tprobe, tys, tus, pc)
+    @assert tem.step_relative_error < 1e-3
+    @assert all(0 .< tem.fractions .< 1)
+    verbose && println("reference audit selftest: PASS (labels, quadratic likelihood, " *
+        "exact EM step, terminal conditioning)")
     return true
 end
 
@@ -184,8 +265,10 @@ end
 Audit the apparent target permutation in `params_model_full.png`. All arms use
 the same state observations, from one draw with both state and costate observed.
 The Gaussian likelihood probes hold nuisance parameters fixed and are not a
-claim of global joint identifiability. Terminal sampling conditions on an event;
-the optional conditional profiles account for that event's normalizer.
+claim of global joint identifiability. Every likelihood reported is the one EM
+maximizes, `log p(y | terminal = 0)` (the package's default `condition_terminal`);
+the oracle controls also print the joint `log p(y, terminal = 0)` optimum, to
+show what scoring the terminal event as an observation would cost.
 """
 function experiment_reference_audit(cfg; figures::Bool=true)
     n, T, N = cfg.n, cfg.tsteps, cfg.ntrials
@@ -224,10 +307,10 @@ function experiment_reference_audit(cfg; figures::Bool=true)
         ll_permuted = elbo(reordered, ys; ux=us)
         # Relabelling input rows with the same permutation must restore the model.
         relabelled = elbo(reordered, ys; ux=[u[perm.order, :] for u in us])
-        @printf("  permutation alone Δjoint %.3f; permutation + input relabel Δjoint %.3g\n",
+        @printf("  permutation alone Δll %.3f; permutation + input relabel Δll %.3g\n",
             ll_permuted - ll, relabelled - ll)
         profile = reference_likelihood_profile(fit, ys, us)
-        @printf("  fixed-nuisance joint information rank %d/%d; λmin %.4g; direct G gain %.3f; quadratic residual %.3g\n",
+        @printf("  fixed-nuisance information rank %d/%d; λmin %.4g; direct G gain %.3f; quadratic residual %.3g\n",
             profile.rank, profile.dimension, minimum(profile.eigenvalues),
             profile.gain, profile.quadratic_residual)
         @printf("  direct G optimum error %.4f (other fitted parameters held fixed)\n",
@@ -244,10 +327,14 @@ function experiment_reference_audit(cfg; figures::Bool=true)
         oracle.state_model.Gref .= fit_model(truth; known_plant=true, free_gref=true).Gref
         refresh!(oracle.state_model)
         p = reference_likelihood_profile(oracle, ys, us; conditional=true)
+        pj = reference_likelihood_profile(oracle, ys, us; conditional=false)
         @printf("\nOracle nuisance, %-15s conditional rank %d/%d; λmin %.4g; G error %.4f; gain %.3f; residual %.3g\n",
             label, p.rank, p.dimension, minimum(p.eigenvalues),
             score(p.optimum, truth.sm.Gref).rmse, p.gain, p.quadratic_residual)
+        @printf("  (joint objective instead: G error %.4f)\n",
+            score(pj.optimum, truth.sm.Gref).rmse)
         results["oracle " * label] = p
+        results["oracle joint " * label] = pj
     end
     if figures
         Gtrue = state.sm.Gref

@@ -47,14 +47,18 @@ end
 The truth's `Gref`: column `j` is the state-space reference the agent steers
 toward when target `j` is the one presented. Deterministic — a truth that moved
 with the rng would make two conditions incomparable — and phase-shifted so the
-columns are mutually distinct and none is a multiple of another.
+columns are distinct when multiple targets are requested. This cosine bank is
+rank at most two and includes antipodal pairs for even `nref`; it is deliberately
+structured, rather than a generic full-rank reference bank.
 
 With `nref = 1` there is one reference and it never varies across trials, which
 is exactly the degenerate case: a constant `−Q₁ G_r u` is indistinguishable from
 the affine drift `h`'s costate half unless something else breaks the tie. Two or
 more targets vary within the dataset and identify the *contrasts* between
-reference vectors; a terminal factor or a second cost regime is what identifies
-their common level.
+reference vectors. Their common level still shares a gauge with the affine
+intercept; a second active running-cost matrix with shared `h`, freezing `h`, or
+an explicit centring constraint is what identifies it. A terminal factor does
+not do so when its own offset `hf` is fitted.
 """
 function reference_map(n::Int, nref::Int; radius::Float64=1.5, ring::Bool=false)
     nref == 0 && return zeros(0, 0)
