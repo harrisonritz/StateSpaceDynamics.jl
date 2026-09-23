@@ -564,6 +564,8 @@ function test_lqr_terminal_normalizer()
     @test maximum(abs, SSD.symplectic_matrix(sm)) > 2      # genuinely explosive
     value = SSD._lqr_terminal_logz(sm, zeros(0, long))
     @test isfinite(value)
+    @test SSD._lqr_terminal_logz_sum(sm, [(ux=zeros(0, long), count=2)]) ≈ 2value rtol =
+        1e-10
     #=
     Float64 forward propagation of the same chain reaches ~1e182 by the endpoint
     and its symmetric eigenvalues straddle zero there, so the dense reference
@@ -583,6 +585,21 @@ function test_lqr_terminal_normalizer()
     end
     @test isfinite(reference)
     @test value ≈ Float64(reference) rtol = 1e-9
+    return nothing
+end
+
+function test_lqr_terminal_normalizer_shared_horizons()
+    rng = StableRNG(20260923)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=18, ux_dim=2, onset=6)
+    sm.Gref .= randn(rng, size(sm.Gref)...) .* 0.2
+    SSD.refresh!(sm)
+    SSD._prepare_lqr!(lds, [11, 14, 18])
+    designs = [
+        (ux=randn(rng, 2, t), count=count) for
+        (t, count) in ((11, 2), (14, 1), (11, 3), (18, 2), (14, 4))
+    ]
+    reference = sum(d.count * SSD._lqr_terminal_logz(sm, d.ux) for d in designs)
+    @test SSD._lqr_terminal_logz_sum(sm, designs) ≈ reference atol = 1e-9
     return nothing
 end
 
@@ -705,9 +722,33 @@ function test_lqr_multitrial_equivalence()
     xg, _ = smooth(ref, ys)
     @test maximum(maximum.(abs, xh .- xg)) < 1e-10
 
-    # Ragged trials take the per-trial fallback; the two must agree there too.
+    # Ragged trials must agree with the explicit Gaussian model too.
     yr = [randn(rng, lds.obs_dim, t) .* 0.4 for t in (11, 16, 13)]
     @test elbo(lds, yr) ≈ elbo(ref, yr) atol = 1e-8
+    return nothing
+end
+
+function test_lqr_ragged_shared_cov_matches_per_trial()
+    rng = StableRNG(20260924)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=3, tsteps=16, ux_dim=2, onset=5)
+    lengths = [11, 16, 11, 13, 16]
+    ys = [randn(rng, lds.obs_dim, t) .* 0.4 for t in lengths]
+    uxs = [randn(rng, 2, t) .* 0.2 for t in lengths]
+    data = SSD.Data(lds, ys; ux=uxs)
+    SSD._prepare_lqr!(lds, data.tsteps)
+    tfs = SSD.initialize_FilterSmooth(lds, data.tsteps)
+    pool = SSD._lqr_sws_pool(lds, data)
+    SSD.smooth!(lds, tfs, data, pool)
+    @test tfs[1].p_smooth === tfs[3].p_smooth
+    @test tfs[2].p_smooth === tfs[5].p_smooth
+    for i in eachindex(lengths)
+        ref = SSD.initialize_FilterSmooth(lds, [lengths[i]])[1]
+        SSD.smooth!(lds, ref, ys[i], pool[1], uxs[i], data.uy[i])
+        @test tfs[i].x_smooth ≈ ref.x_smooth atol = 1e-9
+        @test tfs[i].p_smooth ≈ ref.p_smooth atol = 1e-9
+        @test tfs[i].p_smooth_tt1 ≈ ref.p_smooth_tt1 atol = 1e-9
+        @test tfs[i].entropy ≈ ref.entropy atol = 1e-9
+    end
     return nothing
 end
 
@@ -1227,6 +1268,43 @@ function test_lqr_noise_update_closed_form()
     SSD._lqr_noise_mstep!(ctx2)
     expected = (ctx2.R[1] .+ prior.Ψ) ./ (prior.ν + ctx2.N_q[1] + lds2.latent_dim + 1)
     @test sm2.Σ ≈ expected atol = 1e-12
+    return nothing
+end
+
+function test_lqr_fixed_costate_sigma()
+    rng = StableRNG(135)
+    sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=10)
+    n = size(sm.A, 1)
+    v = 1e-3
+    sm.fixed_costate_sigma = v
+    sm.Σ[(n + 1):(2n), (n + 1):(2n)] .= v .* I(n)
+    refresh!(sm)
+    ys = [randn(rng, lds.obs_dim, 10) .* 0.4 for _ in 1:3]
+    hs, _, _, _ = lqr_estep_stats(lds, ys)
+    ctx = SSD._LQRMStepCtx(hs, sm, true)
+    @test !ctx.profile
+    SSD._lqr_structure_mstep!(ctx, true, sm.mstep_iters)
+    SSD._lqr_noise_mstep!(ctx)
+    @test sm.Σ[1:n, 1:n] ≈ ctx.R[1][1:n, 1:n] ./ ctx.N_q[1] atol = 1e-12
+    @test sm.Σ[(n + 1):(2n), (n + 1):(2n)] ≈ v .* I(n)
+    @test sm.Σ[1:n, (n + 1):(2n)] == zeros(n, n)
+    @test sm.Σ[(n + 1):(2n), 1:n] == zeros(n, n)
+
+    slots = [ones(Int, 1) for _ in 1:4]
+    problem = SSD._lqr_conditional_problem([lds], [hs], slots)
+    θ = copy(problem.theta)
+    @test isfinite(problem.evaluate!(zeros(length(θ)), θ))
+    @test sm.Σ[(n + 1):(2n), (n + 1):(2n)] ≈ v .* I(n)
+    @test sm.Σ[1:n, (n + 1):(2n)] == zeros(n, n)
+
+    @test_throws ArgumentError LQRStateModel(
+        sm.A,
+        sm.S,
+        sm.Qc,
+        sm.Σ;
+        fixed_costate_sigma=v,
+        Σ_prior=IWPrior(Matrix(0.1I, 2n, 2n), 8.0),
+    )
     return nothing
 end
 

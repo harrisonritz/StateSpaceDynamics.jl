@@ -226,6 +226,7 @@ using SSDTest
                 test_td_mn_priors_shrink()
                 test_td_with_uy()
                 test_td_ragged_multi_trial()
+                test_td_ragged_shared_cov_matches_per_trial()
                 test_td_weighted_aggregator_matches_unweighted_with_inputs()
                 test_mn_prior_type_decoupled_from_model_matrix()
             end
@@ -401,6 +402,7 @@ using SSDTest
                 test_lqr_refresh_and_utilities()
                 test_lqr_rescale_costate()
                 test_lqr_terminal_normalizer()
+                test_lqr_terminal_normalizer_shared_horizons()
                 test_lqr_dimension_and_terminal_score()
             end
 
@@ -415,6 +417,7 @@ using SSDTest
             @testset "E-step" begin
                 test_lqr_reduces_to_gaussian_lds()
                 test_lqr_multitrial_equivalence()
+                test_lqr_ragged_shared_cov_matches_per_trial()
                 test_lqr_batched_gradient_matches_per_trial()
                 test_lqr_gradient_and_hessian()
                 test_lqr_elbo_matches_exact_marginal()
@@ -432,6 +435,7 @@ using SSDTest
                 test_lqr_conditional_mstep_gradient()
                 test_lqr_rejectable_failures()
                 test_lqr_noise_update_closed_form()
+                test_lqr_fixed_costate_sigma()
                 test_lqr_recovers_parameters()
             end
 
@@ -488,6 +492,7 @@ using SSDTest
         include("LinearDynamicalSystems/LQRSLDS.jl")
         @testset "Switching inverse-LQR (LQR SLDS)" begin
             test_slds_lqr_matches_lds()
+            test_slds_lqr_fixed_costate_sigma()
             test_slds_lqr_monotone()
             test_slds_free_matches_gaussian_slds()
             test_slds_mixed_free_and_lqr()

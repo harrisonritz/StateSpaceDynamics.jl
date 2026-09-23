@@ -275,9 +275,10 @@ end
 """
     smooth!(lds, tfs, data::Data, sws_pool)
 
-Low-allocation multi-trial smoothing. Trials are partitioned into chunks and
-run in parallel via OhMyThreads' `tforeach`; each chunk owns one workspace from
-`sws_pool`, indexed by chunk position rather than `threadid()` (see
+Low-allocation multi-trial smoothing. Trials are grouped by length, partitioned
+into chunks, and run in parallel via OhMyThreads' `tforeach`; each chunk owns
+one workspace from `sws_pool`, indexed by chunk position rather than
+`threadid()` (see
 https://julialang.org/blog/2023/07/PSA-dont-use-threadid/).
 
 # Arguments
@@ -368,20 +369,59 @@ function smooth!(
         return tfs
     end
 
-    # Variable-length fallback: per-trial smoothing (each trial gets its own
-    # Hessian, cov, and mean pass on the assigned worker workspace).
-    ntasks = min(ntrials, length(sws_pool))
+    # The precision is also shared by trials of the same length in a ragged
+    # dataset. Reuse its factorization and covariance within each length bucket
+    # instead of recomputing them for every trial. The covariance arrays must be
+    # copied once per bucket: the source workspace is reused for the next length.
+    by_length = Dict{Int,Vector{Int}}()
+    for (trial, tsteps) in enumerate(data.tsteps)
+        push!(get!(by_length, tsteps, Int[]), trial)
+    end
+    bucket_sws = sws_pool[1]
+    for tsteps in unique(data.tsteps)
+        trials = by_length[tsteps]
+        if length(trials) == 1
+            single_trial = only(trials)
+            smooth!(
+                lds,
+                tfs[single_trial],
+                _trial(y, single_trial),
+                bucket_sws,
+                ux[single_trial],
+                _trial(uy, single_trial),
+            )
+            continue
+        end
+        shared_entropy = _precompute_shared_cov!(bucket_sws, lds, tsteps)
+        shared_p = copy(view(bucket_sws.agg.p_smooth_shared, :, :, 1:tsteps))
+        shared_p_tt1 = copy(view(bucket_sws.agg.p_smooth_tt1_shared, :, :, 1:tsteps))
+        for trial in trials
+            tfs[trial].p_smooth = shared_p
+            tfs[trial].p_smooth_tt1 = shared_p_tt1
+            tfs[trial].entropy = shared_entropy
+        end
+        ntasks = min(length(trials), length(sws_pool))
+        let chunksize = cld(length(trials), ntasks),
+            trials = trials,
+            bucket_sws = bucket_sws
 
-    let chunksize = cld(ntrials, ntasks)
-        tforeach(1:ntasks) do i
-            lo = (i - 1) * chunksize + 1
-            hi = min(i * chunksize, ntrials)
-            lo > hi && return nothing
-            sws = sws_pool[i]
-            for trial in lo:hi
-                smooth!(
-                    lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial)
-                )
+            tforeach(1:ntasks) do i
+                lo = (i - 1) * chunksize + 1
+                hi = min(i * chunksize, length(trials))
+                lo > hi && return nothing
+                sws = sws_pool[i]
+                for j in lo:hi
+                    local trial = trials[j]
+                    _smooth_mean_only!(
+                        lds,
+                        tfs[trial],
+                        _trial(y, trial),
+                        sws,
+                        ux[trial],
+                        _trial(uy, trial),
+                        bucket_sws,
+                    )
+                end
             end
         end
     end

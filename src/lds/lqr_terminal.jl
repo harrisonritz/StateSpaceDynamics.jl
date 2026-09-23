@@ -51,6 +51,56 @@ function _lqr_terminal_logz(sm::LQRStateModel{T}, ux::AbstractMatrix{T}) where {
            T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual))
 end
 
+"""Sum terminal log normalizers, factoring each distinct horizon only once.
+
+The backward covariance recursion depends on the model and trial length, not
+on the input trajectory. The backward mean recursion still runs for every
+distinct input, with its trial count as weight.
+"""
+function _lqr_terminal_logz_sum(sm::LQRStateModel{T}, designs) where {T}
+    sm.terminal || return zero(T)
+    by_horizon = Dict{Int,Vector{Int}}()
+    for (i, design) in enumerate(designs)
+        push!(get!(by_horizon, size(design.ux, 2), Int[]), i)
+    end
+    n = _plant_dim(sm)
+    c = sm.cache
+    Lf = cholesky(Symmetric(Matrix(sm.Σf))).L
+    Lq = c.G * cholesky(Symmetric(Matrix(sm.Σ))).L
+    L0 = cholesky(Symmetric(Matrix(sm.P0))).L
+    Id = Matrix{T}(I, n, n)
+    total = zero(T)
+    for (horizon, indices) in by_horizon
+        kf = _terminal_regime(sm, horizon)
+        H = Lf \ c.Lf[kf]
+        logscale = -sum(log, abs.(diag(Lf)))
+        # Store the input-independent factors in backward time order.
+        steps = Vector{Tuple{Int,Matrix{T},Matrix{T},Int}}(undef, horizon - 1)
+        for (j, t) in enumerate((horizon - 1):-1:1)
+            k = _regime(sm, t)
+            L = LowerTriangular(Matrix(qr(transpose(hcat(Id, H * Lq))).R)')
+            steps[j] = (t, Matrix(L), H, k)
+            H = L \ (H * c.M[k])
+            logscale -= sum(log, abs.(diag(L)))
+        end
+        L = LowerTriangular(Matrix(qr(transpose(hcat(Id, H * L0))).R)')
+        logscale -= sum(log, abs.(diag(L)))
+        for i in indices
+            design = designs[i]
+            ux = design.ux
+            a = Lf \ (sm.hf - c.Ftrm[kf] * view(ux, :, horizon))
+            for (t, Lt, Ht, k) in steps
+                a = LowerTriangular(Lt) \ (a - Ht * (c.bfwd + c.Bfwd[k] * view(ux, :, t)))
+            end
+            residual = L \ (a - H * sm.x0)
+            total +=
+                design.count *
+                (logscale - T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual)))
+        end
+    end
+    return total
+end
+
 function Q_state!(
     sws::SmoothWorkspace{T},
     lds::LinearDynamicalSystem{T,S,O},
@@ -64,9 +114,7 @@ function Q_state!(
             "`_aggregate_lqr_stats!` records; this `Q_state!` was handed statistics " *
             "that no aggregation pass filled",
         )
-        for design in _lqr_terminal_designs(hs)
-            value -= design.count * _lqr_terminal_logz(sm, design.ux)
-        end
+        value -= _lqr_terminal_logz_sum(sm, _lqr_terminal_designs(hs))
     end
     return value
 end
@@ -171,9 +219,7 @@ _terminal_probe_weight(::_SLQRNormalizer) = true
 function _terminal_extra_value(b::_LQRExactNormalizer, sms)
     total = zero(eltype(sms[1].A))
     for (sm, probe) in zip(sms, b.probes)
-        for design in probe.designs
-            total += design.count * _lqr_terminal_logz(sm, design.ux)
-        end
+        total += _lqr_terminal_logz_sum(sm, probe.designs)
     end
     return total
 end
@@ -210,6 +256,16 @@ function _lqr_rejectable(err)
     err isa CompositeException &&
         return !isempty(err.exceptions) && all(_lqr_rejectable, err.exceptions)
     return false
+end
+
+"""The free part of a covariance in the conditional M-step."""
+function _lqr_conditional_array(sm::LQRStateModel, key::Symbol)
+    array = getproperty(sm, key)
+    if key === :Σ && sm.fixed_costate_sigma !== nothing
+        n = _plant_dim(sm)
+        return view(array, 1:n, 1:n)
+    end
+    return array
 end
 
 """Build a joint conditional generalized M-step, including initial/noise blocks.
@@ -257,13 +313,18 @@ function _lqr_conditional_problem(
     for (key, slot, enabled, width) in (
         (:x0, _G_X0, fit[1], d),
         (:P0, _G_P0, fit[2], d * (d + 1) ÷ 2),
-        (:Σ, _G_Q, fit[4], d * (d + 1) ÷ 2),
+        (
+            :Σ,
+            _G_Q,
+            fit[4],
+            sms[1].fixed_costate_sigma === nothing ? d * (d + 1) ÷ 2 : n * (n + 1) ÷ 2,
+        ),
         (:Σf, _G_Q, fit[4], n * (n + 1) ÷ 2),
     )
         enabled || continue
         for v in unique(slots[slot])
             owners = findall(==(v), slots[slot])
-            array = getproperty(sms[first(owners)], key)
+            array = _lqr_conditional_array(sms[first(owners)], key)
             r = (length(theta) + 1):(length(theta) + width)
             append!(theta, zeros(T, width))
             factor = key === :x0 ? zeros(T, 0, 0) : zeros(T, size(array))
@@ -278,7 +339,7 @@ function _lqr_conditional_problem(
     function write!(theta)
         _lqr_writeback!(ctx, view(theta, 1:np))
         for block in extras
-            array = getproperty(sms[first(block.owners)], block.key)
+            array = _lqr_conditional_array(sms[first(block.owners)], block.key)
             if block.key === :x0
                 copyto!(array, view(theta, block.range))
             else
@@ -286,7 +347,7 @@ function _lqr_conditional_problem(
                 isposdef(Symmetric(array)) || throw(PosDefException(0))
             end
             for c in block.owners[2:end]
-                copyto!(getproperty(sms[c], block.key), array)
+                copyto!(_lqr_conditional_array(sms[c], block.key), array)
             end
         end
         foreach(refresh!, sms)
@@ -432,6 +493,9 @@ function _lqr_conditional_problem(
             end
             for block in extras
                 g = gradients[block.key][block.slot]
+                if block.key === :Σ && sms[1].fixed_costate_sigma !== nothing
+                    g = view(g, 1:n, 1:n)
+                end
                 if block.key === :x0
                     gradient[block.range] .= g
                 else

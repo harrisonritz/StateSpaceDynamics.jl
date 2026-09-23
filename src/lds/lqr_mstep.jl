@@ -953,6 +953,9 @@ function _LQRMStepCtx(
     profile::Bool;
     flags::Union{Nothing,LQRFitFlags}=nothing,
 )
+    # A pinned costate block has no unconstrained full-matrix profile. Optimize
+    # structure at the current covariance, then update the free state block.
+    profile = profile && all(sm.fixed_costate_sigma === nothing for sm in sms)
     sm1 = sms[1]
     T = eltype(sm1.Σ)
     f = flags === nothing ? sm1.fit_flags : flags
@@ -1817,7 +1820,18 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         for (c, sm) in enumerate(ctx.sms)
             ctx.q_of[c] == s || continue
             pr = sm.Σ_prior
-            if pr === nothing
+            if sm.fixed_costate_sigma !== nothing
+                n = _plant_dim(sm)
+                if ctx.N_q[s] > zero(T)
+                    @views sm.Σ[1:n, 1:n] .= ctx.R[s][1:n, 1:n] ./ ctx.N_q[s]
+                end
+                @views Symmetrize!(view(sm.Σ, 1:n, 1:n))
+                @views sm.Σ[1:n, (n + 1):(2n)] .= zero(T)
+                @views sm.Σ[(n + 1):(2n), 1:n] .= zero(T)
+                @views sm.Σ[(n + 1):(2n), (n + 1):(2n)] .= Matrix{T}(
+                    sm.fixed_costate_sigma * I, n, n
+                )
+            elseif pr === nothing
                 if ctx.N_q[s] > zero(T)
                     copyto!(sm.Σ, ctx.R[s])
                     sm.Σ ./= ctx.N_q[s]

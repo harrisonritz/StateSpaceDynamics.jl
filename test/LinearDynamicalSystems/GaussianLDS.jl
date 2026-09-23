@@ -793,7 +793,7 @@ end
 
 function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
     #=
-    Ragged-length multi-trial: exercises the variable-length fallback branch
+    Ragged-length multi-trial: exercises the variable-length smoothing branch
     in smooth!/fit!. Should produce monotone ELBO and match a per-trial fit
     of the longest sub-batch.
     =#
@@ -819,7 +819,7 @@ function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
         # Trial lengths sanity check.
         @test [size(yt, 2) for yt in y] == Ts
 
-        # Smoke: smooth! must run on the ragged fallback path.
+        # Smoke: smooth! must run on the ragged path.
         tfs = StateSpaceDynamics.initialize_FilterSmooth(lds_data, Ts)
         T_max = maximum(Ts)
         sws_pool = [
@@ -844,6 +844,53 @@ function test_td_ragged_multi_trial(; rng=MersenneTwister(20260521))
         lds_fit = LinearDynamicalSystem(sm2, om2)
         elbos = fit!(lds_fit, y; max_iter=20, progress=false)
         @test elbo_monotone(elbos)
+    end
+    return nothing
+end
+
+function test_td_ragged_shared_cov_matches_per_trial(; rng=MersenneTwister(20260923))
+    # Repeated horizons must share the input-independent covariance while the
+    # posterior means still respond to each trial's observations and inputs.
+    D, p, ux_dim, uy_dim = 3, 4, 2, 1
+    lengths = [12, 17, 12, 23, 17]
+    sm = GaussianStateModel(;
+        A=0.7 * StateSpaceDynamics.random_rotation_matrix(D, rng),
+        Q=Matrix(0.2 * I(D)),
+        b=zeros(D),
+        B=randn(rng, D, ux_dim) * 0.1,
+        x0=zeros(D),
+        P0=Matrix(0.5 * I(D)),
+    )
+    om = GaussianObservationModel(;
+        C=randn(rng, p, D), R=Matrix(0.3 * I(p)), d=zeros(p), D=randn(rng, p, uy_dim) * 0.1
+    )
+    lds = LinearDynamicalSystem(sm, om)
+    ys = [randn(rng, p, t) for t in lengths]
+    uxs = [randn(rng, ux_dim, t) for t in lengths]
+    uys = [randn(rng, uy_dim, t) for t in lengths]
+    data = StateSpaceDynamics.Data(lds, ys; ux=uxs, uy=uys)
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(lds, lengths)
+    pool = [
+        StateSpaceDynamics.SmoothWorkspace(
+            Float64, D, p, maximum(lengths); ux_dim=ux_dim, uy_dim=uy_dim
+        ) for _ in 1:Threads.maxthreadid()
+    ]
+    StateSpaceDynamics.smooth!(lds, tfs, data, pool)
+
+    @test tfs[1].p_smooth === tfs[3].p_smooth
+    @test tfs[2].p_smooth === tfs[5].p_smooth
+    @test tfs[1].p_smooth !== tfs[2].p_smooth
+    @test tfs[1].p_smooth !== tfs[4].p_smooth
+    for i in eachindex(lengths)
+        ref = StateSpaceDynamics.initialize_FilterSmooth(lds, [lengths[i]])[1]
+        ws = StateSpaceDynamics.SmoothWorkspace(
+            Float64, D, p, lengths[i]; ux_dim=ux_dim, uy_dim=uy_dim
+        )
+        StateSpaceDynamics.smooth!(lds, ref, ys[i], ws, uxs[i], uys[i])
+        @test tfs[i].x_smooth ≈ ref.x_smooth atol = 1e-10
+        @test tfs[i].p_smooth ≈ ref.p_smooth atol = 1e-10
+        @test tfs[i].p_smooth_tt1 ≈ ref.p_smooth_tt1 atol = 1e-10
+        @test tfs[i].entropy ≈ ref.entropy atol = 1e-10
     end
     return nothing
 end

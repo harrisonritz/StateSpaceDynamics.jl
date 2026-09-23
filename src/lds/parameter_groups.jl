@@ -1099,6 +1099,7 @@ function _build_variants!(
             sm.P0_prior,
             sm.x0_prior,
             sm.Σ_prior,
+            sm.fixed_costate_sigma,
             sm.Qc_prior,
             nothing,
             nothing,

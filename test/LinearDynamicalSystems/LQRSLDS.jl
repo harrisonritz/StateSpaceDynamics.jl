@@ -102,6 +102,27 @@ function test_slds_lqr_matches_lds()
     return nothing
 end
 
+function test_slds_lqr_fixed_costate_sigma()
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]])
+    v = 1e-3
+    for lds in slds.LDSs
+        sm = lds.state_model
+        sm.fixed_costate_sigma = v
+        sm.Σ[3:4, 3:4] .= v .* I(2)
+        refresh!(sm)
+    end
+    ys = hslds_data(4, 12, 2)
+    fit!(slds, ys; max_iter=1, progress=false, rng=StableRNG(7))
+    for lds in slds.LDSs
+        Σ = lds.state_model.Σ
+        @test Σ[3:4, 3:4] ≈ v .* I(2)
+        @test Σ[1:2, 3:4] == zeros(2, 2)
+        @test Σ[3:4, 1:2] == zeros(2, 2)
+        @test isposdef(Symmetric(Σ[1:2, 1:2]))
+    end
+    return nothing
+end
+
 """The fit must improve the bound, and the constrained parameterization must
 survive doing so.
 

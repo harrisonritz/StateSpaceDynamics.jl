@@ -428,9 +428,10 @@ terminal-conditioned draw, stay bounded.
 
 *It is a conditioning event, and `condition_terminal` decides whether the score
 treats it as one.* The pseudo-observation defines the joint
-`p(z) p(y | z) p(y^{term} | z_T)`, but trials are not drawn from that joint. They
-are drawn from it **given** `y^{term} = 0` — which is what `rand` produces, and
-what a reach that ends on target is. The two differ by `p(y^{term} = 0 | θ)`, a
+`p(z) p(y | z) p(y^{term} | z_T)`, but trials under this model are drawn
+**given** `y^{term} = 0` — which is what `rand` produces. This conditions on the
+costate boundary relation at the observed final timestep; it does not constrain
+`x_T` to equal the target. The two scores differ by `p(y^{term} = 0 | θ)`, a
 function of the parameters.
 
 With `condition_terminal = true` (the default) `elbo` and `loglikelihood` report
@@ -574,6 +575,9 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
 - `Σ_prior::Union{Nothing,IWPrior{T}} = nothing`: optional inverse-Wishart prior
   on the mixed-coordinate innovation. See "Regularizing the innovation and the
   cost" below.
+- `fixed_costate_sigma = nothing`: when set to a positive variance, hold the
+  costate block of `Σ` at that variance times identity and its state cross block
+  at zero; the state block remains fitted. Cannot be combined with `Σ_prior`.
 - `Qc_prior = nothing`: optional inverse-Wishart prior on the cost matrices.
   Pass one `IWPrior` to share it across all regimes, or one entry per `Qc`
   regime (each an `IWPrior` or `nothing`) to specify epoch-specific priors,
@@ -616,6 +620,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     P0_prior::Union{Nothing,IWPrior{T}}
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     Σ_prior::Union{Nothing,IWPrior{T}}
+    fixed_costate_sigma::Union{Nothing,T}
     Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
@@ -928,6 +933,8 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
 - `observe_costate::Bool = false`: let the emission read the costate.
 - `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`: see the type docstring.
 - `Σ_prior`: inverse-Wishart prior on the innovation.
+- `fixed_costate_sigma`: fixed isotropic costate innovation variance, with zero
+  state cross covariance.
 - `Qc_prior`: one inverse-Wishart prior shared across every cost matrix, or a
   vector aligned with `Qc` whose entries are inverse-Wishart priors or `nothing`.
   The last scheduled cost can therefore have its own terminal prior. See
@@ -958,6 +965,7 @@ function LQRStateModel(
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
 ) where {T<:Real}
     n = size(A, 1)
@@ -990,6 +998,20 @@ function LQRStateModel(
     Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
+    if fixed_costate_sigma !== nothing
+        Σ_prior === nothing ||
+            throw(ArgumentError("fixed_costate_sigma cannot be combined with Σ_prior"))
+        isfinite(fixed_costate_sigma) && fixed_costate_sigma > 0 ||
+            throw(ArgumentError("fixed_costate_sigma must be finite and positive"))
+        v = T(fixed_costate_sigma)
+        isfinite(v) && v > 0 || throw(
+            ArgumentError("fixed_costate_sigma is outside the covariance's numeric range"),
+        )
+        isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
+            isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
+            isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
+            throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
+    end
 
     h_v = h === nothing ? zeros(T, d) : h
     Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
@@ -1050,6 +1072,7 @@ function LQRStateModel(
         P0_prior,
         x0_prior,
         Σ_prior,
+        fixed_costate_sigma === nothing ? nothing : T(fixed_costate_sigma),
         Qc_prior_value,
         nothing,
         nothing,
@@ -1171,6 +1194,7 @@ function free_state_model(
         P0_prior,
         x0_prior,
         Σ_prior,
+        nothing,
         #=
         A `:free` model has no cost, so a cost prior would have nothing to act
         on. It is rejected above rather than silently carried.
@@ -1652,6 +1676,13 @@ groups in turn would divide it by `c` once per group.
 """
 function rescale_costate!(sm::LQRStateModel{T}, c::Real) where {T<:Real}
     _require_lqr(sm, "rescaling the costate")
+    sm.fixed_costate_sigma === nothing ||
+        c == 1 ||
+        throw(
+            ArgumentError(
+                "costate rescaling would change fixed_costate_sigma; disable rescaling"
+            ),
+        )
     #=
     Any nonzero `c` is a symmetry, negative included: `−S'λ' = −(S/c)(cλ) = −Sλ`
     holds for either sign, so the costate's *sign* is unidentified along with its
