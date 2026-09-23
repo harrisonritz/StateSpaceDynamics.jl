@@ -601,11 +601,10 @@ is a modelling accident rather than a choice.
 function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     #=
     `terminal` and `observe_costate` are compared among the *inverse-LQR* states
-    only. A `:free` state has no costate, so neither means anything for it: it
-    carries no terminal condition, and `_costate_range` already returns `nothing`
-    for it whatever its flag says. In a mixed model the readout mask is therefore
-    set by the LQR states, and a free state simply reads whatever coordinates are
-    left to it.
+    only. A `:free` state has no costate and carries no terminal condition, and
+    its `observe_costate` is not its own to set in a mixed model: the readout
+    mask is set by the LQR states, and `_match_costate_readout!` gives it to the
+    free states, so the emission reads the same coordinates in every mode.
     =#
     ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
     ref === nothing && return nothing

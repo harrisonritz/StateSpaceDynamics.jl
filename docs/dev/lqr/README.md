@@ -629,7 +629,8 @@ recovered from 4.42 to 1.55.
 Things this harness turned up that are about `src/`, not about the models it
 fits. The directory is a measuring instrument, so the fixes live in `src/` and
 `test/`; each entry says where. #1–#3 were closed by milestone M0 of
-[`implementation-plan.md`](implementation-plan.md), #4 earlier; #5 is open.
+[`implementation-plan.md`](implementation-plan.md), #4 earlier, #5 and #6 after
+it.
 
 ### 1. An `SLDS` mis-sizes its weighted sufficient statistics when the discrete states differ in regime count
 
@@ -725,12 +726,49 @@ suite passes 61/61.
 
 ### 5. A tied emission leaks into the costate columns on the pooled SLDS path
 
-Open. In a switching model that ties `C` across a `:free` state and an
-inverse-LQR state with `observe_costate = false`, the plain fit lets `C`'s
-costate columns become non-zero (≈ 0.28 on the diagonal after one M-step in
+In a switching model that ties `C` across a `:free` state and an inverse-LQR
+state with `observe_costate = false`, the plain fit let `C`'s costate columns
+become non-zero (≈ 0.28 on the diagonal after one M-step in
 `test_slds_lqr_grouped_free_state_pools`'s fixture), while the same fit through
-the grouped path — with a grouping that splits nothing — keeps them at zero. The
-two end 14 nats apart. Since the LQR state may not read its costate and `C` is
-shared with it, the grouped (masked) result is the consistent one: the pooled
-emission update appears to take the `:free` state's unmasked statistics into the
-shared `C`.
+the grouped path — with a grouping that splits nothing — kept them at zero. The
+two ended 14 nats apart. A `:free` state defaults to `observe_costate = true`,
+so its statistics carried the costate columns into the pooled `C`; the grouped
+path happened to take its mask from the LQR state.
+
+**Fixed, by making the two modes read the same coordinates.** A `:free` state in
+a switching model now takes the inverse-LQR states' `observe_costate`
+(`_match_costate_readout!`, run at every entry point: `fit!`, the E-step
+helpers and `rand`). With `observe_costate = false` neither mode reads the
+costate half directly; the free state still feels it through its dynamics,
+which couple the two halves. Standalone, a `:free` state keeps reading
+everything. The partial-tie route also had its own leak: its full-width
+`CD_prior` could recreate costate coefficients from a non-zero `M₀`, so the
+prior is now masked to the free columns too (`_masked_mn_prior`). Every
+route — pooled, GLS and partial ties, Gaussian and Poisson, plain and grouped,
+either state order — now leaves the costate columns at exactly zero;
+`test_slds_lqr_tied_emission_mask` checks each.
+
+### 6. A tied regression's noise update read the other regimes' previous coefficients
+
+Found while checking #5, and not specific to LQR. A whole tie of `[C d D]`
+(or `[A b B]`) is fitted onto the tie's first regime and copied onto the rest
+at the end of the M-step. But `R` (or `Q`) is fitted in between, from each
+regime's residual scatter at *that regime's own* regression matrix, and every
+regime but the first still held the previous iterate's. So the noise update mixed
+the new shared `C` with stale copies of it, and the fit depended on which regime
+was listed first: `R` moved by 3e-3 and the fit ended 0.39 nats apart in the
+mixed LQR fixture, and every tied combination of a plain Gaussian `SLDS` differed
+between the two orders from the second iteration on.
+
+**Fixed.** `_grouped_update_C_d!` / `_grouped_update_A_b!` now copy the slot's
+fitted value onto the slot's other units before returning
+(`_share_slot_obs!` / `_share_slot_dyn!`). This is a no-op for the `depends_on`
+cells of one `LDS`, which alias one array. `test_SLDS_tied_params_order_invariant`
+fits `(:C, :d)`, `(:C, :d, :R)`, `(:A, :b)` and `(:A, :b, :Q)` in both orders and
+requires the same trace and parameters; before the fix all 36 of its checks fail.
+
+What is *not* order-invariant, and should not be expected to be: an inverse-LQR
+state's structural M-step is an L-BFGS solve along a nearly flat cost-scale
+direction, and its stopping point moves the ELBO by ~1e-3 nats under a 1e-14
+relative change in the data — the same amount the regime order moves it. That
+is the optimizer, not the model; see the concerns under "Remaining concerns".

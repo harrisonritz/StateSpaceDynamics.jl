@@ -83,11 +83,14 @@ when the emission is not allowed to see it.
 Called before any parallel section, since the cache is shared by every trial
 workspace. A no-op for a state model with no cache to refresh.
 
-Also where the state-model rules of [`validate_SLDS`](@ref) are enforced, so a
-fit, a smooth and a score all refuse the same models `rand` refuses.
+Also where the state-model rules of [`validate_SLDS`](@ref) are enforced, and a
+`:free` state's costate readout matched to the inverse-LQR states' (see
+[`_match_costate_readout!`](@ref)), so a fit, a smooth, a score and `rand` all
+see the same model.
 """
 function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
+    _match_costate_readout!(slds)
     for lds in slds.LDSs
         _prepare_slds_regime!(lds, tsteps)
     end
@@ -95,6 +98,37 @@ function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
 end
 
 _prepare_slds_regime!(::LinearDynamicalSystem, ::AbstractVector{Int}) = nothing
+
+"""
+    _match_costate_readout!(slds) -> slds
+
+Give every `:free` discrete state the inverse-LQR states' `observe_costate`.
+
+The emission then reads the same latent coordinates in every mode. When the
+inverse-LQR states may not read their costate, neither may a free state read
+coordinates `n+1:2n` directly — it still feels them through its own dynamics,
+which mix them into the rest — so what the emission sees does not change meaning
+when the discrete state does. Without this a free state's emission could load on
+coordinates that mean nothing in the other modes, and a tied `C` would have to
+reconcile two different masks.
+
+The inverse-LQR states agree among themselves (`_validate_slds_state_models`
+insists), and a model with no inverse-LQR state is left alone. The free state's
+own emission is then zeroed on those columns by `_prepare_lqr!`, like any other
+state that may not read them.
+"""
+function _match_costate_readout!(slds::SLDS)
+    ref = findfirst(
+        lds -> lds.state_model isa LQRStateModel && !_is_free(lds.state_model), slds.LDSs
+    )
+    ref === nothing && return slds
+    observe = slds.LDSs[ref].state_model.observe_costate
+    for lds in slds.LDSs
+        sm = lds.state_model
+        sm isa LQRStateModel && _is_free(sm) && (sm.observe_costate = observe)
+    end
+    return slds
+end
 
 function _prepare_slds_regime!(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}

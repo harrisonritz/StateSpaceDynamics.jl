@@ -514,6 +514,7 @@ using SSDTest
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
             test_slds_lqr_grouped_free_state_pools()
+            test_slds_lqr_tied_emission_mask()
             test_lqr_pair_slots()
         end
 

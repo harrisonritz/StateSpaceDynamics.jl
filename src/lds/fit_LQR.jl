@@ -55,6 +55,30 @@ function _costate_range(
 end
 
 """
+    _masked_mn_prior(prior, mask) -> MNPrior or nothing
+
+A matrix-normal prior that holds the coefficients on `mask` at zero: their prior
+mean zeroed and their precision decoupled from the other columns (diagonal
+kept). In the normal equations this is the prior restricted to the unmasked
+columns, which is what [`update_C_d!`](@ref) uses, written at full width for a
+solver that cannot drop columns.
+"""
+_masked_mn_prior(prior, ::Nothing) = prior
+_masked_mn_prior(::Nothing, ::UnitRange{Int}) = nothing
+
+function _masked_mn_prior(prior::MNPrior, mask::UnitRange{Int})
+    M₀ = Matrix(prior.M₀)
+    Λ = Matrix(prior.Λ)
+    fill!(view(M₀, :, mask), zero(eltype(M₀)))
+    for j in axes(Λ, 2), i in mask
+        i == j && continue
+        Λ[i, j] = zero(eltype(Λ))
+        Λ[j, i] = zero(eltype(Λ))
+    end
+    return MNPrior(M₀, Λ)
+end
+
+"""
     _zero_costate_readout!(obs_model, n)
 
 Zero the costate columns of every emission matrix. Warns once if they were not

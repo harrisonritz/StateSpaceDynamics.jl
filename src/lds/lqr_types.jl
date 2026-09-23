@@ -1100,6 +1100,14 @@ empty, `terminal` is off, and the LQR readouts (`lqr_parameters`,
 `riccati_solution`, `rescale_costate!`, …) throw rather than invent an answer.
 Its M-step is the ordinary closed-form regression, not the constrained one.
 
+In a switching model alongside inverse-LQR states, its `observe_costate` is set
+to theirs at every entry point, tied emission or not: the emission reads the
+same latent coordinates in every mode. With the default `observe_costate =
+false` on the LQR side, the free state's emission therefore does not load on
+coordinates `n+1:2n` — it feels them only through its own dynamics, which mix
+them into the coordinates it does read. On its own, a free model reads all of
+them (`observe_costate = true` by default).
+
 # Arguments
 - `M`: the `2n × 2n` transition. Its size sets the latent dimension, so it must
   be even-sized.

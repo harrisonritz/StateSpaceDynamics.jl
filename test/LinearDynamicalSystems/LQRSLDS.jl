@@ -748,6 +748,164 @@ function hslds_terminal_pair(p, tsteps; terminal_first=true)
     return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=members)
 end
 
+"""A `:free` state and an inverse-LQR one sharing an emission family — the
+free state as `free_state_model` builds it by default, allowed to read every
+latent coordinate, the LQR state with `observe_costate` as given."""
+function hslds_mixed_pair(emission; free_first::Bool=false, observe_costate::Bool=false)
+    n = 2
+    A = [0.95 0.10; -0.05 0.90]
+    S = Matrix(0.15I, n, n)
+    Qc = Matrix(0.20I, n, n)
+    Σ = Matrix(Diagonal(fill(0.02, 2n)))
+    lqr = LQRStateModel(
+        copy(A),
+        copy(S),
+        [copy(Qc)],
+        copy(Σ);
+        terminal=true,
+        condition_terminal=false,
+        x0=zeros(2n),
+        P0=Matrix(0.1I, 2n, 2n),
+        observe_costate=observe_costate,
+    )
+    seed = LQRStateModel(
+        copy(A), copy(S), [copy(Qc)], copy(Σ); x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n)
+    )
+    free = SSD.free_state_model(
+        Matrix(SSD.symplectic_matrix(seed, 1)),
+        Matrix(seed.cache.Qfwd);
+        h=Vector(seed.cache.bfwd),
+        x0=zeros(2n),
+        P0=Matrix(0.1I, 2n, 2n),
+    )
+    @assert free.observe_costate
+    members = [
+        LinearDynamicalSystem(lqr, emission()), LinearDynamicalSystem(free, emission())
+    ]
+    free_first && reverse!(members)
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=members)
+end
+
+"""In a switching model a `:free` state reads the latent coordinates the
+inverse-LQR states read, no more: its `observe_costate` is matched to theirs.
+
+The emission then means the same thing in every mode, and a tied `C` has one
+mask to obey. Before, a free state (which reads everything by default) kept its
+own mask, and a tied emission obeyed whichever mask its path happened to
+consult: a partial tie (`:C` without `:d`) none at all, a whole tie only the
+first state's — so listing the free state first let its statistics fill the
+costate columns the inverse-LQR state then read. Every path is checked —
+Gaussian and Poisson, partial and whole ties, both orders, pooled and grouped,
+untied — along with a prior that would pull those columns away from zero, and
+the matching in the other direction.
+"""
+function test_slds_lqr_tied_emission_mask()
+    n, tsteps, ntrials = 2, 20, 24
+    costate = (n + 1):(2n)
+    function gauss()
+        return GaussianObservationModel(;
+            C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
+        )
+    end
+    function pois()
+        return PoissonObservationModel(;
+            C=hcat(0.5 .* Matrix(1.0I, n, n), zeros(n, n)), d=fill(0.5, n)
+        )
+    end
+    rng = StableRNG(7)
+    y_gauss = [0.5 .* randn(rng, n, tsteps) for _ in 1:ntrials]
+    y_pois = [Float64.(rand(StableRNG(100 + i), 0:3, n, tsteps)) for i in 1:ntrials]
+    labels = [isodd(i) ? "lo" : "hi" for i in 1:ntrials]
+    function fitted(
+        emission, y, tied; free_first=false, grouped=false, prior=nothing, observe=false
+    )
+        slds = hslds_mixed_pair(emission; free_first=free_first, observe_costate=observe)
+        for lds in slds.LDSs
+            grouped && (lds.state_model.depends_on = (Gref=labels,))
+            prior === nothing || (lds.obs_model.CD_prior = prior)
+        end
+        # One M-step: the final iteration only scores.
+        fit!(slds, y; max_iter=2, progress=false, rng=StableRNG(3), tied_params=tied)
+        return slds
+    end
+    reads_costate(slds) = [norm(lds.obs_model.C[:, costate]) for lds in slds.LDSs]
+
+    for (emission, y, ties) in (
+        (gauss, y_gauss, ([:A, :S], [:A, :S, :C, :R], [:A, :S, :C, :d, :R])),
+        (pois, y_pois, ([:A, :S], [:A, :S, :C, :d])),
+    )
+        for tied in ties, free_first in (false, true), grouped in (false, true)
+            slds = fitted(emission, y, tied; free_first=free_first, grouped=grouped)
+            @test all(iszero, reads_costate(slds))
+            @test !any(lds.state_model.observe_costate for lds in slds.LDSs)
+        end
+    end
+
+    #=
+    A prior centred away from zero in the costate columns, coupling them to the
+    state columns: masking only the data would let it recreate them. Block
+    diagonal between `C` and `d`, as a partial tie requires.
+    =#
+    M₀ = [1.0 0.2 0.5 -0.4; 0.1 0.9 0.3 0.6]
+    L = [2.0 0.5 0.4 0.3; 0.0 2.0 0.2 0.1; 0.0 0.0 1.5 0.3; 0.0 0.0 0.0 1.5]
+    Λ = zeros(5, 5)
+    Λ[1:4, 1:4] .= L' * L
+    Λ[5, 5] = 1.0
+    prior = MNPrior(; M₀=hcat(M₀, zeros(n)), Λ=Λ)
+    for tied in ([:A, :S, :C, :R], [:A, :S, :C, :d, :R]), free_first in (false, true)
+        slds = fitted(gauss, y_gauss, tied; free_first=free_first, prior=prior)
+        @test all(iszero, reads_costate(slds))
+        @test norm(slds.LDSs[1].obs_model.C[:, 1:n] .- M₀[:, 1:n]) > 0.1   # data moved it
+    end
+
+    #=
+    A whole tie is a labelling-invariant pooled fit: the same `[C d]` in either
+    order, and the same through a grouping that splits nothing. So is `R`, which
+    is fitted after it from each state's residuals, and so needs every state to
+    hold the shared `C` by then. (Not the ELBO: the LQR state's L-BFGS stopping
+    point moves it by ~1e-3 nats under a 1e-14 change in its statistics.)
+    =#
+    tied = [:A, :S, :C, :d, :R]
+    lqr_first = fitted(gauss, y_gauss, tied)
+    free_first = fitted(gauss, y_gauss, tied; free_first=true)
+    grouped = fitted(gauss, y_gauss, tied; grouped=true)
+    C = lqr_first.LDSs[1].obs_model.C
+    @test norm(C[:, 1:n] .- Matrix(1.0I, n, n)) > 0.05                     # it was fitted
+    @test free_first.LDSs[2].obs_model.C ≈ C rtol = 1e-10
+    @test grouped.LDSs[1].obs_model.C ≈ C rtol = 1e-10
+    for (k, j) in ((1, 2), (2, 1))
+        @test free_first.LDSs[j].obs_model.R ≈ lqr_first.LDSs[k].obs_model.R rtol = 1e-10
+        @test free_first.LDSs[j].obs_model.d ≈ lqr_first.LDSs[k].obs_model.d rtol = 1e-10
+    end
+    @test grouped.LDSs[2].obs_model.R ≈ lqr_first.LDSs[2].obs_model.R rtol = 1e-10
+    p_lqr = fitted(pois, y_pois, [:A, :S, :C, :d])
+    p_free = fitted(pois, y_pois, [:A, :S, :C, :d]; free_first=true)
+    @test p_free.LDSs[2].obs_model.C ≈ p_lqr.LDSs[1].obs_model.C rtol = 1e-8
+
+    # The other direction: LQR states that read their costate let the free one read it too.
+    reading = fitted(gauss, y_gauss, [:A, :S]; observe=true)
+    @test all(lds.state_model.observe_costate for lds in reading.LDSs)
+    @test all(>(1e-3), reads_costate(reading))
+
+    #=
+    `rand` matches too, so a sample is drawn from the model a fit would see — even
+    from a free state constructed with a nonzero costate readout, which is
+    zeroed with a warning like any other state that may not read those columns.
+    =#
+    fresh = hslds_mixed_pair(gauss; free_first=true)
+    fresh.LDSs[1].obs_model.C[:, costate] .= 0.3
+    @test_logs (:warn, r"costate columns") match_mode = :any rand(StableRNG(1), fresh, 5)
+    @test !fresh.LDSs[1].state_model.observe_costate
+    @test all(iszero, reads_costate(fresh))
+
+    # A model with no inverse-LQR state leaves its free states alone.
+    lone = hslds_mixed_pair(gauss)
+    only_free = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[lone.LDSs[2]])
+    SSD._match_costate_readout!(only_free)
+    @test only_free.LDSs[1].state_model.observe_costate
+    return nothing
+end
+
 """The order the discrete states are listed in is a labelling, not a model.
 
 An inverse-LQR state with its own terminal cost carries two cost regimes and a

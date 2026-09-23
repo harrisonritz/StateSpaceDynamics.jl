@@ -103,7 +103,7 @@ function Random.rand(
     # group's.
     y = _alloc_obs(regimes[1], Ti)
 
-    _validate_slds_state_models(lds1.state_model, slds)
+    _prepare_slds!(slds, [Ti])
     _warn_slds_unstable_rollout(slds, Ti)
     state_params = [_extract_state_params(lds.state_model) for lds in regimes]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
@@ -148,7 +148,7 @@ function Random.rand(
     Per-trial, per-regime parameter sets: one entry per trial, each a vector
     over regimes. Ungrouped, every trial shares the same vector.
     =#
-    _validate_slds_state_models(lds1.state_model, slds)
+    _prepare_slds!(slds, collect(Int, tsteps_per_trial))
     _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on)
     if grp === nothing
@@ -2819,6 +2819,14 @@ _block_noise(::_ObsBlock, lds) = lds.obs_model.R
 _block_prior(::_DynBlock, lds) = lds.state_model.AB_prior
 _block_prior(::_ObsBlock, lds) = lds.obs_model.CD_prior
 
+#=
+Columns a regime's fit must hold at zero: an emission's costate columns when its
+state model may not read them. The statistics arrive with those columns already
+decoupled (see `_mask_costate_gram!`), but a prior does not.
+=#
+_block_mask(::_DynBlock, lds) = nothing
+_block_mask(::_ObsBlock, lds) = _costate_range(lds)
+
 _block_group(::_DynBlock) = _G_AB
 _block_group(::_ObsBlock) = _G_CD
 
@@ -2872,15 +2880,23 @@ function _slds_update_regression!(
     lds1.fit_bool[_block_group(block)] || return slots
 
     stats = [_block_stats(block, sufs[k]) for k in 1:K]
+    masks = [_block_mask(block, ldss[k]) for k in 1:K]
+    #=
+    The partial-tie solver takes full-width priors, so a masked regime's prior is
+    written to hold its masked coefficients at zero; left as it is, a prior mean
+    or coupling on those columns would put them back.
+    =#
     Ws = _partial_tied_regression(
         [st[1] for st in stats],
         [st[2] for st in stats],
         [_block_noise(block, ldss[k]) for k in 1:K],
-        [_block_prior(block, ldss[k]) for k in 1:K],
+        [_masked_mn_prior(_block_prior(block, ldss[k]), masks[k]) for k in 1:K],
         tied_cols,
         "tied_params",
     )
     for k in 1:K
+        # Exactly zero, rather than solved to within roundoff of it.
+        masks[k] === nothing || fill!(view(Ws[k], :, masks[k]), 0)
         ldss[k].fit_bool[_block_group(block)] && _block_write!(block, ldss[k], Ws[k])
     end
     return slots
