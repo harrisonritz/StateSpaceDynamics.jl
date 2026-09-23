@@ -519,6 +519,22 @@ end
 ```
 """
 function validate_SLDS(slds::SLDS)
+    _validate_slds_structure(slds)
+    # This will throw if invalid
+    foreach(validate_LDS, slds.LDSs)
+    return nothing
+end
+
+"""
+    _validate_slds_structure(slds)
+
+The switching-level half of [`validate_SLDS`](@ref): a proper chain, regimes that
+agree on their dimensions, and the state-model rules. This is what every entry
+point runs. Each regime's own consistency is `validate_LDS`'s, which the
+positional `LinearDynamicalSystem` constructor already runs, so it is not
+repeated per call.
+"""
+function _validate_slds_structure(slds::SLDS)
     k = size(slds.A, 1)
     D = length(slds.πₖ)
     lds_count = length(slds.LDSs)
@@ -570,9 +586,6 @@ function validate_SLDS(slds::SLDS)
         member names and order are part of the composite's type — so regimes
         that disagree cannot be put in the same `SLDS` at all.
         =#
-
-        # This will throw if invalid
-        validate_LDS(lds)
     end
 
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
