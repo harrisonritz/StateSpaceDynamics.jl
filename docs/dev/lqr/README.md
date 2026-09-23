@@ -790,3 +790,61 @@ across them) to the last bit of the BLAS. `test_multitrial_rand_is_per_trial`
 pins trial `i` to the single-trial draw from its seed. The `SLDS` and LQR
 samplers draw serially from `rng` and were never affected. This changes the
 data every multi-trial `rand` call produces for a given seed.
+
+## Remaining concerns
+
+Reported, not fixed: each is a design call or outside this branch's scope.
+Most urgent first.
+
+1. **The switching ELBO counts a tied parameter's prior once per regime.**
+   `_slds_prior_logdensity` (and `_grouped_slds_prior_logdensity`, per regime
+   again) sum every regime's `_state_prior_logdensity` /
+   `_obs_prior_logdensity`. The M-step applies a tied group's prior once
+   (the pooled or GLS solve, and `_distinct_by_slot` in the noise updates).
+   So with a tie and a prior, the reported trace is not the objective being
+   maximized. It is off by `(K − 1) · log p(θ_tied)`, which can make it
+   non-monotone, and it skews any comparison across `K`. The fix is to count
+   once per distinct version, as the grouped cells already do.
+
+2. **Under terminal conditioning, the discrete chain ignores `log Ẑ`.**
+   `mstep!` runs the plain Baum–Welch update (`StatsAPI.fit!(dl, …)`) whether
+   or not the model conditions. The probe that estimates
+   `log Ẑ = log p(terminal = 0)` carries copies of `A` and `πₖ`, so the
+   normalizer depends on them. The state M-step (including `x0`/`P0`) is
+   fitted against it; `A`/`πₖ` are not. With the probe held fixed, the chain's
+   surrogate is `Σ (ξ_data − ξ_probe) log A`. It is not concave wherever the
+   probe expects more transitions than the data, so there is no closed form.
+   It needs either an accept-if-improves step on the logits, or a documented
+   statement that the chain is fitted to the unconditioned half.
+
+3. **An inverse-LQR state's structural M-step is chaotic in its inputs.**
+   Measured on the mixed switching fixture: scaling the data by `1 + 1e-14`
+   moves the ELBO by 1.6e-3 nats after one structural M-step and by ~5e-3
+   after five. It moves `S` by 1–2%. The L-BFGS solve stops at a different
+   point along the nearly flat cost-scale direction. As a result, fits are
+   not reproducible to that level across thread counts (see 6), BLAS builds
+   or regime orders, and tests must compare what one M-step determines. A
+   `Qc_prior` is the existing lever; a tighter `g_tol` only moves the problem.
+
+4. **`validate_SLDS` is never called on the fitting path.** `fit!`, `rand` and
+   the E-step helpers run only the state-model rules
+   (`_validate_slds_state_models`). A model with `πₖ = [0.7, 0.7]` and a
+   transition row summing to 1.2 fits without complaint: the first
+   iteration is scored under the improper chain, and the M-step then
+   renormalizes it silently. The comment at `fit_SLDS.jl`'s `Data`
+   construction says the input dimensions are "enforced by `validate_SLDS`";
+   they are not. Calling it from `_prepare_slds!` would fix this.
+
+5. **Diagnostic warnings left in the free-state M-step.** `_free_regression`
+   and `_free_noise_mstep!` (`lqr_mstep.jl`, from `79e9437`) emit an `@warn`
+   on every M-step of every `:free` state. Each pays for a `cond` and two
+   `eigvals`, and together they fill the test log. `@debug` would keep them
+   available.
+
+6. **Some reductions associate by thread count.** `joint_loglikelihood` for a
+   Poisson `LDS` chunks by `Threads.nthreads()`; the Poisson emission M-step
+   and gradient by `tasks_per_thread · nthreads()` and the workspace pool.
+   The sums are deterministic for a given thread count but differ in the last
+   bits across counts. That is harmless for the convex updates, but through
+   3 it becomes ~1e-3 nats in an LQR fit. Chunking by trial count instead of
+   thread count would make them layout-independent, as `rand` now is.
