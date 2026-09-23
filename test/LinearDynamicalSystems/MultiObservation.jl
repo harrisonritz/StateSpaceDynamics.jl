@@ -312,6 +312,7 @@ function test_multiobs_mixed_fit()
                 ),
             ),
         )
+        start = deepcopy(init)
         elbos = fit!(init, y; max_iter=30, progress=false)
         @test elbo_monotone(elbos)
         @test elbos[end] > elbos[1]
@@ -328,11 +329,16 @@ function test_multiobs_mixed_fit()
         xs, _ = smooth(init, y)
         @test length(xs) == 20 && size(xs[1]) == (MO_LATENT_DIM, 50)
         #=
-        The Laplace E-step warm-starts from the previous iterate inside `fit!`
-        and from the prior mean in a fresh call, so a re-evaluation lands a hair
-        either side of the recorded value rather than exactly on it.
+        Each trace entry scores the iterate its M-step then improves, so the
+        model `fit!` returns is one M-step past `elbos[end]`: re-evaluating it is
+        the entry a fit one iteration longer records next. It agrees with that
+        to the Laplace E-step's tolerance — the loop warm-starts it from the
+        previous iterate, a fresh call from the prior mean.
         =#
-        @test isapprox(elbo(init, y), elbos[end]; rtol=1e-6)
+        longer = fit!(start, y; max_iter=31, progress=false)
+        @test longer[1:30] == elbos
+        @test isapprox(elbo(init, y), longer[end]; rtol=1e-9)
+        @test elbo(init, y) >= elbos[end]
         @test_throws ErrorException loglikelihood(init, y)
     end
     return nothing

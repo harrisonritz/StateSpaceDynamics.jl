@@ -55,6 +55,30 @@ function _costate_range(
 end
 
 """
+    _masked_mn_prior(prior, mask) -> MNPrior or nothing
+
+A matrix-normal prior that holds the coefficients on `mask` at zero: their prior
+mean zeroed and their precision decoupled from the other columns (diagonal
+kept). In the normal equations this is the prior restricted to the unmasked
+columns, which is what [`update_C_d!`](@ref) uses, written at full width for a
+solver that cannot drop columns.
+"""
+_masked_mn_prior(prior, ::Nothing) = prior
+_masked_mn_prior(::Nothing, ::UnitRange{Int}) = nothing
+
+function _masked_mn_prior(prior::MNPrior, mask::UnitRange{Int})
+    M₀ = Matrix(prior.M₀)
+    Λ = Matrix(prior.Λ)
+    fill!(view(M₀, :, mask), zero(eltype(M₀)))
+    for j in axes(Λ, 2), i in mask
+        i == j && continue
+        Λ[i, j] = zero(eltype(Λ))
+        Λ[j, i] = zero(eltype(Λ))
+    end
+    return MNPrior(M₀, Λ)
+end
+
+"""
     _zero_costate_readout!(obs_model, n)
 
 Zero the costate columns of every emission matrix. Warns once if they were not
@@ -475,6 +499,7 @@ function fit!(
     };
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     ux=nothing,
     uy=nothing,
@@ -513,6 +538,7 @@ function fit!(
         grp;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         monitor=monitor,
         align_final=!_is_free(lds.state_model),
@@ -522,6 +548,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         monitor=monitor,
         align_final=!_is_free(lds.state_model),
@@ -695,6 +722,7 @@ function fit!(
     uy=nothing,
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -733,6 +761,7 @@ function fit!(
         grp;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
@@ -744,6 +773,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
@@ -847,6 +877,10 @@ function _grouped_state_mstep!(
     sws::SmoothWorkspace{T},
     bufs::GroupedSufBuffers,
 ) where {T<:Real,S<:LQRStateModel{T}}
+    if ldss[1].state_model.terminal && ldss[1].state_model.condition_terminal
+        _lqr_conditional_mstep!(ldss, sufs, slots)
+        return nothing
+    end
     base = [_state_suf(suf.base) for suf in sufs]
     _grouped_update_x0!(ldss, base, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, base, slots[_G_P0], slots[_G_X0], sws)
@@ -890,26 +924,35 @@ Structural priors are counted by array identity. This matters when `depends_on`
 varies structure and noise independently: counting both priors on the `Q` slot
 would under-count a varying `Qc` when `Σ` is shared, and over-count a shared
 `Qc` when `Σ` varies.
+
+`init`, `sigma` and `qc` switch the initial-state, `Σ` and `Qc` terms off, for a
+switching model whose ties share a block across states that do not alias it
+(see `_slds_state_prior_logdensity`).
 """
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
     cell_slot::AbstractVector{Vector{Int}},
-    ::Type{T},
+    ::Type{T};
+    init::Bool=true,
+    sigma::Bool=true,
+    qc::Bool=true,
 ) where {T<:Real,S<:LQRStateModel{T}}
     total = zero(T)
-    for u in _slot_representatives(cell_slot[_G_P0])
-        sm = ldss[u].state_model
-        sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+    if init
+        for u in _slot_representatives(cell_slot[_G_P0])
+            sm = ldss[u].state_model
+            sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
+        end
     end
     seen_sigma = Base.IdSet()
     seen_qc = Base.IdSet()
     for lds in ldss
         sm = lds.state_model
-        if sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
+        if sigma && sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
             push!(seen_sigma, sm.Σ)
             total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
         end
-        if sm.Qc_prior !== nothing && !_is_free(sm)
+        if qc && sm.Qc_prior !== nothing && !_is_free(sm)
             for (k, Q) in enumerate(sm.Qc)
                 Q in seen_qc && continue
                 push!(seen_qc, Q)
@@ -918,6 +961,7 @@ function _grouped_state_prior_logdensity(
             end
         end
     end
+    init || return total
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model
         if sm.x0_prior !== nothing

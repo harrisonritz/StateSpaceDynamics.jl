@@ -1,0 +1,560 @@
+#=============================================================================
+Terminal conditioning for a switching inverse-LQR model.
+
+`log p(terminal = 0 | θ)` sums over `K^T` discrete paths, so unlike the
+non-switching case in `lqr_terminal.jl` there is no exact route to it. What
+there is, is the same variational machinery the model already uses for the
+data: run the E-step on a copy of the model whose emission loads nothing, and
+its ELBO bounds `log p(terminal = 0)` for the same reason the ordinary one
+bounds `log p(y)`.
+
+That makes the reported score
+
+    ELBO(y, terminal = 0)  −  ELBO-hat(terminal = 0)
+
+a difference of two bounds, not a bound itself. It is still the right thing to
+compare across plant dimensions and costate gauges — the confounds the joint
+score carries are removed by the subtraction whether or not either term is
+tight — but it is no longer a quantity anyone should call a likelihood. Both
+halves are therefore reported separately: see `terminal_logz` and the
+`terminal_logz` field `smooth` returns.
+=============================================================================#
+
+#=
+Alternations the probe's own E-step runs. Fixed rather than inherited from the
+caller so that the normalizer is one reproducible number: the fit trace, a later
+`elbo` call and `terminal_logz` all have to agree at the same parameters, and
+they only do if they all spend the same budget. The probe has no observations,
+so its discrete posterior is driven by the dynamics alone and settles quickly.
+=#
+const _SLQR_PROBE_ITERS = 20
+
+# Seed of the probe's own stream; see `_SLQRProbe.rng` and `_slqr_restart!`.
+const _SLQR_PROBE_SEED = 0x5109
+
+"""
+    _slds_condition_terminal(slds) -> Bool
+
+Whether this switching model reports and fits the terminal-conditioned score.
+
+Every discrete state that *has* a terminal factor must agree. One that
+conditioned while another did not would be scoring a mixture of two different
+likelihoods, and the mixture weights are exactly the discrete posterior, so the
+disagreement would not even be constant across trials. States with no terminal
+factor at all (a `:free` regime, say) impose nothing and are not consulted.
+"""
+function _slds_condition_terminal(slds::SLDS)
+    flags = Bool[]
+    for lds in slds.LDSs
+        sm = lds.state_model
+        sm isa LQRStateModel || continue
+        sm.terminal || continue
+        push!(flags, sm.condition_terminal)
+    end
+    isempty(flags) && return false
+    all(flags) && return true
+    any(flags) && throw(
+        ArgumentError(
+            "inverse-LQR discrete states that carry a terminal factor must agree on " *
+            "`condition_terminal`; got a mixture. Set it the same way on every such " *
+            "state, or drop the terminal factor from the ones that should not have it.",
+        ),
+    )
+    return false
+end
+
+_slds_condition_terminal(::Nothing) = false
+
+"""
+    _SLQRProbe{T}
+
+The zero-loading copy of a switching model, with the scaffolding its E-step
+needs held across M-steps so that only the alternation is repaid each time.
+
+`designs` compresses trials that share an input trajectory *and* a horizon:
+`log Z` depends on the trial only through those, so a task design repeated over
+hundreds of trials is smoothed once and counted.
+"""
+mutable struct _SLQRProbe{T<:Real,SL,PL,PP,FB,LN,DS,SF}
+    slds::SL
+    data::Data{T}
+    tfs::TrialFilterSmooth{T}
+    dl::SLDSDiscreteLayer{T}
+    fb::FB
+    pool::PP
+    plan::PL
+    sws::Vector{SmoothWorkspace{T}}
+    obs_seq::Vector{Int}
+    control_seq::Vector{Nothing}
+    seq_ends::Vector{Int}
+    lognorm::LN
+    designs::DS
+    counts::Vector{T}
+    design_of::Vector{Int}
+    per_design::Vector{T}
+    sufs::Vector{SF}
+    #=
+    The probe's own stream. Both `_slds_warmstart!` and `_vem_alternate!` default
+    to `Random.default_rng()`, and a normalizer that drew from the global stream
+    would make the surrounding fit depend on how many numbers everything else had
+    already taken — reproducible runs are the whole reason the discrete layer is
+    scored deterministically in the first place.
+    =#
+    rng::Random.Xoshiro
+    smoothing_iters::Int
+    logz::T
+    started::Bool
+end
+
+"""
+    _slqr_terminal_probe(slds, ux; smoothing_iters) -> _SLQRProbe
+
+Build the probe: every member keeps its state model and loses its emission.
+
+A one-dimensional Gaussian emission with zero loading and unit variance
+contributes `-½ log 2π` per timestep whatever the latent does, so it shifts the
+ELBO by a known constant and leaves the posterior exactly `q(z, s | terminal =
+0)`. Parameter priors are dropped from the copy because the data side already
+carries them; leaving them on would penalize the same parameters twice, once
+with each sign.
+"""
+function _slqr_terminal_probe(
+    slds::SLDS{T}, ux::AbstractVector; smoothing_iters::Int=_SLQR_PROBE_ITERS
+) where {T<:Real}
+    canonical = [Matrix{T}(u) for u in ux]
+    designs = _lqr_terminal_designs(canonical)
+    isempty(designs) && error("Terminal conditioning requires trial inputs/horizons")
+    index = Dict(v.ux => i for (i, v) in enumerate(designs))
+    design_of = [index[u] for u in canonical]
+    d = slds.LDSs[1].latent_dim
+    members = map(slds.LDSs) do lds
+        sm = deepcopy(lds.state_model)
+        if sm isa LQRStateModel
+            sm.condition_terminal = false
+            sm.depends_on = nothing
+            sm.variants = nothing
+            sm.P0_prior = sm.x0_prior = sm.Σ_prior = sm.Qc_prior = nothing
+        end
+        return LinearDynamicalSystem(
+            sm, GaussianObservationModel(zeros(T, 1, d), ones(T, 1, 1), zeros(T, 1))
+        )
+    end
+    probe_slds = SLDS(; A=copy(slds.A), πₖ=copy(slds.πₖ), LDSs=members)
+
+    uxs = [v.ux for v in designs]
+    ys = [zeros(T, 1, size(u, 2)) for u in uxs]
+    data = Data(members[1], ys; ux=uxs)
+    K = length(members)
+    ntrials = length(data.tsteps)
+    seq_ends = cumsum(data.tsteps)
+    total_T = last(seq_ends)
+    T_max = maximum(data.tsteps)
+    tfs = initialize_FilterSmooth(members[1], data.tsteps)::TrialFilterSmooth{T}
+    dl = SLDSDiscreteLayer(probe_slds.A, probe_slds.πₖ, zeros(T, K, total_T))
+    fb = _make_slds_fb_storage(dl, seq_ends)
+    pool = _slds_workspace_pool(probe_slds, nothing, T_max, ntrials; npool=1)
+    plan = _slds_trial_plan(nothing, ntrials, length(pool.slots))
+    sufs = [_initialize_td_sufficient_statistics(T, members[k], data.tsteps) for k in 1:K]
+    return _SLQRProbe(
+        probe_slds,
+        data,
+        tfs,
+        dl,
+        fb,
+        pool,
+        plan,
+        _slds_mstep_pool(probe_slds, T_max, 1),
+        collect(1:total_T),
+        fill(nothing, total_T),
+        seq_ends,
+        _slds_lognorm_all(probe_slds, data.y),
+        designs,
+        T[v.count for v in designs],
+        design_of,
+        fill(T(NaN), length(designs)),
+        sufs,
+        Random.Xoshiro(_SLQR_PROBE_SEED),
+        smoothing_iters,
+        T(NaN),
+        false,
+    )
+end
+
+"""Copy the live model's parameters onto the probe, leaving the probe's own
+zero-loading emission and dropped priors alone."""
+function _slqr_sync_probe!(probe::_SLQRProbe, slds::SLDS)
+    copyto!(probe.slds.A, slds.A)
+    copyto!(probe.slds.πₖ, slds.πₖ)
+    for (member, lds) in zip(probe.slds.LDSs, slds.LDSs)
+        target, source = member.state_model, lds.state_model
+        if target isa LQRStateModel
+            for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+                copyto!(getproperty(target, key), getproperty(source, key))
+            end
+            for k in eachindex(source.Qc)
+                copyto!(target.Qc[k], source.Qc[k])
+            end
+        else
+            for key in (:A, :b, :B, :Q, :x0, :P0)
+                hasproperty(target, key) &&
+                    copyto!(getproperty(target, key), getproperty(source, key))
+            end
+        end
+        refresh!(target)
+    end
+    return probe
+end
+
+"""
+    _slqr_probe_estep!(probe) -> probe
+
+Run the probe's variational E-step and record `log Z-hat` and the per-regime
+responsibility-weighted statistics the M-step's Fisher term reads.
+
+The zero-loading emission's `-½ log 2π` per timestep is added back here, so
+`probe.logz` is the bound on `log p(terminal = 0)` itself rather than on the
+probe's own observation density.
+"""
+function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
+    _prepare_slds!(probe.slds, probe.data.tsteps)
+    #=
+    The pool caches each member's smoother constants from whenever they were
+    last computed, and the smoother reads them without looking at the model. A
+    probe built fresh never notices; one smoothed again after its parameters
+    moved would smooth under the old ones and score under the new.
+    =#
+    refresh_slds_pool!(probe.pool, probe.slds)
+    if !probe.started
+        _slds_warmstart!(
+            probe.slds,
+            nothing,
+            nothing,
+            probe.tfs,
+            probe.data.y,
+            nothing,
+            probe.pool,
+            probe.plan,
+            probe.data.tsteps,
+            length(probe.slds.LDSs);
+            rng=probe.rng,
+            ux=probe.data.ux,
+            uy=probe.data.uy,
+            lognorm=probe.lognorm,
+        )
+        probe.started = true
+    end
+    _vem_alternate!(
+        probe.slds,
+        nothing,
+        nothing,
+        probe.tfs,
+        probe.fb,
+        probe.dl,
+        probe.data.y,
+        probe.pool,
+        probe.plan;
+        obs_seq=probe.obs_seq,
+        control_seq=probe.control_seq,
+        seq_ends=probe.seq_ends,
+        ux=probe.data.ux,
+        uy=probe.data.uy,
+        lognorm=probe.lognorm,
+        smoothing_iters=probe.smoothing_iters,
+        rng=probe.rng,
+    )
+    per_design = _slds_trial_elbos(
+        probe.slds,
+        nothing,
+        nothing,
+        probe.tfs,
+        probe.fb,
+        probe.data.y,
+        probe.pool,
+        probe.plan;
+        seq_ends=probe.seq_ends,
+        ux=probe.data.ux,
+        uy=probe.data.uy,
+        lognorm=probe.lognorm,
+    )
+    half_log2π = T(0.5) * log(T(2π))
+    probe.logz = zero(T)
+    for (i, steps) in enumerate(probe.data.tsteps)
+        probe.per_design[i] = per_design[i] + T(steps) * half_log2π
+        probe.logz += probe.counts[i] * probe.per_design[i]
+    end
+
+    for k in eachindex(probe.slds.LDSs)
+        weights = [
+            begin
+                t1, t2 = HMMs.seq_limits(probe.seq_ends, trial)
+                probe.counts[trial] .* Vector{T}(view(probe.fb.γ, k, t1:t2))
+            end for trial in eachindex(probe.data.tsteps)
+        ]
+        _slds_aggregate_weighted!(
+            probe.sufs[k], probe.tfs, probe.slds.LDSs[k], probe.data, weights, probe.sws[1]
+        )
+    end
+    return probe
+end
+
+"""
+    _slqr_restart!(probe) -> probe
+
+Return the probe to the state it was built in, so that its next E-step is the
+one a freshly built probe would run: warm start included, and the stream
+reseeded.
+
+`log Z-hat` is a function of the parameters only if every evaluation starts
+from the same place. The reported score builds its probe fresh, so an M-step
+that judges proposals with a probe carried over from the last point it visited
+would be judging them on a different number.
+"""
+function _slqr_restart!(probe::_SLQRProbe)
+    probe.started = false
+    Random.seed!(probe.rng, _SLQR_PROBE_SEED)
+    return probe
+end
+
+"""
+    _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probe) -> Bool
+
+The discrete chain's update when the model conditions on its terminal factor.
+
+The score is `ELBO(y, terminal = 0) − log Ẑ`, and `log Ẑ` depends on `A` and
+`πₖ` through the probe's chain as surely as the data half does. With `q` held
+fixed, the chain's part of it is
+
+    g(A, π) = Σᵢⱼ Nᵢⱼ log Aᵢⱼ + Σₖ nₖ log πₖ − log Ẑ(A, π),
+
+`N` / `n` the data's expected transition and initial counts, under the same
+`log(· + 1e-12)` the ELBO takes, and `log Ẑ` from a probe restarted as a fresh
+one would be. Holding the probe's posterior fixed as the state M-step does would
+leave `Σᵢⱼ (Nᵢⱼ − Ξᵢⱼ) log Aᵢⱼ`, with `Ξ` the probe's expected counts: unbounded
+wherever the probe expects more `i → j` transitions than the data, so there is
+no closed-form update. Two proposals instead, each kept only if `g` rises:
+
+1. The Baum–Welch update, which maximizes the data half. It is the whole answer
+   when the chain barely moves `log Ẑ`.
+2. Otherwise an ascent step on `g` itself, in each row's softmax logits. At the
+   probe's stationary posterior `∂ log Ẑ / ∂Aᵢⱼ = Ξᵢⱼ / Aᵢⱼ` (Danskin, as for the
+   state parameters), so the logit gradient is `cᵢⱼ − Aᵢⱼ Σₖ cᵢₖ` with
+   `c = N − Ξ`, and likewise for `πₖ`. The step starts at a size that moves no
+   logit by more than one and halves until `g` rises by an Armijo fraction of
+   what the gradient promises.
+
+If neither improves `g` the chain stays put. Returns whether the probe is left
+smoothed at the chain `slds` now holds, so the state M-step can use it as is.
+"""
+function _slqr_chain_mstep!(
+    slds::SLDS{T},
+    dl::SLDSDiscreteLayer{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    obs_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    probe::_SLQRProbe{T};
+    max_halvings::Int=12,
+) where {T<:Real}
+    K = length(slds.LDSs)
+    # Counts first: `fit!` below uses each trial's last ξ as scratch.
+    N, n = _slds_chain_counts(fb_storage, seq_ends, K, T)
+    floor = T(1e-12)
+    function score!(A, π)
+        copyto!(slds.A, A)
+        copyto!(slds.πₖ, π)
+        _slqr_sync_probe!(probe, slds)
+        _slqr_restart!(probe)
+        _slqr_probe_estep!(probe)
+        chain = sum(N .* log.(A .+ floor)) + sum(n .* log.(π .+ floor))
+        return chain - probe.logz
+    end
+
+    A0, π0 = copy(slds.A), copy(slds.πₖ)
+    base = score!(A0, π0)
+    # The probe's own counts, weighted by how many trials share each design.
+    Ξ, ν = _slds_chain_counts(probe.fb, probe.seq_ends, K, T, probe.counts)
+
+    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)   # writes slds.A / πₖ
+    A1, π1 = copy(slds.A), copy(slds.πₖ)
+    if !(A0 == A1 && π0 == π1)
+        gain = score!(A1, π1) - base
+        if gain >= 0
+            @debug "terminal-conditioned chain step" proposal = :baum_welch gain
+            return true
+        end
+    end
+
+    c, cπ = N .- Ξ, n .- ν
+    Gη = c .- A0 .* sum(c; dims=2)
+    Gπ = cπ .- π0 .* sum(cπ)
+    slope = sum(abs2, Gη) + sum(abs2, Gπ)
+    if slope > zero(T)
+        η0, ηπ0 = log.(A0), log.(π0)
+        step = one(T) / max(maximum(abs, Gη), maximum(abs, Gπ))
+        for _ in 0:max_halvings
+            A = exp.(η0 .+ step .* Gη)
+            A ./= sum(A; dims=2)
+            π = exp.(ηπ0 .+ step .* Gπ)
+            π ./= sum(π)
+            gain = score!(A, π) - base
+            if gain >= T(1e-4) * step * slope
+                @debug "terminal-conditioned chain step" proposal = :gradient step gain
+                return true
+            end
+            step /= 2
+        end
+    end
+    @debug "terminal-conditioned chain step rejected" base
+    copyto!(slds.A, A0)
+    copyto!(slds.πₖ, π0)
+    return false
+end
+
+"""
+    _slds_chain_counts(fb, seq_ends, K, T, weights=nothing) -> (N, n)
+
+Expected transition counts `N` (`K × K`) and initial counts `n` from a
+forward-backward pass, summed over trials, each trial weighted by `weights` if
+given. Reads `ξ` for every step but the last, which is scratch by convention.
+"""
+function _slds_chain_counts(
+    fb::HMMs.ForwardBackwardStorage,
+    seq_ends::AbstractVector{Int},
+    K::Int,
+    ::Type{T},
+    weights::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real}
+    N = zeros(T, K, K)
+    n = zeros(T, K)
+    for trial in eachindex(seq_ends)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        w = weights === nothing ? one(T) : T(weights[trial])
+        n .+= w .* view(fb.γ, :, t1)
+        for t in t1:(t2 - 1)
+            N .+= w .* fb.ξ[t]
+        end
+    end
+    return N, n
+end
+
+# --- normalizer-backend interface, shared with the non-switching M-step -----
+
+#=
+The probe's *statistics* are what stays fixed across the inner L-BFGS — they are
+the expectation the surrogate is taken under, and recomputing them would need an
+SLDS E-step per line-search point. Its *parameters* must not: the M-step context
+reads `Σ` and `Σf` off these models to weight the residuals, so a probe left at
+the values it was smoothed with would weight them by a stale covariance. Copy
+the live parameters over, and keep the probe's nulled priors — the data side
+already carries those, and counting them on both sides would cancel them.
+=#
+function _terminal_probe_stats!(b::_SLQRNormalizer, sms)
+    sufs, psms = _slqr_copy_lqr_params!(b.probe, sms)
+    for (target, hs) in zip(psms, sufs)
+        _fill_mixed_blocks!(hs, target)
+    end
+    return (sufs, psms)
+end
+
+"""
+    _slqr_copy_lqr_params!(probe, sms) -> (sufs, psms)
+
+Copy the M-step's inverse-LQR state parameters onto the matching probe members
+and return those members with their statistics. `sms` holds only the
+inverse-LQR states, in discrete-state order, which is how the M-step context
+collects them.
+"""
+function _slqr_copy_lqr_params!(probe::_SLQRProbe, sms)
+    lqr = [
+        k for k in eachindex(probe.slds.LDSs) if
+        probe.slds.LDSs[k].state_model isa LQRStateModel &&
+        !_is_free(probe.slds.LDSs[k].state_model)
+    ]
+    sufs = [probe.sufs[k] for k in lqr]
+    psms = [probe.slds.LDSs[k].state_model for k in lqr]
+    length(psms) == length(sms) || error(
+        "terminal probe has $(length(psms)) inverse-LQR states, model has $(length(sms))",
+    )
+    for (target, source) in zip(psms, sms)
+        for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+            copyto!(getproperty(target, key), getproperty(source, key))
+        end
+        for k in eachindex(source.Qc)
+            copyto!(target.Qc[k], source.Qc[k])
+        end
+        refresh!(target)
+    end
+    return (sufs, psms)
+end
+
+#=
+The number the fit trace divides by, at the M-step's current parameters: the
+probe restarted and smoothed exactly as `_slds_terminal_trial_logz` smooths a
+fresh one. That is one probe E-step per call, which is why only the acceptance
+check asks for it. A chain the probe cannot factor at these parameters throws,
+and the caller's rejectable-error handling turns that into a rejected point.
+=#
+function _terminal_score_logz(b::_SLQRNormalizer, sms)
+    _slqr_copy_lqr_params!(b.probe, sms)
+    _slqr_restart!(b.probe)
+    _slqr_probe_estep!(b.probe)
+    return b.probe.logz
+end
+
+# The surrogate reads the probe's statistics and nothing else of its posterior.
+_terminal_save(b::_SLQRNormalizer) = deepcopy(b.probe.sufs)
+function _terminal_restore!(b::_SLQRNormalizer, saved)
+    copyto!(b.probe.sufs, saved)
+    return nothing
+end
+
+"""
+    terminal_logz(slds, y; ux, uy, smoothing_iters) -> T
+
+The variational estimate of `log p(terminal = 0 | θ)` this model's score is
+divided by, as a number on its own.
+
+Reported separately because it is an approximation: [`elbo`](@ref) returns the
+joint ELBO less this, and a difference of two bounds is not a bound. Comparing
+it across fits is how to tell whether a score gap is the data fitting better or
+the normalizer moving.
+"""
+function terminal_logz(
+    slds::SLDS{T}, y; ux=nothing, uy=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
+) where {T<:Real}
+    _slds_condition_terminal(slds) || return zero(T)
+    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    probe = _slqr_terminal_probe(slds, data.ux; smoothing_iters=smoothing_iters)
+    _slqr_sync_probe!(probe, slds)
+    _slqr_probe_estep!(probe)
+    return probe.logz
+end
+
+"""Canonical per-trial inputs, reconstructed from the horizons when a caller
+passed none: `log Z` depends on a trial through its inputs *and* its length, and
+the length is always available."""
+function _slds_probe_inputs(ux, seq_ends, ::Type{T}) where {T}
+    ux === nothing || return ux
+    steps = diff(vcat(0, collect(seq_ends)))
+    return [zeros(T, 0, s) for s in steps]
+end
+
+"""
+    _slds_terminal_trial_logz(slds, ux, seq_ends; smoothing_iters) -> Vector or nothing
+
+Each trial's `log Z-hat`, or `nothing` when this model does not condition.
+
+Built fresh rather than cached across iterations: the probe's cost scales with
+the number of distinct designs, not trials, and a task design repeated across a
+session collapses to one smoothed chain.
+"""
+function _slds_terminal_trial_logz(
+    slds::SLDS{T}, ux, seq_ends; smoothing_iters::Int=_SLQR_PROBE_ITERS
+) where {T<:Real}
+    _slds_condition_terminal(slds) || return nothing
+    probe = _slqr_terminal_probe(
+        slds, _slds_probe_inputs(ux, seq_ends, T); smoothing_iters=smoothing_iters
+    )
+    _slqr_sync_probe!(probe, slds)
+    _slqr_probe_estep!(probe)
+    return [probe.per_design[i] for i in probe.design_of]
+end

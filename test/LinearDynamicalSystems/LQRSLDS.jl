@@ -67,38 +67,76 @@ function test_slds_lqr_matches_lds()
     p, tsteps, ntrials = 4, 35, 5
     ys = hslds_data(p, tsteps, ntrials)
     Qc = [0.25 0.04; 0.04 0.18]
-
-    lds = hslds_state(Qc; p=p)
-    slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p)])
-
-    e_lds = _trace(fit!(lds, ys; max_iter=10, tol=1e-14))
-    e_slds = _trace(fit!(slds, ys; max_iter=10, progress=false, rng=StableRNG(7)))
-
-    @test length(e_lds) == length(e_slds)
-    # Both paths now use the same sufficient-statistic accumulation at K=1.
-    # Their outer optimizers still stop independently, and the unpinned
-    # inverse-LQR cost scale is deliberately flat; compare at a tolerance that
-    # is tight on the objective's scale without mistaking gauge drift for a
-    # different estimator.
-    @test maximum(abs, e_lds .- e_slds) < 1e-2
+    function fit_both(iters)
+        lds = hslds_state(Qc; p=p)
+        slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p)])
+        e_lds = _trace(fit!(lds, ys; max_iter=iters, tol=1e-14))
+        e_slds = _trace(fit!(slds, ys; max_iter=iters, progress=false, rng=StableRNG(7)))
+        return lds, slds, e_lds, e_slds
+    end
 
     #=
-    The structural step is L-BFGS on a profiled objective and stops on its own
-    tolerance, so ten iterations of the two paths agree to ~1e-6 rather than to
-    machine precision. The ELBO match above is the tight claim; these confirm the
-    agreement is in every parameter, not just the bound.
+    One M-step (the final iteration is scored, not updated): the sharp check.
+    Both paths start from identical statistics, so a leak is an O(1)
+    difference here, while agreement is limited only by the structural
+    L-BFGS stopping on its own tolerance — measured at ~1e-7.
     =#
+    lds, slds, e_lds, e_slds = fit_both(2)
     a, b = lds.state_model, slds.LDSs[1].state_model
-    @test maximum(abs, a.A .- b.A) < 1e-4
-    @test maximum(abs, a.S .- b.S) < 1e-4
-    @test maximum(abs, a.Qc[1] .- b.Qc[1]) < 1e-2
-    @test maximum(abs, a.Σ .- b.Σ) < 1e-4
-    @test maximum(abs, a.x0 .- b.x0) < 2e-3
-    @test maximum(abs, lds.obs_model.C .- slds.LDSs[1].obs_model.C) < 2e-4
+    @test maximum(abs, a.Qc[1] .- Qc) > 1e-2      # the M-step moved something
+    @test maximum(abs, e_lds .- e_slds) < 1e-5
+    for key in (:A, :S, :Σ, :x0, :P0, :h)
+        @test maximum(abs, getproperty(a, key) .- getproperty(b, key)) < 1e-6
+    end
+    @test maximum(abs, a.Qc[1] .- b.Qc[1]) < 1e-6
+    for key in (:C, :R, :d)
+        @test maximum(
+            abs, getproperty(lds.obs_model, key) .- getproperty(slds.LDSs[1].obs_model, key)
+        ) < 1e-6
+    end
+
+    #=
+    Ten iterations: from the second M-step on, the two structural optimizers
+    stop at different points of the objective's flattest direction — the cost
+    scale, along which `Qc` drifts by ~6% while the loop gain `S P` agrees to
+    ~1e-5 — and the traces separate by ~1e-2 nats in a fit gaining ~200. So
+    what is compared is what the data identify: the closed loop and the loop
+    gain, the noise, the emission and the bound, not the raw cost.
+    =#
+    lds, slds, e_lds, e_slds = fit_both(10)
+    a, b = lds.state_model, slds.LDSs[1].state_model
+    @test length(e_lds) == length(e_slds)
+    @test maximum(abs, e_lds .- e_slds) < 5e-2
+    @test maximum(abs, closed_loop_dynamics(a) .- closed_loop_dynamics(b)) < 1e-3
+    @test maximum(abs, a.S * riccati_solution(a) .- b.S * riccati_solution(b)) < 1e-3
+    @test maximum(abs, a.A .- b.A) < 1e-3
+    @test maximum(abs, a.Σ .- b.Σ) < 1e-3
+    @test maximum(abs, lds.obs_model.C .- slds.LDSs[1].obs_model.C) < 1e-3
 
     # `observe_costate` is off, so the emission may never read the costate half.
     # Without the mask on the switching side these columns fill in silently.
     @test all(iszero, slds.LDSs[1].obs_model.C[:, 3:4])
+    return nothing
+end
+
+function test_slds_lqr_fixed_costate_sigma()
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]])
+    v = 1e-3
+    for lds in slds.LDSs
+        sm = lds.state_model
+        sm.fixed_costate_sigma = v
+        sm.Σ[3:4, 3:4] .= v .* I(2)
+        refresh!(sm)
+    end
+    ys = hslds_data(4, 12, 2)
+    fit!(slds, ys; max_iter=1, progress=false, rng=StableRNG(7))
+    for lds in slds.LDSs
+        Σ = lds.state_model.Σ
+        @test Σ[3:4, 3:4] ≈ v .* I(2)
+        @test Σ[1:2, 3:4] == zeros(2, 2)
+        @test Σ[3:4, 1:2] == zeros(2, 2)
+        @test isposdef(Symmetric(Σ[1:2, 1:2]))
+    end
     return nothing
 end
 
@@ -190,6 +228,34 @@ function test_slds_free_matches_gaussian_slds()
     return nothing
 end
 
+"""An inverse-LQR state's `Σ` is shared by `:noise` and its cost by `:structure`
+(or `:Qc`); each tie makes that prior one term instead of one per state, as the
+constrained M-step fits it. Two identical states with both tied are one model and
+score as it does; the initial state's prior counts once whatever is tied."""
+function test_slds_lqr_tied_prior_counted_once()
+    function with_priors()
+        lds = hslds_state([0.25 0.04; 0.04 0.18])
+        sm = lds.state_model
+        sm.Σ_prior = IWPrior(; Ψ=Matrix(0.1I, 4, 4), ν=8.0)
+        sm.Qc_prior = IWPrior(; Ψ=Matrix(0.2I, 2, 2), ν=5.0)
+        sm.P0_prior = IWPrior(; Ψ=Matrix(0.3I, 4, 4), ν=7.0)
+        return lds
+    end
+    y = hslds_data(4, 35, 5)
+    lds = with_priors()
+    slds = SLDS(; A=[0.9 0.1; 0.2 0.8], πₖ=[0.5, 0.5], LDSs=[with_priors(), with_priors()])
+    sm = lds.state_model
+    σ = SSD.iw_logprior_term(Matrix(sm.Σ), sm.Σ_prior)
+    qc = SSD._lqr_structural_logprior(sm) - σ
+    e = elbo(lds, y)
+    @test elbo(slds, y; tied_params=[:structure, :noise]) ≈ e rtol = 1e-10
+    @test elbo(slds, y; tied_params=[:noise]) - e ≈ qc rtol = 1e-8
+    @test elbo(slds, y; tied_params=[:structure]) - e ≈ σ rtol = 1e-8
+    @test elbo(slds, y; tied_params=[:Qc]) - e ≈ σ rtol = 1e-8
+    @test elbo(slds, y) - e ≈ σ + qc rtol = 1e-8
+    return nothing
+end
+
 """Mixing an unconstrained state with an inverse-LQR one in a single switching
 model — the configuration `:free` mode exists for. Each keeps its own kind of
 update: the LQR state stays symplectic, the free one does not have to."""
@@ -209,10 +275,21 @@ function test_slds_mixed_free_and_lqr()
     @test slds.LDSs[2].state_model.mode === :free
     @test slds.LDSs[1].latent_dim == slds.LDSs[2].latent_dim   # one shared latent path
 
+    #=
+    Monotone only up to the E-step's Monte Carlo noise, which one sample leaves
+    at a few tenths of a nat: enough to show as a decrease once the fit nears
+    its optimum (it does on half the seeds tried). Four samples separate what
+    the M-step does from that noise.
+    =#
     ys = hslds_data(p, tsteps, ntrials)
-    elbos = _trace(fit!(slds, ys; max_iter=12, progress=false, rng=StableRNG(7)))
+    elbos = _trace(
+        fit!(slds, ys; max_iter=12, progress=false, rng=StableRNG(7), num_samples=4)
+    )
     @test minimum(diff(elbos)) > -1e-6
     @test all(isfinite, elbos)
+    # The free state reads what the LQR state reads, which is not its costate.
+    @test !slds.LDSs[2].state_model.observe_costate
+    @test iszero(slds.LDSs[2].obs_model.C[:, 3:4])
 
     # Each state kept its own kind of parameterization.
     @test symplectic_defect(slds.LDSs[1].state_model) < 1e-10
@@ -358,6 +435,15 @@ function test_slds_lqr_terminal()
     p, tsteps, ntrials = 4, 30, 5
     slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p, terminal=true)
     @test all(lds.state_model.terminal for lds in slds.LDSs)
+    #=
+    On the joint objective, where the M-step is a genuine minorant and the trace
+    is therefore monotone. The conditional default divides by a variational
+    normalizer, which is a surrogate rather than a majorant and may dip; that is
+    `test_slds_lqr_terminal_conditioning`'s business.
+    =#
+    for lds in slds.LDSs
+        lds.state_model.condition_terminal = false
+    end
 
     ys = hslds_data(p, tsteps, ntrials)
     elbos = _trace(fit!(slds, ys; max_iter=10, progress=false, rng=StableRNG(7)))
@@ -374,6 +460,222 @@ function test_slds_lqr_terminal()
     xT = res.x[1][:, end]
     resid = xT[3:4] .- sm.Qc[end] * xT[1:2] .- sm.hf
     @test norm(resid) < 10 * norm(xT[3:4]) + 1e-6
+    return nothing
+end
+
+"""Terminal conditioning through the switching path.
+
+`log p(terminal = 0)` has no exact form for a switching model, so it is
+estimated by running the E-step on a zero-loading copy. `K = 1` is where that
+estimate has nothing to approximate — the discrete layer is degenerate and the
+continuous smoother is exact — so it is the case that can check the variational
+route against the closed form the non-switching model uses.
+"""
+function test_slds_lqr_terminal_conditioning()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+
+    lds = hslds_state(Qc; p=p, terminal=true)
+    slds = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p, terminal=true)])
+    @test SSD._slds_condition_terminal(slds)
+
+    exact = ntrials * SSD._lqr_terminal_logz(lds.state_model, zeros(0, tsteps))
+    @test terminal_logz(slds, ys) ≈ exact rtol = 1e-8
+    # And the conditional score itself agrees with the non-switching one.
+    @test elbo(slds, ys) ≈ elbo(lds, ys) atol = 1e-6
+    @test smooth(slds, ys).terminal_logz ≈ exact rtol = 1e-8
+
+    # Joint and conditional differ by exactly that normalizer.
+    joint = SSD.terminal_logz(slds, ys)
+    conditional = elbo(slds, ys)
+    for member in slds.LDSs
+        member.state_model.condition_terminal = false
+    end
+    @test !SSD._slds_condition_terminal(slds)
+    @test elbo(slds, ys) ≈ conditional + joint atol = 1e-6
+    @test terminal_logz(slds, ys) == 0
+    for member in slds.LDSs
+        member.state_model.condition_terminal = true
+    end
+
+    #=
+    The costate gauge moves the joint score by `-N n log|c|` and leaves the
+    conditional one alone. The emission here reads no costate, so nothing else
+    has to be rescaled alongside it.
+    =#
+    before = elbo(slds, ys)
+    rescale_costate!(slds.LDSs[1].state_model, 2.5)
+    @test elbo(slds, ys) ≈ before atol = 1e-6
+
+    # States carrying a terminal factor must agree on whether it is conditioned.
+    mixed = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    mixed.LDSs[2].state_model.condition_terminal = false
+    @test_throws ArgumentError SSD._slds_condition_terminal(mixed)
+
+    # K = 2 fits on the conditional objective and improves on it.
+    two = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    els = _trace(fit!(two, ys; max_iter=8, progress=false, rng=StableRNG(7)))
+    @test all(isfinite, els)
+    @test els[end] > els[1]
+    #=
+    Not `> -1e-6` as on the joint objective. Both halves of the M-step only
+    accept a point that improves the scored objective — the discrete chain is
+    checked against `log Z` too (`test_slds_lqr_terminal_chain_step`) — but the
+    E-step is Monte Carlo. What the fit may not do is lose ground comparable to
+    the progress it makes.
+    =#
+    @test minimum(diff(els)) > -0.05 * (els[end] - els[1])
+    @test terminal_logz(two, ys) < 0
+    #=
+    The regression this fixture caught: the fixed-posterior surrogate is
+    unbounded below wherever the probe's scatter exceeds the data's, and an
+    M-step that trusted it drove a state's `Σ` singular within three iterations.
+    =#
+    for lds in two.LDSs
+        @test minimum(eigvals(Symmetric(lds.state_model.Σ))) > 1e-3
+    end
+    return nothing
+end
+
+"""Under terminal conditioning the discrete chain moves `log Ẑ` as well as the
+data half, so its update is checked against the conditioned score
+`g(A, π) = Σ N log A + Σ n log π − log Ẑ`, the posterior held fixed. The step
+never lowers `g`, keeps the chain stochastic, and leaves the probe smoothed at
+the chain it kept, which is what lets the state M-step reuse it. The random
+posteriors are weak enough that the probe's pull on the chain matters: two keep
+the Baum–Welch proposal, and one needs the score's own ascent step."""
+function test_slds_lqr_terminal_chain_step()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    HMMs = SSD.HMMs
+    proposals = Symbol[]
+    for seed in 1:3
+        two = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+        data = SSD.Data(two.LDSs[1], ys)
+        seq_ends = cumsum(data.tsteps)
+        total = last(seq_ends)
+        dl = SSD.SLDSDiscreteLayer(two.A, two.πₖ, 0.3 .* randn(StableRNG(seed), 2, total))
+        fb = SSD._make_slds_fb_storage(dl, seq_ends)
+        HMMs.forward_backward!(
+            fb,
+            dl,
+            collect(1:total),
+            fill(nothing, total);
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+        N, n = SSD._slds_chain_counts(fb, seq_ends, 2, Float64)
+        function g(m)
+            return sum(N .* log.(m.A .+ 1e-12)) + sum(n .* log.(m.πₖ .+ 1e-12)) -
+                   terminal_logz(m, ys)
+        end
+        before = g(two)
+        A_bw = N ./ sum(N; dims=2)
+        probe = SSD._slqr_terminal_probe(two, data.ux)
+        current = SSD._slqr_chain_mstep!(two, dl, fb, collect(1:total), seq_ends, probe)
+        @test g(two) >= before - 1e-9
+        @test all(≈(1), sum(two.A; dims=2)) && sum(two.πₖ) ≈ 1
+        @test all(>=(0), two.A) && all(>=(0), two.πₖ)
+        current && @test probe.logz ≈ terminal_logz(two, ys) rtol = 1e-10
+        kept = two.A ≈ A_bw ? :baum_welch : :gradient
+        push!(proposals, current ? kept : :none)
+    end
+    @test proposals == [:baum_welch, :gradient, :baum_welch]
+    return nothing
+end
+
+"""Re-smoothing the switching normalizer's probe after its parameters move must
+give what a probe built fresh at those parameters gives.
+
+The probe's workspace pool caches each member's smoother constants. A probe
+smoothed once, at the parameters it was built with, never notices; the M-step's
+acceptance check re-smooths it at every candidate, and a stale pool there
+smoothed under the old parameters while scoring under the new — a score whose
+slope disagreed with the exact normalizer's everywhere but at the start.
+"""
+function test_slds_lqr_probe_resmoothing()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    single = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[hslds_state(Qc; p=p, terminal=true)])
+    switching = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    for slds in (single, switching)
+        data = SSD.Data(slds.LDSs[1], ys)
+        probe = SSD._slqr_terminal_probe(slds, data.ux)
+        SSD._slqr_sync_probe!(probe, slds)
+        SSD._slqr_probe_estep!(probe)
+        backend = SSD._SLQRNormalizer(probe)
+        start = probe.logz
+
+        moved = deepcopy(slds)
+        for lds in moved.LDSs
+            sm = lds.state_model
+            sm.Σ .*= 1.3
+            sm.Qc[1] .*= 0.8
+            refresh!(sm)
+        end
+        sms = [lds.state_model for lds in moved.LDSs]
+        reused = SSD._terminal_score_logz(backend, sms)
+        @test abs(reused - start) > 0.1         # the move is not a no-op ...
+        @test reused ≈ terminal_logz(moved, ys) rtol = 1e-10   # ... and is seen
+        if length(sms) == 1
+            exact = ntrials * SSD._lqr_terminal_logz(sms[1], zeros(0, tsteps))
+            @test reused ≈ exact rtol = 1e-8
+        end
+        # And back: the reused probe returns to exactly where it started.
+        back = SSD._terminal_score_logz(backend, [lds.state_model for lds in slds.LDSs])
+        @test back ≈ start rtol = 1e-12
+    end
+    return nothing
+end
+
+"""The switching surrogate the M-step descends has the scored objective's
+gradient at the point it was built.
+
+The surrogate holds the probe's posterior fixed, and at a stationary posterior
+that costs nothing to first order (Danskin): its gradient is the gradient of the
+freshly re-smoothed score. That is what lets the acceptance step's
+steepest-descent fallback promise an improvement, so it is checked here against
+central differences of the score itself, for two discrete states. Scoring
+re-smooths the probe, so the check also confirms that doing so leaves the
+surrogate exactly as it was.
+"""
+function test_slds_lqr_conditional_score_gradient()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    K = length(slds.LDSs)
+    data = SSD.Data(slds.LDSs[1], ys)
+    # Any valid per-state statistics serve as the data side: the identity under
+    # test is about the normalizer, which the data side does not touch.
+    sufs = [first(lqr_estep_stats(lds, ys)) for lds in slds.LDSs]
+    probe = SSD._slqr_terminal_probe(slds, data.ux)
+    SSD._slqr_sync_probe!(probe, slds)
+    SSD._slqr_probe_estep!(probe)
+    problem = SSD._lqr_conditional_problem(
+        slds.LDSs,
+        sufs,
+        [ones(Int, K), ones(Int, K), collect(1:K), collect(1:K)],
+        SSD._lqr_block_slots(Symbol[], K),
+        SSD._SLQRNormalizer(probe),
+    )
+    @test problem.rescores
+    θ = copy(problem.theta)
+    ∇ = similar(θ)
+    @test isfinite(problem.evaluate!(∇, θ))
+    before = problem.evaluate!(nothing, θ)
+
+    rng = StableRNG(5)
+    for _ in 1:3
+        d = normalize(randn(rng, length(θ)))
+        ε = 1e-5
+        fd = (problem.score!(θ .+ ε .* d) - problem.score!(θ .- ε .* d)) / (2ε)
+        @test fd ≈ dot(∇, d) rtol = 1e-6
+    end
+    @test problem.evaluate!(nothing, θ) == before
+    problem.write!(θ)          # leave the model where it started
     return nothing
 end
 
@@ -525,6 +827,297 @@ function test_slds_lqr_prior_vs_optimal_data()
         ],
     )
     @test prior_acc - opt_acc > 0.25
+    return nothing
+end
+
+"""A state whose own terminal cost differs from its running cost, and a `:free`
+state beside it — the pair a delay-then-reach model uses."""
+function hslds_terminal_pair(p, tsteps; terminal_first=true)
+    n = 2
+    C = randn(StableRNG(11), p, 2n)
+    C[:, (n + 1):end] .= 0
+    obs() = GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+    lqr = LQRStateModel(
+        [0.96 0.07; -0.05 0.93],
+        [0.06 0.01; 0.01 0.05],
+        [[0.25 0.04; 0.04 0.18], [2.0 0.0; 0.0 1.5]],
+        Matrix(0.05I, 2n, 2n);
+        schedule=cost_schedule(tsteps; terminal=true),
+        terminal=true,
+        condition_terminal=false,
+        Σf=Matrix(0.02I, n, n),
+        P0=Matrix(0.3I, 2n, 2n),
+    )
+    free = free_state_model(
+        0.9 * Matrix(1.0I, 2n, 2n), Matrix(0.05I, 2n, 2n); P0=Matrix(0.3I, 2n, 2n)
+    )
+    members = [LinearDynamicalSystem(lqr, obs()), LinearDynamicalSystem(free, obs())]
+    terminal_first || reverse!(members)
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=members)
+end
+
+"""A `:free` state and an inverse-LQR one sharing an emission family — the
+free state as `free_state_model` builds it by default, allowed to read every
+latent coordinate, the LQR state with `observe_costate` as given."""
+function hslds_mixed_pair(emission; free_first::Bool=false, observe_costate::Bool=false)
+    n = 2
+    A = [0.95 0.10; -0.05 0.90]
+    S = Matrix(0.15I, n, n)
+    Qc = Matrix(0.20I, n, n)
+    Σ = Matrix(Diagonal(fill(0.02, 2n)))
+    lqr = LQRStateModel(
+        copy(A),
+        copy(S),
+        [copy(Qc)],
+        copy(Σ);
+        terminal=true,
+        condition_terminal=false,
+        x0=zeros(2n),
+        P0=Matrix(0.1I, 2n, 2n),
+        observe_costate=observe_costate,
+    )
+    seed = LQRStateModel(
+        copy(A), copy(S), [copy(Qc)], copy(Σ); x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n)
+    )
+    free = SSD.free_state_model(
+        Matrix(SSD.symplectic_matrix(seed, 1)),
+        Matrix(seed.cache.Qfwd);
+        h=Vector(seed.cache.bfwd),
+        x0=zeros(2n),
+        P0=Matrix(0.1I, 2n, 2n),
+    )
+    @assert free.observe_costate
+    members = [
+        LinearDynamicalSystem(lqr, emission()), LinearDynamicalSystem(free, emission())
+    ]
+    free_first && reverse!(members)
+    return SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=members)
+end
+
+"""In a switching model a `:free` state reads the latent coordinates the
+inverse-LQR states read, no more: its `observe_costate` is matched to theirs.
+
+The emission then means the same thing in every mode, and a tied `C` has one
+mask to obey. Before, a free state (which reads everything by default) kept its
+own mask, and a tied emission obeyed whichever mask its path happened to
+consult: a partial tie (`:C` without `:d`) none at all, a whole tie only the
+first state's — so listing the free state first let its statistics fill the
+costate columns the inverse-LQR state then read. Every path is checked —
+Gaussian and Poisson, partial and whole ties, both orders, pooled and grouped,
+untied — along with a prior that would pull those columns away from zero, and
+the matching in the other direction.
+"""
+function test_slds_lqr_tied_emission_mask()
+    n, tsteps, ntrials = 2, 20, 24
+    costate = (n + 1):(2n)
+    function gauss()
+        return GaussianObservationModel(;
+            C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
+        )
+    end
+    function pois()
+        return PoissonObservationModel(;
+            C=hcat(0.5 .* Matrix(1.0I, n, n), zeros(n, n)), d=fill(0.5, n)
+        )
+    end
+    rng = StableRNG(7)
+    y_gauss = [0.5 .* randn(rng, n, tsteps) for _ in 1:ntrials]
+    y_pois = [Float64.(rand(StableRNG(100 + i), 0:3, n, tsteps)) for i in 1:ntrials]
+    labels = [isodd(i) ? "lo" : "hi" for i in 1:ntrials]
+    function fitted(
+        emission, y, tied; free_first=false, grouped=false, prior=nothing, observe=false
+    )
+        slds = hslds_mixed_pair(emission; free_first=free_first, observe_costate=observe)
+        for lds in slds.LDSs
+            grouped && (lds.state_model.depends_on = (Gref=labels,))
+            prior === nothing || (lds.obs_model.CD_prior = prior)
+        end
+        # One M-step: the final iteration only scores.
+        fit!(slds, y; max_iter=2, progress=false, rng=StableRNG(3), tied_params=tied)
+        return slds
+    end
+    reads_costate(slds) = [norm(lds.obs_model.C[:, costate]) for lds in slds.LDSs]
+
+    for (emission, y, ties) in (
+        (gauss, y_gauss, ([:A, :S], [:A, :S, :C, :R], [:A, :S, :C, :d, :R])),
+        (pois, y_pois, ([:A, :S], [:A, :S, :C, :d])),
+    )
+        for tied in ties, free_first in (false, true), grouped in (false, true)
+            slds = fitted(emission, y, tied; free_first=free_first, grouped=grouped)
+            @test all(iszero, reads_costate(slds))
+            @test !any(lds.state_model.observe_costate for lds in slds.LDSs)
+        end
+    end
+
+    #=
+    A prior centred away from zero in the costate columns, coupling them to the
+    state columns: masking only the data would let it recreate them. Block
+    diagonal between `C` and `d`, as a partial tie requires.
+    =#
+    M₀ = [1.0 0.2 0.5 -0.4; 0.1 0.9 0.3 0.6]
+    L = [2.0 0.5 0.4 0.3; 0.0 2.0 0.2 0.1; 0.0 0.0 1.5 0.3; 0.0 0.0 0.0 1.5]
+    Λ = zeros(5, 5)
+    Λ[1:4, 1:4] .= L' * L
+    Λ[5, 5] = 1.0
+    prior = MNPrior(; M₀=hcat(M₀, zeros(n)), Λ=Λ)
+    for tied in ([:A, :S, :C, :R], [:A, :S, :C, :d, :R]), free_first in (false, true)
+        slds = fitted(gauss, y_gauss, tied; free_first=free_first, prior=prior)
+        @test all(iszero, reads_costate(slds))
+        @test norm(slds.LDSs[1].obs_model.C[:, 1:n] .- M₀[:, 1:n]) > 0.1   # data moved it
+    end
+
+    #=
+    A whole tie is a labelling-invariant pooled fit: the same `[C d]` in either
+    order, and the same through a grouping that splits nothing. So is `R`, which
+    is fitted after it from each state's residuals, and so needs every state to
+    hold the shared `C` by then. (Not the ELBO: the LQR state's L-BFGS stopping
+    point moves it by ~1e-3 nats under a 1e-14 change in its statistics.)
+    =#
+    tied = [:A, :S, :C, :d, :R]
+    lqr_first = fitted(gauss, y_gauss, tied)
+    free_first = fitted(gauss, y_gauss, tied; free_first=true)
+    grouped = fitted(gauss, y_gauss, tied; grouped=true)
+    C = lqr_first.LDSs[1].obs_model.C
+    @test norm(C[:, 1:n] .- Matrix(1.0I, n, n)) > 0.05                     # it was fitted
+    @test free_first.LDSs[2].obs_model.C ≈ C rtol = 1e-10
+    @test grouped.LDSs[1].obs_model.C ≈ C rtol = 1e-10
+    for (k, j) in ((1, 2), (2, 1))
+        @test free_first.LDSs[j].obs_model.R ≈ lqr_first.LDSs[k].obs_model.R rtol = 1e-10
+        @test free_first.LDSs[j].obs_model.d ≈ lqr_first.LDSs[k].obs_model.d rtol = 1e-10
+    end
+    @test grouped.LDSs[2].obs_model.R ≈ lqr_first.LDSs[2].obs_model.R rtol = 1e-10
+    p_lqr = fitted(pois, y_pois, [:A, :S, :C, :d])
+    p_free = fitted(pois, y_pois, [:A, :S, :C, :d]; free_first=true)
+    @test p_free.LDSs[2].obs_model.C ≈ p_lqr.LDSs[1].obs_model.C rtol = 1e-8
+
+    # The other direction: LQR states that read their costate let the free one read it too.
+    reading = fitted(gauss, y_gauss, [:A, :S]; observe=true)
+    @test all(lds.state_model.observe_costate for lds in reading.LDSs)
+    @test all(>(1e-3), reads_costate(reading))
+
+    #=
+    `rand` matches too, so a sample is drawn from the model a fit would see — even
+    from a free state constructed with a nonzero costate readout, which is
+    zeroed with a warning like any other state that may not read those columns.
+    =#
+    fresh = hslds_mixed_pair(gauss; free_first=true)
+    fresh.LDSs[1].obs_model.C[:, costate] .= 0.3
+    @test_logs (:warn, r"costate columns") match_mode = :any rand(StableRNG(1), fresh, 5)
+    @test !fresh.LDSs[1].state_model.observe_costate
+    @test all(iszero, reads_costate(fresh))
+
+    # A model with no inverse-LQR state leaves its free states alone.
+    lone = hslds_mixed_pair(gauss)
+    only_free = SLDS(; A=ones(1, 1), πₖ=[1.0], LDSs=[lone.LDSs[2]])
+    SSD._match_costate_readout!(only_free)
+    @test only_free.LDSs[1].state_model.observe_costate
+    return nothing
+end
+
+"""The order the discrete states are listed in is a labelling, not a model.
+
+An inverse-LQR state with its own terminal cost carries two cost regimes and a
+`:free` state one. The responsibility-weighted statistics used to be allocated
+as `K` copies of whatever the *first* state needed, so listing the free state
+first under-sized the LQR state's per-regime blocks and the fit died with a
+`BoundsError` — the other order worked by accident. Both must fit, and to the
+same model: exactly for the free state and the chain, and for the LQR state up
+to where its structural optimizer stops in the cost's flat direction, which
+flips with the last bit of the data (see `test_slds_lqr_grouped_free_state_pools`).
+"""
+function test_slds_lqr_state_order()
+    p, tsteps = 4, 20
+    ys = hslds_data(p, tsteps, 4)
+    function fitted(terminal_first)
+        slds = hslds_terminal_pair(p, tsteps; terminal_first=terminal_first)
+        # One M-step: the final iteration only scores.
+        e = _trace(fit!(slds, ys; max_iter=2, progress=false, rng=StableRNG(1)))
+        return slds, e
+    end
+    a, ea = fitted(true)
+    b, eb = fitted(false)
+    @test maximum(abs, ea .- eb) < 1e-2
+    @test maximum(abs, a.A .- b.A[[2, 1], [2, 1]]) < 1e-10
+    @test maximum(abs, a.LDSs[2].state_model.Mfree .- b.LDSs[1].state_model.Mfree) < 1e-10
+
+    la, lb = a.LDSs[1].state_model, b.LDSs[2].state_model
+    rel(x, y) = norm(x .- y) / norm(x)
+    @test norm(la.Qc[2] .- [2.0 0.0; 0.0 1.5]) > 0.1     # the terminal cost was fitted
+    @test rel(la.A, lb.A) < 1e-3
+    @test rel(la.S, lb.S) < 2e-2
+    @test rel(la.Qc[1], lb.Qc[1]) < 2e-2
+    @test rel(la.Qc[2], lb.Qc[2]) < 2e-2
+    return nothing
+end
+
+"""`rand` rolls each inverse-LQR state's own transition cost, and every entry
+point refuses a state whose schedule switches costs within a trial.
+
+The sampler used to hand back `cache.M[1]` whatever the schedule said, while the
+smoother and M-step honoured it — silently a different model. A separate
+terminal cost is not a switch (it is read only by the terminal factor), so a
+state whose transitions all follow cost 2 and whose terminal step is written
+against cost 1 must roll `M[2]`.
+"""
+function test_slds_lqr_rand_schedules()
+    p, tsteps = 4, 20
+    A = [0.96 0.07; -0.05 0.93]
+    S = [0.06 0.01; 0.01 0.05]
+    Σ = Matrix(0.05I, 4, 4)
+    C = randn(StableRNG(11), p, 4)
+    C[:, 3:4] .= 0
+    obs() = GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+    partner() = hslds_state([0.9 0.0; 0.0 0.7]; p=p, C=C, terminal=true)
+
+    flipped = LQRStateModel(
+        copy(A),
+        copy(S),
+        [[2.0 0.0; 0.0 1.5], [0.25 0.04; 0.04 0.18]],
+        copy(Σ);
+        schedule=vcat(fill(2, tsteps - 1), 1),
+        terminal=true,
+        Σf=Matrix(0.02I, 2, 2),
+        P0=Matrix(0.3I, 4, 4),
+    )
+    @test SSD._slds_transition_regimes(flipped) == [2]
+    @test SSD._extract_state_params(flipped).A === flipped.cache.M[2]
+    @test flipped.cache.M[2] != flipped.cache.M[1]
+    ok = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[LinearDynamicalSystem(flipped, obs()), partner()],
+    )
+    @test validate_SLDS(ok) === nothing
+    z, x, y = rand(StableRNG(3), ok, tsteps)
+    @test size(x) == (4, tsteps) && all(isfinite, x) && all(isfinite, y)
+
+    # The usual terminal pair passes too, in either order.
+    @test validate_SLDS(hslds_terminal_pair(p, tsteps)) === nothing
+    @test validate_SLDS(hslds_terminal_pair(p, tsteps; terminal_first=false)) === nothing
+
+    # A cost switch inside a state is refused wherever the model is used.
+    switching = LQRStateModel(
+        copy(A),
+        copy(S),
+        [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]],
+        copy(Σ);
+        schedule=cost_schedule(tsteps; onset=8),
+        P0=Matrix(0.3I, 4, 4),
+    )
+    @test SSD._slds_transition_regimes(switching) == [1, 2]
+    bad = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[
+            LinearDynamicalSystem(switching, obs()),
+            hslds_state([0.9 0.0; 0.0 0.7]; p=p, C=C),
+        ],
+    )
+    ys = hslds_data(p, tsteps, 2)
+    @test_throws ArgumentError rand(StableRNG(3), bad, tsteps)
+    @test_throws ArgumentError rand(StableRNG(3), bad, [tsteps, tsteps])
+    @test_throws ArgumentError fit!(bad, ys; max_iter=2, progress=false)
+    @test_throws ArgumentError smooth(bad, ys)
     return nothing
 end
 
@@ -818,20 +1411,48 @@ function test_slds_lqr_grouped_free_state_pools()
     S = Matrix(0.15I, n, n)
     Qc = Matrix(0.20I, n, n)
     Σ = Matrix(Diagonal([0.02, 0.02, 0.02, 0.02]))
-    emission() = GaussianObservationModel(;
-        C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
-    )
+    function emission()
+        return GaussianObservationModel(;
+            C=hcat(Matrix(1.0I, n, n), zeros(n, n)), d=zeros(n), R=Matrix(0.05I, n, n)
+        )
+    end
     function lqr_lds()
-        sm = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
-            terminal=true, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        sm = LQRStateModel(
+            copy(A),
+            copy(S),
+            [copy(Qc)],
+            copy(Σ);
+            terminal=true,
+            #=
+            What is under test here is how a `:free` state pools with an
+            inverse-LQR one, and terminal conditioning is refused for that
+            mixture — the shared initial state would be fitted from the
+            inverse-LQR regimes alone. Score the joint objective so the pooling
+            is what the test exercises.
+            =#
+            condition_terminal=false,
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         return LinearDynamicalSystem(sm, emission())
     end
     function free_lds()
-        seed = LQRStateModel(copy(A), copy(S), [copy(Qc)], copy(Σ);
-            terminal=false, x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+        seed = LQRStateModel(
+            copy(A),
+            copy(S),
+            [copy(Qc)],
+            copy(Σ);
+            terminal=false,
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         sm = SSD.free_state_model(
-            Matrix(SSD.symplectic_matrix(seed, 1)), Matrix(seed.cache.Qfwd);
-            h=Vector(seed.cache.bfwd), x0=zeros(2n), P0=Matrix(0.1I, 2n, 2n))
+            Matrix(SSD.symplectic_matrix(seed, 1)),
+            Matrix(seed.cache.Qfwd);
+            h=Vector(seed.cache.bfwd),
+            x0=zeros(2n),
+            P0=Matrix(0.1I, 2n, 2n),
+        )
         return LinearDynamicalSystem(sm, emission())
     end
 
@@ -850,8 +1471,14 @@ function test_slds_lqr_grouped_free_state_pools()
             end
         end
         # `max_iter = 2` is exactly one M-step: the last iteration only scores.
-        fit!(slds, y; max_iter=2, progress=false, rng=StableRNG(3),
-            tied_params=[:A, :S, :C, :R])
+        fit!(
+            slds,
+            y;
+            max_iter=2,
+            progress=false,
+            rng=StableRNG(3),
+            tied_params=[:A, :S, :C, :R],
+        )
         return slds
     end
 
@@ -863,9 +1490,18 @@ function test_slds_lqr_grouped_free_state_pools()
     @test rel(fp.Mfree, fg.Mfree) < 1e-10
     @test rel(fp.h, fg.h) < 1e-10
     @test rel(fp.Σ, fg.Σ) < 1e-10
+    #=
+    The inverse-LQR state cannot be held to the same standard, and not because
+    the paths differ: its structural M-step stops at a point in the cost's flat
+    direction that flips with the last bit of the data. Scaling `y` by
+    `1 + 1e-15` moves one M-step's `A` by ~3e-5 and `Qc` by ~2.5e-3 on one
+    Julia version and by nothing on another. A pooling that dropped or
+    double-counted a cell moves them by tens of percent.
+    =#
     lp, lg = plain.LDSs[1].state_model, grouped.LDSs[1].state_model
-    @test rel(lp.A, lg.A) < 1e-6
-    @test rel(lp.Qc[1], lg.Qc[1]) < 1e-6
+    @test rel(lp.A, lg.A) < 1e-3
+    @test rel(closed_loop_dynamics(lp), closed_loop_dynamics(lg)) < 1e-3
+    @test rel(lp.Qc[1], lg.Qc[1]) < 2e-2
 
     # A real grouping: the LQR cost splits, the free state's dynamics do not.
     split = fitted((Qc=labels,))

@@ -22,6 +22,7 @@ Useful subsets:
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=goldstandard
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=modelrecovery,switching
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --only=procedure --gen=lqr
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=reference-audit
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --no-figures
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder
 $ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --smoulder --only=smoulder-gref
@@ -44,6 +45,29 @@ every run).
 | `plotting.jl` | figures |
 | `experiments.jl` | the eight sweeps |
 | `smoulder.jl` | grouped Poisson recovery matched to the smoulder-reward task |
+| `parameterization.md` | a design review: is the mixed-coordinate model the right parameterization? |
+| `parameterization.jl` | the measurements behind it — self-contained, imports nothing from `src/` |
+| `biological.md` | the same question for a system that may only be *approximately* control-like |
+| `biological.jl` | its measurements — also self-contained |
+| `implementation-plan.md` | the plan that follows from both: a closed-loop state model for noisy, approximately optimal neural systems |
+| `reference_audit.jl` | target-column matching, marginal-likelihood curvature, exact EM-step checks, paired costate controls |
+
+`parameterization.md` is the one file here that is not a recovery sweep. It
+takes the findings below as given and asks the prior question: whether the
+mixed-coordinate (Hamiltonian) latent is the right way to write the inverse
+control problem in the first place, and what the alternatives buy. Several of
+the harder findings below — the cost scale, the reference/cost trade, the
+`Σ_λλ` inversion in the switching fit — turn out to be properties of the
+parameterization rather than of the data.
+
+`biological.md` drops the premise that the data came from a controller at all,
+which is the situation for neural data, and asks what can still be claimed. Its
+central measurement is that `Σ_λλ` does **not** measure suboptimality: an
+exactly optimal agent under plant noise already violates the adjoint recursion
+by a large, systematic amount, while the Riccati-graph relation it *doesn't*
+violate is the one that responds to suboptimality alone. It also evaluates
+fixing `S`, constraining `Σ`'s costate block, and an equality-constrained KKT
+backend.
 
 ## Smoulder-reward recovery suite
 
@@ -62,6 +86,9 @@ There is deliberately no session variable and no emission grouping in these
 experiments. Only `Qc` depends on the known reward label. Since the terminal
 cost is the last member of `Qc`, both running and terminal costs get one copy
 per reward, while `A`, `S`, `Gref`, `Σ`, and the Poisson emission are shared.
+Because the target input is one-hot, `h` is frozen at zero in every fitted
+smoulder model; otherwise it duplicates the input intercept and leaves the
+reference origin free to drift along the gauge.
 
 The full suite is expensive: each fit processes 15 million counts, and the
 initialization/prior sweep contains multiple fits over each seed. Use
@@ -69,6 +96,17 @@ initialization/prior sweep contains multiple fits over each seed. Use
 submitting `--smoulder` as a threaded batch job.
 
 ### Reading the `Gref` audit
+
+The ordinary Gaussian harness uses fixed `C = [I 0]`, so its state-coordinate
+map is the identity and a separate Procrustes line would repeat the raw score.
+The explicit fitted-loading audit is an opt-in smoulder experiment; run its
+quick-sized version with:
+
+```console
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=smoulder-gref
+```
+
+(`--smoulder --only=smoulder-gref` selects the full smoulder dimensions.)
 
 When the Poisson loading is fitted, plant coordinates have an orthogonal gauge.
 If `x_true = T*x_fit`, consistency requires transforming all control parameters:
@@ -92,6 +130,18 @@ of coordinates uses `x_true = T*x_fit` and `lambda_true = T^{-T}lambda_fit`, so
 `T'T` is near identity, the ambiguity is only rotational. If only the full map
 works, the fit also contains latent scaling or shear and `Gref'Gref` is not an
 invariant assessment.
+
+There is a separate reference-origin gauge even when `C` is known. For one-hot
+target codes, `sum(u) = 1`, so a common shift of every reference column can be
+absorbed by the costate intercept. The diagnostic therefore also reports
+centred reference contrasts, pairwise target distances, the rank/nullity of the
+augmented design `[1; u]`, and the number of common-translation directions left
+unidentified after accounting for the active cost matrices and whether `h` and
+`hf` are fitted. It also prints the initialization error and how far `Gref`
+actually moved, which distinguishes a fitted answer from a starting value that
+the EM iterations barely updated. Pairwise distances are invariant to
+both an orthogonal latent rotation and a common reference translation;
+`Gref'Gref` is not translation invariant.
 
 ## What it measures
 
@@ -161,6 +211,12 @@ latent basis, and the cost given the latents — and mixing them tells you nothi
 about either. `observe_costate` widens the readout to `C = I`; `--free-C` folds
 the latent-basis problem back in.
 
+Whenever a fitted model has reference-input columns, the harness freezes `h` at
+zero by default. The one-hot `u_r` columns sum to one, so a free affine drift is
+an exactly redundant intercept. The `h estimated` rows in experiment 2b and the
+overview, procedure, and gold-standard controls opt back into that degeneracy
+deliberately.
+
 ## Figures
 
 | file | what it shows |
@@ -213,6 +269,17 @@ per cell would mostly report which seed it got.
 From the default tier: `n = 3`, `T = 25`, `N = 400` trials, 3 seeds, medians.
 Rerun it — these will drift, and the point of the harness is that they can be
 re-measured rather than remembered.
+
+**These tables predate two harness changes and have not been rerun since.**
+They were measured when every fit estimated `h`, including fits with one-hot
+reference inputs; the harness now freezes `h` whenever there is a reference
+input. Almost every experiment has one, so treat the rows below as
+measured under the old default. The exceptions are the two tables that set `h`
+explicitly — experiment 2b's `h estimated` / `h frozen` columns and the
+reference-permutation audit — and runs with `nref = 0`. They were also measured
+before the package conditioned on the terminal event by default
+(`condition_terminal = true`), so terminal-condition rows scored the joint
+`p(y, terminal = 0)` rather than today's conditional objective.
 
 ### The control problem comes back; the cost that induces it comes back less well
 
@@ -284,9 +351,9 @@ to `1e-6`. Restarts fail because the ELBO ranks the cold start best every time �
 under misspecification the bound is not a guide to recovery. And a warm start
 *at the truth* ends at `Qc` 0.394: EM walks away from the generating parameters.
 
-### One reference target is confounded with the affine drift; two are not
+### One reference has no contrasts; several identify contrasts, not the origin
 
-At a loose `Σ_λλ`, where the reference is identifiable at all (`rand`):
+At a loose `Σ_λλ`, where the reference contrasts can move (`rand`):
 
 | targets | `Gref`, `h` estimated | `Gref`, `h` frozen at 0 |
 |---|---|---|
@@ -295,24 +362,102 @@ At a loose `Σ_λλ`, where the reference is identifiable at all (`rand`):
 | 4 | 0.077 / 1.00 | 0.078 / 1.00 |
 | 8 | 0.076 / 1.00 | 0.078 / 1.00 |
 
-Exactly the structure the model's own documentation implies. With one target the
-input never varies, `−Q₁ G_r u` is a constant, and the costate half of `h` is
-another one; freezing `h` at its true value recovers the reference 5.6×
-better. From two targets on, the contrasts identify it and `h` is irrelevant.
-Past four targets nothing more is bought.
+With one target the input never varies, `−Q₁ G_r u` is a constant, and the
+costate half of `h` is another one; freezing `h` at its true value recovers the
+reference 5.6× better. From two targets on, the contrasts are identified and,
+for this zero-centred truth and zero-centred initialization, the raw score also
+looks identified. That does **not** identify the common origin: with one active
+running cost, `Gref → Gref + δ1'` and `h_λ → h_λ + Qδ` are the same model for
+any `δ`. The old raw metric silently selected the initialization's origin.
+The new contrast/distance and translation-nullity diagnostics make that visible.
 
-### The reference lives in the costate, so it needs the costate
+### The apparent reference permutation is retained initialization
 
-The tight costate innovation that fixes the cost destroys the reference: `Gref`
-goes from 0.077/1.00 to ~1.05/0.02. As `Σ_λλ → 0` the smoother can satisfy the
-costate recursion for *any* `G_r`, so nothing pins it. Annealing — fit loose,
-then tighten — does not rescue it: it reverts to the loose answer. What does
-work is observing the costate, and there annealing becomes the best setting
-found anywhere (`Gref` 0.022 / 1.00 drawing from the model, 0.104 / 1.00 from
-the agent).
+For the three-dimensional cosine truth with four targets, the cold start is
+exactly `G0 = Gtrue[:, [2,3,4,1]] / 3`. A fit that barely moves therefore looks
+like a column permutation. Reordering its columns `[4,1,2,3]` recovers the
+orientation, but leaves the one-third radius; rescaling `Gref` is not a costate
+scale gauge. The heatmap and entry scatter preserve column order correctly.
 
-**This is a genuine trade, not a tuning failure.** The default serves the cost;
-if the reference is what you care about, start loose and observe the costate.
+Target identity is observed through the one-hot input. Permuting `Gref` alone
+changes the model; permuting the input rows by the same permutation restores
+it. Fixing `C` does not need to resolve target-label switching, because those
+labels were never latent. In the forward dynamics the reference changes the
+state mean through `−S A^{-T} Q_k Gref u_t`; for the nonsingular known plant
+and costs used here this already conveys reference information to state-only
+observations.
+
+Run the focused audit with:
+
+```console
+$ julia --project=docs -t auto docs/dev/lqr/lqr_recovery.jl --quick --only=reference-audit
+```
+
+It reports the best column matching and a separate radius correction, checks
+likelihood changes with/without relabelling the inputs, and computes the exact
+quadratic marginal-likelihood optimum in `Gref` with other parameters fixed.
+It also checks a Gref-only EM step against an independent quadratic solution
+and compares observed versus complete-data information. The figure
+`reference_permutation_audit.png` includes the initialization explicitly.
+
+For one paired quick-tier dataset (60 trials, 20 bins, 120 reported iterations,
+fixed `C`, fixed `h`, terminal + delay), the relative `Gref` errors are:
+
+| observations | costate-noise initialization | Gref error |
+|---|---|---:|
+| state | tight (`1e-4`) | 1.0254 |
+| state | loose (`5e-2`) | 0.1341 |
+| state + costate | tight (`1e-4`) | 0.9843 |
+| state + costate | loose (`5e-2`) | 0.0206 |
+
+All four arms fit and score `log p(y | terminal = 0)`, the package default
+(`condition_terminal = true`) and the likelihood of what the terminal-conditioned
+sampler draws. An earlier run of this audit, against a package that still fitted
+the joint `p(y, terminal = 0)`, put the state/loose arm at 7.85: that failure was
+the objective mismatch, and it is gone.
+
+The state/tight fit moves just 0.038 truth-RMS units from initialization.
+Column matching alone leaves error 0.681; matching plus a factor of 3.087
+reduces it to 0.110. Yet permuting its columns alone **improves** the log
+likelihood by 206.2 nats, while also relabelling inputs preserves it within
+`7e-12`. Its Gref information matrix has rank 12/12, and optimizing Gref
+directly at the fitted nuisance parameters gains 382.0 nats. This is evidence
+of an unfinished optimization, not a permutation degeneracy.
+
+The tight costate innovation makes the complete-data objective much stiffer
+than the marginal likelihood: costates inferred under the current reference
+resist changing that reference in the next M-step. At the state/tight fit,
+ideal Gref-only EM removes only 6.9e-5 to 5.8e-4 of the error per iteration
+along its eigenmodes, with nuisance parameters held fixed; at the state/loose fit
+it removes 0.087 to 0.35. A small step or ELBO increment therefore does not
+demonstrate lack of information. Earlier wording here claimed that tight noise
+made the reference unidentified; the marginal-likelihood audit contradicts that
+claim. The implemented Gref-only M-step, which carries the terminal normalizer
+`−log Z`, agrees with the independently computed exact update to `3.1e-9`
+relative error in this arm.
+
+With all nuisance parameters fixed at truth, the conditional likelihood has
+rank 12/12 and recovers `Gref` to error 0.0288 using state observations alone,
+or 0.0165 with costate observations. Scoring the joint instead would give 0.0726
+and 0.0240. These oracle controls establish information about Gref given those
+parameters; they do not establish global identifiability of every jointly
+fitted block.
+
+The movement diagnostic confirms that the tight arms' `~1.0` is substantially the
+cold start, whose error is 1.054. In the quick smoulder fixed-`C`, fixed-`h`
+control (`--quick --only=smoulder-gref`, row `truth C, fixed`) the
+initialization error is 0.650, the final raw and centred-contrast errors are both
+0.632, and `Gref` moves only 0.024 truth-RMS units. Its pairwise-distance error
+is 0.864 while its centroid error is 0.003. Thus neither a latent rotation nor
+the reference-origin gauge explains that fit: the target geometry itself stayed
+near its initialization.
+
+In this paired dataset the costate-noise start matters more than observing the
+costate: from a tight start `Gref` barely moves with or without costate
+observations, while from a loose start it comes back either way, and costate
+observations then improve it from 0.134 to 0.021. This is one dataset and one
+seed. The historical gold-standard sweep found good results with costate observations and
+annealing (`Gref` 0.022 / 1.00 drawing from the model, 0.104 / 1.00 from the agent).
 
 ### Terminal conditions and multiple references buy less than expected
 
@@ -424,7 +569,7 @@ candidates score the same quantity:
 | the LQR *optimal trajectory* | −0.640 | −0.470 | **−0.433** | −0.034 | LDS ✗ |
 | a first-order attractor (LDS) | −0.427 | −0.576 | **−0.429** | −0.145 | LDS ✓ |
 
-The LDS competitor has *more* free parameters (52 against 33), so the LQR's win
+The LDS competitor has *more* free parameters (48 against 29), so the LQR's win
 on its own chain is not a win on parsimony.
 
 The middle row is the important one. On optimal-trajectory data — the case the
@@ -577,13 +722,19 @@ recovered from 4.42 to 1.55.
    comes back 3–10× better than the cost matrices do. If you must report the
    cost, report its shape after canonicalization and read `S` for what the scale
    is doing.
-4. **Use two or more distinct reference targets, or freeze `h`.** One target
-   identifies nothing about the reference; two or more identify its contrasts.
-   Past four, nothing more is bought.
-5. **The reference needs the costate.** It enters only through the costate half
-   of the affine term, so the tight innovation that fixes the cost makes `Gref`
-   unidentifiable. If the reference is the question, observe the costate and
-   anneal; otherwise do not report `Gref` at all.
+4. **Use two or more distinct reference targets, and choose an origin.** One
+   target has no reference contrast; two or more identify contrasts. Freeze
+   `h`, impose a centring constraint on `Gref`, or use genuinely different
+   running costs with a shared `h` if the common reference origin matters.
+   A terminal factor with a fitted `hf` does not choose the origin. Past four
+   targets, nothing more is bought here.
+5. **Before reporting `Gref`, check that it moved.** The likelihood carries
+   information about the reference from state observations alone, but at the
+   tight costate innovation that serves the cost, EM corrects well under 1% of
+   the `Gref` error per iteration, so the reported map is mostly its
+   initialization. Read the movement diagnostic first. If the reference is the
+   question, observe the costate and start loose (then anneal); otherwise do not
+   report `Gref` at all.
 6. **Do not spend compute on restarts or on iterations past a few hundred.**
    Neither changes a printed digit. Spend it on observing more of the latent.
 7. **Do not use a likelihood to choose among fits.** Under misspecification the
@@ -604,9 +755,11 @@ recovered from 4.42 to 1.55.
 
 ## Findings on the package
 
-Three things this harness turned up that are about `src/`, not about the models
-it fits. None of them is patched here — this directory is a measuring
-instrument, not a fix.
+Things this harness turned up that are about `src/`, not about the models it
+fits. The directory is a measuring instrument, so the fixes live in `src/` and
+`test/`; each entry says where. #1–#3 were closed by milestone M0 of
+[`implementation-plan.md`](implementation-plan.md), #4 earlier, #5–#7 after
+it.
 
 ### 1. An `SLDS` mis-sizes its weighted sufficient statistics when the discrete states differ in regime count
 
@@ -636,6 +789,11 @@ lqr  = LQRStateModel(A, S, [Qrun, Qterm], Σ;
 "delay, then reach". The general fix is to allocate per discrete state; the
 ordering workaround still fails for two LQR states with different regime counts.
 
+**Fixed.** The statistics are now allocated per discrete state, at all three
+sites (the M-step, the fit's preallocation, and the terminal normalizer's
+probe). `test_slds_lqr_state_order` fits the pair above in both orders and gets
+the same model; the ordering workaround is no longer needed.
+
 ### 2. `rand` on an `SLDS` ignores an LQR state's cost schedule
 
 `_extract_state_params(sm::LQRStateModel)` hands the sampler `cache.M[1]` — one
@@ -648,6 +806,15 @@ M-step honour `schedule`, the sampler does not. Either the sampler should walk
 the schedule, or the constructor should refuse a multi-transition schedule on a
 member of an `SLDS`.
 
+**Fixed, by refusing.** `validate_SLDS` already had a rule for this, but nothing
+called it, and it was stricter than the model: it refused any state with more
+than one `Qc`, which includes the running-plus-terminal state this harness uses.
+The rule is now the precise one — a state's *transitions* follow one cost; a
+separate terminal cost, read only by the terminal factor, is fine — and it is
+enforced wherever the model is used (`fit!`, `smooth`, `elbo` and both `rand`
+methods). The sampler rolls that transition cost's `M`, which need not be
+`M[1]`. See `test_slds_lqr_rand_schedules`.
+
 ### 3. `tol` is an absolute ELBO change, and these models never reach it
 
 `converged = iter > 1 && abs(elbos[iter] - elbos[iter-1]) < tol`. On an
@@ -659,6 +826,12 @@ converged flag because a flag built on `tol` distinguishes nothing. A relative
 criterion (`|Δ| < tol * |elbo|`), or a stopping rule on the parameters rather
 than the bound, would make `fit!` say something useful about convergence.
 
+**Fixed, opt-in.** `fit!` on an `LDS`, a Poisson `LDS` and both inverse-LQR
+emissions takes `rtol` alongside `tol`, and stops once
+`|Δ| < max(tol, rtol · |ELBO|)`. The default `rtol = 0` keeps the absolute test,
+so no existing fit changes; pass something like `rtol = 1e-8` to have a large fit
+stop on the same terms as a small one. See `test_em_relative_tolerance`.
+
 ### 4. Nothing regularized an LQR state's `Σ` — now something does
 
 `LQRStateModel` accepted `P0_prior::IWPrior` and `x0_prior::MNPrior` but had no
@@ -669,7 +842,7 @@ state is a second free state and the fit collapses onto one regime.
 **This one is now implemented** rather than reported — `Σ_prior` and `Qc_prior`
 on `LQRStateModel`, acting in the profiled objective, its gradient, the noise
 M-step and the prior log-density. See "Priors do the job the initialization was
-doing silently" above for what they buy. The other three findings stand.
+doing silently" above for what they buy.
 
 The M-step tests now differentiate an independent reference objective with
 `ForwardDiff` for no, shared, combined, and per-epoch priors in both the profiled and
@@ -679,3 +852,145 @@ noise vary independently. That last check exposed and fixed an ELBO bug: the
 grouped path had counted both structural priors according to the noise groups,
 which under-counted varying `Qc` or over-counted shared `Qc`. The focused prior
 suite passes 61/61.
+
+### 5. A tied emission leaks into the costate columns on the pooled SLDS path
+
+In a switching model that ties `C` across a `:free` state and an inverse-LQR
+state with `observe_costate = false`, the plain fit let `C`'s costate columns
+become non-zero (≈ 0.28 on the diagonal after one M-step in
+`test_slds_lqr_grouped_free_state_pools`'s fixture), while the same fit through
+the grouped path — with a grouping that splits nothing — kept them at zero. The
+two ended 14 nats apart. A `:free` state defaults to `observe_costate = true`,
+so its statistics carried the costate columns into the pooled `C`; the grouped
+path happened to take its mask from the LQR state.
+
+**Fixed, by making the two modes read the same coordinates.** A `:free` state in
+a switching model now takes the inverse-LQR states' `observe_costate`
+(`_match_costate_readout!`, run at every entry point: `fit!`, the E-step
+helpers and `rand`). With `observe_costate = false` neither mode reads the
+costate half directly; the free state still feels it through its dynamics,
+which couple the two halves. Standalone, a `:free` state keeps reading
+everything. The partial-tie route also had its own leak: its full-width
+`CD_prior` could recreate costate coefficients from a non-zero `M₀`, so the
+prior is now masked to the free columns too (`_masked_mn_prior`). Every
+route — pooled, GLS and partial ties, Gaussian and Poisson, plain and grouped,
+either state order — now leaves the costate columns at exactly zero;
+`test_slds_lqr_tied_emission_mask` checks each.
+
+### 6. A tied regression's noise update read the other regimes' previous coefficients
+
+Found while checking #5, and not specific to LQR. A whole tie of `[C d D]`
+(or `[A b B]`) is fitted onto the tie's first regime and copied onto the rest
+at the end of the M-step. But `R` (or `Q`) is fitted in between, from each
+regime's residual scatter at *that regime's own* regression matrix, and every
+regime but the first still held the previous iterate's. So the noise update mixed
+the new shared `C` with stale copies of it, and the fit depended on which regime
+was listed first: `R` moved by 3e-3 and the fit ended 0.39 nats apart in the
+mixed LQR fixture, and every tied combination of a plain Gaussian `SLDS` differed
+between the two orders from the second iteration on.
+
+**Fixed.** `_grouped_update_C_d!` / `_grouped_update_A_b!` now copy the slot's
+fitted value onto the slot's other units before returning
+(`_share_slot_obs!` / `_share_slot_dyn!`). This is a no-op for the `depends_on`
+cells of one `LDS`, which alias one array. `test_SLDS_tied_params_order_invariant`
+fits `(:C, :d)`, `(:C, :d, :R)`, `(:A, :b)` and `(:A, :b, :Q)` in both orders and
+requires the same trace and parameters; before the fix all 36 of its checks fail.
+
+What is *not* order-invariant, and should not be expected to be: an inverse-LQR
+state's structural M-step is an L-BFGS solve along a nearly flat cost-scale
+direction, and its stopping point moves the ELBO by ~1e-3 nats under a 1e-14
+relative change in the data — the same amount the regime order moves it. That
+is the optimizer, not the model; see item 3 of "Concerns raised after M0".
+
+### 7. A multi-trial `rand` depended on the thread layout
+
+The `LDS` sampler split `rng` into `min(ntrials, Threads.maxthreadid())`
+`MersenneTwister` children, one per chunk of trials, so the same seed gave
+different data on different thread counts. Julia 1.12+ starts one interactive
+thread by default, which put `maxthreadid()` at 2 on 1.13 and 1 on 1.10 in the
+same CI configuration. `MersenneTwister`'s integer seeding also changed between
+those versions.
+
+**Fixed.** Each trial now draws from a `Xoshiro` of its own, seeded with the
+trial's `UInt64` off `rng`, drawn in trial order before anything is sampled.
+A trial's data depend on `rng` and its index alone: the same at `maxthreadid()`
+1, 2 and 8, and the same on 1.10 and 1.13 (`Xoshiro`'s seeded stream agrees
+across them) to the last bit of the BLAS. `test_multitrial_rand_is_per_trial`
+pins trial `i` to the single-trial draw from its seed. The `SLDS` and LQR
+samplers draw serially from `rng` and were never affected. This changes the
+data every multi-trial `rand` call produces for a given seed.
+
+## Concerns raised after M0
+
+Found while fixing #5–#7. Each is marked with where it stands.
+
+1. **Fixed: the switching ELBO counted a shared parameter's prior once per
+   regime.** The M-step fits a tied group, and the always-shared initial state,
+   as one value under one prior, but `_slds_prior_logdensity` summed every
+   regime's. With a tie and a prior the trace was therefore off by
+   `(K − 1) · log p(θ_tied)`, which moves as the shared value moves. The prior
+   is now counted once per distinct version: the grouped model's per-version
+   terms, with the regimes as units and each group's versions formed as the
+   M-step forms them. An LQR state's `Σ` (`:noise`) and `Qc` (`:structure`,
+   `:Qc`) are counted once across the states sharing them. `smooth` and `elbo`
+   take `tied_params`, so a tied fit's objective can be re-evaluated. Two
+   identical regimes with everything tied now score exactly as the single
+   model does (`test_SLDS_tied_prior_counted_once`,
+   `test_slds_lqr_tied_prior_counted_once`).
+
+2. **Fixed: under terminal conditioning, the chain ignored `log Ẑ`.** The
+   M-step ran plain Baum–Welch, and on the conditioned switching fixture that
+   lowered the conditioned score at most iterations and drove states toward
+   absorbing (`A = I` in one fit). A fixed-probe surrogate is no help: it is
+   `Σ (N − Ξ) log A`, unbounded wherever the probe expects more `i → j`
+   transitions than the data. The chain step (`_slqr_chain_mstep!`) now works
+   on the score itself, `g = Σ N log A + Σ n log π − log Ẑ`, with `q` held
+   fixed. It keeps Baum–Welch if that raises `g`; otherwise it takes an Armijo
+   step in the row logits along `∇g`, using Danskin's
+   `∂ log Ẑ / ∂A = Ξ / A` as the state M-step does; failing both, the chain
+   stays put. Across six fits the final deterministic ELBO is 2.2 nats better
+   on average, and no chain absorbs (`test_slds_lqr_terminal_chain_step`).
+
+3. **Documented, not changed: the LQR structural M-step is sensitive to its
+   inputs.** On a single inverse-LQR LDS (deterministic E-step), a `1 + 1e-14`
+   rescaling of the data moves the fit as follows after five EM iterations:
+
+   | `mstep_iters` | ΔELBO | `S` (rel.) | `Qc` (rel.) | closed loop (rel.) |
+   |---|---|---|---|---|
+   | 20 | 1e-10 | 1e-10 | 7e-11 | — |
+   | 100 (default) | 9e-4 | 2.5e-2 | 8e-3 | 2.3e-5 |
+   | 500 | 6e-7 | 0.97 | 1e-4 | 1.7e-7 |
+
+   The 100-iteration solve stops partway along a slow valley, and its stopping
+   point amplifies last-bit differences. Converged, the ELBO and the closed
+   loop `(I + S P)⁻¹ A` are reproducible, but `S` moves by 97%: it drifts
+   along the exact cost-scale gauge, which the data do not see. A larger
+   budget did not reliably end at a better ELBO either (the ordering flips
+   between 5 and 40 EM iterations), so the default stands. For reproducible
+   numbers, compare gauge invariants (recommendation 3 above), or fix the
+   scale with a `Qc_prior` (recommendation 2); raise `mstep_iters` when the
+   ELBO itself must reproduce. A tr S gauge was considered and not taken.
+
+4. **Fixed: `validate_SLDS` was never called on the fitting path.** `fit!`,
+   `smooth`, `elbo` and `rand` now run its switching-level checks — a proper
+   chain, regimes that agree on their dimensions, the state-model rules — at
+   entry (`test_SLDS_entry_points_validate`). Per-regime `validate_LDS`, which
+   the positional constructor already runs, is not repeated: it rejects the
+   six-entry `fit_bool` some Poisson models are built with, which fitting has
+   always accepted.
+
+5. **Fixed: diagnostic warnings on every free-state M-step.** They are
+   `@debug` now, and their `cond` / `eigvals` are evaluated only when debug
+   logging is on.
+
+6. **Fixed: Poisson trial sums associated by thread count.** The emission
+   M-step, its gradient, the observation Q-term and the multi-trial joint
+   log-likelihood now chunk by trial count alone (`src/numerics/reduction.jl`),
+   and reduce in chunk order in waves of however many buffers the caller has.
+   Before, all three differed across pool sizes and `ntasks` of 1, 3 and 7;
+   now they give identical bits (`test_poisson_reductions_layout_independent`).
+
+Also fixed along the way: the documentation build, red on every run of the PR
+and identical on `dev_reach`. Stale method signatures on the API page, 26
+exported docstrings missing, and references to undocumented internals meant a
+strict `makedocs` failed; it now passes.

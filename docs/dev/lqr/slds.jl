@@ -301,6 +301,10 @@ and a transition matrix started at a generic stickiness rather than the truth's.
 `πₖ` starts uniform even where the truth is degenerate. A prior pinned at the
 answer would hand the fit the first timestep of every trial for free, which on a
 delay-then-reach design is most of what identifies the onset.
+
+Both state models freeze `h` whenever the reference input is present. Its
+one-hot columns already span the intercept, so leaving `h` free would fit a
+rank-deficient parameterization without adding a model the data can distinguish.
 """
 function fit_slds(
     truth::SldsTruth;
@@ -347,7 +351,8 @@ function fit_slds(
     )
     lqr_sm.Qc_prior = qc_prior(n; scale=qc_prior_scale, strength=qc_prior_strength)
     lqr_sm.fit_flags = LQRFitFlags(;
-        A=(!known_plant), S=(!known_plant), Gref=free_gref, Bu=false
+        A=(!known_plant), S=(!known_plant), Gref=free_gref,
+        h=(truth.nref == 0), Bu=false,
     )
     refresh!(lqr_sm)
 
@@ -358,7 +363,7 @@ function fit_slds(
         P0=Matrix(0.2I, d, d),
         Bu=truth.nref > 0 ? zeros(d, truth.nref) : nothing,
         observe_costate=truth.lqr_sm.observe_costate,
-        fit_flags=LQRFitFlags(; Bu=false),
+        fit_flags=LQRFitFlags(; h=(truth.nref == 0), Bu=false),
     )
     obs_dim = size(truth.C, 1)
     function mk(sm)

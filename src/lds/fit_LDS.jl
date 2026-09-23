@@ -281,9 +281,10 @@ end
 """
     smooth!(lds, tfs, data::Data, sws_pool)
 
-Low-allocation multi-trial smoothing. Trials are partitioned into chunks and
-run in parallel via OhMyThreads' `tforeach`; each chunk owns one workspace from
-`sws_pool`, indexed by chunk position rather than `threadid()` (see
+Low-allocation multi-trial smoothing. Trials are grouped by length, partitioned
+into chunks, and run in parallel via OhMyThreads' `tforeach`; each chunk owns
+one workspace from `sws_pool`, indexed by chunk position rather than
+`threadid()` (see
 https://julialang.org/blog/2023/07/PSA-dont-use-threadid/).
 
 # Arguments
@@ -374,20 +375,59 @@ function smooth!(
         return tfs
     end
 
-    # Variable-length fallback: per-trial smoothing (each trial gets its own
-    # Hessian, cov, and mean pass on the assigned worker workspace).
-    ntasks = min(ntrials, length(sws_pool))
+    # The precision is also shared by trials of the same length in a ragged
+    # dataset. Reuse its factorization and covariance within each length bucket
+    # instead of recomputing them for every trial. The covariance arrays must be
+    # copied once per bucket: the source workspace is reused for the next length.
+    by_length = Dict{Int,Vector{Int}}()
+    for (trial, tsteps) in enumerate(data.tsteps)
+        push!(get!(by_length, tsteps, Int[]), trial)
+    end
+    bucket_sws = sws_pool[1]
+    for tsteps in unique(data.tsteps)
+        trials = by_length[tsteps]
+        if length(trials) == 1
+            single_trial = only(trials)
+            smooth!(
+                lds,
+                tfs[single_trial],
+                _trial(y, single_trial),
+                bucket_sws,
+                ux[single_trial],
+                _trial(uy, single_trial),
+            )
+            continue
+        end
+        shared_entropy = _precompute_shared_cov!(bucket_sws, lds, tsteps)
+        shared_p = copy(view(bucket_sws.agg.p_smooth_shared, :, :, 1:tsteps))
+        shared_p_tt1 = copy(view(bucket_sws.agg.p_smooth_tt1_shared, :, :, 1:tsteps))
+        for trial in trials
+            tfs[trial].p_smooth = shared_p
+            tfs[trial].p_smooth_tt1 = shared_p_tt1
+            tfs[trial].entropy = shared_entropy
+        end
+        ntasks = min(length(trials), length(sws_pool))
+        let chunksize = cld(length(trials), ntasks),
+            trials = trials,
+            bucket_sws = bucket_sws
 
-    let chunksize = cld(ntrials, ntasks)
-        tforeach(1:ntasks) do i
-            lo = (i - 1) * chunksize + 1
-            hi = min(i * chunksize, ntrials)
-            lo > hi && return nothing
-            sws = sws_pool[i]
-            for trial in lo:hi
-                smooth!(
-                    lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial)
-                )
+            tforeach(1:ntasks) do i
+                lo = (i - 1) * chunksize + 1
+                hi = min(i * chunksize, length(trials))
+                lo > hi && return nothing
+                sws = sws_pool[i]
+                for j in lo:hi
+                    local trial = trials[j]
+                    _smooth_mean_only!(
+                        lds,
+                        tfs[trial],
+                        _trial(y, trial),
+                        sws,
+                        ux[trial],
+                        _trial(uy, trial),
+                        bucket_sws,
+                    )
+                end
             end
         end
     end
@@ -829,7 +869,13 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
 # Keywords
 - `max_iter::Int=100`: maximum EM iterations
-- `tol::Float64=1e-6`: convergence tolerance on ELBO change
+- `tol::Float64=1e-6`: convergence tolerance on the ELBO change between
+  iterations, absolute (in nats)
+- `rtol::Float64=0.0`: the same, relative to the ELBO's magnitude. The fit stops
+  once the change is below `max(tol, rtol * |ELBO|)`, so the default of zero is
+  the absolute test alone. The bound grows with the number of trials and
+  timesteps, and an absolute `tol` asks a large fit for more significant
+  figures than a small one; `rtol = 1e-8` or so asks every fit for the same.
 - `progress::Bool=true`: show progress bar
 - `spline_iters::Int=25`: L-BFGS iterations per warp conditional-maximization
   step. Read only when the emission contains a
@@ -869,13 +915,14 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   `(newton_max_iter=10,)` for a Poisson emission.
 
 Returns a `Vector{T}` of ELBO values, one per iteration — or a
-[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
+[`FitTrace`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
     ux=nothing,
@@ -916,6 +963,7 @@ function fit!(
             data;
             max_iter=max_iter,
             tol=tol,
+            rtol=rtol,
             progress=progress,
             spline_iters=spline_iters,
             monitor=monitor,
@@ -923,10 +971,17 @@ function fit!(
     end
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
-        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds,
+        data,
+        grp;
+        max_iter=max_iter,
+        tol=tol,
+        rtol=rtol,
+        progress=progress,
+        monitor=monitor,
     )
     return _fit_tridiag!(
-        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds, data; max_iter=max_iter, tol=tol, rtol=rtol, progress=progress, monitor=monitor
     )
 end
 
@@ -979,6 +1034,23 @@ function _grouped_estep_elbo_gaussian!(
 end
 
 """
+    _em_converged(elbos, iter, tol, rtol) -> Bool
+
+Whether an EM trace has converged at `iter`: its last change is below
+`max(tol, rtol * |elbos[iter]|)`.
+
+`tol` is absolute, and was the whole test before `rtol` existed; `rtol = 0` keeps
+exactly that test. The relative half is there because the bound is a sum over
+every trial and timestep: an absolute `1e-6` asks a fit whose ELBO is `-1e6` for
+twelve significant figures and one whose ELBO is `-10` for seven, while a
+relative tolerance asks both for the same.
+"""
+function _em_converged(elbos::AbstractVector{<:Real}, iter::Int, tol::Real, rtol::Real)
+    iter > 1 || return false
+    return abs(elbos[iter] - elbos[iter - 1]) < max(tol, rtol * abs(elbos[iter]))
+end
+
+"""
     _fit_tridiag_grouped!(lds, data, grp; max_iter, tol, progress)
 
 EM driver for a Gaussian LDS whose parameters depend on an ancillary variable.
@@ -992,6 +1064,7 @@ function _fit_tridiag_grouped!(
     grp::ParameterGrouping;
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
     align_final::Bool=false,
@@ -1023,7 +1096,7 @@ function _fit_tridiag_grouped!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1059,6 +1132,7 @@ function _fit_tridiag!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
     align_final::Bool=false,
@@ -1134,7 +1208,7 @@ function _fit_tridiag!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)

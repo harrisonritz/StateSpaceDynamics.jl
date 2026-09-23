@@ -210,6 +210,11 @@ Optional input sequences:
   models' stored `depends_on` for this call. When the model declares ancillary
   parameter dependencies, each trial is sampled from its own group's parameters
   — which is how you generate a synthetic multi-session dataset.
+
+The multi-trial form samples its trials in parallel, each from a generator of
+its own seeded off `rng` in trial order, so the draw depends on `rng` alone and
+not on the number of threads. A one-element `tsteps_per_trial` draws from `rng`
+directly, as the scalar form does.
 """
 function Random.rand(
     rng::AbstractRNG,
@@ -311,9 +316,6 @@ function Random.rand(
     =#
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps_per_trial, T, lds.obs_model)
 
-    # `MersenneTwister` (and most RNG types) is not thread-safe, so sharing
-    # `rng` across parallel iterations races on internal state; each chunk
-    # gets its own child RNG, indexed by chunk (not `threadid()`).
     if ntrials == 1
         _sample_trial!(
             rng,
@@ -328,27 +330,27 @@ function Random.rand(
         return x, y
     end
 
-    ntasks = min(ntrials, Threads.maxthreadid())
-    chunksize = cld(ntrials, ntasks)
-    task_rngs = [MersenneTwister(rand(rng, UInt64)) for _ in 1:ntasks]
-
-    tforeach(1:ntasks) do i
-        lo = (i - 1) * chunksize + 1
-        hi = min(i * chunksize, ntrials)
-        lo > hi && return nothing
-        trng = task_rngs[i]
-        for trial in lo:hi
-            _sample_trial!(
-                trng,
-                x[trial],
-                y[trial],
-                state_params[trial],
-                obs_params[trial],
-                lds.obs_model,
-                ux_seq[trial],
-                _trial(uy_seq, trial),
-            )
-        end
+    #=
+    The trials run in parallel, and a generator is not thread-safe, so each
+    trial draws from one of its own. Its seed is taken off `rng` in trial order
+    before anything is sampled, so what a trial gets depends on `rng` and its
+    index alone — not on the thread count, the chunking, or which task ran it.
+    `Xoshiro` because its stream from an integer seed has not changed across
+    the Julia versions this package supports, where `MersenneTwister`'s has: a
+    version-stable `rng` then gives the same data everywhere.
+    =#
+    seeds = [rand(rng, UInt64) for _ in 1:ntrials]
+    tforeach(1:ntrials) do trial
+        _sample_trial!(
+            Random.Xoshiro(seeds[trial]),
+            x[trial],
+            y[trial],
+            state_params[trial],
+            obs_params[trial],
+            lds.obs_model,
+            ux_seq[trial],
+            _trial(uy_seq, trial),
+        )
     end
 
     return x, y

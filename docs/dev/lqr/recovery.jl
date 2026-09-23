@@ -76,12 +76,17 @@ does not.
 Why a cold start matters: EM has no reason to move a parameter it starts at the
 optimum of, so a warm-started block's recovery column would report the
 initialization. Everything the sweeps score is started away from the truth.
+
+When `Gref` has columns, `free_h` defaults to `false`: the reference inputs are
+one-hot and their sum is an intercept, so fitting `h` would reintroduce the
+common-origin gauge that the recovery exercise is meant to diagnose rather
+than exploit. Pass `free_h=true` only for an explicit confounding control.
 """
 function fit_model(
     truth::LqrTruth;
     known_plant::Bool,
     free_gref::Bool,
-    free_h::Bool=true,
+    free_h::Bool=(size(truth.sm.Gref, 2) == 0),
     init::Symbol=:cold,
     jitter::Float64=0.0,
     q0::Float64=0.4,
@@ -110,12 +115,12 @@ function fit_model(
         sm.h .= 0
         if free_gref && size(sm.Gref, 2) > 0
             #=
-            An *uninformative* wrong reference, not an adversarial one: the
-            truth's own construction at a third the radius and a quarter-turn of
-            phase. Starting at `-c · Gref_true` would seed the fit on the far
-            side of the sign flip the costate scale already admits, and a
-            correlation of `-1` in the table would then be reporting the
-            initialization rather than a failure of identification.
+            A structured wrong reference: one-third radius, quarter-turn phase.
+            For the cosine-family truth with four targets this is exactly
+            truth.Gref[:, [2,3,4,1]] / 3. A fit that barely moves therefore looks
+            column-permuted. Target labels are observed; that permutation is
+            an initialization error, not an allowed symmetry. The reference
+            audit compares initial/final maps and probes the marginal likelihood.
             =#
             m = size(sm.Gref, 2)
             for j in 1:m, i in 1:n
@@ -203,7 +208,9 @@ suboptimality. `process_noise` applies to `:lqr` only. `terminal`, `onset`,
 `ntrials` shape the truth; see `lqr_truth`.
 
 # Fitting knobs
-`known_plant`, `free_gref` say which blocks EM may move. `max_iter`, `tol`,
+`known_plant`, `free_gref` say which blocks EM may move. `free_h` defaults to
+false when `nref > 0`, fixing the one-hot reference/intercept degeneracy.
+`max_iter`, `tol`,
 `mstep_iters`, `init` and `restarts` are the *procedure* — the axis the
 "what helps" sweep varies while holding the generative model fixed. With
 `restarts > 1` the fit is run that many times from independently jittered
@@ -225,7 +232,7 @@ function recover(;
     observe_costate::Bool=false,
     known_plant::Bool=true,
     free_gref::Bool=(nref > 0),
-    free_h::Bool=true,
+    free_h::Bool=(nref == 0),
     obs_noise::Float64=0.05,
     max_iter::Int=250,
     tol::Float64=1e-10,
@@ -313,6 +320,7 @@ function recover(;
             rng=MersenneTwister(1000seed + r),
         )
         sm.mstep_iters = mstep_iters
+        initial_gref = copy(sm.Gref)
         lds, elbos = one_fit(
             truth,
             ys_fit,
@@ -324,7 +332,7 @@ function recover(;
             fit_noise=fit_noise,
         )
         if best === nothing || elbos[end] > best.elbos[end]
-            best = (sm=sm, lds=lds, elbos=elbos)
+            best = (sm=sm, lds=lds, elbos=elbos, initial_gref=initial_gref)
         end
     end
     elbos = best.elbos
@@ -336,13 +344,14 @@ function recover(;
     landed.
 
     The two starts are good at different things and the ladder above shows it.
-    A loose costate innovation keeps `λ` a quantity the model has to *explain*,
-    which is what identifies the reference — the reference enters only through
-    the costate half of the affine term, so if `Σ_λλ → 0` the smoother can
-    satisfy the costate recursion exactly for any `G_r` and there is nothing left
-    to pin it. A tight one is what identifies the cost's shape, by removing the
-    `n` free directions of slack the cost would otherwise drift along. Doing them
-    in that order asks whether the second pass can keep what the first found.
+    A tight costate innovation can make EM's Gref updates very slow: the E-step
+    reconstructs costates under the current reference, and the complete-data
+    objective strongly penalizes changing that reference while holding those
+    costates fixed. This does not make the marginal likelihood flat: integrating
+    out costates still leaves information through the observed state dynamics.
+    A loose start can accelerate reference learning, but also changes the joint
+    optimization path for costs/noise. Doing these passes in order asks whether
+    the tight pass can retain what the loose pass found.
     =#
     if anneal_costate !== nothing
         sm2 = fit_sm
@@ -399,9 +408,20 @@ function recover(;
         fit_sm, ref, truth.idx, fit_lds.obs_model.C, truth.C;
         known_plant=known_plant, free_gref=free_gref, free_noise=fit_noise,
     )
+    reference_design = reference_design_audit(uxs)
+    audit_ref = deepcopy(ref)
+    audit_ref.fit_flags = fit_sm.fit_flags
+    reference_translation = reference_translation_audit(audit_ref, reference_design)
     return (
         scores=gauge.raw,
         gauge=gauge,
+        reference_design=reference_design,
+        reference_translation=reference_translation,
+        reference_initial=(free_gref && size(ref.Gref, 2) > 0) ?
+            score(best.initial_gref, ref.Gref) : NOSCORE,
+        reference_movement=(free_gref && size(ref.Gref, 2) > 0) ?
+            reference_movement(fit_sm.Gref, best.initial_gref, ref.Gref) :
+            (raw=NaN, contrasts=NaN),
         elbo=elbos[end],
         truth_elbo=truth_elbo,
         heldout=heldout,
@@ -533,9 +553,56 @@ function selftest(; verbose::Bool=true)
         keys(linear_gauge.linear),
     )
 
+    # A fixed emission removes the state-coordinate gauge, but one-hot target
+    # codes leave a separate reference-origin gauge.  With one active running
+    # cost, shifting every target by `delta` and the costate intercept by
+    # `Q*delta` leaves the transition exactly unchanged.  Centred references
+    # and pairwise distances must recognize that equivalence, and freezing `h`
+    # must remove all n translation directions.
+    origin_truth = lqr_truth(; n=3, tsteps=12, nref=4)
+    origin_fit = fit_model(
+        origin_truth; known_plant=true, free_gref=true, free_h=true, init=:warm
+    )
+    origin_ux = target_inputs(MersenneTwister(992), 4, 8, 12)
+    origin_design = reference_design_audit(origin_ux)
+    origin_free = reference_translation_audit(origin_fit, origin_design)
+    origin_default_fit = fit_model(
+        origin_truth; known_plant=true, free_gref=true, init=:warm
+    )
+    origin_default = reference_translation_audit(origin_default_fit, origin_design)
+    delta = [0.4, -0.2, 0.3]
+    translated = deepcopy(origin_truth.sm)
+    translated.Gref .+= delta
+    translated.h[4:6] .+= translated.Qc[1] * delta
+    refresh!(translated)
+    origin_geometry = reference_geometry(translated.Gref, origin_truth.sm.Gref)
+    fixed_h = deepcopy(origin_fit)
+    fixed_h.fit_flags = LQRFitFlags(; A=false, S=false, Qc=true, h=false,
+        Bu=false, Gref=true, terminal=false)
+    origin_fixed = reference_translation_audit(fixed_h, origin_design)
+    terminal_truth = lqr_truth(; n=3, tsteps=12, nref=4, terminal=true)
+    terminal_fit = fit_model(
+        terminal_truth; known_plant=true, free_gref=true, free_h=true, init=:warm
+    )
+    origin_terminal = reference_translation_audit(terminal_fit, origin_design)
+    multiregime_truth = lqr_truth(; n=3, tsteps=12, nref=4, onset=5)
+    multiregime_fit = fit_model(
+        multiregime_truth; known_plant=true, free_gref=true, free_h=true, init=:warm
+    )
+    origin_multiregime = reference_translation_audit(multiregime_fit, origin_design)
+    origin_ok = origin_design.affine_nullity == 1 && origin_free.nullity == 3 &&
+                !origin_default_fit.fit_flags.h && origin_default.nullity == 0 &&
+                origin_fixed.nullity == 0 && origin_terminal.nullity == 3 &&
+                origin_multiregime.nullity == 0 && origin_geometry.raw.rmse > 0.1 &&
+                origin_geometry.contrasts.rmse <= 1e-12 &&
+                origin_geometry.distances.rmse <= 1e-12 &&
+                all(j -> translated.cache.bfwd + translated.cache.Bfwd[1][:, j] ≈
+                         origin_truth.sm.cache.bfwd + origin_truth.sm.cache.Bfwd[1][:, j],
+                    axes(translated.Gref, 2))
+
     ok = worst_id <= 1e-10 && worst_inv <= 1e-8 &&
          gauge.raw.Gref.rmse > 0.1 && worst_gauge <= 1e-8 &&
-         linear_gauge.procrustes.Gref.rmse > 0.1 && worst_linear <= 1e-8
+         linear_gauge.procrustes.Gref.rmse > 0.1 && worst_linear <= 1e-8 && origin_ok
     if verbose
         @printf("selftest  identity: worst block rmse %.3g  (want 0)\n", worst_id)
         @printf("selftest  rescale invariance: worst block rmse %.3g  (want ~1e-16)\n",
@@ -544,6 +611,10 @@ function selftest(; verbose::Bool=true)
                 worst_gauge)
         @printf("selftest  linear gauge: worst block rmse %.3g  (want ~1e-16)\n",
                 worst_linear)
+        @printf("selftest  reference origin: design %d, default/free/fixed/terminal/multiregime %d/%d/%d/%d/%d  (want 1, 0/3/0/3/0)\n",
+                origin_design.affine_nullity, origin_default.nullity,
+                origin_free.nullity, origin_fixed.nullity, origin_terminal.nullity,
+                origin_multiregime.nullity)
         println("selftest  ", ok ? "PASS" : "FAIL")
     end
     return ok

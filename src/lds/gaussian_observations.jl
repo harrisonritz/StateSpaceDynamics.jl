@@ -304,7 +304,7 @@ end
 
 `log p(θ)` for this model's emission parameters at their current values: the
 Inverse-Wishart term for `R` and the matrix-normal term for the stacked
-`[C d D]` (paired with `R`). See [`_state_prior_logdensity`](@ref) for why the
+`[C d D]` (paired with `R`). See `_state_prior_logdensity` for why the
 MN term belongs in the ELBO rather than only in the M-step.
 
 Called once per observation model, so a composite emission sums it over its

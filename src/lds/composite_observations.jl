@@ -1315,7 +1315,7 @@ end
 
 Marginal (observed-data) log-likelihood of an all-Gaussian composite emission,
 with the latent states integrated out. Equal to the value the equivalent stacked
-single-emission model gives (see [`_stacked_gaussian_lds`](@ref)), which is what
+single-emission model gives (see `_stacked_gaussian_lds`), which is what
 it is computed from.
 
 A composite containing a non-Gaussian member has no tractable marginal, exactly

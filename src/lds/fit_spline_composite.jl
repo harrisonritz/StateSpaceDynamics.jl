@@ -266,6 +266,7 @@ function _fit_spline_composite!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
     monitor=nothing,
@@ -329,7 +330,7 @@ function _fit_spline_composite!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
 
         _spline_composite_mstep!(
             lds, glds, suf, sws_pool, tfs, sdata, sites; spline_iters=spline_iters
@@ -435,6 +436,7 @@ function _fit_spline_laplace!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
@@ -493,7 +495,7 @@ function _fit_spline_laplace!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
 
         _spline_composite_mstep!(
             lds, glds, suf, sws_pool, tfs, sdata, sites; spline_iters=spline_iters

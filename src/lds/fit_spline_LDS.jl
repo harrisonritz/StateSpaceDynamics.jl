@@ -187,7 +187,7 @@ function StatsAPI.loglikelihood(
 end
 
 """
-    fit!(lds, y; max_iter=100, tol=1e-6, spline_iters=25, ...)
+    fit!(lds, y; max_iter=100, tol=1e-6, rtol=0.0, spline_iters=25, ...)
 
 Fit a spline-Gaussian Linear Dynamical System by Expectation Conditional
 Maximization.
@@ -215,8 +215,8 @@ non-decreasing.
   `Vector{<:AbstractMatrix}` of per-trial matrices (ragged lengths allowed).
 
 # Keywords
-- `max_iter::Int=100`, `tol::Float64=1e-6`, `progress::Bool=true`: as for the
-  Gaussian [`fit!`](@ref).
+- `max_iter::Int=100`, `tol::Float64=1e-6`, `rtol::Float64=0.0`,
+  `progress::Bool=true`: as for the Gaussian [`fit!`](@ref).
 - `spline_iters::Int=25`: L-BFGS iterations per warp CM-step. A partial
   maximization is still a valid generalized-EM step, so a small budget is safe;
   raise it if the warp is visibly still moving at convergence. `0` freezes the
@@ -228,7 +228,7 @@ non-decreasing.
   the observation scale, so they are comparable with a plain Gaussian LDS fit to
   the same data.
 
-Returns a `Vector{T}` of ELBO values — or a [`FitTrace{T}`](@ref) when `y_test`
+Returns a `Vector{T}` of ELBO values — or a [`FitTrace`](@ref) when `y_test`
 is given, which behaves as that same vector.
 
 # Note
@@ -240,6 +240,7 @@ function fit!(
     y::Observations{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
     ux=nothing,
@@ -280,6 +281,7 @@ function fit!(
         data;
         max_iter=max_iter,
         tol=tol,
+        rtol=rtol,
         progress=progress,
         spline_iters=spline_iters,
         monitor=monitor,
@@ -287,7 +289,7 @@ function fit!(
 end
 
 """
-    _fit_spline!(lds, data; max_iter, tol, progress, spline_iters, monitor)
+    _fit_spline!(lds, data; max_iter, tol, rtol, progress, spline_iters, monitor)
 
 ECM loop for a spline-Gaussian emission. Structurally `_fit_tridiag!` with the
 embedding refresh at the top of each E-step and the warp CM-step at the foot of
@@ -298,6 +300,7 @@ function _fit_spline!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
     monitor=nothing,
@@ -377,7 +380,7 @@ function _fit_spline!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
 
         # CM-step 1: state parameters and the linear half of the emission.
         _spline_linear_mstep!(lds, glds, suf, sws_pool[1])

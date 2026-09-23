@@ -18,7 +18,6 @@ GaussianStateModel
 GaussianObservationModel
 PoissonObservationModel
 SplineGaussianObservationModel
-CompositeObservationModel
 ```
 
 ## Monotonic splines
@@ -43,6 +42,7 @@ copy_warp!
 ```
 
 ```@docs
+CompositeObservationModel
 ProbabilisticPCA
 AbstractStateModel
 AbstractGaussianStateModel
@@ -111,6 +111,7 @@ x0_mean_prior
 ```@docs
 group_labels
 group_parameter
+group_variant
 set_group_seeds!
 set_depends_on!
 ```
@@ -118,11 +119,12 @@ set_depends_on!
 ## Sampling
 
 ```@docs; canonical = false
-Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
 Random.rand(rng::AbstractRNG, slds::SLDS{T,S,O}, tsteps::Integer) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
 ```
 
 ```@docs
+Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
 Random.rand(rng::AbstractRNG, ppca::ProbabilisticPCA, n::Int)
 ```
 
@@ -136,7 +138,10 @@ fit!(slds::SLDS{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}; max_iter
 
 ```@docs
 fit!(plds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:StateSpaceDynamics.NonQuadraticEmission{T}}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}) where {T<:Real,S<:LQRStateModel{T},O<:StateSpaceDynamics.QuadraticEmission{T}}
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}) where {T<:Real,S<:LQRStateModel{T},O<:StateSpaceDynamics.NonQuadraticEmission{T}}
 fit!(ppca::ProbabilisticPCA, X::AbstractMatrix{T}, max_iters::Int=100, tol::Float64=1e-6) where {T<:Real}
+FitTrace
 ```
 
 ## Likelihoods and ELBO
@@ -146,13 +151,15 @@ variants are the workspace-based internals it wraps.
 
 ```@docs
 elbo
+trial_elbos
+terminal_logz
 loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
-loglikelihood(plds::LinearDynamicalSystem{T,S,O}, y) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
+loglikelihood(plds::LinearDynamicalSystem{T,S,O}, y) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
+loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::NamedTuple) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
+loglikelihood(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
 loglikelihood(slds::SLDS, y)
 loglikelihood(ppca::ProbabilisticPCA, X::AbstractMatrix{T}) where {T<:Real}
-elbo!(lds::LinearDynamicalSystem{T,S,O}, suf::StateSpaceDynamics.SufficientStatistics{T}, sws::StateSpaceDynamics.SmoothWorkspace{T}, total_entropy::T) where {T<:Real,S<:GaussianStateModel{T},O<:GaussianObservationModel{T}}
-elbo!(plds::LinearDynamicalSystem{T,S,O}, suf::StateSpaceDynamics.SufficientStatistics{T}, tfs::StateSpaceDynamics.TrialFilterSmooth{T}, data::StateSpaceDynamics.Data{T}, sws_pool::Vector{StateSpaceDynamics.SmoothWorkspace{T}}) where {T<:Real,S<:GaussianStateModel{T},O<:PoissonObservationModel{T}}
-elbo!(slds::SLDS{T,S,O}, tfs::StateSpaceDynamics.TrialFilterSmooth{T}, fb_storage::StateSpaceDynamics.HMMs.ForwardBackwardStorage, y::AbstractVector{<:AbstractMatrix{T}}, slds_ws::StateSpaceDynamics.SLDSSmoothWorkspace{T}) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
+elbo!
 ```
 
 ## Model comparison

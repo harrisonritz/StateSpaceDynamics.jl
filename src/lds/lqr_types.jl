@@ -347,13 +347,25 @@ The model is stochastic in the **mixed** coordinates,
   + h + B_u u_t + \\varepsilon_t, \\qquad \\varepsilon_t \\sim N(0, \\Sigma),
 ```
 
-so `Σ`'s leading block is genuine plant process noise and its trailing block is
-*costate slack* — how far from exactly optimal the behavior is. The equivalent
-forward noise is `G Σ Gᵀ` with `G = [I  S A⁻ᵀ; 0  −A⁻ᵀ]`, and since `G` is
-invertible **the costate must carry process noise**: a singular `Σ` makes the
-forward process-noise covariance singular and the smoother's precision
-undefined. A free `Σ` spans exactly the same model class as a free forward
-covariance, so nothing is lost by parameterizing it here.
+so `Σ`'s leading block is plant process noise and its trailing block is the
+costate's own innovation. The equivalent forward noise is `G Σ Gᵀ` with
+`G = [I  S A⁻ᵀ; 0  −A⁻ᵀ]`, and since `G` is invertible **the costate must carry
+process noise**: a singular `Σ` makes the forward process-noise covariance
+singular and the smoother's precision undefined. A free `Σ` spans exactly the
+same model class as a free forward covariance, so nothing is lost by
+parameterizing it here.
+
+**The costate block does not measure suboptimality.** An exactly optimal agent
+under plant noise re-plans after every disturbance, so its costate innovation is
+not zero but a fixed image of the plant noise,
+`ε^λ_t = −Aᵀ P_{t+1} (I + S P_{t+1})⁻¹ ε^x_t` (the lower block of the formula
+under *Identifiability*). `Σ_λλ` therefore grows with the plant noise whether or
+not the agent is optimal: in the measurements behind
+`docs/dev/lqr/biological.md`, adding substantial suboptimality to an optimal
+agent changed the adjoint residual by 0.3% while the residual from the Riccati
+graph `λ_t = P_t x_t + g_t` went from exactly 0 to about 1. Suboptimality is a
+departure from that graph — what `simulate_lqr`'s `costate_slack` generates —
+and this model has no parameter that isolates it.
 
 ## Time-varying cost
 
@@ -397,6 +409,17 @@ selection: freeze it at `I` with `LQRFitFlags(; Gref = false)`. Pass task
 regressors instead (a target identity, say) and `G_r` is estimated, mapping them
 to the reference the agent was actually steering toward.
 
+If those regressors have a constant sum — one-hot target indicators are the
+standard case — the reference origin needs its own constraint. With one active
+running cost and fitted affine drift, for example,
+`G_r → G_r + δ1ᵀ` and `h_λ → h_λ + Qδ` leave the model unchanged. Multiple
+targets identify their contrasts, not this common translation. When an
+absolute reference origin is required, freeze `h` (`LQRFitFlags(; h = false)`),
+supply genuinely different active running costs that share one `h`, or impose
+the origin yourself — for instance by reporting only the centred columns of
+`G_r`, since no fit flag constrains them to sum to zero. A terminal factor does
+not fix the origin when its offset `h_f` is also fitted.
+
 With `K = 1` and no terminal factor, `B_u`'s costate rows and `-Q_1 G_r` both map
 the input into the costate and are not separately identified; freeze one. Several
 cost regimes, or a terminal factor, separate them.
@@ -406,11 +429,7 @@ cost regimes, or a terminal factor, separate them.
 
 When `terminal` is set, `λ_T = Q_{k_T} x_T` enters as a **soft pseudo-observation**
 — `0 = λ_T − Q_{k_T} x_T − h_f + ε_f`, `ε_f ~ N(0, Σ_f)`, with `Σ_f → 0` the hard
-boundary condition. It is a factor of the emission, not of the chain: the model
-is the proper joint `p(z) p(y | z) p(y^{term} | z_T)`, `elbo` and `loglikelihood`
-report `log p(y, y^{term} = 0)`, and no extra normalizer is involved.
-
-Two consequences are worth stating plainly.
+boundary condition.
 
 *It is what makes the model well-behaved.* A symplectic matrix has reciprocal
 eigenvalue pairs, so the forward transition is unstable by construction and the
@@ -419,15 +438,52 @@ removes exactly the unstable directions — that is what a boundary condition do
 to a two-point boundary value problem — so the posterior, and `rand`'s
 terminal-conditioned draw, stay bounded.
 
-*It is a conditioning event, so recovery from `rand` output is biased.* `rand`
-draws `p(z, y | y^{term} = 0)`, which is what trials actually look like, while the
-fitted objective is `p(y, y^{term} = 0)`; the two differ by `p(y^{term} = 0 | θ)`,
-which depends on the parameters. Maximizing the latter on data drawn from the
-former is therefore a selection effect, not an unbiased estimator, and a
-self-consistency recovery check will not land on the generating parameters. When
-that matters, encode the terminal cost as the last *regime of the transition
-schedule* instead (`terminal = false`, and give the final transitions their own
-`Qc`): that model is a proper directed chain and recovers its own parameters.
+*It is a conditioning event, and `condition_terminal` decides whether the score
+treats it as one.* The pseudo-observation defines the joint
+`p(z) p(y | z) p(y^{term} | z_T)`, but trials under this model are drawn
+**given** `y^{term} = 0` — which is what `rand` produces. This conditions on the
+costate boundary relation at the observed final timestep; it does not constrain
+`x_T` to equal the target. The two scores differ by `p(y^{term} = 0 | θ)`, a
+function of the parameters.
+
+With `condition_terminal = true` (the default) `elbo` and `loglikelihood` report
+
+```math
+\\log p(y \\mid y^{term} = 0, θ)
+  = \\log p(y, y^{term} = 0 \\mid θ) - \\log p(y^{term} = 0 \\mid θ),
+```
+
+and the M-step optimizes the same quantity. The normalizer is computed exactly,
+by backward square-root Gaussian integration over the whole chain, so EM stays
+monotone on the conditional objective: `−Q(θ | θ′) + log Z(θ)` majorizes it and
+touches it at `θ′`.
+
+The subtraction is not cosmetic. Three things it fixes:
+
+- **Dimension.** A plant/costate pair the emission never reads still contributes
+  its own terminal log-density to the joint score, so a sweep over plant
+  dimension scored on the joint is partly a sweep of that density. Under
+  conditioning the unused pair cancels exactly, in numerator and denominator
+  alike.
+- **Gauge.** The inverse-optimal-control rescaling
+  `(λ, S, Q, h, Σ_f, h_f) → (cλ, c⁻¹S, cQ, …, c²Σ_f, c h_f)` leaves the plant
+  posterior alone but moves the joint score by `−n log|c|` per trial, which is
+  unbounded above as `c → 0` when no prior pins the scale. It leaves the
+  whitened terminal residual untouched, so the conditional score is exactly
+  invariant — see [`rescale_costate!`](@ref).
+- **Recovery.** `rand` draws `p(z, y | y^{term} = 0)`. Maximizing the joint on
+  those draws is a selection effect rather than an estimator, and a
+  self-consistency check will not land on the generating parameters. The
+  conditional objective is the likelihood of the process that produced them.
+
+Set `condition_terminal = false` to score and fit the joint
+`log p(y, y^{term} = 0)` instead. That is what fits made before this option
+existed report, and what the exactly-solvable regression tests compare against;
+it is also the cheaper objective, since no normalizer is evaluated.
+
+A switching model's normalizer sums over `K^T` discrete paths and has no exact
+form. It is estimated variationally instead, and reported separately by
+[`terminal_logz`](@ref) so the approximation stays auditable.
 
 ## Grouping (`depends_on`)
 
@@ -460,6 +516,28 @@ cost does not change the policy), and it fixes neither the scale nor the sign.
 The product `S·Q` is identified, `S` and `Q` separately are not. Use
 [`rescale_costate!`](@ref) to put a fit in a canonical scale before comparing
 runs.
+
+A second exact symmetry acts on the cost alone, whenever control enters through
+fewer channels than the plant has states (`rank S = r < n`). Take any symmetric
+`M` with `S M = 0` — a cost on directions the controller cannot push — and move
+
+```math
+Q_k \\to Q_k + M - A^\\top M A \\quad\\text{(every cost the transitions follow)},
+\\qquad
+Q_T \\to Q_T + M \\quad\\text{(a separate terminal cost)},
+```
+
+together with the latent change `λ → λ + M x` it induces: `Σ → L Σ Lᵀ` and
+`h → L h` with `L = [I 0; −AᵀM I]`, and `x0`, `P0` by `[I 0; M I]`. The gains and
+the closed loop do not move, only the costate does, and when the emission does
+not read the costate the likelihood — joint or terminal-conditioned — is
+unchanged exactly. This **shaping class** has dimension `(n − r)(n − r + 1)/2`,
+so a fitted `Qc` is identified only modulo it; with a separate terminal cost the
+identified combinations are `S Q_T` and `Q_k − Q_T + Aᵀ Q_T A`. A terminal
+factor written against a cost the transitions also follow pins `M = 0` (the two
+moves must agree), and a reference input (`Gref`) shrinks the class. A
+`Qc_prior` or `Σ_prior` picks one member, which is the prior's choice rather
+than the data's. See `docs/dev/lqr/parameterization.md` §2.4.
 
 Beyond that invariance there is a sharper caveat worth knowing before reading a
 fitted cost as *the* cost. An **exactly optimal** agent has `λ_t = P_t x_t` — the
@@ -531,6 +609,9 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
 - `Σ_prior::Union{Nothing,IWPrior{T}} = nothing`: optional inverse-Wishart prior
   on the mixed-coordinate innovation. See "Regularizing the innovation and the
   cost" below.
+- `fixed_costate_sigma = nothing`: when set to a positive variance, hold the
+  costate block of `Σ` at that variance times identity and its state cross block
+  at zero; the state block remains fitted. Cannot be combined with `Σ_prior`.
 - `Qc_prior = nothing`: optional inverse-Wishart prior on the cost matrices.
   Pass one `IWPrior` to share it across all regimes, or one entry per `Qc`
   regime (each an `IWPrior` or `nothing`) to specify epoch-specific priors,
@@ -558,6 +639,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     schedule::Vector{Int}
     terminal::Bool
     terminal_regime::Int
+    condition_terminal::Bool
     Σ::M
     h::V
     Bu::M
@@ -572,6 +654,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     P0_prior::Union{Nothing,IWPrior{T}}
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}
     Σ_prior::Union{Nothing,IWPrior{T}}
+    fixed_costate_sigma::Union{Nothing,T}
     Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
@@ -884,6 +967,8 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
 - `observe_costate::Bool = false`: let the emission read the costate.
 - `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`: see the type docstring.
 - `Σ_prior`: inverse-Wishart prior on the innovation.
+- `fixed_costate_sigma`: fixed isotropic costate innovation variance, with zero
+  state cross covariance.
 - `Qc_prior`: one inverse-Wishart prior shared across every cost matrix, or a
   vector aligned with `Qc` whose entries are inverse-Wishart priors or `nothing`.
   The last scheduled cost can therefore have its own terminal prior. See
@@ -900,6 +985,7 @@ function LQRStateModel(
     schedule::AbstractVector{<:Integer}=Int[],
     terminal::Bool=false,
     terminal_regime::Integer=0,
+    condition_terminal::Bool=true,
     Σf::Union{Nothing,AbstractMatrix{T}}=nothing,
     hf::Union{Nothing,AbstractVector{T}}=nothing,
     h::Union{Nothing,AbstractVector{T}}=nothing,
@@ -913,6 +999,7 @@ function LQRStateModel(
     P0_prior::Union{Nothing,IWPrior{T}}=nothing,
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
 ) where {T<:Real}
     n = size(A, 1)
@@ -945,6 +1032,20 @@ function LQRStateModel(
     Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
+    if fixed_costate_sigma !== nothing
+        Σ_prior === nothing ||
+            throw(ArgumentError("fixed_costate_sigma cannot be combined with Σ_prior"))
+        isfinite(fixed_costate_sigma) && fixed_costate_sigma > 0 ||
+            throw(ArgumentError("fixed_costate_sigma must be finite and positive"))
+        v = T(fixed_costate_sigma)
+        isfinite(v) && v > 0 || throw(
+            ArgumentError("fixed_costate_sigma is outside the covariance's numeric range"),
+        )
+        isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
+            isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
+            isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
+            throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
+    end
 
     h_v = h === nothing ? zeros(T, d) : h
     Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
@@ -990,6 +1091,7 @@ function LQRStateModel(
         sched,
         terminal,
         term_k,
+        condition_terminal,
         Σ,
         h_v,
         Bu_m,
@@ -1004,6 +1106,7 @@ function LQRStateModel(
         P0_prior,
         x0_prior,
         Σ_prior,
+        fixed_costate_sigma === nothing ? nothing : T(fixed_costate_sigma),
         Qc_prior_value,
         nothing,
         nothing,
@@ -1030,6 +1133,14 @@ A free model has no plant, no cost and no costate: `A`, `S`, `Qc` and `Gref` are
 empty, `terminal` is off, and the LQR readouts (`lqr_parameters`,
 `riccati_solution`, `rescale_costate!`, …) throw rather than invent an answer.
 Its M-step is the ordinary closed-form regression, not the constrained one.
+
+In a switching model alongside inverse-LQR states, its `observe_costate` is set
+to theirs at every entry point, tied emission or not: the emission reads the
+same latent coordinates in every mode. With the default `observe_costate =
+false` on the LQR side, the free state's emission therefore does not load on
+coordinates `n+1:2n` — it feels them only through its own dynamics, which mix
+them into the coordinates it does read. On its own, a free model reads all of
+them (`observe_costate = true` by default).
 
 # Arguments
 - `M`: the `2n × 2n` transition. Its size sets the latent dimension, so it must
@@ -1110,6 +1221,7 @@ function free_state_model(
         Int[],
         false,
         0,
+        false,
         Σ,
         h_v,
         Bu_m,
@@ -1124,6 +1236,7 @@ function free_state_model(
         P0_prior,
         x0_prior,
         Σ_prior,
+        nothing,
         #=
         A `:free` model has no cost, so a cost prior would have nothing to act
         on. It is rejected above rather than silently carried.
@@ -1563,8 +1676,22 @@ end
     rescale_costate!(sm; target=:trace) -> sm
 
 Apply the inverse-optimal-control scale transformation
-`(λ, S, Q, h, Σ, …) → (cλ, c⁻¹S, cQ, …)`, which leaves the state dynamics — and
-hence the fit — unchanged, and put the model in a canonical scale.
+`(λ, S, Q, h, Σ, …) → (cλ, c⁻¹S, cQ, …)`, which preserves the plant dynamics,
+and put the model in a canonical scale.
+
+What it preserves depends on the score. With the emission transformed as
+described below, and no parameter priors:
+
+- no terminal factor: the marginal likelihood is unchanged;
+- a terminal factor, `condition_terminal = true`: the conditional score is
+  unchanged, exactly. `Σf → c²Σf` and `hf → c·hf` are part of the
+  transformation, so the *whitened* terminal residual — and therefore the
+  conditioning event — does not move;
+- a terminal factor, `condition_terminal = false`: the joint log-density shifts
+  by `-n * log(abs(c))` per trial, because only the `|Σf|^{-1/2}` factor
+  survives the whitening. That direction is unbounded above as `c → 0`.
+
+Parameter-prior penalties can change in any of these cases.
 
 With `target = :trace` the scale is chosen so that `tr(Qc[1]) == n`; with
 `target = :opnorm`, so that the largest absolute eigenvalue of `Qc[1]` is 1.
@@ -1591,6 +1718,13 @@ groups in turn would divide it by `c` once per group.
 """
 function rescale_costate!(sm::LQRStateModel{T}, c::Real) where {T<:Real}
     _require_lqr(sm, "rescaling the costate")
+    sm.fixed_costate_sigma === nothing ||
+        c == 1 ||
+        throw(
+            ArgumentError(
+                "costate rescaling would change fixed_costate_sigma; disable rescaling"
+            ),
+        )
     #=
     Any nonzero `c` is a symmetry, negative included: `−S'λ' = −(S/c)(cλ) = −Sλ`
     holds for either sign, so the costate's *sign* is unidentified along with its

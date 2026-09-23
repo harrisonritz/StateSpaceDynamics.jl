@@ -398,7 +398,7 @@ fit!(lds, (kin = Ykin, spk = Yspk); uy = (kin = Vkin, spk = Vspk))
 
 # Type parameters
 - `QUAD::Bool`: `true` when every member is quadratic in the latent state (see
-    [`_emission_is_quadratic`](@ref)). Encoded in the type so the single-step
+    `_emission_is_quadratic`). Encoded in the type so the single-step
     versus iterative smoother is chosen by dispatch rather than at run time.
 
 # Parameter access
@@ -611,7 +611,7 @@ Newton step.
 
 Both drivers dispatch on these unions rather than on the concrete model types, so
 a composite lands in the right one automatically: its `QUAD` type parameter is
-the `AND` over its members (see [`_emission_is_quadratic`](@ref)).
+the `AND` over its members (see `_emission_is_quadratic`).
 """
 const QuadraticEmission{T} = Union{
     GaussianObservationModel{T},CompositeObservationModel{T,true}

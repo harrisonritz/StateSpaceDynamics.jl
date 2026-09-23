@@ -9,7 +9,7 @@ using Random
 using SparseArrays
 
 using Optim: Optim, optimize, LBFGS
-using LineSearches: HagerZhang
+using LineSearches: HagerZhang, LineSearchException
 using ProgressMeter: Progress, next!, finish!
 using SpecialFunctions: loggamma
 using Statistics: mean
@@ -22,10 +22,12 @@ using Base: show
 
 # Model-agnostic numerical kernels (no package types — reusable primitives).
 include("numerics/linalg.jl")
+include("numerics/reduction.jl")           # trial chunking fixed by trial count
 include("numerics/optimization.jl")        # line search + Newton
 include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
 include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
-include("numerics/rqspline.jl")             # monotonic rational-quadratic splines
+include("numerics/riccati.jl")             # LQR gain/affine sweeps + their adjoint
+include("numerics/rqspline.jl")            # monotonic rational-quadratic splines
 
 # Conjugate priors — defined first because model structs reference IWPrior/MNPrior
 # in their field type annotations.
@@ -73,6 +75,8 @@ include("lds/fit_slds_spline.jl")       # ... and for a warped emission in an SL
 include("lds/lqr_mstep.jl")
 include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_LQR.jl")
+include("lds/lqr_terminal.jl")
+include("lds/slds_lqr_terminal.jl")
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.
@@ -104,7 +108,7 @@ export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
 export free_state_model, plant_dim
 export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
-export simulate_lqr, lqr_riccati_sequence
+export simulate_lqr, lqr_riccati_sequence, terminal_logz
 
 # Ancillary parameter dependencies (`depends_on`)
 export group_labels, group_parameter, group_variant, set_group_seeds!, set_depends_on!

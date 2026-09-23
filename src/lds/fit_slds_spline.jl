@@ -376,13 +376,18 @@ end
 # ============================================================================
 
 """
-    _slds_spline_smooth(slds, y, kwargs) -> NamedTuple
+    _slds_spline_smooth(slds, y, kwargs, tied) -> NamedTuple
 
 `smooth` for a warped `SLDS`: run the ordinary alternating smoother on the
 shadow model and the embedded observations, then move the reported ELBO back to
 the observation scale by adding the change-of-variables term — total to `.elbo`,
 and per trial to `.trial_elbo`, which is where it belongs (it is a property of
 the trial's own observations).
+
+`tied` is the caller's `tied_params`, already resolved against the warped
+emission. It reaches the shadow without the warp's own names: the warp is shared
+across regimes by construction and its prior is added once here, and the
+shadow's Gaussian regimes would reject the name.
 """
 function _slds_spline_smooth(
     slds::SLDS{T},
@@ -394,6 +399,7 @@ function _slds_spline_smooth(
     return_cov::Bool,
     progress::Bool,
     npool::Int,
+    tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real}
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     #=
@@ -414,12 +420,34 @@ function _slds_spline_smooth(
         return_cov=return_cov,
         progress=progress,
         npool=npool,
+        tied_params=_shadow_tied_params(state.shadow, tied),
     )
 
     per_trial = _slds_trial_logjac(state, data)
     trial_elbo = out.trial_elbo .+ per_trial
     total = out.elbo + state.logjac[] + _slds_spline_logprior(T, state)
-    return (; x=out.x, γ=out.γ, elbo=total, trial_elbo=trial_elbo, p=out.p)
+    return (;
+        x=out.x,
+        γ=out.γ,
+        elbo=total,
+        trial_elbo=trial_elbo,
+        p=out.p,
+        terminal_logz=out.terminal_logz,
+    )
+end
+
+#=
+The tied names the shadow's Gaussian regimes know. Everything a spline emission
+adds on top of a Gaussian one is its warp, so this drops exactly the warp's
+names (`:warp`, or a composite member's suffixed form).
+=#
+function _shadow_tied_params(shadow::SLDS, tied::AbstractVector{Symbol})
+    lds1 = shadow.LDSs[1]
+    return filter(tied) do name
+        _param_group(lds1.state_model, name) !== nothing ||
+            _param_group(lds1.obs_model, name) !== nothing ||
+            name in _extra_tied_names(lds1.state_model)
+    end
 end
 
 #=

@@ -786,6 +786,48 @@ function test_spline_holdout_and_early_stopping()
     return nothing
 end
 
+#=
+`rtol` reaches the ECM loops as it does the Gaussian ones: a loose relative
+tolerance stops a fit the absolute one alone keeps running, on the same path.
+Both the standalone driver and a warped composite member are checked, since the
+composite enters through the Gaussian composite `fit!`.
+=#
+function test_spline_rtol_stops_early()
+    p = 4
+    lds_true = sg_true_model(; p=p, seed=18)
+    _, Y = rand(StableRNG(68), lds_true, fill(60, 6))
+
+    full = sg_init_model(Y; p=p, seed=18, n_bins=5)
+    el_full = fit!(full, Y; max_iter=30, tol=1e-12, progress=false)
+    loose = sg_init_model(Y; p=p, seed=18, n_bins=5)
+    el_loose = fit!(loose, Y; max_iter=30, tol=1e-12, rtol=1e-3, progress=false)
+    @test length(el_full) == 30
+    @test 1 < length(el_loose) < length(el_full)
+    @test el_loose ≈ el_full[1:length(el_loose)] rtol = 1e-10
+
+    k = SG_LATENT
+    function composite()
+        om = SplineGaussianObservationModel(
+            randn(StableRNG(69), p, k),
+            Matrix(1.0I, p, p),
+            zeros(p);
+            y=Y,
+            n_bins=5,
+            spline_ridge=0.0,
+        )
+        aux = GaussianObservationModel(
+            randn(StableRNG(70), 2, k), Matrix(1.0I, 2, 2), zeros(2)
+        )
+        return LinearDynamicalSystem(sg_state_model(), (kin=om, aux=aux))
+    end
+    Yc = (kin=Y, aux=[randn(StableRNG(71), 2, size(y, 2)) for y in Y])
+    el_full = fit!(composite(), Yc; max_iter=30, tol=1e-12, progress=false)
+    el_loose = fit!(composite(), Yc; max_iter=30, tol=1e-12, rtol=1e-3, progress=false)
+    @test length(el_full) == 30
+    @test 1 < length(el_loose) < length(el_full)
+    return nothing
+end
+
 function test_spline_grouping_is_rejected()
     rng = StableRNG(61)
     p = 3
@@ -1352,5 +1394,58 @@ function test_spline_slds_collapses_distinct_warps()
         LDSs=[sg_slds_regime(C, w1), sg_slds_regime(C, w3)],
     )
     @test_throws ArgumentError fit!(slds2, Y; max_iter=1, progress=false)
+    return nothing
+end
+
+#=
+`tied_params` on a warped `SLDS`. The names are resolved against the spline
+emission, so `:warp` is accepted — it is shared across regimes by construction,
+so tying it asks for nothing more — and the shadow's Gaussian regimes, which do
+not know that name, never see it. A tie changes only how often a shared group's
+prior is counted: with an identical IW prior on an identical `R` in each regime,
+tying `R` removes exactly `K - 1` copies of its log-density.
+=#
+function test_spline_slds_smooth_tied_params()
+    p, K = 3, 2
+    lo, hi = fill(-6.0, p), fill(6.0, p)
+    warp = MonotonicWarp(lo, hi; n_bins=4)
+    SSD.warp_unpack!(warp, 0.5 .* randn(StableRNG(86), warp_nparams(warp)))
+    C = randn(StableRNG(87), p, SG_LATENT)
+    slds = SSD.SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[sg_slds_regime(C, warp; θ=0.3), sg_slds_regime(C, warp; θ=-0.1)],
+    )
+    _, _, Y = rand(StableRNG(88), slds, fill(40, 3))
+
+    prior = IWPrior(; Ψ=Matrix(0.5I, p, p), ν=float(p + 4))
+    for l in slds.LDSs
+        l.obs_model.R_prior = prior
+    end
+    kw = (; smoothing_iters=5, tol=0.0)
+    free = smooth(slds, Y; kw...)
+    tied = smooth(slds, Y; tied_params=(:R, :warp), kw...)
+
+    @test tied.terminal_logz == 0
+    @test tied.x ≈ free.x
+    @test tied.trial_elbo ≈ free.trial_elbo
+    @test free.elbo - tied.elbo ≈
+        (K - 1) * SSD.iw_logprior_term(slds.LDSs[1].obs_model.R, prior) rtol = 1e-8
+    @test_throws ArgumentError smooth(slds, Y; tied_params=(:not_a_parameter,), kw...)
+
+    # `fit!` resolves the same names, and the held-out score it records runs
+    # through `smooth` with them.
+    tr = fit!(
+        slds,
+        Y[1:2];
+        y_test=Y[3:3],
+        tied_params=(:C, :d, :R, :warp),
+        max_iter=3,
+        smoothing_iters=1,
+        progress=false,
+    )
+    @test all(isfinite, tr.test)
+    @test slds.LDSs[2].obs_model.C ≈ slds.LDSs[1].obs_model.C
+    @test slds.LDSs[2].obs_model.R ≈ slds.LDSs[1].obs_model.R
     return nothing
 end
