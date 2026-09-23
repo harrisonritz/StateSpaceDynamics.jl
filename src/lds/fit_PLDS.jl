@@ -213,15 +213,13 @@ function joint_loglikelihood(
     x::AbstractVector{<:AbstractMatrix{<:Real}},
     y::AbstractVector{<:AbstractMatrix{T}},
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
-    ntrials = length(y)
-    chunks = collect(partition(1:ntrials, max(1, cld(ntrials, Threads.nthreads()))))
-    return tmapreduce(+, chunks) do chunk
-        acc = zero(T)
-        for n in chunk
-            acc += sum(joint_loglikelihood(plds, x[n], y[n]))
-        end
-        return acc
+    # One value per trial, summed in trial order: the total does not depend on
+    # how the trials were split across threads.
+    per_trial = zeros(T, length(y))
+    tforeach(eachindex(y)) do n
+        per_trial[n] = sum(joint_loglikelihood(plds, x[n], y[n]))
     end
+    return sum(per_trial)
 end
 
 """
@@ -347,51 +345,29 @@ function gradient_observation_model!(
     y::AbstractVector{<:AbstractMatrix{T}},
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}},
     sws_pool::Vector{SmoothWorkspace{T}},
-    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing;
-    tasks_per_thread::Int=2,
+    w::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
 ) where {T<:Real}
     trials = length(tfs.FilterSmooths)
     npar = length(grad)
     @assert length(sws_pool[1].reg.CD) == npar && length(sws_pool[1].reg.Syz) == npar "Poisson gradient accumulator size $(length(sws_pool[1].reg.CD)) ≠ npar=$npar (expected obs_dim·(latent_dim+1+uy_dim); build the workspace with uy_dim=lds.uy_dim)"
 
     #=
-    Cap ntasks at `length(sws_pool)` so each chunk gets its own
-    pre-allocated workspace slot indexed by its position in the chunk
-    iteration (not `threadid()`, which can migrate under task
-    scheduling).
+    Chunks fixed by the trial count, accumulated in the pool's workspaces a wave
+    at a time and added into `grad` in chunk order, so the sum does not depend on
+    the pool size or the thread count. Each chunk's `acc`/`tmp` accumulators are
+    views into its workspace's `.reg.CD` / `.reg.Syz` (both `obs_dim × Dp1 =
+    npar` for Poisson, where `uy_dim = 0`), and the trial kernel's h/ρ/λ/CP
+    buffers are its `Q_obs!` scratch.
     =#
-    desired = max(1, tasks_per_thread * Threads.nthreads())
-    ntasks = min(trials, desired, length(sws_pool))
-    chunk_size = max(1, cld(trials, ntasks))
-    chunks = collect(partition(1:trials, chunk_size))
-
-    tforeach(eachindex(chunks)) do task_idx
-        #=
-        Each chunk owns one workspace from the pool. Buffers
-        used by `gradient_observation_model_single_trial!`
-        (h/ρ/λ/CP) come from this workspace's existing
-        `Q_obs!` scratch fields, and the per-chunk `acc`/`tmp`
-        gradient accumulators are views into `.reg.CD` / `.reg.Syz`
-        (both sized `obs_dim × Dp1 = npar` for Poisson, where
-        `uy_dim = 0`).
-        =#
-        sws = sws_pool[task_idx]
+    fill!(grad, zero(T))
+    function accumulate!(slot, chunk)
+        sws = sws_pool[slot]
         acc = vec(sws.reg.CD)
         tmp = vec(sws.reg.Syz)
         fill!(acc, zero(T))
-
-        h_buf = sws.elbo.h_obs
-        ρ_buf = sws.elbo.rho_obs
-        λ_buf = sws.elbo.CEz_obs
-        CP_buf = sws.elbo.CP_obs
-
-        for k in chunks[task_idx]
+        for k in chunk
             fill!(tmp, zero(T))
-
             fs = tfs[k]
-            weights = isnothing(w) ? nothing : w[k]
-            uy_k = isnothing(uy) ? nothing : uy[k]
-
             gradient_observation_model_single_trial!(
                 tmp,
                 C,
@@ -400,30 +376,28 @@ function gradient_observation_model!(
                 fs.x_smooth,
                 fs.p_smooth,
                 y[k],
-                uy_k,
-                weights,
-                h_buf,
-                ρ_buf,
-                λ_buf,
-                CP_buf,
+                isnothing(uy) ? nothing : uy[k],
+                isnothing(w) ? nothing : w[k],
+                sws.elbo.h_obs,
+                sws.elbo.rho_obs,
+                sws.elbo.CEz_obs,
+                sws.elbo.CP_obs,
             )
-
             @simd for i in 1:npar
                 acc[i] += tmp[i]
             end
         end
+        return nothing
     end
-
-    # Deterministic reduction on the caller thread (chunk order is fixed).
-    # Named `chunk_acc`, not `acc`: sharing the closure's `acc` binding would
-    # box it, which OhMyThreads rejects.
-    fill!(grad, zero(T))
-    for task_idx in eachindex(chunks)
-        chunk_acc = vec(sws_pool[task_idx].reg.CD)
+    function reduce!(slot)
+        chunk_acc = vec(sws_pool[slot].reg.CD)
         @simd for i in 1:npar
             grad[i] += chunk_acc[i]
         end
+        return nothing
     end
+    chunks = _reduction_chunks(trials)
+    _foreach_chunk_wave(accumulate!, reduce!, chunks, min(length(chunks), length(sws_pool)))
 
     @. grad = -grad
     return grad
@@ -471,22 +445,24 @@ function _poisson_q_obs_total(
     uy = data.uy
     ntrials = length(y)
     ntasks = min(ntrials, length(sws_pool))
-    partial = zeros(T, ntasks)
+    # One value per trial, summed in trial order: the total does not depend on
+    # how the trials were split across the pool.
+    per_trial = zeros(T, ntrials)
     chunksize = cld(ntrials, ntasks)
     tforeach(1:ntasks) do i
         lo = (i - 1) * chunksize + 1
         hi = min(i * chunksize, ntrials)
         lo > hi && return nothing
         sws = sws_pool[i]
-        acc = zero(T)
         for trial in lo:hi
             fs = tfs[trial]
-            acc += Q_obs!(sws, plds, fs.x_smooth, fs.p_smooth, y[trial], uy[trial])
+            per_trial[trial] = Q_obs!(
+                sws, plds, fs.x_smooth, fs.p_smooth, y[trial], uy[trial]
+            )
         end
-        partial[i] = acc
         return nothing
     end
-    return sum(partial)
+    return sum(per_trial)
 end
 
 """

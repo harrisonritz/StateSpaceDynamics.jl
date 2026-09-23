@@ -288,12 +288,17 @@ function _poisson_mstep_trial!(
 end
 
 """
-    _poisson_mstep_pass!(bufs, chunks, W, tfs, y, uy, w, curvature)
+    _poisson_mstep_pass!(fval, grad, H, bufs, chunks, W, tfs, y, uy, w, curvature, active)
 
-One pass over every trial, chunked across `bufs`. Returns nothing; the
-per-chunk accumulators are reduced by the caller in chunk order.
+One pass over every trial: each row's objective summed into `fval`, and with
+`curvature` its gradient and Hessian into `grad` and `H`. The chunks are fixed
+by the trial count and reduced in chunk order (see `_foreach_chunk_wave`), so
+the sums do not depend on how many buffers or threads ran them.
 """
 function _poisson_mstep_pass!(
+    fval::AbstractVector{T},
+    grad::Union{Nothing,AbstractMatrix{T}},
+    H::Union{Nothing,AbstractArray{T,3}},
     bufs::Vector{PoissonMStepBuffers{T}},
     chunks::Vector{<:AbstractVector{Int}},
     W::AbstractMatrix{T},
@@ -304,10 +309,15 @@ function _poisson_mstep_pass!(
     curvature::Bool,
     active::Union{Nothing,AbstractVector{Bool}}=nothing,
 ) where {T<:Real}
-    tforeach(eachindex(chunks)) do task_idx
-        buf = bufs[task_idx]
+    fill!(fval, zero(T))
+    if curvature
+        fill!(something(grad), zero(T))
+        fill!(something(H), zero(T))
+    end
+    function accumulate!(slot, chunk)
+        buf = bufs[slot]
         _reset_mstep_accumulators!(buf, curvature)
-        for k in chunks[task_idx]
+        for k in chunk
             fs = tfs[k]
             uy_k = uy === nothing ? nothing : uy[k]
             w_k = w === nothing ? nothing : w[k]
@@ -315,21 +325,25 @@ function _poisson_mstep_pass!(
                 buf, W, fs.x_smooth, fs.p_smooth, y[k], uy_k, w_k, curvature, active
             )
         end
+        return nothing
     end
-    return nothing
-end
-
-"""Sum the chunks' row objectives into `out`, in chunk order."""
-function _reduce_fval!(
-    out::AbstractVector{T}, bufs::Vector{PoissonMStepBuffers{T}}
-) where {T<:Real}
-    fill!(out, zero(T))
-    for buf in bufs
-        @inbounds @simd for n in eachindex(out)
-            out[n] += buf.fval[n]
+    function reduce!(slot)
+        buf = bufs[slot]
+        @inbounds @simd for n in eachindex(fval)
+            fval[n] += buf.fval[n]
         end
+        curvature || return nothing
+        g, Hs = something(grad), something(H)
+        @inbounds @simd for i in eachindex(Hs)
+            Hs[i] += buf.H[i]
+        end
+        @inbounds @simd for i in eachindex(g)
+            g[i] += buf.grad[i]
+        end
+        return nothing
     end
-    return out
+    _foreach_chunk_wave(accumulate!, reduce!, chunks, length(bufs))
+    return nothing
 end
 
 """
@@ -470,12 +484,14 @@ its own backtracked step, so a neuron whose problem is badly scaled cannot hold
 back the rest, and a row stops being solved for once a full Newton step promises
 it less than `tol · |Q|` — the same units the caller's ELBO tolerance is in.
 
-The chunk count comes from `ntasks`, which defaults to the pool length because
-that is how many workspaces an LDS caller has to hand. The solver's own
-per-chunk scratch is the freshly built `PoissonMStepBuffers` below, not the
-pool, so a caller that owns one workspace but wants the pass parallel — the
-SLDS, whose emission solve is per regime — passes `ntasks` directly instead of
-padding a pool it has no other use for.
+The trials are summed in chunks fixed by the trial count alone
+(`_reduction_chunks`), so the solve gives the same bits on any number of
+threads. `ntasks` is how many of those chunks run at once, and so how many sets
+of scratch are built; it defaults to the pool length because that is how many
+workspaces an LDS caller has to hand. The scratch is the freshly built
+`PoissonMStepBuffers` below, not the pool, so a caller that owns one workspace
+but wants the pass parallel — the SLDS, whose emission solve is per regime —
+passes `ntasks` directly instead of padding a pool it has no other use for.
 """
 function update_observation_model!(
     plds::LinearDynamicalSystem{T,S,O},
@@ -511,10 +527,8 @@ function update_observation_model!(
     @views W[:, latent_dim + 1] .= plds.obs_model.d
     uy_dim > 0 && (@views W[:, (latent_dim + 2):reg_dim] .= plds.obs_model.D)
 
-    tasks = max(1, min(ntrials, ntasks))
-    chunk_size = max(1, cld(ntrials, tasks))
-    chunks = collect(partition(1:ntrials, chunk_size))
-    tasks = length(chunks)
+    chunks = _reduction_chunks(ntrials)
+    tasks = max(1, min(length(chunks), ntasks))
 
     curv_bufs = [
         PoissonMStepBuffers(T, latent_dim, obs_dim, uy_dim, tsteps_max) for _ in 1:tasks
@@ -534,24 +548,13 @@ function update_observation_model!(
     stepping = falses(obs_dim)
     slope = zeros(T, obs_dim)
 
-    H = curv_bufs[1].H
-    grad = curv_bufs[1].grad
+    H = similar(curv_bufs[1].H)
+    grad = similar(curv_bufs[1].grad)
 
     for _ in 1:max_iter
-        _poisson_mstep_pass!(curv_bufs, chunks, W, tfs, y, uy, w, true, solving)
-        # Reduce onto chunk 1's accumulators, in chunk order, so the result does
-        # not depend on how the chunks were scheduled.
-        for c in 2:tasks
-            Hc = curv_bufs[c].H
-            gc = curv_bufs[c].grad
-            @inbounds @simd for i in eachindex(H)
-                H[i] += Hc[i]
-            end
-            @inbounds @simd for i in eachindex(grad)
-                grad[i] += gc[i]
-            end
-        end
-        _reduce_fval!(fval, curv_bufs)
+        _poisson_mstep_pass!(
+            fval, grad, H, curv_bufs, chunks, W, tfs, y, uy, w, true, solving
+        )
         _poisson_mstep_prior!(fval, grad, H, W, solving, prior)
         #=
         A state model may declare part of the latent state unreadable by the
@@ -607,8 +610,9 @@ function update_observation_model!(
             @inbounds for n in 1:obs_dim, a in 1:reg_dim
                 W_trial[n, a] = W[n, a] + step[n] * Δ[a, n]
             end
-            _poisson_mstep_pass!(ls_bufs, chunks, W_trial, tfs, y, uy, w, false)
-            _reduce_fval!(fval_trial, ls_bufs)
+            _poisson_mstep_pass!(
+                fval_trial, nothing, nothing, ls_bufs, chunks, W_trial, tfs, y, uy, w, false
+            )
             _poisson_mstep_prior!(fval_trial, nothing, nothing, W_trial, nothing, prior)
             still_stepping = false
             @inbounds for n in 1:obs_dim

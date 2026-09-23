@@ -290,6 +290,7 @@ using SSDTest
 
             @testset "EM Algorithm" begin
                 test_parameter_gradient()
+                test_poisson_reductions_layout_independent()
                 test_initial_observation_parameter_updates()
                 test_state_model_parameter_updates()
                 test_initial_observation_parameter_updates(3)
