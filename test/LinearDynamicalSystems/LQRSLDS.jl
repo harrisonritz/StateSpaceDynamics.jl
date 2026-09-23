@@ -498,11 +498,11 @@ function test_slds_lqr_terminal_conditioning()
     @test all(isfinite, els)
     @test els[end] > els[1]
     #=
-    Not `> -1e-6` as on the joint objective. The state M-step only accepts a
-    point that improves the scored objective, but the discrete-transition
-    update ignores what the transition matrix does to `log Z`, and the E-step
-    is Monte Carlo. What the fit may not do is lose ground comparable to the
-    progress it makes.
+    Not `> -1e-6` as on the joint objective. Both halves of the M-step only
+    accept a point that improves the scored objective — the discrete chain is
+    checked against `log Z` too (`test_slds_lqr_terminal_chain_step`) — but the
+    E-step is Monte Carlo. What the fit may not do is lose ground comparable to
+    the progress it makes.
     =#
     @test minimum(diff(els)) > -0.05 * (els[end] - els[1])
     @test terminal_logz(two, ys) < 0
@@ -514,6 +514,59 @@ function test_slds_lqr_terminal_conditioning()
     for lds in two.LDSs
         @test minimum(eigvals(Symmetric(lds.state_model.Σ))) > 1e-3
     end
+    return nothing
+end
+
+"""Under terminal conditioning the discrete chain moves `log Ẑ` as well as the
+data half, so its update is checked against the conditioned score
+`g(A, π) = Σ N log A + Σ n log π − log Ẑ`, the posterior held fixed. The step
+never lowers `g`, keeps the chain stochastic, and leaves the probe smoothed at
+the chain it kept, which is what lets the state M-step reuse it. The random
+posteriors are weak enough that the probe's pull on the chain matters: two keep
+the Baum–Welch proposal, and one needs the score's own ascent step."""
+function test_slds_lqr_terminal_chain_step()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    HMMs = SSD.HMMs
+    proposals = Symbol[]
+    for seed in 1:3
+        two = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+        data = SSD.Data(two.LDSs[1], ys)
+        seq_ends = cumsum(data.tsteps)
+        total = last(seq_ends)
+        dl = SSD.SLDSDiscreteLayer(two.A, two.πₖ, 0.3 .* randn(StableRNG(seed), 2, total))
+        fb = SSD._make_slds_fb_storage(dl, seq_ends)
+        HMMs.forward_backward!(
+            fb,
+            dl,
+            collect(1:total),
+            fill(nothing, total);
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+        N, n = SSD._slds_chain_counts(fb, seq_ends, 2, Float64)
+        function g(m)
+            return sum(N .* log.(m.A .+ 1e-12)) + sum(n .* log.(m.πₖ .+ 1e-12)) -
+                   terminal_logz(m, ys)
+        end
+        before = g(two)
+        A_bw = N ./ sum(N; dims=2)
+        probe = SSD._slqr_terminal_probe(two, data.ux)
+        current = SSD._slqr_chain_mstep!(two, dl, fb, collect(1:total), seq_ends, probe)
+        @test g(two) >= before - 1e-9
+        @test all(≈(1), sum(two.A; dims=2)) && sum(two.πₖ) ≈ 1
+        @test all(>=(0), two.A) && all(>=(0), two.πₖ)
+        current && @test probe.logz ≈ terminal_logz(two, ys) rtol = 1e-10
+        push!(proposals, if two.A ≈ A_bw
+            :baum_welch
+        elseif current
+            :gradient
+        else
+            :none
+        end)
+    end
+    @test proposals == [:baum_welch, :gradient, :baum_welch]
     return nothing
 end
 

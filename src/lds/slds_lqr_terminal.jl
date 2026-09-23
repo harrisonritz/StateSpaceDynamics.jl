@@ -315,6 +315,127 @@ function _slqr_restart!(probe::_SLQRProbe)
     return probe
 end
 
+"""
+    _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probe) -> Bool
+
+The discrete chain's update when the model conditions on its terminal factor.
+
+The score is `ELBO(y, terminal = 0) − log Ẑ`, and `log Ẑ` depends on `A` and
+`πₖ` through the probe's chain as surely as the data half does. With `q` held
+fixed, the chain's part of it is
+
+    g(A, π) = Σᵢⱼ Nᵢⱼ log Aᵢⱼ + Σₖ nₖ log πₖ − log Ẑ(A, π),
+
+`N` / `n` the data's expected transition and initial counts, under the same
+`log(· + 1e-12)` the ELBO takes, and `log Ẑ` from a probe restarted as a fresh
+one would be. Holding the probe's posterior fixed as the state M-step does would
+leave `Σᵢⱼ (Nᵢⱼ − Ξᵢⱼ) log Aᵢⱼ`, with `Ξ` the probe's expected counts: unbounded
+wherever the probe expects more `i → j` transitions than the data, so there is
+no closed-form update. Two proposals instead, each kept only if `g` rises:
+
+1. The Baum–Welch update, which maximizes the data half. It is the whole answer
+   when the chain barely moves `log Ẑ`.
+2. Otherwise an ascent step on `g` itself, in each row's softmax logits. At the
+   probe's stationary posterior `∂ log Ẑ / ∂Aᵢⱼ = Ξᵢⱼ / Aᵢⱼ` (Danskin, as for the
+   state parameters), so the logit gradient is `cᵢⱼ − Aᵢⱼ Σₖ cᵢₖ` with
+   `c = N − Ξ`, and likewise for `πₖ`. The step starts at a size that moves no
+   logit by more than one and halves until `g` rises by an Armijo fraction of
+   what the gradient promises.
+
+If neither improves `g` the chain stays put. Returns whether the probe is left
+smoothed at the chain `slds` now holds, so the state M-step can use it as is.
+"""
+function _slqr_chain_mstep!(
+    slds::SLDS{T},
+    dl::SLDSDiscreteLayer{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    obs_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    probe::_SLQRProbe{T};
+    max_halvings::Int=12,
+) where {T<:Real}
+    K = length(slds.LDSs)
+    # Counts first: `fit!` below uses each trial's last ξ as scratch.
+    N, n = _slds_chain_counts(fb_storage, seq_ends, K, T)
+    floor = T(1e-12)
+    function score!(A, π)
+        copyto!(slds.A, A)
+        copyto!(slds.πₖ, π)
+        _slqr_sync_probe!(probe, slds)
+        _slqr_restart!(probe)
+        _slqr_probe_estep!(probe)
+        chain = sum(N .* log.(A .+ floor)) + sum(n .* log.(π .+ floor))
+        return chain - probe.logz
+    end
+
+    A0, π0 = copy(slds.A), copy(slds.πₖ)
+    base = score!(A0, π0)
+    # The probe's own counts, weighted by how many trials share each design.
+    Ξ, ν = _slds_chain_counts(probe.fb, probe.seq_ends, K, T, probe.counts)
+
+    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)   # writes slds.A / πₖ
+    A1, π1 = copy(slds.A), copy(slds.πₖ)
+    if !(A0 == A1 && π0 == π1)
+        gain = score!(A1, π1) - base
+        if gain >= 0
+            @debug "terminal-conditioned chain step" proposal = :baum_welch gain
+            return true
+        end
+    end
+
+    c, cπ = N .- Ξ, n .- ν
+    Gη = c .- A0 .* sum(c; dims=2)
+    Gπ = cπ .- π0 .* sum(cπ)
+    slope = sum(abs2, Gη) + sum(abs2, Gπ)
+    if slope > zero(T)
+        η0, ηπ0 = log.(A0), log.(π0)
+        step = one(T) / max(maximum(abs, Gη), maximum(abs, Gπ))
+        for _ in 0:max_halvings
+            A = exp.(η0 .+ step .* Gη)
+            A ./= sum(A; dims=2)
+            π = exp.(ηπ0 .+ step .* Gπ)
+            π ./= sum(π)
+            gain = score!(A, π) - base
+            if gain >= T(1e-4) * step * slope
+                @debug "terminal-conditioned chain step" proposal = :gradient step gain
+                return true
+            end
+            step /= 2
+        end
+    end
+    @debug "terminal-conditioned chain step rejected" base
+    copyto!(slds.A, A0)
+    copyto!(slds.πₖ, π0)
+    return false
+end
+
+"""
+    _slds_chain_counts(fb, seq_ends, K, T, weights=nothing) -> (N, n)
+
+Expected transition counts `N` (`K × K`) and initial counts `n` from a
+forward-backward pass, summed over trials, each trial weighted by `weights` if
+given. Reads `ξ` for every step but the last, which is scratch by convention.
+"""
+function _slds_chain_counts(
+    fb::HMMs.ForwardBackwardStorage,
+    seq_ends::AbstractVector{Int},
+    K::Int,
+    ::Type{T},
+    weights::Union{Nothing,AbstractVector}=nothing,
+) where {T<:Real}
+    N = zeros(T, K, K)
+    n = zeros(T, K)
+    for trial in eachindex(seq_ends)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        w = weights === nothing ? one(T) : T(weights[trial])
+        n .+= w .* view(fb.γ, :, t1)
+        for t in t1:(t2 - 1)
+            N .+= w .* fb.ξ[t]
+        end
+    end
+    return N, n
+end
+
 # --- normalizer-backend interface, shared with the non-switching M-step -----
 
 #=

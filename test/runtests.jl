@@ -507,6 +507,7 @@ using SSDTest
             test_slds_lqr_tied()
             test_slds_lqr_terminal()
             test_slds_lqr_terminal_conditioning()
+            test_slds_lqr_terminal_chain_step()
             test_slds_lqr_probe_resmoothing()
             test_slds_lqr_conditional_score_gradient()
             test_slds_lqr_validation()

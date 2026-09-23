@@ -3149,9 +3149,6 @@ function mstep!(
     K = length(slds.LDSs)
     ntrials = _ntrials(y)
 
-    # Update the discrete transition and initial probabilities.
-    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
-
     #=
     `Data` canonicalizes absent ux/uy to zero-row matrices and validates the
     supplied ones. All regimes share the same input dims (enforced by
@@ -3160,6 +3157,21 @@ function mstep!(
     re-validating every trial each M-step is pure overhead.
     =#
     dat = data === nothing ? Data(slds.LDSs[1], y; ux=ux, uy=uy) : data
+
+    #=
+    The discrete transition and initial probabilities. Under terminal
+    conditioning they move `log Ẑ` too, so the ordinary update is only a
+    proposal there, kept as far as it improves the conditioned score; the
+    normalizer's probe is built for that check and reused by the state M-step.
+    =#
+    conditioned = _slds_condition_terminal(slds)
+    probe = conditioned ? _slqr_terminal_probe(slds, dat.ux) : nothing
+    probe_current = if probe === nothing
+        StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
+        false
+    else
+        _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probe)
+    end
 
     function weights_of(k)
         return [
@@ -3232,12 +3244,14 @@ function mstep!(
     as it holds the data posterior fixed, so both halves of the surrogate are
     tight at the same point.
     =#
-    terminal_probe = if _slds_condition_terminal(slds)
-        pr = _slqr_terminal_probe(slds, dat.ux)
-        _slqr_sync_probe!(pr, slds)
-        _slqr_probe_estep!(pr)
-    else
+    terminal_probe = if probe === nothing
         nothing
+    elseif probe_current
+        probe
+    else
+        _slqr_sync_probe!(probe, slds)
+        _slqr_restart!(probe)
+        _slqr_probe_estep!(probe)
     end
 
     _slds_state_mstep!(
