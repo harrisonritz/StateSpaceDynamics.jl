@@ -22,9 +22,11 @@ using Base: show
 
 # Model-agnostic numerical kernels (no package types — reusable primitives).
 include("numerics/linalg.jl")
+include("numerics/reduction.jl")           # trial chunking fixed by trial count
 include("numerics/optimization.jl")        # line search + Newton
 include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
 include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
+include("numerics/riccati.jl")             # LQR gain/affine sweeps + their adjoint
 
 # Conjugate priors — defined first because model structs reference IWPrior/MNPrior
 # in their field type annotations.

@@ -132,7 +132,7 @@ You can generate synthetic data from fitted LDS models. Pass a scalar
 to sample a multi-trial dataset (trial lengths may differ):
 
 ```@docs
-Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+Random.rand(rng::AbstractRNG, lds::LinearDynamicalSystem{T,S,O}, tsteps::Integer) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
 ```
 
 ## Inference in Linear Dynamical Systems

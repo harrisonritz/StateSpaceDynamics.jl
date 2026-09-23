@@ -519,6 +519,22 @@ end
 ```
 """
 function validate_SLDS(slds::SLDS)
+    _validate_slds_structure(slds)
+    # This will throw if invalid
+    foreach(validate_LDS, slds.LDSs)
+    return nothing
+end
+
+"""
+    _validate_slds_structure(slds)
+
+The switching-level half of [`validate_SLDS`](@ref): a proper chain, regimes that
+agree on their dimensions, and the state-model rules. This is what every entry
+point runs. Each regime's own consistency is `validate_LDS`'s, which the
+positional `LinearDynamicalSystem` constructor already runs, so it is not
+repeated per call.
+"""
+function _validate_slds_structure(slds::SLDS)
     k = size(slds.A, 1)
     D = length(slds.πₖ)
     lds_count = length(slds.LDSs)
@@ -570,9 +586,6 @@ function validate_SLDS(slds::SLDS)
         member names and order are part of the composite's type — so regimes
         that disagree cannot be put in the same `SLDS` at all.
         =#
-
-        # This will throw if invalid
-        validate_LDS(lds)
     end
 
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
@@ -588,22 +601,23 @@ shared dimension checks. A no-op for a model with none.
 _validate_slds_state_models(::AbstractStateModel, ::SLDS) = nothing
 
 #=
-An inverse-LQR discrete state carries a single cost: in a switching model the
-*discrete state* is the cost epoch, inferred rather than specified, so a
-deterministic schedule inside a state would be a second, competing notion of
-regime nested inside the first. `terminal` and `observe_costate` describe the
-trial and the emission rather than the state, so they must agree across states —
-a factor that applies in some states and not others, or a readout mask only half
-the states impose, is a modelling accident rather than a choice.
+An inverse-LQR discrete state's transitions follow a single cost: in a switching
+model the *discrete state* is the cost epoch, inferred rather than specified, so
+a deterministic schedule switching costs inside a state would be a second,
+competing notion of regime nested inside the first. A separate *terminal* cost
+is not that — it is read only by the terminal factor, on the last step — and is
+allowed. `terminal` and `observe_costate` describe the trial and the emission
+rather than the state, so they must agree across states — a factor that applies
+in some states and not others, or a readout mask only half the states impose,
+is a modelling accident rather than a choice.
 =#
 function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     #=
     `terminal` and `observe_costate` are compared among the *inverse-LQR* states
-    only. A `:free` state has no costate, so neither means anything for it: it
-    carries no terminal condition, and `_costate_range` already returns `nothing`
-    for it whatever its flag says. In a mixed model the readout mask is therefore
-    set by the LQR states, and a free state simply reads whatever coordinates are
-    left to it.
+    only. A `:free` state has no costate and carries no terminal condition, and
+    its `observe_costate` is not its own to set in a mixed model: the readout
+    mask is set by the LQR states, and `_match_costate_readout!` gives it to the
+    free states, so the emission reads the same coordinates in every mode.
     =#
     ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
     ref === nothing && return nothing
@@ -611,14 +625,16 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     for (i, lds) in enumerate(slds.LDSs)
         sm = lds.state_model
         _is_free(sm) && continue
-        if _nregimes(sm) != 1
+        regimes = _slds_transition_regimes(sm)
+        if length(regimes) != 1
             throw(
                 ArgumentError(
-                    "LDSs[$i]: an inverse-LQR discrete state carries one cost matrix, " *
-                    "but this one has $(_nregimes(sm)). In a switching model the " *
-                    "discrete state *is* the cost epoch — inferred instead of given " *
-                    "by `schedule` — so add a discrete state per cost rather than a " *
-                    "schedule within one.",
+                    "LDSs[$i]: an inverse-LQR discrete state's transitions follow one " *
+                    "cost, but this one's schedule switches among costs $(regimes) " *
+                    "within a trial. In a switching model the discrete state *is* the " *
+                    "cost epoch — inferred instead of given by `schedule` — so add a " *
+                    "discrete state per cost rather than a schedule within one. (A " *
+                    "separate terminal cost, read only at the last step, is fine.)",
                 ),
             )
         end

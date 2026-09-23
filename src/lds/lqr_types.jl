@@ -347,13 +347,25 @@ The model is stochastic in the **mixed** coordinates,
   + h + B_u u_t + \\varepsilon_t, \\qquad \\varepsilon_t \\sim N(0, \\Sigma),
 ```
 
-so `Σ`'s leading block is genuine plant process noise and its trailing block is
-*costate slack* — how far from exactly optimal the behavior is. The equivalent
-forward noise is `G Σ Gᵀ` with `G = [I  S A⁻ᵀ; 0  −A⁻ᵀ]`, and since `G` is
-invertible **the costate must carry process noise**: a singular `Σ` makes the
-forward process-noise covariance singular and the smoother's precision
-undefined. A free `Σ` spans exactly the same model class as a free forward
-covariance, so nothing is lost by parameterizing it here.
+so `Σ`'s leading block is plant process noise and its trailing block is the
+costate's own innovation. The equivalent forward noise is `G Σ Gᵀ` with
+`G = [I  S A⁻ᵀ; 0  −A⁻ᵀ]`, and since `G` is invertible **the costate must carry
+process noise**: a singular `Σ` makes the forward process-noise covariance
+singular and the smoother's precision undefined. A free `Σ` spans exactly the
+same model class as a free forward covariance, so nothing is lost by
+parameterizing it here.
+
+**The costate block does not measure suboptimality.** An exactly optimal agent
+under plant noise re-plans after every disturbance, so its costate innovation is
+not zero but a fixed image of the plant noise,
+`ε^λ_t = −Aᵀ P_{t+1} (I + S P_{t+1})⁻¹ ε^x_t` (the lower block of the formula
+under *Identifiability*). `Σ_λλ` therefore grows with the plant noise whether or
+not the agent is optimal: in the measurements behind
+`docs/dev/lqr/biological.md`, adding substantial suboptimality to an optimal
+agent changed the adjoint residual by 0.3% while the residual from the Riccati
+graph `λ_t = P_t x_t + g_t` went from exactly 0 to about 1. Suboptimality is a
+departure from that graph — what `simulate_lqr`'s `costate_slack` generates —
+and this model has no parameter that isolates it.
 
 ## Time-varying cost
 
@@ -504,6 +516,28 @@ cost does not change the policy), and it fixes neither the scale nor the sign.
 The product `S·Q` is identified, `S` and `Q` separately are not. Use
 [`rescale_costate!`](@ref) to put a fit in a canonical scale before comparing
 runs.
+
+A second exact symmetry acts on the cost alone, whenever control enters through
+fewer channels than the plant has states (`rank S = r < n`). Take any symmetric
+`M` with `S M = 0` — a cost on directions the controller cannot push — and move
+
+```math
+Q_k \\to Q_k + M - A^\\top M A \\quad\\text{(every cost the transitions follow)},
+\\qquad
+Q_T \\to Q_T + M \\quad\\text{(a separate terminal cost)},
+```
+
+together with the latent change `λ → λ + M x` it induces: `Σ → L Σ Lᵀ` and
+`h → L h` with `L = [I 0; −AᵀM I]`, and `x0`, `P0` by `[I 0; M I]`. The gains and
+the closed loop do not move, only the costate does, and when the emission does
+not read the costate the likelihood — joint or terminal-conditioned — is
+unchanged exactly. This **shaping class** has dimension `(n − r)(n − r + 1)/2`,
+so a fitted `Qc` is identified only modulo it; with a separate terminal cost the
+identified combinations are `S Q_T` and `Q_k − Q_T + Aᵀ Q_T A`. A terminal
+factor written against a cost the transitions also follow pins `M = 0` (the two
+moves must agree), and a reference input (`Gref`) shrinks the class. A
+`Qc_prior` or `Σ_prior` picks one member, which is the prior's choice rather
+than the data's. See `docs/dev/lqr/parameterization.md` §2.4.
 
 Beyond that invariance there is a sharper caveat worth knowing before reading a
 fitted cost as *the* cost. An **exactly optimal** agent has `λ_t = P_t x_t` — the
@@ -1099,6 +1133,14 @@ A free model has no plant, no cost and no costate: `A`, `S`, `Qc` and `Gref` are
 empty, `terminal` is off, and the LQR readouts (`lqr_parameters`,
 `riccati_solution`, `rescale_costate!`, …) throw rather than invent an answer.
 Its M-step is the ordinary closed-form regression, not the constrained one.
+
+In a switching model alongside inverse-LQR states, its `observe_costate` is set
+to theirs at every entry point, tied emission or not: the emission reads the
+same latent coordinates in every mode. With the default `observe_costate =
+false` on the LQR side, the free state's emission therefore does not load on
+coordinates `n+1:2n` — it feels them only through its own dynamics, which mix
+them into the coordinates it does read. On its own, a free model reads all of
+them (`observe_costate = true` by default).
 
 # Arguments
 - `M`: the `2n × 2n` transition. Its size sets the latent dimension, so it must

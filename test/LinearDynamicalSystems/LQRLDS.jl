@@ -1201,6 +1201,153 @@ function test_lqr_conditional_mstep_gradient()
     return nothing
 end
 
+"""The shaping class the `LQRStateModel` docstring describes is an exact symmetry
+of the likelihood, and a genuine change of cost.
+
+With control entering through one channel of three, any symmetric `M` with
+`S M = 0` gives `Q_run → Q_run + M − AᵀMA`, `Q_term → Q_term + M`, which with the
+induced change of costate (`Σ`, `h`, `x0`, `P0` transformed to match) leaves the
+closed loop and the ELBO unchanged — joint, terminal-conditioned, and with no
+terminal factor at all — while the cost moves by an amount no fit can see. This
+is why a fitted `Qc` is reported modulo the class.
+"""
+function test_lqr_shaping_symmetry()
+    rng = StableRNG(9)
+    n, p, tsteps = 3, 5, 25
+    A = [0.97 0.08 0.0; -0.06 0.95 0.04; 0.02 0.0 0.93]
+    b = [1.0, 0.3, 0.0]
+    S = 0.08 .* (b * b')                     # rank 1, so the class has dimension 3
+    Qrun = [0.3 0.05 0.0; 0.05 0.25 0.02; 0.0 0.02 0.2]
+    Qterm = Matrix(1.5I, n, n)
+    Σ = Matrix(Diagonal(fill(0.03, 2n))) .+ 0.005
+    C = randn(rng, p, 2n)
+    C[:, (n + 1):end] .= 0
+    # null(S), written out: `nullspace` picks its basis differently across versions.
+    N = hcat(normalize([-0.3, 1.0, 0.0]), [0.0, 0.0, 1.0])
+    @test norm(S * N) < 1e-15
+    M = N * [0.2 0.05; 0.05 0.1] * N'
+    @test norm(S * M) < 1e-14
+    Id = Matrix(1.0I, n, n)
+    T = [Id zeros(n, n); M Id]                # λ → λ + M x
+    L = [Id zeros(n, n); -A'*M Id]          # what that does to the innovation
+    h = 0.05 .* randn(rng, 2n)
+    x0 = 0.1 .* randn(rng, 2n)
+    P0 = Matrix(0.3I, 2n, 2n)
+    sym(X) = Matrix(Symmetric((X + X') / 2))
+    function model(Qs, Σm, hm, x0m, P0m; terminal, condition)
+        sm = LQRStateModel(
+            copy(A),
+            copy(S),
+            sym.(Qs),
+            sym(Σm);
+            schedule=terminal ? cost_schedule(tsteps; terminal=true) : Int[],
+            terminal=terminal,
+            condition_terminal=condition,
+            Σf=Matrix(0.02I, n, n),
+            hf=zeros(n),
+            h=hm,
+            x0=x0m,
+            P0=sym(P0m),
+        )
+        return LinearDynamicalSystem(
+            sm, GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+        )
+    end
+    ys = [0.5 .* randn(StableRNG(40 + i), p, tsteps) for i in 1:3]
+    for (terminal, condition) in ((true, true), (true, false), (false, false))
+        before = terminal ? [Qrun, Qterm] : [Qrun]
+        after = [Qrun + M - A' * M * A]
+        terminal && push!(after, Qterm + M)
+        base = model(before, Σ, h, x0, P0; terminal=terminal, condition=condition)
+        shaped = model(
+            after,
+            L * Σ * L',
+            L * h,
+            T * x0,
+            T * P0 * T';
+            terminal=terminal,
+            condition=condition,
+        )
+        # The move is real: ‖M − AᵀMA‖ ≈ 0.029 on the running cost (A is near I),
+        # ‖M‖ ≈ 0.23 on the terminal one — against an ELBO held to 1e-12.
+        @test norm(after[1] .- before[1]) > 0.02
+        terminal && @test norm(after[2] .- before[2]) > 0.2
+        @test maximum(
+            abs,
+            closed_loop_dynamics(base.state_model) .-
+            closed_loop_dynamics(shaped.state_model),
+        ) < 1e-12
+        @test elbo(shaped, ys) ≈ elbo(base, ys) rtol = 1e-12
+    end
+    return nothing
+end
+
+"""The terminal-conditioned M-step moves only to a point both of its estimates
+call an improvement, and falls back to steepest descent when the optimizer's
+proposal climbs.
+
+A synthetic problem stands in for the real one. Its surrogate is unbounded
+below along `θ₂`, as the switching surrogate is wherever the probe's scatter
+exceeds the data's; its score shares the surrogate's gradient at `θ′ = 0` (as
+the real score does, at a stationary probe posterior) but rises along `θ₂`. An
+optimizer run on that surrogate ends far out along `θ₂`, where every halving
+back toward `θ′` still climbs the score.
+"""
+function test_lqr_conditional_acceptance()
+    written = Ref(Float64[])
+    function problem(surrogate, score; rescores=true)
+        theta = [0.0, 0.0]
+        evaluate!(_, θ) = surrogate(θ)
+        write!(θ) = (written[] = copy(θ); nothing)
+        score!(θ) = score(θ)
+        return (; theta, evaluate!, write!, score!, rescores)
+    end
+    s(θ) = θ[1] - 10 * θ[2]^2
+    J(θ) = θ[1] + θ[2]^2
+    ∇ = [1.0, 0.0]          # both s and J, at θ′
+    at_start = (0.0, 0.0)   # (surrogate, score) at θ′
+
+    # Every halving of the runaway proposal lowers s and raises J: the
+    # fallback's unit steepest-descent step is what gets taken.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [0.0, 50.0], at_start, ∇)
+    @test written[] == [-1.0, 0.0]
+
+    # A proposal both estimates call an improvement is taken whole.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [-0.5, 0.1], at_start, ∇)
+    @test written[] == [-0.5, 0.1]
+
+    # No proposal at all (a failed line search hands back θ′): straight to the fallback.
+    @test SSD._lqr_accept_conditional!(problem(s, J), [0.0, 0.0], at_start, ∇)
+    @test written[] == [-1.0, 0.0]
+
+    #=
+    A score improvement the surrogate contradicts is refused. Both replace
+    `log Z` with a lower bound, so the objective is at least the larger of the
+    two, and here the surrogate's is the larger everywhere but θ′. At a
+    stationary θ′ there is no fallback either, and the M-step stays put.
+    =#
+    bowl(θ) = sum(abs2, θ)
+    @test !SSD._lqr_accept_conditional!(
+        problem(bowl, θ -> -1.0 - abs(θ[1])), [1.0, 1.0], at_start, [0.0, 0.0]
+    )
+    @test written[] == [0.0, 0.0]
+
+    # A non-finite candidate is a rejected one, on either estimate.
+    wall(θ) = θ[1] < -0.3 ? Inf : s(θ)
+    @test SSD._lqr_accept_conditional!(problem(wall, J), [0.0, 50.0], at_start, ∇)
+    @test written[] == [-0.25, 0.0]
+    @test SSD._lqr_accept_conditional!(
+        problem(s, θ -> θ[1] < -0.3 ? NaN : J(θ)), [0.0, 50.0], at_start, ∇
+    )
+    @test written[] == [-0.25, 0.0]
+
+    # With an exact normalizer the two coincide, and the score is never computed.
+    exact = problem(s, _ -> error("scored under an exact normalizer"); rescores=false)
+    @test SSD._lqr_accept_conditional!(exact, [-0.5, 0.0], at_start, ∇)
+    @test written[] == [-0.5, 0.0]
+    return nothing
+end
+
 """A numerical failure at one point is a rejected step, not a dead fit.
 
 The normalizer's probe is smoothed on a model carrying no observations, which
@@ -2254,7 +2401,8 @@ function test_lqr_free_matches_gaussian_lds()
     Theta = SSD._free_theta_pooled([lds], [hs], [1])
     R = SSD._free_residual_scatter(Theta, hs)
     expected = (R + prior.Ψ) / (prior.ν + hs.nk[1] + d + 1)
-    SSD._free_state_mstep!(lds, hs)
+    # Its diagnostics are `@debug`, not a warning on every M-step.
+    @test_logs min_level = Base.CoreLogging.Warn SSD._free_state_mstep!(lds, hs)
     @test sm.Σ ≈ expected atol = 1e-10
     return nothing
 end

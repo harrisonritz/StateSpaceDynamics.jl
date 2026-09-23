@@ -860,7 +860,13 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 
 # Keywords
 - `max_iter::Int=100`: maximum EM iterations
-- `tol::Float64=1e-6`: convergence tolerance on ELBO change
+- `tol::Float64=1e-6`: convergence tolerance on the ELBO change between
+  iterations, absolute (in nats)
+- `rtol::Float64=0.0`: the same, relative to the ELBO's magnitude. The fit stops
+  once the change is below `max(tol, rtol * |ELBO|)`, so the default of zero is
+  the absolute test alone. The bound grows with the number of trials and
+  timesteps, and an absolute `tol` asks a large fit for more significant
+  figures than a small one; `rtol = 1e-8` or so asks every fit for the same.
 - `progress::Bool=true`: show progress bar
 - `ux`: optional dynamics-input sequence in the same shape family as `y`
   (each trial `(ux_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
@@ -897,13 +903,14 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   `(newton_max_iter=10,)` for a Poisson emission.
 
 Returns a `Vector{T}` of ELBO values, one per iteration — or a
-[`FitTrace{T}`](@ref) when `y_test` is given, which behaves as that same vector.
+[`FitTrace`](@ref) when `y_test` is given, which behaves as that same vector.
 """
 function fit!(
     lds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     ux=nothing,
     uy=nothing,
@@ -935,10 +942,17 @@ function fit!(
     )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
-        lds, data, grp; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds,
+        data,
+        grp;
+        max_iter=max_iter,
+        tol=tol,
+        rtol=rtol,
+        progress=progress,
+        monitor=monitor,
     )
     return _fit_tridiag!(
-        lds, data; max_iter=max_iter, tol=tol, progress=progress, monitor=monitor
+        lds, data; max_iter=max_iter, tol=tol, rtol=rtol, progress=progress, monitor=monitor
     )
 end
 
@@ -991,6 +1005,23 @@ function _grouped_estep_elbo_gaussian!(
 end
 
 """
+    _em_converged(elbos, iter, tol, rtol) -> Bool
+
+Whether an EM trace has converged at `iter`: its last change is below
+`max(tol, rtol * |elbos[iter]|)`.
+
+`tol` is absolute, and was the whole test before `rtol` existed; `rtol = 0` keeps
+exactly that test. The relative half is there because the bound is a sum over
+every trial and timestep: an absolute `1e-6` asks a fit whose ELBO is `-1e6` for
+twelve significant figures and one whose ELBO is `-10` for seven, while a
+relative tolerance asks both for the same.
+"""
+function _em_converged(elbos::AbstractVector{<:Real}, iter::Int, tol::Real, rtol::Real)
+    iter > 1 || return false
+    return abs(elbos[iter] - elbos[iter - 1]) < max(tol, rtol * abs(elbos[iter]))
+end
+
+"""
     _fit_tridiag_grouped!(lds, data, grp; max_iter, tol, progress)
 
 EM driver for a Gaussian LDS whose parameters depend on an ancillary variable.
@@ -1004,6 +1035,7 @@ function _fit_tridiag_grouped!(
     grp::ParameterGrouping;
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
     align_final::Bool=false,
@@ -1035,7 +1067,7 @@ function _fit_tridiag_grouped!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1071,6 +1103,7 @@ function _fit_tridiag!(
     data::Data{T};
     max_iter::Int=100,
     tol::Float64=1e-6,
+    rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
     align_final::Bool=false,
@@ -1146,7 +1179,7 @@ function _fit_tridiag!(
             return _fit_result(monitor, elbos, lds)
         end
 
-        converged = iter > 1 && abs(elbos[iter] - elbos[iter - 1]) < tol
+        converged = _em_converged(elbos, iter, tol, rtol)
         if align_final && (converged || iter == max_iter)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)

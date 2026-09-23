@@ -70,6 +70,7 @@ using SSDTest
                 test_valid_SLDS_nonstochastic_rows_and_invalid_Z0()
                 test_valid_SLDS_mixed_observation_model_types()
                 test_valid_SLDS_inconsistent_latent_or_obs_dims()
+                test_SLDS_entry_points_validate()
                 test_SLDS_sampling_gaussian()
                 test_SLDS_sampling_poisson()
                 test_SLDS_deterministic_transitions()
@@ -165,6 +166,8 @@ using SSDTest
                 test_SLDS_tied_params_each_group()
                 test_SLDS_tied_params_elbo_monotone()
                 test_SLDS_tied_params_gls_path()
+                test_SLDS_tied_params_order_invariant()
+                test_SLDS_tied_prior_counted_once()
                 test_SLDS_tied_params_x0_P0_noop()
                 test_SLDS_tied_params_frozen_group()
                 test_SLDS_tied_params_partial_errors()
@@ -239,6 +242,7 @@ using SSDTest
             test_lds_with_B_input_equivalent_to_bias()
             test_td_fit_with_latent_input()
             test_td_sampling_zero_input_matches_no_input()
+            test_multitrial_rand_is_per_trial()
             test_td_fit_missing_u_errors()
             test_marginal_loglikelihood()
             test_marginal_ll_matches_naive_filter()
@@ -287,6 +291,7 @@ using SSDTest
 
             @testset "EM Algorithm" begin
                 test_parameter_gradient()
+                test_poisson_reductions_layout_independent()
                 test_initial_observation_parameter_updates()
                 test_state_model_parameter_updates()
                 test_initial_observation_parameter_updates(3)
@@ -404,6 +409,7 @@ using SSDTest
                 test_lqr_terminal_normalizer()
                 test_lqr_terminal_normalizer_shared_horizons()
                 test_lqr_dimension_and_terminal_score()
+                test_lqr_shaping_symmetry()
             end
 
             @testset "Free mode" begin
@@ -433,6 +439,7 @@ using SSDTest
                 test_lqr_mstep_preserves_structure()
                 test_lqr_em_monotone()
                 test_lqr_conditional_mstep_gradient()
+                test_lqr_conditional_acceptance()
                 test_lqr_rejectable_failures()
                 test_lqr_noise_update_closed_form()
                 test_lqr_fixed_costate_sigma()
@@ -489,6 +496,12 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/Convergence.jl")
+        @testset "EM stopping rule" begin
+            test_em_converged_rule()
+            test_em_relative_tolerance()
+        end
+
         include("LinearDynamicalSystems/LQRSLDS.jl")
         @testset "Switching inverse-LQR (LQR SLDS)" begin
             test_slds_lqr_matches_lds()
@@ -499,13 +512,20 @@ using SSDTest
             test_slds_lqr_tied()
             test_slds_lqr_terminal()
             test_slds_lqr_terminal_conditioning()
+            test_slds_lqr_terminal_chain_step()
+            test_slds_lqr_probe_resmoothing()
+            test_slds_lqr_conditional_score_gradient()
             test_slds_lqr_validation()
             test_slds_lqr_prior_vs_optimal_data()
             test_slds_lqr_rand()
+            test_slds_lqr_state_order()
+            test_slds_lqr_rand_schedules()
             test_slds_lqr_noise_version_lookup()
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
             test_slds_lqr_grouped_free_state_pools()
+            test_slds_lqr_tied_emission_mask()
+            test_slds_lqr_tied_prior_counted_once()
             test_lqr_pair_slots()
         end
 
@@ -589,6 +609,16 @@ using SSDTest
 
         @testset "Covariance info-form update" begin
             test_info_update()
+        end
+
+        include("Utilities/Riccati.jl")
+        @testset "Riccati sweeps" begin
+            test_riccati_simulate_lqr_matches_qp()
+            test_riccati_matches_lqr_riccati_sequence()
+            test_riccati_adjoint()
+            test_riccati_adjoint_accumulates()
+            test_riccati_preallocated()
+            test_riccati_errors()
         end
     end
 

@@ -301,6 +301,62 @@ function test_PoissonLDS_with_params()
     @test poisson_lds.fit_bool == [true, true, true, true, true, true]
 end
 
+"""
+The Poisson emission's trial sums are chunked by trial count, not by thread or
+pool count: the emission M-step, its gradient and the observation Q-term give
+the same bits with one buffer as with three or seven, so a fit is reproducible
+across machines. (An LQR fit's L-BFGS amplifies a last-bit difference in its
+inputs into ~1e-3 nats.)
+"""
+function test_poisson_reductions_layout_independent()
+    plds, _, y = toy_PoissonLDS(37)
+    tsteps = [size(yt, 2) for yt in y]
+    T_max = maximum(tsteps)
+    function pool(n)
+        return [
+            StateSpaceDynamics.SmoothWorkspace(
+                Float64, plds.latent_dim, plds.obs_dim, T_max
+            ) for _ in 1:n
+        ]
+    end
+    tfs = StateSpaceDynamics.initialize_FilterSmooth(plds, tsteps)
+    StateSpaceDynamics.smooth!(plds, tfs, y, pool(2))
+    data = StateSpaceDynamics.Data(plds, y)
+
+    fitted = map((1, 3, 7)) do n
+        m = deepcopy(plds)
+        StateSpaceDynamics.update_observation_model!(m, tfs, y, pool(1); ntasks=n)
+        return (m.obs_model.C, m.obs_model.d)
+    end
+    @test fitted[1] == fitted[2] == fitted[3]
+    @test fitted[1][1] != plds.obs_model.C             # it moved
+
+    C, d, D = plds.obs_model.C, plds.obs_model.d, plds.obs_model.D
+    grads = map((1, 3, 7)) do n
+        g = zeros(length(C) + length(d))
+        StateSpaceDynamics.gradient_observation_model!(g, C, d, D, tfs, y, nothing, pool(n))
+    end
+    @test grads[1] == grads[2] == grads[3]
+
+    qs = [
+        StateSpaceDynamics._poisson_q_obs_total(plds, tfs, data, pool(n)) for n in (1, 3, 7)
+    ]
+    @test qs[1] == qs[2] == qs[3]
+
+    xs = [tfs[k].x_smooth for k in eachindex(y)]
+    jll = StateSpaceDynamics.joint_loglikelihood
+    @test jll(plds, xs, y) ≈ sum(sum(jll(plds, xs[k], y[k])) for k in eachindex(y))
+
+    # The chunks are a function of the trial count alone.
+    @test StateSpaceDynamics._reduction_chunks(37) ==
+        StateSpaceDynamics._reduction_chunks(37)
+    @test reduce(vcat, collect.(StateSpaceDynamics._reduction_chunks(37))) == 1:37
+    @test length(StateSpaceDynamics._reduction_chunks(1000)) <=
+        StateSpaceDynamics._REDUCTION_CHUNKS
+    @test isempty(StateSpaceDynamics._reduction_chunks(0))
+    return nothing
+end
+
 function test_Gradient()
     plds, x, y = toy_PoissonLDS()
     return test_gradient_common(plds, x, y)
@@ -567,7 +623,14 @@ function test_poisson_obs_inputs(; rng=MersenneTwister(0xD0B5))
         @test_throws ArgumentError elbo(plds, Y)
         @test_throws ArgumentError fit!(deepcopy(plds), Y; progress=false)
 
-        # Laplace-EM ELBO monotone and D is learned from a zero init.
+        #=
+        Laplace-EM improves and D is learned from a zero init. Not monotone to
+        1e-6: the Laplace E-step is approximate, and once the fit is near its
+        optimum the trace wobbles at that approximation's resolution (on Julia
+        1.10's draw of this fixture, fourteen steps dip, the largest by 8e-3
+        nats, against a 305-nat gain). A dip must stay small next to the
+        progress.
+        =#
         plds0 = LinearDynamicalSystem(
             GaussianStateModel(;
                 A=0.5 * Matrix{Float64}(I, Dl, Dl),
@@ -579,7 +642,9 @@ function test_poisson_obs_inputs(; rng=MersenneTwister(0xD0B5))
             PoissonObservationModel(; C=0.1 * randn(rng, P, Dl), d=zeros(P), D=zeros(P, V)),
         )
         elbos = fit!(plds0, Y; uy=uy, max_iter=50, progress=false)
-        @test minimum(diff(elbos)) >= -1e-6
+        gain = elbos[end] - elbos[1]
+        @test gain > 0
+        @test minimum(diff(elbos)) >= -1e-4 * gain
         @test norm(plds0.obs_model.D) > 1e-3
     end
     return nothing

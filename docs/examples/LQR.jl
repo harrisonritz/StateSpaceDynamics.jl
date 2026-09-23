@@ -61,14 +61,14 @@ default(; # hide
 # parameters ``(A, S, Q_{1:K})`` and derives ``M_t`` from them, so every M-step
 # returns a model that is still exactly a control problem.
 
-plant_dim = 2
+nplant = 2                           # the plant dimension n
 obs_dim = 8
 tsteps = 30
 
 A = [0.97 0.05; -0.04 0.95]          # the plant
 S = [0.05 0.01; 0.01 0.04]           # B R⁻¹ Bᵀ — control authority
 Qc = [0.20 0.03; 0.03 0.15]          # running state cost
-Σ = Matrix(Diagonal(fill(0.02, 2 * plant_dim)));
+Σ = Matrix(Diagonal(fill(0.02, 2 * nplant)));
 
 # The noise lives in the **mixed** coordinates ``[x_{t+1}; \lambda_t]``: its
 # leading block is genuine plant process noise and its trailing block is *costate
@@ -81,8 +81,8 @@ state_model = LQRStateModel(A, S, Qc, Σ; P0=Matrix(0.2I, 4, 4))
 # The emission reads the state but not the costate — the default, since the
 # costate is an inferred intention rather than something recorded.
 
-C = randn(rng, obs_dim, 2 * plant_dim)
-C[:, (plant_dim + 1):end] .= 0
+C = randn(rng, obs_dim, 2 * nplant)
+C[:, (nplant + 1):end] .= 0
 obs_model = GaussianObservationModel(C, Matrix(0.05I, obs_dim, obs_dim), zeros(obs_dim))
 lds = LinearDynamicalSystem(state_model, obs_model)
 
@@ -134,7 +134,7 @@ _, ys_model = rand(StableRNG(99), model_lds, fill(20, 120))
 init = LQRStateModel(
     copy(A),
     copy(S),
-    Matrix(0.4I, plant_dim, plant_dim),      # deliberately wrong starting cost
+    Matrix(0.4I, nplant, nplant),      # deliberately wrong starting cost
     Matrix(0.05I, 4, 4);
     P0=Matrix(0.2I, 4, 4),
     fit_flags=LQRFitFlags(; A=false, S=false),
@@ -183,7 +183,7 @@ println("fitted Qc = ", round.(init.Qc[1]; digits=3))
 # the generating one:
 
 fit_on_optimal = LQRStateModel(
-    copy(A), copy(S), Matrix(0.4I, plant_dim, plant_dim), Matrix(0.05I, 4, 4);
+    copy(A), copy(S), Matrix(0.4I, nplant, nplant), Matrix(0.05I, 4, 4);
     P0=Matrix(0.2I, 4, 4), fit_flags=LQRFitFlags(; A=false, S=false),
 )
 lds_opt = LinearDynamicalSystem(
@@ -239,7 +239,7 @@ varying = LQRStateModel(
     copy(Σ);
     schedule=schedule,
     terminal=true,
-    Σf=Matrix(0.02I, plant_dim, plant_dim),
+    Σf=Matrix(0.02I, nplant, nplant),
     P0=Matrix(0.2I, 4, 4),
 )
 z_var = simulate_lqr(rng, varying, tsteps; process_noise=false, x1=[1.0, -0.6])
@@ -270,14 +270,14 @@ track_sm = LQRStateModel(
     copy(Σ);
     schedule=cost_schedule(tsteps; terminal=true),
     terminal=true,
-    Bu=zeros(4, plant_dim),
-    Gref=Matrix(1.0I, plant_dim, plant_dim),    # the reference *is* the input
-    Σf=Matrix(1e-6I, plant_dim, plant_dim),
+    Bu=zeros(4, nplant),
+    Gref=Matrix(1.0I, nplant, nplant),    # the reference *is* the input
+    Σf=Matrix(1e-6I, nplant, nplant),
     P0=Matrix(0.2I, 4, 4),
 )
 target = [1.5, -0.8]
 z_track = simulate_lqr(
-    track_sm, tsteps; process_noise=false, x1=zeros(plant_dim),
+    track_sm, tsteps; process_noise=false, x1=zeros(nplant),
     ux=repeat(target, 1, tsteps),
 )
 
@@ -287,7 +287,7 @@ hline!(p3, target; label="target", linestyle=:dot, color=:black)
 p3
 
 println("distance to target at the end: ",
-        round(norm(z_track[1:plant_dim, end] .- target); digits=4))
+        round(norm(z_track[1:nplant, end] .- target); digits=4))
 
 # The costate is the gradient of the cost-to-go, so it vanishes as the state
 # reaches the target — `λ_T = Q_f(x_T − r_T)` is the terminal condition, and with
@@ -461,7 +461,7 @@ println("plant shared: ", sp1.A == sp2.A, "   cost differs: ", sp1.Qc[1] != sp2.
 # way, and so do composite emissions mixing kinematics with spikes.
 
 C_spk = 0.4 .* randn(rng, 12, 4)
-C_spk[:, (plant_dim + 1):end] .= 0
+C_spk[:, (nplant + 1):end] .= 0
 plds = LinearDynamicalSystem(
     LQRStateModel(copy(A), copy(S), copy(Qc), copy(Σ); P0=Matrix(0.2I, 4, 4)),
     PoissonObservationModel(C_spk, fill(0.5, 12)),
@@ -481,8 +481,8 @@ using SSDTest  #src
 @test size(z_var) == (4, tsteps)  #src
 @test all(isfinite, z_var)  #src
 @test minimum(diff(poisson_elbos)) > -1e-6  #src
-@test all(iszero, plds.obs_model.C[:, (plant_dim + 1):end])  #src
-@test norm(z_track[1:plant_dim, end] .- target) < 0.05  #src
+@test all(iszero, plds.obs_model.C[:, (nplant + 1):end])  #src
+@test norm(z_track[1:nplant, end] .- target) < 0.05  #src
 @test size(z_track) == (4, tsteps)  #src
 @test sw_elbos[end] > sw_elbos[1]  #src
 @test all(symplectic_defect(l.state_model) < 1e-9 for l in slds.LDSs)  #src

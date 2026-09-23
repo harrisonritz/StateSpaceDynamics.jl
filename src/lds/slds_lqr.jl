@@ -17,8 +17,10 @@ The *forward* transition parameters an `SLDS` sampler rolls, read from the cache
 them under the same names a Gaussian state uses lets `_sample_slds_trial!` draw a
 switching path without knowing which kind of state it is drawing from.
 
-An `SLDS` member carries a single cost (the discrete state *is* the epoch), so
-there is one transition to hand back.
+An `SLDS` member's transitions follow a single cost (the discrete state *is*
+the epoch), so there is one transition to hand back: that cost's. A separate
+terminal cost is read only by the terminal factor and does not enter the roll.
+The rule is enforced before sampling by `_validate_slds_state_models`.
 
 As with a single inverse-LQR model, this rolls the model's own forward flow,
 which is unstable by construction — see [`_warn_unstable_rollout`](@ref) and
@@ -28,14 +30,32 @@ function _extract_state_params(sm::LQRStateModel{T}) where {T<:Real}
     c = sm.cache
     d = _state_latent_dim(sm)
     m = size(sm.Bu, 2)
+    k = first(_slds_transition_regimes(sm))
     return (
-        A=c.M[1],
-        B=m > 0 ? c.Bfwd[1] : zeros(T, d, 0),
+        A=c.M[k],
+        B=m > 0 ? c.Bfwd[k] : zeros(T, d, 0),
         Q=Matrix{T}(c.Qfwd),
         b=c.bfwd,
         x0=sm.x0,
         P0=sm.P0,
     )
+end
+
+"""
+    _slds_transition_regimes(sm) -> Vector{Int}
+
+The distinct costs an inverse-LQR state's *transitions* follow: its schedule's
+entries, the last excepted, since entry `T` of a schedule is read only by the
+terminal factor. An empty schedule is regime 1 throughout.
+
+A switching model allows exactly one — see `_validate_slds_state_models` — and
+it need not be regime 1: `[2, 2, …, 2, 1]` is one cost and a terminal cost.
+"""
+function _slds_transition_regimes(sm::LQRStateModel)
+    sched = sm.schedule
+    isempty(sched) && return [1]
+    length(sched) == 1 && return [sched[1]]
+    return unique(view(sched, 1:(length(sched) - 1)))
 end
 
 """
@@ -62,8 +82,16 @@ when the emission is not allowed to see it.
 
 Called before any parallel section, since the cache is shared by every trial
 workspace. A no-op for a state model with no cache to refresh.
+
+Also where the switching-level checks of [`validate_SLDS`](@ref) run — the chain
+is a proper distribution, the regimes agree on their dimensions, and the
+state-model rules hold — and where a `:free` state's costate readout is matched
+to the inverse-LQR states' (see [`_match_costate_readout!`](@ref)), so a fit, a
+smooth, a score and `rand` all see the same, valid model.
 """
 function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
+    _validate_slds_structure(slds)
+    _match_costate_readout!(slds)
     for lds in slds.LDSs
         _prepare_slds_regime!(lds, tsteps)
     end
@@ -71,6 +99,37 @@ function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
 end
 
 _prepare_slds_regime!(::LinearDynamicalSystem, ::AbstractVector{Int}) = nothing
+
+"""
+    _match_costate_readout!(slds) -> slds
+
+Give every `:free` discrete state the inverse-LQR states' `observe_costate`.
+
+The emission then reads the same latent coordinates in every mode. When the
+inverse-LQR states may not read their costate, neither may a free state read
+coordinates `n+1:2n` directly — it still feels them through its own dynamics,
+which mix them into the rest — so what the emission sees does not change meaning
+when the discrete state does. Without this a free state's emission could load on
+coordinates that mean nothing in the other modes, and a tied `C` would have to
+reconcile two different masks.
+
+The inverse-LQR states agree among themselves (`_validate_slds_state_models`
+insists), and a model with no inverse-LQR state is left alone. The free state's
+own emission is then zeroed on those columns by `_prepare_lqr!`, like any other
+state that may not read them.
+"""
+function _match_costate_readout!(slds::SLDS)
+    ref = findfirst(
+        lds -> lds.state_model isa LQRStateModel && !_is_free(lds.state_model), slds.LDSs
+    )
+    ref === nothing && return slds
+    observe = slds.LDSs[ref].state_model.observe_costate
+    for lds in slds.LDSs
+        sm = lds.state_model
+        sm isa LQRStateModel && _is_free(sm) && (sm.observe_costate = observe)
+    end
+    return slds
+end
 
 function _prepare_slds_regime!(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}
@@ -186,7 +245,7 @@ function _slds_state_mstep!(
     tied::AbstractVector{Symbol},
     ::AbstractVector{Int},
     ::SmoothWorkspace{T},
-    _,
+    ::Any,               # not `_`: Julia 1.10 cannot lower `_` beside keywords
     K::Int,
     ::Int,
     ::Int;

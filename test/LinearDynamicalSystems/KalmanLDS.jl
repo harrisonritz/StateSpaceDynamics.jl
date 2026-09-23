@@ -332,6 +332,53 @@ function test_td_sampling_zero_input_matches_no_input()
     @test y1 ≈ y2 atol = 1e-12
 end
 
+"""
+A multi-trial draw is a function of `rng` and the trial index alone. Trial `i` is
+exactly the single-trial draw from a `Xoshiro` seeded with the `i`-th `UInt64`
+off `rng` — so no thread count or chunking can move it — and hence a prefix of
+the trials, or a change to another trial's length, leaves it where it was. The
+sampler used to split `rng` over `Threads.maxthreadid()` chunks, which Julia
+1.12+ sets to 2 by default and 1.10 to 1: the same seed gave different data.
+"""
+function test_multitrial_rand_is_per_trial()
+    D, p = 2, 3
+    sm = GaussianStateModel(;
+        A=[0.9 0.1; -0.1 0.9],
+        Q=Matrix(0.1I, D, D),
+        x0=zeros(D),
+        P0=Matrix(1.0I, D, D),
+        b=zeros(D),
+    )
+    C = [0.5 -0.2; 0.1 0.4; -0.3 0.3]
+    gauss = LinearDynamicalSystem(
+        sm, GaussianObservationModel(; C=C, R=Matrix(0.2I, p, p), d=zeros(p))
+    )
+    pois = LinearDynamicalSystem(sm, PoissonObservationModel(; C=C, d=fill(0.3, p)))
+    ts = [12, 7, 20, 9, 15]
+    for lds in (gauss, pois)
+        x, y = rand(StableRNG(5), lds, ts)
+        seeds = let r = StableRNG(5)
+            [rand(r, UInt64) for _ in ts]
+        end
+        for i in eachindex(ts)
+            xi, yi = rand(Random.Xoshiro(seeds[i]), lds, ts[i])
+            @test x[i] == xi
+            @test y[i] == yi
+        end
+
+        xp, yp = rand(StableRNG(5), lds, ts[1:3])
+        @test xp == x[1:3] && yp == y[1:3]
+        xr, yr = rand(StableRNG(5), lds, [12, 7, 3, 9, 15])
+        @test xr[[1, 2, 4, 5]] == x[[1, 2, 4, 5]] && yr[[1, 2, 4, 5]] == y[[1, 2, 4, 5]]
+
+        # One trial draws from `rng` itself, as the scalar form does.
+        x1, y1 = rand(StableRNG(5), lds, [12])
+        xs, ys = rand(StableRNG(5), lds, 12)
+        @test x1[1] == xs && y1[1] == ys
+    end
+    return nothing
+end
+
 function test_td_fit_missing_u_errors()
     # B is set but the required dynamics inputs are omitted at fit time → error.
     D, p, T, N = 2, 3, 15, 2

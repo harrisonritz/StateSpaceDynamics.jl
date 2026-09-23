@@ -45,7 +45,29 @@ every run).
 | `plotting.jl` | figures |
 | `experiments.jl` | the eight sweeps |
 | `smoulder.jl` | grouped Poisson recovery matched to the smoulder-reward task |
+| `parameterization.md` | a design review: is the mixed-coordinate model the right parameterization? |
+| `parameterization.jl` | the measurements behind it — self-contained, imports nothing from `src/` |
+| `biological.md` | the same question for a system that may only be *approximately* control-like |
+| `biological.jl` | its measurements — also self-contained |
+| `implementation-plan.md` | the plan that follows from both: a closed-loop state model for noisy, approximately optimal neural systems |
 | `reference_audit.jl` | target-column matching, marginal-likelihood curvature, exact EM-step checks, paired costate controls |
+
+`parameterization.md` is the one file here that is not a recovery sweep. It
+takes the findings below as given and asks the prior question: whether the
+mixed-coordinate (Hamiltonian) latent is the right way to write the inverse
+control problem in the first place, and what the alternatives buy. Several of
+the harder findings below — the cost scale, the reference/cost trade, the
+`Σ_λλ` inversion in the switching fit — turn out to be properties of the
+parameterization rather than of the data.
+
+`biological.md` drops the premise that the data came from a controller at all,
+which is the situation for neural data, and asks what can still be claimed. Its
+central measurement is that `Σ_λλ` does **not** measure suboptimality: an
+exactly optimal agent under plant noise already violates the adjoint recursion
+by a large, systematic amount, while the Riccati-graph relation it *doesn't*
+violate is the one that responds to suboptimality alone. It also evaluates
+fixing `S`, constraining `Σ`'s costate block, and an equality-constrained KKT
+backend.
 
 ## Smoulder-reward recovery suite
 
@@ -733,9 +755,11 @@ recovered from 4.42 to 1.55.
 
 ## Findings on the package
 
-Three things this harness turned up that are about `src/`, not about the models
-it fits. None of them is patched here — this directory is a measuring
-instrument, not a fix.
+Things this harness turned up that are about `src/`, not about the models it
+fits. The directory is a measuring instrument, so the fixes live in `src/` and
+`test/`; each entry says where. #1–#3 were closed by milestone M0 of
+[`implementation-plan.md`](implementation-plan.md), #4 earlier, #5–#7 after
+it.
 
 ### 1. An `SLDS` mis-sizes its weighted sufficient statistics when the discrete states differ in regime count
 
@@ -765,6 +789,11 @@ lqr  = LQRStateModel(A, S, [Qrun, Qterm], Σ;
 "delay, then reach". The general fix is to allocate per discrete state; the
 ordering workaround still fails for two LQR states with different regime counts.
 
+**Fixed.** The statistics are now allocated per discrete state, at all three
+sites (the M-step, the fit's preallocation, and the terminal normalizer's
+probe). `test_slds_lqr_state_order` fits the pair above in both orders and gets
+the same model; the ordering workaround is no longer needed.
+
 ### 2. `rand` on an `SLDS` ignores an LQR state's cost schedule
 
 `_extract_state_params(sm::LQRStateModel)` hands the sampler `cache.M[1]` — one
@@ -777,6 +806,15 @@ M-step honour `schedule`, the sampler does not. Either the sampler should walk
 the schedule, or the constructor should refuse a multi-transition schedule on a
 member of an `SLDS`.
 
+**Fixed, by refusing.** `validate_SLDS` already had a rule for this, but nothing
+called it, and it was stricter than the model: it refused any state with more
+than one `Qc`, which includes the running-plus-terminal state this harness uses.
+The rule is now the precise one — a state's *transitions* follow one cost; a
+separate terminal cost, read only by the terminal factor, is fine — and it is
+enforced wherever the model is used (`fit!`, `smooth`, `elbo` and both `rand`
+methods). The sampler rolls that transition cost's `M`, which need not be
+`M[1]`. See `test_slds_lqr_rand_schedules`.
+
 ### 3. `tol` is an absolute ELBO change, and these models never reach it
 
 `converged = iter > 1 && abs(elbos[iter] - elbos[iter-1]) < tol`. On an
@@ -788,6 +826,12 @@ converged flag because a flag built on `tol` distinguishes nothing. A relative
 criterion (`|Δ| < tol * |elbo|`), or a stopping rule on the parameters rather
 than the bound, would make `fit!` say something useful about convergence.
 
+**Fixed, opt-in.** `fit!` on an `LDS`, a Poisson `LDS` and both inverse-LQR
+emissions takes `rtol` alongside `tol`, and stops once
+`|Δ| < max(tol, rtol · |ELBO|)`. The default `rtol = 0` keeps the absolute test,
+so no existing fit changes; pass something like `rtol = 1e-8` to have a large fit
+stop on the same terms as a small one. See `test_em_relative_tolerance`.
+
 ### 4. Nothing regularized an LQR state's `Σ` — now something does
 
 `LQRStateModel` accepted `P0_prior::IWPrior` and `x0_prior::MNPrior` but had no
@@ -798,7 +842,7 @@ state is a second free state and the fit collapses onto one regime.
 **This one is now implemented** rather than reported — `Σ_prior` and `Qc_prior`
 on `LQRStateModel`, acting in the profiled objective, its gradient, the noise
 M-step and the prior log-density. See "Priors do the job the initialization was
-doing silently" above for what they buy. The other three findings stand.
+doing silently" above for what they buy.
 
 The M-step tests now differentiate an independent reference objective with
 `ForwardDiff` for no, shared, combined, and per-epoch priors in both the profiled and
@@ -808,3 +852,145 @@ noise vary independently. That last check exposed and fixed an ELBO bug: the
 grouped path had counted both structural priors according to the noise groups,
 which under-counted varying `Qc` or over-counted shared `Qc`. The focused prior
 suite passes 61/61.
+
+### 5. A tied emission leaks into the costate columns on the pooled SLDS path
+
+In a switching model that ties `C` across a `:free` state and an inverse-LQR
+state with `observe_costate = false`, the plain fit let `C`'s costate columns
+become non-zero (≈ 0.28 on the diagonal after one M-step in
+`test_slds_lqr_grouped_free_state_pools`'s fixture), while the same fit through
+the grouped path — with a grouping that splits nothing — kept them at zero. The
+two ended 14 nats apart. A `:free` state defaults to `observe_costate = true`,
+so its statistics carried the costate columns into the pooled `C`; the grouped
+path happened to take its mask from the LQR state.
+
+**Fixed, by making the two modes read the same coordinates.** A `:free` state in
+a switching model now takes the inverse-LQR states' `observe_costate`
+(`_match_costate_readout!`, run at every entry point: `fit!`, the E-step
+helpers and `rand`). With `observe_costate = false` neither mode reads the
+costate half directly; the free state still feels it through its dynamics,
+which couple the two halves. Standalone, a `:free` state keeps reading
+everything. The partial-tie route also had its own leak: its full-width
+`CD_prior` could recreate costate coefficients from a non-zero `M₀`, so the
+prior is now masked to the free columns too (`_masked_mn_prior`). Every
+route — pooled, GLS and partial ties, Gaussian and Poisson, plain and grouped,
+either state order — now leaves the costate columns at exactly zero;
+`test_slds_lqr_tied_emission_mask` checks each.
+
+### 6. A tied regression's noise update read the other regimes' previous coefficients
+
+Found while checking #5, and not specific to LQR. A whole tie of `[C d D]`
+(or `[A b B]`) is fitted onto the tie's first regime and copied onto the rest
+at the end of the M-step. But `R` (or `Q`) is fitted in between, from each
+regime's residual scatter at *that regime's own* regression matrix, and every
+regime but the first still held the previous iterate's. So the noise update mixed
+the new shared `C` with stale copies of it, and the fit depended on which regime
+was listed first: `R` moved by 3e-3 and the fit ended 0.39 nats apart in the
+mixed LQR fixture, and every tied combination of a plain Gaussian `SLDS` differed
+between the two orders from the second iteration on.
+
+**Fixed.** `_grouped_update_C_d!` / `_grouped_update_A_b!` now copy the slot's
+fitted value onto the slot's other units before returning
+(`_share_slot_obs!` / `_share_slot_dyn!`). This is a no-op for the `depends_on`
+cells of one `LDS`, which alias one array. `test_SLDS_tied_params_order_invariant`
+fits `(:C, :d)`, `(:C, :d, :R)`, `(:A, :b)` and `(:A, :b, :Q)` in both orders and
+requires the same trace and parameters; before the fix all 36 of its checks fail.
+
+What is *not* order-invariant, and should not be expected to be: an inverse-LQR
+state's structural M-step is an L-BFGS solve along a nearly flat cost-scale
+direction, and its stopping point moves the ELBO by ~1e-3 nats under a 1e-14
+relative change in the data — the same amount the regime order moves it. That
+is the optimizer, not the model; see item 3 of "Concerns raised after M0".
+
+### 7. A multi-trial `rand` depended on the thread layout
+
+The `LDS` sampler split `rng` into `min(ntrials, Threads.maxthreadid())`
+`MersenneTwister` children, one per chunk of trials, so the same seed gave
+different data on different thread counts. Julia 1.12+ starts one interactive
+thread by default, which put `maxthreadid()` at 2 on 1.13 and 1 on 1.10 in the
+same CI configuration. `MersenneTwister`'s integer seeding also changed between
+those versions.
+
+**Fixed.** Each trial now draws from a `Xoshiro` of its own, seeded with the
+trial's `UInt64` off `rng`, drawn in trial order before anything is sampled.
+A trial's data depend on `rng` and its index alone: the same at `maxthreadid()`
+1, 2 and 8, and the same on 1.10 and 1.13 (`Xoshiro`'s seeded stream agrees
+across them) to the last bit of the BLAS. `test_multitrial_rand_is_per_trial`
+pins trial `i` to the single-trial draw from its seed. The `SLDS` and LQR
+samplers draw serially from `rng` and were never affected. This changes the
+data every multi-trial `rand` call produces for a given seed.
+
+## Concerns raised after M0
+
+Found while fixing #5–#7. Each is marked with where it stands.
+
+1. **Fixed: the switching ELBO counted a shared parameter's prior once per
+   regime.** The M-step fits a tied group, and the always-shared initial state,
+   as one value under one prior, but `_slds_prior_logdensity` summed every
+   regime's. With a tie and a prior the trace was therefore off by
+   `(K − 1) · log p(θ_tied)`, which moves as the shared value moves. The prior
+   is now counted once per distinct version: the grouped model's per-version
+   terms, with the regimes as units and each group's versions formed as the
+   M-step forms them. An LQR state's `Σ` (`:noise`) and `Qc` (`:structure`,
+   `:Qc`) are counted once across the states sharing them. `smooth` and `elbo`
+   take `tied_params`, so a tied fit's objective can be re-evaluated. Two
+   identical regimes with everything tied now score exactly as the single
+   model does (`test_SLDS_tied_prior_counted_once`,
+   `test_slds_lqr_tied_prior_counted_once`).
+
+2. **Fixed: under terminal conditioning, the chain ignored `log Ẑ`.** The
+   M-step ran plain Baum–Welch, and on the conditioned switching fixture that
+   lowered the conditioned score at most iterations and drove states toward
+   absorbing (`A = I` in one fit). A fixed-probe surrogate is no help: it is
+   `Σ (N − Ξ) log A`, unbounded wherever the probe expects more `i → j`
+   transitions than the data. The chain step (`_slqr_chain_mstep!`) now works
+   on the score itself, `g = Σ N log A + Σ n log π − log Ẑ`, with `q` held
+   fixed. It keeps Baum–Welch if that raises `g`; otherwise it takes an Armijo
+   step in the row logits along `∇g`, using Danskin's
+   `∂ log Ẑ / ∂A = Ξ / A` as the state M-step does; failing both, the chain
+   stays put. Across six fits the final deterministic ELBO is 2.2 nats better
+   on average, and no chain absorbs (`test_slds_lqr_terminal_chain_step`).
+
+3. **Documented, not changed: the LQR structural M-step is sensitive to its
+   inputs.** On a single inverse-LQR LDS (deterministic E-step), a `1 + 1e-14`
+   rescaling of the data moves the fit as follows after five EM iterations:
+
+   | `mstep_iters` | ΔELBO | `S` (rel.) | `Qc` (rel.) | closed loop (rel.) |
+   |---|---|---|---|---|
+   | 20 | 1e-10 | 1e-10 | 7e-11 | — |
+   | 100 (default) | 9e-4 | 2.5e-2 | 8e-3 | 2.3e-5 |
+   | 500 | 6e-7 | 0.97 | 1e-4 | 1.7e-7 |
+
+   The 100-iteration solve stops partway along a slow valley, and its stopping
+   point amplifies last-bit differences. Converged, the ELBO and the closed
+   loop `(I + S P)⁻¹ A` are reproducible, but `S` moves by 97%: it drifts
+   along the exact cost-scale gauge, which the data do not see. A larger
+   budget did not reliably end at a better ELBO either (the ordering flips
+   between 5 and 40 EM iterations), so the default stands. For reproducible
+   numbers, compare gauge invariants (recommendation 3 above), or fix the
+   scale with a `Qc_prior` (recommendation 2); raise `mstep_iters` when the
+   ELBO itself must reproduce. A tr S gauge was considered and not taken.
+
+4. **Fixed: `validate_SLDS` was never called on the fitting path.** `fit!`,
+   `smooth`, `elbo` and `rand` now run its switching-level checks — a proper
+   chain, regimes that agree on their dimensions, the state-model rules — at
+   entry (`test_SLDS_entry_points_validate`). Per-regime `validate_LDS`, which
+   the positional constructor already runs, is not repeated: it rejects the
+   six-entry `fit_bool` some Poisson models are built with, which fitting has
+   always accepted.
+
+5. **Fixed: diagnostic warnings on every free-state M-step.** They are
+   `@debug` now, and their `cond` / `eigvals` are evaluated only when debug
+   logging is on.
+
+6. **Fixed: Poisson trial sums associated by thread count.** The emission
+   M-step, its gradient, the observation Q-term and the multi-trial joint
+   log-likelihood now chunk by trial count alone (`src/numerics/reduction.jl`),
+   and reduce in chunk order in waves of however many buffers the caller has.
+   Before, all three differed across pool sizes and `ntasks` of 1, 3 and 7;
+   now they give identical bits (`test_poisson_reductions_layout_independent`).
+
+Also fixed along the way: the documentation build, red on every run of the PR
+and identical on `dev_reach`. Stale method signatures on the API page, 26
+exported docstrings missing, and references to undocumented internals meant a
+strict `makedocs` failed; it now passes.
