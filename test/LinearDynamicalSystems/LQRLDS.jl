@@ -1160,6 +1160,87 @@ function test_lqr_conditional_mstep_gradient()
     return nothing
 end
 
+"""The shaping class the `LQRStateModel` docstring describes is an exact symmetry
+of the likelihood, and a genuine change of cost.
+
+With control entering through one channel of three, any symmetric `M` with
+`S M = 0` gives `Q_run → Q_run + M − AᵀMA`, `Q_term → Q_term + M`, which with the
+induced change of costate (`Σ`, `h`, `x0`, `P0` transformed to match) leaves the
+closed loop and the ELBO unchanged — joint, terminal-conditioned, and with no
+terminal factor at all — while the cost moves by an amount no fit can see. This
+is why a fitted `Qc` is reported modulo the class.
+"""
+function test_lqr_shaping_symmetry()
+    rng = StableRNG(9)
+    n, p, tsteps = 3, 5, 25
+    A = [0.97 0.08 0.0; -0.06 0.95 0.04; 0.02 0.0 0.93]
+    b = [1.0, 0.3, 0.0]
+    S = 0.08 .* (b * b')                     # rank 1, so the class has dimension 3
+    Qrun = [0.3 0.05 0.0; 0.05 0.25 0.02; 0.0 0.02 0.2]
+    Qterm = Matrix(1.5I, n, n)
+    Σ = Matrix(Diagonal(fill(0.03, 2n))) .+ 0.005
+    C = randn(rng, p, 2n)
+    C[:, (n + 1):end] .= 0
+    # null(S), written out: `nullspace` picks its basis differently across versions.
+    N = hcat(normalize([-0.3, 1.0, 0.0]), [0.0, 0.0, 1.0])
+    @test norm(S * N) < 1e-15
+    M = N * [0.2 0.05; 0.05 0.1] * N'
+    @test norm(S * M) < 1e-14
+    Id = Matrix(1.0I, n, n)
+    T = [Id zeros(n, n); M Id]                # λ → λ + M x
+    L = [Id zeros(n, n); -A'*M Id]          # what that does to the innovation
+    h = 0.05 .* randn(rng, 2n)
+    x0 = 0.1 .* randn(rng, 2n)
+    P0 = Matrix(0.3I, 2n, 2n)
+    sym(X) = Matrix(Symmetric((X + X') / 2))
+    function model(Qs, Σm, hm, x0m, P0m; terminal, condition)
+        sm = LQRStateModel(
+            copy(A),
+            copy(S),
+            sym.(Qs),
+            sym(Σm);
+            schedule=terminal ? cost_schedule(tsteps; terminal=true) : Int[],
+            terminal=terminal,
+            condition_terminal=condition,
+            Σf=Matrix(0.02I, n, n),
+            hf=zeros(n),
+            h=hm,
+            x0=x0m,
+            P0=sym(P0m),
+        )
+        return LinearDynamicalSystem(
+            sm, GaussianObservationModel(copy(C), Matrix(0.1I, p, p), zeros(p))
+        )
+    end
+    ys = [0.5 .* randn(StableRNG(40 + i), p, tsteps) for i in 1:3]
+    for (terminal, condition) in ((true, true), (true, false), (false, false))
+        before = terminal ? [Qrun, Qterm] : [Qrun]
+        after = [Qrun + M - A' * M * A]
+        terminal && push!(after, Qterm + M)
+        base = model(before, Σ, h, x0, P0; terminal=terminal, condition=condition)
+        shaped = model(
+            after,
+            L * Σ * L',
+            L * h,
+            T * x0,
+            T * P0 * T';
+            terminal=terminal,
+            condition=condition,
+        )
+        # The move is real: ‖M − AᵀMA‖ ≈ 0.029 on the running cost (A is near I),
+        # ‖M‖ ≈ 0.23 on the terminal one — against an ELBO held to 1e-12.
+        @test norm(after[1] .- before[1]) > 0.02
+        terminal && @test norm(after[2] .- before[2]) > 0.2
+        @test maximum(
+            abs,
+            closed_loop_dynamics(base.state_model) .-
+            closed_loop_dynamics(shaped.state_model),
+        ) < 1e-12
+        @test elbo(shaped, ys) ≈ elbo(base, ys) rtol = 1e-12
+    end
+    return nothing
+end
+
 """The terminal-conditioned M-step moves only to a point both of its estimates
 call an improvement, and falls back to steepest descent when the optimizer's
 proposal climbs.

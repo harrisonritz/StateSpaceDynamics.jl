@@ -626,9 +626,10 @@ recovered from 4.42 to 1.55.
 
 ## Findings on the package
 
-Three things this harness turned up that are about `src/`, not about the models
-it fits. None of them is patched here — this directory is a measuring
-instrument, not a fix.
+Things this harness turned up that are about `src/`, not about the models it
+fits. The directory is a measuring instrument, so the fixes live in `src/` and
+`test/`; each entry says where. #1–#3 were closed by milestone M0 of
+[`implementation-plan.md`](implementation-plan.md), #4 earlier; #5 is open.
 
 ### 1. An `SLDS` mis-sizes its weighted sufficient statistics when the discrete states differ in regime count
 
@@ -658,6 +659,11 @@ lqr  = LQRStateModel(A, S, [Qrun, Qterm], Σ;
 "delay, then reach". The general fix is to allocate per discrete state; the
 ordering workaround still fails for two LQR states with different regime counts.
 
+**Fixed.** The statistics are now allocated per discrete state, at all three
+sites (the M-step, the fit's preallocation, and the terminal normalizer's
+probe). `test_slds_lqr_state_order` fits the pair above in both orders and gets
+the same model; the ordering workaround is no longer needed.
+
 ### 2. `rand` on an `SLDS` ignores an LQR state's cost schedule
 
 `_extract_state_params(sm::LQRStateModel)` hands the sampler `cache.M[1]` — one
@@ -670,6 +676,15 @@ M-step honour `schedule`, the sampler does not. Either the sampler should walk
 the schedule, or the constructor should refuse a multi-transition schedule on a
 member of an `SLDS`.
 
+**Fixed, by refusing.** `validate_SLDS` already had a rule for this, but nothing
+called it, and it was stricter than the model: it refused any state with more
+than one `Qc`, which includes the running-plus-terminal state this harness uses.
+The rule is now the precise one — a state's *transitions* follow one cost; a
+separate terminal cost, read only by the terminal factor, is fine — and it is
+enforced wherever the model is used (`fit!`, `smooth`, `elbo` and both `rand`
+methods). The sampler rolls that transition cost's `M`, which need not be
+`M[1]`. See `test_slds_lqr_rand_schedules`.
+
 ### 3. `tol` is an absolute ELBO change, and these models never reach it
 
 `converged = iter > 1 && abs(elbos[iter] - elbos[iter-1]) < tol`. On an
@@ -681,6 +696,12 @@ converged flag because a flag built on `tol` distinguishes nothing. A relative
 criterion (`|Δ| < tol * |elbo|`), or a stopping rule on the parameters rather
 than the bound, would make `fit!` say something useful about convergence.
 
+**Fixed, opt-in.** `fit!` on an `LDS`, a Poisson `LDS` and both inverse-LQR
+emissions takes `rtol` alongside `tol`, and stops once
+`|Δ| < max(tol, rtol · |ELBO|)`. The default `rtol = 0` keeps the absolute test,
+so no existing fit changes; pass something like `rtol = 1e-8` to have a large fit
+stop on the same terms as a small one. See `test_em_relative_tolerance`.
+
 ### 4. Nothing regularized an LQR state's `Σ` — now something does
 
 `LQRStateModel` accepted `P0_prior::IWPrior` and `x0_prior::MNPrior` but had no
@@ -691,7 +712,7 @@ state is a second free state and the fit collapses onto one regime.
 **This one is now implemented** rather than reported — `Σ_prior` and `Qc_prior`
 on `LQRStateModel`, acting in the profiled objective, its gradient, the noise
 M-step and the prior log-density. See "Priors do the job the initialization was
-doing silently" above for what they buy. The other three findings stand.
+doing silently" above for what they buy.
 
 The M-step tests now differentiate an independent reference objective with
 `ForwardDiff` for no, shared, combined, and per-epoch priors in both the profiled and
@@ -701,3 +722,15 @@ noise vary independently. That last check exposed and fixed an ELBO bug: the
 grouped path had counted both structural priors according to the noise groups,
 which under-counted varying `Qc` or over-counted shared `Qc`. The focused prior
 suite passes 61/61.
+
+### 5. A tied emission leaks into the costate columns on the pooled SLDS path
+
+Open. In a switching model that ties `C` across a `:free` state and an
+inverse-LQR state with `observe_costate = false`, the plain fit lets `C`'s
+costate columns become non-zero (≈ 0.28 on the diagonal after one M-step in
+`test_slds_lqr_grouped_free_state_pools`'s fixture), while the same fit through
+the grouped path — with a grouping that splits nothing — keeps them at zero. The
+two end 14 nats apart. Since the LQR state may not read its costate and `C` is
+shared with it, the grouped (masked) result is the consistent one: the pooled
+emission update appears to take the `:free` state's unmasked statistics into the
+shared `C`.

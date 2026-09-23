@@ -720,6 +720,18 @@ are there to order the work, not to promise dates.
 **Done when** the sweep kernels pass their tests and the three findings are
 closed.
 
+**Status: done.** The kernels are in `src/numerics/riccati.jl`, with
+`tracking_cost!` and its adjoint for the reference, tested in
+`test/Utilities/Riccati.jl`. `simulate_lqr` and a rollout of the kernels both
+match the tracking QP to `6e-15`, and the old feedforward's policy costs 11.5%
+more. The adjoint matches `ForwardDiff` to `1e-11` and central differences to
+`1e-6`, for every block. The findings are closed as `README.md` records, with
+one refinement to #2: the rule enforced is "a state's *transitions* follow one
+cost". A plain "one `Qc` per state" would have refused the running-plus-terminal
+state this directory's switching harness uses. The shaping class is checked as
+an exact symmetry of the existing model's likelihood (`test_lqr_shaping_symmetry`,
+`1e-12`). The `tr S` gauge was declined.
+
 ### M1 — The closed-loop model, Gaussian, known `B` *(M)*
 
 Types, cache, kernels, per-`τ` statistics, the GEM M-step over `A`, `{Q_k}`,

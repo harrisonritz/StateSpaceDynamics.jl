@@ -402,6 +402,7 @@ using SSDTest
                 test_lqr_rescale_costate()
                 test_lqr_terminal_normalizer()
                 test_lqr_dimension_and_terminal_score()
+                test_lqr_shaping_symmetry()
             end
 
             @testset "Free mode" begin
