@@ -502,6 +502,175 @@ function test_lqr_rescale_costate()
     return nothing
 end
 
+"""
+A ragged model of the shape real reaching data takes: one running cost on every
+transition, the terminal factor pinned to its own cost (`terminal_regime`), a
+one-hot target input, and trial lengths that are all different.
+"""
+function _pinned_ragged_lqr(rng; n::Int=2, m::Int=3, tmax::Int=40)
+    d = 2n
+    sm = LQRStateModel(
+        Matrix(0.95I, n, n) + 0.02 .* randn(rng, n, n),
+        Matrix(0.05I, n, n),
+        [Matrix(0.2I, n, n), Matrix(0.9I, n, n)],
+        Matrix(0.03I, d, d);
+        schedule=fill(1, tmax),
+        terminal=true,
+        terminal_regime=2,
+        Σf=Matrix(0.04I, n, n),
+        hf=randn(rng, n) .* 0.05,
+        h=randn(rng, d) .* 0.05,
+        Bu=randn(rng, d, m),
+        Gref=randn(rng, n, m) .* 0.3,
+        P0=Matrix(0.25I, d, d),
+        x0=randn(rng, d) .* 0.1,
+    )
+    SSD.refresh!(sm)
+    return sm
+end
+
+function test_lqr_terminal_normalizer_pinned_ragged()
+    # The shared-step path: every horizon's backward recursion is a prefix of
+    # the longest one's, so it is computed once.
+    rng = StableRNG(20260924)
+    sm = _pinned_ragged_lqr(rng)
+    designs = [
+        (ux=randn(rng, 3, t), count=c) for
+        (t, c) in ((11, 2), (14, 1), (11, 3), (40, 2), (14, 4), (2, 1), (27, 5), (39, 1))
+    ]
+    reference = sum(d.count * SSD._lqr_terminal_logz(sm, d.ux) for d in designs)
+    @test SSD._lqr_terminal_logz_sum(sm, designs) ≈ reference rtol = 1e-12
+    # A single design, and designs of one horizon only.
+    for subset in (designs[4:4], designs[[1, 3]])
+        ref = sum(d.count * SSD._lqr_terminal_logz(sm, d.ux) for d in subset)
+        @test SSD._lqr_terminal_logz_sum(sm, subset) ≈ ref rtol = 1e-12
+    end
+    return nothing
+end
+
+"""
+The terminal-conditioning probe's statistics: the dedicated aggregator against
+the two generic weighted aggregators it replaces, and its serial and parallel
+chunk schedules against each other bit for bit.
+"""
+function test_lqr_probe_aggregate_matches_weighted()
+    rng = StableRNG(20260925)
+    sm = _pinned_ragged_lqr(rng)
+    lengths = [7, 12, 12, 19, 25, 25, 25, 31, 40]
+    n = SSD.plant_dim(sm)
+    lds = LinearDynamicalSystem(
+        sm, GaussianObservationModel(randn(rng, 3, 2n), Matrix(0.5I, 3, 3), zeros(3))
+    )
+    suf = SSD._initialize_td_sufficient_statistics(Float64, lds, lengths)
+    for (i, t) in enumerate(lengths)
+        u = zeros(3, t)
+        u[mod1(i, 3), :] .= 1
+        push!(suf.terminal_inputs, u)
+        push!(suf.terminal_counts, Float64(1 + i % 4))
+    end
+    probe = SSD._lqr_terminal_probe(sm, suf)
+    SSD._lqr_sync_probe!(probe, sm)
+    SSD.smooth!(probe.lds, probe.tfs, probe.data, probe.pool)
+
+    old = deepcopy(probe.hs)
+    SSD._aggregate_td_suff_stats_weighted!(
+        old.base, probe.tfs, probe.lds, probe.data, probe.weights, probe.pool[1]
+    )
+    SSD._aggregate_lqr_stats_weighted!(old, probe.tfs, probe.lds, probe.data, probe.weights)
+    counts = [Float64(d.count) for d in probe.designs]
+    serial = deepcopy(probe.hs)
+    SSD._lqr_probe_aggregate!(serial, probe.tfs, probe.lds, probe.data, counts)
+    parallel = deepcopy(probe.hs)
+    SSD._lqr_probe_aggregate!(
+        parallel, probe.tfs, probe.lds, probe.data, counts; serial_below=0
+    )
+
+    for k in eachindex(old.zz)
+        @test serial.zz[k] ≈ old.zz[k] rtol = 1e-12
+        @test serial.zy[k] ≈ old.zy[k] rtol = 1e-12
+        @test serial.yy[k] ≈ old.yy[k] rtol = 1e-12
+        @test serial.term_zz[k] ≈ old.term_zz[k] rtol = 1e-12
+    end
+    @test serial.nk ≈ old.nk rtol = 1e-14
+    @test serial.term_n ≈ old.term_n rtol = 1e-14
+    @test serial.base.init_n ≈ old.base.init_n rtol = 1e-14
+    @test serial.base.init_xy ≈ old.base.init_xy rtol = 1e-12
+    @test serial.base.init_yy[] ≈ old.base.init_yy[] rtol = 1e-12
+    for f in (:zz, :zy, :yy, :term_zz, :nk, :term_n)
+        @test getfield(serial, f) == getfield(parallel, f)
+    end
+    @test serial.base.init_yy[] == parallel.base.init_yy[]
+    return nothing
+end
+
+"""The probe is built once per fit, and rebuilt when the designs change."""
+function test_lqr_probe_cache()
+    rng = StableRNG(20260926)
+    sm = _pinned_ragged_lqr(rng)
+    n = SSD.plant_dim(sm)
+    lds = LinearDynamicalSystem(
+        sm, GaussianObservationModel(randn(rng, 3, 2n), Matrix(0.5I, 3, 3), zeros(3))
+    )
+    suf = SSD._initialize_td_sufficient_statistics(Float64, lds, [9, 14])
+    for t in (9, 14)
+        push!(suf.terminal_inputs, ones(3, t))
+        push!(suf.terminal_counts, 1.0)
+    end
+    p1 = SSD._lqr_terminal_probe_cached(sm, suf)
+    # A new E-step records the same designs in fresh arrays: still the same probe.
+    empty!(suf.terminal_inputs)
+    empty!(suf.terminal_counts)
+    for t in (9, 14)
+        push!(suf.terminal_inputs, ones(3, t))
+        push!(suf.terminal_counts, 1.0)
+    end
+    @test SSD._lqr_terminal_probe_cached(sm, suf) === p1
+    suf.terminal_counts[2] = 2.0
+    p2 = SSD._lqr_terminal_probe_cached(sm, suf)
+    @test p2 !== p1
+    @test p2.designs[2].count == 2.0
+    return nothing
+end
+
+"""
+Ragged smoothing of an LQR model with a terminal factor and inputs — the
+terminal-conditioning probe's case — gives the same bits for every workspace
+pool size, and again on a second call that reuses the covariance storage.
+"""
+function test_lqr_ragged_smooth_pool_invariance()
+    rng = StableRNG(20260927)
+    sm = _pinned_ragged_lqr(rng)
+    n = SSD.plant_dim(sm)
+    lds = LinearDynamicalSystem(
+        sm, GaussianObservationModel(zeros(1, 2n), ones(1, 1), zeros(1))
+    )
+    lengths = [5, 9, 9, 14, 22, 22, 31, 40, 17]
+    uxs = [randn(rng, 3, t) for t in lengths]
+    ys = [zeros(1, t) for t in lengths]
+    data = SSD.Data(lds, ys; ux=uxs)
+    function run(npool)
+        tfs = SSD.initialize_FilterSmooth(lds, lengths)
+        pool = [
+            SSD.SmoothWorkspace(Float64, 2n, 1, maximum(lengths); ux_dim=3) for _ in 1:npool
+        ]
+        SSD.smooth!(lds, tfs, data, pool)
+        first_pass = deepcopy(tfs)
+        SSD.smooth!(lds, tfs, data, pool)
+        return first_pass, tfs
+    end
+    _, ref = run(1)
+    for npool in (2, 3, 7)
+        first_pass, second = run(npool)
+        for tfs in (first_pass, second), i in eachindex(lengths)
+            @test tfs[i].x_smooth == ref[i].x_smooth
+            @test tfs[i].p_smooth == ref[i].p_smooth
+            @test tfs[i].p_smooth_tt1[:, :, 2:end] == ref[i].p_smooth_tt1[:, :, 2:end]
+            @test tfs[i].entropy == ref[i].entropy
+        end
+    end
+    return nothing
+end
+
 """`_lqr_terminal_logz` against an independent forward-moment reference.
 
 Also pins the relationship the whole conditional objective rests on: with

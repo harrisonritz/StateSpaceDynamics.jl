@@ -377,24 +377,26 @@ function smooth!(
     for (trial, tsteps) in enumerate(data.tsteps)
         push!(get!(by_length, tsteps, Int[]), trial)
     end
+    #=
+    Nearly-distinct lengths leave most buckets with one or two trials, so the
+    per-bucket covariance pass — the `O(T D³)` part — is the work. With a second
+    workspace to hold it, the forward half of that pass is shared by every
+    length and the buckets run in parallel; see `_smooth_ragged_prefix!`.
+    =#
+    if length(sws_pool) >= 2
+        return _smooth_ragged_prefix!(lds, tfs, data, sws_pool, by_length)
+    end
     bucket_sws = sws_pool[1]
     for tsteps in unique(data.tsteps)
         trials = by_length[tsteps]
         if length(trials) == 1
-            single_trial = only(trials)
-            smooth!(
-                lds,
-                tfs[single_trial],
-                _trial(y, single_trial),
-                bucket_sws,
-                ux[single_trial],
-                _trial(uy, single_trial),
-            )
+            _smooth_bucket!(lds, tfs, data, bucket_sws, sws_pool, tsteps, trials)
             continue
         end
         shared_entropy = _precompute_shared_cov!(bucket_sws, lds, tsteps)
-        shared_p = copy(view(bucket_sws.agg.p_smooth_shared, :, :, 1:tsteps))
-        shared_p_tt1 = copy(view(bucket_sws.agg.p_smooth_tt1_shared, :, :, 1:tsteps))
+        shared_p, shared_p_tt1 = _bucket_cov_storage(
+            tfs[first(trials)], bucket_sws, sws_pool, tsteps
+        )
         for trial in trials
             tfs[trial].p_smooth = shared_p
             tfs[trial].p_smooth_tt1 = shared_p_tt1
@@ -426,6 +428,287 @@ function smooth!(
         end
     end
 
+    return tfs
+end
+
+"""
+    _bucket_cov_storage(fs, sws, sws_pool, tsteps) -> (p_smooth, p_smooth_tt1)
+
+Copy a length bucket's shared covariance out of `sws` — which the next bucket
+will overwrite — into arrays the bucket's trials can alias.
+
+The arrays of the bucket's first trial are reused when they already have the
+bucket's shape and are not a pool workspace's own buffer (which the equal-length
+path aliases trials to, and which this pass may overwrite). After one E-step every
+trial of the bucket aliases them, so from then on nothing is allocated here. That
+matters where the same `tfs` is re-smoothed many times at new parameters, as the
+terminal-conditioning probe is on every objective evaluation of an M-step.
+Trials of different lengths never share a bucket, so a reused array is only ever
+shared by trials that should share it.
+"""
+function _bucket_cov_storage(
+    fs::FilterSmooth{T},
+    sws::SmoothWorkspace{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    tsteps::Int,
+) where {T<:Real}
+    src_p = view(sws.agg.p_smooth_shared::Array{T,3}, :, :, 1:tsteps)
+    src_q = view(sws.agg.p_smooth_tt1_shared::Array{T,3}, :, :, 1:tsteps)
+    p = fs.p_smooth::Array{T,3}
+    q = fs.p_smooth_tt1::Array{T,3}
+    function in_pool(a)
+        return any(
+            ws -> a === ws.agg.p_smooth_shared || a === ws.agg.p_smooth_tt1_shared, sws_pool
+        )
+    end
+    if size(p) == size(src_p) &&
+        size(q) == size(src_q) &&
+        p !== q &&
+        !in_pool(p) &&
+        !in_pool(q)
+        copyto!(p, src_p)
+        copyto!(q, src_q)
+        return p, q
+    end
+    return copy(src_p), copy(src_q)
+end
+
+"""
+    _prefix_forward!(src, lds, tmax) -> logprefix
+
+The length-independent half of every bucket's covariance pass, run once.
+
+The negated Hessian of a trial of length `h` agrees with that of the longest
+trial on every block before `h`: the state blocks are indexed forward from
+`t = 1` (a cost schedule too), and only the last diagonal block — no outgoing
+transition, plus any terminal factor — depends on where the trial ends. The
+forward sweep of [`block_tridiagonal_inverse_logdet!`](@ref) therefore produces
+the same Schur-complement factors `chol_factors[i]`, the same `D[i+1] = Mᵢ⁻¹Cᵢ`
+and the same inverses `Mᵢ⁻¹` for `i < h` whatever `h` is. This runs that sweep
+over blocks `1 … tmax-1` of the longest trial on `src`, keeps the inverses in
+`src.agg.p_smooth_shared` (scratch on this path — no trial aliases a pool
+buffer), and returns the running log-determinant after each block.
+
+Every operation is the one the per-bucket sweep performs, in the same order, so
+a bucket completed from this prefix is bit-for-bit the bucket computed alone.
+"""
+function _prefix_forward!(
+    src::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, tmax::Int
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    compute_smooth_constants!(src, lds)
+    _fill_hessian_blocks!(src, lds.state_model, tmax)
+    btd = src.btd
+    _negate_blocks!(btd, tmax)
+    D = btd.D
+    Minv = src.agg.p_smooth_shared::Array{T,3}
+    fill!(D[1], zero(T))
+    logprefix = Vector{T}(undef, max(tmax - 1, 0))
+    acc = zero(T)
+    for i in 1:(tmax - 1)
+        Ai = i == 1 ? btd.Z : btd.neg_sub[i - 1]
+        Mi = btd.chol_factors[i]
+        copyto!(Mi, btd.neg_diag[i])
+        mul!(Mi, Ai, D[i], -one(T), one(T))
+        F = cholesky!(Symmetric(Mi, :U))
+        for j in 1:(btd.block_size)
+            acc += 2 * log(Mi[j, j])
+        end
+        logprefix[i] = acc
+        ldiv!(D[i + 1], F, btd.neg_super[i])
+        Mi_inv = tview(Minv, :, :, i)
+        copyto!(Mi_inv, btd.Ibs)
+        ldiv!(LinearAlgebra.Cholesky{T,Matrix{T}}(Mi, 'U', 0), Mi_inv)
+    end
+    return logprefix
+end
+
+"""
+    _bucket_from_prefix!(ws, src, lds, h, logprefix) -> entropy
+
+What `_precompute_shared_cov!(ws, lds, h)` computes — the covariance of a
+length-`h` trial in `ws.agg.p_smooth_shared` / `p_smooth_tt1_shared`, and in
+`ws.btd` the complete factorization `block_tridiagonal_backsubst!` reads — but
+completed from the shared forward prefix on `src` (see
+[`_prefix_forward!`](@ref)) instead of recomputed.
+
+The per-bucket work drops to the last block's factorization, an `O(h D²)` copy
+of the prefix factors, and the backward covariance recursion: two block products
+per step, against the three products and a Cholesky solve pair the full pass
+spends there and in the forward sweep.
+"""
+function _bucket_from_prefix!(
+    ws::SmoothWorkspace{T},
+    src::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    h::Int,
+    logprefix::AbstractVector{T},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    _mirror_smooth_constants!(ws, src, lds)
+    _fill_hessian_blocks!(ws, lds.state_model, h)
+    btd = ws.btd
+    sbtd = src.btd
+    _negate_blocks!(btd, h)
+    for i in 1:(h - 1)
+        copyto!(btd.chol_factors[i], sbtd.chol_factors[i])
+        copyto!(btd.D[i + 1], sbtd.D[i + 1])
+    end
+
+    # Last block: the only factor that depends on the length.
+    Mh = btd.chol_factors[h]
+    copyto!(Mh, btd.neg_diag[h])
+    mul!(Mh, btd.neg_sub[h - 1], btd.D[h], -one(T), one(T))
+    cholesky!(Symmetric(Mh, :U))
+    logdet_precision = logprefix[h - 1]
+    for j in 1:(btd.block_size)
+        logdet_precision += 2 * log(Mh[j, j])
+    end
+
+    # Backward recursion of `block_tridiagonal_inverse_logdet!`, with each
+    # `Mᵢ⁻¹` read from the prefix rather than solved for again.
+    P = ws.agg.p_smooth_shared::Array{T,3}
+    Q = ws.agg.p_smooth_tt1_shared::Array{T,3}
+    Minv = src.agg.p_smooth_shared::Array{T,3}
+    @views begin
+        copyto!(P[:, :, h], btd.Ibs)
+        ldiv!(LinearAlgebra.Cholesky{T,Matrix{T}}(Mh, 'U', 0), P[:, :, h])
+        for i in h:-1:2
+            mul!(Q[:, :, i], P[:, :, i], transpose(btd.D[i]), -one(T), zero(T))
+            copyto!(P[:, :, i - 1], Minv[:, :, i - 1])
+            mul!(P[:, :, i - 1], btd.D[i], Q[:, :, i], -one(T), one(T))
+        end
+    end
+    for i in 1:h
+        Symmetrize!(tview(P, :, :, i))
+    end
+    return gaussian_entropy_from_logdet(logdet_precision, lds.latent_dim * h)
+end
+
+"""
+    _smooth_bucket!(lds, tfs, data, sws, sws_pool, tsteps, trials, prefix)
+
+Smooth every trial of one length bucket on workspace `sws`: the shared
+covariance once, then each trial's mean against its factorization. `prefix`
+is `(src, logprefix)` from [`_prefix_forward!`](@ref), or `nothing` to run the
+whole covariance pass on `sws`.
+
+A bucket of one trial goes the same way. The single-trial `smooth!` would solve
+for the mean with a banded factorization and then factor the same precision a
+second time for the covariance; here the covariance pass's factors serve both.
+"""
+function _smooth_bucket!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws::SmoothWorkspace{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    tsteps::Int,
+    trials::Vector{Int},
+    prefix=nothing,
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    y, ux, uy = data.y, data.ux, data.uy
+    shared_entropy = if prefix === nothing
+        _precompute_shared_cov!(sws, lds, tsteps)
+    else
+        _bucket_from_prefix!(sws, prefix[1], lds, tsteps, prefix[2])
+    end
+    shared_p, shared_p_tt1 = _bucket_cov_storage(tfs[first(trials)], sws, sws_pool, tsteps)
+    for trial in trials
+        tfs[trial].p_smooth = shared_p
+        tfs[trial].p_smooth_tt1 = shared_p_tt1
+        tfs[trial].entropy = shared_entropy
+    end
+    for trial in trials
+        _smooth_mean_only!(
+            lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial), sws
+        )
+    end
+    return nothing
+end
+
+"""
+    _smooth_ragged_prefix!(lds, tfs, data, sws_pool, by_length)
+
+Ragged multi-trial smoothing with the forward half of every bucket's covariance
+pass shared ([`_prefix_forward!`](@ref) on `sws_pool[1]`) and the rest spread
+over the other workspaces.
+
+With at least as many buckets as worker workspaces, each task takes a workspace,
+completes whole buckets on it and hands it back; buckets are issued longest
+first, so the last to finish are the cheapest. With fewer, the buckets run one
+at a time and each bucket's per-trial mean solves are split across the workers
+instead — the shape of a dataset with a few lengths and many trials each.
+
+Every trial's arithmetic is the same on either schedule and on any workspace, so
+the result does not depend on the thread count.
+"""
+function _smooth_ragged_prefix!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+    by_length::Dict{Int,Vector{Int}},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    y, ux, uy = data.y, data.ux, data.uy
+    src = sws_pool[1]
+    workers = sws_pool[2:end]
+    logprefix = _prefix_forward!(src, lds, maximum(keys(by_length)))
+    prefix = (src, logprefix)
+    buckets = sort!(collect(by_length); by=b -> (-b.first, -length(b.second)))
+
+    if length(workers) > 1 && length(buckets) >= length(workers)
+        free = Channel{SmoothWorkspace{T}}(length(workers))
+        foreach(ws -> put!(free, ws), workers)
+        tforeach(buckets; scheduler=:greedy, ntasks=length(workers)) do bucket
+            ws = take!(free)
+            try
+                _smooth_bucket!(
+                    lds, tfs, data, ws, sws_pool, bucket.first, bucket.second, prefix
+                )
+            finally
+                put!(free, ws)
+            end
+            return nothing
+        end
+        return tfs
+    end
+
+    bucket_ws = workers[1]
+    for (tsteps, trials) in buckets
+        if length(trials) == 1 || length(workers) == 1
+            _smooth_bucket!(lds, tfs, data, bucket_ws, sws_pool, tsteps, trials, prefix)
+            continue
+        end
+        shared_entropy = _bucket_from_prefix!(bucket_ws, src, lds, tsteps, logprefix)
+        shared_p, shared_p_tt1 = _bucket_cov_storage(
+            tfs[first(trials)], bucket_ws, sws_pool, tsteps
+        )
+        for trial in trials
+            tfs[trial].p_smooth = shared_p
+            tfs[trial].p_smooth_tt1 = shared_p_tt1
+            tfs[trial].entropy = shared_entropy
+        end
+        ntasks = min(length(trials), length(workers))
+        chunksize = cld(length(trials), ntasks)
+        tforeach(1:ntasks) do i
+            lo = (i - 1) * chunksize + 1
+            hi = min(i * chunksize, length(trials))
+            lo > hi && return nothing
+            ws = workers[i]
+            for j in lo:hi
+                trial = trials[j]
+                _smooth_mean_only!(
+                    lds,
+                    tfs[trial],
+                    _trial(y, trial),
+                    ws,
+                    ux[trial],
+                    _trial(uy, trial),
+                    bucket_ws,
+                )
+            end
+            return nothing
+        end
+    end
     return tfs
 end
 

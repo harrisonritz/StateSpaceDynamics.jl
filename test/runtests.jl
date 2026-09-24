@@ -408,6 +408,10 @@ using SSDTest
                 test_lqr_rescale_costate()
                 test_lqr_terminal_normalizer()
                 test_lqr_terminal_normalizer_shared_horizons()
+                test_lqr_terminal_normalizer_pinned_ragged()
+                test_lqr_probe_aggregate_matches_weighted()
+                test_lqr_probe_cache()
+                test_lqr_ragged_smooth_pool_invariance()
                 test_lqr_dimension_and_terminal_score()
                 test_lqr_shaping_symmetry()
             end

@@ -51,54 +51,202 @@ function _lqr_terminal_logz(sm::LQRStateModel{T}, ux::AbstractMatrix{T}) where {
            T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual))
 end
 
-"""Sum terminal log normalizers, factoring each distinct horizon only once.
+"""Sum terminal log normalizers over `designs`, each weighted by its trial count.
 
-The backward covariance recursion depends on the model and trial length, not
-on the input trajectory. The backward mean recursion still runs for every
-distinct input, with its trial count as weight.
+The backward square-root recursion of [`_lqr_terminal_logz`](@ref) has an
+input-independent part — the whitened constraint `H_j` and the factor `L_j` after
+`j` backward steps — and a mean part that is linear in the inputs. The
+input-independent part depends on a trial only through its horizon, and through
+the regimes the backward steps cross.
+
+Whenever every horizon has the same terminal regime and the running regime is
+the same on every transition of the longest trial (a single running cost with the
+terminal factor pinned by `terminal_regime` — the ragged-dataset shape), step `j`
+is the *same* for every horizon, so the recursion for a horizon `h` is the first
+`h - 1` steps of the longest one. It is then computed once, and each horizon adds
+only its closing factor against `P0`. Otherwise each distinct horizon runs its
+own recursion, as before.
+
+Either way the mean recursion runs over all designs at once: sorted by
+decreasing horizon, the designs still active at backward step `j` (`h > j`) are a
+leading block of columns, so each step is one GEMM and one triangular solve
+with many right-hand sides instead of a small allocating solve per design.
 """
 function _lqr_terminal_logz_sum(sm::LQRStateModel{T}, designs) where {T}
     sm.terminal || return zero(T)
-    by_horizon = Dict{Int,Vector{Int}}()
-    for (i, design) in enumerate(designs)
-        push!(get!(by_horizon, size(design.ux, 2), Int[]), i)
-    end
-    n = _plant_dim(sm)
-    c = sm.cache
-    Lf = cholesky(Symmetric(Matrix(sm.Σf))).L
-    Lq = c.G * cholesky(Symmetric(Matrix(sm.Σ))).L
-    L0 = cholesky(Symmetric(Matrix(sm.P0))).L
-    Id = Matrix{T}(I, n, n)
+    isempty(designs) && return zero(T)
+    horizons = [size(d.ux, 2) for d in designs]
+    kfs = [_terminal_regime(sm, h) for h in horizons]
+    hmax = maximum(horizons)
+    k1 = _regime(sm, 1)
+    shared = all(==(kfs[1]), kfs) && all(t -> _regime(sm, t) == k1, 1:(hmax - 1))
+    chol = _lqr_logz_factors(sm)
     total = zero(T)
-    for (horizon, indices) in by_horizon
-        kf = _terminal_regime(sm, horizon)
-        H = Lf \ c.Lf[kf]
-        logscale = -sum(log, abs.(diag(Lf)))
-        # Store the input-independent factors in backward time order.
-        steps = Vector{Tuple{Int,Matrix{T},Matrix{T},Int}}(undef, horizon - 1)
-        for (j, t) in enumerate((horizon - 1):-1:1)
-            k = _regime(sm, t)
-            L = LowerTriangular(Matrix(qr(transpose(hcat(Id, H * Lq))).R)')
-            steps[j] = (t, Matrix(L), H, k)
-            H = L \ (H * c.M[k])
-            logscale -= sum(log, abs.(diag(L)))
+    if shared
+        total += _lqr_terminal_logz_batch(sm, chol, designs, collect(eachindex(designs)))
+    else
+        by_horizon = Dict{Int,Vector{Int}}()
+        for (i, h) in enumerate(horizons)
+            push!(get!(by_horizon, h, Int[]), i)
         end
-        L = LowerTriangular(Matrix(qr(transpose(hcat(Id, H * L0))).R)')
-        logscale -= sum(log, abs.(diag(L)))
-        for i in indices
-            design = designs[i]
-            ux = design.ux
-            a = Lf \ (sm.hf - c.Ftrm[kf] * view(ux, :, horizon))
-            for (t, Lt, Ht, k) in steps
-                a = LowerTriangular(Lt) \ (a - Ht * (c.bfwd + c.Bfwd[k] * view(ux, :, t)))
-            end
-            residual = L \ (a - H * sm.x0)
-            total +=
-                design.count *
-                (logscale - T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual)))
+        for h in sort!(collect(keys(by_horizon)); rev=true)
+            total += _lqr_terminal_logz_batch(sm, chol, designs, by_horizon[h])
         end
     end
     return total
+end
+
+"""The Cholesky factors every `log Z` evaluation starts from."""
+function _lqr_logz_factors(sm::LQRStateModel{T}) where {T}
+    Lf = cholesky(Symmetric(Matrix(sm.Σf))).L
+    Lq = sm.cache.G * cholesky(Symmetric(Matrix(sm.Σ))).L
+    L0 = cholesky(Symmetric(Matrix(sm.P0))).L
+    return (; Lf, Lq, L0)
+end
+
+"""
+    _lqr_terminal_logz_batch(sm, chol, designs, idx) -> T
+
+`Σ_{i ∈ idx} count_i · log Z_i` for designs whose backward steps coincide: all
+share a terminal regime, and backward step `j` crosses the same regime for every
+one of them. The steps are computed once, for the longest horizon in `idx`.
+"""
+function _lqr_terminal_logz_batch(
+    sm::LQRStateModel{T}, chol, designs, idx::AbstractVector{Int}
+) where {T}
+    n = _plant_dim(sm)
+    c = sm.cache
+    (; Lf, Lq, L0) = chol
+    order = sort(idx; by=i -> -size(designs[i].ux, 2))
+    nd = length(order)
+    hs = [size(designs[i].ux, 2) for i in order]
+    hmax = hs[1]
+    kf = _terminal_regime(sm, hmax)
+    m = size(c.Ftrm[kf], 2)
+
+    #=
+    Input-independent backward steps. `Hs[:, :, j]` is the whitened constraint
+    before step `j`, `Ls[:, :, j]` that step's lower factor, and `cum[j]` the
+    log-determinant after `j - 1` steps, summed in step order exactly as the
+    per-horizon recursion does. Step `j` of a trial of horizon `h` is the
+    transition `t = h - j`; the regime is read at the longest trial's `t`, which
+    is the same regime for every trial by the caller's grouping.
+
+    Each factor is the `R` of a QR of `[I; (H Lq)ᵀ]`, taken in place on one
+    preallocated buffer: this runs on every objective evaluation of the M-step,
+    and an allocating QR per step is most of what it would otherwise cost.
+    =#
+    J = hmax - 1
+    Hs = Array{T,3}(undef, n, 2n, J + 1)
+    Ls = Array{T,3}(undef, n, n, J)
+    ks = Vector{Int}(undef, J)
+    cum = Vector{T}(undef, J + 1)
+    W = Matrix{T}(undef, 3n, n)
+    tau = Vector{T}(undef, n)
+    G = Matrix{T}(undef, n, 2n)
+    ldiv!(view(Hs, :, :, 1), Lf, c.Lf[kf])
+    cum[1] = -sum(log, abs.(diag(Lf)))
+    for j in 1:J
+        k = _regime(sm, hmax - j)
+        ks[j] = k
+        Hj = view(Hs, :, :, j)
+        mul!(G, Hj, Lq)
+        Lj = view(Ls, :, :, j)
+        cum[j + 1] = cum[j] - _whitening_factor!(Lj, W, tau, G)
+        Hn = view(Hs, :, :, j + 1)
+        mul!(Hn, Hj, c.M[k])
+        ldiv!(LowerTriangular(Lj), Hn)
+    end
+
+    # Mean recursion, one column per design, starting from the terminal residual.
+    A = Matrix{T}(undef, n, nd)
+    U = Matrix{T}(undef, m, nd)
+    for (col, i) in enumerate(order)
+        U[:, col] .= view(designs[i].ux, :, hs[col])
+    end
+    A .= sm.hf
+    m > 0 && mul!(A, c.Ftrm[kf], U, -one(T), one(T))
+    ldiv!(Lf, A)
+    Hb = Vector{T}(undef, n)
+    HB = Matrix{T}(undef, n, m)
+    nactive = nd
+    for j in 1:J
+        # designs of horizon ≤ j have finished; they are the trailing columns
+        while nactive > 0 && hs[nactive] <= j
+            nactive -= 1
+        end
+        nactive == 0 && break
+        k = ks[j]
+        Hj = view(Hs, :, :, j)
+        Aj = view(A, :, 1:nactive)
+        mul!(Hb, Hj, c.bfwd)
+        Aj .-= Hb
+        if m > 0
+            mul!(HB, Hj, c.Bfwd[k])
+            Uj = view(U, :, 1:nactive)
+            for col in 1:nactive
+                Uj[:, col] .= view(designs[order[col]].ux, :, hs[col] - j)
+            end
+            mul!(Aj, HB, Uj, -one(T), one(T))
+        end
+        ldiv!(LowerTriangular(view(Ls, :, :, j)), Aj)
+    end
+
+    # Close each horizon against the initial-state prior.
+    total = zero(T)
+    lognorm = T(0.5) * T(n) * log(T(2π))
+    Hx0 = Vector{T}(undef, n)
+    L = Matrix{T}(undef, n, n)
+    col = 1
+    while col <= nd
+        h = hs[col]
+        stop = col
+        while stop < nd && hs[stop + 1] == h
+            stop += 1
+        end
+        H = view(Hs, :, :, h)
+        mul!(G, H, L0)
+        logscale = cum[h] - _whitening_factor!(L, W, tau, G)
+        mul!(Hx0, H, sm.x0)
+        R = view(A, :, col:stop)
+        R .-= Hx0
+        ldiv!(LowerTriangular(L), R)
+        for (r, j) in enumerate(col:stop)
+            total +=
+                designs[order[j]].count *
+                (logscale - lognorm - T(0.5) * sum(abs2, view(R, :, r)))
+        end
+        col = stop + 1
+    end
+    return total
+end
+
+"""
+    _whitening_factor!(L, W, tau, G) -> Σ log|Lᵢᵢ|
+
+Lower-triangular `L` with `L Lᵀ = I + G Gᵀ`, as the transposed `R` of a QR of
+`[I; Gᵀ]` (`n × 2n` `G`, `3n × n` scratch `W`), and its log-determinant. The QR
+route keeps the factor accurate when `G` is huge, which is the case the
+backward recursion exists for; see [`_lqr_terminal_logz`](@ref).
+"""
+function _whitening_factor!(
+    L::AbstractMatrix{T}, W::Matrix{T}, tau::Vector{T}, G::AbstractMatrix{T}
+) where {T}
+    n = size(G, 1)
+    fill!(W, zero(T))
+    for i in 1:n
+        W[i, i] = one(T)
+    end
+    W[(n + 1):end, :] .= transpose(G)
+    LAPACK.geqrf!(W, tau)
+    logdet = zero(T)
+    for j in 1:n
+        for i in 1:n
+            L[i, j] = i >= j ? W[j, i] : zero(T)
+        end
+        logdet += log(abs(W[j, j]))
+    end
+    return logdet
 end
 
 function Q_state!(
@@ -144,6 +292,62 @@ function _lqr_terminal_probe(sm::LQRStateModel{T}, hs) where {T}
     return (; lds, data, tfs, pool, hs, weights, designs)
 end
 
+#=
+Probes kept across M-steps, keyed (weakly) by the data statistics they were
+built from. A fit's statistics object lives for the whole fit and its designs do
+not change, so the probe — a model copy, its `Data`, a smoother state and a
+workspace pool sized for the longest trial — is built once per fit instead of
+once per M-step. At a large latent dimension and thread count that pool alone
+is gigabytes, all allocated, touched and collected again every iteration.
+Parameters are copied into the probe on every evaluation anyway
+(`_lqr_sync_probe!`), so only the structure has to match.
+=#
+const _LQR_PROBE_CACHE = WeakKeyDict{Any,Any}()
+const _LQR_PROBE_CACHE_LOCK = ReentrantLock()
+
+"""Structure a cached probe must share with the model it stands in for."""
+function _lqr_probe_signature(sm::LQRStateModel)
+    return (
+        size(sm.A),
+        size(sm.Bu),
+        length(sm.Qc),
+        copy(sm.schedule),
+        sm.terminal,
+        sm.terminal_regime,
+        sm.fixed_costate_sigma,
+        Threads.maxthreadid(),
+    )
+end
+
+"""
+    _lqr_terminal_probe_cached(sm, hs)
+
+[`_lqr_terminal_probe`](@ref), reused while `hs` carries the same designs and
+`sm` the same structure as when it was built.
+"""
+function _lqr_terminal_probe_cached(sm::LQRStateModel{T}, hs) where {T}
+    sig = _lqr_probe_signature(sm)
+    lock(_LQR_PROBE_CACHE_LOCK) do
+        cached = get(_LQR_PROBE_CACHE, hs, nothing)
+        if cached !== nothing &&
+            cached.signature == sig &&
+            _same_designs(cached.probe.designs, hs)
+            return cached.probe
+        end
+        probe = _lqr_terminal_probe(sm, hs)
+        _LQR_PROBE_CACHE[hs] = (; probe, signature=sig)
+        return probe
+    end
+end
+
+function _same_designs(designs, hs)
+    length(designs) == length(hs.terminal_inputs) || return false
+    for (d, u, c) in zip(designs, hs.terminal_inputs, hs.terminal_counts)
+        (d.count == c && d.ux == u) || return false
+    end
+    return true
+end
+
 function _lqr_sync_probe!(probe, sm)
     target = probe.lds.state_model
     for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
@@ -157,12 +361,209 @@ function _lqr_sync_probe!(probe, sm)
 end
 
 function _lqr_probe_statistics!(probe)
-    (; lds, data, tfs, pool, hs, weights) = probe
+    (; lds, data, tfs, pool, hs, designs) = probe
     smooth!(lds, tfs, data, pool)
-    _aggregate_td_suff_stats_weighted!(hs.base, tfs, lds, data, weights, pool[1])
-    _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights)
+    counts = [eltype(hs.nk)(d.count) for d in designs]
+    _lqr_probe_aggregate!(hs, tfs, lds, data, counts)
     _fill_mixed_blocks!(hs, lds.state_model)
     return hs
+end
+
+# Below this many (timestep × regressor²) units the probe aggregation runs serially.
+const _PROBE_SERIAL_WORK = 1 << 22
+
+#=
+One chunk's share of the probe statistics: the per-regime LQR blocks and the
+initial-state moments, which is everything the conditional M-step reads from a
+probe (see `_lqr_conditional_problem`).
+=#
+struct _ProbePartial{T<:Real}
+    lqr::_LQRStatsPartial{T}
+    init_x::Vector{T}
+    init_yy::Matrix{T}
+    init_n::Base.RefValue{T}
+end
+
+function _ProbePartial(hs::LQRSufficientStatistics{T}) where {T<:Real}
+    d = size(hs.yy[1], 1)
+    return _ProbePartial{T}(
+        _LQRStatsPartial(hs), Vector{T}(undef, d), Matrix{T}(undef, d, d), Ref(zero(T))
+    )
+end
+
+function _zero!(p::_ProbePartial{T}) where {T}
+    _zero!(p.lqr)
+    fill!(p.init_x, zero(T))
+    fill!(p.init_yy, zero(T))
+    p.init_n[] = zero(T)
+    return p
+end
+
+"""
+    _lqr_probe_aggregate!(hs, tfs, lds, data, counts; serial_below) -> hs
+
+The terminal-conditioning probe's statistics: what
+`_aggregate_lqr_stats_weighted!` and the initial-state half of
+`_aggregate_td_suff_stats_weighted!` produce for weights constant within each
+trial (`counts[i]` on every timestep of design `i`), computed the cheap way.
+
+Two facts about the probe make that possible. Its weight is a per-design
+constant, so the mean parts go through BLAS-3 per regime run with the count as
+the scalar, as in the unweighted [`_aggregate_lqr_stats!`](@ref), rather than one
+rank-1 update per timestep. And its covariance depends on the horizon alone —
+the smoother hands every trial of a length bucket the *same* covariance array —
+so each shared covariance is summed once, scaled by the total count of the
+designs holding it, instead of once per design.
+
+The sum runs over fixed chunks of items (one item per shared covariance, one per
+design), accumulated in parallel and reduced in chunk order, so the result is
+independent of the thread count. Below `serial_below` units of work the same
+chunks run one after another on the calling task, which gives the same bits
+without waking any threads. The algebra is that of the per-timestep
+aggregators; only the order of the floating-point additions differs.
+"""
+function _lqr_probe_aggregate!(
+    hs::LQRSufficientStatistics{T},
+    tfs::TrialFilterSmooth{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    data::Data{T},
+    counts::AbstractVector{T};
+    serial_below::Int=_PROBE_SERIAL_WORK,
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    d = lds.latent_dim
+    m = lds.ux_dim
+    reg = d + 1 + m
+    K = _nregimes(sm)
+    ntrials = length(tfs)
+
+    # Designs grouped by the covariance array they share (identity, not value).
+    group_of = IdDict{Array{T,3},Int}()
+    group_first = Int[]
+    group_weight = T[]
+    for i in 1:ntrials
+        P = tfs[i].p_smooth::Array{T,3}
+        g = get!(group_of, P) do
+            push!(group_first, i)
+            push!(group_weight, zero(T))
+            length(group_first)
+        end
+        group_weight[g] += counts[i]
+    end
+    ngroups = length(group_first)
+    nitems = ngroups + ntrials
+
+    chunks = _reduction_chunks(nitems)
+    #=
+    The probe is re-aggregated on every gradient evaluation of the M-step, so a
+    small one is dominated by waking worker threads for each wave. The chunks and
+    their reduction order are fixed by `nitems` alone, so running them one at a
+    time gives the same bits; do that below roughly a millisecond of work.
+    =#
+    work = sum(i -> size(tfs[i].x_smooth, 2), 1:ntrials; init=0) * reg^2
+    nbuf = work < serial_below ? 1 : min(length(chunks), Threads.nthreads())
+    partials = [_ProbePartial(hs) for _ in 1:nbuf]
+
+    for k in 1:K
+        fill!(hs.zz[k], zero(T))
+        fill!(hs.zy[k], zero(T))
+        fill!(hs.yy[k], zero(T))
+        hs.nk[k] = zero(T)
+        fill!(hs.term_zz[k], zero(T))
+        hs.term_n[k] = zero(T)
+    end
+    init_x = zeros(T, d)
+    init_yy = zeros(T, d, d)
+    init_n = Ref(zero(T))
+
+    function accumulate!(slot, chunk)
+        p = _zero!(partials[slot])
+        for item in chunk
+            if item <= ngroups
+                _probe_cov_item!(p, sm, tfs[group_first[item]], group_weight[item], d)
+            else
+                i = item - ngroups
+                _probe_mean_item!(p, sm, tfs[i], data.ux[i], counts[i], d, m, reg)
+            end
+        end
+        return nothing
+    end
+    function reduce!(slot)
+        p = partials[slot]
+        q = p.lqr
+        for k in 1:K
+            hs.zz[k] .+= q.zz[k]
+            hs.zy[k] .+= q.zy[k]
+            hs.yy[k] .+= q.yy[k]
+            hs.nk[k] += q.nk[k]
+            hs.term_zz[k] .+= q.term_zz[k]
+            hs.term_n[k] += q.term_n[k]
+        end
+        init_x .+= p.init_x
+        init_yy .+= p.init_yy
+        init_n[] += p.init_n[]
+        return nothing
+    end
+    if nbuf == 1
+        for chunk in chunks
+            accumulate!(1, chunk)
+            reduce!(1)
+        end
+    else
+        _foreach_chunk_wave(accumulate!, reduce!, chunks, nbuf)
+    end
+
+    base = _state_suf(hs.base)
+    base.init_n = init_n[]
+    for i in 1:d
+        base.init_xy[1, i] = init_x[i]
+    end
+    Symmetrize!(init_yy)
+    base.init_yy[] = init_yy
+    return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
+end
+
+# Covariance half of one shared-covariance group, scaled by its total count `w`.
+function _probe_cov_item!(
+    p::_ProbePartial{T}, sm::LQRStateModel, fs::FilterSmooth{T}, w::T, d::Int
+) where {T<:Real}
+    P = fs.p_smooth::Array{T,3}
+    P1 = fs.p_smooth_tt1::Array{T,3}
+    T_n = size(P, 3)
+    for t in 1:(T_n - 1)
+        k = _regime(sm, t)
+        zz, zy, yy = p.lqr.zz[k], p.lqr.zy[k], p.lqr.yy[k]
+        @views begin
+            zz[1:d, 1:d] .+= w .* P[:, :, t]
+            yy .+= w .* P[:, :, t + 1]
+            zy[1:d, :] .+= w .* adjoint(P1[:, :, t + 1])
+        end
+    end
+    if sm.terminal
+        kT = _terminal_regime(sm, T_n)
+        @views p.lqr.term_zz[kT][1:d, 1:d] .+= w .* P[:, :, T_n]
+    end
+    @views p.init_yy .+= w .* P[:, :, 1]
+    return nothing
+end
+
+# Mean half of one design, every moment scaled by its count `w`.
+function _probe_mean_item!(
+    p::_ProbePartial{T},
+    sm::LQRStateModel,
+    fs::FilterSmooth{T},
+    ux::AbstractMatrix{T},
+    w::T,
+    d::Int,
+    m::Int,
+    reg::Int,
+) where {T<:Real}
+    _lqr_stats_trial!(p.lqr, sm, fs, ux, d, m, reg, w, false)
+    x1 = tview(fs.x_smooth::Matrix{T}, :, 1)
+    p.init_x .+= w .* x1
+    BLAS.ger!(w, x1, x1, p.init_yy)
+    p.init_n[] += w
+    return nothing
 end
 
 function _lqr_refresh_precision!(ctx)
@@ -226,11 +627,16 @@ _terminal_probe_weight(::_SLQRNormalizer) = true
 
 """The part of `log Z` that is not already in the probe's expected log-density."""
 function _terminal_extra_value(b::_LQRExactNormalizer, sms)
-    total = zero(eltype(sms[1].A))
-    for (sm, probe) in zip(sms, b.probes)
-        total += _lqr_terminal_logz_sum(sm, probe.designs)
+    #=
+    One normalizer per cell (a `depends_on` variant has its own dynamics), each
+    independent of the others: compute them concurrently, sum them in cell order
+    so the total does not depend on the thread count.
+    =#
+    values = zeros(eltype(sms[1].A), length(sms))
+    tforeach(eachindex(sms, b.probes)) do c
+        values[c] = _lqr_terminal_logz_sum(sms[c], b.probes[c].designs)
     end
-    return total
+    return sum(values)
 end
 
 _terminal_extra_value(::_SLQRNormalizer, sms) = zero(eltype(sms[1].A))
@@ -264,9 +670,15 @@ _terminal_restore!(::_LQRExactNormalizer, ::Nothing) = nothing
 
 """Terminal-conditioned prior moments at the current parameters."""
 function _terminal_probe_stats!(b::_LQRExactNormalizer, sms)
-    for (sm, probe) in zip(sms, b.probes)
-        _lqr_sync_probe!(probe, sm)
-        _lqr_probe_statistics!(probe)
+    #=
+    Each cell's probe owns its model copy, workspaces and statistics, so the
+    cells run concurrently; the smoother inside each spreads its own buckets
+    over threads as well, and running cells side by side fills the tail of one
+    cell's schedule with another's work.
+    =#
+    tforeach(eachindex(sms, b.probes)) do c
+        _lqr_sync_probe!(b.probes[c], sms[c])
+        _lqr_probe_statistics!(b.probes[c])
     end
     return ([p.hs for p in b.probes], [p.lds.state_model for p in b.probes])
 end
@@ -313,7 +725,7 @@ function _lqr_conditional_problem(
     slots::AbstractVector{<:AbstractVector{Int}},
 ) where {T<:Real}
     sms = [lds.state_model for lds in ldss]
-    probes = [_lqr_terminal_probe(sm, hs) for (sm, hs) in zip(sms, sufs)]
+    probes = [_lqr_terminal_probe_cached(sm, hs) for (sm, hs) in zip(sms, sufs)]
     return _lqr_conditional_problem(
         ldss, sufs, slots, _lqr_cell_slots(sms, slots[_G_AB]), _LQRExactNormalizer(probes)
     )

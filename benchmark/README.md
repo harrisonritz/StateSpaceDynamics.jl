@@ -7,11 +7,13 @@ All benchmarking lives under this directory. There are three distinct pieces:
 | `benchmarks.jl` + `Project.toml` | **Regression tracking** — the `SUITE` run by [AirspeedVelocity.jl](https://github.com/MilesCranmer/AirspeedVelocity.jl) to compare a PR against its base branch. | lightweight (BenchmarkTools, StableRNGs) |
 | `comparison/` | **Cross-library comparison** — benchmarks StateSpaceDynamics against Python libraries (pykalman, Dynamax). | heavy (PythonCall/CondaPkg, Plots, CSV) |
 | `profiling/` | **Ad-hoc profiling** scripts for chasing allocations / hot loops during development. | uses `comparison/`'s env |
+| `lqr/` | **Inverse-LQR EM harness** — ragged, terminal-conditioned, grouped Poisson workloads; phase-by-phase multi-thread profile; thread scaling; revision comparison against a rounding-noise floor. See [`lqr/README.md`](lqr/README.md). | own env (BenchmarkTools, StableRNGs, Distributions) |
 
 ## Regression tracking (AirspeedVelocity)
 
 `benchmark/benchmarks.jl` defines `const SUITE::BenchmarkGroup` (Gaussian + Poisson
-LDS smoothing across problem sizes). On every PR, the
+LDS smoothing across problem sizes, and a ragged terminal-conditioned inverse-LQR
+slice). On every PR, the
 [`.github/workflows/airspeed.yml`](../.github/workflows/airspeed.yml) workflow runs
 the suite on both the PR head and its base in the same environment and posts a
 comparison table as a PR comment.
