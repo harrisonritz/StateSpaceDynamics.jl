@@ -136,6 +136,12 @@ function smooth(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    #= A warped member needs its embedding refreshed before anything Gaussian
+    runs; see `fit_spline_composite.jl` for why this is a run-time branch rather
+    than dispatch. =#
+    if _warped_route(lds, depends_on)
+        return _spline_composite_smooth(lds, y, ux, uy)
+    end
     data = Data(lds, y; ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -1079,6 +1085,9 @@ function elbo(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    if _warped_route(lds, depends_on)
+        return _spline_composite_elbo(lds, y, ux, uy)
+    end
     data = Data(lds, y; ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -1151,6 +1160,9 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
   timesteps, and an absolute `tol` asks a large fit for more significant
   figures than a small one; `rtol = 1e-8` or so asks every fit for the same.
 - `progress::Bool=true`: show progress bar
+- `spline_iters::Int=25`: L-BFGS iterations per warp conditional-maximization
+  step. Read only when the emission contains a
+  [`SplineGaussianObservationModel`](@ref); ignored otherwise.
 - `ux`: optional dynamics-input sequence in the same shape family as `y`
   (each trial `(ux_dim, T_i)`); required when `size(state_model.B, 2) > 0`.
 - `uy`: optional observation-input sequence (same shape family) for the
@@ -1195,6 +1207,7 @@ function fit!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    spline_iters::Int=25,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -1223,6 +1236,21 @@ function fit!(
         restore_best=restore_best,
         test_kwargs=test_kwargs,
     )
+    #= A composite with a warped member runs the ECM driver instead: its
+    embedding has to be rebuilt every E-step, and its warps get a second
+    conditional-maximization step. =#
+    if _warped_route(lds, depends_on, depends_on_test)
+        return _fit_spline_composite!(
+            lds,
+            data;
+            max_iter=max_iter,
+            tol=tol,
+            rtol=rtol,
+            progress=progress,
+            spline_iters=spline_iters,
+            monitor=monitor,
+        )
+    end
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
         lds,

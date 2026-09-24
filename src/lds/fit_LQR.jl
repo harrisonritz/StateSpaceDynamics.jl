@@ -515,6 +515,7 @@ function fit!(
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
@@ -570,6 +571,7 @@ function elbo(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
@@ -651,6 +653,7 @@ function smooth(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
@@ -692,6 +695,7 @@ function smooth(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
@@ -734,6 +738,7 @@ function fit!(
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
@@ -795,6 +800,7 @@ function elbo(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)

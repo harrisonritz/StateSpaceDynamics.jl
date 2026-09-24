@@ -1273,6 +1273,14 @@ function smooth(
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
     )
+    #= A warped emission is smoothed on its embedding; see `fit_slds_spline.jl`. =#
+    if _slds_is_warped(slds)
+        depends_on === nothing ||
+            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+        return _slds_spline_smooth(
+            slds, y, ux, uy, smoothing_iters, tol, return_cov, progress, npool, tied
+        )
+    end
     #=
     Same setup as `fit!`, minus the M-step workspaces: `Data` validates and
     canonicalizes the observation / input shapes, the grouping resolves
@@ -3646,6 +3654,7 @@ function fit!(
     max_iter::Int=50,
     smoothing_iters::Int=1,
     num_samples::Int=1,
+    spline_iters::Int=25,
     progress::Bool=true,
     rng::AbstractRNG=Random.default_rng(),
     rng_mode::Symbol=:trial,
@@ -3689,6 +3698,23 @@ function fit!(
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
+    #=
+    A warped emission fits on its embedding. `target` stays the model the caller
+    holds (and the one the held-out monitor scores and restores); everything
+    below runs on the shadow `SLDS`, whose Gaussian regimes share this model's
+    arrays, and on the shadow `Data` holding `z = g(y)`. The warp is shared
+    across regimes, so the change-of-variables term is regime-independent and
+    `q(z)` is unaffected — see `fit_slds_spline.jl`.
+    =#
+    target = slds
+    dataful = data
+    spline_state = _slds_spline_state(slds, data)
+    if spline_state !== nothing
+        depends_on === nothing ||
+            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+        slds = spline_state.shadow
+        data = spline_state.sdata
+    end
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy
@@ -3851,6 +3877,8 @@ function fit!(
     )
 
     for iter in 1:max_iter
+        # The warp moved in the previous M-step, so refresh `z = g(y)` in place.
+        spline_state === nothing || _slds_spline_embed!(spline_state, dataful)
         #=
         E-step: fill q(z) from the current samples, run forward-backward,
         re-smooth q(x), and draw the next samples for the following iteration.
@@ -3891,17 +3919,21 @@ function fit!(
                 lognorm=lognorm,
                 tied=tied,
             )
+            if spline_state !== nothing
+                elbos[iter] +=
+                    spline_state.logjac[] + _slds_spline_logprior(T, spline_state)
+            end
 
             #=
             Held-out score at the same parameters the training ELBO just used.
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
-                return _fit_result(monitor, elbos, slds)
+                return _fit_result(monitor, elbos, target)
             end
             if align_final && iter == max_iter
                 prog !== nothing && next!(prog)
@@ -3930,6 +3962,16 @@ function fit!(
             )
             # Every slot, not just the first: the ungrouped passes read the
             # cached constants without refreshing them.
+            #=
+            CM-step for the shared warp, after the regimes' own updates: it
+            conditions on the `(C_k, d_k, R_k)` just written and on the
+            responsibilities the E-step produced.
+            =#
+            if spline_state !== nothing
+                _slds_spline_mstep!(
+                    spline_state, tfs, fb_storage, seq_ends; spline_iters=spline_iters
+                )
+            end
             refresh_slds_pool!(pool, slds)
         else
             grouping = grp::ParameterGrouping
@@ -3976,11 +4018,11 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, slds, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
-                return _fit_result(monitor, elbos, slds)
+                return _fit_result(monitor, elbos, target)
             end
             if align_final && iter == max_iter
                 prog !== nothing && next!(prog)
@@ -4013,7 +4055,7 @@ function fit!(
     if prog !== nothing
         finish!(prog)
     end
-    return _fit_result(monitor, elbos, slds)
+    return _fit_result(monitor, elbos, target)
 end
 
 # ============================================================================

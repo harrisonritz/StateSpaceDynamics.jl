@@ -802,6 +802,9 @@ function elbo(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    if _warped_route(plds, depends_on)
+        return _spline_composite_elbo_laplace(plds, y, ux, uy, newton_max_iter, newton_tol)
+    end
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -859,8 +862,15 @@ function smooth(
     y::CompositeObservations{T};
     ux=nothing,
     uy=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    if _warped_route(plds, depends_on)
+        return _spline_composite_smooth_laplace(
+            plds, y, ux, uy, newton_max_iter, newton_tol
+        )
+    end
     data = Data(plds, y; ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(plds, data, grp, y)
@@ -878,7 +888,7 @@ function smooth(
             uy_dim=_ws_uy_dim(plds),
         ) for _ in 1:npool
     ]
-    smooth!(plds, tfs, data, sws_pool)
+    smooth!(plds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return _collect_smooth_output(tfs, y)
 end
 
@@ -953,6 +963,7 @@ function fit!(
     progress=true,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    spline_iters::Int=25,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
     ux_test=nothing,
@@ -979,6 +990,22 @@ function fit!(
         restore_best=restore_best,
         test_kwargs=test_kwargs,
     )
+    #= A warped member needs its embedding rebuilt every E-step and its warp a
+    second conditional-maximization step; see `fit_spline_composite.jl`. =#
+    if _warped_route(plds, depends_on, depends_on_test)
+        return _fit_spline_laplace!(
+            plds,
+            data;
+            max_iter=max_iter,
+            tol=tol,
+            rtol=rtol,
+            progress=progress,
+            newton_max_iter=newton_max_iter,
+            newton_tol=newton_tol,
+            spline_iters=spline_iters,
+            monitor=monitor,
+        )
+    end
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(
         plds,

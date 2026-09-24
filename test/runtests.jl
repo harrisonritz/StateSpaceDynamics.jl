@@ -16,6 +16,7 @@ using StableRNGs
 using StateSpaceDynamics
 const SSD = StateSpaceDynamics
 using SparseArrays
+using Statistics
 using StatsFuns
 using SpecialFunctions
 using Test
@@ -355,6 +356,78 @@ using SSDTest
                 test_SLDS_smooth_npool_invariant()
                 test_SLDS_fit_reproducibility()
                 test_SLDS_rng_modes()
+            end
+        end
+
+        include("LinearDynamicalSystems/SplineGaussianLDS.jl")
+        @testset "Spline-Gaussian LDS (manifold discovery)" begin
+            @testset "Monotonic RQ spline kernel" begin
+                test_warp_identity_at_zero()
+                test_warp_monotone_and_invertible()
+                test_warp_gradient_matches_forwarddiff()
+                test_warp_gradient_logjac_counted_once()
+                test_spline_mixture_objective_gradient()
+                test_warp_bounds_and_construction_errors()
+                test_warp_pack_roundtrip()
+                test_warp_copy_shape_mismatch()
+                test_warp_bin_lookup()
+                test_warp_apply_block()
+            end
+
+            @testset "Construction and printing" begin
+                test_spline_construction_and_validation()
+                test_spline_fit_bool_keyword_form()
+                test_spline_show()
+            end
+
+            @testset "Reduction to the linear model" begin
+                test_spline_frozen_warp_matches_gaussian()
+                test_spline_identity_warp_scores_as_gaussian()
+            end
+
+            @testset "Log-density bookkeeping" begin
+                test_spline_elbo_equals_loglikelihood()
+                test_spline_trial_elbos_sum()
+                test_spline_logprior_enters_elbo()
+            end
+
+            @testset "ECM" begin
+                test_spline_elbo_monotone()
+                test_spline_recovers_warp_and_beats_linear()
+                test_spline_R_structure()
+                test_spline_smooth_equals_gaussian_on_embedded()
+                test_spline_partial_warp_maximization_still_monotone()
+                test_spline_fit_bool_freezes()
+                test_spline_inputs_and_ragged_trials()
+                test_spline_single_trial_matrix_shapes()
+                test_spline_sampling_roundtrip()
+                test_spline_holdout_and_early_stopping()
+                test_spline_rtol_stops_early()
+                test_spline_grouping_is_rejected()
+                test_spline_lqr_state_model_rejected()
+                test_spline_three_dim_observations()
+                test_spline_float32()
+            end
+
+            @testset "Shadow emission, R structure and priors" begin
+                test_spline_gaussian_shadow_shares_arrays()
+                test_spline_diagonal_R_matches_iw_map()
+                test_spline_R_floor_binds_and_warns()
+                test_spline_priors_shift_the_fit()
+            end
+
+            @testset "Composite emissions" begin
+                test_spline_composite_fit()
+                test_spline_composite_trial_elbos()
+                test_spline_composite_fit_bool()
+                test_spline_composite_with_poisson()
+            end
+
+            @testset "SLDS" begin
+                test_spline_slds_fit()
+                test_spline_slds_collapses_distinct_warps()
+                test_spline_slds_smooth_tied_params()
+                test_spline_slds_entry_points_validate()
             end
         end
 

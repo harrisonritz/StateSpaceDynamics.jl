@@ -207,6 +207,11 @@ function trial_elbos(
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
+    #= A warped member is scored on its embedding, with each trial's own
+    change-of-variables term added back; see `fit_spline_composite.jl`. =#
+    if _warped_route(lds)
+        return _spline_composite_trial_elbos(lds, y, ux, uy)
+    end
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
     smooth!(lds, tfs, data, sws_pool)
     return _accumulate_trial_elbos(lds, tfs, data, sws_pool[1])
@@ -230,6 +235,11 @@ function trial_elbos(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    if _warped_route(plds)
+        return _spline_composite_trial_elbos(
+            plds, y, ux, uy; newton_max_iter=newton_max_iter, newton_tol=newton_tol
+        )
+    end
     data, tfs, sws_pool = _trial_elbo_setup(plds, y, ux, uy)
     smooth!(plds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return _accumulate_trial_elbos(plds, tfs, data, sws_pool[1])
@@ -378,6 +388,7 @@ function trial_elbos(
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
     _prepare_lqr!(lds, data.tsteps)
     smooth!(lds, tfs, data, sws_pool)
@@ -402,6 +413,7 @@ function trial_elbos(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
     _prepare_lqr!(lds, data.tsteps)
     smooth!(lds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))

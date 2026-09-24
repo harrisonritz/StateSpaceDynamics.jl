@@ -79,6 +79,166 @@ Where ``d`` is a bias term.
 PoissonObservationModel
 ```
 
+## Manifold discovery: a monotonic normalizing flow on the emission
+
+A linear-Gaussian emission assumes each channel is an affine readout of the
+latent state. Neurons saturate, sensors rectify, kinematic variables are bounded
+— so the latent manifold is rarely linear in the coordinates you measured.
+[`SplineGaussianObservationModel`](@ref) keeps the dynamics linear and Gaussian
+and puts a learned, element-wise, strictly increasing warp between the latent
+readout and the observations:
+
+```math
+y_t = g^{-1}(z_t), \qquad z_t \mid x_t \sim \mathcal{N}(C x_t + d + D v_t,\ R)
+```
+
+Each ``g_j`` is a monotonic rational-quadratic spline (Gregory & Delbourgo 1982,
+in the normalizing-flow parameterization of Durkan et al. 2019). Because ``g`` is
+a diffeomorphism the emission density is exact, with a change-of-variables term:
+
+```math
+p(y_t \mid x_t) = \mathcal{N}\big(g(y_t);\, C x_t + d + D v_t,\ R\big)\,
+                  \prod_j g_j'(y_{tj})
+```
+
+With ``C`` of size ``p \times k`` and ``k < p``, ``z`` concentrates near a
+``k``-dimensional affine subspace and ``y = g^{-1}(z)`` traces a curved
+``k``-manifold in observation space — which is the manifold the fit discovers.
+
+```julia
+om  = SplineGaussianObservationModel(C, R, d; y = Y, n_bins = 8)
+lds = LinearDynamicalSystem(state_model, om)
+elbos = fit!(lds, Y)
+
+# channel j's learned tuning curve, on the observation scale
+zs = [warp_forward(lds.obs_model.warp, j, y)[1] for y in ys]
+```
+
+### What it does and does not buy
+
+One layer of element-wise warps is exactly a **Gaussian-copula (nonparanormal)
+LDS**: arbitrary continuous per-channel marginals — rectification, saturation,
+skew, heavy or light tails — over linear-Gaussian latent dynamics. It does *not*
+mix channels, so it cannot rotate or bend a manifold sideways. That restriction
+is the point: each ``g_j`` stays a directly interpretable per-channel
+nonlinearity, and the latent state keeps the meaning it has in the linear model.
+
+### How it is fitted
+
+Hold ``g`` fixed and ``z = g(y)`` is data, so the model in ``z`` is an ordinary
+linear-Gaussian SSM. Fitting is therefore *exact* Expectation Conditional
+Maximization, not a variational approximation:
+
+1. **E-step.** Embed ``z = g(y)`` and smooth. The posterior ``q(x) = p(x \mid z)``
+   is exact — the Jacobian term does not involve ``x`` at all.
+2. **CM-step 1.** The usual closed-form updates of ``x_0``, ``P_0``, ``[A\ b\ B]``,
+   ``Q``, ``[C\ d\ D]`` and ``R`` from the sufficient statistics of ``z``. With
+   ``g`` fixed the Jacobian is a constant and drops out.
+3. **CM-step 2.** L-BFGS on the spline parameters ``\phi`` with everything else
+   fixed. Write ``\hat\mu_t = C\hat x_t + d + D v_t`` for the smoothed emission
+   mean and ``R = LL^\top``. The expectation over ``q`` then separates,
+
+```math
+\mathbb{E}_q\big\|g(y_t) - \mu_t\big\|^2_{R^{-1}}
+   = \big\|L^{-1}\big(g(y_t) - \hat\mu_t\big)\big\|^2
+   + \operatorname{tr}\!\big(R^{-1} C \Sigma_t C^\top\big)
+```
+
+   and the trace is constant in ``\phi``. So the warp objective
+
+```math
+\mathcal{Q}(\phi) = -\tfrac12 \sum_{n,t} \big\|L^{-1}\big(g_\phi(y_{nt}) -
+   \hat\mu_{nt}\big)\big\|^2 + \sum_{n,t,j} \log g_{\phi_j}'(y_{ntj})
+```
+
+   is exactly a normalizing-flow maximum-likelihood fit against a per-timestep
+   Gaussian base centred on the smoothed prediction. Only the smoothed *mean*
+   enters.
+
+Both conditional maximizations increase the same ``Q(\theta, q)``, and the warp
+step is accepted only when it strictly improves, so the observed-data
+log-likelihood is non-decreasing. `spline_iters` (default 25) caps the L-BFGS
+budget per iteration; a partial maximization is still a valid generalized-EM
+step.
+
+All spline parameters start at zero, which is **exactly the identity map**. A
+fresh spline emission is therefore the corresponding linear-Gaussian emission,
+and `fit_bool = (spline = false,)` (or `spline_iters = 0`) freezes it there — the
+natural baseline to compare a warped fit against.
+
+### Reported log-densities
+
+Because ``z`` moves between iterations, only a density on the ``y`` scale is
+comparable across iterations or against another model. `elbo`, `loglikelihood`
+and `trial_elbos` all include ``\sum_{t,j} \log g_j'(y_{tj})``, so a spline fit's
+held-out ELBO can be compared directly with a plain Gaussian LDS fit to the same
+data.
+
+### Identifiability and the noise floor
+
+Each ``g_j`` maps its interval ``[\mathrm{lo}_j, \mathrm{hi}_j]`` onto itself and
+is the identity outside it, with the endpoints pinned to the diagonal. That is
+not cosmetic: without it, ``g \mapsto \alpha \odot g + \beta`` is an exact
+``2p``-dimensional flat direction of the likelihood (the ``\log\det R`` and
+log-Jacobian terms cancel when the rescaling is absorbed into ``C``, ``d`` and
+``R``). The interval is fixed at construction — from the data range (`y = Y`) or
+explicitly (`bounds = (lo, hi)`) — and is never refitted.
+
+Two further knobs matter in practice. `R_structure` defaults to `:diagonal`,
+which is the identified, factor-analysis-style choice when ``k < p``: it forces
+the latent state to carry all cross-channel structure. And, like any flow with a
+free noise level, this model's likelihood is *unbounded above* — a warp that
+interpolates the smoothed prediction on one channel drives that channel's
+residual to zero. `R_floor` keeps `R` factorizable if a fit walks into that
+direction and warns when it binds; the statistical remedy is an `R_prior`, fewer
+`n_bins`, or a larger `spline_ridge`.
+
+### Composite emissions and switching models
+
+A spline emission can be a member of a composite, alongside Gaussian or Poisson
+readouts of the same latent state; each warped member gets its own independent
+warp CM-step. In an [`SLDS`](@ref) the warp is **shared across regimes** — a
+per-channel distortion is a property of the measurement, not of which regime the
+system is in — so the regimes differ in ``(A_k, Q_k, C_k, d_k, R_k)`` on a fixed
+nonlinear manifold. The shared warp also makes the change-of-variables term
+regime-independent, so it cancels out of the discrete posterior and the warp's
+CM-step becomes a responsibility-weighted mixture fit.
+
+Two combinations are refused rather than approximated. `depends_on` parameter
+grouping would need a warp per group to be coherent with this package's session
+stitching (groups may observe different channel sets), so fit each group
+separately. And an [`LQRStateModel`](@ref) is fitted by its own *structural*
+M-step, which the spline driver's generic state updates would discard.
+
+The knot layout (`pX`, `pY`, `dYdX`, with identity tails and endpoints on the
+diagonal) is the same one [MonotonicSplines.jl](https://github.com/bat/MonotonicSplines.jl)
+uses, so a fitted channel can be handed straight to that package:
+
+```julia
+using MonotonicSplines
+w = lds.obs_model.warp
+f = RQSpline(w.pX[:, j], w.pY[:, j], w.dYdX[:, j])
+```
+
+```@docs
+SplineGaussianObservationModel
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:SplineGaussianObservationModel{T}}
+loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,SM<:GaussianStateModel{T},OM<:SplineGaussianObservationModel{T}}
+MonotonicWarp
+warp_forward
+warp_inverse
+warp_apply!
+warp_unapply!
+warp_bounds
+warp_channels
+warp_bins
+warp_nparams
+is_identity_warp
+refresh_knots!
+copy_warp!
+```
+
+
 ## Several observation models at once
 
 One latent process can be measured in more than one way — spike counts *and*

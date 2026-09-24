@@ -27,6 +27,7 @@ include("numerics/optimization.jl")        # line search + Newton
 include("numerics/block_tridiagonal.jl")   # BTD workspace + solver/inverse
 include("numerics/cov_update.jl")          # info_update! + CovUpdateCache
 include("numerics/riccati.jl")             # LQR gain/affine sweeps + their adjoint
+include("numerics/rqspline.jl")            # monotonic rational-quadratic splines
 
 # Conjugate priors — defined first because model structs reference IWPrior/MNPrior
 # in their field type annotations.
@@ -53,6 +54,7 @@ include("lds/lqr_latents.jl")                       # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
+include("lds/spline_gaussian_observations.jl")  # Gaussian ∘ monotonic warp (manifold discovery)
 include("lds/poisson_observations.jl")
 include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
 include("lds/composite_observations.jl")            # several emissions on one latent state
@@ -62,8 +64,11 @@ include("lds/grouped_em.jl")
 
 # Fitting Functions
 include("lds/fit_LDS.jl")
+include("lds/fit_spline_LDS.jl")        # ECM driver for the spline-Gaussian emission
+include("lds/fit_spline_composite.jl")  # ... and for warped members of a composite
 include("lds/fit_PLDS.jl")
 include("lds/fit_SLDS.jl")
+include("lds/fit_slds_spline.jl")       # ... and for a warped emission in an SLDS
 
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
@@ -86,8 +91,15 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
 export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
+export SplineGaussianObservationModel
 export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior
+
+# Monotonic rational-quadratic splines (the normalizing-flow layer of a
+# `SplineGaussianObservationModel`; usable on their own).
+export MonotonicWarp, refresh_knots!, copy_warp!
+export warp_forward, warp_inverse, warp_apply!, warp_unapply!
+export warp_bounds, warp_bins, warp_channels, warp_nparams, is_identity_warp
 export CovUpdateCache
 export FitTrace
 
