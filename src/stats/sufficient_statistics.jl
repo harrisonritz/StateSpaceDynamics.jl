@@ -225,6 +225,140 @@ function _base_td_sufficient_statistics(
     )
 end
 
+# Below this many (timestep × regressor × latent) units the aggregation is serial.
+const _TD_AGGREGATE_SERIAL_WORK = 1 << 22
+
+#=
+One chunk's share of the state-independent sufficient statistics accumulated by
+`_aggregate_td_suff_stats!` (upper triangles for the symmetric blocks).
+=#
+struct _TDStatsPartial{T<:Real}
+    init_xy::Matrix{T}
+    init_yy::Matrix{T}
+    dyn_xx::Matrix{T}
+    obs_xx::Matrix{T}
+    dyn_xy::Matrix{T}
+    dyn_yy::Matrix{T}
+    obs_xy::Matrix{T}
+    cov_all::Matrix{T}
+    cov_prev::Matrix{T}
+    cov_next::Matrix{T}
+    xcov::Matrix{T}
+end
+
+function _TDStatsPartial(::Type{T}, D::Int, p::Int, dyn_reg::Int, obs_reg::Int) where {T}
+    return _TDStatsPartial{T}(
+        zeros(T, 1, D),
+        zeros(T, D, D),
+        zeros(T, dyn_reg, dyn_reg),
+        zeros(T, obs_reg, obs_reg),
+        zeros(T, dyn_reg, D),
+        zeros(T, D, D),
+        zeros(T, obs_reg, p),
+        zeros(T, D, D),
+        zeros(T, D, D),
+        zeros(T, D, D),
+        zeros(T, D, D),
+    )
+end
+
+function _zero!(acc::_TDStatsPartial{T}) where {T}
+    for f in fieldnames(_TDStatsPartial)
+        fill!(getfield(acc, f), zero(T))
+    end
+    return acc
+end
+
+"""
+    _td_stats_trial!(acc, fs, y, ux, uy, D, ux_dim, uy_dim, dyn_reg_dim, obs_reg_dim, cov_cache)
+
+One trial's contribution to `_aggregate_td_suff_stats!`, added into the chunk
+partial `acc`. The covariance sums are skipped on the cov-cache path, where the
+caller adds the shared covariance once for all trials.
+"""
+function _td_stats_trial!(
+    acc::_TDStatsPartial{T},
+    fs::FilterSmooth{T},
+    y_trial::AbstractMatrix,
+    ux_trial::AbstractMatrix,
+    uy_trial,
+    D::Int,
+    ux_dim::Int,
+    uy_dim::Int,
+    dyn_reg_dim::Int,
+    obs_reg_dim::Int,
+    cov_cache::Bool,
+) where {T<:Real}
+    x = fs.x_smooth::Matrix{T}
+    p_smooth = fs.p_smooth::Array{T,3}
+    p_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
+    T_n = size(x, 2)
+    Szz_Ab, Szz_Cd, Q_sum = acc.dyn_xx, acc.obs_xx, acc.dyn_yy
+    td_dyn_xy, td_obs_xy = acc.dyn_xy, acc.obs_xy
+
+    # Per-trial cov sums when not on the cov-cache fast path.
+    if !cov_cache
+        @views for t in 1:T_n
+            acc.cov_all .+= p_smooth[:, :, t]
+            if t < T_n
+                acc.cov_prev .+= p_smooth[:, :, t]
+            end
+            if t > 1
+                acc.cov_next .+= p_smooth[:, :, t]
+                acc.xcov .+= p_smooth_tt1[:, :, t]
+            end
+        end
+    end
+
+    # init_xy[1, :] += x[:, 1];   init_yy += x[:, 1] x[:, 1]'
+    for j in 1:D
+        acc.init_xy[1, j] += x[j, 1]
+    end
+    x1 = tview(x, :, 1)
+    BLAS.ger!(one(T), x1, x1, acc.init_yy)
+
+    x_prev = tview(x, :, 1:(T_n - 1))
+    x_next = tview(x, :, 2:T_n)
+
+    # dyn_xx[1:D, 1:D] += x_prev x_prev'   (upper triangle via syrk)
+    BLAS.syrk!('U', 'N', one(T), x_prev, one(T), tview(Szz_Ab, 1:D, 1:D))
+    # obs_xx[1:D, 1:D] += x x'             (upper triangle via syrk)
+    BLAS.syrk!('U', 'N', one(T), x, one(T), tview(Szz_Cd, 1:D, 1:D))
+
+    # dyn_xx[1:D, D+1] += Σ x_prev   (column-sum into upper-only bias col)
+    for t in 1:(T_n - 1), i in 1:D
+        Szz_Ab[i, D + 1] += x_prev[i, t]
+    end
+    # obs_xx[1:D, D+1] += Σ x
+    for t in 1:T_n, i in 1:D
+        Szz_Cd[i, D + 1] += x[i, t]
+    end
+
+    # dyn_xy[1:D, :] += x_prev x_next'
+    mul!(view(td_dyn_xy, 1:D, :), x_prev, x_next', one(T), one(T))
+    # dyn_xy[D+1, :] += Σ x_next
+    for t in 1:(T_n - 1), j in 1:D
+        td_dyn_xy[D + 1, j] += x_next[j, t]
+    end
+
+    # dyn_yy += x_next x_next'  (upper tri)
+    BLAS.syrk!('U', 'N', one(T), x_next, one(T), Q_sum)
+
+    # obs_xy[1:D, :] += x y'
+    mul!(view(td_obs_xy, 1:D, :), x, y_trial', one(T), one(T))
+
+    # Input-side cross blocks (x × u, u × x).
+    if ux_dim > 0
+        ux_prev = view(ux_trial, :, 1:(T_n - 1))
+        mul!(view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, ux_prev', one(T), one(T))
+        mul!(view(td_dyn_xy, (D + 2):dyn_reg_dim, :), ux_prev, x_next', one(T), one(T))
+    end
+    if uy_dim > 0
+        mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, uy_trial', one(T), one(T))
+    end
+    return nothing
+end
+
 """
     _aggregate_td_suff_stats!(suf, tfs, lds, data, sws)
 
@@ -315,75 +449,59 @@ function _aggregate_td_suff_stats!(
         sum_xcov .*= N_T
     end
 
-    for trial in 1:ntrials
-        fs = tfs[trial]
-        x = fs.x_smooth::Matrix{T}
-        p_smooth = fs.p_smooth::Array{T,3}
-        p_smooth_tt1 = fs.p_smooth_tt1::Array{T,3}
-        T_n = size(x, 2)
-
-        # Per-trial cov sums when not on the cov-cache fast path.
+    #=
+    The per-trial sums run in fixed chunks of trials, each into its own partial,
+    added into the totals in chunk order: the result depends on the trial count
+    alone, not on the thread count. A small aggregation runs the same chunks on
+    the calling task — the same bits, without waking any threads.
+    =#
+    chunks = _reduction_chunks(ntrials)
+    work = sum(n -> size(tfs[n].x_smooth, 2), 1:ntrials; init=0) * (D + p + 1) * D
+    nbuf = work < _TD_AGGREGATE_SERIAL_WORK ? 1 : min(length(chunks), Threads.nthreads())
+    partials = [_TDStatsPartial(T, D, p, dyn_reg_dim, obs_reg_dim) for _ in 1:(nbuf)]
+    function accumulate!(slot, chunk)
+        acc = _zero!(partials[slot])
+        for trial in chunk
+            _td_stats_trial!(
+                acc,
+                tfs[trial],
+                y[trial],
+                ux_seq[trial],
+                _trial(uy_seq, trial),
+                D,
+                ux_dim,
+                uy_dim,
+                dyn_reg_dim,
+                obs_reg_dim,
+                cov_cache,
+            )
+        end
+        return nothing
+    end
+    function reduce!(slot)
+        acc = partials[slot]
+        td_init_xy .+= acc.init_xy
+        S0_sum .+= acc.init_yy
+        Szz_Ab .+= acc.dyn_xx
+        Szz_Cd .+= acc.obs_xx
+        td_dyn_xy .+= acc.dyn_xy
+        Q_sum .+= acc.dyn_yy
+        td_obs_xy .+= acc.obs_xy
         if !cov_cache
-            @views for t in 1:T_n
-                sum_cov_all .+= p_smooth[:, :, t]
-                if t < T_n
-                    sum_cov_prev .+= p_smooth[:, :, t]
-                end
-                if t > 1
-                    sum_cov_next .+= p_smooth[:, :, t]
-                    sum_xcov .+= p_smooth_tt1[:, :, t]
-                end
-            end
+            sum_cov_all .+= acc.cov_all
+            sum_cov_prev .+= acc.cov_prev
+            sum_cov_next .+= acc.cov_next
+            sum_xcov .+= acc.xcov
         end
-
-        # init_xy[1, :] += x[:, 1];   init_yy += x[:, 1] x[:, 1]'
-        for j in 1:D
-            td_init_xy[1, j] += x[j, 1]
+        return nothing
+    end
+    if nbuf == 1
+        for chunk in chunks
+            accumulate!(1, chunk)
+            reduce!(1)
         end
-        x1 = tview(x, :, 1)
-        BLAS.ger!(one(T), x1, x1, S0_sum)
-
-        x_prev = tview(x, :, 1:(T_n - 1))
-        x_next = tview(x, :, 2:T_n)
-
-        # dyn_xx[1:D, 1:D] += x_prev x_prev'   (upper triangle via syrk)
-        BLAS.syrk!('U', 'N', one(T), x_prev, one(T), tview(Szz_Ab, 1:D, 1:D))
-        # obs_xx[1:D, 1:D] += x x'             (upper triangle via syrk)
-        BLAS.syrk!('U', 'N', one(T), x, one(T), tview(Szz_Cd, 1:D, 1:D))
-
-        # dyn_xx[1:D, D+1] += Σ x_prev   (column-sum into upper-only bias col)
-        for t in 1:(T_n - 1), i in 1:D
-            Szz_Ab[i, D + 1] += x_prev[i, t]
-        end
-        # obs_xx[1:D, D+1] += Σ x
-        for t in 1:T_n, i in 1:D
-            Szz_Cd[i, D + 1] += x[i, t]
-        end
-
-        # dyn_xy[1:D, :] += x_prev x_next'
-        mul!(view(td_dyn_xy, 1:D, :), x_prev, x_next', one(T), one(T))
-        # dyn_xy[D+1, :] += Σ x_next
-        for t in 1:(T_n - 1), j in 1:D
-            td_dyn_xy[D + 1, j] += x_next[j, t]
-        end
-
-        # dyn_yy += x_next x_next'  (upper tri)
-        BLAS.syrk!('U', 'N', one(T), x_next, one(T), Q_sum)
-
-        # obs_xy[1:D, :] += x y'
-        mul!(view(td_obs_xy, 1:D, :), x, y[trial]', one(T), one(T))
-
-        # Input-side cross blocks (x × u, u × x).
-        if ux_dim > 0
-            ux_trial = ux_seq[trial]
-            ux_prev = view(ux_trial, :, 1:(T_n - 1))
-            mul!(view(Szz_Ab, 1:D, (D + 2):dyn_reg_dim), x_prev, ux_prev', one(T), one(T))
-            mul!(view(td_dyn_xy, (D + 2):dyn_reg_dim, :), ux_prev, x_next', one(T), one(T))
-        end
-        if uy_dim > 0
-            uy_trial = uy_seq[trial]
-            mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, uy_trial', one(T), one(T))
-        end
+    else
+        _foreach_chunk_wave(accumulate!, reduce!, chunks, nbuf)
     end
 
     # init_yy: need Σ_n P_smooth[n,:,:,1].

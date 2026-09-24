@@ -48,3 +48,7 @@ CLAUDE.md
 /dev/
 **.cov
 docs/dev/lqr/*/*.png
+
+# LQR benchmark harness: revision worktrees and run outputs.
+.bench-worktrees/
+benchmark/lqr/results/
