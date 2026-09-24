@@ -1289,23 +1289,6 @@ function smooth(
     =#
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
-    #=
-    A warped emission fits on its embedding. `target` stays the model the caller
-    holds (and the one the held-out monitor scores and restores); everything
-    below runs on the shadow `SLDS`, whose Gaussian regimes share this model's
-    arrays, and on the shadow `Data` holding `z = g(y)`. The warp is shared
-    across regimes, so the change-of-variables term is regime-independent and
-    `q(z)` is unaffected — see `fit_slds_spline.jl`.
-    =#
-    target = slds
-    dataful = data
-    spline_state = _slds_spline_state(slds, data)
-    if spline_state !== nothing
-        depends_on === nothing ||
-            throw(ArgumentError("`depends_on` is not supported for a spline emission"))
-        slds = spline_state.shadow
-        data = spline_state.sdata
-    end
     y_seq = data.y
     ux_seq = data.ux
     uy_seq = data.uy

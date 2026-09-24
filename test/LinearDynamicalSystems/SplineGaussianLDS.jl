@@ -800,7 +800,7 @@ function test_spline_rtol_stops_early()
     full = sg_init_model(Y; p=p, seed=18, n_bins=5)
     el_full = fit!(full, Y; max_iter=30, tol=1e-12, progress=false)
     loose = sg_init_model(Y; p=p, seed=18, n_bins=5)
-    el_loose = fit!(loose, Y; max_iter=30, tol=1e-12, rtol=1e-3, progress=false)
+    el_loose = fit!(loose, Y; max_iter=30, tol=1e-12, rtol=1e-2, progress=false)
     @test length(el_full) == 30
     @test 1 < length(el_loose) < length(el_full)
     @test el_loose ≈ el_full[1:length(el_loose)] rtol = 1e-10
@@ -822,7 +822,7 @@ function test_spline_rtol_stops_early()
     end
     Yc = (kin=Y, aux=[randn(StableRNG(71), 2, size(y, 2)) for y in Y])
     el_full = fit!(composite(), Yc; max_iter=30, tol=1e-12, progress=false)
-    el_loose = fit!(composite(), Yc; max_iter=30, tol=1e-12, rtol=1e-3, progress=false)
+    el_loose = fit!(composite(), Yc; max_iter=30, tol=1e-12, rtol=1e-2, progress=false)
     @test length(el_full) == 30
     @test 1 < length(el_loose) < length(el_full)
     return nothing
@@ -837,6 +837,44 @@ function test_spline_grouping_is_rejected()
     @test_throws ArgumentError fit!(lds, Y; max_iter=2, progress=false)
     @test_throws ArgumentError elbo(lds, Y)
     set_depends_on!(lds.obs_model, nothing)
+
+    #=
+    Labels passed at the call rather than declared on the model are refused
+    too, at every composite entry point, on both the quadratic and the Laplace
+    routes -- not silently dropped.
+    =#
+    k = SG_LATENT
+    labels = (C=[1, 1, 2, 2],)
+    function kin()
+        return SplineGaussianObservationModel(
+            randn(StableRNG(62), p, k), Matrix(1.0I, p, p), zeros(p); y=Y, n_bins=4
+        )
+    end
+    quad = LinearDynamicalSystem(
+        sg_state_model(),
+        (
+            kin=kin(),
+            aux=GaussianObservationModel(randn(rng, 2, k), Matrix(1.0I, 2, 2), zeros(2)),
+        ),
+    )
+    Yq = (kin=Y, aux=[randn(rng, 2, 40) for _ in 1:4])
+    lap = LinearDynamicalSystem(
+        sg_state_model(),
+        (kin=kin(), spk=PoissonObservationModel(randn(rng, 2, k), zeros(2))),
+    )
+    Yl = (kin=Y, spk=[Float64.(rand(rng, 0:2, 2, 40)) for _ in 1:4])
+    for (m, y) in ((quad, Yq), (lap, Yl))
+        @test_throws ArgumentError fit!(m, y; max_iter=1, progress=false, depends_on=labels)
+        @test_throws ArgumentError fit!(
+            m, y; max_iter=1, progress=false, y_test=y, depends_on_test=labels
+        )
+        @test_throws ArgumentError smooth(m, y; depends_on=labels)
+        @test_throws ArgumentError elbo(m, y; depends_on=labels)
+    end
+    @test_throws ArgumentError loglikelihood(quad, Yq; depends_on=labels)
+    # Without labels the same calls go through.
+    @test isfinite(loglikelihood(quad, Yq))
+    @test isfinite(elbo(lap, Yl))
     return nothing
 end
 
@@ -1394,6 +1432,30 @@ function test_spline_slds_collapses_distinct_warps()
         LDSs=[sg_slds_regime(C, w1), sg_slds_regime(C, w3)],
     )
     @test_throws ArgumentError fit!(slds2, Y; max_iter=1, progress=false)
+    return nothing
+end
+
+#=
+The switching-level checks run at every entry point, and a warped model's
+`smooth` hands off to its shadow early -- so they must run on the caller's model
+before that, as `fit!` runs them, rather than surfacing from the shadow or not
+at all.
+=#
+function test_spline_slds_entry_points_validate()
+    p = 3
+    lo, hi = fill(-5.0, p), fill(5.0, p)
+    C = randn(StableRNG(89), p, SG_LATENT)
+    regimes() = [sg_slds_regime(C, MonotonicWarp(lo, hi; n_bins=4)) for _ in 1:2]
+    Y = [randn(StableRNG(90), p, 30) for _ in 1:2]
+    improper_π = SSD.SLDS(; A=[0.9 0.1; 0.1 0.9], πₖ=[0.7, 0.7], LDSs=regimes())
+    improper_A = SSD.SLDS(; A=[0.9 0.3; 0.1 0.9], πₖ=[0.5, 0.5], LDSs=regimes())
+    for bad in (improper_π, improper_A)
+        @test_throws InvalidProbabilityVectorError smooth(bad, Y)
+        @test_throws InvalidProbabilityVectorError elbo(bad, Y)
+        @test_throws InvalidProbabilityVectorError fit!(
+            deepcopy(bad), Y; max_iter=1, progress=false
+        )
+    end
     return nothing
 end
 

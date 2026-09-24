@@ -398,11 +398,16 @@ function _spline_composite_elbo(
            _spline_sites_logprior(T, sites)
 end
 
+#=
+Takes the caller's `Data` rather than `y, ux, uy`: forwarding the keyword
+arguments of the public `loglikelihood` here crashes the compiler's lattice
+("This object never exists at runtime") when that method is inferred at its
+abstract signature, which is what JET analyses.
+=#
 function _spline_composite_loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy
+    lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)

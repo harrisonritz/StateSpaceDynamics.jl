@@ -139,7 +139,7 @@ function smooth(
     #= A warped member needs its embedding refreshed before anything Gaussian
     runs; see `fit_spline_composite.jl` for why this is a run-time branch rather
     than dispatch. =#
-    if _has_warped_member(lds.obs_model)
+    if _warped_route(lds, depends_on)
         return _spline_composite_smooth(lds, y, ux, uy)
     end
     data = Data(lds, y; ux=ux, uy=uy)
@@ -802,7 +802,7 @@ function elbo(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
-    if _has_warped_member(lds.obs_model)
+    if _warped_route(lds, depends_on)
         return _spline_composite_elbo(lds, y, ux, uy)
     end
     data = Data(lds, y; ux=ux, uy=uy)
@@ -956,8 +956,7 @@ function fit!(
     #= A composite with a warped member runs the ECM driver instead: its
     embedding has to be rebuilt every E-step, and its warps get a second
     conditional-maximization step. =#
-    if _has_warped_member(lds.obs_model)
-        _reject_spline_grouping(lds)
+    if _warped_route(lds, depends_on, depends_on_test)
         return _fit_spline_composite!(
             lds,
             data;

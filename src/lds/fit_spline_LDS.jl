@@ -79,6 +79,24 @@ function _reject_spline_grouping(lds::LinearDynamicalSystem)
     return nothing
 end
 
+#=
+Whether a composite entry point takes its spline route. A call-level
+`depends_on` / `depends_on_test` is refused there for the reason
+`_reject_spline_grouping` refuses a declared one: the spline routes fit one
+warp, so ignoring the labels would quietly score or fit an ungrouped model.
+=#
+function _warped_route(
+    lds::LinearDynamicalSystem, depends_on=nothing, depends_on_test=nothing
+)
+    _has_warped_member(lds.obs_model) || return false
+    depends_on === nothing ||
+        throw(ArgumentError("`depends_on` is not supported for a spline emission"))
+    depends_on_test === nothing ||
+        throw(ArgumentError("`depends_on_test` is not supported for a spline emission"))
+    _reject_spline_grouping(lds)
+    return true
+end
+
 """
     smooth(lds, y; ux=nothing, uy=nothing)
 

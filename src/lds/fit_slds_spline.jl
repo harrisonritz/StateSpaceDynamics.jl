@@ -402,6 +402,9 @@ function _slds_spline_smooth(
     tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real}
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    # The switching-level checks every entry point runs, on the caller's model
+    # and before `_slds_spline_state` starts sharing its warps -- as `fit!` does.
+    _prepare_slds!(slds, data.tsteps)
     #=
     `_slds_spline_state` returns `nothing` for an unwarped model, and every
     caller reaches here only after `_slds_is_warped`. Assert it rather than

@@ -794,7 +794,7 @@ function elbo(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
-    if _has_warped_member(plds.obs_model)
+    if _warped_route(plds, depends_on)
         return _spline_composite_elbo_laplace(plds, y, ux, uy, newton_max_iter, newton_tol)
     end
     data = Data(plds, y; ux=ux, uy=uy)
@@ -858,7 +858,7 @@ function smooth(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
-    if _has_warped_member(plds.obs_model)
+    if _warped_route(plds, depends_on)
         return _spline_composite_smooth_laplace(
             plds, y, ux, uy, newton_max_iter, newton_tol
         )
@@ -984,8 +984,7 @@ function fit!(
     )
     #= A warped member needs its embedding rebuilt every E-step and its warp a
     second conditional-maximization step; see `fit_spline_composite.jl`. =#
-    if _has_warped_member(plds.obs_model)
-        _reject_spline_grouping(plds)
+    if _warped_route(plds, depends_on, depends_on_test)
         return _fit_spline_laplace!(
             plds,
             data;

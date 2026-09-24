@@ -427,6 +427,7 @@ using SSDTest
                 test_spline_slds_fit()
                 test_spline_slds_collapses_distinct_warps()
                 test_spline_slds_smooth_tied_params()
+                test_spline_slds_entry_points_validate()
             end
         end
 

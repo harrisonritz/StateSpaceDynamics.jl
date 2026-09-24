@@ -209,7 +209,7 @@ function trial_elbos(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
     #= A warped member is scored on its embedding, with each trial's own
     change-of-variables term added back; see `fit_spline_composite.jl`. =#
-    if _has_warped_member(lds.obs_model)
+    if _warped_route(lds)
         return _spline_composite_trial_elbos(lds, y, ux, uy)
     end
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
@@ -235,7 +235,7 @@ function trial_elbos(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
-    if _has_warped_member(plds.obs_model)
+    if _warped_route(plds)
         return _spline_composite_trial_elbos(
             plds, y, ux, uy; newton_max_iter=newton_max_iter, newton_tol=newton_tol
         )
