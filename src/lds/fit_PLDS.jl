@@ -669,15 +669,20 @@ function smooth!(
         return tfs
     end
 
+    #=
+    Trials are independent Newton solves whose cost varies with length and with
+    how many Newton steps each takes, so fixed contiguous chunks leave threads
+    idle behind the slowest chunk. Hand trials out one at a time instead,
+    longest first, each task holding one workspace from the pool. Every trial's
+    arithmetic is the same on any workspace, so the result is too.
+    =#
     ntasks = min(ntrials, length(sws_pool))
-    chunksize = cld(ntrials, ntasks)
-
-    tforeach(1:ntasks) do i
-        lo = (i - 1) * chunksize + 1
-        hi = min(i * chunksize, ntrials)
-        lo > hi && return nothing
-        sws = sws_pool[i]
-        for trial in lo:hi
+    order = sortperm(data.tsteps; rev=true)
+    free = Channel{SmoothWorkspace{T}}(ntasks)
+    foreach(i -> put!(free, sws_pool[i]), 1:ntasks)
+    tforeach(order; scheduler=:greedy, ntasks=ntasks) do trial
+        sws = take!(free)
+        try
             smooth!(
                 lds,
                 tfs[trial],
@@ -688,7 +693,10 @@ function smooth!(
                 max_iter=max_iter,
                 tol=tol,
             )
+        finally
+            put!(free, sws)
         end
+        return nothing
     end
 
     return tfs

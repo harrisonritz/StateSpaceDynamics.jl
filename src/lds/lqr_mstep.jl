@@ -178,6 +178,8 @@ z_{t+1})`, where the smoother stores `p_smooth_tt1[:, :, t] = Cov(z_t, z_{t-1})`
 sums are the unavoidable per-timestep part, exactly as on the Gaussian path.
 
 `trials` restricts the sum to a subset, every other trial contributing nothing.
+Trials are summed in fixed chunks, in parallel for a large aggregation (see
+`serial_below`), with a result that does not depend on the thread count.
 The blocks are zeroed first either way, so the result is that subset's own
 statistics rather than an accumulation onto whatever was there — which is what
 lets [`trial_elbos`](@ref) reach one trial's state Q-term through the same
@@ -188,24 +190,14 @@ function _aggregate_lqr_stats!(
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
-    trials::AbstractVector{Int}=Base.OneTo(length(tfs)),
+    trials::AbstractVector{Int}=Base.OneTo(length(tfs));
+    serial_below::Int=_AGGREGATE_SERIAL_WORK,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
     m = lds.ux_dim
     reg = d + 1 + m
     K = _nregimes(sm)
-
-    for k in 1:K
-        fill!(hs.zz[k], zero(T))
-        fill!(hs.zy[k], zero(T))
-        fill!(hs.yy[k], zero(T))
-        hs.nk[k] = zero(T)
-    end
-    for k in 1:K
-        fill!(hs.term_zz[k], zero(T))
-        hs.term_n[k] = zero(T)
-    end
 
     empty!(hs.terminal_inputs)
     empty!(hs.terminal_counts)
@@ -224,87 +216,182 @@ function _aggregate_lqr_stats!(
         end
     end
 
-    for trial in trials
-        fs = tfs[trial]
-        x = fs.x_smooth::Matrix{T}
-        p_smooth = fs.p_smooth::Array{T,3}
-        p_tt1 = fs.p_smooth_tt1::Array{T,3}
-        T_n = size(x, 2)
-        ux = data.ux[trial]
-
-        for (k, t0, t1) in _regime_runs(sm, T_n)
-            zz = hs.zz[k]
-            zy = hs.zy[k]
-            yy = hs.yy[k]
-            len = t1 - t0 + 1
-            hs.nk[k] += T(len)
-
-            x_prev = tview(x, :, t0:t1)
-            x_next = tview(x, :, (t0 + 1):(t1 + 1))
-
-            # Mean parts (BLAS-3 over the run).
-            BLAS.syrk!('U', 'N', one(T), x_prev, one(T), tview(zz, 1:d, 1:d))
-            mul!(view(zy, 1:d, :), x_prev, transpose(x_next), one(T), one(T))
-            BLAS.syrk!('U', 'N', one(T), x_next, one(T), yy)
-            for t in t0:t1, i in 1:d
-                zz[i, d + 1] += x[i, t]
-                zy[d + 1, i] += x[i, t + 1]
-            end
-            zz[d + 1, d + 1] += T(len)
-
-            # Covariance parts.
-            @views for t in t0:t1
-                zz[1:d, 1:d] .+= p_smooth[:, :, t]
-                yy .+= p_smooth[:, :, t + 1]
-                # Cov(z_t, z_{t+1}) = Cov(z_{t+1}, z_t)ᵀ = p_smooth_tt1[:,:,t+1]ᵀ
-                zy[1:d, :] .+= adjoint(p_tt1[:, :, t + 1])
-            end
-
-            if m > 0
-                u_run = tview(ux, :, t0:t1)
-                mul!(view(zz, 1:d, (d + 2):reg), x_prev, transpose(u_run), one(T), one(T))
-                mul!(view(zy, (d + 2):reg, :), u_run, transpose(x_next), one(T), one(T))
-                BLAS.syrk!(
-                    'U', 'N', one(T), u_run, one(T), tview(zz, (d + 2):reg, (d + 2):reg)
-                )
-                for t in t0:t1, j in 1:m
-                    zz[d + 1, d + 1 + j] += ux[j, t]
-                end
-            end
+    #=
+    The per-trial sums run in fixed chunks of trials, each into its own partial,
+    reduced into `hs` in chunk order: the result depends on the trial count
+    alone, not on the thread count. Small aggregations run the same chunks on
+    the calling task, which gives the same bits without waking any threads.
+    =#
+    chunks = _reduction_chunks(length(trials))
+    work = sum(i -> size(tfs[i].x_smooth, 2), trials; init=0) * reg^2
+    nbuf = work < serial_below ? 1 : min(length(chunks), Threads.nthreads())
+    partials = [_LQRStatsPartial(hs) for _ in 1:nbuf]
+    for k in 1:K
+        fill!(hs.zz[k], zero(T))
+        fill!(hs.zy[k], zero(T))
+        fill!(hs.yy[k], zero(T))
+        hs.nk[k] = zero(T)
+        fill!(hs.term_zz[k], zero(T))
+        hs.term_n[k] = zero(T)
+    end
+    function accumulate!(slot, chunk)
+        p = _zero!(partials[slot])
+        for j in chunk
+            trial = trials[j]
+            _lqr_stats_trial!(p, sm, tfs[trial], data.ux[trial], d, m, reg)
         end
-
-        #=
-        Terminal factor statistics: `E[[z_T; 1; u_T][z_T; 1; u_T]ᵀ]` summed over
-        trials. The input block is there for the terminal *reference* — a reach
-        is scored against where the target was, so the terminal residual carries
-        `+Q_f G_r u_T`.
-        =#
-        if sm.terminal
-            kT = _terminal_regime(sm, T_n)
-            term_zz = hs.term_zz[kT]
-            xT = tview(x, :, T_n)
-            BLAS.ger!(one(T), xT, xT, tview(term_zz, 1:d, 1:d))
-            @views term_zz[1:d, 1:d] .+= p_smooth[:, :, T_n]
-            for i in 1:d
-                term_zz[i, d + 1] += x[i, T_n]
-            end
-            if m > 0
-                uT = tview(ux, :, T_n)
-                @views mul!(
-                    term_zz[1:d, (d + 2):(d + 1 + m)], xT, transpose(uT), one(T), one(T)
-                )
-                BLAS.ger!(
-                    one(T), uT, uT, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m))
-                )
-                for j in 1:m
-                    term_zz[d + 1, d + 1 + j] += ux[j, T_n]
-                end
-            end
-            hs.term_n[kT] += one(T)
+        return nothing
+    end
+    function reduce!(slot)
+        p = partials[slot]
+        for k in 1:K
+            hs.zz[k] .+= p.zz[k]
+            hs.zy[k] .+= p.zy[k]
+            hs.yy[k] .+= p.yy[k]
+            hs.nk[k] += p.nk[k]
+            hs.term_zz[k] .+= p.term_zz[k]
+            hs.term_n[k] += p.term_n[k]
         end
+        return nothing
+    end
+    if nbuf == 1
+        for chunk in chunks
+            accumulate!(1, chunk)
+            reduce!(1)
+        end
+    else
+        _foreach_chunk_wave(accumulate!, reduce!, chunks, nbuf)
     end
 
     return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
+end
+
+# Below this many (timestep × regressor²) units an aggregation runs serially.
+const _AGGREGATE_SERIAL_WORK = 1 << 22
+
+#=
+One chunk's share of the per-regime state statistics.
+=#
+struct _LQRStatsPartial{T<:Real}
+    zz::Vector{Matrix{T}}
+    zy::Vector{Matrix{T}}
+    yy::Vector{Matrix{T}}
+    nk::Vector{T}
+    term_zz::Vector{Matrix{T}}
+    term_n::Vector{T}
+end
+
+function _LQRStatsPartial(hs::LQRSufficientStatistics{T}) where {T<:Real}
+    return _LQRStatsPartial{T}(
+        [similar(Z) for Z in hs.zz],
+        [similar(Z) for Z in hs.zy],
+        [similar(Z) for Z in hs.yy],
+        similar(hs.nk),
+        [similar(Z) for Z in hs.term_zz],
+        similar(hs.term_n),
+    )
+end
+
+function _zero!(p::_LQRStatsPartial{T}) where {T}
+    foreach(Z -> fill!(Z, zero(T)), p.zz)
+    foreach(Z -> fill!(Z, zero(T)), p.zy)
+    foreach(Z -> fill!(Z, zero(T)), p.yy)
+    fill!(p.nk, zero(T))
+    foreach(Z -> fill!(Z, zero(T)), p.term_zz)
+    fill!(p.term_n, zero(T))
+    return p
+end
+
+"""
+    _lqr_stats_trial!(acc, sm, fs, ux, d, m, reg[, w, with_cov])
+
+One trial's contribution to the per-regime statistics, every moment scaled by
+`w`, added into `acc` (the upper triangles of the symmetric blocks;
+`_finalize_lqr_stats!` mirrors them). `with_cov = false` leaves out the
+smoothed-covariance terms, for a caller that sums a covariance shared by many
+trials once (the terminal-conditioning probe).
+"""
+function _lqr_stats_trial!(
+    acc,
+    sm::LQRStateModel,
+    fs::FilterSmooth{T},
+    ux::AbstractMatrix,
+    d::Int,
+    m::Int,
+    reg::Int,
+    w::T=one(T),
+    with_cov::Bool=true,
+) where {T<:Real}
+    x = fs.x_smooth::Matrix{T}
+    p_smooth = fs.p_smooth::Array{T,3}
+    p_tt1 = fs.p_smooth_tt1::Array{T,3}
+    T_n = size(x, 2)
+
+    for (k, t0, t1) in _regime_runs(sm, T_n)
+        zz = acc.zz[k]
+        zy = acc.zy[k]
+        yy = acc.yy[k]
+        len = t1 - t0 + 1
+        acc.nk[k] += w * T(len)
+
+        x_prev = tview(x, :, t0:t1)
+        x_next = tview(x, :, (t0 + 1):(t1 + 1))
+
+        # Mean parts (BLAS-3 over the run).
+        BLAS.syrk!('U', 'N', w, x_prev, one(T), tview(zz, 1:d, 1:d))
+        mul!(view(zy, 1:d, :), x_prev, transpose(x_next), w, one(T))
+        BLAS.syrk!('U', 'N', w, x_next, one(T), yy)
+        for t in t0:t1, i in 1:d
+            zz[i, d + 1] += w * x[i, t]
+            zy[d + 1, i] += w * x[i, t + 1]
+        end
+        zz[d + 1, d + 1] += w * T(len)
+
+        # Covariance parts.
+        with_cov && @views for t in t0:t1
+            zz[1:d, 1:d] .+= w .* p_smooth[:, :, t]
+            yy .+= w .* p_smooth[:, :, t + 1]
+            # Cov(z_t, z_{t+1}) = Cov(z_{t+1}, z_t)ᵀ = p_smooth_tt1[:,:,t+1]ᵀ
+            zy[1:d, :] .+= w .* adjoint(p_tt1[:, :, t + 1])
+        end
+
+        if m > 0
+            u_run = tview(ux, :, t0:t1)
+            mul!(view(zz, 1:d, (d + 2):reg), x_prev, transpose(u_run), w, one(T))
+            mul!(view(zy, (d + 2):reg, :), u_run, transpose(x_next), w, one(T))
+            BLAS.syrk!('U', 'N', w, u_run, one(T), tview(zz, (d + 2):reg, (d + 2):reg))
+            for t in t0:t1, j in 1:m
+                zz[d + 1, d + 1 + j] += w * ux[j, t]
+            end
+        end
+    end
+
+    #=
+    Terminal factor statistics: `E[[z_T; 1; u_T][z_T; 1; u_T]ᵀ]` summed over
+    trials. The input block is there for the terminal *reference* — a reach
+    is scored against where the target was, so the terminal residual carries
+    `+Q_f G_r u_T`.
+    =#
+    if sm.terminal
+        kT = _terminal_regime(sm, T_n)
+        term_zz = acc.term_zz[kT]
+        xT = tview(x, :, T_n)
+        BLAS.ger!(w, xT, xT, tview(term_zz, 1:d, 1:d))
+        with_cov && @views term_zz[1:d, 1:d] .+= w .* p_smooth[:, :, T_n]
+        for i in 1:d
+            term_zz[i, d + 1] += w * x[i, T_n]
+        end
+        if m > 0
+            uT = tview(ux, :, T_n)
+            @views mul!(term_zz[1:d, (d + 2):(d + 1 + m)], xT, transpose(uT), w, one(T))
+            BLAS.ger!(w, uT, uT, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)))
+            for j in 1:m
+                term_zz[d + 1, d + 1 + j] += w * ux[j, T_n]
+            end
+        end
+        acc.term_n[kT] += w
+    end
+    return nothing
 end
 
 """
