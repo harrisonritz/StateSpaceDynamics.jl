@@ -222,6 +222,8 @@ f = RQSpline(w.pX[:, j], w.pY[:, j], w.dYdX[:, j])
 
 ```@docs
 SplineGaussianObservationModel
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:SplineGaussianObservationModel{T}}
+loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,SM<:GaussianStateModel{T},OM<:SplineGaussianObservationModel{T}}
 MonotonicWarp
 warp_forward
 warp_inverse

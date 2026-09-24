@@ -209,7 +209,7 @@ end
 
 Rebuild the derived knots (`pX`, `pY`, `dYdX`) and the cached bin fractions
 (`sw`, `sh`) from the logits. Every write to `θw` / `θh` / `θd` must be followed
-by this call; [`warp_unpack!`](@ref) does it for you.
+by this call; `warp_unpack!` does it for you.
 """
 function refresh_knots!(warp::MonotonicWarp{T}) where {T<:Real}
     K = warp_bins(warp)
