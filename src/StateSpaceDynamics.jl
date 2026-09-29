@@ -108,7 +108,7 @@ export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
 export free_state_model, plant_dim
 export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
-export simulate_lqr, lqr_riccati_sequence, terminal_logz
+export simulate_lqr, lqr_riccati_sequence, terminal_logz, terminal_normalizer
 
 # Ancillary parameter dependencies (`depends_on`)
 export group_labels, group_parameter, group_variant, set_group_seeds!, set_depends_on!

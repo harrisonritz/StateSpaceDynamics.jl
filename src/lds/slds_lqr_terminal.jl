@@ -66,6 +66,41 @@ end
 _slds_condition_terminal(::Nothing) = false
 
 """
+    _slds_check_grouped_conditioning(slds, grp)
+
+Refuse terminal conditioning under a `depends_on` grouping that splits the state
+parameters, and allow it under one that does not.
+
+`log p(terminal = 0 | θ)` is a property of the dynamics, the chain, the inputs and
+the horizon — never of the emission. So when only the emission varies by cell (the
+stitched fit: one readout per session, one set of control problems), every cell
+shares one normalizer, and the probe built from the parent model — whose state
+arrays every cell's variant shares, since slot 1 of a parameter is the parent's
+own array — is the right one. A grouping that gives cells their own state
+parameters gives them their own normalizers too, one probe each, which is not
+built. That refusal happens here, before any work, rather than the fit quietly
+reporting the joint score.
+"""
+function _slds_check_grouped_conditioning(slds::SLDS, grp)
+    grp === nothing && return nothing
+    _slds_condition_terminal(slds) || return nothing
+    _slds_state_shared(grp) && return nothing
+    throw(
+        ArgumentError(
+            "terminal conditioning is not implemented for a switching fit whose " *
+            "`depends_on` grouping splits the state parameters: each group of trials " *
+            "then has its own dynamics and so its own normalizer. Group only the " *
+            "emission (the stitched fit), or set `condition_terminal=false` on every " *
+            "inverse-LQR discrete state to fit the joint objective instead.",
+        ),
+    )
+end
+
+"""Whether every cell of `grp` uses the parent's state parameters — the one
+state variant — so that only the emission varies across cells."""
+_slds_state_shared(grp) = all(==(1), grp.cell_state)
+
+"""
     _SLQRProbe{T}
 
 The zero-loading copy of a switching model, with the scaffolding its E-step
@@ -188,7 +223,7 @@ function _slqr_sync_probe!(probe::_SLQRProbe, slds::SLDS)
     for (member, lds) in zip(probe.slds.LDSs, slds.LDSs)
         target, source = member.state_model, lds.state_model
         if target isa LQRStateModel
-            for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+            for key in (:A, :Mfree, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
                 copyto!(getproperty(target, key), getproperty(source, key))
             end
             for k in eachindex(source.Qc)
@@ -527,6 +562,78 @@ function terminal_logz(
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)
     return probe.logz
+end
+
+"""
+    terminal_normalizer(model, ux; smoothing_iters) -> Vector
+
+Each trial's `log p(terminal = 0 | θ)` under `model`, **whether or not** the model
+conditions its score on it: the number that turns a joint score into the
+conditional one when subtracted.
+
+That is what makes a fit made on the joint objective (`condition_terminal =
+false`) comparable across plant dimensions after the fact. Its score carries this
+term, which grows with the number of closed-loop modes whatever the data say.
+[`terminal_logz`](@ref) is zero for such a model, because nothing was divided by
+it.
+
+- An inverse-LQR `LinearDynamicalSystem` gets the exact value, from the backward
+  square-root recursion the conditional fit uses.
+- An `SLDS` gets the variational estimate its conditional score divides by: a
+  zero-loading copy of the model, smoothed (see [`terminal_logz`](@ref)).
+
+`ux` holds the per-trial input matrices the model was fitted with (`ux_dim × T_i`),
+which fix the horizons as well as the inputs; a model with no inputs takes
+zero-row matrices of the trials' lengths. Every entry is zero when no state carries
+a terminal factor.
+
+The normalizer is a property of the state side alone, so the emission — and any
+`depends_on` grouping of it, as in a stitched fit — does not enter. A model whose
+`depends_on` splits the *state* parameters has one normalizer per group and is
+refused.
+
+A `:free` discrete state carries no terminal factor, but the probe still smooths
+under its prior with no data to pin it, so an explosive free transition can make
+that smoother's factorization fail (`PosDefException`).
+"""
+function terminal_normalizer(
+    slds::SLDS{T},
+    ux::AbstractVector{<:AbstractMatrix};
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
+) where {T<:Real}
+    lqr = [lds.state_model for lds in slds.LDSs if lds.state_model isa LQRStateModel]
+    any(sm -> sm.terminal, lqr) || return zeros(T, length(ux))
+    any(sm -> sm.depends_on !== nothing, lqr) && throw(
+        ArgumentError(
+            "terminal_normalizer: a state model declares `depends_on`, so each group " *
+            "of trials has its own dynamics and its own normalizer. Only a grouping " *
+            "of the emission is supported.",
+        ),
+    )
+    probe = _slqr_terminal_probe(
+        slds, [Matrix{T}(u) for u in ux]; smoothing_iters=smoothing_iters
+    )
+    _slqr_sync_probe!(probe, slds)
+    _slqr_probe_estep!(probe)
+    return [probe.per_design[i] for i in probe.design_of]
+end
+
+function terminal_normalizer(
+    lds::LinearDynamicalSystem{T,S}, ux::AbstractVector{<:AbstractMatrix}
+) where {T<:Real,S<:LQRStateModel{T}}
+    sm = lds.state_model
+    sm.terminal || return zeros(T, length(ux))
+    sm.depends_on === nothing || throw(
+        ArgumentError(
+            "terminal_normalizer: the state model declares `depends_on`, so each group " *
+            "of trials has its own dynamics and its own normalizer. Only a grouping " *
+            "of the emission is supported.",
+        ),
+    )
+    inputs = [Matrix{T}(u) for u in ux]
+    _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
+    refresh!(sm)
+    return [_lqr_terminal_logz(sm, u) for u in inputs]
 end
 
 """Canonical per-trial inputs, reconstructed from the horizons when a caller

@@ -399,7 +399,9 @@ function _slds_spline_smooth(
     return_cov::Bool,
     progress::Bool,
     npool::Int,
-    tied::AbstractVector{Symbol}=Symbol[],
+    tied::AbstractVector{Symbol}=Symbol[];
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
     data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
     # The switching-level checks every entry point runs, on the caller's model
@@ -424,6 +426,8 @@ function _slds_spline_smooth(
         progress=progress,
         npool=npool,
         tied_params=_shadow_tied_params(state.shadow, tied),
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
 
     per_trial = _slds_trial_logjac(state, data)
@@ -436,6 +440,8 @@ function _slds_spline_smooth(
         trial_elbo=trial_elbo,
         p=out.p,
         terminal_logz=out.terminal_logz,
+        converged=out.converged,
+        newton_unconverged=out.newton_unconverged,
     )
 end
 
