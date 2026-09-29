@@ -442,6 +442,7 @@ function _slds_spline_smooth(
         terminal_logz=out.terminal_logz,
         converged=out.converged,
         newton_unconverged=out.newton_unconverged,
+        iterations=out.iterations,
     )
 end
 

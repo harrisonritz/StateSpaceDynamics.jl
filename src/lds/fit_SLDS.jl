@@ -1252,7 +1252,7 @@ held-out data.
 
 # Returns
 A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz, converged,
-newton_unconverged)`. For a single-trial matrix `y`, `x` is
+newton_unconverged, iterations)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
@@ -1271,6 +1271,10 @@ attributing a score gap to fit quality. See [`terminal_logz`](@ref).
 `tol=0`), and `newton_unconverged` counts the trials whose Newton solve stopped short
 of the MAP in the final alternation. A nonzero count means `elbo` was scored at a
 posterior mean that is not a MAP: raise `smoothing_iters` or `newton_max_iter`.
+`iterations` is how many alternations ran. Solves that make no progress once `γ` has
+settled end the alternation early, unconverged, rather than running out
+`smoothing_iters`; a solve stalled at roundoff will not finish with a higher cap either,
+and loosening `newton_tol` is then what lets it count as converged.
 
 Because a converged alternation is expensive, `smooth` returns everything it computed in
 one call — read its `elbo` / `trial_elbo` fields rather than calling [`elbo`](@ref) or
@@ -1377,7 +1381,7 @@ function smooth(
         nothing
     end
 
-    _, converged, newton_unconverged = _vem_alternate!(
+    iterations, converged, newton_unconverged = _vem_alternate!(
         slds,
         cell_slds,
         grp,
@@ -1402,7 +1406,7 @@ function smooth(
     prog !== nothing && finish!(prog)
 
     if tol > 0 && !converged
-        @warn "SLDS smoothing did not converge" smoothing_iters tol newton_unconverged newton_max_iter
+        @warn "SLDS smoothing did not converge" iterations smoothing_iters tol newton_unconverged newton_max_iter
     end
 
     #=
@@ -1480,6 +1484,7 @@ function smooth(
         terminal_logz,
         converged,
         newton_unconverged,
+        iterations,
     )
 end
 
@@ -1503,6 +1508,7 @@ function _collect_slds_smooth_output(
     terminal_logz,
     converged,
     newton_unconverged,
+    iterations,
 )
     return (;
         x=x[1],
@@ -1513,11 +1519,21 @@ function _collect_slds_smooth_output(
         terminal_logz=terminal_logz,
         converged=converged,
         newton_unconverged=newton_unconverged,
+        iterations=iterations,
     )
 end
 
 function _collect_slds_smooth_output(
-    x, γ, p, total_elbo, trial_elbo, _, terminal_logz, converged, newton_unconverged
+    x,
+    γ,
+    p,
+    total_elbo,
+    trial_elbo,
+    _,
+    terminal_logz,
+    converged,
+    newton_unconverged,
+    iterations,
 )
     return (;
         x=x,
@@ -1528,6 +1544,7 @@ function _collect_slds_smooth_output(
         terminal_logz=terminal_logz,
         converged=converged,
         newton_unconverged=newton_unconverged,
+        iterations=iterations,
     )
 end
 
@@ -2015,7 +2032,9 @@ while the continuous means are still moving — each Newton solve is capped at
 `newton_max_iter` steps — and a mean scored as a MAP when it is not one is scored
 against the posterior covariance of a different point. Each further alternation
 resumes the solves from where they stopped, so the cap bounds one pass, not the
-whole E-step.
+whole E-step. Once `γ` has stayed settled for two alternations, one that finishes
+none of the remaining solves ends the loop too, unconverged: those solves are
+stalled, and running out `smoothing_iters` would not move them.
 
 Returns `(iters, converged, newton_unconverged)`, the last being how many trials'
 Newton solves stopped short in the final alternation.
@@ -2090,6 +2109,8 @@ function _vem_alternate!(
     converged = false
     iters = 0
     unconverged = 0
+    unconverged_prev = typemax(Int)
+    settled_prev = false
 
     for iter in 1:smoothing_iters
         iters = iter
@@ -2193,12 +2214,28 @@ function _vem_alternate!(
                     d = abs(fb_storage.γ[i] - γ_prev[i])
                     d > Δγ && (Δγ = d)
                 end
-                if Δγ < tol && unconverged == 0
-                    converged = true
-                    break
+                settled = Δγ < tol
+                if settled
+                    if unconverged == 0
+                        converged = true
+                        break
+                    end
+                    #= With `γ` settled across this alternation and the one before,
+                    both handed the same Newton problems more steps. If this one
+                    finished none of the solves the last left short, they are
+                    stalled (typically at roundoff on an ill-conditioned
+                    posterior), and more alternations would run out
+                    `smoothing_iters` without changing anything. Stop, and leave
+                    them reported as unconverged. One settled alternation is not
+                    enough: the solves in it started from means fitted under the
+                    previous `γ`, so a capped solve may only confirm its MAP in
+                    the next. =#
+                    settled_prev && unconverged >= unconverged_prev && break
                 end
+                settled_prev = settled
             end
             copyto!(γ_prev, fb_storage.γ)
+            unconverged_prev = unconverged
         end
     end
 

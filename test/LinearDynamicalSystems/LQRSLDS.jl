@@ -1562,6 +1562,18 @@ function test_slds_newton_convergence_reported()
     @test slow.converged
     @test slow.newton_unconverged == 0
     @test slow.elbo ≈ ref.elbo rtol = 1e-6
+    @test slow.iterations < 500
+
+    #= A zero tolerance no solve can meet: every one stalls at roundoff. Once `γ`
+    settles the alternation stops, reporting them, rather than spending the whole
+    `smoothing_iters` on problems that no longer change. =#
+    stalled = @test_logs (:warn, r"did not converge") match_mode = :any smooth(
+        slds, ys; smoothing_iters=500, newton_tol=0.0
+    )
+    @test !stalled.converged
+    @test stalled.newton_unconverged == ntrials
+    @test stalled.iterations < 50
+    @test stalled.elbo ≈ ref.elbo rtol = 1e-6
 
     @test_logs (:warn, r"Newton MAP") match_mode = :any fit!(
         deepcopy(slds), ys; max_iter=2, progress=false, rng=StableRNG(7), newton_max_iter=1
