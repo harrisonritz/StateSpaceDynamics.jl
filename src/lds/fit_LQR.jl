@@ -1280,6 +1280,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps::Integer;
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -1289,10 +1290,11 @@ function Random.rand(
     Ti = Int(tsteps)
     _prepare_lqr!(lds, [Ti])
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
+    u0 = _normalize_ux0(ux0, lds.state_model, 1)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     z = Matrix{T}(undef, lds.latent_dim, Ti)
-    _sample_lqr_path!(rng, z, lds, ux_trial)
+    _sample_lqr_path!(rng, z, _trial_initial_model(lds, view(u0, :, 1)), ux_trial)
     y = _alloc_obs(lds, Ti)
     _sample_lqr_obs!(rng, y, z, lds.obs_model, _extract_obs_params(lds.obs_model), uy_trial)
     return z, y
@@ -1302,6 +1304,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -1309,6 +1312,7 @@ function Random.rand(
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     ntrials = length(tsteps_per_trial)
+    u0 = _normalize_ux0(ux0, lds.state_model, ntrials)
     lengths = Int[Int(t) for t in tsteps_per_trial]
     _prepare_lqr!(lds, lengths)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, lengths, T, "ux")
@@ -1325,7 +1329,7 @@ function Random.rand(
     for i in 1:ntrials
         z[i] = Matrix{T}(undef, lds.latent_dim, lengths[i])
         y[i] = _alloc_obs(lds, lengths[i])
-        _sample_lqr_path!(rng, z[i], lds, ux_seq[i])
+        _sample_lqr_path!(rng, z[i], _trial_initial_model(lds, view(u0, :, i)), ux_seq[i])
         _sample_lqr_obs!(rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i))
     end
     return z, y

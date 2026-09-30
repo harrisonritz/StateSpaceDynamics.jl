@@ -106,7 +106,7 @@ vector of per-trial matrices. `ux` and `tsteps` are shared, so every state-side
 consumer of a `Data` is identical in both cases — which is why `YV` and `UYV`
 carry no bound.
 
-See also [`Data(lds, y; ux, uy)`](@ref), the validating constructor (below).
+See also [`Data(lds, y; ux0, ux, uy)`](@ref), the validating constructor (below).
 """
 struct Data{T<:Real,YV,UXV<:AbstractVector{<:AbstractMatrix{T}},UYV}
     y::YV
@@ -116,8 +116,9 @@ struct Data{T<:Real,YV,UXV<:AbstractVector{<:AbstractMatrix{T}},UYV}
     ux0::Matrix{T}                  # (initial-input dimension, ntrials)
 end
 
-Data(y, ux::AbstractVector{<:AbstractMatrix{T}}, uy, tsteps) where {T<:Real} =
-    Data(y, ux, uy, tsteps, zeros(T, 0, length(tsteps)))
+function Data(y, ux::AbstractVector{<:AbstractMatrix{T}}, uy, tsteps) where {T<:Real}
+    return Data(y, ux, uy, tsteps, zeros(T, 0, length(tsteps)))
+end
 
 """
     GaussianStateModel{T<:Real, M<:AbstractMatrix{T}, V<:AbstractVector{T}}
@@ -126,7 +127,7 @@ Represents the state model of a Linear Dynamical System with Gaussian noise.
 
 State evolution:
 ```math
-x_1           ~ N(x_0, P_0)
+x_1           ~ N(B_0 ux0_i, P_0)  (or N(x_0, P_0) when B_0 has no columns)
 x_{t+1} | x_t ~ N(A x_t + b + B ux_t, Q)
 ```
 where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns).
@@ -136,6 +137,10 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
 - `Q::M`: Process noise covariance matrix.
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
+- `B0::M`: Optional initial-input matrix (`latent_dim × ux0_dim`). With columns,
+    trial `i` has initial mean `B0 * ux0[:, i]`; `x0` is used only when `B0` has
+    no columns. The first state `fit_bool` slot fits `B0` in this case. Include
+    a constant row in `ux0` to fit a baseline initial mean.
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
 - `B::M`: Optional dynamics input matrix (`latent_dim × ux_dim`).
     When supplied, inputs `ux` must be passed to `fit!`/`smooth!` via a keyword argument.
@@ -145,8 +150,9 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
     the stacked dynamics matrix `[A B]`. Pair with `Q_prior` for a full MNIW prior on `(AB, Q)`.
     Prior matrices are stored as plain `Matrix{T}` (decoupled from `A`'s storage type `M`) so
     they match the internal workspaces regardless of how `A` is stored.
-- `x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on the
-    initial mean `x0`.
+- `x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
+    `x0` when `B0` is empty, or on `B0` with a `(latent_dim, ux0_dim)` prior mean
+    when initial inputs are present.
 - `depends_on::Union{Nothing,NamedTuple} = nothing`: Optional declaration that some
     parameters are estimated separately per group of trials. Keys are parameter names
     (`:x0`, `:P0`, `:A`/`:b`/`:B`, `:Q`), values are per-trial label vectors; `nothing`
@@ -694,26 +700,38 @@ function _state_ux_dim(sm::AbstractStateModel)
     return hasproperty(sm, :B) && !isnothing(sm.B) ? size(sm.B, 2) : 0
 end
 
+_state_ux0_dim(::AbstractStateModel) = 0
 _state_ux0_dim(sm::AbstractGaussianStateModel) = size(sm.B0, 2)
-_initial_coefficients(sm::AbstractGaussianStateModel) =
-    isempty(sm.B0) ? reshape(sm.x0, :, 1) : sm.B0
+function _initial_coefficients(sm::AbstractGaussianStateModel)
+    return isempty(sm.B0) ? reshape(sm.x0, :, 1) : sm.B0
+end
 
 """Give one trial its own initial mean without changing the shared fitted model."""
-function _trial_initial_model(lds::LinearDynamicalSystem{T,S,O}, u0) where {
-    T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}
-}
+function _trial_initial_model(
+    lds::LinearDynamicalSystem{T,S,O}, u0
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     isempty(sm.B0) && return lds
     fields = ntuple(fieldcount(S)) do i
         name = fieldname(S, i)
-        name === :x0 ? copy(sm.x0) :
-        name === :cache ? deepcopy(sm.cache) : getfield(sm, i)
+        if name === :x0
+            copy(sm.x0)
+        elseif name === :cache
+            deepcopy(sm.cache)
+        else
+            getfield(sm, i)
+        end
     end
     local_sm = S(fields...)
     mul!(local_sm.x0, local_sm.B0, u0)
     return LinearDynamicalSystem{T,S,O}(
-        local_sm, lds.obs_model, lds.latent_dim, lds.obs_dim,
-        lds.ux_dim, lds.uy_dim, lds.fit_bool,
+        local_sm,
+        lds.obs_model,
+        lds.latent_dim,
+        lds.obs_dim,
+        lds.ux_dim,
+        lds.uy_dim,
+        lds.fit_bool,
     )
 end
 
@@ -724,10 +742,10 @@ function _normalize_ux0(ux0, sm::AbstractGaussianStateModel{T}, ntrials::Int) wh
         return zeros(T, 0, ntrials)
     end
     values = ux0 isa AbstractVector ? reshape(ux0, :, 1) : ux0
-    values isa AbstractMatrix || throw(ArgumentError("ux0 must be a matrix of size (input dimension, ntrials)"))
-    size(values) == (q, ntrials) || throw(DimensionMismatchError(
-        "ux0 shape", (q, ntrials), size(values)
-    ))
+    values isa AbstractMatrix ||
+        throw(ArgumentError("ux0 must be a matrix of size (input dimension, ntrials)"))
+    size(values) == (q, ntrials) ||
+        throw(DimensionMismatchError("ux0 shape", (q, ntrials), size(values)))
     all(isfinite, values) || throw(ArgumentError("ux0 contains non-finite values"))
     return Matrix{T}(values)
 end
@@ -987,9 +1005,14 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
     LDSs::Vector{LinearDynamicalSystem{T,S,O}}
 end
 
-function _trial_initial_model(slds::SLDS{T,S,O,TM,ISV}, u0) where {
-    T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T},
-    TM<:AbstractMatrix{T},ISV<:AbstractVector{T}
+function _trial_initial_model(
+    slds::SLDS{T,S,O,TM,ISV}, u0
+) where {
+    T<:Real,
+    S<:AbstractGaussianStateModel{T},
+    O<:AbstractObservationModel{T},
+    TM<:AbstractMatrix{T},
+    ISV<:AbstractVector{T},
 }
     isempty(slds.LDSs[1].state_model.B0) && return slds
     members = [_trial_initial_model(lds, u0) for lds in slds.LDSs]
@@ -1046,7 +1069,7 @@ Workaround for JET union-split false positive on views with unbound eltype
 # ============================================================================
 
 """
-    Data(lds, y; ux=nothing, uy=nothing)
+    Data(lds, y; ux0=nothing, ux=nothing, uy=nothing)
 
 Validate observations and inputs against `lds` and canonicalize them into the
 internal [`Data`](@ref) container.
@@ -1056,6 +1079,8 @@ array, or a vector of per-trial `(obs_dim, T_i)` matrices (ragged trial
 lengths allowed). `ux` / `uy` accept the same shape family as `y`, or
 `nothing` when the model has no `B` / `D` input matrix; absent inputs are
 canonicalized to zero-row matrices.
+`ux0` is a `(ux0_dim, ntrials)` matrix with one column per trial, or a vector
+for a single trial. It is required when the state model has a nonempty `B0`.
 
 # Throws
 - `DimensionMismatchError` when observation or input dimensions disagree with
@@ -1097,7 +1122,11 @@ function Data(
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
 ) where {T<:Real}
     return Data(
-        lds, [y]; ux0=ux0, ux=(ux === nothing ? nothing : [ux]), uy=(uy === nothing ? nothing : [uy])
+        lds,
+        [y];
+        ux0=ux0,
+        ux=(ux === nothing ? nothing : [ux]),
+        uy=(uy === nothing ? nothing : [uy]),
     )
 end
 

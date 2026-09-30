@@ -400,10 +400,11 @@ function _slds_spline_smooth(
     progress::Bool,
     npool::Int,
     tied::AbstractVector{Symbol}=Symbol[];
+    ux0=nothing,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
 ) where {T<:Real}
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     # The switching-level checks every entry point runs, on the caller's model
     # and before `_slds_spline_state` starts sharing its warps -- as `fit!` does.
     _prepare_slds!(slds, data.tsteps)
@@ -418,6 +419,7 @@ function _slds_spline_smooth(
     out = smooth(
         state.shadow,
         state.sdata.y;
+        ux0=state.sdata.ux0,
         ux=state.sdata.ux,
         uy=state.sdata.uy,
         smoothing_iters=smoothing_iters,

@@ -180,8 +180,7 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
     if length(sm.x0) != 2n
         throw(DimensionMismatchError("LQR x0", 2n, length(sm.x0)))
     end
-    size(sm.B0, 1) == 2n ||
-        throw(DimensionMismatchError("LQR B0 rows", 2n, size(sm.B0, 1)))
+    size(sm.B0, 1) == 2n || throw(DimensionMismatchError("LQR B0 rows", 2n, size(sm.B0, 1)))
     if length(sm.hf) != n
         throw(DimensionMismatchError("LQR hf", n, length(sm.hf)))
     end
@@ -249,7 +248,9 @@ function _validate_state_model(
         )
     end
     size(state_model.B0, 1) == latent_dim || throw(
-        DimensionMismatchError("initial input B0 rows", latent_dim, size(state_model.B0, 1))
+        DimensionMismatchError(
+            "initial input B0 rows", latent_dim, size(state_model.B0, 1)
+        ),
     )
 
     # Check P0 matrix (initial covariance)
@@ -565,6 +566,7 @@ function _validate_slds_structure(slds::SLDS)
     latent_dim = slds.LDSs[1].latent_dim
     obs_dim = slds.LDSs[1].obs_dim
     ux_dim = slds.LDSs[1].ux_dim
+    ux0_dim = _state_ux0_dim(slds.LDSs[1].state_model)
     uy_dim = slds.LDSs[1].uy_dim
 
     for (i, lds) in enumerate(slds.LDSs)
@@ -579,6 +581,14 @@ function _validate_slds_structure(slds::SLDS)
         # One SLDS data object is shared across regimes.
         if lds.ux_dim != ux_dim
             throw(DimensionMismatchError("LDS[$i].ux_dim", ux_dim, lds.ux_dim))
+        end
+
+        if _state_ux0_dim(lds.state_model) != ux0_dim
+            throw(
+                DimensionMismatchError(
+                    "LDS[$i].ux0_dim", ux0_dim, _state_ux0_dim(lds.state_model)
+                ),
+            )
         end
 
         if lds.uy_dim != uy_dim

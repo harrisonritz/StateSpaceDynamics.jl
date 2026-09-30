@@ -203,7 +203,10 @@ function _pool_lqr_state_stats(
     units::AbstractVector{<:LQRSufficientStatistics{T}}
 ) where {T<:Real}
     pooled = deepcopy(first(units))
-    index = Dict{Matrix{T},Int}(u => i for (i, u) in enumerate(pooled.terminal_inputs))
+    index = Dict{Tuple{Matrix{T},Vector{T}},Int}(
+        (u, u0) => i for
+        (i, (u, u0)) in enumerate(zip(pooled.terminal_inputs, pooled.terminal_ux0))
+    )
     for hs in Iterators.drop(units, 1)
         for k in eachindex(pooled.zz)
             pooled.zz[k] .+= hs.zz[k]
@@ -222,12 +225,15 @@ function _pool_lqr_state_stats(
             dst.init_u0u0 .+= src.init_u0u0
             dst.init_yy[] = dst.init_yy[] + src.init_yy[]
         end
-        for (u, c) in zip(hs.terminal_inputs, hs.terminal_counts)
-            slot = get(index, u, 0)
+        for (u, u0, c) in zip(hs.terminal_inputs, hs.terminal_ux0, hs.terminal_counts)
+            slot = get(index, (u, u0), 0)
             if slot == 0
                 push!(pooled.terminal_inputs, copy(u))
                 push!(pooled.terminal_counts, c)
-                index[pooled.terminal_inputs[end]] = length(pooled.terminal_inputs)
+                push!(pooled.terminal_ux0, copy(u0))
+                index[(pooled.terminal_inputs[end], pooled.terminal_ux0[end])] = length(
+                    pooled.terminal_inputs
+                )
             else
                 pooled.terminal_counts[slot] += c
             end

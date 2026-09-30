@@ -602,6 +602,9 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
     regulation problem.
 - `Σf::M`, `hf::V`: terminal factor covariance (`n × n`) and offset (`n`).
 - `x0::V`, `P0::M`: prior on `z₁ = [x₁; λ₁]` (`2n`).
+- `B0::M`: optional `2n × ux0_dim` initial-input map. With columns, trial `i`
+    starts under `N(B0 * ux0[:, i], P0)`; otherwise it uses `x0`. The first
+    state `fit_bool` slot fits `B0` when present.
 - `observe_costate::Bool`: whether the emission may read the costate. `false`
     (the default) pins the costate columns of `C` at zero.
 - `fit_flags::LQRFitFlags`: which structural parameters move.

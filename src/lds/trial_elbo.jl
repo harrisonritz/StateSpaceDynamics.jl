@@ -139,8 +139,14 @@ function _accumulate_trial_elbos(
     for n in eachindex(per_trial)
         fs = tfs[n]
         per_trial[n] =
-            Q_state!(sws, _trial_initial_model(lds, view(data.ux0, :, n)),
-                     fs.E_z, fs.E_zz, fs.E_zz_prev, data.ux[n]) +
+            Q_state!(
+                sws,
+                _trial_initial_model(lds, view(data.ux0, :, n)),
+                fs.E_z,
+                fs.E_zz,
+                fs.E_zz_prev,
+                data.ux[n],
+            ) +
             log2π_per_step * data.tsteps[n] +
             _trial_q_obs(sws, lds, fs, data, n) +
             fs.entropy
@@ -274,6 +280,7 @@ function trial_elbos(
     return smooth(
         slds,
         y;
+        ux0=ux0,
         ux=ux,
         uy=uy,
         smoothing_iters=smoothing_iters,

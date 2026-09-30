@@ -74,6 +74,7 @@ function Random.rand(
     rng::AbstractRNG,
     slds::SLDS{T,S,O},
     tsteps::Integer;
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -97,6 +98,7 @@ function Random.rand(
     else
         _slds_cell_sldss(slds, grp)[grp.trial_cell[1]].LDSs
     end
+    u0 = _normalize_ux0(ux0, lds1.state_model, 1)
 
     # Sized from the trial's own cell, not the template: `depends_on` groups may
     # observe different channel sets, and then `lds1.obs_dim` is only the first
@@ -105,7 +107,10 @@ function Random.rand(
 
     _prepare_slds!(slds, [Ti])
     _warn_slds_unstable_rollout(slds, Ti)
-    state_params = [_extract_state_params(lds.state_model) for lds in regimes]
+    state_params = [
+        _extract_state_params(_trial_initial_model(lds, view(u0, :, 1)).state_model) for
+        lds in regimes
+    ]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
 
     _sample_slds_trial!(
@@ -129,6 +134,7 @@ function Random.rand(
     rng::AbstractRNG,
     slds::SLDS{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -136,6 +142,7 @@ function Random.rand(
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
     ntrials = length(tsteps_per_trial)
+    u0 = _normalize_ux0(ux0, lds1.state_model, ntrials)
 
     ux_seq = _normalize_multitrial_ux(ux, lds1.ux_dim, tsteps_per_trial, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds1.uy_dim, tsteps_per_trial, T, lds1.obs_model)
@@ -158,6 +165,7 @@ function Random.rand(
         obs_of = fill(base_obs, ntrials)
         # Every trial reads the same emission, so the template sizes them all.
         alloc_of = fill(lds1, ntrials)
+        model_of = fill(slds.LDSs, ntrials)
     else
         cell_slds = _slds_cell_sldss(slds, grp)
         cell_state = [
@@ -170,6 +178,16 @@ function Random.rand(
         obs_of = [cell_obs[grp.trial_cell[n]] for n in 1:ntrials]
         # A group's channel count, not the template's — as in the LDS sampler.
         alloc_of = [cell_slds[grp.trial_cell[n]].LDSs[1] for n in 1:ntrials]
+        model_of = [cell_slds[grp.trial_cell[n]].LDSs for n in 1:ntrials]
+    end
+
+    if !isempty(lds1.state_model.B0)
+        state_of = [
+            [
+                merge(state_of[i][k], (x0=model_of[i][k].state_model.B0 * view(u0, :, i),))
+                for k in eachindex(model_of[i])
+            ] for i in 1:ntrials
+        ]
     end
 
     for trial in 1:ntrials
@@ -1316,6 +1334,7 @@ function smooth(
             progress,
             npool,
             tied;
+            ux0=ux0,
             newton_max_iter=newton_max_iter,
             newton_tol=newton_tol,
         )
@@ -1329,6 +1348,7 @@ function smooth(
     data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
     y_seq = data.y
+    ux0_seq = data.ux0
     ux_seq = data.ux
     uy_seq = data.uy
 
@@ -1369,6 +1389,7 @@ function smooth(
         plan,
         tsteps_per_trial,
         K;
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
@@ -1395,6 +1416,7 @@ function smooth(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
@@ -1428,6 +1450,7 @@ function smooth(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0_seq,
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
@@ -1444,6 +1467,7 @@ function smooth(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0_seq,
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
@@ -1458,7 +1482,7 @@ function smooth(
     than quietly reporting the joint score.
     =#
     terminal_logz = zero(T)
-    logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends)
+    logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends; ux0=ux0_seq)
     if logz !== nothing
         trial_elbo = trial_elbo .- logz
         terminal_logz = sum(logz)
@@ -1750,6 +1774,7 @@ function _slds_fill_logL!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -1786,6 +1811,8 @@ function _slds_fill_logL!(
             x_src = x_of(trial)
             y_trial = _trial(y, trial)
             ux_trial = ux === nothing ? nothing : ux[trial]
+            initial_slds =
+                ux0 === nothing ? slds_t : _trial_initial_model(slds_t, view(ux0, :, trial))
             uy_trial = uy === nothing ? nothing : _trial(uy, trial)
             ln_trial = lognorm === nothing ? nothing : lognorm[trial]
             for k in 1:K
@@ -1794,7 +1821,7 @@ function _slds_fill_logL!(
                     ll_k,
                     ws_t,
                     ws_t.consts[k],
-                    slds_t.LDSs[k],
+                    initial_slds.LDSs[k],
                     x_src,
                     y_trial,
                     ux_trial,
@@ -1807,7 +1834,7 @@ function _slds_fill_logL!(
                         ll_k,
                         ws_t,
                         ws_t.consts[k],
-                        slds_t.LDSs[k],
+                        initial_slds.LDSs[k],
                         x_src,
                         y_trial,
                         tfs[trial],
@@ -1858,6 +1885,7 @@ function _slds_smooth_all!(
     w_of;
     rng_of=_ -> Random.default_rng(),
     noise_of=_ -> nothing,
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -1890,7 +1918,11 @@ function _slds_smooth_all!(
             end
 
             smooth!(
-                slds_t,
+                if ux0 === nothing
+                    slds_t
+                else
+                    _trial_initial_model(slds_t, view(ux0, :, trial))
+                end,
                 tfs[trial],
                 _trial(y, trial),
                 w_of(trial);
@@ -2053,6 +2085,7 @@ function _vem_alternate!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -2093,6 +2126,7 @@ function _vem_alternate!(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0,
             ux=ux,
             uy=uy,
             lognorm=lognorm,
@@ -2199,6 +2233,7 @@ function _vem_alternate!(
             w_of;
             rng_of=rng_of,
             noise_of=noise_of,
+            ux0=ux0,
             ux=ux,
             uy=uy,
             lognorm=lognorm,
@@ -2277,6 +2312,7 @@ function estep!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -2297,6 +2333,7 @@ function estep!(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -2656,13 +2693,26 @@ function elbo!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     per_trial = _slds_trial_elbos(
-        slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
+        slds,
+        nothing,
+        nothing,
+        tfs,
+        fb_storage,
+        y,
+        pool,
+        plan;
+        seq_ends,
+        ux0,
+        ux,
+        uy,
+        lognorm,
     )
     total = sum(per_trial) + _slds_prior_logdensity(slds, tied)
     #=
@@ -2671,7 +2721,7 @@ function elbo!(
     total is a difference of two bounds rather than a bound; `terminal_logz`
     returns the subtracted half on its own.
     =#
-    logz = _slds_terminal_trial_logz(slds, ux, seq_ends)
+    logz = _slds_terminal_trial_logz(slds, ux, seq_ends; ux0=ux0)
     logz === nothing || (total -= sum(logz))
     return total
 end
@@ -2690,6 +2740,7 @@ function elbo!(
     y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     slds_ws::SLDSSmoothWorkspace{T};
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
@@ -2703,6 +2754,7 @@ function elbo!(
         _slds_solo_pool(slds_ws),
         _slds_trial_plan(nothing, _ntrials(y), 1);
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -2733,6 +2785,7 @@ function _slds_trial_elbos(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -2761,7 +2814,11 @@ function _slds_trial_elbos(
 
             t1, t2 = HMMs.seq_limits(seq_ends, trial)
             per_trial[trial] = _slds_trial_elbo(
-                slds_t,
+                if ux0 === nothing
+                    slds_t
+                else
+                    _trial_initial_model(slds_t, view(ux0, :, trial))
+                end,
                 tfs[trial],
                 fb_storage,
                 _trial(y, trial),
@@ -2814,6 +2871,7 @@ function elbo(
     return smooth(
         slds,
         y;
+        ux0=ux0,
         ux=ux,
         uy=uy,
         smoothing_iters=smoothing_iters,
@@ -3315,7 +3373,7 @@ function mstep!(
     normalizer's probe is built for that check and reused by the state M-step.
     =#
     conditioned = _slds_condition_terminal(slds)
-    probe = conditioned ? _slqr_terminal_probe(slds, dat.ux) : nothing
+    probe = conditioned ? _slqr_terminal_probe(slds, dat.ux; ux0=dat.ux0) : nothing
     probe_current = if probe === nothing
         StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
         false
@@ -3891,6 +3949,7 @@ function fit!(
         data = spline_state.sdata
     end
     y_seq = data.y
+    ux0_seq = data.ux0
     ux_seq = data.ux
     uy_seq = data.uy
 
@@ -4049,6 +4108,7 @@ function fit!(
         rng=rng,
         rng_mode=rng_mode,
         noise_bufs=noise_bufs,
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
@@ -4081,6 +4141,7 @@ function fit!(
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
@@ -4098,6 +4159,7 @@ function fit!(
                 pool,
                 plan;
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
@@ -4134,6 +4196,7 @@ function fit!(
                 sws;
                 obs_seq=obs_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 tied=tied,
@@ -4176,6 +4239,7 @@ function fit!(
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
@@ -4193,6 +4257,7 @@ function fit!(
                 pool,
                 plan;
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
@@ -4293,6 +4358,7 @@ function _slds_warmstart!(
     rng::AbstractRNG=Random.default_rng(),
     rng_mode::Symbol=:trial,
     noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -4321,6 +4387,7 @@ function _slds_warmstart!(
         w_of;
         rng_of=rng_of,
         noise_of=noise_of,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -4518,6 +4585,7 @@ function _estep_grouped!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -4543,6 +4611,7 @@ function _estep_grouped!(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -4596,6 +4665,7 @@ function _elbo_grouped!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -4612,6 +4682,7 @@ function _elbo_grouped!(
         pool,
         plan;
         seq_ends,
+        ux0,
         ux,
         uy,
         lognorm,
@@ -4619,7 +4690,7 @@ function _elbo_grouped!(
     total = sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
     if terminal_slds !== nothing
         _slds_check_grouped_conditioning(terminal_slds, grp)
-        logz = _slds_terminal_trial_logz(terminal_slds, ux, seq_ends)
+        logz = _slds_terminal_trial_logz(terminal_slds, ux, seq_ends; ux0=ux0)
         logz === nothing || (total -= sum(logz))
     end
     return total
@@ -4642,6 +4713,7 @@ function _broadcast_initial_state!(
         for k in 2:K
             dst = slds_c.LDSs[k].state_model
             do_x0 && copyto!(dst.x0, src.x0)
+            do_x0 && copyto!(dst.B0, src.B0)
             do_P0 && copyto!(dst.P0, src.P0)
         end
     end
@@ -4709,7 +4781,8 @@ function _mstep_grouped!(
     =#
     conditioned = terminal_slds !== nothing && _slds_condition_terminal(terminal_slds)
     conditioned && _slds_check_grouped_conditioning(terminal_slds, grp)
-    probe = conditioned ? _slqr_terminal_probe(terminal_slds, data.ux) : nothing
+    probe =
+        conditioned ? _slqr_terminal_probe(terminal_slds, data.ux; ux0=data.ux0) : nothing
     probe_current = if probe === nothing
         StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
         false

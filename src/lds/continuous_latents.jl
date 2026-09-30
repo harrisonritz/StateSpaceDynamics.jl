@@ -665,13 +665,19 @@ function update_initial_state_mean!(
         XX = copy(suf.init_u0u0)
         XY = copy(suf.init_u0y)
         if prior !== nothing
-            size(prior.M₀) == size(B0) || throw(DimensionMismatchError(
-                "B0 prior mean", size(B0), size(prior.M₀)
-            ))
+            size(prior.M₀) == size(B0) ||
+                throw(DimensionMismatchError("B0 prior mean", size(B0), size(prior.M₀)))
             XX .+= prior.Λ
             XY .+= prior.Λ * prior.M₀'
         end
-        B0 .= (XX \ XY)'
+        F = cholesky(Symmetric(XX); check=false)
+        issuccess(F) || throw(
+            ArgumentError(
+                "ux0 initial-state design is rank deficient; remove collinear columns " *
+                "or supply a positive-definite x0_prior",
+            ),
+        )
+        B0 .= (F \ XY)'
         return nothing
     end
     x0 = lds.state_model.x0

@@ -544,6 +544,12 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/InitialInputs.jl")
+        @testset "Initial inputs" begin
+            test_initial_inputs()
+            test_lqr_initial_inputs_terminal()
+        end
+
         include("LinearDynamicalSystems/TrialELBO.jl")
         @testset "Per-trial ELBO" begin
             test_trial_elbos_sum_to_elbo()

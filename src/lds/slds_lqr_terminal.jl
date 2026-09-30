@@ -154,13 +154,16 @@ carries them; leaving them on would penalize the same parameters twice, once
 with each sign.
 """
 function _slqr_terminal_probe(
-    slds::SLDS{T}, ux::AbstractVector; smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T}, ux::AbstractVector; ux0=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
 ) where {T<:Real}
     canonical = [Matrix{T}(u) for u in ux]
-    designs = _lqr_terminal_designs(canonical)
+    u0 = _normalize_ux0(ux0, slds.LDSs[1].state_model, length(canonical))
+    designs = _lqr_terminal_designs(canonical, u0)
     isempty(designs) && error("Terminal conditioning requires trial inputs/horizons")
-    index = Dict(v.ux => i for (i, v) in enumerate(designs))
-    design_of = [index[u] for u in canonical]
+    index = Dict((v.ux, v.ux0) => i for (i, v) in enumerate(designs))
+    design_of = [
+        index[(canonical[i], Vector{T}(view(u0, :, i)))] for i in eachindex(canonical)
+    ]
     d = slds.LDSs[1].latent_dim
     members = map(slds.LDSs) do lds
         sm = deepcopy(lds.state_model)
@@ -178,7 +181,7 @@ function _slqr_terminal_probe(
 
     uxs = [v.ux for v in designs]
     ys = [zeros(T, 1, size(u, 2)) for u in uxs]
-    data = Data(members[1], ys; ux=uxs)
+    data = Data(members[1], ys; ux0=hcat((v.ux0 for v in designs)...), ux=uxs)
     K = length(members)
     ntrials = length(data.tsteps)
     seq_ends = cumsum(data.tsteps)
@@ -223,14 +226,14 @@ function _slqr_sync_probe!(probe::_SLQRProbe, slds::SLDS)
     for (member, lds) in zip(probe.slds.LDSs, slds.LDSs)
         target, source = member.state_model, lds.state_model
         if target isa LQRStateModel
-            for key in (:A, :Mfree, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+            for key in (:A, :Mfree, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :B0, :P0)
                 copyto!(getproperty(target, key), getproperty(source, key))
             end
             for k in eachindex(source.Qc)
                 copyto!(target.Qc[k], source.Qc[k])
             end
         else
-            for key in (:A, :b, :B, :Q, :x0, :P0)
+            for key in (:A, :b, :B, :Q, :x0, :B0, :P0)
                 hasproperty(target, key) &&
                     copyto!(getproperty(target, key), getproperty(source, key))
             end
@@ -272,6 +275,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
             probe.data.tsteps,
             length(probe.slds.LDSs);
             rng=probe.rng,
+            ux0=probe.data.ux0,
             ux=probe.data.ux,
             uy=probe.data.uy,
             lognorm=probe.lognorm,
@@ -291,6 +295,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         obs_seq=probe.obs_seq,
         control_seq=probe.control_seq,
         seq_ends=probe.seq_ends,
+        ux0=probe.data.ux0,
         ux=probe.data.ux,
         uy=probe.data.uy,
         lognorm=probe.lognorm,
@@ -307,6 +312,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         probe.pool,
         probe.plan;
         seq_ends=probe.seq_ends,
+        ux0=probe.data.ux0,
         ux=probe.data.ux,
         uy=probe.data.uy,
         lognorm=probe.lognorm,
@@ -510,7 +516,7 @@ function _slqr_copy_lqr_params!(probe::_SLQRProbe, sms)
         "terminal probe has $(length(psms)) inverse-LQR states, model has $(length(sms))",
     )
     for (target, source) in zip(psms, sms)
-        for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+        for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :B0, :P0)
             copyto!(getproperty(target, key), getproperty(source, key))
         end
         for k in eachindex(source.Qc)
@@ -554,11 +560,18 @@ it across fits is how to tell whether a score gap is the data fitting better or
 the normalizer moving.
 """
 function terminal_logz(
-    slds::SLDS{T}, y; ux=nothing, uy=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T},
+    y;
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return zero(T)
     data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
-    probe = _slqr_terminal_probe(slds, data.ux; smoothing_iters=smoothing_iters)
+    probe = _slqr_terminal_probe(
+        slds, data.ux; ux0=data.ux0, smoothing_iters=smoothing_iters
+    )
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)
     return probe.logz
@@ -599,6 +612,7 @@ that smoother's factorization fail (`PosDefException`).
 function terminal_normalizer(
     slds::SLDS{T},
     ux::AbstractVector{<:AbstractMatrix};
+    ux0=nothing,
     smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     lqr = [lds.state_model for lds in slds.LDSs if lds.state_model isa LQRStateModel]
@@ -611,7 +625,7 @@ function terminal_normalizer(
         ),
     )
     probe = _slqr_terminal_probe(
-        slds, [Matrix{T}(u) for u in ux]; smoothing_iters=smoothing_iters
+        slds, [Matrix{T}(u) for u in ux]; ux0=ux0, smoothing_iters=smoothing_iters
     )
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)
@@ -619,7 +633,7 @@ function terminal_normalizer(
 end
 
 function terminal_normalizer(
-    lds::LinearDynamicalSystem{T,S}, ux::AbstractVector{<:AbstractMatrix}
+    lds::LinearDynamicalSystem{T,S}, ux::AbstractVector{<:AbstractMatrix}; ux0=nothing
 ) where {T<:Real,S<:LQRStateModel{T}}
     sm = lds.state_model
     sm.terminal || return zeros(T, length(ux))
@@ -631,9 +645,10 @@ function terminal_normalizer(
         ),
     )
     inputs = [Matrix{T}(u) for u in ux]
+    u0 = _normalize_ux0(ux0, sm, length(inputs))
     _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
     refresh!(sm)
-    return [_lqr_terminal_logz(sm, u) for u in inputs]
+    return [_lqr_terminal_logz(sm, u, view(u0, :, i)) for (i, u) in enumerate(inputs)]
 end
 
 """Canonical per-trial inputs, reconstructed from the horizons when a caller
@@ -655,11 +670,11 @@ the number of distinct designs, not trials, and a task design repeated across a
 session collapses to one smoothed chain.
 """
 function _slds_terminal_trial_logz(
-    slds::SLDS{T}, ux, seq_ends; smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T}, ux, seq_ends; ux0=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return nothing
     probe = _slqr_terminal_probe(
-        slds, _slds_probe_inputs(ux, seq_ends, T); smoothing_iters=smoothing_iters
+        slds, _slds_probe_inputs(ux, seq_ends, T); ux0=ux0, smoothing_iters=smoothing_iters
     )
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)
