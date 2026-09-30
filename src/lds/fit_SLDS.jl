@@ -4780,14 +4780,17 @@ function _mstep_grouped!(
     reused by the state M-step below.
     =#
     conditioned = terminal_slds !== nothing && _slds_condition_terminal(terminal_slds)
-    conditioned && _slds_check_grouped_conditioning(terminal_slds, grp)
-    probe =
-        conditioned ? _slqr_terminal_probe(terminal_slds, data.ux; ux0=data.ux0) : nothing
+    probe = if conditioned
+        _slds_check_grouped_conditioning(terminal_slds::SLDS, grp)
+        _slqr_terminal_probe(terminal_slds::SLDS, data.ux; ux0=data.ux0)
+    else
+        nothing
+    end
     probe_current = if probe === nothing
         StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
         false
     else
-        _slqr_chain_mstep!(terminal_slds, dl, fb_storage, obs_seq, seq_ends, probe)
+        _slqr_chain_mstep!(terminal_slds::SLDS, dl, fb_storage, obs_seq, seq_ends, probe)
     end
 
     #=
@@ -4889,9 +4892,10 @@ function _mstep_grouped!(
         terminal_probe = if probe_current
             probe
         else
-            _slqr_sync_probe!(probe, terminal_slds)
-            _slqr_restart!(probe)
-            _slqr_probe_estep!(probe)
+            conditioned_probe = probe::_SLQRProbe
+            _slqr_sync_probe!(conditioned_probe, terminal_slds::SLDS)
+            _slqr_restart!(conditioned_probe)
+            _slqr_probe_estep!(conditioned_probe)
         end
         _slds_state_mstep!(
             cell_slds[1].LDSs,
