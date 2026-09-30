@@ -1721,3 +1721,98 @@ function test_slds_lqr_grouped_free_state_pools()
     @test_throws ArgumentError fitted((h=labels,))
     return nothing
 end
+
+"""A Dirichlet chain prior under terminal conditioning. The chain step's objective
+gains `Σ (α − 1) log A + Σ (α_π − 1) log π`, which is `g` with the pseudo-counts
+added to `N` / `n`, and it must still never lower that. The normalizer's probe
+drops the prior (the data side carries it), so the conditional score moves by the
+chain's log-prior exactly, and a short fit keeps every transition reachable."""
+function test_slds_lqr_terminal_chain_prior()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qc = [0.25 0.04; 0.04 0.18]
+    HMMs = SSD.HMMs
+    α = transition_prior(2; concentration=3.0, sticky=4.0)
+    απ = [2.0, 2.0]
+    function with_prior(m)
+        m.A_prior = copy(α)
+        m.πₖ_prior = copy(απ)
+        return m
+    end
+    for seed in 1:3
+        two = with_prior(hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true))
+        data = SSD.Data(two.LDSs[1], ys)
+        seq_ends = cumsum(data.tsteps)
+        total = last(seq_ends)
+        dl = SSD.SLDSDiscreteLayer(two.A, two.πₖ, 0.3 .* randn(StableRNG(seed), 2, total))
+        fb = SSD._make_slds_fb_storage(dl, seq_ends)
+        HMMs.forward_backward!(
+            fb,
+            dl,
+            collect(1:total),
+            fill(nothing, total);
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+        N, n = SSD._slds_chain_counts(fb, seq_ends, 2, Float64)
+        function g(m)
+            return sum((N .+ α .- 1) .* log.(m.A .+ 1e-12)) +
+                   sum((n .+ απ .- 1) .* log.(m.πₖ .+ 1e-12)) - terminal_logz(m, ys)
+        end
+        before = g(two)
+        probe = SSD._slqr_terminal_probe(two, data.ux)
+        @test probe.slds.A_prior === nothing && probe.slds.πₖ_prior === nothing
+        SSD._slqr_chain_mstep!(two, dl, fb, collect(1:total), seq_ends, probe)
+        @test g(two) >= before - 1e-9
+        @test all(≈(1), sum(two.A; dims=2)) && sum(two.πₖ) ≈ 1
+        @test all(>(0), two.A) && all(>(0), two.πₖ)
+    end
+
+    # Same parameters, same E-step, same normalizer: only the log-prior differs.
+    plain = hslds_model([Qc, [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    prior = with_prior(deepcopy(plain))
+    a, b = smooth(plain, ys), smooth(prior, ys)
+    @test b.terminal_logz == a.terminal_logz
+    expected = sum((α .- 1) .* log.(plain.A)) + sum((απ .- 1) .* log.(plain.πₖ))
+    @test b.elbo - a.elbo ≈ expected rtol = 1e-8
+
+    els = _trace(fit!(prior, ys; max_iter=3, progress=false, rng=StableRNG(7)))
+    @test all(isfinite, els)
+    @test minimum(prior.A) > 1e-3
+    return nothing
+end
+
+"""The discrete warm-up on a terminal-conditioned switching inverse-LQR: the chain
+stays exactly as set while the states are fitted — the conditional state step still
+gets its probe, smoothed at the unchanged chain."""
+function test_slds_lqr_terminal_warmup()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    Qcs = [[0.25 0.04; 0.04 0.18], [0.8 0.0; 0.0 0.6]]
+    evidence = zeros(2, tsteps * ntrials)
+    for t in axes(evidence, 2)
+        evidence[mod1(t, tsteps) <= tsteps ÷ 2 ? 2 : 1, t] = -4.0
+    end
+    two = hslds_model(Qcs; p=p, terminal=true)
+    @test SSD._slds_condition_terminal(two)
+    A0, π0 = copy(two.A), copy(two.πₖ)
+    Qc0 = [copy(lds.state_model.Qc[1]) for lds in two.LDSs]
+    els = _trace(
+        fit!(
+            two,
+            ys;
+            max_iter=2,
+            progress=false,
+            rng=StableRNG(7),
+            discrete_warmup=2,
+            warmup_logL=evidence,
+        ),
+    )
+    @test all(isfinite, els)
+    @test two.A == A0 && two.πₖ == π0
+    @test any(two.LDSs[k].state_model.Qc[1] != Qc0[k] for k in 1:2)
+    for lds in two.LDSs
+        @test minimum(eigvals(Symmetric(lds.state_model.Σ))) > 1e-3
+    end
+    return nothing
+end

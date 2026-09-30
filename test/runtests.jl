@@ -187,6 +187,16 @@ using SSDTest
                 test_SLDS_fit_with_inputs_poisson()
                 test_SLDS_poisson_cd_prior_with_inputs()
             end
+
+            @testset "Discrete chain prior and warm-up" begin
+                test_SLDS_transition_prior_helper()
+                test_SLDS_chain_prior_map_closed_form()
+                test_SLDS_chain_prior_flat_is_identity()
+                test_SLDS_chain_prior_elbo_term()
+                test_SLDS_chain_prior_sticky()
+                test_SLDS_warmup_estep_mstep()
+                test_SLDS_warmup_fit()
+            end
         end
 
         include("LinearDynamicalSystems/GaussianLDS.jl")
@@ -607,6 +617,8 @@ using SSDTest
             test_slds_lqr_tied_emission_mask()
             test_slds_lqr_tied_prior_counted_once()
             test_lqr_pair_slots()
+            test_slds_lqr_terminal_chain_prior()
+            test_slds_lqr_terminal_warmup()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

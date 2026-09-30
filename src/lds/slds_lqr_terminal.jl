@@ -392,6 +392,13 @@ function _slqr_chain_mstep!(
     K = length(slds.LDSs)
     # Counts first: `fit!` below uses each trial's last ξ as scratch.
     N, n = _slds_chain_counts(fb_storage, seq_ends, K, T)
+    #=
+    A Dirichlet chain prior adds `Σ (α − 1) log A` to `g`, which is the same as
+    adding `α − 1` to the counts: `score!`, the ascent direction `c = N − Ξ` and
+    (through `fit!`'s own prior keywords) the Baum–Welch proposal all see it.
+    =#
+    slds.A_prior === nothing || (N .+= slds.A_prior .- one(T))
+    slds.πₖ_prior === nothing || (n .+= slds.πₖ_prior .- one(T))
     floor = T(1e-12)
     function score!(A, π)
         copyto!(slds.A, A)
@@ -408,7 +415,14 @@ function _slqr_chain_mstep!(
     # The probe's own counts, weighted by how many trials share each design.
     Ξ, ν = _slds_chain_counts(probe.fb, probe.seq_ends, K, T, probe.counts)
 
-    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)   # writes slds.A / πₖ
+    StatsAPI.fit!(                                               # writes slds.A / πₖ
+        dl,
+        fb_storage,
+        obs_seq;
+        seq_ends=seq_ends,
+        A_prior=slds.A_prior,
+        πₖ_prior=slds.πₖ_prior,
+    )
     A1, π1 = copy(slds.A), copy(slds.πₖ)
     if !(A0 == A1 && π0 == π1)
         gain = score!(A1, π1) - base

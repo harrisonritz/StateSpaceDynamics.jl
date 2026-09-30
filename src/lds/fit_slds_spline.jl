@@ -181,13 +181,16 @@ end
     _slds_gaussian_shadow(slds) -> SLDS
 
 The `SLDS` with every regime's warped emission replaced by its Gaussian shadow.
-The discrete transition matrix, the initial distribution and every regime's
-state model and emission arrays are shared by reference, so the existing
-discrete and continuous M-steps write straight through to the real model.
+The discrete transition matrix, the initial distribution (and their Dirichlet
+priors) and every regime's state model and emission arrays are shared by
+reference, so the existing discrete and continuous M-steps write straight
+through to the real model.
 """
 function _slds_gaussian_shadow(slds::SLDS{T}) where {T<:Real}
     ldss = [_gaussian_shadow(l) for l in slds.LDSs]
-    return SLDS(; A=slds.A, πₖ=slds.πₖ, LDSs=ldss)
+    return SLDS(;
+        A=slds.A, πₖ=slds.πₖ, LDSs=ldss, A_prior=slds.A_prior, πₖ_prior=slds.πₖ_prior
+    )
 end
 
 """
