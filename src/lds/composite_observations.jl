@@ -245,7 +245,7 @@ shared and takes the same shapes as before.
 - `DimensionMismatchError` when a member's row count disagrees with its emission
 """
 function Data(
-    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     models = _models(lds.obs_model)
     obs_keys = keys(models)
@@ -311,7 +311,7 @@ function Data(
         end,
     )
 
-    return Data(y_seq, ux_seq, uy_seq, tsteps)
+    return Data(y_seq, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(tsteps)))
 end
 
 #=
@@ -1326,11 +1326,12 @@ Returns the **total** log-likelihood over every member, trial and timestep.
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,SM,OM},
     y::NamedTuple;
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,true}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _warped_route(lds, depends_on) && return _spline_composite_loglikelihood(lds, data)
     ntrials = length(data.tsteps)
 

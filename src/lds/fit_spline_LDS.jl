@@ -113,6 +113,7 @@ Returns and accepts exactly what the Gaussian [`smooth`](@ref) does.
 function smooth(
     lds::LinearDynamicalSystem{T,S,O},
     y::Observations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -120,7 +121,7 @@ function smooth(
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` is not supported for a spline emission"))
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds, emb = _spline_setup(lds, data)
     tfs = _smooth_data(glds, emb.data)
     return _collect_smooth_output(tfs, y)
@@ -143,6 +144,7 @@ ridge, matching the penalized objective the M-step maximizes.
 function elbo(
     lds::LinearDynamicalSystem{T,S,O},
     y::Observations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -150,7 +152,7 @@ function elbo(
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` is not supported for a spline emission"))
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds, emb = _spline_setup(lds, data)
 
     tfs = initialize_FilterSmooth(glds, data.tsteps)::TrialFilterSmooth{T}
@@ -192,6 +194,7 @@ exactly for a model with no priors and a zero `spline_ridge`.
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,SM,OM},
     y::Observations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -199,7 +202,7 @@ function StatsAPI.loglikelihood(
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` is not supported for a spline emission"))
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds, emb = _spline_setup(lds, data)
     return loglikelihood(glds, emb.z; ux=data.ux, uy=data.uy) + emb.logjac[]
 end
@@ -261,6 +264,7 @@ function fit!(
     rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -281,7 +285,7 @@ function fit!(
         throw(ArgumentError("`depends_on_test` is not supported for a spline emission"))
     _reject_spline_grouping(lds)
 
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
         T,
         y_test;
@@ -502,13 +506,13 @@ no trial and is excluded, so — as for every other emission —
     sum(trial_elbos(lds, y)) + log p(θ) == elbo(lds, y)
 """
 function trial_elbos(
-    lds::LinearDynamicalSystem{T,S,O}, y::Observations{T}; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y::Observations{T}; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:SplineGaussianObservationModel{T}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds, emb = _spline_setup(lds, data)
 
-    per_trial = trial_elbos(glds, emb.z; ux=data.ux, uy=data.uy)
+    per_trial = trial_elbos(glds, emb.z; ux0=data.ux0, ux=data.ux, uy=data.uy)
     #=
     Re-walk the raw observations per trial: `_embed!` only keeps the total, and
     the split has to be exact for the contract above to hold.

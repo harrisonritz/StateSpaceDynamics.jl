@@ -1000,6 +1000,7 @@ function _build_variants!(
     end
 
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
+    B0s = _slot_arrays(sm.B0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
     As = _slot_arrays(sm.A, dep.nslots[3])
     bs = _slot_arrays(sm.b, dep.nslots[3])
@@ -1014,6 +1015,7 @@ function _build_variants!(
             Q=Qs[s[4]],
             b=bs[s[3]],
             x0=x0s[s[1]],
+            B0=B0s[s[1]],
             P0=P0s[s[2]],
             B=Bs[s[3]],
             Q_prior=sm.Q_prior,
@@ -1053,6 +1055,7 @@ function _build_variants!(
     end
 
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
+    B0s = _slot_arrays(sm.B0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
     #= Slot 3 is the structural block and slot 4 the noise. A structural piece
     the declaration did not name takes one slot however many the block has, and
@@ -1092,6 +1095,7 @@ function _build_variants!(
             Σfs[s[4]],
             hfs[struct_slot(s, _LQR_BLOCK_F)],
             x0s[s[1]],
+            B0s[s[1]],
             P0s[s[2]],
             sm.observe_costate,
             sm.fit_flags,

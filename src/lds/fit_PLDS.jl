@@ -657,7 +657,7 @@ function smooth!(
 
     if ntrials == 1
         smooth!(
-            lds,
+            _trial_initial_model(lds, view(data.ux0, :, 1)),
             tfs[1],
             _trial(y, 1),
             sws_pool[1],
@@ -684,7 +684,7 @@ function smooth!(
         sws = take!(free)
         try
             smooth!(
-                lds,
+                _trial_initial_model(lds, view(data.ux0, :, trial)),
                 tfs[trial],
                 _trial(y, trial),
                 sws,
@@ -796,6 +796,7 @@ Returns a scalar.
 function elbo(
     plds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -805,7 +806,7 @@ function elbo(
     if _warped_route(plds, depends_on)
         return _spline_composite_elbo_laplace(plds, y, ux, uy, newton_max_iter, newton_tol)
     end
-    data = Data(plds, y; ux=ux, uy=uy)
+    data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(plds, data)
@@ -860,6 +861,7 @@ For multi-trial `y`: `Vector`s of the above, one entry per trial.
 function smooth(
     plds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -871,7 +873,7 @@ function smooth(
             plds, y, ux, uy, newton_max_iter, newton_tol
         )
     end
-    data = Data(plds, y; ux=ux, uy=uy)
+    data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(plds, data, grp, y)
     tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
@@ -955,6 +957,7 @@ Returns a `Vector{T}` of ELBO values, one per iteration — or a
 function fit!(
     plds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=100,
@@ -976,7 +979,7 @@ function fit!(
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
-    data = Data(plds, y; ux=ux, uy=uy)
+    data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
         T,
         y_test;

@@ -1285,6 +1285,7 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -1325,7 +1326,7 @@ function smooth(
     `depends_on` into per-cell parameter views, and the discrete layer wraps the
     (K × ΣT) log-likelihood matrix the forward-backward pass reads.
     =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
     y_seq = data.y
     ux_seq = data.ux
@@ -2799,6 +2800,7 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -3283,6 +3285,7 @@ function mstep!(
     sws::SmoothWorkspace{T};
     obs_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
@@ -3303,7 +3306,7 @@ function mstep!(
     at entry and passes it in — the shapes cannot change between iterations, so
     re-validating every trial each M-step is pure overhead.
     =#
-    dat = data === nothing ? Data(slds.LDSs[1], y; ux=ux, uy=uy) : data
+    dat = data === nothing ? Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy) : data
 
     #=
     The discrete transition and initial probabilities. Under terminal
@@ -3443,15 +3446,21 @@ function mstep!(
     D = slds.LDSs[1].latent_dim
     suf = _slds_init_suf(sf_state[1])
     init_xy = zeros(T, 1, D)
+    init_u0y = zeros(T, size(suf.init_u0y))
+    init_u0u0 = zeros(T, size(suf.init_u0u0))
     init_yy = zeros(T, D, D)
     init_n = zero(T)
     for k in 1:K
         base_k = _slds_init_suf(sf_state[k])
         init_xy .+= base_k.init_xy
+        init_u0y .+= base_k.init_u0y
+        init_u0u0 .+= base_k.init_u0u0
         init_yy .+= base_k.init_yy[]
         init_n += T(base_k.init_n)
     end
     copyto!(suf.init_xy, init_xy)
+    copyto!(suf.init_u0y, init_u0y)
+    copyto!(suf.init_u0u0, init_u0u0)
     suf.init_yy[] = init_yy
     suf.init_n = init_n
     # Already fitted, against `log Z`, by the conditional state M-step above.
@@ -3646,6 +3655,7 @@ function _update_shared_initial_state!(
     =#
     if scratch !== nothing
         copyto!(lds1.state_model.x0, slds.LDSs[1].state_model.x0)
+        copyto!(lds1.state_model.B0, slds.LDSs[1].state_model.B0)
         copyto!(lds1.state_model.P0, slds.LDSs[1].state_model.P0)
     end
     update_initial_state_mean!(lds1, suf)
@@ -3653,6 +3663,7 @@ function _update_shared_initial_state!(
     fit_x0, fit_P0 = lds1.fit_bool[1], lds1.fit_bool[2]
     for k in eachindex(slds.LDSs)
         fit_x0 && copyto!(slds.LDSs[k].state_model.x0, lds1.state_model.x0)
+        fit_x0 && copyto!(slds.LDSs[k].state_model.B0, lds1.state_model.B0)
         fit_P0 && copyto!(slds.LDSs[k].state_model.P0, lds1.state_model.P0)
     end
     return nothing
@@ -3800,6 +3811,7 @@ function fit!(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=50,
@@ -3857,7 +3869,7 @@ function fit!(
     observation/input forms (regime dims are uniform, so validating against
     LDSs[1] covers all regimes). Absent ux/uy become zero-row matrices.
     =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
     #=
     A warped emission fits on its embedding. `target` stays the model the caller

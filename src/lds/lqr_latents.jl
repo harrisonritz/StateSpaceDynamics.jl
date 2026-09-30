@@ -296,7 +296,7 @@ function _state_prior_logdensity(
     total = zero(T)
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
     if sm.x0_prior !== nothing
-        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+        total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
     end
     return total + _lqr_structural_logprior(sm)
 end

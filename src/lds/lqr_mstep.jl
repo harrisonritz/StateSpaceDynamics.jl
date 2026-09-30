@@ -2356,11 +2356,8 @@ function _lqr_joint_Q_state!(
 
     # S_init = Σ E[z₁z₁ᵀ] − μ x0ᵀ − x0 μᵀ + N₁ x0 x0ᵀ
     S_init = sws.elbo.temp
-    copyto!(S_init, suf.init_yy[])
-    μ_sum = vec(suf.init_xy)
-    BLAS.ger!(-one(T), μ_sum, x0, S_init)
-    BLAS.ger!(-one(T), x0, μ_sum, S_init)
-    BLAS.ger!(T(N1), x0, x0, S_init)
+    fill!(S_init, zero(T))
+    _accumulate_init_scatter!(S_init, lds, suf)
     ldiv!(P0_U', S_init)
     ldiv!(P0_U, S_init)
     Q_val = T(-0.5) * (T(N1) * (T(d) * log2π + logdet(P0_PD)) + tr(S_init))

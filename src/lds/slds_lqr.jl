@@ -218,6 +218,8 @@ function _pool_lqr_state_stats(
         for (dst, src) in zip(_base_members(pooled.base), _base_members(hs.base))
             dst.init_n += src.init_n
             dst.init_xy .+= src.init_xy
+            dst.init_u0y .+= src.init_u0y
+            dst.init_u0u0 .+= src.init_u0u0
             dst.init_yy[] = dst.init_yy[] + src.init_yy[]
         end
         for (u, c) in zip(hs.terminal_inputs, hs.terminal_counts)

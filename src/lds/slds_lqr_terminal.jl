@@ -557,7 +557,7 @@ function terminal_logz(
     slds::SLDS{T}, y; ux=nothing, uy=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return zero(T)
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     probe = _slqr_terminal_probe(slds, data.ux; smoothing_iters=smoothing_iters)
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)

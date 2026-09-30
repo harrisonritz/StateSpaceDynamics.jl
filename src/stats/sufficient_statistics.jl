@@ -213,6 +213,8 @@ function _base_td_sufficient_statistics(
     return SufficientStatistics{T}(
         T(ntrials),
         zeros(T, 1, D),                            # init_xy
+        zeros(T, _state_ux0_dim(lds.state_model), D),
+        zeros(T, _state_ux0_dim(lds.state_model), _state_ux0_dim(lds.state_model)),
         Base.RefValue{Matrix{T}}(zeros(T, D, D)),  # this does not need to be PD as we do not compute a cholesky
         T(total_dyn),
         _pd_ref(PD_init(dyn_reg_dim)),                 # dyn_xx
@@ -546,6 +548,8 @@ function _aggregate_td_suff_stats!(
     suf.obs_xx[] = pd_gram(copy(Szz_Cd); name="emission Gram [x d uy]")
     suf.obs_yy[] = pd_gram(copy(R_sum); name="emission scatter")
 
+    _aggregate_initial_inputs!(suf, tfs, data)
+
     return suf
 end
 
@@ -774,5 +778,24 @@ function _aggregate_td_suff_stats_weighted!(
     suf.obs_xx[] = pd_gram(copy(obs_xx); name="regime-weighted emission Gram [x d uy]")
     suf.obs_yy[] = pd_gram(copy(obs_yy); name="regime-weighted emission scatter")
 
+    _aggregate_initial_inputs!(suf, tfs, data, weights)
+
+    return suf
+end
+
+function _aggregate_initial_inputs!(
+    suf::SufficientStatistics{T}, tfs::TrialFilterSmooth{T}, data::Data{T},
+    weights=nothing,
+) where {T<:Real}
+    fill!(suf.init_u0y, zero(T))
+    fill!(suf.init_u0u0, zero(T))
+    isempty(suf.init_u0y) && return suf
+    for trial in 1:length(tfs)
+        w = weights === nothing ? one(T) : weights[trial][1]
+        u0 = view(data.ux0, :, trial)
+        x1 = view(tfs[trial].x_smooth, :, 1)
+        BLAS.ger!(w, u0, x1, suf.init_u0y)
+        BLAS.ger!(w, u0, u0, suf.init_u0u0)
+    end
     return suf
 end

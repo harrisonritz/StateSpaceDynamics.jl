@@ -72,16 +72,16 @@ matching what [`elbo`](@ref) and [`loglikelihood`](@ref) report for it.
 function trial_elbos end
 
 """
-    _trial_elbo_setup(lds, y, ux, uy) -> (data, tfs, sws_pool)
+    _trial_elbo_setup(lds, y, ux0, ux, uy) -> (data, tfs, sws_pool)
 
 The `Data`, smoother storage and workspace pool [`elbo`](@ref) builds, with the
 grouped path rejected up front. Split out so the quadratic and non-quadratic
 methods differ only in how they smooth.
 """
 function _trial_elbo_setup(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     parameter_grouping(lds, length(data.tsteps); y=data.y) === nothing || error(
         "trial_elbos does not support parameter grouping (`depends_on`): a grouped " *
         "model carries one parameter set per cell of trials, and the per-trial " *
@@ -204,6 +204,7 @@ function trial_elbos(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:QuadraticEmission{T}}
@@ -212,7 +213,7 @@ function trial_elbos(
     if _warped_route(lds)
         return _spline_composite_trial_elbos(lds, y, ux, uy)
     end
-    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
     smooth!(lds, tfs, data, sws_pool)
     return _accumulate_trial_elbos(lds, tfs, data, sws_pool[1])
 end
@@ -230,6 +231,7 @@ function trial_elbos(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -240,7 +242,7 @@ function trial_elbos(
             plds, y, ux, uy; newton_max_iter=newton_max_iter, newton_tol=newton_tol
         )
     end
-    data, tfs, sws_pool = _trial_elbo_setup(plds, y, ux, uy)
+    data, tfs, sws_pool = _trial_elbo_setup(plds, y, ux0, ux, uy)
     smooth!(plds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return _accumulate_trial_elbos(plds, tfs, data, sws_pool[1])
 end
@@ -260,6 +262,7 @@ function trial_elbos(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -385,11 +388,12 @@ function trial_elbos(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
     _prepare_lqr!(lds, data.tsteps)
     smooth!(lds, tfs, data, sws_pool)
     return _accumulate_lqr_trial_elbos(lds, tfs, data, sws_pool[1])
@@ -408,13 +412,14 @@ function trial_elbos(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux, uy)
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
     _prepare_lqr!(lds, data.tsteps)
     smooth!(lds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return _accumulate_lqr_trial_elbos(lds, tfs, data, sws_pool[1])

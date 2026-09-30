@@ -501,6 +501,7 @@ function fit!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -516,7 +517,7 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
@@ -567,12 +568,13 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -604,6 +606,7 @@ parameter log-priors removed, so it is a likelihood and not a MAP objective.
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,S,O},
     y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
@@ -624,7 +627,7 @@ end
 function _lqr_loglikelihood(
     lds::LinearDynamicalSystem{T,S,O}, y; ux=nothing, uy=nothing
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _lqr_sws_pool(lds, data)
@@ -649,12 +652,13 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -691,12 +695,13 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -718,6 +723,7 @@ function fit!(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=100,
@@ -739,7 +745,7 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
@@ -794,6 +800,7 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -801,7 +808,7 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -965,7 +972,7 @@ function _grouped_state_prior_logdensity(
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model
         if sm.x0_prior !== nothing
-            total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+            total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
         end
     end
     return total

@@ -180,6 +180,8 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
     if length(sm.x0) != 2n
         throw(DimensionMismatchError("LQR x0", 2n, length(sm.x0)))
     end
+    size(sm.B0, 1) == 2n ||
+        throw(DimensionMismatchError("LQR B0 rows", 2n, size(sm.B0, 1)))
     if length(sm.hf) != n
         throw(DimensionMismatchError("LQR hf", n, length(sm.hf)))
     end
@@ -246,6 +248,9 @@ function _validate_state_model(
             DimensionMismatchError("initial state x0", latent_dim, length(state_model.x0))
         )
     end
+    size(state_model.B0, 1) == latent_dim || throw(
+        DimensionMismatchError("initial input B0 rows", latent_dim, size(state_model.B0, 1))
+    )
 
     # Check P0 matrix (initial covariance)
     if size(state_model.P0) != (latent_dim, latent_dim)

@@ -647,6 +647,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     Σf::M
     hf::V
     x0::V
+    B0::M
     P0::M
     observe_costate::Bool
     fit_flags::LQRFitFlags
@@ -992,6 +993,7 @@ function LQRStateModel(
     Bu::Union{Nothing,AbstractMatrix{T}}=nothing,
     Gref::Union{Nothing,AbstractMatrix{T}}=nothing,
     x0::Union{Nothing,AbstractVector{T}}=nothing,
+    B0::Union{Nothing,AbstractMatrix{T}}=nothing,
     P0::Union{Nothing,AbstractMatrix{T}}=nothing,
     observe_costate::Bool=false,
     fit_flags::LQRFitFlags=LQRFitFlags(),
@@ -1073,6 +1075,7 @@ function LQRStateModel(
     )
     _check_gref_cols(fit_flags, size(Gref_m, 2), d)
     length(x0_v) == d || throw(DimensionMismatchError("LQR x0", d, length(x0_v)))
+    B0 === nothing || size(B0, 1) == d || throw(DimensionMismatchError("LQR B0 rows", d, size(B0, 1)))
     size(P0_m) == (d, d) || throw(DimensionMismatchError("LQR P0 rows", d, size(P0_m, 1)))
     size(Σf_m) == (n, n) || throw(DimensionMismatchError("LQR Σf rows", n, size(Σf_m, 1)))
     length(hf_v) == n || throw(DimensionMismatchError("LQR hf", n, length(hf_v)))
@@ -1099,6 +1102,7 @@ function LQRStateModel(
         Σf_m,
         hf_v,
         x0_v,
+        B0 === nothing ? zeros(T, d, 0) : Matrix{T}(B0),
         P0_m,
         observe_costate,
         fit_flags,
@@ -1170,6 +1174,7 @@ function free_state_model(
     h::Union{Nothing,AbstractVector{T}}=nothing,
     Bu::Union{Nothing,AbstractMatrix{T}}=nothing,
     x0::Union{Nothing,AbstractVector{T}}=nothing,
+    B0::Union{Nothing,AbstractMatrix{T}}=nothing,
     P0::Union{Nothing,AbstractMatrix{T}}=nothing,
     observe_costate::Bool=true,
     fit_flags::LQRFitFlags=LQRFitFlags(),
@@ -1204,6 +1209,7 @@ function free_state_model(
     length(h_v) == d || throw(DimensionMismatchError("free h", d, length(h_v)))
     size(Bu_m, 1) == d || throw(DimensionMismatchError("free Bu rows", d, size(Bu_m, 1)))
     length(x0_v) == d || throw(DimensionMismatchError("free x0", d, length(x0_v)))
+    B0 === nothing || size(B0, 1) == d || throw(DimensionMismatchError("free B0 rows", d, size(B0, 1)))
     size(P0_m) == (d, d) || throw(DimensionMismatchError("free P0 rows", d, size(P0_m, 1)))
 
     mstep_iters >= 1 ||
@@ -1229,6 +1235,7 @@ function free_state_model(
         Matrix{T}(I, n, n),
         zeros(T, n),
         x0_v,
+        B0 === nothing ? zeros(T, d, 0) : Matrix{T}(B0),
         P0_m,
         observe_costate,
         fit_flags,

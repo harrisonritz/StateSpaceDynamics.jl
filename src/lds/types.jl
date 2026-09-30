@@ -113,7 +113,11 @@ struct Data{T<:Real,YV,UXV<:AbstractVector{<:AbstractMatrix{T}},UYV}
     ux::UXV
     uy::UYV
     tsteps::Vector{Int}
+    ux0::Matrix{T}                  # (initial-input dimension, ntrials)
 end
+
+Data(y, ux::AbstractVector{<:AbstractMatrix{T}}, uy, tsteps) where {T<:Real} =
+    Data(y, ux, uy, tsteps, zeros(T, 0, length(tsteps)))
 
 """
     GaussianStateModel{T<:Real, M<:AbstractMatrix{T}, V<:AbstractVector{T}}
@@ -160,6 +164,7 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
+    B0::M = zeros(eltype(A), size(A, 1), 0)
     B::M = zeros(eltype(A), size(A, 1), 0)
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
@@ -689,6 +694,44 @@ function _state_ux_dim(sm::AbstractStateModel)
     return hasproperty(sm, :B) && !isnothing(sm.B) ? size(sm.B, 2) : 0
 end
 
+_state_ux0_dim(sm::AbstractGaussianStateModel) = size(sm.B0, 2)
+_initial_coefficients(sm::AbstractGaussianStateModel) =
+    isempty(sm.B0) ? reshape(sm.x0, :, 1) : sm.B0
+
+"""Give one trial its own initial mean without changing the shared fitted model."""
+function _trial_initial_model(lds::LinearDynamicalSystem{T,S,O}, u0) where {
+    T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}
+}
+    sm = lds.state_model
+    isempty(sm.B0) && return lds
+    fields = ntuple(fieldcount(S)) do i
+        name = fieldname(S, i)
+        name === :x0 ? copy(sm.x0) :
+        name === :cache ? deepcopy(sm.cache) : getfield(sm, i)
+    end
+    local_sm = S(fields...)
+    mul!(local_sm.x0, local_sm.B0, u0)
+    return LinearDynamicalSystem{T,S,O}(
+        local_sm, lds.obs_model, lds.latent_dim, lds.obs_dim,
+        lds.ux_dim, lds.uy_dim, lds.fit_bool,
+    )
+end
+
+function _normalize_ux0(ux0, sm::AbstractGaussianStateModel{T}, ntrials::Int) where {T}
+    q = _state_ux0_dim(sm)
+    if ux0 === nothing
+        q == 0 || throw(ArgumentError("ux0 is required when B0 has $q columns"))
+        return zeros(T, 0, ntrials)
+    end
+    values = ux0 isa AbstractVector ? reshape(ux0, :, 1) : ux0
+    values isa AbstractMatrix || throw(ArgumentError("ux0 must be a matrix of size (input dimension, ntrials)"))
+    size(values) == (q, ntrials) || throw(DimensionMismatchError(
+        "ux0 shape", (q, ntrials), size(values)
+    ))
+    all(isfinite, values) || throw(ArgumentError("ux0 contains non-finite values"))
+    return Matrix{T}(values)
+end
+
 """
     _obs_dim(obs_model) -> Int
 
@@ -1014,6 +1057,7 @@ canonicalized to zero-row matrices.
 function Data(
     lds::LinearDynamicalSystem{T},
     y::AbstractVector{<:AbstractMatrix{T}};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
 ) where {T<:Real}
@@ -1033,23 +1077,25 @@ function Data(
     tsteps = Int[size(yt, 2) for yt in y]
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps, T, lds.obs_model)
-    return Data(y, ux_seq, uy_seq, tsteps)
+    return Data(y, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(y)))
 end
 
 function Data(
     lds::LinearDynamicalSystem{T},
     y::AbstractMatrix{T};
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
 ) where {T<:Real}
     return Data(
-        lds, [y]; ux=(ux === nothing ? nothing : [ux]), uy=(uy === nothing ? nothing : [uy])
+        lds, [y]; ux0=ux0, ux=(ux === nothing ? nothing : [ux]), uy=(uy === nothing ? nothing : [uy])
     )
 end
 
 function Data(
     lds::LinearDynamicalSystem{T},
     y::AbstractArray{T,3};
+    ux0=nothing,
     ux::Union{Nothing,AbstractArray{T,3}}=nothing,
     uy::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
@@ -1057,6 +1103,7 @@ function Data(
     return Data(
         lds,
         _trials(y);
+        ux0=ux0,
         ux=(ux === nothing ? nothing : _trials(ux)),
         uy=(uy === nothing ? nothing : _trials(uy)),
     )
