@@ -953,7 +953,7 @@ its own `Data` is indistinguishable from a single-emission model.
 """
 function _member_datas(data::Data)
     ks = keys(data.y)
-    return NamedTuple{ks}(map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps), ks))
+    return NamedTuple{ks}(map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps, data.ux0), ks))
 end
 
 # ============================================================================
@@ -1347,7 +1347,7 @@ function StatsAPI.loglikelihood(
     stacked = _stacked_gaussian_lds(lds)
     ys = _stack_trials(data.y, ntrials)
     uys = lds.uy_dim > 0 ? _stack_trials(data.uy, ntrials) : nothing
-    return loglikelihood(stacked, ys; ux=data.ux, uy=uys)
+    return loglikelihood(stacked, ys; ux0=data.ux0, ux=data.ux, uy=uys)
 end
 
 function StatsAPI.loglikelihood(

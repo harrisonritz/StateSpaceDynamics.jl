@@ -1691,6 +1691,7 @@ function _subset_data(data::Data, trials::AbstractVector{Int})
         data.ux[trials],
         _subset_obs(data.uy, trials),
         data.tsteps[trials],
+        data.ux0[:, trials],
     )
 end
 

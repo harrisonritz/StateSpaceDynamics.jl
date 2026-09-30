@@ -269,6 +269,7 @@ function fit!(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -289,6 +290,7 @@ function fit!(
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         test_every=test_every,

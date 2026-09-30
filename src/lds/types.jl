@@ -987,6 +987,15 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
     LDSs::Vector{LinearDynamicalSystem{T,S,O}}
 end
 
+function _trial_initial_model(slds::SLDS{T,S,O,TM,ISV}, u0) where {
+    T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T},
+    TM<:AbstractMatrix{T},ISV<:AbstractVector{T}
+}
+    isempty(slds.LDSs[1].state_model.B0) && return slds
+    members = [_trial_initial_model(lds, u0) for lds in slds.LDSs]
+    return SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, members)
+end
+
 """
     SLDSDiscreteLayer{T,TM,TV}
 

@@ -506,6 +506,7 @@ function fit!(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -522,6 +523,7 @@ function fit!(
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -610,7 +612,7 @@ function StatsAPI.loglikelihood(
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
-    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
 end
 
 #=
@@ -619,13 +621,13 @@ specificity, so this method has to match it there — otherwise the two are
 ambiguous, each more specific in a different argument.
 =#
 function StatsAPI.loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
-    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
 end
 
 function _lqr_loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
@@ -734,6 +736,7 @@ function fit!(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -750,6 +753,7 @@ function fit!(
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,

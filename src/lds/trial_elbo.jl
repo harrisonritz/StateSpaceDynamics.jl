@@ -139,7 +139,8 @@ function _accumulate_trial_elbos(
     for n in eachindex(per_trial)
         fs = tfs[n]
         per_trial[n] =
-            Q_state!(sws, lds, fs.E_z, fs.E_zz, fs.E_zz_prev, data.ux[n]) +
+            Q_state!(sws, _trial_initial_model(lds, view(data.ux0, :, n)),
+                     fs.E_z, fs.E_zz, fs.E_zz_prev, data.ux[n]) +
             log2π_per_step * data.tsteps[n] +
             _trial_q_obs(sws, lds, fs, data, n) +
             fs.entropy
@@ -211,7 +212,7 @@ function trial_elbos(
     #= A warped member is scored on its embedding, with each trial's own
     change-of-variables term added back; see `fit_spline_composite.jl`. =#
     if _warped_route(lds)
-        return _spline_composite_trial_elbos(lds, y, ux, uy)
+        return _spline_composite_trial_elbos(lds, y, ux0, ux, uy)
     end
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
     smooth!(lds, tfs, data, sws_pool)
@@ -239,7 +240,7 @@ function trial_elbos(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     if _warped_route(plds)
         return _spline_composite_trial_elbos(
-            plds, y, ux, uy; newton_max_iter=newton_max_iter, newton_tol=newton_tol
+            plds, y, ux0, ux, uy; newton_max_iter=newton_max_iter, newton_tol=newton_tol
         )
     end
     data, tfs, sws_pool = _trial_elbo_setup(plds, y, ux0, ux, uy)
@@ -332,6 +333,11 @@ function _lqr_trial_state_suf!(
 
     suf.init_n = one(T)
     @views suf.init_xy[1, :] .= x1
+    if !isempty(suf.init_u0y)
+        u0 = view(data.ux0, :, n)
+        suf.init_u0y .= u0 * x1'
+        suf.init_u0u0 .= u0 * u0'
+    end
     S0 = suf.init_yy[]
     copyto!(S0, view(fs.p_smooth, :, :, 1))
     S0 .+= x1 .* transpose(x1)

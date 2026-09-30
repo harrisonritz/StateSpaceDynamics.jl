@@ -236,7 +236,7 @@ function _slds_spline_state(slds::SLDS{T}, data::Data{T}) where {T<:Real}
     else
         NamedTuple{keys(data.y)}(map(k -> get(zmap, k, data.y[k]), keys(data.y)))
     end
-    sdata = Data(sy, data.ux, data.uy, data.tsteps)
+    sdata = Data(sy, data.ux, data.uy, data.tsteps, data.ux0)
 
     state = _SLDSSplineState{T,typeof(shadow),typeof(sdata)}(
         shadow, sdata, sites, gamma, Ref(zero(T))

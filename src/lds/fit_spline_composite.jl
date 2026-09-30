@@ -152,7 +152,7 @@ function _spline_shadow_data(data::Data{T}, sites::AbstractVector) where {T<:Rea
     y = data.y
     zmap = Dict{Symbol,Any}(site.key => site.z for site in sites)
     znt = NamedTuple{keys(y)}(map(k -> get(zmap, k, y[k]), keys(y)))
-    return Data(znt, data.ux, data.uy, data.tsteps)
+    return Data(znt, data.ux, data.uy, data.tsteps, data.ux0)
 end
 
 """
@@ -354,10 +354,10 @@ end
 # ============================================================================
 
 function _spline_composite_smooth(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
@@ -367,10 +367,10 @@ function _spline_composite_smooth(
 end
 
 function _spline_composite_elbo(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
@@ -520,10 +520,10 @@ function _fit_spline_laplace!(
 end
 
 function _spline_composite_smooth_laplace(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy, newton_max_iter::Int, newton_tol::Float64
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy, newton_max_iter::Int, newton_tol::Float64
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
@@ -546,10 +546,10 @@ function _spline_composite_smooth_laplace(
 end
 
 function _spline_composite_elbo_laplace(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy, newton_max_iter::Int, newton_tol::Float64
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy, newton_max_iter::Int, newton_tol::Float64
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
@@ -613,14 +613,14 @@ parameter log-prior (IW/MN terms and the warp ridge) belongs to no trial and is
 excluded, exactly as for every other emission.
 """
 function _spline_composite_trial_elbos(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux, uy; kwargs...
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy; kwargs...
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
     _reject_spline_grouping(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     glds = _gaussian_shadow(lds)
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
     _spline_embed_sites!(sites, data)
-    per_trial = trial_elbos(glds, sdata.y; ux=sdata.ux, uy=sdata.uy, kwargs...)
+    per_trial = trial_elbos(glds, sdata.y; ux0=sdata.ux0, ux=sdata.ux, uy=sdata.uy, kwargs...)
     return per_trial .+ _spline_trial_logjac(T, sites, data, length(data.tsteps))
 end

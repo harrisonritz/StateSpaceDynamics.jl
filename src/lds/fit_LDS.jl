@@ -141,7 +141,7 @@ function smooth(
     runs; see `fit_spline_composite.jl` for why this is a run-time branch rather
     than dispatch. =#
     if _warped_route(lds, depends_on)
-        return _spline_composite_smooth(lds, y, ux, uy)
+        return _spline_composite_smooth(lds, y, ux0, ux, uy)
     end
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
@@ -1089,7 +1089,7 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     if _warped_route(lds, depends_on)
-        return _spline_composite_elbo(lds, y, ux, uy)
+        return _spline_composite_elbo(lds, y, ux0, ux, uy)
     end
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
@@ -1216,6 +1216,7 @@ function fit!(
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -1230,6 +1231,7 @@ function fit!(
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -1700,7 +1702,8 @@ function StatsAPI.loglikelihood(
             S_chol, K = _filter_cov_pass(lds_c, maximum(data.tsteps[n] for n in trials))
             for n in trials
                 total_ll += _filter_ll_trial(
-                    lds_c, data.y[n], data.ux[n], data.uy[n], S_chol, K
+                    _trial_initial_model(lds_c, view(data.ux0, :, n)),
+                    data.y[n], data.ux[n], data.uy[n], S_chol, K
                 )
             end
         end
@@ -1711,7 +1714,10 @@ function StatsAPI.loglikelihood(
 
     total_ll = zero(T)
     for n in eachindex(data.y)
-        total_ll += _filter_ll_trial(lds, data.y[n], data.ux[n], data.uy[n], S_chol, K)
+        total_ll += _filter_ll_trial(
+            _trial_initial_model(lds, view(data.ux0, :, n)),
+            data.y[n], data.ux[n], data.uy[n], S_chol, K
+        )
     end
     return total_ll
 end
