@@ -347,12 +347,18 @@ function _sample_continuous_given_discrete!(
 end
 
 """
-    StatsAPI.fit!(dl::SLDSDiscreteLayer, fb_storage, obs_seq; seq_ends)
+    StatsAPI.fit!(dl::SLDSDiscreteLayer, fb_storage, obs_seq; seq_ends,
+                  A_prior=nothing, πₖ_prior=nothing)
 
 Update the discrete transition matrix `dl.A` and initial-state distribution `dl.πₖ`
 in place from forward-backward statistics. Mirrors HiddenMarkovModels.jl's
 `fit!(::HMM, ...)` pattern using the `ξ[t2]` scratch trick: for each sequence,
 `ξ[t2]` is zero by FB convention so it doubles as an accumulator for `sum(ξ[t1:t2-1])`.
+
+`A_prior` / `πₖ_prior` are the chain's Dirichlet concentrations (the `SLDS` fields of
+the same names). With one set, the update is the MAP one: `α − 1` pseudo-counts are
+added to the expected counts before normalising, `Aᵢⱼ ∝ Nᵢⱼ + αᵢⱼ − 1` and
+`πₖ ∝ nₖ + αₖ − 1`. `nothing` is the maximum-likelihood update, unchanged.
 
 Skips fitting observation distributions because the SLDS discrete layer doesn't have
 parametric obs distributions; per-state log-likelihoods are filled into `dl.logL`
@@ -363,6 +369,8 @@ function StatsAPI.fit!(
     fb_storage::HMMs.ForwardBackwardStorage,
     obs_seq::AbstractVector;
     seq_ends::AbstractVector{Int},
+    A_prior::Union{Nothing,AbstractMatrix}=nothing,
+    πₖ_prior::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     γ = fb_storage.γ
     ξ = fb_storage.ξ
@@ -387,6 +395,15 @@ function StatsAPI.fit!(
         dl.πₖ .+= view(γ, :, t1)
         dl.A .+= ξ[t2]
     end
+
+    #=
+    Dirichlet MAP: the posterior is Dir(N + α), whose mode is `N + α − 1`
+    normalised. `α ≥ 1` (validated at entry) keeps the pseudo-counts
+    non-negative, so the row sums below stay positive wherever either the data
+    or the prior put mass.
+    =#
+    A_prior === nothing || (dl.A .+= A_prior .- one(T))
+    πₖ_prior === nothing || (dl.πₖ .+= πₖ_prior .- one(T))
 
     dl.πₖ ./= sum(dl.πₖ)
     for i in axes(dl.A, 1)
@@ -2024,6 +2041,12 @@ difference between the two callers:
 `grp` / `cell_slds` carry an ancillary-dependency (`depends_on`) grouping; both
 `nothing` keeps every step on the ungrouped code path.
 
+`clamp_logL` (a `K × sum(T_i)` matrix, `nothing` by default) replaces step 1: its
+values are copied into `dl.logL` instead of the model's own per-regime scores, so
+`q(z)` is the chain posterior under that external evidence while steps 2 and 3
+run as usual. This is `fit!`'s discrete warm-up; `x_samples` are still drawn in
+step 3, so the stream a warm-up consumes is the stream an ordinary E-step would.
+
 `tol` selects the stopping rule. `tol == 0` runs exactly `smoothing_iters`
 alternations; `tol > 0` stops early once `max|Δγ| < tol` *and* every trial's Newton
 solve in that alternation reached its MAP. `γ` alone is not enough: it can settle
@@ -2063,6 +2086,7 @@ function _vem_alternate!(
     prog=nothing,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    clamp_logL::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
     smoothing_iters >= 1 ||
         throw(ArgumentError("smoothing_iters must be ≥ 1, got $smoothing_iters"))
@@ -2120,7 +2144,10 @@ function _vem_alternate!(
         `½ tr(H Σ)` term that turns that plug-in into E_q(x)[·]; the sampled
         path gets the spread from the draw itself and passes `tfs = nothing`.
         =#
-        if x_samples === nothing
+        if clamp_logL !== nothing
+            #= Discrete warm-up: the evidence is supplied, not scored. =#
+            copyto!(dl.logL, clamp_logL)
+        elseif x_samples === nothing
             fill_logL!(trial -> tfs[trial].x_smooth)
         elseif num_samples == 1
             fill_logL!(trial -> view(x_samples[trial], :, :, 1))
@@ -2259,6 +2286,10 @@ log-likelihood fill. `nothing` (the default) means no inputs.
 
 `newton_max_iter` / `newton_tol` bound each trial's Newton solve for `q(x)`. Returns
 how many trials' solves stopped short of the MAP in the last alternation.
+
+`clamp_logL` (`K × sum(T_i)`) replaces the discrete evidence of every alternation
+with the given per-bin log-likelihoods — `fit!`'s discrete warm-up; see
+[`_vem_alternate!`](@ref).
 """
 function estep!(
     slds::SLDS{T,S,O},
@@ -2281,6 +2312,7 @@ function estep!(
     smoothing_iters::Int=1,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    clamp_logL::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     _, _, unconverged = _vem_alternate!(
         slds,
@@ -2305,6 +2337,7 @@ function estep!(
         noise_bufs=noise_bufs,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        clamp_logL=clamp_logL,
     )
     return unconverged
 end
@@ -2336,6 +2369,7 @@ function estep!(
     smoothing_iters::Int=1,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    clamp_logL::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return estep!(
         slds,
@@ -2358,6 +2392,7 @@ function estep!(
         smoothing_iters=smoothing_iters,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        clamp_logL=clamp_logL,
     )
 end
 
@@ -2374,9 +2409,10 @@ end
     _slds_prior_logdensity(slds, tied=Symbol[])
 
 `log p(θ)` for a switching model: IW on `Q`/`P0`/`R` (and an LQR state's `Σ` and
-`Qc`), MN on `[A b B]`/`[C d D]`/`x0`, and the MN-only `[C d D]` term for Poisson
-emissions that matches their M-step objective. A composite emission sums over
-its members. Zero when no priors are set.
+`Qc`), MN on `[A b B]`/`[C d D]`/`x0`, the MN-only `[C d D]` term for Poisson
+emissions that matches their M-step objective, and the Dirichlet terms on the
+discrete chain ([`_slds_chain_prior_logdensity`](@ref)). A composite emission sums
+over its members. Zero when no priors are set.
 
 Each prior is counted once per distinct *version* of its parameter — once for a
 group tied across the discrete states, whose M-step fits one shared value under
@@ -2392,7 +2428,33 @@ function _slds_prior_logdensity(
     # One cell: every group's per-cell slot is 1. The emission's groups follow the
     # four state groups, so the last emission ordinal is the group count.
     cell_slot = [[1] for _ in 1:last(last(_obs_slot_ordinals(lds1.obs_model)))]
-    return _slds_units_prior_logdensity(slds.LDSs, cell_slot, length(slds.LDSs), tied, T)
+    return _slds_units_prior_logdensity(slds.LDSs, cell_slot, length(slds.LDSs), tied, T) +
+           _slds_chain_prior_logdensity(slds)
+end
+
+"""
+    _slds_chain_prior_logdensity(slds) -> T
+
+`log Dir(A | A_prior) + log Dir(πₖ | πₖ_prior)` at the current chain, each row of `A`
+its own Dirichlet; zero for a prior that is `nothing`.
+
+Unnormalised, as the IW / MN terms are: the `log Γ` constants depend on the
+concentrations alone, so dropping them leaves the MAP objective the trace tracks
+unchanged up to a constant, and a flat `α ≡ 1` adds exactly zero (see
+[`dirichlet_logprior_term`](@ref)).
+
+There is one chain per model, so this is counted once however the trials are
+grouped: a `depends_on` fit's cell views share the parent's chain *and* its prior
+by reference, and [`_grouped_slds_prior_logdensity`](@ref) reads it off the first
+cell only.
+"""
+function _slds_chain_prior_logdensity(slds::SLDS{T}) where {T<:Real}
+    total = zero(T)
+    slds.A_prior === nothing || (total += dirichlet_logprior_term(slds.A, slds.A_prior))
+    if slds.πₖ_prior !== nothing
+        total += dirichlet_logprior_term(slds.πₖ, slds.πₖ_prior)
+    end
+    return total
 end
 
 """
@@ -2637,8 +2699,9 @@ forward-backward chain posterior:
 - `H[q(z)]` is the Markov-chain entropy of the FB posterior,
   `−Σ γ₁ log γ₁ − Σ_t Σ_ij ξ_t(i,j) log(ξ_t(i,j)/γ_t(i))` — not the
   factorized `−Σ γ log γ`, which would overstate the entropy of a chain.
-- `log p(θ)` collects per-regime IW/MN prior log-densities so the ELBO tracks
-  the MAP objective the M-step optimizes (zero when no priors are set).
+- `log p(θ)` collects per-regime IW/MN prior log-densities, and the Dirichlet
+  terms on the discrete chain, so the ELBO tracks the MAP objective the M-step
+  optimizes (zero when no priors are set).
 
 The continuous term is evaluated at the smoothed mean (deterministic given the
 current posteriors), not at the E-step's posterior sample. For K = 1 with
@@ -3291,6 +3354,7 @@ function mstep!(
     sufs::Union{Nothing,AbstractVector}=nothing,
     bufs::Union{Nothing,GroupedSufBuffers{T},NamedTuple}=nothing,
     init_scratch::Union{Nothing,LinearDynamicalSystem}=nothing,
+    update_chain::Bool=true,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     K = length(slds.LDSs)
     ntrials = _ntrials(y)
@@ -3312,8 +3376,23 @@ function mstep!(
     =#
     conditioned = _slds_condition_terminal(slds)
     probe = conditioned ? _slqr_terminal_probe(slds, dat.ux) : nothing
-    probe_current = if probe === nothing
-        StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
+    #=
+    `update_chain = false` is `fit!`'s discrete warm-up: the chain stays exactly
+    as the caller set it. The probe is still built — the conditional state
+    M-step below needs it — but is not current, so it is smoothed there at the
+    chain as it stands.
+    =#
+    probe_current = if !update_chain
+        false
+    elseif probe === nothing
+        StatsAPI.fit!(
+            dl,
+            fb_storage,
+            obs_seq;
+            seq_ends=seq_ends,
+            A_prior=slds.A_prior,
+            πₖ_prior=slds.πₖ_prior,
+        )
         false
     else
         _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probe)
@@ -3740,6 +3819,30 @@ solve for `q(x)` within one E-step alternation. The solve resumes from its last
 mean at the next iteration, so the cap bounds one pass; a fit whose final E-step
 still leaves trials short of the MAP warns.
 
+# Discrete chain prior and warm-up
+
+A model carrying `A_prior` / `πₖ_prior` (Dirichlet concentrations, see [`SLDS`](@ref)
+and [`transition_prior`](@ref)) is fitted by MAP on the chain, and the trace
+includes the chain's log-prior.
+
+`discrete_warmup = N` with `warmup_logL` (a `K × ΣTᵢ` matrix of per-bin
+log-likelihoods, trials concatenated in order as in the forward-backward pass —
+e.g. from an AR-HMM fitted as an initialiser) clamps the discrete evidence for the
+first `N` EM iterations. In those iterations every E-step alternation takes `q(z)`
+as the chain posterior of `warmup_logL` under the current `(A, πₖ)` instead of
+scoring the regimes from the continuous latents, `q(x)` is smoothed under it as
+usual, and the M-step updates every state and emission parameter but leaves `A`
+and `πₖ` exactly as the caller set them. The warm start smooths under that same
+posterior rather than uniform weights. Initialise the chain from the same source
+as the evidence and the warm-up reproduces that source's segmentation exactly, so
+each state's continuous parameters are fitted to its own segment before the
+model's own, self-reinforcing, discrete evidence takes over at iteration `N + 1`.
+
+The warm-up trace is still an ELBO: the bound holds for any `q(z)`, and it is
+evaluated from the model's densities, not from `warmup_logL`. Expect a jump when
+the clamp is released. `discrete_warmup ≥ max_iter` makes the whole fit a
+warm-up; `warmup_logL` without a positive `discrete_warmup` throws.
+
 # Parallelism and reproducibility
 
 Every per-trial pass — the smoother, the discrete layer's log-likelihood fill,
@@ -3825,6 +3928,8 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    discrete_warmup::Int=0,
+    warmup_logL::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     rng_mode in (:trial, :global) ||
         throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
@@ -3890,6 +3995,9 @@ function fit!(
     seq_ends = cumsum(tsteps_per_trial)
     total_T = last(seq_ends)
     T_max = maximum(tsteps_per_trial)
+
+    # Checked before any smoothing, like every other argument.
+    warm_logL = _slds_warmup_logL(warmup_logL, discrete_warmup, K, total_T, T)
 
     #=
     Ancillary parameter dependencies. `grp === nothing` (no regime declares
@@ -4017,8 +4125,25 @@ function fit!(
 
     #=
     Warm-start: smooth each trial once with uniform weights, drawing the first
-    sample into x_samples for the first E-step to consume.
+    sample into x_samples for the first E-step to consume. Under a discrete
+    warm-up the weights are instead the chain posterior of the supplied evidence
+    — the same `γ` the first clamped E-step will produce — so `q(x)` starts from
+    each state's own segment.
     =#
+    γ_init = if warm_logL === nothing
+        nothing
+    else
+        copyto!(dl.logL, warm_logL)
+        HMMs.forward_backward!(
+            fb_storage,
+            dl,
+            obs_seq,
+            control_seq;
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+        fb_storage.γ
+    end
     _slds_warmstart!(
         slds,
         cell_slds,
@@ -4038,6 +4163,7 @@ function fit!(
         lognorm=lognorm,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        γ_init=γ_init,
     )
     # Trials the latest E-step left short of their MAP; see the warning below.
     newton_unconverged = 0
@@ -4045,6 +4171,17 @@ function fit!(
     for iter in 1:max_iter
         # The warp moved in the previous M-step, so refresh `z = g(y)` in place.
         spline_state === nothing || _slds_spline_embed!(spline_state, dataful)
+        #=
+        Discrete warm-up. For the first `discrete_warmup` iterations the E-step
+        reads the supplied evidence instead of scoring the regimes itself, and the
+        M-step leaves the chain alone; everything else runs as usual. The trace
+        these iterations record is still an ELBO: the bound holds for *any* q(z),
+        and `elbo!` / `_elbo_grouped!` evaluate it from the model's own densities
+        and the forward-backward marginals, never from `dl.logL`. It is the
+        clamped q(z) that is suboptimal, not the number.
+        =#
+        warming = iter <= discrete_warmup
+        clamp_iter = warming ? warm_logL : nothing
         #=
         E-step: fill q(z) from the current samples, run forward-backward,
         re-smooth q(x), and draw the next samples for the following iteration.
@@ -4071,6 +4208,7 @@ function fit!(
                 smoothing_iters=smoothing_iters,
                 newton_max_iter=newton_max_iter,
                 newton_tol=newton_tol,
+                clamp_logL=clamp_iter,
             )
 
             # Compute the ELBO at the current posteriors.
@@ -4127,6 +4265,7 @@ function fit!(
                 sufs=mstep_sufs,
                 bufs=mstep_bufs,
                 init_scratch=init_scratch,
+                update_chain=!warming,
             )
             # Every slot, not just the first: the ungrouped passes read the
             # cached constants without refreshing them.
@@ -4166,6 +4305,7 @@ function fit!(
                 smoothing_iters=smoothing_iters,
                 newton_max_iter=newton_max_iter,
                 newton_tol=newton_tol,
+                clamp_logL=clamp_iter,
             )
 
             elbos[iter] = _elbo_grouped!(
@@ -4218,6 +4358,7 @@ function fit!(
                 bufs=mstep_bufs,
                 cell_views=cell_views,
                 terminal_slds=slds,
+                update_chain=!warming,
             )
         end
 
@@ -4244,6 +4385,43 @@ function fit!(
     return _fit_result(monitor, elbos, target)
 end
 
+"""
+    _slds_warmup_logL(warmup_logL, discrete_warmup, K, total_T, T) -> Matrix or nothing
+
+Validate `fit!`'s discrete warm-up arguments and return the evidence as a
+`Matrix{T}`, or `nothing` when there is no warm-up.
+
+`warmup_logL` without a positive `discrete_warmup` is refused rather than
+ignored: an evidence matrix the caller built and the fit then never read is far
+more likely a forgotten keyword than an intention.
+"""
+function _slds_warmup_logL(
+    warmup_logL, discrete_warmup::Int, K::Int, total_T::Int, ::Type{T}
+) where {T<:Real}
+    discrete_warmup >= 0 ||
+        throw(ArgumentError("discrete_warmup must be ≥ 0, got $discrete_warmup"))
+    if discrete_warmup == 0
+        warmup_logL === nothing && return nothing
+        throw(
+            ArgumentError(
+                "`warmup_logL` was given but `discrete_warmup = 0`, so it would never " *
+                "be read. Set `discrete_warmup` to the number of clamped EM iterations.",
+            ),
+        )
+    end
+    warmup_logL === nothing && throw(
+        ArgumentError(
+            "discrete_warmup = $discrete_warmup needs `warmup_logL`, the K × total_T " *
+            "per-bin log-likelihoods to clamp the discrete evidence to",
+        ),
+    )
+    size(warmup_logL) == (K, total_T) ||
+        throw(DimensionMismatchError("warmup_logL", (K, total_T), size(warmup_logL)))
+    all(isfinite, warmup_logL) ||
+        throw(ArgumentError("warmup_logL must be finite; it has non-finite entries"))
+    return Matrix{T}(warmup_logL)
+end
+
 # ============================================================================
 # Ancillary parameter dependencies (`depends_on`) for the SLDS.
 #
@@ -4262,6 +4440,11 @@ Smooth every trial once with uniform discrete weights `γ ≡ 1/K`, so the first
 discrete update has a continuous trajectory to score. `x_samples` receives the
 first posterior draw the Monte-Carlo E-step consumes; pass `nothing` for the
 deterministic path of [`smooth`](@ref), which scores the smoothed mean instead.
+
+`γ_init` (`K × sum(Tᵢ)`, trials laid out as in `dl.logL`) replaces the uniform
+weights: `fit!`'s discrete warm-up passes the chain posterior of its supplied
+evidence, so the first `q(x)` is already each state's own segment rather than an
+even blend of all of them.
 """
 function _slds_warmstart!(
     slds::SLDS{T},
@@ -4282,9 +4465,13 @@ function _slds_warmstart!(
     lognorm::Union{Nothing,AbstractVector}=nothing,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    γ_init::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
+    seq_ends = cumsum(tsteps)
     function w_of(trial)
-        return fill(one(T) / K, K, tsteps[trial])
+        γ_init === nothing && return fill(one(T) / K, K, tsteps[trial])
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        return view(γ_init, :, t1:t2)
     end
 
     # The warm start's draw is simply the first one off `rng`.
@@ -4350,15 +4537,22 @@ end
 
 One `SLDS` view per cell, sharing `A` and `πₖ` by reference (so the discrete
 M-step still updates the single shared chain) and holding each regime's
-per-cell parameter arrays.
+per-cell parameter arrays. The chain's Dirichlet priors are shared the same way,
+so the grouped discrete M-step can read them off any cell; the ELBO counts them
+once, not once per cell (see [`_grouped_slds_prior_logdensity`](@ref)).
 """
 function _slds_cell_sldss(
     slds::SLDS{T,S,O,TM,ISV}, grp::ParameterGrouping
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel,TM,ISV}
     K = length(slds.LDSs)
     return [
-        SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, [_cell_lds(slds.LDSs[k], grp, c) for k in 1:K])
-        for c in 1:(grp.ncells)
+        SLDS{T,S,O,TM,ISV}(
+            slds.A,
+            slds.πₖ,
+            [_cell_lds(slds.LDSs[k], grp, c) for k in 1:K],
+            slds.A_prior,
+            slds.πₖ_prior,
+        ) for c in 1:(grp.ncells)
     ]
 end
 
@@ -4484,7 +4678,8 @@ end
 Grouped SLDS E-step: `smoothing_iters` alternations of [`_vem_alternate!`](@ref)
 with the cell views in play, so each pass over the trials refreshes the regime
 constants once per cell. The forward-backward call stays global — the discrete
-chain is shared by all trials.
+chain is shared by all trials. `clamp_logL` is the discrete warm-up's supplied
+evidence, as for [`estep!`](@ref).
 """
 function _estep_grouped!(
     cell_slds::AbstractVector,
@@ -4508,6 +4703,7 @@ function _estep_grouped!(
     smoothing_iters::Int=1,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    clamp_logL::Union{Nothing,AbstractMatrix}=nothing,
 ) where {T<:Real}
     #=
     Cell 1 stands in for the parent only where `_vem_alternate!` needs a regime
@@ -4537,6 +4733,7 @@ function _estep_grouped!(
         noise_bufs=noise_bufs,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        clamp_logL=clamp_logL,
     )
     return unconverged
 end
@@ -4546,7 +4743,8 @@ end
 
 `log p(θ)` for a grouped SLDS: the terms of [`_slds_prior_logdensity`](@ref),
 counted once per distinct parameter version, across cells and — for a tied
-group, or the initial state — across regimes.
+group, or the initial state — across regimes. The chain is shared by every cell,
+so its Dirichlet terms are taken once, from the first cell's view of it.
 """
 function _grouped_slds_prior_logdensity(
     cell_slds::AbstractVector,
@@ -4556,7 +4754,8 @@ function _grouped_slds_prior_logdensity(
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
     unit_lds = [cell_slds[c].LDSs[k] for k in 1:K for c in 1:(grp.ncells)]
-    return _slds_units_prior_logdensity(unit_lds, grp.cell_slot, K, tied, T)
+    return _slds_units_prior_logdensity(unit_lds, grp.cell_slot, K, tied, T) +
+           _slds_chain_prior_logdensity(cell_slds[1])
 end
 
 """
@@ -4665,6 +4864,9 @@ over the cells of that variant (see
 emission — the stitched fit — has one state variant and one normalizer; one that
 splits the state parameters has one normalizer per variant. The emission stays
 per cell.
+
+`update_chain = false` leaves `A` / `πₖ` exactly as they are and updates everything
+else — `fit!`'s discrete warm-up.
 """
 function _mstep_grouped!(
     cell_slds::AbstractVector,
@@ -4684,6 +4886,7 @@ function _mstep_grouped!(
     bufs::Union{Nothing,GroupedSufBuffers{T},NamedTuple}=nothing,
     cell_views::Union{Nothing,Tuple{<:AbstractVector,<:AbstractVector}}=nothing,
     terminal_slds::Union{Nothing,SLDS}=nothing,
+    update_chain::Bool=true,
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
     ncells = grp.ncells
@@ -4701,8 +4904,19 @@ function _mstep_grouped!(
     else
         (nothing, nothing, nothing)
     end
-    probe_current = if probes === nothing
-        StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
+    # `update_chain = false`: the discrete warm-up, as on the ungrouped path.
+    probe_current = if !update_chain
+        false
+    elseif probes === nothing
+        # The cell views share the parent's chain priors by reference.
+        StatsAPI.fit!(
+            dl,
+            fb_storage,
+            obs_seq;
+            seq_ends=seq_ends,
+            A_prior=cell_slds[1].A_prior,
+            πₖ_prior=cell_slds[1].πₖ_prior,
+        )
         false
     else
         _slqr_chain_mstep!(terminal_slds, dl, fb_storage, obs_seq, seq_ends, probes, sources)

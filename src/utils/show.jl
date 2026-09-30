@@ -308,6 +308,22 @@ function Base.show(io::IO, slds::SLDS; gap="")
         println(io, gap, " A  = $(round.(slds.A, sigdigits=3))")
         println(io, gap, " πₖ = $(round.(slds.πₖ, sigdigits=3))")
     end
+    #= The chain priors, when set, in the same compact-or-shape form as the
+    chain itself; an unpenalised chain prints nothing, as before. =#
+    if slds.A_prior !== nothing
+        if K > 3
+            println(io, gap, " A_prior  = Dirichlet rows, size $(size(slds.A_prior))")
+        else
+            println(io, gap, " A_prior  = Dirichlet $(round.(slds.A_prior, sigdigits=3))")
+        end
+    end
+    if slds.πₖ_prior !== nothing
+        if K > 3
+            println(io, gap, " πₖ_prior = Dirichlet, length $(length(slds.πₖ_prior))")
+        else
+            println(io, gap, " πₖ_prior = Dirichlet $(round.(slds.πₖ_prior, sigdigits=3))")
+        end
+    end
 
     println(io, gap, " Linear Dynamical Systems:")
     println(io, gap, " -------------------------")

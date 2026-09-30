@@ -4098,3 +4098,335 @@ function test_SLDS_rng_modes()
     )
     return nothing
 end
+
+# ============================================================================
+# Discrete chain: Dirichlet prior on (A, πₖ) and the clamped-evidence warm-up
+# ============================================================================
+
+#=
+Two regimes that differ only in their emission offset, so the data pin down the
+segmentation, and a fitted model built from two *identical* copies of one LDS —
+the symmetric start the warm-up exists to break.
+=#
+function _chain_truth(; A=[0.9 0.1; 0.1 0.9])
+    ldss = [_make_gaussian_lds_dense(2, 3; seed=5) for _ in 1:2]
+    ldss[1].obs_model.d .= -3.0
+    ldss[2].obs_model.d .= 3.0
+    return SLDS(; A=copy(A), πₖ=[0.5, 0.5], LDSs=ldss)
+end
+
+function _chain_model()
+    lds = _make_gaussian_lds_dense(2, 3; seed=7)
+    return SLDS(; A=[0.8 0.2; 0.3 0.7], πₖ=[0.6, 0.4], LDSs=[lds, deepcopy(lds)])
+end
+
+# Per-bin evidence strongly favouring the simulated states, in `dl.logL` layout.
+function _chain_evidence(z; strength=5.0)
+    zs = reduce(vcat, z)
+    return [zs[t] == k ? 0.0 : -strength for k in 1:2, t in eachindex(zs)]
+end
+
+# The chain's own discrete layer and forward-backward storage over `tsteps`.
+function _chain_fb(A, πₖ, logL, tsteps)
+    seq_ends = cumsum(tsteps)
+    dl = StateSpaceDynamics.SLDSDiscreteLayer(A, πₖ, Matrix{Float64}(logL))
+    fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
+    total = last(seq_ends)
+    StateSpaceDynamics.HMMs.forward_backward!(
+        fb,
+        dl,
+        collect(1:total),
+        fill(nothing, total);
+        seq_ends=seq_ends,
+        transition_marginals=true,
+    )
+    return dl, fb, seq_ends
+end
+
+_logdir(p, α) = sum((α .- 1) .* log.(p))
+
+function test_SLDS_transition_prior_helper()
+    @testset "transition_prior + chain prior validation" begin
+        α = transition_prior(3; concentration=2.0, sticky=5.0)
+        @test α == fill(2.0, 3, 3) + 5.0 * I
+        @test transition_prior(2) == ones(2, 2)
+        @test_throws ArgumentError transition_prior(2; concentration=0.5)
+        @test_throws ArgumentError transition_prior(2; sticky=-1.0)
+
+        slds = _chain_model()
+        @test slds.A_prior === nothing && slds.πₖ_prior === nothing
+        # The pre-prior positional form still builds an unpenalised model.
+        positional = SLDS(slds.A, slds.πₖ, slds.LDSs)
+        @test positional.A_prior === nothing && positional.πₖ_prior === nothing
+        _, _, y = rand(MersenneTwister(1), _chain_truth(), fill(10, 2))
+
+        bad = deepcopy(slds)
+        bad.A_prior = [2.0 0.5; 1.0 1.0]   # below one: the mode is not the ratio
+        @test_throws ArgumentError fit!(bad, y; max_iter=1, progress=false)
+        bad.A_prior = ones(3, 3)
+        @test_throws StateSpaceDynamics.DimensionMismatchError validate_SLDS(bad)
+        bad.A_prior = nothing
+        bad.πₖ_prior = [1.0, NaN]
+        @test_throws ArgumentError smooth(bad, y)
+        bad.πₖ_prior = ones(3)
+        @test_throws StateSpaceDynamics.DimensionMismatchError validate_SLDS(bad)
+
+        shown = deepcopy(slds)
+        @test !occursin("A_prior", sprint(show, shown))
+        shown.A_prior = transition_prior(2; sticky=3.0)
+        shown.πₖ_prior = [2.0, 2.0]
+        @test occursin("A_prior", sprint(show, shown))
+        @test occursin("πₖ_prior", sprint(show, shown))
+    end
+    return nothing
+end
+
+"""The discrete M-step with a Dirichlet prior is the posterior mode: expected
+counts plus `α − 1`, normalised — and without one, the plain ratio."""
+function test_SLDS_chain_prior_map_closed_form()
+    @testset "chain prior: MAP closed form" begin
+        tsteps = [12, 9, 15]
+        total = sum(tsteps)
+        A0, π0 = [0.7 0.3; 0.4 0.6], [0.5, 0.5]
+        logL = 0.8 .* randn(StableRNG(3), 2, total)
+        α = [3.0 1.5; 2.0 6.0]
+        απ = [4.0, 1.0]
+
+        dl, fb, seq_ends = _chain_fb(copy(A0), copy(π0), logL, tsteps)
+        N, n = StateSpaceDynamics._slds_chain_counts(fb, seq_ends, 2, Float64)
+        fit!(dl, fb, collect(1:total); seq_ends=seq_ends, A_prior=α, πₖ_prior=απ)
+        @test dl.A ≈ (N .+ α .- 1) ./ sum(N .+ α .- 1; dims=2) rtol = 1e-12
+        @test dl.πₖ ≈ (n .+ απ .- 1) ./ sum(n .+ απ .- 1) rtol = 1e-12
+
+        dl, fb, seq_ends = _chain_fb(copy(A0), copy(π0), logL, tsteps)
+        fit!(dl, fb, collect(1:total); seq_ends=seq_ends)
+        @test dl.A ≈ N ./ sum(N; dims=2) rtol = 1e-12
+        @test dl.πₖ ≈ n ./ sum(n) rtol = 1e-12
+    end
+    return nothing
+end
+
+"""A flat prior (`α ≡ 1`) is no prior: the same chain, the same trace, bit for bit."""
+function test_SLDS_chain_prior_flat_is_identity(; rng=MersenneTwister(0xD1A1))
+    @testset "chain prior: α ≡ 1 changes nothing" begin
+        _, _, y = rand(rng, _chain_truth(), fill(20, 3))
+        plain = _chain_model()
+        flat = deepcopy(plain)
+        flat.A_prior = ones(2, 2)
+        flat.πₖ_prior = ones(2)
+        e_plain = fit!(plain, y; max_iter=4, progress=false, rng=MersenneTwister(5))
+        e_flat = fit!(flat, y; max_iter=4, progress=false, rng=MersenneTwister(5))
+        @test e_flat == e_plain
+        @test flat.A == plain.A
+        @test flat.πₖ == plain.πₖ
+        @test elbo(flat, y) == elbo(plain, y)
+    end
+    return nothing
+end
+
+"""The prior leaves the deterministic E-step alone, so at identical parameters the
+public ELBO moves by exactly the chain's log-prior — once, grouped or not."""
+function test_SLDS_chain_prior_elbo_term(; rng=MersenneTwister(0xD1A2))
+    @testset "chain prior: ELBO carries log Dir once" begin
+        _, _, y = rand(rng, _chain_truth(), fill(20, 4))
+        plain = _chain_model()
+        prior = deepcopy(plain)
+        prior.A_prior = transition_prior(2; concentration=2.0, sticky=5.0)
+        prior.πₖ_prior = [3.0, 1.5]
+        expected = _logdir(prior.A, prior.A_prior) + _logdir(prior.πₖ, prior.πₖ_prior)
+        @test expected < 0
+        a, b = smooth(plain, y), smooth(prior, y)
+        @test b.elbo - a.elbo ≈ expected rtol = 1e-8
+        # The prior belongs to no trial.
+        @test b.trial_elbo == a.trial_elbo
+
+        # Grouped: every cell shares the chain, and its prior counts once.
+        labels = [:s1, :s1, :s2, :s2]
+        for m in (plain, prior), lds in m.LDSs
+            lds.obs_model.depends_on = (C=labels, d=labels)
+        end
+        @test elbo(prior, y) - elbo(plain, y) ≈ expected rtol = 1e-8
+    end
+    return nothing
+end
+
+"""A strongly sticky prior lengthens the fitted dwell over the same data and seed."""
+function test_SLDS_chain_prior_sticky(; rng=MersenneTwister(0xD1A3))
+    @testset "chain prior: sticky prior raises the diagonal" begin
+        _, _, y = rand(rng, _chain_truth(; A=[0.5 0.5; 0.5 0.5]), fill(25, 3))
+        plain = _chain_model()
+        sticky = deepcopy(plain)
+        sticky.A_prior = transition_prior(2; concentration=2.0, sticky=200.0)
+        e_plain = fit!(plain, y; max_iter=5, progress=false, rng=MersenneTwister(9))
+        e_sticky = fit!(sticky, y; max_iter=5, progress=false, rng=MersenneTwister(9))
+        @test all(isfinite, e_sticky)
+        @test minimum(diag(sticky.A)) > maximum(diag(plain.A))
+        # `concentration > 1` keeps every transition reachable.
+        @test minimum(sticky.A) > 1e-3
+
+        # Poisson emissions take the same chain update.
+        pois = _distinct_poisson_slds(2, 2, 3)
+        _, _, yp = rand(rng, _distinct_poisson_slds(2, 2, 3), fill(20, 3))
+        pois.A_prior = transition_prior(2; concentration=3.0, sticky=50.0)
+        pois.πₖ_prior = [2.0, 2.0]
+        @test all(isfinite, fit!(pois, yp; max_iter=3, progress=false))
+        @test minimum(diag(pois.A)) > 0.5
+    end
+    return nothing
+end
+
+"""The clamped E-step's `q(z)` is the chain posterior of the supplied evidence, and
+the chain-frozen M-step moves everything but the chain."""
+function test_SLDS_warmup_estep_mstep(; rng=MersenneTwister(0xD1A4))
+    @testset "warm-up: clamped E-step, chain-frozen M-step" begin
+        tsteps = [20, 20]
+        z, _, y = rand(rng, _chain_truth(), tsteps)
+        slds = _chain_model()
+        evidence = _chain_evidence(z)
+        K, latent_dim, obs_dim = 2, 2, 3
+        seq_ends = cumsum(tsteps)
+        total = last(seq_ends)
+        obs_seq = collect(1:total)
+        control_seq = fill(nothing, total)
+
+        tfs = StateSpaceDynamics.initialize_FilterSmooth(slds.LDSs[1], tsteps)
+        dl = StateSpaceDynamics.SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(K, total))
+        fb = StateSpaceDynamics._make_slds_fb_storage(dl, seq_ends)
+        slds_ws = StateSpaceDynamics.SLDSSmoothWorkspace(Float64, slds, maximum(tsteps))
+        sws = StateSpaceDynamics.SmoothWorkspace(
+            Float64, latent_dim, obs_dim, maximum(tsteps)
+        )
+        x_samples = [Array{Float64,3}(undef, latent_dim, T, 1) for T in tsteps]
+        for trial in eachindex(tsteps)
+            StateSpaceDynamics.smooth!(
+                slds,
+                tfs[trial],
+                y[trial],
+                fill(0.5, K, tsteps[trial]);
+                ws=slds_ws,
+                x_sample=x_samples[trial],
+                rng=rng,
+            )
+        end
+        StateSpaceDynamics.estep!(
+            slds,
+            tfs,
+            fb,
+            dl,
+            y,
+            x_samples,
+            slds_ws;
+            rng=rng,
+            obs_seq=obs_seq,
+            control_seq=control_seq,
+            seq_ends=seq_ends,
+            smoothing_iters=3,
+            clamp_logL=evidence,
+        )
+        _, ref, _ = _chain_fb(copy(slds.A), copy(slds.πₖ), evidence, tsteps)
+        @test fb.γ ≈ ref.γ rtol = 1e-12
+        @test dl.logL == evidence
+
+        A0, π0 = copy(slds.A), copy(slds.πₖ)
+        d0 = copy(slds.LDSs[1].obs_model.d)
+        StateSpaceDynamics.mstep!(
+            slds,
+            tfs,
+            fb,
+            dl,
+            y,
+            sws;
+            obs_seq=obs_seq,
+            seq_ends=seq_ends,
+            update_chain=false,
+        )
+        @test slds.A == A0 && slds.πₖ == π0
+        @test slds.LDSs[1].obs_model.d != d0
+        # Under that evidence each state's emission is fitted to its own segment.
+        @test slds.LDSs[1].obs_model.d[1] < 0 < slds.LDSs[2].obs_model.d[1]
+    end
+    return nothing
+end
+
+function test_SLDS_warmup_fit(; rng=MersenneTwister(0xD1A5))
+    @testset "warm-up: fit!" begin
+        tsteps = fill(20, 4)
+        z, _, y = rand(rng, _chain_truth(), tsteps)
+        evidence = _chain_evidence(z)
+
+        # `discrete_warmup = 0` is the ordinary fit, bit for bit.
+        a, b = _chain_model(), _chain_model()
+        e_a = fit!(a, y; max_iter=3, progress=false, rng=MersenneTwister(2))
+        e_b = fit!(
+            b, y; max_iter=3, progress=false, rng=MersenneTwister(2), discrete_warmup=0
+        )
+        @test e_a == e_b && a.A == b.A && a.πₖ == b.πₖ
+
+        #=
+        All warm-up: the chain is left exactly as set, and the symmetric start is
+        broken by the evidence, not by the model's own discrete scores.
+        =#
+        m = _chain_model()
+        A0, π0 = copy(m.A), copy(m.πₖ)
+        els = fit!(
+            m,
+            y;
+            max_iter=4,
+            progress=false,
+            rng=MersenneTwister(2),
+            discrete_warmup=4,
+            warmup_logL=evidence,
+        )
+        @test all(isfinite, els)
+        @test m.A == A0 && m.πₖ == π0
+        @test m.LDSs[1].obs_model.d[1] < -1 && m.LDSs[2].obs_model.d[1] > 1
+        # Longer than the fit is fine: the whole fit is a warm-up.
+        m2 = _chain_model()
+        fit!(m2, y; max_iter=2, progress=false, discrete_warmup=10, warmup_logL=evidence)
+        @test m2.A == A0
+
+        # After the warm-up the chain is fitted as usual.
+        m3 = _chain_model()
+        fit!(m3, y; max_iter=3, progress=false, discrete_warmup=2, warmup_logL=evidence)
+        @test m3.A != A0
+
+        # Grouped (`depends_on`) path.
+        labels = [:s1, :s1, :s2, :s2]
+        g = _chain_model()
+        for lds in g.LDSs
+            lds.obs_model.depends_on = (C=labels, d=labels)
+        end
+        g.A_prior = transition_prior(2; concentration=2.0)
+        els_g = fit!(
+            g, y; max_iter=2, progress=false, discrete_warmup=2, warmup_logL=evidence
+        )
+        @test all(isfinite, els_g)
+        @test g.A == A0 && g.πₖ == π0
+        fit!(g, y; max_iter=1, progress=false)
+        @test g.A != A0
+
+        # Validation.
+        v = _chain_model()
+        @test_throws ArgumentError fit!(
+            v, y; max_iter=1, progress=false, discrete_warmup=-1
+        )
+        @test_throws ArgumentError fit!(v, y; max_iter=1, progress=false, discrete_warmup=1)
+        @test_throws StateSpaceDynamics.DimensionMismatchError fit!(
+            v,
+            y;
+            max_iter=1,
+            progress=false,
+            discrete_warmup=1,
+            warmup_logL=evidence[:, 1:(end - 1)],
+        )
+        nan = copy(evidence)
+        nan[2, 3] = NaN
+        @test_throws ArgumentError fit!(
+            v, y; max_iter=1, progress=false, discrete_warmup=1, warmup_logL=nan
+        )
+        @test_throws ArgumentError fit!(
+            v, y; max_iter=1, progress=false, warmup_logL=evidence
+        )
+    end
+    return nothing
+end

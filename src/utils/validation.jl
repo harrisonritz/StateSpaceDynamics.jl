@@ -495,12 +495,15 @@ Validate SLDS structure. Throws descriptive exceptions on validation failure.
 # Checks performed
 - Dimensions of A match the length of πₖ and the number of LDSs
 - Rows of A and πₖ are valid probability vectors
+- `A_prior` / `πₖ_prior`, when set, are `K × K` / length `K` with every
+  concentration finite and `≥ 1`
 - Each LDS has the same state dimension and observation dimension
 - Each individual LDS is valid
 
 # Throws
 - `DimensionMismatchError`: If dimensions are inconsistent
 - `InvalidProbabilityVectorError`: If probability vectors are invalid
+- `ArgumentError`: If a chain prior has a concentration below one (or non-finite)
 - Other exceptions from `validate_LDS` for individual LDS validation
 
 # Examples
@@ -589,7 +592,51 @@ function _validate_slds_structure(slds::SLDS)
     end
 
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
+    _validate_slds_chain_prior(slds)
     return nothing
+end
+
+"""
+    _validate_slds_chain_prior(slds)
+
+The Dirichlet concentrations on the discrete chain, when set: `A_prior` is
+`K × K` and `πₖ_prior` has length `K`, and every entry is finite and `≥ 1`.
+
+The bound is what makes the M-step a closed form. With every `α ≥ 1` the
+pseudo-counts `α − 1` are non-negative, so `(N + α − 1) / rowsum` is the mode
+of the Dirichlet posterior and lies in the simplex. Below one the density is
+unbounded at the boundary, the mode is a vertex rather than that ratio, and the
+"update" would go negative wherever the expected counts are smaller than
+`1 − α`.
+"""
+function _validate_slds_chain_prior(slds::SLDS)
+    K = size(slds.A, 1)
+    if slds.A_prior !== nothing
+        size(slds.A_prior) == (K, K) ||
+            throw(DimensionMismatchError("A_prior", (K, K), size(slds.A_prior)))
+        _check_dirichlet_concentration(slds.A_prior, "A_prior")
+    end
+    if slds.πₖ_prior !== nothing
+        length(slds.πₖ_prior) == K ||
+            throw(DimensionMismatchError("length(πₖ_prior)", K, length(slds.πₖ_prior)))
+        _check_dirichlet_concentration(slds.πₖ_prior, "πₖ_prior")
+    end
+    return nothing
+end
+
+function _check_dirichlet_concentration(α::AbstractArray, name::String)
+    bad = findfirst(a -> !(isfinite(a) && a >= one(a)), α)
+    bad === nothing && return nothing
+    throw(
+        ArgumentError(
+            "$name: every Dirichlet concentration must be finite and ≥ 1, got " *
+            "$(α[bad]) at index $(Tuple(bad)). The MAP update adds `α − 1` " *
+            "pseudo-counts to the expected counts, which is the posterior mode only " *
+            "when those are non-negative (the mode is then interior, or on the " *
+            "boundary only where α = 1 and no transitions were seen). Use α = 1 for " *
+            "a flat entry.",
+        ),
+    )
 end
 
 """

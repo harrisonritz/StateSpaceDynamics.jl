@@ -106,6 +106,10 @@ MNPrior
 x0_mean_prior
 ```
 
+```@docs
+transition_prior
+```
+
 ## Ancillary parameter dependencies
 
 ```@docs

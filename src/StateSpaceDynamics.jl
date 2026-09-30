@@ -93,7 +93,7 @@ export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export SplineGaussianObservationModel
 export CompositeObservationModel
-export IWPrior, MNPrior, x0_mean_prior
+export IWPrior, MNPrior, x0_mean_prior, transition_prior
 
 # Monotonic rational-quadratic splines (the normalizing-flow layer of a
 # `SplineGaussianObservationModel`; usable on their own).
