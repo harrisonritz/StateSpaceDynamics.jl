@@ -665,8 +665,16 @@ struct _LQRExactNormalizer{P}
     probes::P
 end
 
+#=
+`probes[i]` stands in for the M-step units `units[i]` — the inverse-LQR discrete
+states of one state variant, in regime order. Without a `depends_on` split of
+the state parameters there is one probe and its units are the `K` states; with
+one there is a probe per variant, and the units are that variant's `(regime,
+variant)` pairs.
+=#
 struct _SLQRNormalizer{P}
-    probe::P
+    probes::Vector{P}
+    units::Vector{Vector{Int}}
 end
 
 """Whether the probe's own expected log-density stands in for `log Z`'s value.

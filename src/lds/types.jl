@@ -992,6 +992,18 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
 - `A::TM`: Transition matrix for the discrete states (K x K)
 - `πₖ::ISV`: Initial state distribution for the discrete states (K-dimensional vector)
 - `LDSs::Vector{LinearDynamicalSystem{T,S,O}}`: Vector of K Linear Dynamical Systems, one for each discrete state
+- `A_prior::Union{Nothing,Matrix{T}}`: optional `K × K` Dirichlet concentration on the
+  transition matrix, row `i` of `A` ~ `Dir(A_prior[i, :])`. `nothing` (the default)
+  fits `A` by maximum likelihood.
+- `πₖ_prior::Union{Nothing,Vector{T}}`: optional length-`K` Dirichlet concentration on
+  the initial distribution, `πₖ ~ Dir(πₖ_prior)`.
+
+With a chain prior the discrete M-step is the MAP update — expected counts plus
+`α − 1` pseudo-counts, normalised — and the reported ELBO carries the matching
+log-prior, as it does for the IW / MN priors on the continuous parameters. Every
+concentration must be `≥ 1`: that keeps the mode in the closed simplex, where the
+pseudo-count update is its maximiser. See [`transition_prior`](@ref) for the usual
+"flat plus sticky" choice.
 """
 @kwdef mutable struct SLDS{
     T<:Real,
@@ -1003,6 +1015,25 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
     A::TM
     πₖ::ISV
     LDSs::Vector{LinearDynamicalSystem{T,S,O}}
+    A_prior::Union{Nothing,Matrix{T}} = nothing
+    πₖ_prior::Union{Nothing,Vector{T}} = nothing
+end
+
+#=
+The three-field positional forms, from before the chain priors existed. Kept
+because internal views (`_slds_cell_sldss`) and callers build an `SLDS`
+positionally; both leave the chain unpenalised.
+=#
+function SLDS(
+    A::TM, πₖ::ISV, LDSs::Vector{LinearDynamicalSystem{T,S,O}}
+) where {T<:Real,S,O,TM<:AbstractMatrix{T},ISV<:AbstractVector{T}}
+    return SLDS(A, πₖ, LDSs, nothing, nothing)
+end
+
+function SLDS{T,S,O,TM,ISV}(
+    A, πₖ, LDSs
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel,TM,ISV}
+    return SLDS{T,S,O,TM,ISV}(A, πₖ, LDSs, nothing, nothing)
 end
 
 function _trial_initial_model(

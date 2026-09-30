@@ -18,6 +18,13 @@ score carries are removed by the subtraction whether or not either term is
 tight — but it is no longer a quantity anyone should call a likelihood. Both
 halves are therefore reported separately: see `terminal_logz` and the
 `terminal_logz` field `smooth` returns.
+
+`log p(terminal = 0 | θ)` factorizes over trials given the chain, and reads only
+the state side. So a `depends_on` grouping that splits the state parameters — a
+cost per reward level — gives one probe per state variant, over that variant's
+trials, and `log Ẑ` is their sum: the variants' state M-steps each read their own
+probe, and the shared chain's reads them all. A grouping of the emission alone
+(the stitched fit) leaves the one probe the parent model has always had.
 =============================================================================#
 
 #=
@@ -65,40 +72,116 @@ end
 
 _slds_condition_terminal(::Nothing) = false
 
-"""
-    _slds_check_grouped_conditioning(slds, grp)
-
-Refuse terminal conditioning under a `depends_on` grouping that splits the state
-parameters, and allow it under one that does not.
-
-`log p(terminal = 0 | θ)` is a property of the dynamics, the chain, the inputs and
-the horizon — never of the emission. So when only the emission varies by cell (the
-stitched fit: one readout per session, one set of control problems), every cell
-shares one normalizer, and the probe built from the parent model — whose state
-arrays every cell's variant shares, since slot 1 of a parameter is the parent's
-own array — is the right one. A grouping that gives cells their own state
-parameters gives them their own normalizers too, one probe each, which is not
-built. That refusal happens here, before any work, rather than the fit quietly
-reporting the joint score.
-"""
-function _slds_check_grouped_conditioning(slds::SLDS, grp)
-    grp === nothing && return nothing
-    _slds_condition_terminal(slds) || return nothing
-    _slds_state_shared(grp) && return nothing
-    throw(
-        ArgumentError(
-            "terminal conditioning is not implemented for a switching fit whose " *
-            "`depends_on` grouping splits the state parameters: each group of trials " *
-            "then has its own dynamics and so its own normalizer. Group only the " *
-            "emission (the stitched fit), or set `condition_terminal=false` on every " *
-            "inverse-LQR discrete state to fit the joint objective instead.",
-        ),
-    )
-end
-
 """Whether every cell of `grp` uses the parent's state parameters — the one
 state variant — so that only the emission varies across cells."""
 _slds_state_shared(grp) = all(==(1), grp.cell_state)
+
+"""
+    _slds_trial_variants(grp) -> Vector{Int} or nothing
+
+Each trial's state-parameter variant under a `depends_on` grouping, or `nothing`
+when every trial reads the parent's state parameters.
+
+`log p(terminal = 0 | θ)` is a property of the dynamics, the chain, the inputs and
+the horizon — never of the emission — and it factorizes over trials. So the
+partition it needs is the state side's alone: a grouping that splits only the
+emission (the stitched fit) leaves one normalizer, the parent model's, and one
+that splits the state parameters (a cost per reward level, say) gives each state
+variant its own, over its own trials. The chain is shared by every variant, which
+is what couples them in the discrete M-step.
+"""
+function _slds_trial_variants(grp)
+    grp === nothing && return nothing
+    _slds_state_shared(grp) && return nothing
+    return [grp.cell_state[grp.trial_cell[n]] for n in eachindex(grp.trial_cell)]
+end
+
+"""
+    _slds_variant_view(slds, v) -> SLDS
+
+The switching model as state variant `v` sees it: every regime's state model
+replaced by its `v`-th `depends_on` variant, the chain shared **by reference**.
+
+Parameters the declaration did not split are shared by reference across the
+variants too, so a view is a window onto the live model rather than a copy of it:
+writing a variant's cost through the view writes the model's, and a chain update
+on the parent is already the view's. The emission is the parent's template and is
+never read — the normalizer does not depend on it.
+"""
+function _slds_variant_view(
+    slds::SLDS{T,S,O,TM,ISV}, v::Int
+) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel,TM,ISV}
+    ldss = map(slds.LDSs) do lds
+        sm = (lds.state_model.variants::Vector{S})[v]
+        LinearDynamicalSystem{T,S,O}(
+            sm,
+            lds.obs_model,
+            lds.latent_dim,
+            _obs_dim(lds.obs_model),
+            lds.ux_dim,
+            lds.uy_dim,
+            lds.fit_bool,
+        )
+    end
+    return SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, ldss)
+end
+
+"""
+    _state_trial_variants(sm, ntrials; depends_on) -> Vector{Int} or nothing
+
+Each of `ntrials` trials' state variant for a state model that declares
+`depends_on`, read from the labels stored on the model — the fitted trials — or
+from `depends_on`, which relabels another set of trials (a held-out one) into
+the groups the model already has. `nothing` when the state side is not grouped.
+
+Only the state model's groups are read, so an override may carry the emission's
+labels too (a stitched fit's session per trial) and they are ignored here: the
+normalizer does not depend on the emission.
+"""
+function _state_trial_variants(
+    sm::AbstractStateModel, ntrials::Int; depends_on::Union{Nothing,NamedTuple}=nothing
+)
+    sm isa DependentModel || return nothing
+    dep = _resolve_dependence(sm)
+    _any_varies(dep) || return nothing
+    _build_variants!(sm, dep)
+    labels = [_trial_labels_for(dep, g, sm, depends_on) for g in eachindex(dep.names)]
+    for g in eachindex(dep.names)
+        dep.varies[g] || continue
+        length(labels[g]) == ntrials || throw(
+            DimensionMismatchError(
+                "depends_on labels for :$(dep.names[g])", ntrials, length(labels[g])
+            ),
+        )
+    end
+    slots = ones(Int, length(dep.names))
+    return map(1:ntrials) do n
+        for g in eachindex(dep.names)
+            slots[g] = _slot_of(dep, g, dep.varies[g] ? labels[g][n] : nothing)
+        end
+        _variant_index(dep.nslots, slots)
+    end
+end
+
+"""The switching counterpart of [`_state_trial_variants`](@ref): every regime
+declares the same grouping, and every regime's variants are built, since the
+probe for a variant reads all of them."""
+function _slds_state_trial_variants(
+    slds::SLDS, ntrials::Int; depends_on::Union{Nothing,NamedTuple}=nothing
+)
+    variants = nothing
+    for lds in slds.LDSs
+        v = _state_trial_variants(lds.state_model, ntrials; depends_on=depends_on)
+        variants === nothing && (variants = v)
+        v == variants || throw(
+            ArgumentError(
+                "SLDS: every regime must declare the same state `depends_on` labels; " *
+                "the terminal normalizer is built per state variant, over all regimes.",
+            ),
+        )
+    end
+    return variants
+end
 
 """
     _SLQRProbe{T}
@@ -356,8 +439,80 @@ function _slqr_restart!(probe::_SLQRProbe)
     return probe
 end
 
+"""The normalizer backend for one probe standing in for every inverse-LQR state
+of its model, in discrete-state order — the ungrouped (or stitched) case."""
+function _SLQRNormalizer(probe::_SLQRProbe)
+    n = count(
+        lds -> lds.state_model isa LQRStateModel && !_is_free(lds.state_model),
+        probe.slds.LDSs,
+    )
+    return _SLQRNormalizer([probe], [collect(1:n)])
+end
+
 """
-    _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probe) -> Bool
+    _slqr_terminal_probes(slds, ux, variants; ux0, smoothing_iters) -> (probes, sources, trials)
+
+One probe per state variant: `probes[i]` mirrors the model `sources[i]` over the
+trials `trials[i]`, whose inputs are `ux[trials[i]]`.
+
+`variants === nothing` (no grouping, or one that splits only the emission) is the
+single probe the parent model has always had, over every trial. Otherwise each
+variant gets a probe of its own, built from [`_slds_variant_view`](@ref), since
+its trials are conditioned under its own control problems: `log Ẑ` is then the
+sum of the variants' bounds. The views share the parent's chain by reference, so
+a chain the M-step writes into the parent is the one every probe syncs.
+"""
+function _slqr_terminal_probes(
+    slds::SLDS{T},
+    ux::AbstractVector,
+    variants::Union{Nothing,AbstractVector{Int}};
+    ux0=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
+) where {T<:Real}
+    if variants === nothing
+        probe = _slqr_terminal_probe(slds, ux; ux0=ux0, smoothing_iters=smoothing_iters)
+        return [probe], [slds], [collect(eachindex(ux))]
+    end
+    ids = sort!(unique(variants))
+    trials = [findall(==(v), variants) for v in ids]
+    sources = [_slds_variant_view(slds, v) for v in ids]
+    #= `ux0` is one column per trial, so each variant's probe takes its own
+    trials' columns: the initial state, and with it `log Z`, moves with them. =#
+    probes = [
+        _slqr_terminal_probe(
+            src,
+            ux[tr];
+            ux0=ux0 === nothing ? nothing : ux0[:, tr],
+            smoothing_iters=smoothing_iters,
+        ) for (src, tr) in zip(sources, trials)
+    ]
+    return probes, sources, trials
+end
+
+"""
+    _slqr_probes_logz!(probes, sources; restart=true) -> T
+
+`log Ẑ` at the parameters `sources` hold now: each probe synced to its source,
+restarted (unless `restart = false`, for a probe built fresh), smoothed, and the
+bounds summed in probe order so the total does not depend on the thread count.
+
+Each probe owns its model copy, workspaces and stream, so the variants smooth
+concurrently; a probe's own passes run on one workspace and would otherwise leave
+the other threads idle.
+"""
+function _slqr_probes_logz!(
+    probes::AbstractVector{<:_SLQRProbe{T}}, sources::AbstractVector; restart::Bool=true
+) where {T<:Real}
+    tforeach(eachindex(probes, sources)) do i
+        _slqr_sync_probe!(probes[i], sources[i])
+        restart && _slqr_restart!(probes[i])
+        _slqr_probe_estep!(probes[i])
+    end
+    return sum(p.logz for p in probes)
+end
+
+"""
+    _slqr_chain_mstep!(slds, dl, fb_storage, obs_seq, seq_ends, probes, sources) -> Bool
 
 The discrete chain's update when the model conditions on its terminal factor.
 
@@ -383,8 +538,14 @@ no closed-form update. Two proposals instead, each kept only if `g` rises:
    logit by more than one and halves until `g` rises by an Armijo fraction of
    what the gradient promises.
 
-If neither improves `g` the chain stays put. Returns whether the probe is left
-smoothed at the chain `slds` now holds, so the state M-step can use it as is.
+With a `depends_on` grouping that splits the state parameters there is one probe
+per state variant ([`_slqr_terminal_probes`](@ref)) and one chain: `log Ẑ` is the
+sum of the variants' bounds, and `Ξ` the sum of their expected counts, each over
+its own trials. Nothing else changes — the chain is shared, so it is fitted
+against every variant's normalizer at once.
+
+If neither improves `g` the chain stays put. Returns whether the probes are left
+smoothed at the chain `slds` now holds, so the state M-step can use them as is.
 """
 function _slqr_chain_mstep!(
     slds::SLDS{T},
@@ -393,28 +554,60 @@ function _slqr_chain_mstep!(
     obs_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
     probe::_SLQRProbe{T};
+    kwargs...,
+) where {T<:Real}
+    return _slqr_chain_mstep!(
+        slds, dl, fb_storage, obs_seq, seq_ends, [probe], [slds]; kwargs...
+    )
+end
+
+function _slqr_chain_mstep!(
+    slds::SLDS{T},
+    dl::SLDSDiscreteLayer{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    obs_seq::AbstractVector,
+    seq_ends::AbstractVector{Int},
+    probes::AbstractVector{<:_SLQRProbe{T}},
+    sources::AbstractVector;
     max_halvings::Int=12,
 ) where {T<:Real}
     K = length(slds.LDSs)
     # Counts first: `fit!` below uses each trial's last ξ as scratch.
     N, n = _slds_chain_counts(fb_storage, seq_ends, K, T)
+    #=
+    A Dirichlet chain prior adds `Σ (α − 1) log A` to `g`, which is the same as
+    adding `α − 1` to the counts: `score!`, the ascent direction `c = N − Ξ` and
+    (through `fit!`'s own prior keywords) the Baum–Welch proposal all see it.
+    =#
+    slds.A_prior === nothing || (N .+= slds.A_prior .- one(T))
+    slds.πₖ_prior === nothing || (n .+= slds.πₖ_prior .- one(T))
     floor = T(1e-12)
     function score!(A, π)
         copyto!(slds.A, A)
         copyto!(slds.πₖ, π)
-        _slqr_sync_probe!(probe, slds)
-        _slqr_restart!(probe)
-        _slqr_probe_estep!(probe)
+        logz = _slqr_probes_logz!(probes, sources)
         chain = sum(N .* log.(A .+ floor)) + sum(n .* log.(π .+ floor))
-        return chain - probe.logz
+        return chain - logz
     end
 
     A0, π0 = copy(slds.A), copy(slds.πₖ)
     base = score!(A0, π0)
-    # The probe's own counts, weighted by how many trials share each design.
-    Ξ, ν = _slds_chain_counts(probe.fb, probe.seq_ends, K, T, probe.counts)
+    # The probes' own counts, weighted by how many trials share each design.
+    Ξ, ν = zeros(T, K, K), zeros(T, K)
+    for probe in probes
+        Ξp, νp = _slds_chain_counts(probe.fb, probe.seq_ends, K, T, probe.counts)
+        Ξ .+= Ξp
+        ν .+= νp
+    end
 
-    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)   # writes slds.A / πₖ
+    StatsAPI.fit!(                                               # writes slds.A / πₖ
+        dl,
+        fb_storage,
+        obs_seq;
+        seq_ends=seq_ends,
+        A_prior=slds.A_prior,
+        πₖ_prior=slds.πₖ_prior,
+    )
     A1, π1 = copy(slds.A), copy(slds.πₖ)
     if !(A0 == A1 && π0 == π1)
         gain = score!(A1, π1) - base
@@ -448,6 +641,119 @@ function _slqr_chain_mstep!(
     copyto!(slds.A, A0)
     copyto!(slds.πₖ, π0)
     return false
+end
+
+"""
+    _slds_lqr_variant_units(cell_slds, grp, K, tied) -> NamedTuple
+
+The M-step units of a grouped switching fit under terminal conditioning: one per
+`(regime, state variant)` pair, regime-major, with everything the conditional
+M-step needs to know about them.
+
+- `ldss[u]` writes through a representative cell's regime model, whose state
+  arrays are the variant's;
+- `cells[i]` are the cells of variant `i` — the ones whose statistics pool into
+  its units, since they differ only in their emission;
+- `slots` / `blockslots`: which copy of each group and structural block each unit
+  fits, the pair of its version across regimes (from `tied`) and across variants
+  (from the `depends_on` declaration, read off the arrays the variants share) —
+  the same bookkeeping the joint grouped step uses;
+- `units[i]`: variant `i`'s units in regime order, which its probe mirrors.
+
+Variants are listed as [`_slqr_terminal_probes`](@ref) lists them, sorted, so
+`units[i]` and the `i`-th probe are the same variant.
+"""
+function _slds_lqr_variant_units(
+    cell_slds::AbstractVector, grp::ParameterGrouping, K::Int, tied::AbstractVector{Symbol}
+)
+    ids = sort!(unique(grp.cell_state))
+    V = length(ids)
+    rep = [findfirst(==(v), grp.cell_state)::Int for v in ids]
+    cells = [findall(==(v), grp.cell_state) for v in ids]
+    ldss = [cell_slds[rep[i]].LDSs[k] for k in 1:K for i in 1:V]
+    sms = [lds.state_model for lds in ldss]
+
+    nunits = K * V
+    regime_of(u) = fldmod1(u, V)[1]
+    cell_of(u) = rep[fldmod1(u, V)[2]]
+    function pair(regime, group)
+        return _lqr_pair_slots(
+            [regime(u) for u in 1:nunits],
+            [grp.cell_slot[group][cell_of(u)] for u in 1:nunits],
+        )
+    end
+    block_slots = _lqr_block_slots(tied, K)
+    variant_shares = ntuple(b -> _lqr_shares_block(sms[1:V], b), _LQR_BLOCK_N)
+    blockslots = ntuple(
+        b -> _lqr_pair_slots(
+            [block_slots[b][regime_of(u)] for u in 1:nunits],
+            [variant_shares[b] ? 1 : grp.cell_slot[_G_AB][cell_of(u)] for u in 1:nunits],
+        ),
+        _LQR_BLOCK_N,
+    )
+    #= `x0` / `P0` are tied across regimes unconditionally, so only the
+    declaration can split them; the noise follows `tied` across regimes. =#
+    slots = [Int[] for _ in 1:_G_Q]
+    slots[_G_X0] = pair(_ -> 1, _G_X0)
+    slots[_G_P0] = pair(_ -> 1, _G_P0)
+    slots[_G_AB] = blockslots[_LQR_BLOCK_A]
+    slots[_G_Q] = pair(u -> (:noise in tied) ? 1 : regime_of(u), _G_Q)
+    units = [[(k - 1) * V + i for k in 1:K] for i in 1:V]
+    return (; ldss, cells, slots, blockslots, units)
+end
+
+"""
+    _slds_lqr_grouped_conditional_mstep!(cell_slds, unit_suf, grp, K, tied,
+                                         probes, sources, probes_current)
+
+The state half of a grouped switching M-step under terminal conditioning, over
+the `(regime, state variant)` units of [`_slds_lqr_variant_units`](@ref): each
+variant's statistics are pooled over its cells (see
+[`_pool_lqr_state_stats`](@ref)), and `probes[i]` supplies the Fisher term and
+`log Ẑ` for variant `i`'s units.
+
+A grouping that leaves the state side shared has one variant, and this is then
+exactly the ungrouped conditional M-step on the pooled statistics — which is
+what makes the stitched fit and the single-session one the same estimator.
+
+`probes_current` says the chain step left every probe smoothed at the current
+parameters; otherwise they are re-smoothed here first.
+"""
+function _slds_lqr_grouped_conditional_mstep!(
+    cell_slds::AbstractVector,
+    unit_suf::AbstractVector,
+    grp::ParameterGrouping,
+    K::Int,
+    tied::AbstractVector{Symbol},
+    probes::AbstractVector{<:_SLQRProbe},
+    sources::AbstractVector,
+    probes_current::Bool,
+)
+    (; ldss, cells, slots, blockslots, units) = _slds_lqr_variant_units(
+        cell_slds, grp, K, tied
+    )
+    length(probes) == length(units) || error(
+        "terminal probes ($(length(probes))) do not match state variants " *
+        "($(length(units)))",
+    )
+    sms = [lds.state_model for lds in ldss]
+    any(_is_free, sms) && throw(
+        ArgumentError(
+            "terminal conditioning is not implemented for a switching model that " *
+            "mixes `:free` and inverse-LQR discrete states: the shared initial " *
+            "state would be fitted from the inverse-LQR regimes alone. Use " *
+            "inverse-LQR states throughout, or set `condition_terminal=false`.",
+        ),
+    )
+    ncells = grp.ncells
+    pooled = [
+        _pool_lqr_state_stats([unit_suf[(k - 1) * ncells + c] for c in cells[i]]) for
+        k in 1:K for i in eachindex(cells)
+    ]
+    probes_current || _slqr_probes_logz!(probes, sources)
+    _lqr_conditional_mstep!(ldss, pooled, slots, blockslots, _SLQRNormalizer(probes, units))
+    foreach(refresh!, sms)
+    return nothing
 end
 
 """
@@ -489,11 +795,18 @@ the live parameters over, and keep the probe's nulled priors — the data side
 already carries those, and counting them on both sides would cancel them.
 =#
 function _terminal_probe_stats!(b::_SLQRNormalizer, sms)
-    sufs, psms = _slqr_copy_lqr_params!(b.probe, sms)
-    for (target, hs) in zip(psms, sufs)
-        _fill_mixed_blocks!(hs, target)
+    psufs = Vector{Any}(undef, length(sms))
+    psms = Vector{Any}(undef, length(sms))
+    for (probe, units) in zip(b.probes, b.units)
+        sufs, targets = _slqr_copy_lqr_params!(probe, sms[units])
+        for (u, hs, target) in zip(units, sufs, targets)
+            _fill_mixed_blocks!(hs, target)
+            psufs[u] = hs
+            psms[u] = target
+        end
     end
-    return (sufs, psms)
+    # Concretely typed again, which the M-step context's constructor dispatches on.
+    return ([hs for hs in psufs], [sm for sm in psms])
 end
 
 """
@@ -535,21 +848,27 @@ check asks for it. A chain the probe cannot factor at these parameters throws,
 and the caller's rejectable-error handling turns that into a rejected point.
 =#
 function _terminal_score_logz(b::_SLQRNormalizer, sms)
-    _slqr_copy_lqr_params!(b.probe, sms)
-    _slqr_restart!(b.probe)
-    _slqr_probe_estep!(b.probe)
-    return b.probe.logz
+    #= The variants smooth concurrently (each probe owns its storage and stream)
+    and are summed in probe order, so the total is the same on any thread count. =#
+    tforeach(eachindex(b.probes, b.units)) do i
+        _slqr_copy_lqr_params!(b.probes[i], sms[b.units[i]])
+        _slqr_restart!(b.probes[i])
+        _slqr_probe_estep!(b.probes[i])
+    end
+    return sum(p.logz for p in b.probes)
 end
 
-# The surrogate reads the probe's statistics and nothing else of its posterior.
-_terminal_save(b::_SLQRNormalizer) = deepcopy(b.probe.sufs)
+# The surrogate reads the probes' statistics and nothing else of their posteriors.
+_terminal_save(b::_SLQRNormalizer) = [deepcopy(p.sufs) for p in b.probes]
 function _terminal_restore!(b::_SLQRNormalizer, saved)
-    copyto!(b.probe.sufs, saved)
+    for (probe, sufs) in zip(b.probes, saved)
+        copyto!(probe.sufs, sufs)
+    end
     return nothing
 end
 
 """
-    terminal_logz(slds, y; ux, uy, smoothing_iters) -> T
+    terminal_logz(slds, y; ux, uy, depends_on, smoothing_iters) -> T
 
 The variational estimate of `log p(terminal = 0 | θ)` this model's score is
 divided by, as a number on its own.
@@ -558,6 +877,11 @@ Reported separately because it is an approximation: [`elbo`](@ref) returns the
 joint ELBO less this, and a difference of two bounds is not a bound. Comparing
 it across fits is how to tell whether a score gap is the data fitting better or
 the normalizer moving.
+
+A model whose `depends_on` splits the state parameters has one normalizer per
+state variant, each over its own trials, and this is their sum. `depends_on`
+relabels `y`'s trials into the model's existing groups when they are not the
+trials it was fitted to, exactly as it does for [`smooth`](@ref).
 """
 function terminal_logz(
     slds::SLDS{T},
@@ -565,20 +889,21 @@ function terminal_logz(
     ux0=nothing,
     ux=nothing,
     uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
     smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return zero(T)
     data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
-    probe = _slqr_terminal_probe(
-        slds, data.ux; ux0=data.ux0, smoothing_iters=smoothing_iters
+    variants = _slds_state_trial_variants(slds, length(data.tsteps); depends_on=depends_on)
+    return sum(
+        _slqr_trial_logz(
+            slds, data.ux, variants; ux0=data.ux0, smoothing_iters=smoothing_iters
+        ),
     )
-    _slqr_sync_probe!(probe, slds)
-    _slqr_probe_estep!(probe)
-    return probe.logz
 end
 
 """
-    terminal_normalizer(model, ux; smoothing_iters) -> Vector
+    terminal_normalizer(model, ux; depends_on, smoothing_iters) -> Vector
 
 Each trial's `log p(terminal = 0 | θ)` under `model`, **whether or not** the model
 conditions its score on it: the number that turns a joint score into the
@@ -602,8 +927,11 @@ a terminal factor.
 
 The normalizer is a property of the state side alone, so the emission — and any
 `depends_on` grouping of it, as in a stitched fit — does not enter. A model whose
-`depends_on` splits the *state* parameters has one normalizer per group and is
-refused.
+`depends_on` splits the *state* parameters (a cost per reward level, say) has one
+normalizer per state variant: each trial's value is its own variant's, from a
+probe over that variant's trials. The trials are read as the ones the model was
+fitted to, labelled by the `depends_on` stored on it; pass `depends_on` to label a
+different set (a held-out one) into the same groups.
 
 A `:free` discrete state carries no terminal factor, but the probe still smooths
 under its prior with no data to pin it, so an explosive free transition can make
@@ -613,42 +941,50 @@ function terminal_normalizer(
     slds::SLDS{T},
     ux::AbstractVector{<:AbstractMatrix};
     ux0=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
     smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     lqr = [lds.state_model for lds in slds.LDSs if lds.state_model isa LQRStateModel]
     any(sm -> sm.terminal, lqr) || return zeros(T, length(ux))
-    any(sm -> sm.depends_on !== nothing, lqr) && throw(
-        ArgumentError(
-            "terminal_normalizer: a state model declares `depends_on`, so each group " *
-            "of trials has its own dynamics and its own normalizer. Only a grouping " *
-            "of the emission is supported.",
-        ),
+    variants = _slds_state_trial_variants(slds, length(ux); depends_on=depends_on)
+    return _slqr_trial_logz(
+        slds,
+        [Matrix{T}(u) for u in ux],
+        variants;
+        ux0=ux0,
+        smoothing_iters=smoothing_iters,
     )
-    probe = _slqr_terminal_probe(
-        slds, [Matrix{T}(u) for u in ux]; ux0=ux0, smoothing_iters=smoothing_iters
-    )
-    _slqr_sync_probe!(probe, slds)
-    _slqr_probe_estep!(probe)
-    return [probe.per_design[i] for i in probe.design_of]
 end
 
 function terminal_normalizer(
-    lds::LinearDynamicalSystem{T,S}, ux::AbstractVector{<:AbstractMatrix}; ux0=nothing
+    lds::LinearDynamicalSystem{T,S},
+    ux::AbstractVector{<:AbstractMatrix};
+    ux0=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T}}
     sm = lds.state_model
     sm.terminal || return zeros(T, length(ux))
-    sm.depends_on === nothing || throw(
-        ArgumentError(
-            "terminal_normalizer: the state model declares `depends_on`, so each group " *
-            "of trials has its own dynamics and its own normalizer. Only a grouping " *
-            "of the emission is supported.",
-        ),
-    )
     inputs = [Matrix{T}(u) for u in ux]
     u0 = _normalize_ux0(ux0, sm, length(inputs))
-    _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
-    refresh!(sm)
-    return [_lqr_terminal_logz(sm, u, view(u0, :, i)) for (i, u) in enumerate(inputs)]
+    variants = _state_trial_variants(sm, length(inputs); depends_on=depends_on)
+    if variants === nothing
+        _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
+        refresh!(sm)
+        return [_lqr_terminal_logz(sm, u, view(u0, :, i)) for (i, u) in enumerate(inputs)]
+    end
+    #= Exact per trial, against the trial's own variant: the non-switching
+    normalizer factorizes over trials with nothing shared between them. =#
+    out = zeros(T, length(inputs))
+    for v in unique(variants)
+        vsm = (sm.variants::Vector{S})[v]
+        idx = findall(==(v), variants)
+        _lqr_lengths_ok(vsm, [size(inputs[n], 2) for n in idx])
+        refresh!(vsm)
+        for n in idx
+            out[n] = _lqr_terminal_logz(vsm, inputs[n], view(u0, :, n))
+        end
+    end
+    return out
 end
 
 """Canonical per-trial inputs, reconstructed from the horizons when a caller
@@ -661,22 +997,56 @@ function _slds_probe_inputs(ux, seq_ends, ::Type{T}) where {T}
 end
 
 """
-    _slds_terminal_trial_logz(slds, ux, seq_ends; smoothing_iters) -> Vector or nothing
+    _slds_terminal_trial_logz(slds, ux, seq_ends; variants, smoothing_iters) -> Vector or nothing
 
 Each trial's `log Z-hat`, or `nothing` when this model does not condition.
+
+`variants` is each trial's state variant ([`_slds_trial_variants`](@ref)), or
+`nothing` for one normalizer over every trial; a trial's value then comes from
+its own variant's probe.
 
 Built fresh rather than cached across iterations: the probe's cost scales with
 the number of distinct designs, not trials, and a task design repeated across a
 session collapses to one smoothed chain.
 """
 function _slds_terminal_trial_logz(
-    slds::SLDS{T}, ux, seq_ends; ux0=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T},
+    ux,
+    seq_ends;
+    ux0=nothing,
+    variants::Union{Nothing,AbstractVector{Int}}=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return nothing
-    probe = _slqr_terminal_probe(
-        slds, _slds_probe_inputs(ux, seq_ends, T); ux0=ux0, smoothing_iters=smoothing_iters
+    return _slqr_trial_logz(
+        slds,
+        _slds_probe_inputs(ux, seq_ends, T),
+        variants;
+        ux0=ux0,
+        smoothing_iters=smoothing_iters,
     )
-    _slqr_sync_probe!(probe, slds)
-    _slqr_probe_estep!(probe)
-    return [probe.per_design[i] for i in probe.design_of]
+end
+
+"""
+    _slqr_trial_logz(slds, inputs, variants; smoothing_iters) -> Vector
+
+Each trial's `log Z-hat` from freshly built probes, one per state variant (or one
+in all when `variants === nothing`), whether or not the model conditions on it.
+"""
+function _slqr_trial_logz(
+    slds::SLDS{T},
+    inputs::AbstractVector,
+    variants::Union{Nothing,AbstractVector{Int}};
+    ux0=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
+) where {T<:Real}
+    probes, sources, trials = _slqr_terminal_probes(
+        slds, inputs, variants; ux0=ux0, smoothing_iters=smoothing_iters
+    )
+    _slqr_probes_logz!(probes, sources; restart=false)
+    out = zeros(T, length(inputs))
+    for (probe, tr) in zip(probes, trials)
+        out[tr] .= view(probe.per_design, probe.design_of)
+    end
+    return out
 end
