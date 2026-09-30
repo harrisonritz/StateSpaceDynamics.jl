@@ -1691,6 +1691,60 @@ function test_slds_lqr_state_grouped_conditional()
 end
 
 """
+    test_slds_lqr_state_grouped_initial_inputs()
+
+Per-variant terminal normalizers with initial-state inputs. `ux0` is one column
+per trial and moves that trial's initial mean, and with it `log p(terminal = 0)`,
+so each state variant's probe has to see its own trials' columns: every trial's
+normalizer is the one a model holding its group's costs gives it at its own
+`ux0`, and differs from its group-mates' because their `ux0` differs.
+"""
+function test_slds_lqr_state_grouped_initial_inputs()
+    p, tsteps, ntrials = 4, 20, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    ux = [zeros(0, tsteps) for _ in 1:ntrials]
+    Qa = [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]
+    Qb = [[0.5 0.0; 0.0 0.3], [1.4 0.1; 0.1 1.1]]
+    labels = [:a, :b, :a, :b, :a, :b]
+    ia, ib = findall(==(:a), labels), findall(==(:b), labels)
+    u0 = vcat(ones(1, ntrials), reshape(collect(0.0:0.5:2.5), 1, :))
+    B0 = [0.0 0.3; 0.0 -0.2; 0.0 0.1; 0.0 0.05]
+    function with_b0(m)
+        for lds in m.LDSs
+            lds.state_model.B0 = copy(B0)
+            refresh!(lds.state_model)
+        end
+        return m
+    end
+    ma = with_b0(hslds_model(Qa; p=p, terminal=true))
+    mb = with_b0(hslds_model(Qb; p=p, terminal=true))
+    split = with_b0(hslds_model(Qa; p=p, terminal=true))
+    for lds_k in split.LDSs
+        lds_k.state_model.depends_on = (Qc=labels,)
+    end
+    variants = SSD._slds_state_trial_variants(split, ntrials)
+    for (k, lds_k) in enumerate(split.LDSs)
+        sm = lds_k.state_model.variants[variants[ib[1]]]
+        sm.Qc[1] .= Qb[k]
+        refresh!(sm)
+    end
+
+    z = terminal_normalizer(split, ux; ux0=u0)
+    @test z[ia] ≈ terminal_normalizer(ma, ux[ia]; ux0=u0[:, ia]) rtol = 1e-10
+    @test z[ib] ≈ terminal_normalizer(mb, ux[ib]; ux0=u0[:, ib]) rtol = 1e-10
+    # Same horizon, same costs, different `ux0`: different normalizers.
+    @test allunique(round.(z[ia]; digits=8))
+    @test terminal_logz(split, ys; ux0=u0) ≈ sum(z) rtol = 1e-10
+    @test smooth(split, ys; ux0=u0).terminal_logz ≈ sum(z) rtol = 1e-8
+
+    m = deepcopy(split)
+    els = _trace(fit!(m, ys; ux0=u0, max_iter=3, progress=false, rng=StableRNG(7)))
+    @test all(isfinite, els)
+    @test all(isfinite, m.LDSs[1].state_model.B0)
+    return nothing
+end
+
+"""
     test_slds_newton_convergence_reported()
 
 Each trial's Newton solve for `q(x)` is capped per alternation, and neither the
