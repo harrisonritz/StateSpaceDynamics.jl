@@ -1388,8 +1388,8 @@ state parameter identically: the emission is the only thing the grouped step fit
 per cell, and it is fitted after the state side, so the state updates see the same
 statistics — pooled over the cells on one side, aggregated at once on the other.
 
-A grouping that splits the *state* side has one normalizer per group, which is not
-built, and is refused before any work; the joint objective stays available.
+A grouping that splits the *state* side has one normalizer per state variant; see
+`test_slds_lqr_state_grouped_conditional`.
 """
 function test_slds_lqr_grouped_conditional()
     p, tsteps, ntrials = 4, 20, 6
@@ -1448,19 +1448,6 @@ function test_slds_lqr_grouped_conditional()
         end
     end
 
-    # A state-side grouping: one normalizer per group, refused up front.
-    split = hslds_model(Qcs; p=p, terminal=true)
-    for lds_k in split.LDSs
-        lds_k.state_model.depends_on = (Qc=labels,)
-    end
-    @test_throws ArgumentError fit!(split, ys; max_iter=2, progress=false, rng=StableRNG(7))
-    @test_throws ArgumentError smooth(split, ys)
-    for lds_k in split.LDSs
-        lds_k.state_model.condition_terminal = false
-    end
-    @test all(
-        isfinite, _trace(fit!(split, ys; max_iter=2, progress=false, rng=StableRNG(7)))
-    )
     return nothing
 end
 
@@ -1506,10 +1493,29 @@ function test_terminal_normalizer()
     end
     @test terminal_normalizer(stitched, ux) ≈ zs rtol = 1e-10
     @test smooth(stitched, ys).terminal_logz ≈ sum(zs) rtol = 1e-10
+    #= A state grouping whose variants still hold the same costs normalizes every
+    trial as before — per variant now, over that variant's trials. =#
     for lds_k in stitched.LDSs
         lds_k.state_model.depends_on = (Qc=labels,)
     end
-    @test_throws ArgumentError terminal_normalizer(stitched, ux)
+    @test terminal_normalizer(stitched, ux) ≈ zs rtol = 1e-10
+
+    #= The exact, non-switching normalizer with a state grouping: each trial
+    under its own variant's cost, and a held-out set relabelled into the same
+    groups. =#
+    split = hslds_state(Qc; p=p, terminal=true)
+    split.state_model.depends_on = (Qc=labels,)
+    variants = SSD._state_trial_variants(split.state_model, ntrials)
+    other = split.state_model.variants[variants[3]]
+    other.Qc[1] .= Qcs[2]
+    refresh!(other)
+    zsplit = terminal_normalizer(split, ux)
+    @test zsplit[1:2] ≈ terminal_normalizer(hslds_state(Qc; p=p, terminal=true), ux[1:2])
+    @test zsplit[3:4] ≈
+        terminal_normalizer(hslds_state(Qcs[2]; p=p, terminal=true), ux[3:4])
+    @test !(zsplit[1] ≈ zsplit[3])
+    @test terminal_normalizer(split, ux[[4, 1]]; depends_on=(Qc=labels[[4, 1]],)) ≈
+        zsplit[[4, 1]]
 
     @test terminal_normalizer(hslds_model(Qcs; p=p), ux) == zeros(ntrials)
 
@@ -1528,6 +1534,159 @@ function test_terminal_normalizer()
     mixed.LDSs[2].state_model.Mfree .*= 0.5
     SSD._slqr_sync_probe!(probe, mixed)
     @test probe.slds.LDSs[2].state_model.Mfree == mixed.LDSs[2].state_model.Mfree
+    return nothing
+end
+
+"""
+    test_slds_lqr_state_grouped_conditional()
+
+Terminal conditioning when `depends_on` splits the *state* parameters — a cost per
+group of trials, the reward-level fit. `log p(terminal = 0 | θ)` factorizes over
+trials given the chain and reads only the state side, so each group's trials are
+normalized under that group's own control problems, and `log Ẑ` is the sum over
+groups. The anchors:
+
+* each trial's normalizer, and its share of the conditional score, is exactly what
+  a model holding its group's costs gives it (the groups are interleaved, so a
+  variant/trial mix-up cannot hide behind trial order);
+* the multi-probe surrogate the M-step descends has the gradient of the
+  re-smoothed, per-variant score — the check that each `(regime, variant)` unit
+  reads its own probe;
+* the shared chain's step never lowers `g`, now with one probe per variant;
+* a fit runs on the conditional objective, improves it, keeps the groups' costs
+  apart and the undeclared pieces shared.
+"""
+function test_slds_lqr_state_grouped_conditional()
+    p, tsteps, ntrials = 4, 20, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    ux = [zeros(0, tsteps) for _ in 1:ntrials]
+    Qa = [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]
+    Qb = [[0.5 0.0; 0.0 0.3], [1.4 0.1; 0.1 1.1]]
+    labels = [:a, :b, :a, :b, :a, :b]
+    ia, ib = findall(==(:a), labels), findall(==(:b), labels)
+
+    ma = hslds_model(Qa; p=p, terminal=true)
+    mb = hslds_model(Qb; p=p, terminal=true)
+    function split_model()
+        m = hslds_model(Qa; p=p, terminal=true)
+        for lds_k in m.LDSs
+            lds_k.state_model.depends_on = (Qc=labels,)
+        end
+        variants = SSD._slds_state_trial_variants(m, ntrials)
+        for (k, lds_k) in enumerate(m.LDSs)
+            sm = lds_k.state_model.variants[variants[ib[1]]]
+            sm.Qc[1] .= Qb[k]
+            refresh!(sm)
+        end
+        return m, variants
+    end
+    split, variants = split_model()
+    va, vb = variants[ia[1]], variants[ib[1]]
+    @test va != vb
+    @test SSD._slds_condition_terminal(split)
+
+    # The normalizer, per trial: its own group's.
+    z = terminal_normalizer(split, ux)
+    @test z[ia] ≈ terminal_normalizer(ma, ux[ia]) rtol = 1e-10
+    @test z[ib] ≈ terminal_normalizer(mb, ux[ib]) rtol = 1e-10
+    @test !(z[ia[1]] ≈ z[ib[1]])
+    @test terminal_logz(split, ys) ≈ sum(z) rtol = 1e-10
+    held = [ib[2], ia[1]]
+    @test terminal_normalizer(split, ux[held]; depends_on=(Qc=labels[held],)) ≈ z[held] rtol =
+        1e-10
+
+    # The conditional score, per trial: what the group's own model scores it.
+    kw = (; smoothing_iters=200, tol=1e-12)
+    s = smooth(split, ys; kw...)
+    @test s.terminal_logz ≈ sum(z) rtol = 1e-10
+    @test s.trial_elbo[ia] ≈ smooth(ma, ys[ia]; kw...).trial_elbo rtol = 1e-7
+    @test s.trial_elbo[ib] ≈ smooth(mb, ys[ib]; kw...).trial_elbo rtol = 1e-7
+    @test elbo(split, ys) ≈ s.elbo rtol = 1e-8
+
+    # The M-step surrogate over (regime, variant) units, against the score.
+    grp = SSD._slds_parameter_grouping(split, ntrials)
+    cells = SSD._slds_cell_sldss(split, grp)
+    probes, sources, _ = SSD._slqr_terminal_probes(split, ux, SSD._slds_trial_variants(grp))
+    @test length(probes) == 2
+    SSD._slqr_probes_logz!(probes, sources)
+    for tied in (Symbol[], [:A, :S, :noise])
+        units = SSD._slds_lqr_variant_units(cells, grp, 2, tied)
+        @test length(units.ldss) == 4
+        # Units are regime-major; variant `i`'s units read variant `i`'s costs.
+        @test units.ldss[2].state_model.Qc[1] ≈ Qb[1]
+        @test units.ldss[3].state_model.Qc[1] ≈ Qa[2]
+        # The costs split by variant (and regime), the plant does not.
+        @test length(unique(units.blockslots[SSD._LQR_BLOCK_Q])) == 4
+        @test length(unique(units.blockslots[SSD._LQR_BLOCK_A])) == (:A in tied ? 1 : 2)
+        sufs = [first(lqr_estep_stats(lds, ys)) for lds in units.ldss]
+        problem = SSD._lqr_conditional_problem(
+            units.ldss,
+            sufs,
+            units.slots,
+            units.blockslots,
+            SSD._SLQRNormalizer(probes, units.units),
+        )
+        θ = copy(problem.theta)
+        ∇ = similar(θ)
+        @test isfinite(problem.evaluate!(∇, θ))
+        rng = StableRNG(5)
+        for _ in 1:3
+            d = normalize(randn(rng, length(θ)))
+            ε = 1e-5
+            fd = (problem.score!(θ .+ ε .* d) - problem.score!(θ .- ε .* d)) / (2ε)
+            @test fd ≈ dot(∇, d) rtol = 1e-6
+        end
+        problem.write!(θ)
+    end
+
+    # The shared chain's step, against every variant's normalizer.
+    HMMs = SSD.HMMs
+    data = SSD.Data(split.LDSs[1], ys)
+    seq_ends = cumsum(data.tsteps)
+    total = last(seq_ends)
+    for seed in 1:3
+        m, _ = split_model()
+        dl = SSD.SLDSDiscreteLayer(m.A, m.πₖ, 0.3 .* randn(StableRNG(seed), 2, total))
+        fb = SSD._make_slds_fb_storage(dl, seq_ends)
+        HMMs.forward_backward!(
+            fb,
+            dl,
+            collect(1:total),
+            fill(nothing, total);
+            seq_ends=seq_ends,
+            transition_marginals=true,
+        )
+        N, n = SSD._slds_chain_counts(fb, seq_ends, 2, Float64)
+        function g(x)
+            return sum(N .* log.(x.A .+ 1e-12)) + sum(n .* log.(x.πₖ .+ 1e-12)) -
+                   terminal_logz(x, ys)
+        end
+        before = g(m)
+        mg = SSD._slds_parameter_grouping(m, ntrials)
+        ps, srcs, _ = SSD._slqr_terminal_probes(m, data.ux, SSD._slds_trial_variants(mg))
+        current = SSD._slqr_chain_mstep!(m, dl, fb, collect(1:total), seq_ends, ps, srcs)
+        @test g(m) >= before - 1e-9
+        @test all(≈(1), sum(m.A; dims=2)) && sum(m.πₖ) ≈ 1
+        current && @test sum(p.logz for p in ps) ≈ terminal_logz(m, ys) rtol = 1e-10
+    end
+
+    # A fit on the conditional objective.
+    for tied in ([:A, :S], [:A, :S, :noise])
+        m, _ = split_model()
+        els = _trace(
+            fit!(m, ys; max_iter=6, progress=false, rng=StableRNG(7), tied_params=tied)
+        )
+        @test all(isfinite, els)
+        @test els[end] > els[1]
+        for lds_k in m.LDSs
+            a, b = lds_k.state_model.variants[va], lds_k.state_model.variants[vb]
+            @test !(a.Qc[1] ≈ b.Qc[1])
+            @test a.A === b.A && a.S === b.S && a.Σ === b.Σ
+            @test symplectic_defect(a) < 1e-10 && symplectic_defect(b) < 1e-10
+            @test minimum(eigvals(Symmetric(a.Σ))) > 1e-3
+        end
+        @test smooth(m, ys).terminal_logz ≈ sum(terminal_normalizer(m, ux)) rtol = 1e-8
+    end
     return nothing
 end
 

@@ -601,6 +601,7 @@ using SSDTest
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
             test_slds_lqr_grouped_conditional()
+            test_slds_lqr_state_grouped_conditional()
             test_terminal_normalizer()
             test_slds_newton_convergence_reported()
             test_slds_lqr_grouped_free_state_pools()

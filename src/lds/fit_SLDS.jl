@@ -1340,8 +1340,6 @@ function smooth(
 
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
-    # Before the alternation, which a refused grouping would otherwise pay for.
-    _slds_check_grouped_conditioning(slds, grp)
 
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
     dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
@@ -1453,11 +1451,12 @@ function smooth(
     Terminal conditioning, per trial so the vector stays the per-trial split of
     the returned total. A grouping that leaves the state side shared (the
     stitched fit) has one normalizer, the parent model's; one that splits the
-    state would need a probe per cell, which is not built, and is refused rather
-    than quietly reporting the joint score.
+    state gives each state variant its own, over its own trials.
     =#
     terminal_logz = zero(T)
-    logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends)
+    logz = _slds_terminal_trial_logz(
+        slds, ux_seq, seq_ends; variants=_slds_trial_variants(grp)
+    )
     if logz !== nothing
         trial_elbo = trial_elbo .- logz
         terminal_logz = sum(logz)
@@ -3728,11 +3727,13 @@ already splits the regression per group of trials — those throw rather than
 guess.
 
 Inverse-LQR regimes that condition on their terminal factor fit
-`log p(y | terminal = 0)` under `depends_on` too, as long as the grouping leaves
-the state parameters shared — the stitched fit, one emission per session and one
-set of control problems. The normalizer depends on the dynamics, the chain, the
-inputs and the horizon, never on the emission, so every cell shares it. A grouping
-that splits the state side is refused at entry.
+`log p(y | terminal = 0)` under `depends_on` too. The normalizer depends on the
+dynamics, the chain, the inputs and the horizon, never on the emission: a grouping
+that leaves the state parameters shared — the stitched fit, one emission per
+session and one set of control problems — has one normalizer, and one that splits
+them (`(Qc = reward,)`, a cost per reward level) has one per state variant, each
+over its own trials, coupled through the shared chain. See
+[`terminal_normalizer`](@ref).
 
 `newton_max_iter` / `newton_tol` (default 20 / `1e-6`) bound each trial's Newton
 solve for `q(x)` within one E-step alternation. The solve resumes from its last
@@ -3897,9 +3898,6 @@ function fit!(
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
     _validate_tied_params(slds.LDSs[1], tied, grp !== nothing)
-    #= Before any work: a grouping the terminal normalizer cannot follow would
-    otherwise run the whole fit and fail at the first score. =#
-    _slds_check_grouped_conditioning(slds, grp)
 
     # Continuous-state smoother storage (per-trial sized).
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
@@ -4569,9 +4567,10 @@ Grouped SLDS ELBO: each trial's contribution evaluated against its cell's
 parameters, plus one prior term per distinct parameter version.
 
 `terminal_slds` is the parent model. When it conditions on its terminal factor
-the total is `log p(y | terminal = 0)`, as on the ungrouped path; the grouping
-must leave the state side shared (see [`_slds_check_grouped_conditioning`](@ref)),
-so the parent's normalizer is every cell's.
+the total is `log p(y | terminal = 0)`, as on the ungrouped path: one normalizer
+when the grouping leaves the state side shared (the stitched fit), one per state
+variant, over that variant's trials, when it splits it (see
+[`_slds_trial_variants`](@ref)).
 """
 function _elbo_grouped!(
     cell_slds::AbstractVector,
@@ -4604,8 +4603,9 @@ function _elbo_grouped!(
     )
     total = sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
     if terminal_slds !== nothing
-        _slds_check_grouped_conditioning(terminal_slds, grp)
-        logz = _slds_terminal_trial_logz(terminal_slds, ux, seq_ends)
+        logz = _slds_terminal_trial_logz(
+            terminal_slds, ux, seq_ends; variants=_slds_trial_variants(grp)
+        )
         logz === nothing || (total -= sum(logz))
     end
     return total
@@ -4656,13 +4656,15 @@ Units are laid out regime-major, so the first unit of any version belongs to
 regime 1; the update writes there and the broadcasters restore the tie. `x0`/`P0`
 are tied across regimes unconditionally.
 
-`terminal_slds` is the parent model. When it conditions on its terminal factor —
-which a grouping may only do if it leaves the state side shared, the stitched fit
-— the discrete chain and the state side are fitted against `log Ẑ` exactly as on
+`terminal_slds` is the parent model. When it conditions on its terminal factor
+the discrete chain and the state side are fitted against `log Ẑ` exactly as on
 the ungrouped path: the chain by [`_slqr_chain_mstep!`](@ref), and the state by
-the conditional M-step on each regime's statistics pooled over the cells (see
-[`_pool_lqr_state_stats`](@ref)), which is what the ungrouped aggregator would
-have built from the same trials. The emission stays per cell.
+the conditional M-step on each `(regime, state variant)`'s statistics pooled
+over the cells of that variant (see
+[`_slds_lqr_grouped_conditional_mstep!`](@ref)). A grouping that splits only the
+emission — the stitched fit — has one state variant and one normalizer; one that
+splits the state parameters has one normalizer per variant. The emission stays
+per cell.
 """
 function _mstep_grouped!(
     cell_slds::AbstractVector,
@@ -4690,17 +4692,20 @@ function _mstep_grouped!(
     #=
     The discrete layer (`slds.A`, `slds.πₖ`, updated in place via `dl`). Under
     terminal conditioning the chain moves `log Ẑ` too, so the ordinary update is
-    only a proposal, as on the ungrouped path; the probe built for that check is
-    reused by the state M-step below.
+    only a proposal, as on the ungrouped path; the probes built for that check —
+    one per state variant — are reused by the state M-step below.
     =#
     conditioned = terminal_slds !== nothing && _slds_condition_terminal(terminal_slds)
-    conditioned && _slds_check_grouped_conditioning(terminal_slds, grp)
-    probe = conditioned ? _slqr_terminal_probe(terminal_slds, data.ux) : nothing
-    probe_current = if probe === nothing
+    probes, sources, _ = if conditioned
+        _slqr_terminal_probes(terminal_slds, data.ux, _slds_trial_variants(grp))
+    else
+        (nothing, nothing, nothing)
+    end
+    probe_current = if probes === nothing
         StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
         false
     else
-        _slqr_chain_mstep!(terminal_slds, dl, fb_storage, obs_seq, seq_ends, probe)
+        _slqr_chain_mstep!(terminal_slds, dl, fb_storage, obs_seq, seq_ends, probes, sources)
     end
 
     #=
@@ -4787,36 +4792,8 @@ function _mstep_grouped!(
     slots_cd = nothing
 
     if conditioned
-        #=
-        Every cell shares the state parameters, so the (regime, cell) units
-        collapse to one per regime: pool each regime's statistics over its cells
-        and hand them to the ungrouped conditional M-step, whose probe lines up
-        with the `K` discrete states. `cell_slds[1]`'s state models are the ones
-        every cell reads, sharing the parent's arrays, so writing through them
-        updates the whole model.
-        =#
-        pooled = [
-            _pool_lqr_state_stats([unit_suf[(k - 1) * ncells + c] for c in 1:ncells]) for
-            k in 1:K
-        ]
-        terminal_probe = if probe_current
-            probe
-        else
-            _slqr_sync_probe!(probe, terminal_slds)
-            _slqr_restart!(probe)
-            _slqr_probe_estep!(probe)
-        end
-        _slds_state_mstep!(
-            cell_slds[1].LDSs,
-            pooled,
-            tied,
-            collect(1:K),
-            sws,
-            _state_bufs(bf),
-            K,
-            D,
-            lds1.ux_dim;
-            terminal_probe=terminal_probe,
+        _slds_lqr_grouped_conditional_mstep!(
+            cell_slds, unit_suf, grp, K, tied, probes, sources, probe_current
         )
     else
         _grouped_slds_state_mstep!(
