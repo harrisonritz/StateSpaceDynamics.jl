@@ -1,5 +1,5 @@
 #=============================================================================
-Boundaries between an SLDS's discrete states: exit bridges.
+Boundaries between an SLDS's discrete states: exit bridges and entry priors.
 
 A switching model of a task with stages — control toward a target, hold there,
 control toward the next — has two things a plain SLDS does not say about the
@@ -12,6 +12,19 @@ moment the chain switches:
     bridged state applies the same factor wherever its segment ends: at every
     exit `s_t = k → s_{t+1} ≠ k`, and at the end of the trial if the trial ends
     in it (the ordinary terminal factor, unchanged).
+
+  * **Entry priors.** A control segment starts from a fresh plan. Without one,
+    entering state `j` carries the previous state's costate through `j`'s
+    adjoint equation, which says nothing about how a plan begins. With an
+    `EntryPrior`, the transition into the first bin of a `j` segment entered
+    from `i` is replaced by
+
+        λ_t ~ N(μ_j + K_j (x_{t-1} − r⁽ⁱ⁾_{t-1}), P_j),
+        x_t = A x_{t-1} − S λ_t + h_x + B_{u,x} u_{t-1} + ε_x,   ε_x ~ N(0, Σ_xx),
+
+    with `r⁽ⁱ⁾ = G_r⁽ⁱ⁾ u` the reference of the state being left. The plant row
+    is `j`'s own (its `A`, `S`, plant drift and plant noise), driven by the new
+    plan, so the neural state stays continuous; only the costate is re-drawn.
 
 The bridge is a factor on `(s_t, s_{t+1}, z_t)`. It enters the two halves of the
 variational E-step the way any such factor does:
@@ -29,16 +42,27 @@ The bridge reuses the state's terminal parameters (`Qc[k_f]`, `Σf`, `hf`,
 `Gref`), so the M-step needs no new parameters: exits simply add terminal
 statistics, weighted by their exit probability.
 
+An entry is a different transition density on `(s_{t-1}, s_t, z_{t-1}, z_t)`,
+and enters the same way: the discrete side sees
+`E_q[log p_entry(i→j) − log p_j]` as a potential on the `i → j` transition, and
+the continuous side swaps the ordinary transition for the entry one with weight
+`ξ_{t-1}(i, j)`. In the M-step the entry parameters are an exact weighted
+regression of `λ_t` on `[1; x_{t-1} − r⁽ⁱ⁾]`; entry bins leave `j`'s ordinary
+transition statistics; and their plant row — which shares `j`'s structure — is
+honoured by accepting the structural step only if it does not lower the
+complete-data objective with that row included (a generalized M-step).
+
 Generative semantics. With bridges the model is the joint over the chain, the
 latents and the bridge pseudo-observations, as the terminal factor is under
 `condition_terminal = false`; the reported score is `log p(y, bridges = 0)`.
 Conditioning on the bridges (dividing by their probability) needs a normalizer
-over the switching paths and is not implemented yet, so a model with bridges
-must score the joint objective.
+over the switching paths and is not implemented yet, so a model with bridges or
+entry priors must score the joint objective.
 =============================================================================#
 
 """
-    set_boundaries!(slds; bridge_states=Int[]) -> slds
+    set_boundaries!(slds; bridge_states=Int[], entry_states=Int[],
+                    entry_gain=true, entry_cov=1.0) -> slds
 
 Configure what happens at the switches between `slds`'s discrete states.
 
@@ -51,8 +75,18 @@ Configure what happens at the switches between `slds`'s discrete states.
   factor, with its cost `Qc[k_f]` (`terminal_regime`, else the last schedule
   entry), covariance `Σf`, offset `hf` and reference `Gref`.
 
-Bridges score the joint objective `log p(y, bridges = 0)`, so every bridged
-state needs `condition_terminal = false`.
+- `entry_states`: the states that start their segment from an
+  [`EntryPrior`](@ref) — a fresh plan — when the chain enters them from another
+  state: `λ_t ~ N(μ + K (x_{t-1} − r⁽ⁱ⁾_{t-1}), P)`, `r⁽ⁱ⁾` the reference of the
+  state being left (zero for one without a reference), while the plant moves
+  under the entered state's own dynamics driven by that plan. Each must be an
+  inverse-LQR control state (`mode = :lqr`). The prior starts at `μ = 0`,
+  `K = 0`, `P = entry_cov · I` and is fitted by EM; `entry_gain = false` keeps
+  `K` at zero, so only the costate's mean offset and spread are learned.
+
+Bridges and entry priors score the joint objective `log p(y, bridges = 0)`, so
+the model may not condition on its terminal factor (`condition_terminal = false`
+on every inverse-LQR state that has one).
 
 Passing no states clears the configuration. Returns `slds`.
 
@@ -60,28 +94,56 @@ Passing no states clears the configuration. Returns `slds`.
 ```julia
 # control → hold → control → hold, on a banded chain
 slds.A, slds.πₖ = banded_transition(4; stay=median_dwell_stay.([10, 25, 12]))
-set_boundaries!(slds; bridge_states=[1, 3])
+set_boundaries!(slds; bridge_states=[1, 3], entry_states=[3])
 ```
 """
 function set_boundaries!(
-    slds::SLDS{T}; bridge_states::AbstractVector{<:Integer}=Int[]
+    slds::SLDS{T};
+    bridge_states::AbstractVector{<:Integer}=Int[],
+    entry_states::AbstractVector{<:Integer}=Int[],
+    entry_gain::Bool=true,
+    entry_cov::Real=1.0,
 ) where {T<:Real}
     K = length(slds.LDSs)
     bridge = falses(K)
-    for k in bridge_states
-        1 <= k <= K ||
-            throw(ArgumentError("bridge_states names state $k; the model has $K states"))
-        bridge[k] = true
+    entry = falses(K)
+    for (name, states, mask) in
+        (("bridge_states", bridge_states, bridge), ("entry_states", entry_states, entry))
+        for k in states
+            1 <= k <= K ||
+                throw(ArgumentError("$name names state $k; the model has $K states"))
+            mask[k] = true
+        end
     end
-    if !any(bridge)
+    entry_cov > 0 || throw(ArgumentError("entry_cov must be positive, got $entry_cov"))
+    if !any(bridge) && !any(entry)
         slds.boundaries = nothing
         return slds
     end
-    slds.boundaries = SLDSBoundaries{T}(
-        collect(bridge), Union{Nothing,EntryPrior{T}}[nothing for _ in 1:K]
-    )
+    entries = Union{Nothing,EntryPrior{T}}[nothing for _ in 1:K]
+    for k in 1:K
+        entry[k] || continue
+        sm = slds.LDSs[k].state_model
+        (sm isa LQRStateModel && sm.mode === :lqr) || throw(
+            ArgumentError(
+                "entry_states includes state $k, which is not an inverse-LQR control " *
+                "state (`mode = :lqr`): an entry prior is a fresh plan's costate, " *
+                "and only a control state has a plan.",
+            ),
+        )
+        n = _plant_dim(sm)
+        entries[k] = EntryPrior{T}(
+            zeros(T, n), zeros(T, n, n), Matrix{T}(T(entry_cov) * I, n, n), entry_gain
+        )
+    end
+    slds.boundaries = SLDSBoundaries{T}(collect(bridge), entries)
     _validate_boundaries(slds)
     return slds
+end
+
+"""Whether `slds` carries any entry prior."""
+function _slds_has_entries(slds::SLDS)
+    return slds.boundaries !== nothing && any(!isnothing, slds.boundaries.entry)
 end
 
 """Whether `slds` carries any exit bridge."""
@@ -117,14 +179,31 @@ function _validate_boundaries(slds::SLDS)
                 "(cost `Qc[k_f]`, `Σf`, `hf`, `Gref`) at every exit from the state.",
             ),
         )
-        sm.condition_terminal && throw(
+    end
+    for k in 1:K
+        ep = b.entry[k]
+        ep === nothing && continue
+        sm = slds.LDSs[k].state_model
+        (sm isa LQRStateModel && sm.mode === :lqr) || throw(
             ArgumentError(
-                "bridge_states includes state $k, which conditions on its terminal " *
-                "factor. Exit bridges score the joint objective `log p(y, bridges = " *
-                "0)`; set `condition_terminal = false` on the bridged states.",
+                "state $k carries an entry prior but is not a `:lqr` control state"
             ),
         )
+        n = _plant_dim(sm)
+        (length(ep.μ) == n && size(ep.K) == (n, n) && size(ep.P) == (n, n)) || throw(
+            DimensionMismatchError("entry prior of state $k (plant dim)", n, length(ep.μ)),
+        )
+        isposdef(Symmetric(Matrix(ep.P))) || throw(
+            ArgumentError("the entry prior of state $k has a non-positive-definite P")
+        )
     end
+    _slds_condition_terminal(slds) && throw(
+        ArgumentError(
+            "exit bridges and entry priors score the joint objective `log p(y, " *
+            "bridges = 0)`, but this model conditions on its terminal factor. Set " *
+            "`condition_terminal = false` on its inverse-LQR states.",
+        ),
+    )
     return nothing
 end
 
@@ -141,6 +220,11 @@ function _slds_discrete_layer(slds::SLDS{T}, total_T::Int) where {T<:Real}
         dl.bridge = copy(slds.boundaries.bridge)
         dl.exit_logL = zeros(T, K, total_T)
         dl.exit_w = zeros(T, K, total_T)
+    end
+    if _slds_has_entries(slds)
+        dl.entry = [ep !== nothing for ep in slds.boundaries.entry]
+        dl.entry_logL = zeros(T, K, K, total_T)
+        dl.entry_w = zeros(T, K, K, total_T)
     end
     return dl
 end
@@ -364,4 +448,735 @@ function _slds_exit_potentials!(
         end
     end
     return out
+end
+
+# ============================================================================
+# Entry priors
+# ============================================================================
+
+"""
+    _state_reference!(out, sm, u) -> out
+
+The reference `r = G_r u` a state regulates toward, at inputs `u`; zero for a
+state without one (a `:free` or Gaussian state, or a model without inputs). An
+entry prior centres the new plan on the state's offset from the *previous*
+state's reference.
+"""
+_state_reference!(out::AbstractVector, ::AbstractStateModel, _) =
+    fill!(out, zero(eltype(out)))
+
+function _state_reference!(out::AbstractVector{T}, sm::LQRStateModel, u) where {T}
+    if u === nothing || _is_free(sm) || size(sm.Gref, 2) == 0
+        fill!(out, zero(T))
+    else
+        mul!(out, sm.Gref, u)
+    end
+    return out
+end
+
+"""
+    _EntryTerms{T}
+
+The pieces of state `j`'s entry density, factored once per pass: the plant row's
+`A`, `S`, drift and input block and its noise precision `Σ_xx⁻¹`, the prior's
+`μ`, `K` and precision `P⁻¹`, the constant, and the blocks of the (negative
+definite) Hessian on `(z_{t-1}, z_t)`, which do not depend on where the state is.
+"""
+struct _EntryTerms{T<:Real}
+    n::Int
+    A::Matrix{T}
+    S::Matrix{T}
+    hx::Vector{T}
+    Bux::Matrix{T}
+    μ::Vector{T}
+    K::Matrix{T}
+    Pinv::Matrix{T}
+    Sinv::Matrix{T}
+    c::T
+    H_prev::Matrix{T}   # ∂²/∂z_{t-1}² (2n × 2n), x block only
+    H_cur::Matrix{T}    # ∂²/∂z_t²     (2n × 2n)
+    H_sub::Matrix{T}    # ∂²/∂z_t ∂z_{t-1} (rows z_t, cols z_{t-1})
+end
+
+function _EntryTerms(sm::LQRStateModel{T}, ep::EntryPrior) where {T<:Real}
+    n = _plant_dim(sm)
+    d = 2n
+    xr, lr = 1:n, (n + 1):d
+    Pc = cholesky(Symmetric(Matrix{T}(ep.P)))
+    Sc = cholesky(Symmetric(Matrix{T}(sm.Σ[xr, xr])))
+    Pinv = Matrix(inv(Pc))
+    Sinv = Matrix(inv(Sc))
+    A = Matrix{T}(sm.A)
+    S = Matrix{T}(sm.S)
+    K = Matrix{T}(ep.K)
+    c = -T(n) * log(T(2π)) - T(0.5) * (logdet(Pc) + logdet(Sc))
+    H_prev = zeros(T, d, d)
+    H_prev[xr, xr] .= .-(transpose(K) * Pinv * K) .- (transpose(A) * Sinv * A)
+    H_cur = zeros(T, d, d)
+    H_cur[xr, xr] .= .-Sinv
+    H_cur[lr, lr] .= .-Pinv .- S * Sinv * S
+    H_cur[xr, lr] .= .-(Sinv * S)
+    H_cur[lr, xr] .= .-(S * Sinv)
+    H_sub = zeros(T, d, d)
+    H_sub[xr, xr] .= Sinv * A
+    H_sub[lr, xr] .= Pinv * K .+ S * Sinv * A
+    return _EntryTerms{T}(
+        n,
+        A,
+        S,
+        Vector{T}(sm.h[xr]),
+        Matrix{T}(sm.Bu[xr, :]),
+        Vector{T}(ep.μ),
+        K,
+        Pinv,
+        Sinv,
+        c,
+        H_prev,
+        H_cur,
+        H_sub,
+    )
+end
+
+"""
+    _entry_residuals!(r1, r2, et, x, t, ux, rref)
+
+The two residuals of the entry density at local step `t ≥ 2`:
+`r1 = λ_t − μ − K (x_{t-1} − r)` (the new plan against its prior) and
+`r2 = x_t − A x_{t-1} + S λ_t − h_x − B_{u,x} u_{t-1}` (the plant row).
+"""
+function _entry_residuals!(
+    r1::AbstractVector{T},
+    r2::AbstractVector{T},
+    et::_EntryTerms{T},
+    x::AbstractMatrix{T},
+    t::Int,
+    ux::Union{Nothing,AbstractMatrix},
+    rref::AbstractVector{T},
+) where {T<:Real}
+    n = et.n
+    xprev = view(x, 1:n, t - 1)
+    λt = view(x, (n + 1):(2n), t)
+    xt = view(x, 1:n, t)
+    r2 .= xprev .- rref
+    mul!(r1, et.K, r2)
+    r1 .= λt .- et.μ .- r1
+    mul!(r2, et.A, xprev)
+    r2 .= xt .- r2 .- et.hx
+    mul!(r2, et.S, λt, one(T), one(T))
+    if ux !== nothing && size(et.Bux, 2) > 0
+        mul!(r2, et.Bux, view(ux, :, t - 1), -one(T), one(T))
+    end
+    return nothing
+end
+
+function _entry_loglik(
+    et::_EntryTerms{T}, r1::AbstractVector{T}, r2::AbstractVector{T}
+) where {T<:Real}
+    return et.c - T(0.5) * (dot(r1, et.Pinv, r1) + dot(r2, et.Sinv, r2))
+end
+
+"""The ordinary forward transition's log-density into local step `t` (no terminal)."""
+function _ordinary_transition_loglik(
+    lds::LinearDynamicalSystem,
+    x::AbstractMatrix{T},
+    t::Int,
+    ux::Union{Nothing,AbstractMatrix},
+    tmp::AbstractVector{T},
+) where {T<:Real}
+    c = lds.state_model.cache
+    _transition_residual!(tmp, lds, x, t, ux)
+    _whiten!(c.Qfwd.chol, tmp)
+    return T(c.cQ) - T(0.5) * sum(abs2, tmp)
+end
+
+"""
+    _slds_entry_weights!(entry_w, fb_storage, seq_ends, entry) -> entry_w
+
+`entry_w[i, j, t] = q(s_{t-1} = i, s_t = j)` for every entry-prior state `j`, every
+`i ≠ j` and every step with a predecessor in its trial; zero elsewhere.
+"""
+function _slds_entry_weights!(
+    entry_w::AbstractArray{T,3},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    seq_ends::AbstractVector{Int},
+    entry::AbstractVector{Bool},
+) where {T<:Real}
+    fill!(entry_w, zero(T))
+    K = length(entry)
+    for trial in eachindex(seq_ends)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        for t in (t1 + 1):t2
+            ξ = fb_storage.ξ[t - 1]
+            for j in 1:K
+                entry[j] || continue
+                for i in 1:K
+                    i == j || (entry_w[i, j, t] = max(zero(T), T(ξ[i, j])))
+                end
+            end
+        end
+    end
+    return entry_w
+end
+
+#=
+The continuous half: for every entry-prior state `j`, every source `i ≠ j` and
+every step `t ≥ 2`, add `pw[i, j, t] · (log p_entry(i→j) − log p_j)` — the swap
+of `j`'s ordinary transition into `t` for the entry one — and its derivatives.
+`pw` is the trial's `K × K × T` view of `entry_w`, `nothing` without entries.
+=#
+
+@inline _slds_entry_loglik!(_, ::SLDSSmoothWorkspace, ::SLDS, _, ::Nothing, _) = nothing
+
+function _slds_entry_loglik!(
+    ll::AbstractVector{T},
+    ws::SLDSSmoothWorkspace{T},
+    slds::SLDS{T},
+    x::AbstractMatrix{T},
+    pw::AbstractArray{T,3},
+    ux::Union{Nothing,AbstractMatrix},
+) where {T<:Real}
+    b = slds.boundaries
+    b === nothing && return nothing
+    K = length(slds.LDSs)
+    d, tsteps = size(x)
+    for j in 1:K
+        ep = b.entry[j]
+        ep === nothing && continue
+        lds_j = slds.LDSs[j]
+        et = _EntryTerms(lds_j.state_model, ep)
+        n = et.n
+        r1, r2, rref, tmp = zeros(T, n), zeros(T, n), zeros(T, n), zeros(T, d)
+        for t in 2:tsteps
+            ord = T(NaN)
+            for i in 1:K
+                w = i == j ? zero(T) : pw[i, j, t]
+                iszero(w) && continue
+                isnan(ord) && (ord = _ordinary_transition_loglik(lds_j, x, t, ux, tmp))
+                _state_reference!(
+                    rref,
+                    slds.LDSs[i].state_model,
+                    ux === nothing ? nothing : view(ux, :, t - 1),
+                )
+                _entry_residuals!(r1, r2, et, x, t, ux, rref)
+                ll[t] += w * (_entry_loglik(et, r1, r2) - ord)
+            end
+        end
+    end
+    return nothing
+end
+
+@inline _slds_entry_gradient!(_, ::SLDSSmoothWorkspace, ::SLDS, _, ::Nothing, _) = nothing
+
+function _slds_entry_gradient!(
+    grad::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    slds::SLDS{T},
+    x::AbstractMatrix{T},
+    pw::AbstractArray{T,3},
+    ux::Union{Nothing,AbstractMatrix},
+) where {T<:Real}
+    b = slds.boundaries
+    b === nothing && return nothing
+    K = length(slds.LDSs)
+    d, tsteps = size(x)
+    for j in 1:K
+        ep = b.entry[j]
+        ep === nothing && continue
+        lds_j = slds.LDSs[j]
+        sm = lds_j.state_model
+        c = sm.cache
+        et = _EntryTerms(sm, ep)
+        n = et.n
+        xr, lr = 1:n, (n + 1):d
+        r1, r2, rref = zeros(T, n), zeros(T, n), zeros(T, n)
+        g1, g2 = zeros(T, n), zeros(T, n)
+        res, tmp = zeros(T, d), zeros(T, d)
+        for t in 2:tsteps
+            wsum = zero(T)
+            for i in 1:K
+                w = i == j ? zero(T) : pw[i, j, t]
+                iszero(w) && continue
+                wsum += w
+                _state_reference!(
+                    rref,
+                    slds.LDSs[i].state_model,
+                    ux === nothing ? nothing : view(ux, :, t - 1),
+                )
+                _entry_residuals!(r1, r2, et, x, t, ux, rref)
+                mul!(g1, et.Pinv, r1)
+                mul!(g2, et.Sinv, r2)
+                # ∂/∂x_{t-1} = Kᵀ P⁻¹ r1 + Aᵀ Σ⁻¹ r2
+                @views mul!(grad[xr, t - 1], transpose(et.K), g1, w, one(T))
+                @views mul!(grad[xr, t - 1], transpose(et.A), g2, w, one(T))
+                # ∂/∂λ_t = −P⁻¹ r1 − S Σ⁻¹ r2 ;  ∂/∂x_t = −Σ⁻¹ r2
+                @views grad[lr, t] .-= w .* g1
+                @views mul!(grad[lr, t], et.S, g2, -w, one(T))
+                @views grad[xr, t] .-= w .* g2
+            end
+            iszero(wsum) && continue
+            # Remove `j`'s ordinary transition with the same total weight.
+            k = _regime(sm, t - 1)
+            _transition_residual!(res, lds_j, x, t, ux)
+            mul!(tmp, c.negQinv, res)                  # ∂/∂z_t = −Q⁻¹ r
+            @views grad[:, t] .-= wsum .* tmp
+            mul!(tmp, c.MtQinv[k], res)                # ∂/∂z_{t-1} = MᵀQ⁻¹ r
+            @views grad[:, t - 1] .-= wsum .* tmp
+        end
+    end
+    return nothing
+end
+
+@inline _slds_entry_hessian!(_, ::SLDS, ::Nothing, ::Int) = nothing
+
+function _slds_entry_hessian!(
+    btd, slds::SLDS{T}, pw::AbstractArray{T,3}, tsteps::Int
+) where {T<:Real}
+    b = slds.boundaries
+    b === nothing && return nothing
+    K = length(slds.LDSs)
+    for j in 1:K
+        ep = b.entry[j]
+        ep === nothing && continue
+        sm = slds.LDSs[j].state_model
+        c = sm.cache
+        et = _EntryTerms(sm, ep)
+        for t in 2:tsteps
+            wsum = zero(T)
+            for i in 1:K
+                i == j || (wsum += pw[i, j, t])
+            end
+            iszero(wsum) && continue
+            k = _regime(sm, t - 1)
+            @. btd.H_diag[t - 1] += wsum * (et.H_prev - c.negMtQinvM[k])
+            @. btd.H_diag[t] += wsum * (et.H_cur - c.negQinv)
+            @. btd.H_sub[t - 1] += wsum * (et.H_sub - c.QinvM[k])
+            btd.H_super[t - 1] .+= wsum .* transpose(et.H_sub .- c.QinvM[k])
+        end
+    end
+    return nothing
+end
+
+"""
+    _slds_entry_potentials!(Φ, ws, slds, j, x, ux, fs)
+
+State `j`'s entry potentials over a trial, `Φ[i, t] = E_q[log p_entry(i→j)(z_t |
+z_{t-1}) − log p_j(z_t | z_{t-1})]` for `i ≠ j` and `t ≥ 2` (zero elsewhere): the
+plug-in at `x`, plus — when `fs` is given — the `½ tr(ΔH Σ)` term over the pair
+`(z_{t-1}, z_t)` that turns it into an expectation under the Laplace posterior.
+"""
+function _slds_entry_potentials!(
+    Φ::AbstractMatrix{T},
+    ws::SLDSSmoothWorkspace{T},
+    slds::SLDS{T},
+    j::Int,
+    x::AbstractMatrix{T},
+    ux::Union{Nothing,AbstractMatrix},
+    fs::Union{Nothing,FilterSmooth{T}},
+) where {T<:Real}
+    fill!(Φ, zero(T))
+    ep = slds.boundaries.entry[j]
+    ep === nothing && return Φ
+    K = length(slds.LDSs)
+    d, tsteps = size(x)
+    lds_j = slds.LDSs[j]
+    sm = lds_j.state_model
+    c = sm.cache
+    et = _EntryTerms(sm, ep)
+    n = et.n
+    r1, r2, rref, tmp = zeros(T, n), zeros(T, n), zeros(T, n), zeros(T, d)
+    ΔHp, ΔHc, ΔHs = similar(et.H_prev), similar(et.H_cur), similar(et.H_sub)
+    for t in 2:tsteps
+        ord = _ordinary_transition_loglik(lds_j, x, t, ux, tmp)
+        corr = zero(T)
+        if fs !== nothing
+            k = _regime(sm, t - 1)
+            ΔHp .= et.H_prev .- c.negMtQinvM[k]
+            ΔHc .= et.H_cur .- c.negQinv
+            ΔHs .= et.H_sub .- c.QinvM[k]
+            Σ_ttm1 = view(fs.p_smooth_tt1, :, :, t)  # Cov(z_t, z_{t-1})
+            corr =
+                T(0.5) * (
+                    _tr_prod(ΔHp, view(fs.p_smooth, :, :, t - 1)) +
+                    _tr_prod(ΔHc, view(fs.p_smooth, :, :, t)) +
+                    _tr_prod(transpose(ΔHs), Σ_ttm1) +
+                    _tr_prod(ΔHs, transpose(Σ_ttm1))
+                )
+        end
+        for i in 1:K
+            i == j && continue
+            _state_reference!(
+                rref,
+                slds.LDSs[i].state_model,
+                ux === nothing ? nothing : view(ux, :, t - 1),
+            )
+            _entry_residuals!(r1, r2, et, x, t, ux, rref)
+            Φ[i, t] = _entry_loglik(et, r1, r2) - ord + corr
+        end
+    end
+    return Φ
+end
+
+# ----------------------------------------------------------------------------
+# M-step
+# ----------------------------------------------------------------------------
+
+"""
+    _EntryStats{T}
+
+Weighted second moments for one entry-prior state, accumulated over every entry
+into it:
+
+- the prior's regression of `λ_t` on `ψ = [1; x_{t-1} − r⁽ⁱ⁾]` (`Sψψ`, `Sλψ`,
+  `Sλλ`, total weight `N`);
+- the plant row's regression of `x_t` on `w̃ = [x_{t-1}; λ_t; 1; u_{t-1}]` (`Zx`,
+  `Xx`, `Yx`, weight `N`), which shares the state's structural parameters.
+"""
+struct _EntryStats{T<:Real}
+    Sψψ::Matrix{T}
+    Sλψ::Matrix{T}
+    Sλλ::Matrix{T}
+    Zx::Matrix{T}
+    Xx::Matrix{T}
+    Yx::Matrix{T}
+    N::Base.RefValue{T}
+end
+
+function _EntryStats(::Type{T}, n::Int, m::Int) where {T<:Real}
+    reg = 2n + 1 + m
+    return _EntryStats{T}(
+        zeros(T, n + 1, n + 1),
+        zeros(T, n, n + 1),
+        zeros(T, n, n),
+        zeros(T, reg, reg),
+        zeros(T, n, reg),
+        zeros(T, n, n),
+        Ref(zero(T)),
+    )
+end
+
+"""
+    _entry_stats(slds_of, j, tfs, data, entry_w, seq_ends) -> _EntryStats
+
+Accumulate state `j`'s entry statistics over every trial, each trial's source
+references read off `slds_of(trial)` (its cell's model under `depends_on`).
+"""
+function _entry_stats(
+    slds_of,
+    j::Int,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    entry_w::AbstractArray{T,3},
+    seq_ends::AbstractVector{Int};
+    trials=eachindex(seq_ends),
+) where {T<:Real}
+    slds1 = slds_of(first(trials))
+    K = length(slds1.LDSs)
+    n = _plant_dim(slds1.LDSs[j].state_model)
+    d = 2n
+    m = size(data.ux[1], 1)
+    st = _EntryStats(T, n, m)
+    xr, lr = 1:n, (n + 1):d
+    reg = d + 1 + m
+    # Joint moments of ω = [x_{t-1}; λ_t; 1; u_{t-1}; x_t], then sliced.
+    no = reg + n
+    mω = zeros(T, no)
+    Cω = zeros(T, no, no)
+    rref = zeros(T, n)
+    for trial in trials
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        fs = tfs[trial]
+        x = fs.x_smooth
+        ux = data.ux[trial]
+        slds_t = slds_of(trial)
+        for t in 2:(t2 - t1 + 1)
+            g = t1 + t - 1
+            wtot = zero(T)
+            for i in 1:K
+                i == j || (wtot += entry_w[i, j, g])
+            end
+            iszero(wtot) && continue
+            # Means and covariance of ω under q.
+            fill!(Cω, zero(T))
+            @views begin
+                mω[1:n] .= x[xr, t - 1]
+                mω[(n + 1):d] .= x[lr, t]
+                mω[d + 1] = one(T)
+                m > 0 && (mω[(d + 2):reg] .= ux[:, t - 1])
+                mω[(reg + 1):no] .= x[xr, t]
+                Pp = fs.p_smooth[:, :, t - 1]
+                Pc = fs.p_smooth[:, :, t]
+                Pc1 = fs.p_smooth_tt1[:, :, t]       # Cov(z_t, z_{t-1})
+                Cω[1:n, 1:n] .= Pp[xr, xr]
+                Cω[(n + 1):d, (n + 1):d] .= Pc[lr, lr]
+                Cω[(n + 1):d, 1:n] .= Pc1[lr, xr]
+                Cω[1:n, (n + 1):d] .= transpose(Pc1[lr, xr])
+                Cω[(reg + 1):no, (reg + 1):no] .= Pc[xr, xr]
+                Cω[(reg + 1):no, 1:n] .= Pc1[xr, xr]
+                Cω[1:n, (reg + 1):no] .= transpose(Pc1[xr, xr])
+                Cω[(reg + 1):no, (n + 1):d] .= Pc[xr, lr]
+                Cω[(n + 1):d, (reg + 1):no] .= Pc[lr, xr]
+            end
+            Eω = Cω .+ mω * transpose(mω)
+            ir = 1:reg
+            ix = (reg + 1):no
+            @views begin
+                st.Zx .+= wtot .* Eω[ir, ir]
+                st.Xx .+= wtot .* Eω[ix, ir]
+                st.Yx .+= wtot .* Eω[ix, ix]
+            end
+            # The prior's regression, per source (its reference differs).
+            for i in 1:K
+                i == j && continue
+                w = entry_w[i, j, g]
+                iszero(w) && continue
+                _state_reference!(
+                    rref, slds_t.LDSs[i].state_model, m > 0 ? view(ux, :, t - 1) : nothing
+                )
+                δ = mω[1:n] .- rref                  # E[x_{t-1} − r]
+                λm = mω[(n + 1):d]
+                Exx = Cω[1:n, 1:n] .+ δ * transpose(δ)
+                Eλx = Cω[(n + 1):d, 1:n] .+ λm * transpose(δ)
+                st.Sψψ[1, 1] += w
+                @views st.Sψψ[1, 2:end] .+= w .* δ
+                @views st.Sψψ[2:end, 1] .+= w .* δ
+                @views st.Sψψ[2:end, 2:end] .+= w .* Exx
+                @views st.Sλψ[:, 1] .+= w .* λm
+                @views st.Sλψ[:, 2:end] .+= w .* Eλx
+                st.Sλλ .+= w .* (Cω[(n + 1):d, (n + 1):d] .+ λm * transpose(λm))
+            end
+            st.N[] += wtot
+        end
+    end
+    return st
+end
+
+"""
+    _update_entry_prior!(ep, st)
+
+The exact maximizer of the entry prior's expected log-density: weighted least
+squares `[μ K] = Sλψ Sψψ⁻¹` (or `μ` alone with `K` held, when `fit_gain` is off),
+then `P` the weighted residual covariance. Skipped when the entries carry
+negligible weight; `P` is floored so a near-degenerate scatter stays positive
+definite.
+"""
+function _update_entry_prior!(ep::EntryPrior{T}, st::_EntryStats{T}) where {T<:Real}
+    N = st.N[]
+    N > sqrt(eps(T)) || return ep
+    n = length(ep.μ)
+    Θ = if ep.fit_gain
+        F = cholesky(Symmetric(st.Sψψ); check=false)
+        issuccess(F) || return ep
+        st.Sλψ / F
+    else
+        # μ alone: E_w[λ − K δ] / N, with K held.
+        μ = (st.Sλψ[:, 1] .- ep.K * st.Sψψ[2:end, 1]) ./ N
+        hcat(μ, ep.K)
+    end
+    R =
+        st.Sλλ .- Θ * transpose(st.Sλψ) .- st.Sλψ * transpose(Θ) .+
+        Θ * st.Sψψ * transpose(Θ)
+    P = Matrix(Symmetric((R .+ transpose(R)) ./ (2N)))
+    floor = max(sqrt(eps(T)), T(1e-8) * tr(P) / n)
+    E = eigen(Symmetric(P))
+    P = E.vectors * Diagonal(max.(E.values, floor)) * transpose(E.vectors)
+    ep.μ .= Θ[:, 1]
+    ep.K .= Θ[:, 2:end]
+    ep.P .= (P .+ transpose(P)) ./ 2
+    return ep
+end
+
+"""
+    _entry_plant_Q(sm, st) -> T
+
+The plant row's expected log-density over state `sm`'s entries, at its current
+structure and noise: `−½[N (n log 2π + log det Σ_xx) + tr(Σ_xx⁻¹ R)]` with `R` the
+residual scatter of `x_t ≈ [A −S h_x B_{u,x}] w̃`.
+"""
+function _entry_plant_Q(sm::LQRStateModel{T}, st::_EntryStats{T}) where {T<:Real}
+    N = st.N[]
+    iszero(N) && return zero(T)
+    n = _plant_dim(sm)
+    xr = 1:n
+    Θ = hcat(Matrix{T}(sm.A), -Matrix{T}(sm.S), sm.h[xr], Matrix{T}(sm.Bu[xr, :]))
+    R = st.Yx .- Θ * transpose(st.Xx) .- st.Xx * transpose(Θ) .+ Θ * st.Zx * transpose(Θ)
+    Sc = cholesky(Symmetric(Matrix{T}(sm.Σ[xr, xr])); check=false)
+    issuccess(Sc) || return -T(Inf)
+    return -T(0.5) * (N * (T(n) * log(T(2π)) + logdet(Sc)) + tr(Sc \ R))
+end
+
+"""
+    _state_transition_Q(sm, hs) -> T
+
+A state's expected complete-data log-density over the transitions and terminal
+factors its statistics `hs` carry, at its current parameters, in forward
+coordinates (so it applies to every state mode through the cache):
+`Σ_k −½[n_k (d log 2π + log det Q) + tr(Q⁻¹ R_k)]` plus the same for the terminal
+factor. This is what the structural M-step improves; the entry acceptance test
+adds the entries' plant row to it.
+"""
+function _state_transition_Q(
+    sm::LQRStateModel{T}, hs::LQRSufficientStatistics{T}
+) where {T<:Real}
+    c = sm.cache
+    d = _state_latent_dim(sm)
+    n = _plant_dim(sm)
+    total = zero(T)
+    logdetQ = logdet(c.Qfwd)
+    for k in eachindex(hs.zz)
+        nk = hs.nk[k]
+        iszero(nk) && continue
+        kk = min(k, length(c.M))
+        m = size(hs.zz[k], 1) - d - 1
+        Θ = hcat(c.M[kk], c.bfwd, m > 0 ? c.Bfwd[kk] : zeros(T, d, 0))
+        zy = hs.zy[k]
+        R =
+            hs.yy[k] .- Θ * zy .- transpose(zy) * transpose(Θ) .+
+            Θ * hs.zz[k] * transpose(Θ)
+        total -= T(0.5) * (nk * (T(d) * log(T(2π)) + logdetQ) + tr(c.Qfwd \ Symmetric(R)))
+    end
+    if sm.terminal
+        logdetF = logdet(c.Sf_PD)
+        for k in eachindex(hs.term_zz)
+            tn = hs.term_n[k]
+            iszero(tn) && continue
+            m = size(hs.term_zz[k], 1) - d - 1
+            Ψ = hcat(c.Lf[k], -sm.hf, m > 0 ? c.Ftrm[k] : zeros(T, n, 0))
+            Rf = Ψ * hs.term_zz[k] * transpose(Ψ)
+            total -=
+                T(0.5) * (tn * (T(n) * log(T(2π)) + logdetF) + tr(c.Sf_PD \ Symmetric(Rf)))
+        end
+    end
+    return total
+end
+
+"""The structural parameters an acceptance test may have to restore."""
+function _lqr_struct_snapshot(sm::LQRStateModel)
+    return map(
+        deepcopy, (sm.A, sm.Mfree, sm.S, sm.Qc, sm.Σ, sm.h, sm.Bu, sm.Gref, sm.Σf, sm.hf)
+    )
+end
+
+function _lqr_struct_restore!(sm::LQRStateModel, snap)
+    for (dst, src) in zip(
+        (sm.A, sm.Mfree, sm.S, sm.h, sm.Bu, sm.Gref, sm.Σf, sm.hf, sm.Σ),
+        (snap[1], snap[2], snap[3], snap[6], snap[7], snap[8], snap[9], snap[10], snap[5]),
+    )
+        copyto!(dst, src)
+    end
+    for (dst, src) in zip(sm.Qc, snap[4])
+        copyto!(dst, src)
+    end
+    refresh!(sm)
+    return sm
+end
+
+"""
+    _slds_ordinary_weights(dl, fb_storage, seq_ends, k, trials)
+
+State `k`'s ordinary-transition weights per trial: `γ_k(t) − Σ_{i≠k} q(s_{t-1} = i,
+s_t = k)` when `k` carries an entry prior (the entered bins take the entry
+transition instead), and `nothing` — the responsibilities themselves — otherwise.
+"""
+function _slds_ordinary_weights(
+    dl::SLDSDiscreteLayer{T},
+    fb_storage::HMMs.ForwardBackwardStorage,
+    seq_ends::AbstractVector{Int},
+    k::Int,
+    trials,
+) where {T<:Real}
+    (_has_entries(dl) && dl.entry[k]) || return nothing
+    K = size(dl.A, 1)
+    out = Vector{Vector{T}}(undef, length(trials))
+    for (idx, trial) in enumerate(trials)
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        w = Vector{T}(fb_storage.γ[k, t1:t2])
+        for t in t1:t2, i in 1:K
+            i == k || (w[t - t1 + 1] -= dl.entry_w[i, k, t])
+        end
+        out[idx] = max.(w, zero(T))
+    end
+    return out
+end
+
+"""
+    _slds_update_entry_priors!(boundaries, slds_of, tfs, data, dl, seq_ends, groups)
+        -> Vector{Union{Nothing,Vector{_EntryStats}}}
+
+Collect every entry-prior state's statistics per trial group (one group
+ungrouped, one per cell under `depends_on`), update each state's prior from the
+groups pooled — the prior is one per state — and return the per-group statistics
+for the structural step's acceptance test.
+"""
+function _slds_update_entry_priors!(
+    b::SLDSBoundaries{T},
+    slds_of,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    dl::SLDSDiscreteLayer{T},
+    seq_ends::AbstractVector{Int},
+    groups,
+) where {T<:Real}
+    K = length(b.entry)
+    out = Vector{Union{Nothing,Vector{_EntryStats{T}}}}(nothing, K)
+    for j in 1:K
+        ep = b.entry[j]
+        ep === nothing && continue
+        per_group = [
+            _entry_stats(slds_of, j, tfs, data, dl.entry_w, seq_ends; trials=g) for
+            g in groups
+        ]
+        pooled = per_group[1]
+        if length(per_group) > 1
+            pooled = deepcopy(per_group[1])
+            for st in per_group[2:end]
+                pooled.Sψψ .+= st.Sψψ
+                pooled.Sλψ .+= st.Sλψ
+                pooled.Sλλ .+= st.Sλλ
+                pooled.N[] += st.N[]
+            end
+        end
+        _update_entry_prior!(ep, pooled)
+        out[j] = per_group
+    end
+    return out
+end
+
+"""
+    _slds_entry_guarded(step!, ldss, sufs, entry_stats, unit_key)
+
+Run the structural/noise step `step!` and keep its result only if the units'
+complete-data objective — their transitions and terminal factors (what `step!`
+improves) plus the entries' plant row (which shares their structure but which
+`step!` does not see) — did not go down. Otherwise every unit is restored to
+its incoming parameters, which is a legitimate generalized M-step: the bound
+cannot decrease either way. `unit_key(u)` names unit `u`'s `(state, group)` in
+`entry_stats`. A model without entry priors runs `step!` unguarded.
+"""
+function _slds_entry_guarded(step!, ldss, sufs, entry_stats, unit_key)
+    entry_stats === nothing && return step!()
+    q0 = _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+    snaps = [_lqr_struct_snapshot(l.state_model) for l in ldss]
+    result = step!()
+    q1 = _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+    tol = sqrt(eps(typeof(q0))) * max(one(q0), abs(q0))
+    if !(q1 >= q0 - tol)
+        for (l, snap) in zip(ldss, snaps)
+            _lqr_struct_restore!(l.state_model, snap)
+        end
+        @debug "structural step lowered the objective once entries' plant row counted; kept the incoming parameters" q0 q1
+    end
+    return result
+end
+
+function _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+    T = eltype(first(sufs).nk)
+    total = zero(T)
+    for (u, l) in enumerate(ldss)
+        sm = l.state_model
+        total += _state_transition_Q(sm, sufs[u])
+        j, g = unit_key(u)
+        st = entry_stats[j]
+        st === nothing || (total += _entry_plant_Q(sm, st[g]))
+    end
+    return total
 end

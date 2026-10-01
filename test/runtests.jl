@@ -638,13 +638,19 @@ using SSDTest
         end
 
         include("LinearDynamicalSystems/SLDSBoundaries.jl")
-        @testset "SLDS boundaries (exit bridges)" begin
+        @testset "SLDS boundaries (exit bridges, entry priors)" begin
             test_bridge_forward_backward_exact()
             test_bridge_smoother_derivatives()
             test_bridge_aggregate_stats()
             test_bridge_validation()
             test_bridge_fit()
             test_bridge_grouped_and_sampled()
+            test_entry_forward_backward_exact()
+            test_entry_smoother_derivatives()
+            test_entry_prior_mstep_exact()
+            test_entry_guard_restores()
+            test_entry_validation()
+            test_entry_fit()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

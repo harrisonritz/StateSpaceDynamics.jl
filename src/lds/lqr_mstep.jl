@@ -464,6 +464,7 @@ function _aggregate_lqr_stats_weighted!(
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}};
     exit_weights::Union{Nothing,AbstractVector}=nothing,
+    dyn_weights::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
@@ -495,6 +496,11 @@ function _aggregate_lqr_stats_weighted!(
         either way, so nothing downstream can tell the difference. =#
         ux = data.ux[trial]::AbstractMatrix{T}
         w = weights[trial]
+        #= The transitions' own weights. With an entry prior these are the
+        responsibilities less the mass that entered the state at that bin, whose
+        transition is the entry one (`set_boundaries!`); otherwise the
+        responsibilities themselves. =#
+        wdyn = dyn_weights === nothing ? w : dyn_weights[trial]
 
         #=
         Everything handed to `ger!` is hoisted through `tview` with a concrete
@@ -503,7 +509,7 @@ function _aggregate_lqr_stats_weighted!(
         method" report on every union-split branch.
         =#
         for t in 1:(T_n - 1)
-            wt = w[t + 1]::T                  # the factor coupling (z_t, z_{t+1})
+            wt = wdyn[t + 1]::T               # the factor coupling (z_t, z_{t+1})
             iszero(wt) && continue
             k = _regime(sm, t)
             zz = hs.zz[k]::Matrix{T}

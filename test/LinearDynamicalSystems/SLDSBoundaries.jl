@@ -312,3 +312,285 @@ function test_bridge_grouped_and_sampled()
     @test sampled.A[2, 1] == 0
     return nothing
 end
+
+# ============================================================================
+# Entry priors
+# ============================================================================
+
+"""A banded control → free → control model whose last state has an entry prior
+(and both control states bridges)."""
+function _entry_model(; p::Int=4, n::Int=2, stays=[0.85, 0.85])
+    c1 = hslds_state([0.4 0.05; 0.05 0.3]; p=p, terminal=true)
+    c1.state_model.condition_terminal = false
+    c3 = hslds_state([0.6 0.0; 0.0 0.5]; p=p, terminal=true, seed=11)
+    c3.state_model.condition_terminal = false
+    d = 2n
+    free = LinearDynamicalSystem(
+        free_state_model(
+            0.9 * Matrix(1.0I, d, d), Matrix(0.05I, d, d); P0=Matrix(0.3I, d, d)
+        ),
+        deepcopy(c1.obs_model),
+    )
+    free.state_model.observe_costate = false
+    A, πₖ = banded_transition(3; stay=stays)
+    slds = SLDS(; A=A, πₖ=πₖ, LDSs=[c1, free, c3])
+    set_boundaries!(slds; bridge_states=[1, 3], entry_states=[3], entry_cov=0.5)
+    return slds
+end
+
+"""
+Forward-backward with entry potentials is exact: brute force over paths, where an
+`i → j` transition into an entry-prior state `j` also pays `exp(Φ[i, j, t])`.
+"""
+function test_entry_forward_backward_exact()
+    rng = StableRNG(53)
+    K, T = 3, 5
+    A = [0.6 0.3 0.1; 0.2 0.5 0.3; 0.25 0.25 0.5]
+    π = [0.5, 0.3, 0.2]
+    logL = randn(rng, K, T)
+    Φ = 2.0 .* randn(rng, K, K, T)
+    entry = [false, true, true]
+
+    dl = _SB.SLDSDiscreteLayer(copy(A), copy(π), copy(logL))
+    dl.entry = copy(entry)
+    dl.entry_logL = copy(Φ)
+    dl.entry_w = zeros(K, K, T)
+    fb = _SB._make_slds_fb_storage(dl, [T])
+    _SB.HMMs.forward_backward!(
+        fb, dl, collect(1:T), collect(1:T); seq_ends=[T], transition_marginals=true
+    )
+    _SB._slds_entry_weights!(dl.entry_w, fb, [T], dl.entry)
+
+    γ = zeros(K, T)
+    ξ = [zeros(K, K) for _ in 1:(T - 1)]
+    total = 0.0
+    for s in Iterators.product(ntuple(_ -> 1:K, T)...)
+        w = π[s[1]] * exp(logL[s[1], 1])
+        for t in 2:T
+            w *= A[s[t - 1], s[t]] * exp(logL[s[t], t])
+            entry[s[t]] && s[t] != s[t - 1] && (w *= exp(Φ[s[t - 1], s[t], t]))
+        end
+        total += w
+        for t in 1:T
+            γ[s[t], t] += w
+        end
+        for t in 1:(T - 1)
+            ξ[t][s[t], s[t + 1]] += w
+        end
+    end
+    @test fb.γ ≈ γ ./ total rtol = 1e-10
+    for t in 1:(T - 1)
+        @test fb.ξ[t] ≈ ξ[t] ./ total rtol = 1e-10
+        for i in 1:K, j in 1:K
+            expected = (entry[j] && i != j) ? ξ[t][i, j] / total : 0.0
+            @test dl.entry_w[i, j, t + 1] ≈ expected atol = 1e-12
+        end
+    end
+    return nothing
+end
+
+"""
+The entry swap's objective, gradient and block-tridiagonal Hessian agree by
+finite differences — diagonal *and* off-diagonal blocks — and a zero entry weight
+leaves the smoother's objective exactly as it was.
+"""
+function test_entry_smoother_derivatives()
+    rng = StableRNG(59)
+    slds = _entry_model()
+    slds.boundaries.entry[3].μ .= [0.2, -0.1]
+    slds.boundaries.entry[3].K .= [0.3 0.1; -0.2 0.4]
+    tsteps = 6
+    d = slds.LDSs[1].latent_dim
+    y = 0.5 .* randn(rng, 4, tsteps)
+    x = 0.3 .* randn(rng, d, tsteps)
+    w = rand(rng, 3, tsteps)
+    w ./= sum(w; dims=1)
+    pw = zeros(3, 3, tsteps)
+    pw[1, 3, 2:end] .= 0.3 .* rand(rng, tsteps - 1)
+    pw[2, 3, 2:end] .= 0.3 .* rand(rng, tsteps - 1)
+
+    ws = _SB.SLDSSmoothWorkspace(Float64, slds, tsteps)
+    f(xv) = sum(_SB.joint_loglikelihood!(ws, slds, xv, y, w; pw=pw))
+    g = copy(_SB.gradient!(ws, slds, x, y, w; pw=pw))
+    h = 1e-6
+    gfd = similar(x)
+    for i in eachindex(x)
+        xp, xm = copy(x), copy(x)
+        xp[i] += h
+        xm[i] -= h
+        gfd[i] = (f(xp) - f(xm)) / (2h)
+    end
+    @test g ≈ gfd rtol = 1e-6 atol = 1e-6
+
+    _SB.hessian!(ws, slds, x, y, w; pw=pw)
+    Hd = [copy(ws.btd.H_diag[t]) for t in 1:tsteps]
+    Hs = [copy(ws.btd.H_sub[t]) for t in 1:(tsteps - 1)]      # ∂²/∂z_{t+1}∂z_t
+    Hp = [copy(ws.btd.H_super[t]) for t in 1:(tsteps - 1)]    # ∂²/∂z_t∂z_{t+1}
+    for t in 1:tsteps, i in 1:d
+        xp, xm = copy(x), copy(x)
+        xp[i, t] += h
+        xm[i, t] -= h
+        gp = copy(_SB.gradient!(ws, slds, xp, y, w; pw=pw))
+        gm = copy(_SB.gradient!(ws, slds, xm, y, w; pw=pw))
+        dg = (gp .- gm) ./ (2h)
+        @test Hd[t][:, i] ≈ dg[:, t] rtol = 1e-5 atol = 1e-6
+        t < tsteps && @test Hs[t][:, i] ≈ dg[:, t + 1] rtol = 1e-5 atol = 1e-6
+        t > 1 && @test Hp[t - 1][:, i] ≈ dg[:, t - 1] rtol = 1e-5 atol = 1e-6
+    end
+
+    plain = sum(_SB.joint_loglikelihood!(ws, slds, x, y, w))
+    @test sum(_SB.joint_loglikelihood!(ws, slds, x, y, w; pw=zeros(3, 3, tsteps))) == plain
+    return nothing
+end
+
+"""
+The entry prior's M-step is the exact weighted regression: entries whose new
+costate is an exact affine function of where the state was relative to the
+previous reference recover that function, and with `fit_gain = false` only the
+offset moves.
+"""
+function test_entry_prior_mstep_exact()
+    rng = StableRNG(61)
+    slds = _entry_model()
+    lds = slds.LDSs[3]
+    n = 2
+    d = 2n
+    μ_true = [0.5, -0.3]
+    K_true = [0.7 0.2; -0.1 0.4]
+    tsteps = [5, 5, 5, 5, 5, 5]
+    ys = [zeros(4, T) for T in tsteps]
+    data = _SB.Data(lds, ys)
+    tfs = _SB.initialize_FilterSmooth(lds, tsteps)
+    seq_ends = cumsum(tsteps)
+    entry_w = zeros(3, 3, last(seq_ends))
+    for (i, T) in enumerate(tsteps)
+        x = tfs[i].x_smooth
+        x .= randn(rng, d, T)
+        # Entries at local t = 3, from state 1 (no inputs, so r = 0).
+        x[(n + 1):d, 3] .= μ_true .+ K_true * x[1:n, 2]
+        t1 = seq_ends[i] - T + 1
+        entry_w[1, 3, t1 + 2] = 1.0
+        fill!(tfs[i].p_smooth, 0.0)
+        fill!(tfs[i].p_smooth_tt1, 0.0)
+    end
+    st = _SB._entry_stats(_ -> slds, 3, tfs, data, entry_w, seq_ends)
+    ep = deepcopy(slds.boundaries.entry[3])
+    _SB._update_entry_prior!(ep, st)
+    @test ep.μ ≈ μ_true atol = 1e-8
+    @test ep.K ≈ K_true atol = 1e-8
+    @test all(eigvals(Symmetric(ep.P)) .> 0)
+    @test st.N[] ≈ length(tsteps)
+
+    held = deepcopy(slds.boundaries.entry[3])
+    held.fit_gain = false
+    held.K .= K_true
+    _SB._update_entry_prior!(held, st)
+    @test held.μ ≈ μ_true atol = 1e-8
+    @test held.K == K_true
+    return nothing
+end
+
+"""
+The acceptance guard keeps a structural step that does not lower the objective
+with the entries' plant row counted, and undoes one that does.
+"""
+function test_entry_guard_restores()
+    rng = StableRNG(67)
+    slds = _entry_model()
+    lds = slds.LDSs[3]
+    sm = lds.state_model
+    n = 2
+    d = 2n
+    T = 6
+    ys = [zeros(4, T) for _ in 1:3]
+    data = _SB.Data(lds, ys)
+    tfs = _SB.initialize_FilterSmooth(lds, fill(T, 3))
+    for i in 1:3
+        tfs[i].x_smooth .= 0.3 .* randn(rng, d, T)
+        for t in 1:T
+            tfs[i].p_smooth[:, :, t] .= 0.01I(d)
+        end
+    end
+    seq_ends = cumsum(fill(T, 3))
+    entry_w = zeros(3, 3, last(seq_ends))
+    entry_w[1, 3, 3] = entry_w[1, 3, T + 3] = 1.0
+    st = [_SB._entry_stats(_ -> slds, 3, tfs, data, entry_w, seq_ends)]
+    hs = _SB._initialize_td_sufficient_statistics(Float64, lds, fill(T, 3))
+    _SB._aggregate_lqr_stats_weighted!(hs, tfs, lds, data, [ones(T) for _ in 1:3])
+    stats = Union{Nothing,Vector{eltype(st)}}[nothing, nothing, st]
+    A0 = copy(sm.A)
+
+    # A step that wrecks the plant is undone.
+    _SB._slds_entry_guarded([lds], [hs], stats, u -> (3, 1)) do
+        sm.A .*= 3.0
+        refresh!(sm)
+    end
+    @test sm.A == A0
+    # A step that changes nothing is kept (trivially).
+    _SB._slds_entry_guarded([lds], [hs], stats, u -> (3, 1)) do
+        nothing
+    end
+    @test sm.A == A0
+    # Without entry statistics the step runs unguarded.
+    _SB._slds_entry_guarded([lds], [hs], nothing, u -> (3, 1)) do
+        sm.A .*= 1.01
+        refresh!(sm)
+    end
+    @test sm.A ≈ 1.01 .* A0
+    return nothing
+end
+
+"""`set_boundaries!` refuses an entry prior on anything but a control state."""
+function test_entry_validation()
+    slds = _entry_model()
+    @test slds.boundaries.entry[3] isa _SB.EntryPrior
+    @test slds.boundaries.entry[1] === nothing
+    @test slds.boundaries.entry[3].P == 0.5I(2)
+    @test_throws ArgumentError set_boundaries!(deepcopy(slds); entry_states=[2])
+    @test_throws ArgumentError set_boundaries!(deepcopy(slds); entry_states=[4])
+    @test_throws ArgumentError set_boundaries!(
+        deepcopy(slds); entry_states=[3], entry_cov=0.0
+    )
+    cond = deepcopy(slds)
+    cond.LDSs[1].state_model.condition_terminal = true
+    cond.LDSs[3].state_model.condition_terminal = true
+    @test_throws ArgumentError validate_SLDS(cond)
+    return nothing
+end
+
+"""
+End to end: control (bridged) → free → control (bridged, entry prior) on a banded
+chain fits with finite traces, improves its converged bound, keeps the band, and
+moves the entry prior off its initial value; grouped and sampled fits run too.
+"""
+function test_entry_fit()
+    p, tsteps, ntrials = 4, 36, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = _entry_model(; p=p)
+    before = elbo(slds, ys)
+    trace = _trace(fit!(slds, ys; max_iter=6, progress=false, rng=StableRNG(5)))
+    after = elbo(slds, ys)
+    @test all(isfinite, trace)
+    @test after > before
+    @test slds.A[2, 1] == 0 && slds.A[3, 1] == 0 && slds.A[3, 2] == 0
+    ep = slds.boundaries.entry[3]
+    @test norm(ep.μ) > 0
+    @test isposdef(Symmetric(ep.P))
+    for k in (1, 3)
+        @test symplectic_defect(slds.LDSs[k].state_model) < 1e-10
+    end
+
+    labels = [:a, :a, :a, :b, :b, :b]
+    grouped = _entry_model(; p=p)
+    for lds in grouped.LDSs
+        lds.obs_model.depends_on = (C=labels, d=labels)
+    end
+    trace = _trace(fit!(grouped, ys; max_iter=3, progress=false, rng=StableRNG(5)))
+    @test all(isfinite, trace)
+    sampled = _entry_model(; p=p)
+    trace = _trace(
+        fit!(sampled, ys; max_iter=3, num_samples=2, progress=false, rng=StableRNG(5))
+    )
+    @test all(isfinite, trace)
+    return nothing
+end

@@ -997,11 +997,14 @@ plan, so the neural state stays continuous across the switch. See
 - `K::Matrix{T}`: how the entry costate depends on where the state is relative to
   the previous state's reference (`n × n`).
 - `P::Matrix{T}`: the entry costate's covariance (`n × n`, positive definite).
+- `fit_gain::Bool`: whether the M-step fits `K`; `false` keeps it at its value
+  (zero by default), so only the costate's mean offset and spread are learned.
 """
 mutable struct EntryPrior{T<:Real}
     μ::Vector{T}
     K::Matrix{T}
     P::Matrix{T}
+    fit_gain::Bool
 end
 
 """
@@ -1128,16 +1131,38 @@ mutable struct SLDSDiscreteLayer{T<:Real,TM<:AbstractMatrix{T},TV<:AbstractVecto
     bridge::Vector{Bool}
     exit_logL::Matrix{T}
     exit_w::Matrix{T}
+    #=
+    Entry priors (see `set_boundaries!`), likewise empty without them.
+    `entry_logL[i, j, t]` is `E_q[log p_entry(i→j)(z_t | z_{t-1}) − log p_j(z_t |
+    z_{t-1})]` — what entering `j` from `i` at `t` changes about the transition
+    into `t` — and `entry_w[i, j, t] = q(s_{t-1} = i, s_t = j)` for `i ≠ j`.
+    =#
+    entry::Vector{Bool}
+    entry_logL::Array{T,3}
+    entry_w::Array{T,3}
 end
 
 function SLDSDiscreteLayer(
     A::TM, πₖ::TV, logL::Matrix{T}
 ) where {T<:Real,TM<:AbstractMatrix{T},TV<:AbstractVector{T}}
-    return SLDSDiscreteLayer{T,TM,TV}(A, πₖ, logL, Bool[], zeros(T, 0, 0), zeros(T, 0, 0))
+    return SLDSDiscreteLayer{T,TM,TV}(
+        A,
+        πₖ,
+        logL,
+        Bool[],
+        zeros(T, 0, 0),
+        zeros(T, 0, 0),
+        Bool[],
+        zeros(T, 0, 0, 0),
+        zeros(T, 0, 0, 0),
+    )
 end
 
 """Whether the layer carries exit bridges."""
 _has_bridges(dl::SLDSDiscreteLayer) = !isempty(dl.bridge)
+
+"""Whether the layer carries entry priors."""
+_has_entries(dl::SLDSDiscreteLayer) = !isempty(dl.entry)
 
 HMMs.initialization(dl::SLDSDiscreteLayer) = dl.πₖ
 HMMs.transition_matrix(dl::SLDSDiscreteLayer) = dl.A
@@ -1158,14 +1183,27 @@ posterior cannot underflow a whole row to zero; nothing within ±500 of a
 realistic bridge log-density is affected.
 =#
 function HMMs.transition_matrix(dl::SLDSDiscreteLayer{T}, t::Integer) where {T}
-    (_has_bridges(dl) && t > 1) || return dl.A
+    ((_has_bridges(dl) || _has_entries(dl)) && t > 1) || return dl.A
     trans = Matrix{T}(dl.A)
     K = size(trans, 1)
-    for i in 1:K
-        dl.bridge[i] || continue
-        f = exp(clamp(dl.exit_logL[i, t - 1], -T(500), T(500)))
+    if _has_bridges(dl)
+        for i in 1:K
+            dl.bridge[i] || continue
+            f = exp(clamp(dl.exit_logL[i, t - 1], -T(500), T(500)))
+            for j in 1:K
+                j == i || (trans[i, j] *= f)
+            end
+        end
+    end
+    #= Entering `j` from `i` swaps `j`'s ordinary transition into `t` (already
+    in `logL[j, t]`) for the entry one: the difference rides on the transition. =#
+    if _has_entries(dl)
         for j in 1:K
-            j == i || (trans[i, j] *= f)
+            dl.entry[j] || continue
+            for i in 1:K
+                i == j && continue
+                trans[i, j] *= exp(clamp(dl.entry_logL[i, j, t], -T(500), T(500)))
+            end
         end
     end
     return trans
