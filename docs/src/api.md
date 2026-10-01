@@ -71,6 +71,7 @@ closed_loop_dynamics
 simulate_lqr
 rescale_costate!
 free_state_model
+hold_state_model
 plant_dim
 ```
 
@@ -86,6 +87,13 @@ inferred rather than given by `schedule`, so each member carries a single cost.
 `free_state_model` supplies a state whose transition is unconstrained rather than
 symplectic, which is how a switching model mixes plain linear dynamics with LQR
 dynamics under one concrete state-model type.
+
+`hold_state_model` supplies the infinite-horizon counterpart of a control state:
+a stationary regulator that holds the state at a reference, with its costate on
+the stable manifold of the discrete algebraic Riccati equation. It shares the
+plant, control authority, inputs and reference map with the finite-horizon form
+and is fitted in the same joint M-step, so `tied_params = [:A, :S]` gives a
+"reach" state and a "hold" state one plant with a cost each.
 
 `tied_params = [:structure]` shares the joint block `(A, S, Qc, h, Bu, Gref)`
 across discrete states and `[:noise]` shares `Σ`, each fitted jointly from the
