@@ -123,7 +123,9 @@ function _slds_variant_view(
             lds.fit_bool,
         )
     end
-    return SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, ldss)
+    return SLDS{T,S,O,TM,ISV}(
+        slds.A, slds.πₖ, ldss, slds.A_prior, slds.πₖ_prior, slds.boundaries
+    )
 end
 
 """

@@ -979,6 +979,51 @@ function LinearDynamicalSystem(
 end
 
 """
+    EntryPrior{T}
+
+The costate a discrete state starts from when the chain **enters** it from another
+state: a fresh plan, rather than the previous state's costate carried through the
+new state's adjoint equation. For an entry `i → j` at time `t`,
+
+    λ_t ~ N(μ + K (x_{t-1} − r⁽ⁱ⁾_{t-1}), P),
+
+where `r⁽ⁱ⁾ = G_r⁽ⁱ⁾ u` is the reference of the state being left (zero for a state
+without one). The plant keeps its own row of `j`'s transition, driven by the new
+plan, so the neural state stays continuous across the switch. See
+[`set_boundaries!`](@ref).
+
+# Fields
+- `μ::Vector{T}`: the entry costate's mean offset (length `n`).
+- `K::Matrix{T}`: how the entry costate depends on where the state is relative to
+  the previous state's reference (`n × n`).
+- `P::Matrix{T}`: the entry costate's covariance (`n × n`, positive definite).
+"""
+mutable struct EntryPrior{T<:Real}
+    μ::Vector{T}
+    K::Matrix{T}
+    P::Matrix{T}
+end
+
+"""
+    SLDSBoundaries{T}
+
+What happens at the boundaries between an [`SLDS`](@ref)'s discrete states:
+which states end their segment with a **bridge** (their terminal factor, applied
+when the chain leaves them) and which start theirs from an
+[`EntryPrior`](@ref). Built and attached by [`set_boundaries!`](@ref).
+
+# Fields
+- `bridge::Vector{Bool}`: per state, whether leaving it applies its terminal
+  factor at the exit.
+- `entry::Vector{Union{Nothing,EntryPrior{T}}}`: per state, its entry prior, or
+  `nothing` for a state that keeps the ordinary transition on entry.
+"""
+struct SLDSBoundaries{T<:Real}
+    bridge::Vector{Bool}
+    entry::Vector{Union{Nothing,EntryPrior{T}}}
+end
+
+"""
     SLDS{T,S,O,TM,ISV}
 
 A Switching Linear Dynamical System (SLDS). A hierarchical time-series model of the form:
@@ -998,6 +1043,9 @@ y_t | x_t, z_t ~ N(C^{(z_t)} x_t + d^{(z_t)}, R^{(z_t)})
   fits `A` by maximum likelihood.
 - `πₖ_prior::Union{Nothing,Vector{T}}`: optional length-`K` Dirichlet concentration on
   the initial distribution, `πₖ ~ Dir(πₖ_prior)`.
+- `boundaries::Union{Nothing,SLDSBoundaries{T}}`: optional exit bridges and entry
+  priors at the switches between discrete states; see [`set_boundaries!`](@ref).
+  `nothing` (the default) is the plain switching model.
 
 With a chain prior the discrete M-step is the MAP update — expected counts plus
 `α − 1` pseudo-counts, normalised — and the reported ELBO carries the matching
@@ -1018,6 +1066,7 @@ pseudo-count update is its maximiser. See [`transition_prior`](@ref) for the usu
     LDSs::Vector{LinearDynamicalSystem{T,S,O}}
     A_prior::Union{Nothing,Matrix{T}} = nothing
     πₖ_prior::Union{Nothing,Vector{T}} = nothing
+    boundaries::Union{Nothing,SLDSBoundaries{T}} = nothing
 end
 
 #=
@@ -1028,13 +1077,13 @@ positionally; both leave the chain unpenalised.
 function SLDS(
     A::TM, πₖ::ISV, LDSs::Vector{LinearDynamicalSystem{T,S,O}}
 ) where {T<:Real,S,O,TM<:AbstractMatrix{T},ISV<:AbstractVector{T}}
-    return SLDS(A, πₖ, LDSs, nothing, nothing)
+    return SLDS(A, πₖ, LDSs, nothing, nothing, nothing)
 end
 
 function SLDS{T,S,O,TM,ISV}(
     A, πₖ, LDSs
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel,TM,ISV}
-    return SLDS{T,S,O,TM,ISV}(A, πₖ, LDSs, nothing, nothing)
+    return SLDS{T,S,O,TM,ISV}(A, πₖ, LDSs, nothing, nothing, nothing)
 end
 
 function _trial_initial_model(
@@ -1048,7 +1097,9 @@ function _trial_initial_model(
 }
     isempty(slds.LDSs[1].state_model.B0) && return slds
     members = [_trial_initial_model(lds, u0) for lds in slds.LDSs]
-    return SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, members)
+    return SLDS{T,S,O,TM,ISV}(
+        slds.A, slds.πₖ, members, slds.A_prior, slds.πₖ_prior, slds.boundaries
+    )
 end
 
 """
@@ -1067,10 +1118,58 @@ mutable struct SLDSDiscreteLayer{T<:Real,TM<:AbstractMatrix{T},TV<:AbstractVecto
     A::TM            # K×K row-stochastic transition matrix
     πₖ::TV           # K initial-state distribution
     logL::Matrix{T}  # K×T pre-computed log-likelihoods; mutated before each FB pass
+    #=
+    Exit bridges (see `set_boundaries!`). Empty for a model without them, which
+    keeps every transition the plain `A`. With them, `exit_logL[k, t]` is
+    `E_q[log f_k(z_t)]` — state `k`'s bridge factor, scored at `t` — and
+    `exit_w[k, t]` is `q(s_t = k, s_{t+1} ≠ k)`, the weight the continuous side
+    gives that factor. Both are global-time indexed like `logL`.
+    =#
+    bridge::Vector{Bool}
+    exit_logL::Matrix{T}
+    exit_w::Matrix{T}
 end
+
+function SLDSDiscreteLayer(
+    A::TM, πₖ::TV, logL::Matrix{T}
+) where {T<:Real,TM<:AbstractMatrix{T},TV<:AbstractVector{T}}
+    return SLDSDiscreteLayer{T,TM,TV}(A, πₖ, logL, Bool[], zeros(T, 0, 0), zeros(T, 0, 0))
+end
+
+"""Whether the layer carries exit bridges."""
+_has_bridges(dl::SLDSDiscreteLayer) = !isempty(dl.bridge)
 
 HMMs.initialization(dl::SLDSDiscreteLayer) = dl.πₖ
 HMMs.transition_matrix(dl::SLDSDiscreteLayer) = dl.A
+
+#=
+The control passed to HMMs.jl is the global time index (`1:ΣT`), and in its
+convention `control_seq[t]` governs the transition `t − 1 → t`. Without bridges
+that is the plain chain. With them, leaving bridged state `i` at `t − 1` also
+pays its bridge factor: every off-diagonal entry of row `i` is multiplied by
+`exp(exit_logL[i, t − 1])`. The rows stop being stochastic, which forward-backward
+does not need — it normalizes per step — and the posteriors `γ`, `ξ` it returns
+are then exactly those of the chain with the factor attached. A trial's first
+index is never asked for a transition (its α comes from `πₖ`), so `t − 1` never
+crosses into the previous trial.
+
+The potential is clamped at ±500 nats so that a bridge scored far outside its
+posterior cannot underflow a whole row to zero; nothing within ±500 of a
+realistic bridge log-density is affected.
+=#
+function HMMs.transition_matrix(dl::SLDSDiscreteLayer{T}, t::Integer) where {T}
+    (_has_bridges(dl) && t > 1) || return dl.A
+    trans = Matrix{T}(dl.A)
+    K = size(trans, 1)
+    for i in 1:K
+        dl.bridge[i] || continue
+        f = exp(clamp(dl.exit_logL[i, t - 1], -T(500), T(500)))
+        for j in 1:K
+            j == i || (trans[i, j] *= f)
+        end
+    end
+    return trans
+end
 
 # Override the log-density chokepoint so obs_distributions is never needed.
 # obs is the timestep index t (an Int), supplied as obs_seq = 1:T.

@@ -462,7 +462,8 @@ function _aggregate_lqr_stats_weighted!(
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
-    weights::AbstractVector{<:AbstractVector{T}},
+    weights::AbstractVector{<:AbstractVector{T}};
+    exit_weights::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
@@ -541,31 +542,65 @@ function _aggregate_lqr_stats_weighted!(
 
         if sm.terminal
             wT = w[T_n]::T
-            if !iszero(wT)
-                kT = _terminal_regime(sm, T_n)
-                term_zz = hs.term_zz[kT]
-                xT = tview(x, :, T_n)
-                BLAS.ger!(wT, xT, xT, tview(term_zz, 1:d, 1:d))
-                @views term_zz[1:d, 1:d] .+= wT .* p_smooth[:, :, T_n]
-                for i in 1:d
-                    term_zz[i, d + 1] += wT * x[i, T_n]
-                end
-                if m > 0
-                    uT = tview(ux, :, T_n)
-                    BLAS.ger!(wT, xT, uT, tview(term_zz, 1:d, (d + 2):(d + 1 + m)))
-                    BLAS.ger!(
-                        wT, uT, uT, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m))
-                    )
-                    for j in 1:m
-                        term_zz[d + 1, d + 1 + j] += wT * uT[j]
-                    end
-                end
-                hs.term_n[kT] += wT
+            iszero(wT) || _add_terminal_moment!(
+                hs, _terminal_regime(sm, T_n), wT, x, p_smooth, ux, T_n
+            )
+        end
+        #=
+        Exit bridges (`set_boundaries!`): the same terminal factor, applied at
+        every exit from this state, weighted by the exit probability
+        `q(s_t = k, s_{t+1} ≠ k)`. Its statistics land on the bridge's own cost
+        regime, so the structural M-step fits that cost from every segment end,
+        exits and trial ends alike.
+        =#
+        if exit_weights !== nothing
+            e = exit_weights[trial]
+            kb = _bridge_regime(sm)
+            for t in 1:(T_n - 1)
+                et = e[t]::T
+                iszero(et) || _add_terminal_moment!(hs, kb, et, x, p_smooth, ux, t)
             end
         end
     end
 
     return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
+end
+
+"""
+    _add_terminal_moment!(hs, k, w, x, p_smooth, ux, t)
+
+Add `w · E[[z_t; 1; u_t][z_t; 1; u_t]ᵀ]` to regime `k`'s terminal statistics and
+`w` to its count: one weighted terminal factor at `t`. The end-of-trial factor
+uses it at `t = T`, an exit bridge at its exit.
+"""
+function _add_terminal_moment!(
+    hs::LQRSufficientStatistics{T},
+    k::Int,
+    w::T,
+    x::Matrix{T},
+    p_smooth::Array{T,3},
+    ux::AbstractMatrix{T},
+    t::Int,
+) where {T<:Real}
+    d = size(x, 1)
+    m = size(ux, 1)
+    term_zz = hs.term_zz[k]
+    xt = tview(x, :, t)
+    BLAS.ger!(w, xt, xt, tview(term_zz, 1:d, 1:d))
+    @views term_zz[1:d, 1:d] .+= w .* p_smooth[:, :, t]
+    for i in 1:d
+        term_zz[i, d + 1] += w * x[i, t]
+    end
+    if m > 0
+        ut = tview(ux, :, t)
+        BLAS.ger!(w, xt, ut, tview(term_zz, 1:d, (d + 2):(d + 1 + m)))
+        BLAS.ger!(w, ut, ut, tview(term_zz, (d + 2):(d + 1 + m), (d + 2):(d + 1 + m)))
+        for j in 1:m
+            term_zz[d + 1, d + 1 + j] += w * ut[j]
+        end
+    end
+    hs.term_n[k] += w
+    return hs
 end
 
 """

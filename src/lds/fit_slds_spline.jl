@@ -189,7 +189,12 @@ through to the real model.
 function _slds_gaussian_shadow(slds::SLDS{T}) where {T<:Real}
     ldss = [_gaussian_shadow(l) for l in slds.LDSs]
     return SLDS(;
-        A=slds.A, πₖ=slds.πₖ, LDSs=ldss, A_prior=slds.A_prior, πₖ_prior=slds.πₖ_prior
+        A=slds.A,
+        πₖ=slds.πₖ,
+        LDSs=ldss,
+        A_prior=slds.A_prior,
+        πₖ_prior=slds.πₖ_prior,
+        boundaries=slds.boundaries,
     )
 end
 

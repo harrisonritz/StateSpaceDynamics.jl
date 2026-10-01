@@ -608,6 +608,7 @@ function _validate_slds_structure(slds::SLDS)
 
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
     _validate_slds_chain_prior(slds)
+    _validate_boundaries(slds)
     return nothing
 end
 

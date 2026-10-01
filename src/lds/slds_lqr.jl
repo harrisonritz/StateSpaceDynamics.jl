@@ -151,14 +151,15 @@ function _slds_aggregate_weighted!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
-    sws::SmoothWorkspace{T},
+    sws::SmoothWorkspace{T};
+    exit_weights::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     # A one-state SLDS has γ ≡ 1 and is exactly an LDS. Use the same batched
     # accumulation in that case: the weighted timestep loop is mathematically
     # identical but differs at roundoff, and the deliberately flat inverse-LQR
     # cost-scale direction can amplify that tiny difference across EM steps.
     # This also makes the K=1 equivalence test a sharp dispatch check again.
-    unit_weights = all(w -> all(isone, w), weights)
+    unit_weights = exit_weights === nothing && all(w -> all(isone, w), weights)
     if unit_weights
         # The ordinary fit seeds the data-only aggregate blocks once before its
         # EM loop. The switching path normally rebuilds them inside the
@@ -169,7 +170,7 @@ function _slds_aggregate_weighted!(
         _aggregate_lqr_stats!(hs, tfs, lds, data)
     else
         _aggregate_td_suff_stats_weighted!(hs.base, tfs, lds, data, weights, sws)
-        _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights)
+        _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights; exit_weights)
     end
     #=
     Same masking the ungrouped `estep!` applies, at the same point: with

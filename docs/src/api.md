@@ -111,6 +111,10 @@ transition_prior
 ```
 
 ```@docs
+set_boundaries!
+```
+
+```@docs
 banded_transition
 banded_transition_prior
 median_dwell_stay

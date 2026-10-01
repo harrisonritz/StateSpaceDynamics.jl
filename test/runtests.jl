@@ -637,6 +637,16 @@ using SSDTest
             test_slds_lqr_terminal_warmup()
         end
 
+        include("LinearDynamicalSystems/SLDSBoundaries.jl")
+        @testset "SLDS boundaries (exit bridges)" begin
+            test_bridge_forward_backward_exact()
+            test_bridge_smoother_derivatives()
+            test_bridge_aggregate_stats()
+            test_bridge_validation()
+            test_bridge_fit()
+            test_bridge_grouped_and_sampled()
+        end
+
         include("LinearDynamicalSystems/Stitching.jl")
         @testset "Stitching (per-session obs_dim)" begin
             @testset "Shapes and validation" begin

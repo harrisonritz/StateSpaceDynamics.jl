@@ -77,6 +77,7 @@ include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_LQR.jl")
 include("lds/lqr_terminal.jl")
 include("lds/slds_lqr_terminal.jl")
+include("lds/slds_boundaries.jl")   # exit bridges between discrete states
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.
@@ -89,6 +90,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
+export set_boundaries!
 export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export SplineGaussianObservationModel
