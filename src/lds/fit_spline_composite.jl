@@ -520,7 +520,13 @@ function _fit_spline_laplace!(
 end
 
 function _spline_composite_smooth_laplace(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy, newton_max_iter::Int, newton_tol::Float64
+    lds::LinearDynamicalSystem{T,S,O},
+    y,
+    ux0,
+    ux,
+    uy,
+    newton_max_iter::Int,
+    newton_tol::Float64,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     _reject_spline_grouping(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
@@ -546,7 +552,13 @@ function _spline_composite_smooth_laplace(
 end
 
 function _spline_composite_elbo_laplace(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy, newton_max_iter::Int, newton_tol::Float64
+    lds::LinearDynamicalSystem{T,S,O},
+    y,
+    ux0,
+    ux,
+    uy,
+    newton_max_iter::Int,
+    newton_tol::Float64,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T,false}}
     _reject_spline_grouping(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
@@ -621,6 +633,8 @@ function _spline_composite_trial_elbos(
     sites = _spline_sites(lds, data)
     sdata = _spline_shadow_data(data, sites)
     _spline_embed_sites!(sites, data)
-    per_trial = trial_elbos(glds, sdata.y; ux0=sdata.ux0, ux=sdata.ux, uy=sdata.uy, kwargs...)
+    per_trial = trial_elbos(
+        glds, sdata.y; ux0=sdata.ux0, ux=sdata.ux, uy=sdata.uy, kwargs...
+    )
     return per_trial .+ _spline_trial_logjac(T, sites, data, length(data.tsteps))
 end

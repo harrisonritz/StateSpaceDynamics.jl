@@ -137,10 +137,11 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
 - `Q::M`: Process noise covariance matrix.
 - `b::V`: Bias vector (length `latent_dim`).
 - `x0::V`: Initial state mean (length `latent_dim`).
-- `B0::M`: Optional initial-input matrix (`latent_dim × ux0_dim`). With columns,
+- `B0::Matrix{T}`: Optional initial-input matrix (`latent_dim × ux0_dim`). With columns,
     trial `i` has initial mean `B0 * ux0[:, i]`; `x0` is used only when `B0` has
     no columns. The first state `fit_bool` slot fits `B0` in this case. Include
-    a constant row in `ux0` to fit a baseline initial mean.
+    a constant row in `ux0` to fit a baseline initial mean. Stored as a plain
+    `Matrix{T}` (like the priors) so the default works whatever type `A` has.
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
 - `B::M`: Optional dynamics input matrix (`latent_dim × ux_dim`).
     When supplied, inputs `ux` must be passed to `fit!`/`smooth!` via a keyword argument.
@@ -170,7 +171,7 @@ Base.@kwdef mutable struct GaussianStateModel{
     b::V
     x0::V
     P0::M
-    B0::M = zeros(eltype(A), size(A, 1), 0)
+    B0::Matrix{T} = zeros(eltype(A), size(A, 1), 0)
     B::M = zeros(eltype(A), size(A, 1), 0)
     Q_prior::Union{Nothing,IWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing

@@ -508,7 +508,11 @@ no trial and is excluded, so — as for every other emission —
     sum(trial_elbos(lds, y)) + log p(θ) == elbo(lds, y)
 """
 function trial_elbos(
-    lds::LinearDynamicalSystem{T,S,O}, y::Observations{T}; ux0=nothing, ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O},
+    y::Observations{T};
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:SplineGaussianObservationModel{T}}
     _reject_spline_grouping(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)

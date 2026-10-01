@@ -804,7 +804,9 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     if _warped_route(plds, depends_on)
-        return _spline_composite_elbo_laplace(plds, y, ux0, ux, uy, newton_max_iter, newton_tol)
+        return _spline_composite_elbo_laplace(
+            plds, y, ux0, ux, uy, newton_max_iter, newton_tol
+        )
     end
     data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)

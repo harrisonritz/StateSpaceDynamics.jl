@@ -307,7 +307,14 @@ function smooth!(
     ntrials = length(data.tsteps)
 
     if ntrials == 1
-        smooth!(_trial_initial_model(lds, view(data.ux0, :, 1)), tfs[1], _trial(y, 1), sws_pool[1], ux[1], _trial(uy, 1))
+        smooth!(
+            _trial_initial_model(lds, view(data.ux0, :, 1)),
+            tfs[1],
+            _trial(y, 1),
+            sws_pool[1],
+            ux[1],
+            _trial(uy, 1),
+        )
         return tfs
     end
 
@@ -627,7 +634,12 @@ function _smooth_bucket!(
     for trial in trials
         _smooth_mean_only!(
             _trial_initial_model(lds, view(data.ux0, :, trial)),
-            tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial), sws
+            tfs[trial],
+            _trial(y, trial),
+            sws,
+            ux[trial],
+            _trial(uy, trial),
+            sws,
         )
     end
     return nothing
@@ -1703,7 +1715,11 @@ function StatsAPI.loglikelihood(
             for n in trials
                 total_ll += _filter_ll_trial(
                     _trial_initial_model(lds_c, view(data.ux0, :, n)),
-                    data.y[n], data.ux[n], data.uy[n], S_chol, K
+                    data.y[n],
+                    data.ux[n],
+                    data.uy[n],
+                    S_chol,
+                    K,
                 )
             end
         end
@@ -1716,7 +1732,11 @@ function StatsAPI.loglikelihood(
     for n in eachindex(data.y)
         total_ll += _filter_ll_trial(
             _trial_initial_model(lds, view(data.ux0, :, n)),
-            data.y[n], data.ux[n], data.uy[n], S_chol, K
+            data.y[n],
+            data.ux[n],
+            data.uy[n],
+            S_chol,
+            K,
         )
     end
     return total_ll

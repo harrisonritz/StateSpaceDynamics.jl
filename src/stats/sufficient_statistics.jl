@@ -784,18 +784,18 @@ function _aggregate_td_suff_stats_weighted!(
 end
 
 function _aggregate_initial_inputs!(
-    suf::SufficientStatistics{T}, tfs::TrialFilterSmooth{T}, data::Data{T},
-    weights=nothing,
+    suf::SufficientStatistics{T}, tfs::TrialFilterSmooth{T}, data::Data{T}, weights=nothing
 ) where {T<:Real}
     fill!(suf.init_u0y, zero(T))
     fill!(suf.init_u0u0, zero(T))
     isempty(suf.init_u0y) && return suf
+    ux0 = data.ux0::Matrix{T}
     for trial in 1:length(tfs)
-        w = weights === nothing ? one(T) : weights[trial][1]
-        u0 = view(data.ux0, :, trial)
-        x1 = view(tfs[trial].x_smooth, :, 1)
-        BLAS.ger!(w, u0, x1, suf.init_u0y)
-        BLAS.ger!(w, u0, u0, suf.init_u0u0)
+        w = weights === nothing ? one(T) : T(weights[trial][1])
+        u0 = view(ux0, :, trial)
+        x1 = view(tfs[trial].x_smooth::Matrix{T}, :, 1)
+        mul!(suf.init_u0y, u0, x1', w, one(T))
+        mul!(suf.init_u0u0, u0, u0', w, one(T))
     end
     return suf
 end

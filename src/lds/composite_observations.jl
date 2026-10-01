@@ -311,7 +311,9 @@ function Data(
         end,
     )
 
-    return Data(y_seq, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(tsteps)))
+    return Data(
+        y_seq, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(tsteps))
+    )
 end
 
 #=
@@ -953,7 +955,9 @@ its own `Data` is indistinguishable from a single-emission model.
 """
 function _member_datas(data::Data)
     ks = keys(data.y)
-    return NamedTuple{ks}(map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps, data.ux0), ks))
+    return NamedTuple{ks}(
+        map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps, data.ux0), ks)
+    )
 end
 
 # ============================================================================

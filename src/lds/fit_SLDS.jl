@@ -4986,8 +4986,9 @@ function _mstep_grouped!(
     =#
     conditioned = terminal_slds !== nothing && _slds_condition_terminal(terminal_slds)
     probes, sources, _ = if conditioned
+        #= Narrowed for JET: `conditioned` already rules out `nothing`. =#
         _slqr_terminal_probes(
-            terminal_slds, data.ux, _slds_trial_variants(grp); ux0=data.ux0
+            terminal_slds::SLDS, data.ux, _slds_trial_variants(grp); ux0=data.ux0
         )
     else
         (nothing, nothing, nothing)
@@ -5007,7 +5008,15 @@ function _mstep_grouped!(
         )
         false
     else
-        _slqr_chain_mstep!(terminal_slds, dl, fb_storage, obs_seq, seq_ends, probes, sources)
+        _slqr_chain_mstep!(
+            terminal_slds::SLDS,
+            dl,
+            fb_storage,
+            obs_seq,
+            seq_ends,
+            probes::AbstractVector,
+            sources::AbstractVector,
+        )
     end
 
     #=
@@ -5095,7 +5104,14 @@ function _mstep_grouped!(
 
     if conditioned
         _slds_lqr_grouped_conditional_mstep!(
-            cell_slds, unit_suf, grp, K, tied, probes, sources, probe_current
+            cell_slds,
+            unit_suf,
+            grp,
+            K,
+            tied,
+            probes::AbstractVector,
+            sources::AbstractVector,
+            probe_current,
         )
     else
         _grouped_slds_state_mstep!(

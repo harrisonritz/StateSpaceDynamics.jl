@@ -121,7 +121,12 @@ function _holdout_monitor(
     patience >= 1 || throw(ArgumentError("patience must be >= 1, got $patience"))
     min_delta >= 0 || throw(ArgumentError("min_delta must be >= 0, got $min_delta"))
     return HoldoutMonitor{
-        T,typeof(y_test),typeof(ux0_test),typeof(ux_test),typeof(uy_test),typeof(test_kwargs)
+        T,
+        typeof(y_test),
+        typeof(ux0_test),
+        typeof(ux_test),
+        typeof(uy_test),
+        typeof(test_kwargs),
     }(
         y_test,
         ux0_test,
@@ -171,8 +176,15 @@ and `early_stopping` is on.
 """
 function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Real}
     v = T(
-        elbo(model, mon.y; ux0=mon.ux0, ux=mon.ux, uy=mon.uy,
-             depends_on=mon.depends_on, mon.kwargs...)
+        elbo(
+            model,
+            mon.y;
+            ux0=mon.ux0,
+            ux=mon.ux,
+            uy=mon.uy,
+            depends_on=mon.depends_on,
+            mon.kwargs...,
+        ),
     )
     push!(mon.values, v)
     push!(mon.iters, iter)

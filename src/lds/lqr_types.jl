@@ -1078,7 +1078,9 @@ function LQRStateModel(
     )
     _check_gref_cols(fit_flags, size(Gref_m, 2), d)
     length(x0_v) == d || throw(DimensionMismatchError("LQR x0", d, length(x0_v)))
-    B0 === nothing || size(B0, 1) == d || throw(DimensionMismatchError("LQR B0 rows", d, size(B0, 1)))
+    B0 === nothing ||
+        size(B0, 1) == d ||
+        throw(DimensionMismatchError("LQR B0 rows", d, size(B0, 1)))
     size(P0_m) == (d, d) || throw(DimensionMismatchError("LQR P0 rows", d, size(P0_m, 1)))
     size(Σf_m) == (n, n) || throw(DimensionMismatchError("LQR Σf rows", n, size(Σf_m, 1)))
     length(hf_v) == n || throw(DimensionMismatchError("LQR hf", n, length(hf_v)))
@@ -1212,7 +1214,9 @@ function free_state_model(
     length(h_v) == d || throw(DimensionMismatchError("free h", d, length(h_v)))
     size(Bu_m, 1) == d || throw(DimensionMismatchError("free Bu rows", d, size(Bu_m, 1)))
     length(x0_v) == d || throw(DimensionMismatchError("free x0", d, length(x0_v)))
-    B0 === nothing || size(B0, 1) == d || throw(DimensionMismatchError("free B0 rows", d, size(B0, 1)))
+    B0 === nothing ||
+        size(B0, 1) == d ||
+        throw(DimensionMismatchError("free B0 rows", d, size(B0, 1)))
     size(P0_m) == (d, d) || throw(DimensionMismatchError("free P0 rows", d, size(P0_m, 1)))
 
     mstep_iters >= 1 ||
