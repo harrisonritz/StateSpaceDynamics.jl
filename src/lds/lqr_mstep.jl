@@ -87,6 +87,7 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     =#
     const terminal_inputs::Vector{Matrix{T}}
     const terminal_counts::Vector{T}
+    const terminal_ux0::Vector{Vector{T}}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -137,6 +138,7 @@ function _wrap_lqr_suff_stats(
         [zeros(T, d + 1 + m, d + 1 + m) for _ in 1:K],
         Matrix{T}[],
         T[],
+        Vector{T}[],
     )
 end
 
@@ -201,15 +203,18 @@ function _aggregate_lqr_stats!(
 
     empty!(hs.terminal_inputs)
     empty!(hs.terminal_counts)
+    empty!(hs.terminal_ux0)
     if sm.terminal && sm.condition_terminal
-        index = Dict{Matrix{T},Int}()
+        index = Dict{Tuple{Matrix{T},Vector{T}},Int}()
         for i in trials
             u = data.ux[i]
-            slot = get(index, u, 0)
+            u0 = Vector{T}(view(data.ux0, :, i))
+            slot = get(index, (u, u0), 0)
             if slot == 0
                 push!(hs.terminal_inputs, Matrix{T}(u))
                 push!(hs.terminal_counts, one(T))
-                index[hs.terminal_inputs[end]] = length(hs.terminal_inputs)
+                push!(hs.terminal_ux0, u0)
+                index[(hs.terminal_inputs[end], u0)] = length(hs.terminal_inputs)
             else
                 hs.terminal_counts[slot] += one(T)
             end
@@ -2356,11 +2361,8 @@ function _lqr_joint_Q_state!(
 
     # S_init = Σ E[z₁z₁ᵀ] − μ x0ᵀ − x0 μᵀ + N₁ x0 x0ᵀ
     S_init = sws.elbo.temp
-    copyto!(S_init, suf.init_yy[])
-    μ_sum = vec(suf.init_xy)
-    BLAS.ger!(-one(T), μ_sum, x0, S_init)
-    BLAS.ger!(-one(T), x0, μ_sum, S_init)
-    BLAS.ger!(T(N1), x0, x0, S_init)
+    fill!(S_init, zero(T))
+    _accumulate_init_scatter!(S_init, lds, suf)
     ldiv!(P0_U', S_init)
     ldiv!(P0_U, S_init)
     Q_val = T(-0.5) * (T(N1) * (T(d) * log2π + logdet(P0_PD)) + tr(S_init))

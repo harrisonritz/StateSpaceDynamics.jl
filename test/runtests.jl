@@ -544,6 +544,12 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/InitialInputs.jl")
+        @testset "Initial inputs" begin
+            test_initial_inputs()
+            test_lqr_initial_inputs_terminal()
+        end
+
         include("LinearDynamicalSystems/TrialELBO.jl")
         @testset "Per-trial ELBO" begin
             test_trial_elbos_sum_to_elbo()
@@ -600,6 +606,9 @@ using SSDTest
             test_slds_lqr_noise_version_lookup()
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
+            test_slds_lqr_grouped_conditional()
+            test_terminal_normalizer()
+            test_slds_newton_convergence_reported()
             test_slds_lqr_grouped_free_state_pools()
             test_slds_lqr_tied_emission_mask()
             test_slds_lqr_tied_prior_counted_once()

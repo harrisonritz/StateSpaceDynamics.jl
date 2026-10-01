@@ -220,6 +220,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps::Integer;
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     #= A composite emission takes its members' inputs as a NamedTuple keyed by
     member, exactly as the SLDS sampler and `fit!` do; `_check_uy` dispatches on
@@ -232,7 +233,10 @@ function Random.rand(
     end
     grp = parameter_grouping(lds, 1; depends_on=depends_on)
     lds1 = grp === nothing ? lds : _cell_lds(lds, grp, grp.trial_cell[1])
-    state_params = _extract_state_params(lds1.state_model)
+    u0 = _normalize_ux0(ux0, lds.state_model, 1)
+    state_params = _extract_state_params(
+        _trial_initial_model(lds1, view(u0, :, 1)).state_model
+    )
     obs_params = _extract_obs_params(lds1.obs_model)
     Ti = Int(tsteps)
 
@@ -285,6 +289,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     # As the single-trial method: a NamedTuple of per-member sequences under a
     # composite emission, one sequence otherwise.
@@ -300,6 +305,14 @@ function Random.rand(
     written from two branches of an `if` is boxed, which OhMyThreads rejects.
     =#
     state_params, obs_params, alloc_lds = _per_trial_sample_params(lds, grp, ntrials)
+    u0 = _normalize_ux0(ux0, lds.state_model, ntrials)
+    if !isempty(lds.state_model.B0)
+        for i in 1:ntrials
+            state_params[i] = merge(
+                state_params[i], (x0=alloc_lds[i].state_model.B0 * view(u0, :, i),)
+            )
+        end
+    end
 
     x = Vector{Matrix{T}}(undef, ntrials)
     y = Vector{typeof(_alloc_obs(lds, 1))}(undef, ntrials)

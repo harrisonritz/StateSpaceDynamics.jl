@@ -153,6 +153,7 @@ variants are the workspace-based internals it wraps.
 elbo
 trial_elbos
 terminal_logz
+terminal_normalizer
 loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
 loglikelihood(plds::LinearDynamicalSystem{T,S,O}, y) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:PoissonObservationModel{T}}
 loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::NamedTuple) where {T<:Real,SM<:AbstractGaussianStateModel{T},OM<:CompositeObservationModel{T,true}}

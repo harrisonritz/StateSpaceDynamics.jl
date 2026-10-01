@@ -7,7 +7,15 @@ Already compressed by [`_aggregate_lqr_stats!`](@ref); this only pairs the two
 vectors up.
 """
 function _lqr_terminal_designs(hs::LQRSufficientStatistics)
-    return [(ux=u, count=c) for (u, c) in zip(hs.terminal_inputs, hs.terminal_counts)]
+    u0s = if length(hs.terminal_ux0) == length(hs.terminal_inputs)
+        hs.terminal_ux0
+    else
+        [zeros(eltype(u), 0) for u in hs.terminal_inputs]
+    end
+    return [
+        (ux=u, ux0=u0, count=c) for
+        (u, u0, c) in zip(hs.terminal_inputs, u0s, hs.terminal_counts)
+    ]
 end
 
 """Compress identical input trajectories (including their horizons).
@@ -20,12 +28,23 @@ function _lqr_terminal_designs(inputs::Vector{Matrix{T}}) where {T}
     for u in inputs
         counts[u] = get(counts, u, 0) + 1
     end
-    return [(ux=u, count=count) for (u, count) in counts]
+    return [(ux=u, ux0=zeros(T, 0), count=count) for (u, count) in counts]
+end
+
+function _lqr_terminal_designs(inputs::Vector{Matrix{T}}, ux0::AbstractMatrix{T}) where {T}
+    counts = Dict{Tuple{Matrix{T},Vector{T}},Int}()
+    for i in eachindex(inputs)
+        key = (inputs[i], Vector{T}(view(ux0, :, i)))
+        counts[key] = get(counts, key, 0) + 1
+    end
+    return [(ux=u, ux0=u0, count=c) for ((u, u0), c) in counts]
 end
 
 """Exact log p(terminal=0 | inputs), using backward square-root integration.
 Whitening after each transition avoids exponentially large forward covariances."""
-function _lqr_terminal_logz(sm::LQRStateModel{T}, ux::AbstractMatrix{T}) where {T}
+function _lqr_terminal_logz(
+    sm::LQRStateModel{T}, ux::AbstractMatrix{T}, ux0=nothing
+) where {T}
     sm.terminal || return zero(T)
     n = _plant_dim(sm)
     horizon = size(ux, 2)
@@ -46,7 +65,8 @@ function _lqr_terminal_logz(sm::LQRStateModel{T}, ux::AbstractMatrix{T}) where {
     end
     L0 = cholesky(Symmetric(Matrix(sm.P0))).L
     L = LowerTriangular(Matrix(qr(transpose(hcat(Id, H * L0))).R)')
-    residual = L \ (a - H * sm.x0)
+    initial = isempty(sm.B0) ? sm.x0 : sm.B0 * ux0
+    residual = L \ (a - H * initial)
     return value - sum(log, abs.(diag(L))) -
            T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual))
 end
@@ -207,9 +227,12 @@ function _lqr_terminal_logz_batch(
         H = view(Hs, :, :, h)
         mul!(G, H, L0)
         logscale = cum[h] - _whitening_factor!(L, W, tau, G)
-        mul!(Hx0, H, sm.x0)
         R = view(A, :, col:stop)
-        R .-= Hx0
+        for j in col:stop
+            initial = isempty(sm.B0) ? sm.x0 : sm.B0 * designs[order[j]].ux0
+            mul!(Hx0, H, initial)
+            view(R, :, j - col + 1) .-= Hx0
+        end
         ldiv!(LowerTriangular(L), R)
         for (r, j) in enumerate(col:stop)
             total +=
@@ -284,7 +307,8 @@ function _lqr_terminal_probe(sm::LQRStateModel{T}, hs) where {T}
     )
     ux = [v.ux for v in designs]
     ys = [zeros(T, 1, size(u, 2)) for u in ux]
-    data = Data(lds, ys; ux=ux)
+    ux0 = hcat((v.ux0 for v in designs)...)
+    data = Data(lds, ys; ux0=ux0, ux=ux)
     tfs = initialize_FilterSmooth(lds, data.tsteps)
     pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -310,6 +334,7 @@ function _lqr_probe_signature(sm::LQRStateModel)
     return (
         size(sm.A),
         size(sm.Bu),
+        size(sm.B0),
         length(sm.Qc),
         copy(sm.schedule),
         sm.terminal,
@@ -342,15 +367,19 @@ end
 
 function _same_designs(designs, hs)
     length(designs) == length(hs.terminal_inputs) || return false
-    for (d, u, c) in zip(designs, hs.terminal_inputs, hs.terminal_counts)
-        (d.count == c && d.ux == u) || return false
+    for (i, (d, u, c)) in enumerate(zip(designs, hs.terminal_inputs, hs.terminal_counts))
+        (
+            d.count == c &&
+            d.ux == u &&
+            (isempty(hs.terminal_ux0) || d.ux0 == hs.terminal_ux0[i])
+        ) || return false
     end
     return true
 end
 
 function _lqr_sync_probe!(probe, sm)
     target = probe.lds.state_model
-    for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+    for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :B0, :P0)
         copyto!(getproperty(target, key), getproperty(sm, key))
     end
     for k in eachindex(sm.Qc)
@@ -382,12 +411,19 @@ struct _ProbePartial{T<:Real}
     init_x::Vector{T}
     init_yy::Matrix{T}
     init_n::Base.RefValue{T}
+    init_u0y::Matrix{T}
+    init_u0u0::Matrix{T}
 end
 
 function _ProbePartial(hs::LQRSufficientStatistics{T}) where {T<:Real}
     d = size(hs.yy[1], 1)
     return _ProbePartial{T}(
-        _LQRStatsPartial(hs), Vector{T}(undef, d), Matrix{T}(undef, d, d), Ref(zero(T))
+        _LQRStatsPartial(hs),
+        Vector{T}(undef, d),
+        Matrix{T}(undef, d, d),
+        Ref(zero(T)),
+        similar(_state_suf(hs.base).init_u0y),
+        similar(_state_suf(hs.base).init_u0u0),
     )
 end
 
@@ -396,6 +432,8 @@ function _zero!(p::_ProbePartial{T}) where {T}
     fill!(p.init_x, zero(T))
     fill!(p.init_yy, zero(T))
     p.init_n[] = zero(T)
+    fill!(p.init_u0y, zero(T))
+    fill!(p.init_u0u0, zero(T))
     return p
 end
 
@@ -475,6 +513,9 @@ function _lqr_probe_aggregate!(
     init_x = zeros(T, d)
     init_yy = zeros(T, d, d)
     init_n = Ref(zero(T))
+    base = _state_suf(hs.base)
+    init_u0y = zeros(T, size(base.init_u0y))
+    init_u0u0 = zeros(T, size(base.init_u0u0))
 
     function accumulate!(slot, chunk)
         p = _zero!(partials[slot])
@@ -483,7 +524,9 @@ function _lqr_probe_aggregate!(
                 _probe_cov_item!(p, sm, tfs[group_first[item]], group_weight[item], d)
             else
                 i = item - ngroups
-                _probe_mean_item!(p, sm, tfs[i], data.ux[i], counts[i], d, m, reg)
+                _probe_mean_item!(
+                    p, sm, tfs[i], data.ux[i], view(data.ux0, :, i), counts[i], d, m, reg
+                )
             end
         end
         return nothing
@@ -502,6 +545,8 @@ function _lqr_probe_aggregate!(
         init_x .+= p.init_x
         init_yy .+= p.init_yy
         init_n[] += p.init_n[]
+        init_u0y .+= p.init_u0y
+        init_u0u0 .+= p.init_u0u0
         return nothing
     end
     if nbuf == 1
@@ -520,6 +565,8 @@ function _lqr_probe_aggregate!(
     end
     Symmetrize!(init_yy)
     base.init_yy[] = init_yy
+    base.init_u0y .= init_u0y
+    base.init_u0u0 .= init_u0u0
     return _finalize_lqr_stats!(hs, sm, d, m, reg, K)
 end
 
@@ -553,6 +600,7 @@ function _probe_mean_item!(
     sm::LQRStateModel,
     fs::FilterSmooth{T},
     ux::AbstractMatrix{T},
+    ux0::AbstractVector{T},
     w::T,
     d::Int,
     m::Int,
@@ -563,6 +611,10 @@ function _probe_mean_item!(
     p.init_x .+= w .* x1
     BLAS.ger!(w, x1, x1, p.init_yy)
     p.init_n[] += w
+    if !isempty(ux0)
+        BLAS.ger!(w, ux0, x1, p.init_u0y)
+        BLAS.ger!(w, ux0, ux0, p.init_u0u0)
+    end
     return nothing
 end
 
@@ -740,6 +792,8 @@ function _lqr_conditional_problem(
 ) where {T<:Real}
     sms = [lds.state_model for lds in ldss]
     d, n = _state_latent_dim(sms[1]), _plant_dim(sms[1])
+    initkey = isempty(sms[1].B0) ? :x0 : :B0
+    q0 = size(_initial_coefficients(sms[1]), 2)
     fit = ldss[1].fit_bool
     flags = if fit[3]
         sms[1].fit_flags
@@ -759,7 +813,7 @@ function _lqr_conditional_problem(
         Tuple{Symbol,Int,Vector{Int},UnitRange{Int},Matrix{T}},
     }[]
     for (key, slot, enabled, width) in (
-        (:x0, _G_X0, fit[1], d),
+        (initkey, _G_X0, fit[1], d * q0),
         (:P0, _G_P0, fit[2], d * (d + 1) ÷ 2),
         (
             :Σ,
@@ -775,9 +829,9 @@ function _lqr_conditional_problem(
             array = _lqr_conditional_array(sms[first(owners)], key)
             r = (length(theta) + 1):(length(theta) + width)
             append!(theta, zeros(T, width))
-            factor = key === :x0 ? zeros(T, 0, 0) : zeros(T, size(array))
-            if key === :x0
-                theta[r] .= array
+            factor = key === initkey ? zeros(T, 0, 0) : zeros(T, size(array))
+            if key === initkey
+                theta[r] .= vec(array)
             else
                 _lqr_pack_psd!(theta, r, array, string(key))
             end
@@ -788,8 +842,8 @@ function _lqr_conditional_problem(
         _lqr_writeback!(ctx, view(theta, 1:np))
         for block in extras
             array = _lqr_conditional_array(sms[first(block.owners)], block.key)
-            if block.key === :x0
-                copyto!(array, view(theta, block.range))
+            if block.key === initkey
+                array .= reshape(view(theta, block.range), size(array))
             else
                 _lqr_unpack_psd!(array, block.factor, theta, block.range)
                 isposdef(Symmetric(array)) || throw(PosDefException(0))
@@ -880,16 +934,19 @@ function _lqr_conditional_problem(
             # Initial state and its priors, including cross-group x0/P0 pairs.
             for (c, (sm, hs)) in enumerate(zip(sms, sufs))
                 base = _state_suf(hs.base)
-                mu = vec(base.init_xy)
+                UY = isempty(sm.B0) ? base.init_xy : base.init_u0y
+                UU = isempty(sm.B0) ? fill(T(base.init_n), 1, 1) : base.init_u0u0
                 count = T(base.init_n)
                 yy = copy(base.init_yy[])
                 if weighted
                     b = _state_suf(psufs[c].base)
-                    mu -= vec(b.init_xy)
+                    UY = UY - (isempty(sm.B0) ? b.init_xy : b.init_u0y)
+                    UU = UU - (isempty(sm.B0) ? fill(T(b.init_n), 1, 1) : b.init_u0u0)
                     count -= T(b.init_n)
                     yy -= b.init_yy[]
                 end
-                R = yy - mu * sm.x0' - sm.x0 * mu' + count * sm.x0 * sm.x0'
+                C0 = _initial_coefficients(sm)
+                R = yy - C0 * UY - UY' * C0' + C0 * UU * C0'
                 chol_P0 = cholesky(Symmetric(sm.P0); check=false)
                 issuccess(chol_P0) || return T(Inf)
                 W = inv(chol_P0)
@@ -901,7 +958,7 @@ function _lqr_conditional_problem(
             end
             for c in _pair_slot_representatives(slots[_G_X0], slots[_G_P0])
                 sm = sms[c]
-                value -= mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+                value -= mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
             end
             gradient === nothing && return value
 
@@ -911,7 +968,7 @@ function _lqr_conditional_problem(
             which vanish whenever the two posteriors carry the same weight.
             =#
             gradients = Dict(
-                :x0 => [zeros(T, d) for _ in 1:maximum(slots[_G_X0])],
+                initkey => [zeros(T, d, q0) for _ in 1:maximum(slots[_G_X0])],
                 :P0 => [zeros(T, d, d) for _ in 1:maximum(slots[_G_P0])],
                 :Σ => [zeros(T, d, d) for _ in 1:(ctx.nq)],
                 :Σf => [zeros(T, n, n) for _ in 1:(ctx.nq)],
@@ -928,15 +985,21 @@ function _lqr_conditional_problem(
             end
             for (c, (sm, hs)) in enumerate(zip(sms, sufs))
                 a, b = _state_suf(hs.base), _state_suf(psufs[c].base)
-                delta_mu = vec(a.init_xy - b.init_xy)
+                delta_UY = isempty(sm.B0) ? a.init_xy - b.init_xy : a.init_u0y - b.init_u0y
+                delta_UU = if isempty(sm.B0)
+                    fill(T(a.init_n - b.init_n), 1, 1)
+                else
+                    a.init_u0u0 - b.init_u0u0
+                end
                 delta_n = T(a.init_n) - T(b.init_n)
+                C0 = _initial_coefficients(sm)
                 delta_R =
-                    a.init_yy[] - b.init_yy[] - delta_mu * sm.x0' - sm.x0 * delta_mu' +
-                    delta_n * sm.x0 * sm.x0'
+                    a.init_yy[] - b.init_yy[] - C0 * delta_UY - delta_UY' * C0' +
+                    C0 * delta_UU * C0'
                 chol_P0 = cholesky(Symmetric(sm.P0); check=false)
                 issuccess(chol_P0) || return T(Inf)
                 W = inv(chol_P0)
-                gradients[:x0][slots[_G_X0][c]] .+= W * (delta_n .* sm.x0 .- delta_mu)
+                gradients[initkey][slots[_G_X0][c]] .+= W * (C0 * delta_UU - delta_UY')
                 gradients[:P0][slots[_G_P0][c]] .+=
                     T(0.5) .* (delta_n .* W .- W * delta_R * W)
             end
@@ -950,8 +1013,8 @@ function _lqr_conditional_problem(
                 pr = sm.x0_prior
                 pr === nothing && continue
                 W = inv(cholesky(Symmetric(sm.P0)))
-                delta = reshape(sm.x0, :, 1) - pr.M₀
-                gradients[:x0][slots[_G_X0][c]] .+= vec(W * delta * pr.Λ)
+                delta = _initial_coefficients(sm) - pr.M₀
+                gradients[initkey][slots[_G_X0][c]] .+= W * delta * pr.Λ
                 gradients[:P0][slots[_G_P0][c]] .-=
                     T(0.5) .* (W * delta * pr.Λ * delta' * W)
             end
@@ -960,8 +1023,8 @@ function _lqr_conditional_problem(
                 if block.key === :Σ && sms[1].fixed_costate_sigma !== nothing
                     g = view(g, 1:n, 1:n)
                 end
-                if block.key === :x0
-                    gradient[block.range] .= g
+                if block.key === initkey
+                    gradient[block.range] .= vec(g)
                 else
                     dL = (g + g') * block.factor
                     _lqr_pack_psd_gradient!(gradient, block.range, dL, block.factor)

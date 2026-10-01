@@ -97,6 +97,8 @@ mutable struct SufficientStatistics{T<:Real}
     =#
     init_n::T
     init_xy::Matrix{T}
+    init_u0y::Matrix{T}             # Σ u0 E[x1]' (q × latent_dim)
+    init_u0u0::Matrix{T}            # Σ u0 u0' (q × q)
     #= Raw scatter `Σγ(x₁x₁' + P₁)`, only ever read as a plain matrix. Not a PDMat:
     a zero-weight regime makes it the zero matrix (would fail the Cholesky). =#
     init_yy::Base.RefValue{Matrix{T}}

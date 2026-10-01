@@ -236,7 +236,7 @@ function _slds_spline_state(slds::SLDS{T}, data::Data{T}) where {T<:Real}
     else
         NamedTuple{keys(data.y)}(map(k -> get(zmap, k, data.y[k]), keys(data.y)))
     end
-    sdata = Data(sy, data.ux, data.uy, data.tsteps)
+    sdata = Data(sy, data.ux, data.uy, data.tsteps, data.ux0)
 
     state = _SLDSSplineState{T,typeof(shadow),typeof(sdata)}(
         shadow, sdata, sites, gamma, Ref(zero(T))
@@ -399,9 +399,12 @@ function _slds_spline_smooth(
     return_cov::Bool,
     progress::Bool,
     npool::Int,
-    tied::AbstractVector{Symbol}=Symbol[],
+    tied::AbstractVector{Symbol}=Symbol[];
+    ux0=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     # The switching-level checks every entry point runs, on the caller's model
     # and before `_slds_spline_state` starts sharing its warps -- as `fit!` does.
     _prepare_slds!(slds, data.tsteps)
@@ -416,6 +419,7 @@ function _slds_spline_smooth(
     out = smooth(
         state.shadow,
         state.sdata.y;
+        ux0=state.sdata.ux0,
         ux=state.sdata.ux,
         uy=state.sdata.uy,
         smoothing_iters=smoothing_iters,
@@ -424,6 +428,8 @@ function _slds_spline_smooth(
         progress=progress,
         npool=npool,
         tied_params=_shadow_tied_params(state.shadow, tied),
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
 
     per_trial = _slds_trial_logjac(state, data)
@@ -436,6 +442,9 @@ function _slds_spline_smooth(
         trial_elbo=trial_elbo,
         p=out.p,
         terminal_logz=out.terminal_logz,
+        converged=out.converged,
+        newton_unconverged=out.newton_unconverged,
+        iterations=out.iterations,
     )
 end
 

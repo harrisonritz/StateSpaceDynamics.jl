@@ -74,6 +74,7 @@ function Random.rand(
     rng::AbstractRNG,
     slds::SLDS{T,S,O},
     tsteps::Integer;
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -97,6 +98,7 @@ function Random.rand(
     else
         _slds_cell_sldss(slds, grp)[grp.trial_cell[1]].LDSs
     end
+    u0 = _normalize_ux0(ux0, lds1.state_model, 1)
 
     # Sized from the trial's own cell, not the template: `depends_on` groups may
     # observe different channel sets, and then `lds1.obs_dim` is only the first
@@ -105,7 +107,10 @@ function Random.rand(
 
     _prepare_slds!(slds, [Ti])
     _warn_slds_unstable_rollout(slds, Ti)
-    state_params = [_extract_state_params(lds.state_model) for lds in regimes]
+    state_params = [
+        _extract_state_params(_trial_initial_model(lds, view(u0, :, 1)).state_model) for
+        lds in regimes
+    ]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
 
     _sample_slds_trial!(
@@ -129,6 +134,7 @@ function Random.rand(
     rng::AbstractRNG,
     slds::SLDS{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -136,6 +142,7 @@ function Random.rand(
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
     ntrials = length(tsteps_per_trial)
+    u0 = _normalize_ux0(ux0, lds1.state_model, ntrials)
 
     ux_seq = _normalize_multitrial_ux(ux, lds1.ux_dim, tsteps_per_trial, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds1.uy_dim, tsteps_per_trial, T, lds1.obs_model)
@@ -158,6 +165,7 @@ function Random.rand(
         obs_of = fill(base_obs, ntrials)
         # Every trial reads the same emission, so the template sizes them all.
         alloc_of = fill(lds1, ntrials)
+        model_of = fill(slds.LDSs, ntrials)
     else
         cell_slds = _slds_cell_sldss(slds, grp)
         cell_state = [
@@ -170,6 +178,16 @@ function Random.rand(
         obs_of = [cell_obs[grp.trial_cell[n]] for n in 1:ntrials]
         # A group's channel count, not the template's — as in the LDS sampler.
         alloc_of = [cell_slds[grp.trial_cell[n]].LDSs[1] for n in 1:ntrials]
+        model_of = [cell_slds[grp.trial_cell[n]].LDSs for n in 1:ntrials]
+    end
+
+    if !isempty(lds1.state_model.B0)
+        state_of = [
+            [
+                merge(state_of[i][k], (x0=model_of[i][k].state_model.B0 * view(u0, :, i),))
+                for k in eachindex(model_of[i])
+            ] for i in 1:ntrials
+        ]
     end
 
     for trial in 1:ntrials
@@ -1035,6 +1053,7 @@ function smooth!(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
+    converged::Union{Nothing,Base.RefValue{Bool}}=nothing,
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
     tsteps = _ntsteps(y)
@@ -1097,7 +1116,14 @@ function smooth!(
             return nothing
         end
 
-    newton_smooth!(
+    #=
+    Whether the MAP was reached — within `max_iter` steps, without the line
+    search stalling — goes back to the caller through `converged`. A Laplace
+    posterior read off an unconverged mean is scored as if it were the MAP, and
+    against a near-singular innovation covariance that is a large error, so the
+    alternation above this has to know rather than stop on `γ` alone.
+    =#
+    ok = newton_smooth!(
         Val(:max),
         x,
         g,
@@ -1110,6 +1136,7 @@ function smooth!(
         max_iter=max_iter,
         tol=tol,
     )
+    converged === nothing || (converged[] = ok)
 
     # Posterior covariance at the MAP under the Laplace approximation.
     hessian!(ws, slds, x, y, w, uy)
@@ -1191,7 +1218,8 @@ end
 
 """
     smooth(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
-           return_cov=false, progress=false, depends_on=nothing, tied_params=nothing)
+           return_cov=false, progress=false, depends_on=nothing, tied_params=nothing,
+           newton_max_iter=20, newton_tol=1e-6)
 
 Infer the joint posterior of a **fitted** `SLDS` with the parameters held fixed: the
 continuous states `q(x)`, the discrete responsibilities `γₜ(k) = q(zₜ = k)`, and the
@@ -1218,8 +1246,13 @@ held-out data.
 
 # Keywords
 - `smoothing_iters::Int=100`: maximum discrete↔continuous alternations.
-- `tol::Real=1e-6`: stop once `max|Δγ| < tol`; `tol=0` runs exactly `smoothing_iters`
-  alternations with no stopping test.
+- `tol::Real=1e-6`: stop once `max|Δγ| < tol` and every trial's Newton solve in that
+  alternation reached its MAP; `tol=0` runs exactly `smoothing_iters` alternations
+  with no stopping test.
+- `newton_max_iter::Int=20`, `newton_tol::Real=1e-6`: the cap and tolerance of each
+  trial's Newton solve for `q(x)` within one alternation. A solve that hits the cap
+  resumes from where it stopped in the next alternation, so the cap bounds one pass,
+  not the posterior's accuracy — as long as `smoothing_iters` leaves room.
 - `return_cov::Bool=false`: also return the smoothed covariances (`latent_dim² × T` per
   trial — large, hence opt-in).
 - `progress::Bool=false`: show a progress bar.
@@ -1236,7 +1269,8 @@ held-out data.
   same `tied_params` reports. No effect without priors.
 
 # Returns
-A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz)`. For a single-trial matrix `y`, `x` is
+A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz, converged,
+newton_unconverged, iterations)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
@@ -1251,6 +1285,15 @@ is reported because it is a *variational estimate* for a switching model, which 
 `elbo` a difference of two bounds rather than a bound: read the two together before
 attributing a score gap to fit quality. See [`terminal_logz`](@ref).
 
+`converged` says whether the alternation met its stopping rule (always `false` with
+`tol=0`), and `newton_unconverged` counts the trials whose Newton solve stopped short
+of the MAP in the final alternation. A nonzero count means `elbo` was scored at a
+posterior mean that is not a MAP: raise `smoothing_iters` or `newton_max_iter`.
+`iterations` is how many alternations ran. Solves that make no progress once `γ` has
+settled end the alternation early, unconverged, rather than running out
+`smoothing_iters`; a solve stalled at roundoff will not finish with a higher cap either,
+and loosening `newton_tol` is then what lets it count as converged.
+
 Because a converged alternation is expensive, `smooth` returns everything it computed in
 one call — read its `elbo` / `trial_elbo` fields rather than calling [`elbo`](@ref) or
 [`trial_elbos`](@ref) separately.
@@ -1260,6 +1303,7 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -1269,6 +1313,8 @@ function smooth(
     npool::Int=Threads.maxthreadid(),
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
@@ -1278,7 +1324,19 @@ function smooth(
         depends_on === nothing ||
             throw(ArgumentError("`depends_on` is not supported for a spline emission"))
         return _slds_spline_smooth(
-            slds, y, ux, uy, smoothing_iters, tol, return_cov, progress, npool, tied
+            slds,
+            y,
+            ux,
+            uy,
+            smoothing_iters,
+            tol,
+            return_cov,
+            progress,
+            npool,
+            tied;
+            ux0=ux0,
+            newton_max_iter=newton_max_iter,
+            newton_tol=newton_tol,
         )
     end
     #=
@@ -1287,9 +1345,10 @@ function smooth(
     `depends_on` into per-cell parameter views, and the discrete layer wraps the
     (K × ΣT) log-likelihood matrix the forward-backward pass reads.
     =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
     y_seq = data.y
+    ux0_seq = data.ux0
     ux_seq = data.ux
     uy_seq = data.uy
 
@@ -1302,6 +1361,8 @@ function smooth(
 
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
+    # Before the alternation, which a refused grouping would otherwise pay for.
+    _slds_check_grouped_conditioning(slds, grp)
 
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
     dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
@@ -1328,9 +1389,12 @@ function smooth(
         plan,
         tsteps_per_trial,
         K;
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
 
     prog = if progress
@@ -1339,7 +1403,7 @@ function smooth(
         nothing
     end
 
-    _, converged = _vem_alternate!(
+    iterations, converged, newton_unconverged = _vem_alternate!(
         slds,
         cell_slds,
         grp,
@@ -1352,17 +1416,20 @@ function smooth(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
         smoothing_iters=smoothing_iters,
         tol=T(tol),
         prog=prog,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
     prog !== nothing && finish!(prog)
 
     if tol > 0 && !converged
-        @warn "SLDS smoothing did not converge" smoothing_iters tol
+        @warn "SLDS smoothing did not converge" iterations smoothing_iters tol newton_unconverged newton_max_iter
     end
 
     #=
@@ -1383,6 +1450,7 @@ function smooth(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0_seq,
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
@@ -1399,6 +1467,7 @@ function smooth(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0_seq,
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
@@ -1407,25 +1476,16 @@ function smooth(
     end
     #=
     Terminal conditioning, per trial so the vector stays the per-trial split of
-    the returned total. A grouped fit would need one probe per cell, which is
-    not built yet, so refuse rather than quietly report the joint score.
+    the returned total. A grouping that leaves the state side shared (the
+    stitched fit) has one normalizer, the parent model's; one that splits the
+    state would need a probe per cell, which is not built, and is refused rather
+    than quietly reporting the joint score.
     =#
     terminal_logz = zero(T)
-    if grp === nothing
-        logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends)
-        if logz !== nothing
-            trial_elbo = trial_elbo .- logz
-            terminal_logz = sum(logz)
-        end
-    elseif _slds_condition_terminal(slds)
-        throw(
-            ArgumentError(
-                "terminal conditioning is not implemented for grouped switching fits: " *
-                "each cell has its own parameters and so its own normalizer. Fit the " *
-                "cells separately, or set `condition_terminal=false` on every " *
-                "inverse-LQR discrete state to score the joint objective instead.",
-            ),
-        )
+    logz = _slds_terminal_trial_logz(slds, ux_seq, seq_ends; ux0=ux0_seq)
+    if logz !== nothing
+        trial_elbo = trial_elbo .- logz
+        terminal_logz = sum(logz)
     end
     total_elbo = sum(trial_elbo) + prior_logdensity
 
@@ -1440,7 +1500,16 @@ function smooth(
     end
 
     return _collect_slds_smooth_output(
-        x_trials, γ_trials, p_trials, total_elbo, trial_elbo, y, terminal_logz
+        x_trials,
+        γ_trials,
+        p_trials,
+        total_elbo,
+        trial_elbo,
+        y,
+        terminal_logz,
+        converged,
+        newton_unconverged,
+        iterations,
     )
 end
 
@@ -1455,7 +1524,16 @@ would be indistinguishable from `elbo` — which for one trial and no priors is
 the same number.
 =#
 function _collect_slds_smooth_output(
-    x, γ, p, total_elbo, trial_elbo, ::AbstractMatrix, terminal_logz
+    x,
+    γ,
+    p,
+    total_elbo,
+    trial_elbo,
+    ::AbstractMatrix,
+    terminal_logz,
+    converged,
+    newton_unconverged,
+    iterations,
 )
     return (;
         x=x[1],
@@ -1464,12 +1542,34 @@ function _collect_slds_smooth_output(
         trial_elbo=trial_elbo,
         p=(p === nothing ? nothing : p[1]),
         terminal_logz=terminal_logz,
+        converged=converged,
+        newton_unconverged=newton_unconverged,
+        iterations=iterations,
     )
 end
 
-function _collect_slds_smooth_output(x, γ, p, total_elbo, trial_elbo, _, terminal_logz)
+function _collect_slds_smooth_output(
+    x,
+    γ,
+    p,
+    total_elbo,
+    trial_elbo,
+    _,
+    terminal_logz,
+    converged,
+    newton_unconverged,
+    iterations,
+)
     return (;
-        x=x, γ=γ, elbo=total_elbo, trial_elbo=trial_elbo, p=p, terminal_logz=terminal_logz
+        x=x,
+        γ=γ,
+        elbo=total_elbo,
+        trial_elbo=trial_elbo,
+        p=p,
+        terminal_logz=terminal_logz,
+        converged=converged,
+        newton_unconverged=newton_unconverged,
+        iterations=iterations,
     )
 end
 
@@ -1674,6 +1774,7 @@ function _slds_fill_logL!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -1710,6 +1811,8 @@ function _slds_fill_logL!(
             x_src = x_of(trial)
             y_trial = _trial(y, trial)
             ux_trial = ux === nothing ? nothing : ux[trial]
+            initial_slds =
+                ux0 === nothing ? slds_t : _trial_initial_model(slds_t, view(ux0, :, trial))
             uy_trial = uy === nothing ? nothing : _trial(uy, trial)
             ln_trial = lognorm === nothing ? nothing : lognorm[trial]
             for k in 1:K
@@ -1718,7 +1821,7 @@ function _slds_fill_logL!(
                     ll_k,
                     ws_t,
                     ws_t.consts[k],
-                    slds_t.LDSs[k],
+                    initial_slds.LDSs[k],
                     x_src,
                     y_trial,
                     ux_trial,
@@ -1731,7 +1834,7 @@ function _slds_fill_logL!(
                         ll_k,
                         ws_t,
                         ws_t.consts[k],
-                        slds_t.LDSs[k],
+                        initial_slds.LDSs[k],
                         x_src,
                         y_trial,
                         tfs[trial],
@@ -1764,6 +1867,11 @@ should consume, or `nothing` to have the trial draw its own from
 `rng_of(trial)`. Between them these are the two reproducibility modes: a
 pre-drawn stream keeps the global-RNG semantics under parallelism, a per-trial
 generator makes the draw independent of both scheduling and thread count.
+
+`newton_max_iter` / `newton_tol` bound each trial's Newton solve for the MAP.
+Returns how many trials stopped short of it — at the cap, or on a stalled line
+search — so the caller can keep alternating rather than read an unconverged mean
+as a posterior.
 """
 function _slds_smooth_all!(
     slds::SLDS{T},
@@ -1777,14 +1885,20 @@ function _slds_smooth_all!(
     w_of;
     rng_of=_ -> Random.default_rng(),
     noise_of=_ -> nothing,
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
     grouped = grp !== nothing && cell_slds !== nothing
+    #= Trials whose Newton solve stopped short of the MAP, counted per task slot
+    so no two tasks write one counter; summed once the pass is done. =#
+    unconverged = zeros(Int, _plan_ntasks(plan))
 
     tforeach(1:_plan_ntasks(plan)) do slot
-        local lo, hi, cur_cell, ws_t, slds_t
+        local lo, hi, cur_cell, ws_t, slds_t, ok
         lo = plan.bounds[slot]
         hi = plan.bounds[slot + 1] - 1
         lo > hi && return nothing
@@ -1792,6 +1906,7 @@ function _slds_smooth_all!(
         cur_cell = 0
         ws_t = pool.slots[slot]
         slds_t = slds
+        ok = Ref(true)
 
         for idx in lo:hi
             trial = plan.order[idx]
@@ -1803,7 +1918,11 @@ function _slds_smooth_all!(
             end
 
             smooth!(
-                slds_t,
+                if ux0 === nothing
+                    slds_t
+                else
+                    _trial_initial_model(slds_t, view(ux0, :, trial))
+                end,
                 tfs[trial],
                 _trial(y, trial),
                 w_of(trial);
@@ -1814,11 +1933,15 @@ function _slds_smooth_all!(
                 ux=(ux === nothing ? nothing : ux[trial]),
                 uy=(uy === nothing ? nothing : _trial(uy, trial)),
                 lognorm_t=(lognorm === nothing ? nothing : lognorm[trial]),
+                max_iter=newton_max_iter,
+                tol=T(newton_tol),
+                converged=ok,
             )
+            ok[] || (unconverged[slot] += 1)
         end
         return nothing
     end
-    return nothing
+    return sum(unconverged)
 end
 
 # ============================================================================
@@ -1936,9 +2059,18 @@ difference between the two callers:
 `nothing` keeps every step on the ungrouped code path.
 
 `tol` selects the stopping rule. `tol == 0` runs exactly `smoothing_iters`
-alternations; `tol > 0` stops early once `max|Δγ| < tol`.
+alternations; `tol > 0` stops early once `max|Δγ| < tol` *and* every trial's Newton
+solve in that alternation reached its MAP. `γ` alone is not enough: it can settle
+while the continuous means are still moving — each Newton solve is capped at
+`newton_max_iter` steps — and a mean scored as a MAP when it is not one is scored
+against the posterior covariance of a different point. Each further alternation
+resumes the solves from where they stopped, so the cap bounds one pass, not the
+whole E-step. Once `γ` has stayed settled for two alternations, one that finishes
+none of the remaining solves ends the loop too, unconverged: those solves are
+stalled, and running out `smoothing_iters` would not move them.
 
-Returns `(iters, converged)`.
+Returns `(iters, converged, newton_unconverged)`, the last being how many trials'
+Newton solves stopped short in the final alternation.
 """
 function _vem_alternate!(
     slds::SLDS{T},
@@ -1953,6 +2085,7 @@ function _vem_alternate!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -1963,6 +2096,8 @@ function _vem_alternate!(
     rng_mode::Symbol=:trial,
     noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
     prog=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
     smoothing_iters >= 1 ||
         throw(ArgumentError("smoothing_iters must be ≥ 1, got $smoothing_iters"))
@@ -1991,6 +2126,7 @@ function _vem_alternate!(
             pool,
             plan;
             seq_ends=seq_ends,
+            ux0=ux0,
             ux=ux,
             uy=uy,
             lognorm=lognorm,
@@ -2007,6 +2143,9 @@ function _vem_alternate!(
     γ_prev = tol > 0 ? fill(T(Inf), K, last(seq_ends)) : nothing
     converged = false
     iters = 0
+    unconverged = 0
+    unconverged_prev = typemax(Int)
+    settled_prev = false
 
     for iter in 1:smoothing_iters
         iters = iter
@@ -2082,7 +2221,7 @@ function _vem_alternate!(
         previous draw.
         =#
         rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
-        _slds_smooth_all!(
+        unconverged = _slds_smooth_all!(
             slds,
             cell_slds,
             grp,
@@ -2094,9 +2233,12 @@ function _vem_alternate!(
             w_of;
             rng_of=rng_of,
             noise_of=noise_of,
+            ux0=ux0,
             ux=ux,
             uy=uy,
             lognorm=lognorm,
+            newton_max_iter=newton_max_iter,
+            newton_tol=newton_tol,
         )
 
         prog !== nothing && next!(prog)
@@ -2108,16 +2250,32 @@ function _vem_alternate!(
                     d = abs(fb_storage.γ[i] - γ_prev[i])
                     d > Δγ && (Δγ = d)
                 end
-                if Δγ < tol
-                    converged = true
-                    break
+                settled = Δγ < tol
+                if settled
+                    if unconverged == 0
+                        converged = true
+                        break
+                    end
+                    #= With `γ` settled across this alternation and the one before,
+                    both handed the same Newton problems more steps. If this one
+                    finished none of the solves the last left short, they are
+                    stalled (typically at roundoff on an ill-conditioned
+                    posterior), and more alternations would run out
+                    `smoothing_iters` without changing anything. Stop, and leave
+                    them reported as unconverged. One settled alternation is not
+                    enough: the solves in it started from means fitted under the
+                    previous `γ`, so a capped solve may only confirm its MAP in
+                    the next. =#
+                    settled_prev && unconverged >= unconverged_prev && break
                 end
+                settled_prev = settled
             end
             copyto!(γ_prev, fb_storage.γ)
+            unconverged_prev = unconverged
         end
     end
 
-    return iters, converged
+    return iters, converged, unconverged
 end
 
 """
@@ -2135,6 +2293,9 @@ each alternation. `obs_seq`/`control_seq` are the HMMs.jl placeholder sequences 
 (`ux[trial]` is `(ux_dim, T_trial)`, `uy[trial]` is `(uy_dim, T_trial)`); they
 feed the per-regime `Bₖ u` / `Dₖ v` terms of every trial's smoother and
 log-likelihood fill. `nothing` (the default) means no inputs.
+
+`newton_max_iter` / `newton_tol` bound each trial's Newton solve for `q(x)`. Returns
+how many trials' solves stopped short of the MAP in the last alternation.
 """
 function estep!(
     slds::SLDS{T,S,O},
@@ -2151,12 +2312,15 @@ function estep!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
-    _vem_alternate!(
+    _, _, unconverged = _vem_alternate!(
         slds,
         nothing,
         nothing,
@@ -2169,6 +2333,7 @@ function estep!(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -2177,8 +2342,10 @@ function estep!(
         rng=rng,
         rng_mode=rng_mode,
         noise_bufs=noise_bufs,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
-    return nothing
+    return unconverged
 end
 
 """
@@ -2206,6 +2373,8 @@ function estep!(
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
     smoothing_iters::Int=1,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return estep!(
         slds,
@@ -2226,6 +2395,8 @@ function estep!(
         uy=uy,
         lognorm=lognorm,
         smoothing_iters=smoothing_iters,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
 end
 
@@ -2522,13 +2693,26 @@ function elbo!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     per_trial = _slds_trial_elbos(
-        slds, nothing, nothing, tfs, fb_storage, y, pool, plan; seq_ends, ux, uy, lognorm
+        slds,
+        nothing,
+        nothing,
+        tfs,
+        fb_storage,
+        y,
+        pool,
+        plan;
+        seq_ends,
+        ux0,
+        ux,
+        uy,
+        lognorm,
     )
     total = sum(per_trial) + _slds_prior_logdensity(slds, tied)
     #=
@@ -2537,7 +2721,7 @@ function elbo!(
     total is a difference of two bounds rather than a bound; `terminal_logz`
     returns the subtracted half on its own.
     =#
-    logz = _slds_terminal_trial_logz(slds, ux, seq_ends)
+    logz = _slds_terminal_trial_logz(slds, ux, seq_ends; ux0=ux0)
     logz === nothing || (total -= sum(logz))
     return total
 end
@@ -2556,6 +2740,7 @@ function elbo!(
     y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple},
     slds_ws::SLDSSmoothWorkspace{T};
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
@@ -2569,6 +2754,7 @@ function elbo!(
         _slds_solo_pool(slds_ws),
         _slds_trial_plan(nothing, _ntrials(y), 1);
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -2599,6 +2785,7 @@ function _slds_trial_elbos(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
@@ -2627,7 +2814,11 @@ function _slds_trial_elbos(
 
             t1, t2 = HMMs.seq_limits(seq_ends, trial)
             per_trial[trial] = _slds_trial_elbo(
-                slds_t,
+                if ux0 === nothing
+                    slds_t
+                else
+                    _trial_initial_model(slds_t, view(ux0, :, trial))
+                end,
                 tfs[trial],
                 fb_storage,
                 _trial(y, trial),
@@ -2647,14 +2838,16 @@ end
 
 """
     elbo(slds, y; ux=nothing, uy=nothing, smoothing_iters=100, tol=1e-6,
-         progress=false, depends_on=nothing, tied_params=nothing)
+         progress=false, depends_on=nothing, tied_params=nothing,
+         newton_max_iter=20, newton_tol=1e-6)
 
 Evidence lower bound of an `SLDS` at the current parameters — the `elbo` field of
 [`smooth`](@ref)`(slds, y)`, which infers `q(x)` and `q(z)` by deterministic
 coordinate ascent before evaluating the bound. Deterministic and reproducible.
 
 Accepts the same observation and input forms as [`smooth`](@ref), and the same
-`smoothing_iters` / `tol` / `tied_params` keywords. Returns a scalar.
+`smoothing_iters` / `tol` / `tied_params` / `newton_max_iter` / `newton_tol`
+keywords. Returns a scalar.
 
 If you also want the posteriors that produced it, call [`smooth`](@ref) once and read
 its `elbo` field rather than paying for the alternation twice.
@@ -2664,6 +2857,7 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     smoothing_iters::Int=100,
@@ -2671,10 +2865,13 @@ function elbo(
     progress::Bool=false,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return smooth(
         slds,
         y;
+        ux0=ux0,
         ux=ux,
         uy=uy,
         smoothing_iters=smoothing_iters,
@@ -2683,6 +2880,8 @@ function elbo(
         progress=progress,
         depends_on=depends_on,
         tied_params=tied_params,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     ).elbo
 end
 
@@ -3144,6 +3343,7 @@ function mstep!(
     sws::SmoothWorkspace{T};
     obs_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
@@ -3164,7 +3364,7 @@ function mstep!(
     at entry and passes it in — the shapes cannot change between iterations, so
     re-validating every trial each M-step is pure overhead.
     =#
-    dat = data === nothing ? Data(slds.LDSs[1], y; ux=ux, uy=uy) : data
+    dat = data === nothing ? Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy) : data
 
     #=
     The discrete transition and initial probabilities. Under terminal
@@ -3173,7 +3373,7 @@ function mstep!(
     normalizer's probe is built for that check and reused by the state M-step.
     =#
     conditioned = _slds_condition_terminal(slds)
-    probe = conditioned ? _slqr_terminal_probe(slds, dat.ux) : nothing
+    probe = conditioned ? _slqr_terminal_probe(slds, dat.ux; ux0=dat.ux0) : nothing
     probe_current = if probe === nothing
         StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
         false
@@ -3304,15 +3504,21 @@ function mstep!(
     D = slds.LDSs[1].latent_dim
     suf = _slds_init_suf(sf_state[1])
     init_xy = zeros(T, 1, D)
+    init_u0y = zeros(T, size(suf.init_u0y))
+    init_u0u0 = zeros(T, size(suf.init_u0u0))
     init_yy = zeros(T, D, D)
     init_n = zero(T)
     for k in 1:K
         base_k = _slds_init_suf(sf_state[k])
         init_xy .+= base_k.init_xy
+        init_u0y .+= base_k.init_u0y
+        init_u0u0 .+= base_k.init_u0u0
         init_yy .+= base_k.init_yy[]
         init_n += T(base_k.init_n)
     end
     copyto!(suf.init_xy, init_xy)
+    copyto!(suf.init_u0y, init_u0y)
+    copyto!(suf.init_u0u0, init_u0u0)
     suf.init_yy[] = init_yy
     suf.init_n = init_n
     # Already fitted, against `log Z`, by the conditional state M-step above.
@@ -3507,6 +3713,7 @@ function _update_shared_initial_state!(
     =#
     if scratch !== nothing
         copyto!(lds1.state_model.x0, slds.LDSs[1].state_model.x0)
+        copyto!(lds1.state_model.B0, slds.LDSs[1].state_model.B0)
         copyto!(lds1.state_model.P0, slds.LDSs[1].state_model.P0)
     end
     update_initial_state_mean!(lds1, suf)
@@ -3514,6 +3721,7 @@ function _update_shared_initial_state!(
     fit_x0, fit_P0 = lds1.fit_bool[1], lds1.fit_bool[2]
     for k in eachindex(slds.LDSs)
         fit_x0 && copyto!(slds.LDSs[k].state_model.x0, lds1.state_model.x0)
+        fit_x0 && copyto!(slds.LDSs[k].state_model.B0, lds1.state_model.B0)
         fit_P0 && copyto!(slds.LDSs[k].state_model.P0, lds1.state_model.P0)
     end
     return nothing
@@ -3588,6 +3796,18 @@ LBFGS rather than from sufficient statistics, or alongside `depends_on`, which
 already splits the regression per group of trials — those throw rather than
 guess.
 
+Inverse-LQR regimes that condition on their terminal factor fit
+`log p(y | terminal = 0)` under `depends_on` too, as long as the grouping leaves
+the state parameters shared — the stitched fit, one emission per session and one
+set of control problems. The normalizer depends on the dynamics, the chain, the
+inputs and the horizon, never on the emission, so every cell shares it. A grouping
+that splits the state side is refused at entry.
+
+`newton_max_iter` / `newton_tol` (default 20 / `1e-6`) bound each trial's Newton
+solve for `q(x)` within one E-step alternation. The solve resumes from its last
+mean at the next iteration, so the cap bounds one pass; a fit whose final E-step
+still leaves trials short of the MAP warns.
+
 # Parallelism and reproducibility
 
 Every per-trial pass — the smoother, the discrete layer's log-likelihood fill,
@@ -3649,6 +3869,7 @@ function fit!(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=50,
@@ -3662,6 +3883,7 @@ function fit!(
     depends_on::Union{Nothing,NamedTuple}=nothing,
     tied_params=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -3671,12 +3893,15 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     rng_mode in (:trial, :global) ||
         throw(ArgumentError("rng_mode must be :trial or :global, got $(repr(rng_mode))"))
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -3685,8 +3910,16 @@ function fit!(
         patience=patience,
         min_delta=min_delta,
         restore_best=restore_best,
-        # The held-out score counts a shared group's prior as the trace does.
-        test_kwargs=merge((; tied_params=tied_params), test_kwargs),
+        #= The held-out score counts a shared group's prior as the trace does, and
+        solves for `q(x)` under the same Newton budget; `test_kwargs` overrides. =#
+        test_kwargs=merge(
+            (;
+                tied_params=tied_params,
+                newton_max_iter=newton_max_iter,
+                newton_tol=newton_tol,
+            ),
+            test_kwargs,
+        ),
     )
     tied = _resolve_tied_params(
         slds.LDSs[1].state_model, slds.LDSs[1].obs_model, tied_params
@@ -3696,7 +3929,7 @@ function fit!(
     observation/input forms (regime dims are uniform, so validating against
     LDSs[1] covers all regimes). Absent ux/uy become zero-row matrices.
     =#
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
     #=
     A warped emission fits on its embedding. `target` stays the model the caller
@@ -3716,6 +3949,7 @@ function fit!(
         data = spline_state.sdata
     end
     y_seq = data.y
+    ux0_seq = data.ux0
     ux_seq = data.ux
     uy_seq = data.uy
 
@@ -3736,6 +3970,9 @@ function fit!(
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on, y=y_seq)
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
     _validate_tied_params(slds.LDSs[1], tied, grp !== nothing)
+    #= Before any work: a grouping the terminal normalizer cannot follow would
+    otherwise run the whole fit and fail at the first score. =#
+    _slds_check_grouped_conditioning(slds, grp)
 
     # Continuous-state smoother storage (per-trial sized).
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
@@ -3871,10 +4108,15 @@ function fit!(
         rng=rng,
         rng_mode=rng_mode,
         noise_bufs=noise_bufs,
+        ux0=ux0_seq,
         ux=ux_seq,
         uy=uy_seq,
         lognorm=lognorm,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
+    # Trials the latest E-step left short of their MAP; see the warning below.
+    newton_unconverged = 0
 
     for iter in 1:max_iter
         # The warp moved in the previous M-step, so refresh `z = g(y)` in place.
@@ -3884,7 +4126,7 @@ function fit!(
         re-smooth q(x), and draw the next samples for the following iteration.
         =#
         if grp === nothing
-            estep!(
+            newton_unconverged = estep!(
                 slds,
                 tfs,
                 fb_storage,
@@ -3899,10 +4141,13 @@ function fit!(
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
                 smoothing_iters=smoothing_iters,
+                newton_max_iter=newton_max_iter,
+                newton_tol=newton_tol,
             )
 
             # Compute the ELBO at the current posteriors.
@@ -3914,6 +4159,7 @@ function fit!(
                 pool,
                 plan;
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
@@ -3950,6 +4196,7 @@ function fit!(
                 sws;
                 obs_seq=obs_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 tied=tied,
@@ -3976,7 +4223,7 @@ function fit!(
         else
             grouping = grp::ParameterGrouping
             cells = cell_slds::Vector
-            _estep_grouped!(
+            newton_unconverged = _estep_grouped!(
                 cells,
                 grouping,
                 tfs,
@@ -3992,10 +4239,13 @@ function fit!(
                 obs_seq=obs_seq,
                 control_seq=control_seq,
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
                 smoothing_iters=smoothing_iters,
+                newton_max_iter=newton_max_iter,
+                newton_tol=newton_tol,
             )
 
             elbos[iter] = _elbo_grouped!(
@@ -4007,10 +4257,12 @@ function fit!(
                 pool,
                 plan;
                 seq_ends=seq_ends,
+                ux0=ux0_seq,
                 ux=ux_seq,
                 uy=uy_seq,
                 lognorm=lognorm,
                 tied=tied,
+                terminal_slds=slds,
             )
 
             #=
@@ -4046,6 +4298,7 @@ function fit!(
                 ntasks=npool,
                 bufs=mstep_bufs,
                 cell_views=cell_views,
+                terminal_slds=slds,
             )
         end
 
@@ -4055,6 +4308,20 @@ function fit!(
     if prog !== nothing
         finish!(prog)
     end
+    #=
+    The last trace entry is scored at the final E-step's `q(x)`. Earlier ones
+    matter less — each iteration resumes every Newton solve from its last mean —
+    but a final pass that stopped short is a final score read off means that are
+    not MAPs, and that is worth saying once.
+    =#
+    newton_unconverged > 0 && @warn(
+        "SLDS fit: the final E-step left trials short of their Newton MAP; the " *
+            "last ELBO is scored at unconverged means. Raise `newton_max_iter` or " *
+            "`smoothing_iters`.",
+        newton_unconverged,
+        newton_max_iter,
+        maxlog = 1,
+    )
     return _fit_result(monitor, elbos, target)
 end
 
@@ -4091,9 +4358,12 @@ function _slds_warmstart!(
     rng::AbstractRNG=Random.default_rng(),
     rng_mode::Symbol=:trial,
     noise_bufs::Union{Nothing,AbstractVector{<:AbstractVector{T}}}=nothing,
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
     function w_of(trial)
         return fill(one(T) / K, K, tsteps[trial])
@@ -4102,6 +4372,9 @@ function _slds_warmstart!(
     # The warm start's draw is simply the first one off `rng`.
     rng_of, noise_of = _slds_draw_sources(rng, rng_mode, x_samples, noise_bufs)
 
+    #= The count is not acted on here: the alternation that follows resumes each
+    trial's Newton solve from where this one stopped, and it is that pass's
+    count the stopping rule reads. =#
     _slds_smooth_all!(
         slds,
         cell_slds,
@@ -4114,9 +4387,12 @@ function _slds_warmstart!(
         w_of;
         rng_of=rng_of,
         noise_of=noise_of,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
     return nothing
 end
@@ -4309,17 +4585,20 @@ function _estep_grouped!(
     obs_seq::AbstractVector,
     control_seq::AbstractVector,
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     smoothing_iters::Int=1,
+    newton_max_iter::Int=20,
+    newton_tol::Real=1e-6,
 ) where {T<:Real}
     #=
     Cell 1 stands in for the parent only where `_vem_alternate!` needs a regime
     count and the ungrouped fall-through; every parameter read goes through
     `cell_slds` because `grp` is non-`nothing`.
     =#
-    _vem_alternate!(
+    _, _, unconverged = _vem_alternate!(
         cell_slds[1],
         cell_slds,
         grp,
@@ -4332,6 +4611,7 @@ function _estep_grouped!(
         obs_seq=obs_seq,
         control_seq=control_seq,
         seq_ends=seq_ends,
+        ux0=ux0,
         ux=ux,
         uy=uy,
         lognorm=lognorm,
@@ -4340,8 +4620,10 @@ function _estep_grouped!(
         rng=rng,
         rng_mode=rng_mode,
         noise_bufs=noise_bufs,
+        newton_max_iter=newton_max_iter,
+        newton_tol=newton_tol,
     )
-    return nothing
+    return unconverged
 end
 
 """
@@ -4363,10 +4645,16 @@ function _grouped_slds_prior_logdensity(
 end
 
 """
-    _elbo_grouped!(cell_slds, grp, tfs, fb_storage, y, slds_ws; seq_ends, ux, uy)
+    _elbo_grouped!(cell_slds, grp, tfs, fb_storage, y, slds_ws; seq_ends, ux, uy,
+                   terminal_slds=nothing)
 
 Grouped SLDS ELBO: each trial's contribution evaluated against its cell's
 parameters, plus one prior term per distinct parameter version.
+
+`terminal_slds` is the parent model. When it conditions on its terminal factor
+the total is `log p(y | terminal = 0)`, as on the ungrouped path; the grouping
+must leave the state side shared (see [`_slds_check_grouped_conditioning`](@ref)),
+so the parent's normalizer is every cell's.
 """
 function _elbo_grouped!(
     cell_slds::AbstractVector,
@@ -4377,10 +4665,12 @@ function _elbo_grouped!(
     pool::SLDSWorkspacePool{T},
     plan::SLDSTrialPlan;
     seq_ends::AbstractVector{Int},
+    ux0::Union{Nothing,AbstractMatrix{T}}=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
+    terminal_slds::Union{Nothing,SLDS}=nothing,
 ) where {T<:Real}
     per_trial = _slds_trial_elbos(
         cell_slds[1],
@@ -4392,11 +4682,18 @@ function _elbo_grouped!(
         pool,
         plan;
         seq_ends,
+        ux0,
         ux,
         uy,
         lognorm,
     )
-    return sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
+    total = sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
+    if terminal_slds !== nothing
+        _slds_check_grouped_conditioning(terminal_slds, grp)
+        logz = _slds_terminal_trial_logz(terminal_slds, ux, seq_ends; ux0=ux0)
+        logz === nothing || (total -= sum(logz))
+    end
+    return total
 end
 
 """
@@ -4416,6 +4713,7 @@ function _broadcast_initial_state!(
         for k in 2:K
             dst = slds_c.LDSs[k].state_model
             do_x0 && copyto!(dst.x0, src.x0)
+            do_x0 && copyto!(dst.B0, src.B0)
             do_P0 && copyto!(dst.P0, src.P0)
         end
     end
@@ -4443,6 +4741,14 @@ runs over that flat unit list, driven by a slot vector per group:
 Units are laid out regime-major, so the first unit of any version belongs to
 regime 1; the update writes there and the broadcasters restore the tie. `x0`/`P0`
 are tied across regimes unconditionally.
+
+`terminal_slds` is the parent model. When it conditions on its terminal factor —
+which a grouping may only do if it leaves the state side shared, the stitched fit
+— the discrete chain and the state side are fitted against `log Ẑ` exactly as on
+the ungrouped path: the chain by [`_slqr_chain_mstep!`](@ref), and the state by
+the conditional M-step on each regime's statistics pooled over the cells (see
+[`_pool_lqr_state_stats`](@ref)), which is what the ungrouped aggregator would
+have built from the same trials. The emission stays per cell.
 """
 function _mstep_grouped!(
     cell_slds::AbstractVector,
@@ -4461,13 +4767,31 @@ function _mstep_grouped!(
     ntasks::Int=1,
     bufs::Union{Nothing,GroupedSufBuffers{T},NamedTuple}=nothing,
     cell_views::Union{Nothing,Tuple{<:AbstractVector,<:AbstractVector}}=nothing,
+    terminal_slds::Union{Nothing,SLDS}=nothing,
 ) where {T<:Real}
     K = length(cell_slds[1].LDSs)
     ncells = grp.ncells
     lds1 = cell_slds[1].LDSs[1]
 
-    # Discrete-layer M-step (slds.A, slds.πₖ are updated in place via dl).
-    StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
+    #=
+    The discrete layer (`slds.A`, `slds.πₖ`, updated in place via `dl`). Under
+    terminal conditioning the chain moves `log Ẑ` too, so the ordinary update is
+    only a proposal, as on the ungrouped path; the probe built for that check is
+    reused by the state M-step below.
+    =#
+    conditioned = terminal_slds !== nothing && _slds_condition_terminal(terminal_slds)
+    probe = if conditioned
+        _slds_check_grouped_conditioning(terminal_slds::SLDS, grp)
+        _slqr_terminal_probe(terminal_slds::SLDS, data.ux; ux0=data.ux0)
+    else
+        nothing
+    end
+    probe_current = if probe === nothing
+        StatsAPI.fit!(dl, fb_storage, obs_seq; seq_ends=seq_ends)
+        false
+    else
+        _slqr_chain_mstep!(terminal_slds::SLDS, dl, fb_storage, obs_seq, seq_ends, probe)
+    end
 
     #=
     Per-cell slices of the data and the smoother storage. They depend only on
@@ -4552,19 +4876,54 @@ function _mstep_grouped!(
     # takes them from `grp.cell_slot` at each model's own ordinals.
     slots_cd = nothing
 
-    _grouped_slds_state_mstep!(
-        lds1.state_model,
-        unit_lds,
-        unit_suf,
-        grp,
-        K,
-        ncells,
-        tied,
-        slots_ab,
-        slots_q,
-        sws,
-        bf,
-    )
+    if conditioned
+        #=
+        Every cell shares the state parameters, so the (regime, cell) units
+        collapse to one per regime: pool each regime's statistics over its cells
+        and hand them to the ungrouped conditional M-step, whose probe lines up
+        with the `K` discrete states. `cell_slds[1]`'s state models are the ones
+        every cell reads, sharing the parent's arrays, so writing through them
+        updates the whole model.
+        =#
+        pooled = [
+            _pool_lqr_state_stats([unit_suf[(k - 1) * ncells + c] for c in 1:ncells]) for
+            k in 1:K
+        ]
+        terminal_probe = if probe_current
+            probe
+        else
+            conditioned_probe = probe::_SLQRProbe
+            _slqr_sync_probe!(conditioned_probe, terminal_slds::SLDS)
+            _slqr_restart!(conditioned_probe)
+            _slqr_probe_estep!(conditioned_probe)
+        end
+        _slds_state_mstep!(
+            cell_slds[1].LDSs,
+            pooled,
+            tied,
+            collect(1:K),
+            sws,
+            _state_bufs(bf),
+            K,
+            D,
+            lds1.ux_dim;
+            terminal_probe=terminal_probe,
+        )
+    else
+        _grouped_slds_state_mstep!(
+            lds1.state_model,
+            unit_lds,
+            unit_suf,
+            grp,
+            K,
+            ncells,
+            tied,
+            slots_ab,
+            slots_q,
+            sws,
+            bf,
+        )
+    end
 
     #= The emission side is state-model-agnostic and reads the shared blocks, so
     an LQR state's wrapper is unwrapped first — `_state_suf` is *not*
@@ -4597,6 +4956,9 @@ function _mstep_grouped!(
     for slds_c in cell_slds
         _broadcast_tied_params!(slds_c, tied)
     end
+
+    # Already fitted, against `log Ẑ`, by the conditional state M-step above.
+    conditioned && return nothing
 
     #=
     Tied initial state, pooled over every (regime, cell) unit. Since

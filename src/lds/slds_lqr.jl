@@ -185,6 +185,66 @@ end
 
 _slds_init_suf(hs::LQRSufficientStatistics) = hs.base
 
+"""
+    _pool_lqr_state_stats(units) -> LQRSufficientStatistics
+
+One discrete state's state-side statistics over every cell of a grouping that
+leaves the state parameters shared: the sum of the cells' own.
+
+Every block the inverse-LQR state M-step reads is a responsibility-weighted sum
+over trials — the transition and terminal moments, the initial-state moments, and
+the terminal designs with their trial counts — so summing the per-cell blocks is
+the statistic the ungrouped aggregator would have built from all the trials at
+once. The mixed-coordinate blocks are derived, and the state M-step refills them
+from these sums. The emission blocks are left as the first cell's: they are
+per-cell by construction, and nothing on the state side reads them.
+"""
+function _pool_lqr_state_stats(
+    units::AbstractVector{<:LQRSufficientStatistics{T}}
+) where {T<:Real}
+    pooled = deepcopy(first(units))
+    index = Dict{Tuple{Matrix{T},Vector{T}},Int}(
+        (u, u0) => i for
+        (i, (u, u0)) in enumerate(zip(pooled.terminal_inputs, pooled.terminal_ux0))
+    )
+    for hs in Iterators.drop(units, 1)
+        for k in eachindex(pooled.zz)
+            pooled.zz[k] .+= hs.zz[k]
+            pooled.zy[k] .+= hs.zy[k]
+            pooled.yy[k] .+= hs.yy[k]
+            pooled.term_zz[k] .+= hs.term_zz[k]
+        end
+        pooled.nk .+= hs.nk
+        pooled.term_n .+= hs.term_n
+        #= A composite emission carries the state's initial-state blocks on every
+        member, identically; keep that true of the pooled copy. =#
+        for (dst, src) in zip(_base_members(pooled.base), _base_members(hs.base))
+            dst.init_n += src.init_n
+            dst.init_xy .+= src.init_xy
+            dst.init_u0y .+= src.init_u0y
+            dst.init_u0u0 .+= src.init_u0u0
+            dst.init_yy[] = dst.init_yy[] + src.init_yy[]
+        end
+        for (u, u0, c) in zip(hs.terminal_inputs, hs.terminal_ux0, hs.terminal_counts)
+            slot = get(index, (u, u0), 0)
+            if slot == 0
+                push!(pooled.terminal_inputs, copy(u))
+                push!(pooled.terminal_counts, c)
+                push!(pooled.terminal_ux0, copy(u0))
+                index[(pooled.terminal_inputs[end], pooled.terminal_ux0[end])] = length(
+                    pooled.terminal_inputs
+                )
+            else
+                pooled.terminal_counts[slot] += c
+            end
+        end
+    end
+    return pooled
+end
+
+_base_members(base::NamedTuple) = values(base)
+_base_members(base) = (base,)
+
 #=
 Partial ties: sharing some structural parameters across discrete states while
 fitting the rest per state.

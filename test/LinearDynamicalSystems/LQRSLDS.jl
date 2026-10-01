@@ -1375,6 +1375,228 @@ function test_slds_lqr_grouped()
 end
 
 """
+    test_slds_lqr_grouped_conditional()
+
+Terminal conditioning through the stitched switching fit.
+
+`log p(terminal = 0 | θ)` depends on the dynamics, the chain, the inputs and the
+horizon — never on the emission — so a grouping that splits only the emission has
+one normalizer, the parent model's. The anchor is the ungrouped fit. Started from
+identical parameters, with every cell's emission a copy of the template, the two
+must score the same conditional ELBO, and one EM step must move the chain and every
+state parameter identically: the emission is the only thing the grouped step fits
+per cell, and it is fitted after the state side, so the state updates see the same
+statistics — pooled over the cells on one side, aggregated at once on the other.
+
+A grouping that splits the *state* side has one normalizer per group, which is not
+built, and is refused before any work; the joint objective stays available.
+"""
+function test_slds_lqr_grouped_conditional()
+    p, tsteps, ntrials = 4, 20, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    Qcs = [[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]
+    labels = [:a, :a, :a, :b, :b, :b]
+
+    function pair()
+        plain = hslds_model(Qcs; p=p, terminal=true)
+        stitched = deepcopy(plain)
+        for lds_k in stitched.LDSs
+            lds_k.obs_model.depends_on = (C=labels, d=labels, R=labels)
+        end
+        return plain, stitched
+    end
+
+    plain, stitched = pair()
+    @test SSD._slds_condition_terminal(stitched)
+    a, b = smooth(plain, ys), smooth(stitched, ys)
+    @test b.terminal_logz < 0
+    @test b.terminal_logz ≈ a.terminal_logz rtol = 1e-10
+    @test b.elbo ≈ a.elbo rtol = 1e-9
+
+    for tied in ([:A, :S], [:A, :S, :noise])
+        plain, stitched = pair()
+        function fit_one(m)
+            return _trace(
+                fit!(m, ys; max_iter=2, progress=false, rng=StableRNG(7), tied_params=tied)
+            )
+        end
+        tp, ts = fit_one(plain), fit_one(stitched)
+        @test all(isfinite, ts)
+        # Scored before any M-step: the conditional score, on both paths.
+        @test ts[1] ≈ tp[1] rtol = 1e-9
+        # One M-step: the chain against `log Ẑ`, then the conditional state step.
+        @test stitched.A ≈ plain.A rtol = 1e-8
+        @test stitched.πₖ ≈ plain.πₖ rtol = 1e-8
+        #=
+        The two sides sum the same moments in a different order, and the state
+        step's L-BFGS carries that roundoff; `x0` sits near zero, so it needs an
+        absolute floor as well as the relative one.
+
+        That holds only while the state step is well conditioned, which it is
+        with one `Σ`. With a `Σ` per regime the conditional state step is not
+        continuous in its statistics: the L-BFGS proposal on the switching
+        surrogate (unbounded below) followed by the halving accept turns a
+        1e-14 perturbation of the *data* into a percent-level change of an
+        ungrouped fit's own `A`/`S`/`Σ`. Parameter equality there depends on
+        the machine's roundoff, so the untied case checks what is stable
+        instead: both paths take an improving step from the same score.
+        =#
+        for k in 1:2
+            u, v = plain.LDSs[k].state_model, stitched.LDSs[k].state_model
+            if :noise in tied
+                for key in (:A, :S, :Σ, :Σf, :x0, :P0)
+                    @test getproperty(v, key) ≈ getproperty(u, key) rtol = 1e-6 atol = 1e-7
+                end
+                @test v.Qc[1] ≈ u.Qc[1] rtol = 1e-6
+            end
+            @test symplectic_defect(v) < 1e-10
+        end
+        if !(:noise in tied)
+            @test tp[end] > tp[1]
+            @test ts[end] > ts[1]
+        end
+        # The tie held on the grouped path too.
+        if :noise in tied
+            @test stitched.LDSs[1].state_model.Σ == stitched.LDSs[2].state_model.Σ
+        else
+            @test stitched.LDSs[1].state_model.Σ != stitched.LDSs[2].state_model.Σ
+        end
+    end
+
+    # A state-side grouping: one normalizer per group, refused up front.
+    split = hslds_model(Qcs; p=p, terminal=true)
+    for lds_k in split.LDSs
+        lds_k.state_model.depends_on = (Qc=labels,)
+    end
+    @test_throws ArgumentError fit!(split, ys; max_iter=2, progress=false, rng=StableRNG(7))
+    @test_throws ArgumentError smooth(split, ys)
+    for lds_k in split.LDSs
+        lds_k.state_model.condition_terminal = false
+    end
+    @test all(
+        isfinite, _trace(fit!(split, ys; max_iter=2, progress=false, rng=StableRNG(7)))
+    )
+    return nothing
+end
+
+"""
+    test_terminal_normalizer()
+
+`terminal_normalizer` is each trial's `log p(terminal = 0 | θ)` whether or not the
+model conditions on it — exactly the gap between its joint and conditional scores.
+Exact for a single inverse-LQR model; for a switching one, the same variational
+estimate the conditional score divides by. An emission grouping does not enter it,
+and a state grouping — one normalizer per group — is refused.
+"""
+function test_terminal_normalizer()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    ux = [zeros(0, tsteps) for _ in 1:ntrials]
+    Qc = [0.25 0.04; 0.04 0.18]
+    Qcs = [Qc, [0.8 0.0; 0.0 0.6]]
+
+    lds = hslds_state(Qc; p=p, terminal=true)
+    z = terminal_normalizer(lds, ux)
+    @test length(z) == ntrials
+    @test all(z .≈ SSD._lqr_terminal_logz(lds.state_model, zeros(0, tsteps)))
+    conditional = elbo(lds, ys)
+    lds.state_model.condition_terminal = false
+    @test terminal_normalizer(lds, ux) ≈ z
+    @test elbo(lds, ys) ≈ conditional + sum(z) atol = 1e-6
+
+    two = hslds_model(Qcs; p=p, terminal=true)
+    zs = terminal_normalizer(two, ux)
+    @test all(<(0), zs)
+    @test sum(zs) ≈ terminal_logz(two, ys) rtol = 1e-10
+    for member in two.LDSs
+        member.state_model.condition_terminal = false
+    end
+    @test terminal_logz(two, ys) == 0
+    @test terminal_normalizer(two, ux) ≈ zs rtol = 1e-10
+
+    labels = [:a, :a, :b, :b]
+    stitched = hslds_model(Qcs; p=p, terminal=true)
+    for lds_k in stitched.LDSs
+        lds_k.obs_model.depends_on = (C=labels, d=labels, R=labels)
+    end
+    @test terminal_normalizer(stitched, ux) ≈ zs rtol = 1e-10
+    @test smooth(stitched, ys).terminal_logz ≈ sum(zs) rtol = 1e-10
+    for lds_k in stitched.LDSs
+        lds_k.state_model.depends_on = (Qc=labels,)
+    end
+    @test_throws ArgumentError terminal_normalizer(stitched, ux)
+
+    @test terminal_normalizer(hslds_model(Qcs; p=p), ux) == zeros(ntrials)
+
+    # A probe synced after the parameters moved smooths under the new ones,
+    # a `:free` state's transition included.
+    free = LinearDynamicalSystem(
+        free_state_model(0.9 * Matrix(1.0I, 4, 4), Matrix(0.1I, 4, 4)),
+        GaussianObservationModel(zeros(p, 4), Matrix(0.1I, p, p), zeros(p)),
+    )
+    mixed = SLDS(;
+        A=[0.9 0.1; 0.1 0.9],
+        πₖ=[0.5, 0.5],
+        LDSs=[hslds_state(Qc; p=p, terminal=true), free],
+    )
+    probe = SSD._slqr_terminal_probe(mixed, ux)
+    mixed.LDSs[2].state_model.Mfree .*= 0.5
+    SSD._slqr_sync_probe!(probe, mixed)
+    @test probe.slds.LDSs[2].state_model.Mfree == mixed.LDSs[2].state_model.Mfree
+    return nothing
+end
+
+"""
+    test_slds_newton_convergence_reported()
+
+Each trial's Newton solve for `q(x)` is capped per alternation, and neither the
+alternation nor its caller may treat a capped solve as a MAP. `smooth` reports how
+many trials stopped short and does not stop on `γ` while any did; given room, it
+resumes the solves and reaches the same posterior as an uncapped run. `fit!` says
+so when its final E-step left trials short.
+
+The emission is Gaussian, so every solve is one exact Newton step — and the cap of
+one step is exactly one short of the step that would confirm it.
+"""
+function test_slds_newton_convergence_reported()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p)
+
+    ref = smooth(slds, ys)
+    @test ref.converged
+    @test ref.newton_unconverged == 0
+
+    short = @test_logs (:warn, r"did not converge") match_mode = :any smooth(
+        slds, ys; smoothing_iters=1, newton_max_iter=1
+    )
+    @test !short.converged
+    @test short.newton_unconverged > 0
+
+    slow = smooth(slds, ys; smoothing_iters=500, newton_max_iter=1)
+    @test slow.converged
+    @test slow.newton_unconverged == 0
+    @test slow.elbo ≈ ref.elbo rtol = 1e-6
+    @test slow.iterations < 500
+
+    #= A zero tolerance no solve can meet: every one stalls at roundoff. Once `γ`
+    settles the alternation stops, reporting them, rather than spending the whole
+    `smoothing_iters` on problems that no longer change. =#
+    stalled = @test_logs (:warn, r"did not converge") match_mode = :any smooth(
+        slds, ys; smoothing_iters=500, newton_tol=0.0
+    )
+    @test !stalled.converged
+    @test stalled.newton_unconverged == ntrials
+    @test stalled.iterations < 50
+    @test stalled.elbo ≈ ref.elbo rtol = 1e-6
+
+    @test_logs (:warn, r"Newton MAP") match_mode = :any fit!(
+        deepcopy(slds), ys; max_iter=2, progress=false, rng=StableRNG(7), newton_max_iter=1
+    )
+    return nothing
+end
+
+"""
     test_lqr_pair_slots()
 
 The (regime, cell) version map: units agreeing on both axes share a version,

@@ -501,10 +501,12 @@ function fit!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -516,11 +518,12 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -567,12 +570,13 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -604,10 +608,11 @@ parameter log-priors removed, so it is a likelihood and not a MAP objective.
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,S,O},
     y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
-    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
 end
 
 #=
@@ -616,15 +621,15 @@ specificity, so this method has to match it there — otherwise the two are
 ambiguous, each more specific in a different argument.
 =#
 function StatsAPI.loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
-    return _lqr_loglikelihood(lds, y; ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
 end
 
 function _lqr_loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y; ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O}, y; ux0=nothing, ux=nothing, uy=nothing
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _lqr_sws_pool(lds, data)
@@ -649,12 +654,13 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -691,12 +697,13 @@ function smooth(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
@@ -718,6 +725,7 @@ function fit!(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=100,
@@ -728,6 +736,7 @@ function fit!(
     newton_tol::Float64=1e-6,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -739,11 +748,12 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -794,6 +804,7 @@ function elbo(
     y::Union{
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -801,7 +812,7 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
@@ -965,7 +976,7 @@ function _grouped_state_prior_logdensity(
     for u in _pair_slot_representatives(cell_slot[_G_X0], cell_slot[_G_P0])
         sm = ldss[u].state_model
         if sm.x0_prior !== nothing
-            total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+            total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
         end
     end
     return total
@@ -1269,6 +1280,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps::Integer;
+    ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -1278,10 +1290,11 @@ function Random.rand(
     Ti = Int(tsteps)
     _prepare_lqr!(lds, [Ti])
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
+    u0 = _normalize_ux0(ux0, lds.state_model, 1)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     z = Matrix{T}(undef, lds.latent_dim, Ti)
-    _sample_lqr_path!(rng, z, lds, ux_trial)
+    _sample_lqr_path!(rng, z, _trial_initial_model(lds, view(u0, :, 1)), ux_trial)
     y = _alloc_obs(lds, Ti)
     _sample_lqr_obs!(rng, y, z, lds.obs_model, _extract_obs_params(lds.obs_model), uy_trial)
     return z, y
@@ -1291,6 +1304,7 @@ function Random.rand(
     rng::AbstractRNG,
     lds::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
+    ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -1298,6 +1312,7 @@ function Random.rand(
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     ntrials = length(tsteps_per_trial)
+    u0 = _normalize_ux0(ux0, lds.state_model, ntrials)
     lengths = Int[Int(t) for t in tsteps_per_trial]
     _prepare_lqr!(lds, lengths)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, lengths, T, "ux")
@@ -1314,7 +1329,7 @@ function Random.rand(
     for i in 1:ntrials
         z[i] = Matrix{T}(undef, lds.latent_dim, lengths[i])
         y[i] = _alloc_obs(lds, lengths[i])
-        _sample_lqr_path!(rng, z[i], lds, ux_seq[i])
+        _sample_lqr_path!(rng, z[i], _trial_initial_model(lds, view(u0, :, i)), ux_seq[i])
         _sample_lqr_obs!(rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i))
     end
     return z, y

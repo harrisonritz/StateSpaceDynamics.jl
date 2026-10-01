@@ -66,6 +66,41 @@ end
 _slds_condition_terminal(::Nothing) = false
 
 """
+    _slds_check_grouped_conditioning(slds, grp)
+
+Refuse terminal conditioning under a `depends_on` grouping that splits the state
+parameters, and allow it under one that does not.
+
+`log p(terminal = 0 | θ)` is a property of the dynamics, the chain, the inputs and
+the horizon — never of the emission. So when only the emission varies by cell (the
+stitched fit: one readout per session, one set of control problems), every cell
+shares one normalizer, and the probe built from the parent model — whose state
+arrays every cell's variant shares, since slot 1 of a parameter is the parent's
+own array — is the right one. A grouping that gives cells their own state
+parameters gives them their own normalizers too, one probe each, which is not
+built. That refusal happens here, before any work, rather than the fit quietly
+reporting the joint score.
+"""
+function _slds_check_grouped_conditioning(slds::SLDS, grp)
+    grp === nothing && return nothing
+    _slds_condition_terminal(slds) || return nothing
+    _slds_state_shared(grp) && return nothing
+    throw(
+        ArgumentError(
+            "terminal conditioning is not implemented for a switching fit whose " *
+            "`depends_on` grouping splits the state parameters: each group of trials " *
+            "then has its own dynamics and so its own normalizer. Group only the " *
+            "emission (the stitched fit), or set `condition_terminal=false` on every " *
+            "inverse-LQR discrete state to fit the joint objective instead.",
+        ),
+    )
+end
+
+"""Whether every cell of `grp` uses the parent's state parameters — the one
+state variant — so that only the emission varies across cells."""
+_slds_state_shared(grp) = all(==(1), grp.cell_state)
+
+"""
     _SLQRProbe{T}
 
 The zero-loading copy of a switching model, with the scaffolding its E-step
@@ -119,13 +154,16 @@ carries them; leaving them on would penalize the same parameters twice, once
 with each sign.
 """
 function _slqr_terminal_probe(
-    slds::SLDS{T}, ux::AbstractVector; smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T}, ux::AbstractVector; ux0=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
 ) where {T<:Real}
     canonical = [Matrix{T}(u) for u in ux]
-    designs = _lqr_terminal_designs(canonical)
+    u0 = _normalize_ux0(ux0, slds.LDSs[1].state_model, length(canonical))
+    designs = _lqr_terminal_designs(canonical, u0)
     isempty(designs) && error("Terminal conditioning requires trial inputs/horizons")
-    index = Dict(v.ux => i for (i, v) in enumerate(designs))
-    design_of = [index[u] for u in canonical]
+    index = Dict((v.ux, v.ux0) => i for (i, v) in enumerate(designs))
+    design_of = [
+        index[(canonical[i], Vector{T}(view(u0, :, i)))] for i in eachindex(canonical)
+    ]
     d = slds.LDSs[1].latent_dim
     members = map(slds.LDSs) do lds
         sm = deepcopy(lds.state_model)
@@ -143,7 +181,7 @@ function _slqr_terminal_probe(
 
     uxs = [v.ux for v in designs]
     ys = [zeros(T, 1, size(u, 2)) for u in uxs]
-    data = Data(members[1], ys; ux=uxs)
+    data = Data(members[1], ys; ux0=hcat((v.ux0 for v in designs)...), ux=uxs)
     K = length(members)
     ntrials = length(data.tsteps)
     seq_ends = cumsum(data.tsteps)
@@ -188,14 +226,14 @@ function _slqr_sync_probe!(probe::_SLQRProbe, slds::SLDS)
     for (member, lds) in zip(probe.slds.LDSs, slds.LDSs)
         target, source = member.state_model, lds.state_model
         if target isa LQRStateModel
-            for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+            for key in (:A, :Mfree, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :B0, :P0)
                 copyto!(getproperty(target, key), getproperty(source, key))
             end
             for k in eachindex(source.Qc)
                 copyto!(target.Qc[k], source.Qc[k])
             end
         else
-            for key in (:A, :b, :B, :Q, :x0, :P0)
+            for key in (:A, :b, :B, :Q, :x0, :B0, :P0)
                 hasproperty(target, key) &&
                     copyto!(getproperty(target, key), getproperty(source, key))
             end
@@ -237,6 +275,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
             probe.data.tsteps,
             length(probe.slds.LDSs);
             rng=probe.rng,
+            ux0=probe.data.ux0,
             ux=probe.data.ux,
             uy=probe.data.uy,
             lognorm=probe.lognorm,
@@ -256,6 +295,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         obs_seq=probe.obs_seq,
         control_seq=probe.control_seq,
         seq_ends=probe.seq_ends,
+        ux0=probe.data.ux0,
         ux=probe.data.ux,
         uy=probe.data.uy,
         lognorm=probe.lognorm,
@@ -272,6 +312,7 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         probe.pool,
         probe.plan;
         seq_ends=probe.seq_ends,
+        ux0=probe.data.ux0,
         ux=probe.data.ux,
         uy=probe.data.uy,
         lognorm=probe.lognorm,
@@ -475,7 +516,7 @@ function _slqr_copy_lqr_params!(probe::_SLQRProbe, sms)
         "terminal probe has $(length(psms)) inverse-LQR states, model has $(length(sms))",
     )
     for (target, source) in zip(psms, sms)
-        for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :P0)
+        for key in (:A, :S, :h, :Bu, :Gref, :hf, :Σ, :Σf, :x0, :B0, :P0)
             copyto!(getproperty(target, key), getproperty(source, key))
         end
         for k in eachindex(source.Qc)
@@ -519,14 +560,95 @@ it across fits is how to tell whether a score gap is the data fitting better or
 the normalizer moving.
 """
 function terminal_logz(
-    slds::SLDS{T}, y; ux=nothing, uy=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T},
+    y;
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return zero(T)
-    data = Data(slds.LDSs[1], y; ux=ux, uy=uy)
-    probe = _slqr_terminal_probe(slds, data.ux; smoothing_iters=smoothing_iters)
+    data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
+    probe = _slqr_terminal_probe(
+        slds, data.ux; ux0=data.ux0, smoothing_iters=smoothing_iters
+    )
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)
     return probe.logz
+end
+
+"""
+    terminal_normalizer(model, ux; smoothing_iters) -> Vector
+
+Each trial's `log p(terminal = 0 | θ)` under `model`, **whether or not** the model
+conditions its score on it: the number that turns a joint score into the
+conditional one when subtracted.
+
+That is what makes a fit made on the joint objective (`condition_terminal =
+false`) comparable across plant dimensions after the fact. Its score carries this
+term, which grows with the number of closed-loop modes whatever the data say.
+[`terminal_logz`](@ref) is zero for such a model, because nothing was divided by
+it.
+
+- An inverse-LQR `LinearDynamicalSystem` gets the exact value, from the backward
+  square-root recursion the conditional fit uses.
+- An `SLDS` gets the variational estimate its conditional score divides by: a
+  zero-loading copy of the model, smoothed (see [`terminal_logz`](@ref)).
+
+`ux` holds the per-trial input matrices the model was fitted with (`ux_dim × T_i`),
+which fix the horizons as well as the inputs; a model with no inputs takes
+zero-row matrices of the trials' lengths. Every entry is zero when no state carries
+a terminal factor.
+
+The normalizer is a property of the state side alone, so the emission — and any
+`depends_on` grouping of it, as in a stitched fit — does not enter. A model whose
+`depends_on` splits the *state* parameters has one normalizer per group and is
+refused.
+
+A `:free` discrete state carries no terminal factor, but the probe still smooths
+under its prior with no data to pin it, so an explosive free transition can make
+that smoother's factorization fail (`PosDefException`).
+"""
+function terminal_normalizer(
+    slds::SLDS{T},
+    ux::AbstractVector{<:AbstractMatrix};
+    ux0=nothing,
+    smoothing_iters::Int=_SLQR_PROBE_ITERS,
+) where {T<:Real}
+    lqr = [lds.state_model for lds in slds.LDSs if lds.state_model isa LQRStateModel]
+    any(sm -> sm.terminal, lqr) || return zeros(T, length(ux))
+    any(sm -> sm.depends_on !== nothing, lqr) && throw(
+        ArgumentError(
+            "terminal_normalizer: a state model declares `depends_on`, so each group " *
+            "of trials has its own dynamics and its own normalizer. Only a grouping " *
+            "of the emission is supported.",
+        ),
+    )
+    probe = _slqr_terminal_probe(
+        slds, [Matrix{T}(u) for u in ux]; ux0=ux0, smoothing_iters=smoothing_iters
+    )
+    _slqr_sync_probe!(probe, slds)
+    _slqr_probe_estep!(probe)
+    return [probe.per_design[i] for i in probe.design_of]
+end
+
+function terminal_normalizer(
+    lds::LinearDynamicalSystem{T,S}, ux::AbstractVector{<:AbstractMatrix}; ux0=nothing
+) where {T<:Real,S<:LQRStateModel{T}}
+    sm = lds.state_model
+    sm.terminal || return zeros(T, length(ux))
+    sm.depends_on === nothing || throw(
+        ArgumentError(
+            "terminal_normalizer: the state model declares `depends_on`, so each group " *
+            "of trials has its own dynamics and its own normalizer. Only a grouping " *
+            "of the emission is supported.",
+        ),
+    )
+    inputs = [Matrix{T}(u) for u in ux]
+    u0 = _normalize_ux0(ux0, sm, length(inputs))
+    _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
+    refresh!(sm)
+    return [_lqr_terminal_logz(sm, u, view(u0, :, i)) for (i, u) in enumerate(inputs)]
 end
 
 """Canonical per-trial inputs, reconstructed from the horizons when a caller
@@ -548,11 +670,11 @@ the number of distinct designs, not trials, and a task design repeated across a
 session collapses to one smoothed chain.
 """
 function _slds_terminal_trial_logz(
-    slds::SLDS{T}, ux, seq_ends; smoothing_iters::Int=_SLQR_PROBE_ITERS
+    slds::SLDS{T}, ux, seq_ends; ux0=nothing, smoothing_iters::Int=_SLQR_PROBE_ITERS
 ) where {T<:Real}
     _slds_condition_terminal(slds) || return nothing
     probe = _slqr_terminal_probe(
-        slds, _slds_probe_inputs(ux, seq_ends, T); smoothing_iters=smoothing_iters
+        slds, _slds_probe_inputs(ux, seq_ends, T); ux0=ux0, smoothing_iters=smoothing_iters
     )
     _slqr_sync_probe!(probe, slds)
     _slqr_probe_estep!(probe)

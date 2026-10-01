@@ -132,6 +132,7 @@ For multi-trial `y`: `Vector`s of the above, one entry per trial.
 function smooth(
     lds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
@@ -140,9 +141,9 @@ function smooth(
     runs; see `fit_spline_composite.jl` for why this is a run-time branch rather
     than dispatch. =#
     if _warped_route(lds, depends_on)
-        return _spline_composite_smooth(lds, y, ux, uy)
+        return _spline_composite_smooth(lds, y, ux0, ux, uy)
     end
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = _smooth_data(lds, data)
@@ -306,7 +307,14 @@ function smooth!(
     ntrials = length(data.tsteps)
 
     if ntrials == 1
-        smooth!(lds, tfs[1], _trial(y, 1), sws_pool[1], ux[1], _trial(uy, 1))
+        smooth!(
+            _trial_initial_model(lds, view(data.ux0, :, 1)),
+            tfs[1],
+            _trial(y, 1),
+            sws_pool[1],
+            ux[1],
+            _trial(uy, 1),
+        )
         return tfs
     end
 
@@ -344,7 +352,7 @@ function smooth!(
         with BLAS-3 dispatch.
         =#
         bat = source_sws.batched
-        if bat !== nothing && size(bat.x_mat, 3) == ntrials
+        if bat !== nothing && size(bat.x_mat, 3) == ntrials && isempty(lds.state_model.B0)
             if !bat.data_valid[]
                 _populate_batched_data!(source_sws, data)
             end
@@ -361,7 +369,7 @@ function smooth!(
                 sws = sws_pool[i]
                 for trial in lo:hi
                     _smooth_mean_only!(
-                        lds,
+                        _trial_initial_model(lds, view(data.ux0, :, trial)),
                         tfs[trial],
                         _trial(y, trial),
                         sws,
@@ -421,7 +429,7 @@ function smooth!(
                 for j in lo:hi
                     local trial = trials[j]
                     _smooth_mean_only!(
-                        lds,
+                        _trial_initial_model(lds, view(data.ux0, :, trial)),
                         tfs[trial],
                         _trial(y, trial),
                         sws,
@@ -625,7 +633,13 @@ function _smooth_bucket!(
     end
     for trial in trials
         _smooth_mean_only!(
-            lds, tfs[trial], _trial(y, trial), sws, ux[trial], _trial(uy, trial), sws
+            _trial_initial_model(lds, view(data.ux0, :, trial)),
+            tfs[trial],
+            _trial(y, trial),
+            sws,
+            ux[trial],
+            _trial(uy, trial),
+            sws,
         )
     end
     return nothing
@@ -703,7 +717,7 @@ function _smooth_ragged_prefix!(
             for j in lo:hi
                 trial = trials[j]
                 _smooth_mean_only!(
-                    lds,
+                    _trial_initial_model(lds, view(data.ux0, :, trial)),
                     tfs[trial],
                     _trial(y, trial),
                     ws,
@@ -1081,14 +1095,15 @@ Returns a scalar.
 function elbo(
     lds::LinearDynamicalSystem{T,S,O},
     y::CompositeObservations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     if _warped_route(lds, depends_on)
-        return _spline_composite_elbo(lds, y, ux, uy)
+        return _spline_composite_elbo(lds, y, ux0, ux, uy)
     end
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(lds, data)
@@ -1208,10 +1223,12 @@ function fit!(
     rtol::Float64=0.0,
     progress::Bool=true,
     spline_iters::Int=25,
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -1222,10 +1239,11 @@ function fit!(
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
         T,
         y_test;
+        ux0_test=ux0_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -1675,11 +1693,12 @@ per-observation score that is comparable across configurations.
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,SM,OM},
     y::Observations{T};
+    ux0=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
-    data = Data(lds, y; ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
 
     #=
@@ -1695,7 +1714,12 @@ function StatsAPI.loglikelihood(
             S_chol, K = _filter_cov_pass(lds_c, maximum(data.tsteps[n] for n in trials))
             for n in trials
                 total_ll += _filter_ll_trial(
-                    lds_c, data.y[n], data.ux[n], data.uy[n], S_chol, K
+                    _trial_initial_model(lds_c, view(data.ux0, :, n)),
+                    data.y[n],
+                    data.ux[n],
+                    data.uy[n],
+                    S_chol,
+                    K,
                 )
             end
         end
@@ -1706,7 +1730,14 @@ function StatsAPI.loglikelihood(
 
     total_ll = zero(T)
     for n in eachindex(data.y)
-        total_ll += _filter_ll_trial(lds, data.y[n], data.ux[n], data.uy[n], S_chol, K)
+        total_ll += _filter_ll_trial(
+            _trial_initial_model(lds, view(data.ux0, :, n)),
+            data.y[n],
+            data.ux[n],
+            data.uy[n],
+            S_chol,
+            K,
+        )
     end
     return total_ll
 end

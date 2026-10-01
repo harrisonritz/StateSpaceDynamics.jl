@@ -278,10 +278,16 @@ end
 """
     _state_prior_logdensity(lds, sws) -> T
 
-`log p(θ)` for an LQR state model. Only the initial-state priors exist
-here: there is no Inverse-Wishart prior on `Σ` (the M-step profiles it out) and
-no matrix-normal prior on the structural block, whose entries are shared between
-`𝓔`'s (1,1) and (2,2) blocks and so do not form a free regression matrix.
+`log p(θ)` for an LQR state model: the initial-state priors (`P0_prior`,
+`x0_prior`), plus the inverse-Wishart priors on `Σ` and on each distinct `Qc` when
+they are set (see [`_lqr_structural_logprior`](@ref)). There is no matrix-normal
+prior on the structural block, whose entries are shared between `𝓔`'s (1,1) and
+(2,2) blocks and so do not form a free regression matrix; nor on `Σf`, which the
+M-step fits by maximum likelihood.
+
+The inverse-Wishart terms omit their normalizing constant, which is fine for a
+fixed-dimension MAP fit but changes with `2n` and `Ψ` — so a MAP objective is not
+comparable across plant dimensions or prior settings.
 """
 function _state_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, ::Union{Nothing,SmoothWorkspace{T}}
@@ -290,7 +296,7 @@ function _state_prior_logdensity(
     total = zero(T)
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
     if sm.x0_prior !== nothing
-        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+        total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
     end
     return total + _lqr_structural_logprior(sm)
 end

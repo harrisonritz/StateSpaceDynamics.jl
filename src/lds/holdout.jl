@@ -74,8 +74,9 @@ best-so-far parameter snapshot.
 `nothing` in a driver's `monitor` slot means "no held-out data", which is the
 default and leaves every code path exactly as it was.
 """
-mutable struct HoldoutMonitor{T<:Real,Y,UX,UY,NT<:NamedTuple}
+mutable struct HoldoutMonitor{T<:Real,Y,UX0,UX,UY,NT<:NamedTuple}
     y::Y
+    ux0::UX0
     ux::UX
     uy::UY
     depends_on::Union{Nothing,NamedTuple}
@@ -104,6 +105,7 @@ Build the monitor, or return `nothing` when no held-out data was given. Every
 function _holdout_monitor(
     ::Type{T},
     y_test;
+    ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -119,9 +121,15 @@ function _holdout_monitor(
     patience >= 1 || throw(ArgumentError("patience must be >= 1, got $patience"))
     min_delta >= 0 || throw(ArgumentError("min_delta must be >= 0, got $min_delta"))
     return HoldoutMonitor{
-        T,typeof(y_test),typeof(ux_test),typeof(uy_test),typeof(test_kwargs)
+        T,
+        typeof(y_test),
+        typeof(ux0_test),
+        typeof(ux_test),
+        typeof(uy_test),
+        typeof(test_kwargs),
     }(
         y_test,
+        ux0_test,
         ux_test,
         uy_test,
         depends_on_test,
@@ -168,7 +176,15 @@ and `early_stopping` is on.
 """
 function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Real}
     v = T(
-        elbo(model, mon.y; ux=mon.ux, uy=mon.uy, depends_on=mon.depends_on, mon.kwargs...)
+        elbo(
+            model,
+            mon.y;
+            ux0=mon.ux0,
+            ux=mon.ux,
+            uy=mon.uy,
+            depends_on=mon.depends_on,
+            mon.kwargs...,
+        ),
     )
     push!(mon.values, v)
     push!(mon.iters, iter)

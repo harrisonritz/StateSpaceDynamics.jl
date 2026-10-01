@@ -495,7 +495,7 @@ function SplineEmbedding(data::Data{T}, obs_dim::Int) where {T<:Real}
     y = data.y
     z = [Matrix{T}(undef, obs_dim, size(yt, 2)) for yt in y]
     mu = [Matrix{T}(undef, obs_dim, size(yt, 2)) for yt in y]
-    zdata = Data(z, data.ux, data.uy, data.tsteps)
+    zdata = Data(z, data.ux, data.uy, data.tsteps, data.ux0)
     return SplineEmbedding{T,typeof(zdata)}(z, zdata, mu, Ref(zero(T)))
 end
 

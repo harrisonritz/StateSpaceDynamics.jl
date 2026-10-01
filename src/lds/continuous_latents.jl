@@ -562,13 +562,10 @@ function Q_state!(
     const_init = T(N) * D * log2π
     const_trans = T(dyn_n) * D * log2π
 
-    # S_init = init_yy - μ x0' - x0 μ' + N x0 x0'    (μ = Σ x_init)
+    # Initial regression residual scatter, including B0 when supplied.
     S_init = sws.elbo.temp
-    copyto!(S_init, suf.init_yy[])
-    μ_sum = vec(suf.init_xy)
-    BLAS.ger!(-one(T), μ_sum, x0, S_init)
-    BLAS.ger!(-one(T), x0, μ_sum, S_init)
-    BLAS.ger!(T(N), x0, x0, S_init)
+    fill!(S_init, zero(T))
+    _accumulate_init_scatter!(S_init, lds, suf)
 
     ldiv!(P0_U', S_init)
     ldiv!(P0_U, S_init)
@@ -623,7 +620,7 @@ function _state_prior_logdensity(
     sm.Q_prior === nothing || (total += iw_logprior_term(sm.Q, sm.Q_prior))
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
     if sm.x0_prior !== nothing
-        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+        total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
     end
     if sm.AB_prior !== nothing
         W_ab = _dyn_pack_scratch(lds, sws)
@@ -662,6 +659,27 @@ function update_initial_state_mean!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[1] || return nothing
+    if !isempty(lds.state_model.B0)
+        B0 = lds.state_model.B0
+        prior = lds.state_model.x0_prior
+        XX = copy(suf.init_u0u0)
+        XY = copy(suf.init_u0y)
+        if prior !== nothing
+            size(prior.M₀) == size(B0) ||
+                throw(DimensionMismatchError("B0 prior mean", size(B0), size(prior.M₀)))
+            XX .+= prior.Λ
+            XY .+= prior.Λ * prior.M₀'
+        end
+        F = cholesky(Symmetric(XX); check=false)
+        issuccess(F) || throw(
+            ArgumentError(
+                "ux0 initial-state design is rank deficient; remove collinear columns " *
+                "or supply a positive-definite x0_prior",
+            ),
+        )
+        B0 .= (F \ XY)'
+        return nothing
+    end
     x0 = lds.state_model.x0
     x0_prior = lds.state_model.x0_prior
     # NIW mean update: x0 = (Σγ·x₁ + κ₀ μ₀) / (Σγ + κ₀)
@@ -699,6 +717,16 @@ function _accumulate_init_scatter!(
 
     S0 .+= suf.init_yy[]
 
+    if !isempty(lds.state_model.B0)
+        B0 = lds.state_model.B0
+        UY = suf.init_u0y
+        UU = suf.init_u0u0
+        S0 .-= B0 * UY
+        S0 .-= UY' * B0'
+        S0 .+= B0 * UU * B0'
+        return S0
+    end
+
     # Rank-1 updates inline (BLAS.ger! would need a contiguous μ vector and
     # `view(init_xy, 1, :)` allocates a SubArray header — small but nonzero).
     for j in 1:D
@@ -730,6 +758,12 @@ function _accumulate_x0_prior_scatter!(
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     x0_prior = lds.state_model.x0_prior
     x0_prior === nothing && return S0
+    if !isempty(lds.state_model.B0)
+        B0 = lds.state_model.B0
+        Δ = B0 - x0_prior.M₀
+        S0 .+= Δ * x0_prior.Λ * Δ'
+        return S0
+    end
     D = lds.latent_dim
     x0 = lds.state_model.x0
     κ₀ = x0_prior.Λ[1, 1]

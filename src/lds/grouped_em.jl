@@ -94,12 +94,16 @@ function _pool_init!(
     suf = bufs.suf
     n = zero(T)
     fill!(suf.init_xy, zero(T))
+    fill!(suf.init_u0y, zero(T))
+    fill!(suf.init_u0u0, zero(T))
     M = bufs.init_yy
     fill!(M, zero(T))
     for u in units
         src = sufs[u]
         n += T(src.init_n)
         suf.init_xy .+= src.init_xy
+        suf.init_u0y .+= src.init_u0y
+        suf.init_u0u0 .+= src.init_u0u0
         M .+= src.init_yy[]
     end
     suf.init_n = n
@@ -1330,7 +1334,7 @@ function _grouped_state_prior_logdensity(
     for u in _pair_slot_representatives(slots[_G_X0], slots[_G_P0])
         sm = ldss[u].state_model
         sm.x0_prior === nothing && continue
-        total += mn_logprior_term(reshape(sm.x0, :, 1), sm.P0, sm.x0_prior)
+        total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
     end
     for u in _pair_slot_representatives(slots[_G_AB], slots[_G_Q])
         lds = ldss[u]
