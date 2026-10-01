@@ -1212,8 +1212,12 @@ Warn once when rolling the forward transition for `tsteps` steps is predicted to
 diverge. `ρ(M)^T` is the growth of the fastest mode; past roughly `1/eps` the
 sampled path carries no usable signal, and the caller almost certainly wants
 [`simulate_lqr`](@ref).
+
+A `:hold` model's forward transition is the stable closed loop, so it never
+warns.
 """
 function _warn_unstable_rollout(sm::LQRStateModel{T}, tsteps::Int) where {T<:Real}
+    _is_hold(sm) && return nothing
     ρ = maximum(abs, eigvals(sm.cache.M[_regime(sm, 1)]))
     growth = ρ^tsteps
     if growth > 1 / sqrt(eps(T))

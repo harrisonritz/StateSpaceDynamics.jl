@@ -111,11 +111,71 @@ function _show_free_state_model(io::IO, lqr_sm::LQRStateModel, n::Int; gap="")
     return nothing
 end
 
+#=
+`:hold` mode shares the plant, cost and inputs with `:lqr` mode, but has no
+schedule, no terminal factor and no symplectic structure; what characterizes it
+is the steady state, so that is what the summary reports.
+=#
+function _show_hold_state_model(io::IO, lqr_sm::LQRStateModel{T}, n::Int; gap="") where {T}
+    println(io, gap, "LQR State Model (:hold — infinite-horizon regulator):")
+    println(io, gap, "--------------------------------------------------------")
+    println(io, gap, " Plant dim n = $n, latent dim 2n = $(2n)   [z = (x; λ), λ ≈ P x + g]")
+    if n <= 4
+        println(io, gap, "  A     = $(round.(lqr_sm.A, sigdigits=3))")
+        println(io, gap, "  S     = $(round.(lqr_sm.S, sigdigits=3))   [= B R⁻¹ Bᵀ]")
+        println(io, gap, "  Q_h   = $(round.(lqr_sm.Qc[1], sigdigits=3))")
+    else
+        println(io, gap, "  size(A)  = ($n, $n)")
+        println(io, gap, "  size(S)  = ($n, $n)   [= B R⁻¹ Bᵀ]")
+        println(io, gap, "  size(Q_h) = ($n, $n)")
+    end
+    H = _HoldUnit(T, n, size(lqr_sm.Bu, 2))
+    ok = _hold_steady_state!(
+        H, lqr_sm.A, lqr_sm.S, lqr_sm.Qc[1], lqr_sm.h, lqr_sm.Bu, lqr_sm.Gref
+    )
+    println(io, gap, " Steady state:")
+    if ok
+        ρ = maximum(abs, eigvals(H.Acl))
+        println(io, gap, "  closed-loop spectral radius ρ(A_cl) = $(round(ρ, sigdigits=3))")
+    else
+        println(io, gap, "  (no stabilizing DARE solution at these parameters)")
+    end
+    println(io, gap, " Noise (plant row / manifold row):")
+    println(io, gap, "  size(Σ)  = ($(size(lqr_sm.Σ,1)), $(size(lqr_sm.Σ,2)))")
+    println(io, gap, " Initial state:")
+    println(io, gap, "  size(x0) = ($(length(lqr_sm.x0)),)")
+    println(io, gap, "  size(P0) = ($(size(lqr_sm.P0,1)), $(size(lqr_sm.P0,2)))")
+    println(io, gap, " Dynamics input:")
+    println(io, gap, "  size(Bu)   = ($(size(lqr_sm.Bu,1)), $(size(lqr_sm.Bu,2)))")
+    println(
+        io,
+        gap,
+        "  size(Gref) = ($(size(lqr_sm.Gref,1)), $(size(lqr_sm.Gref,2)))" *
+        (all(iszero, lqr_sm.Gref) ? "   [no reference]" : "   [tracking]"),
+    )
+    f = lqr_sm.fit_flags
+    free = String[
+        s for (s, on) in (
+            ("A", f.A),
+            ("S", f.S),
+            ("Q_h", f.Qc),
+            ("h", f.h),
+            ("Bu", f.Bu),
+            ("Gref", f.Gref && size(lqr_sm.Gref, 2) > 0),
+        ) if on
+    ]
+    println(io, gap, " Fitting:")
+    println(io, gap, "  free: " * (isempty(free) ? "(none)" : join(free, ", ")))
+    println(io, gap, "  observe_costate = $(lqr_sm.observe_costate)")
+    return nothing
+end
+
 function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
     n = _plant_dim(lqr_sm)
     if _is_free(lqr_sm)
         return _show_free_state_model(io, lqr_sm, n; gap=gap)
     end
+    _is_hold(lqr_sm) && return _show_hold_state_model(io, lqr_sm, n; gap=gap)
     println(io, gap, "LQR State Model:")
     println(io, gap, "--------------------------------------")
     println(io, gap, " Plant dim n = $n, latent dim 2n = $(2n)   [z = (x; λ)]")

@@ -24,7 +24,8 @@ The rule is enforced before sampling by `_validate_slds_state_models`.
 
 As with a single inverse-LQR model, this rolls the model's own forward flow,
 which is unstable by construction — see [`_warn_unstable_rollout`](@ref) and
-prefer `simulate_lqr` for trajectories on the stable manifold.
+prefer `simulate_lqr` for trajectories on the stable manifold. A `:hold` state
+is the exception: its forward flow is the stable closed loop.
 """
 function _extract_state_params(sm::LQRStateModel{T}) where {T<:Real}
     c = sm.cache
@@ -331,6 +332,13 @@ function _slds_state_mstep!(
     the wrong problem. The caller skips it when a probe is supplied.
     =#
     if terminal_probe !== nothing
+        any(_is_hold, sms) && throw(
+            ArgumentError(
+                "terminal conditioning is not implemented for a switching model with a " *
+                "`:hold` discrete state; set `condition_terminal=false` on the " *
+                "inverse-LQR states.",
+            ),
+        )
         any(_is_free, sms) && throw(
             ArgumentError(
                 "terminal conditioning is not implemented for a switching model that " *
@@ -355,6 +363,11 @@ function _slds_state_mstep!(
     A `:free` state is an ordinary regression, so it is updated on its own rather
     than through the constrained context. Mixing modes across discrete states is
     the whole point of `:free`, so neither branch may assume the other is absent.
+
+    A `:hold` state is *not* updated on its own: its plant and inputs mean what
+    the `:lqr` states' do, so it joins their context, where `tied = [:A, :S]`
+    gives control and hold states one shared plant fitted from both, and each
+    state's cost stays its own copy unless `:Qc` is tied too.
     =#
     for k in 1:K
         if _is_free(sms[k])
