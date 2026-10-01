@@ -554,6 +554,19 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/HoldLDS.jl")
+        @testset "Hold (infinite-horizon LQR)" begin
+            test_hold_dare()
+            test_hold_cache()
+            test_hold_construction()
+            test_hold_gauge()
+            test_hold_mstep_gradient()
+            test_hold_joint_gradient()
+            test_hold_em_recovery()
+            test_hold_depends_on()
+            test_hold_slds()
+        end
+
         include("LinearDynamicalSystems/InitialInputs.jl")
         @testset "Initial inputs" begin
             test_initial_inputs()
