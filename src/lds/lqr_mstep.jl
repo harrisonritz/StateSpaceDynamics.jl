@@ -34,6 +34,15 @@ leaves the objective this file minimizes over `θ = (A, S, Q_{1:K}, h, Bu, hf)`:
 which is smooth with cheap exact gradients. It is optimized by L-BFGS warm
 started at the incoming parameters and accepted only if it improved, which makes
 the step a generalized M-step: the ELBO cannot decrease.
+
+A `:hold` model (the infinite-horizon regulator, see `lqr_hold.jl`) is fitted in
+the same objective. Its residual is `Lh z_{t+1} − Θh ω_t` with
+`Lh = [I S; −P I]`, `Θh = [A 0 F; 0 0 G]` and `P` the stabilizing DARE
+solution, over the forward statistics; `det Lh = det(I + S P)` takes the place
+of `det A`, so a hold unit carries `−N log det(I + S P)`. Hold and `:lqr` units
+share block copies and noise versions freely — that is how a switching model
+ties one plant across a control state and a hold state — and the gradient
+through `P` is one adjoint Stein solve (see `_hold_unit_gradient!`).
 =============================================================================#
 
 """
@@ -594,9 +603,11 @@ function _fill_mixed_blocks!(
     #=
     In `:free` mode the mixed coordinates *are* the forward ones — the regressor
     is `[z_t; 1; u_t]` and the response `z_{t+1}`, with no interleaving — so the
-    rearrangement below collapses to three copies.
+    rearrangement below collapses to three copies. `:hold` mode regresses
+    `Lh z_{t+1}` on the same `[z_t; 1; u_t]`, and since `Lh` is a parameter it is
+    applied inside the objective, so its blocks are the forward ones too.
     =#
-    if _is_free(sm)
+    if _is_free(sm) || _is_hold(sm)
         copyto!(hs.Zw[1], hs.zz[1])
         copyto!(hs.Xv[1], transpose(hs.zy[1]))
         copyto!(hs.Yv, hs.yy[1])
@@ -706,7 +717,14 @@ instead of silently becoming rank-locked.
 
 A frozen block (see [`LQRFitFlags`](@ref)) has width zero and is neither
 packed nor updated, so freezing shrinks the problem rather than projecting its
-solution. `Qc`'s copy spans all `K` regimes contiguously.
+solution. `Qc`'s copy spans its regimes contiguously.
+
+Copies of `Qc` need not all carry the same number of regimes: `Kq[v]` is copy
+`v`'s count and `qoff[v]` its offset within the block. A `:hold` state carries
+one cost while an `:lqr` state beside it in a switching model may carry a running
+and a terminal cost, and giving each copy its own count is what lets both sit in
+one packed problem without padding either. `K` is the largest count, and `w` for
+the cost block is its width at that count — only ever read as "frozen or not".
 """
 struct _LQRPack
     n::Int
@@ -720,6 +738,8 @@ struct _LQRPack
     gcols::Vector{Int}     # input columns of `Gref` that are packed
     bcols::Vector{Int}     # input columns of `Bu` that are packed
     brows::Vector{Int}     # mixed-coordinate rows of `Bu` that are packed
+    Kq::Vector{Int}        # regimes per `Qc` copy
+    qoff::Vector{Int}      # 0-based offset of each `Qc` copy within its block
 end
 
 # Block ordinals, in layout order.
@@ -750,9 +770,9 @@ end
 Slots holding regime `k` of copy `v` of the cost block.
 """
 @inline function _lqr_blk_q(p::_LQRPack, v::Int, k::Int)
-    p.w[_LQR_BLOCK_Q] == 0 && return 1:0
+    (p.w[_LQR_BLOCK_Q] == 0 || k > p.Kq[v]) && return 1:0
     nc = p.n * (p.n + 1) ÷ 2
-    off = p.base[_LQR_BLOCK_Q] + (v - 1) * p.w[_LQR_BLOCK_Q] + (k - 1) * nc
+    off = p.base[_LQR_BLOCK_Q] + p.qoff[v] + (k - 1) * nc
     return (off + 1):(off + nc)
 end
 
@@ -767,13 +787,23 @@ end
 #=
 Taking the flags explicitly rather than off the model is what lets a caller
 freeze part of the block for one pass; taking `nv` is what lets each block carry
-its own number of copies.
+its own number of copies, and `Kq` each cost copy its own number of regimes
+(every copy has the model's own count by default). `terminal` says whether any
+model in the problem carries a terminal factor, whose offset is then packed.
 =#
-function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
+function _LQRPack(
+    sm::LQRStateModel,
+    f::LQRFitFlags,
+    nv::NTuple{7,Int},
+    Kq::AbstractVector{Int}=fill(_nregimes(sm), nv[_LQR_BLOCK_Q]),
+    terminal::Bool=sm.terminal,
+)
     n = _plant_dim(sm)
     d = 2n
     m = size(sm.Bu, 2)
-    K = _nregimes(sm)
+    length(Kq) == nv[_LQR_BLOCK_Q] ||
+        throw(DimensionMismatchError("regimes per Qc copy", nv[_LQR_BLOCK_Q], length(Kq)))
+    K = maximum(Kq; init=_nregimes(sm))
     #= `Gref` is the one block that can be free in part: `Gref_cols` names the
     input columns the reference is a function of, and the rest are packed no
     more than a frozen block is. =#
@@ -788,16 +818,34 @@ function _LQRPack(sm::LQRStateModel, f::LQRFitFlags, nv::NTuple{7,Int})
         f.h ? d : 0,
         length(brows) * length(bcols),
         n * length(gcols),
-        (sm.terminal && f.terminal) ? n : 0,
+        (terminal && f.terminal) ? n : 0,
     )
+    qoff = zeros(Int, length(Kq))
+    acc = 0
+    for v in eachindex(Kq)
+        qoff[v] = acc
+        acc += f.Qc ? Kq[v] * nc : 0
+    end
     bases = zeros(Int, _LQR_BLOCK_N)
     pos = 0
     for b in 1:_LQR_BLOCK_N
         bases[b] = pos
-        pos += nv[b] * w[b]
+        pos += b == _LQR_BLOCK_Q ? acc : nv[b] * w[b]
     end
     return _LQRPack(
-        n, d, m, K, nv, w, ntuple(b -> bases[b], _LQR_BLOCK_N), pos, gcols, bcols, brows
+        n,
+        d,
+        m,
+        K,
+        nv,
+        w,
+        ntuple(b -> bases[b], _LQR_BLOCK_N),
+        pos,
+        gcols,
+        bcols,
+        brows,
+        collect(Int, Kq),
+        qoff,
     )
 end
 
@@ -806,19 +854,23 @@ end
 
 One pooled group of trials in the structural M-step: its aggregated statistics,
 which copy of each structural block it uses (`v`, indexed by the `_LQR_BLOCK_*`
-ordinals), and which noise version (`q`).
+ordinals), which noise version (`q`), and whether its model is a `:hold`
+regulator (`hold`) rather than the finite-horizon form.
 
-Cells agreeing on every version are pooled into one unit before the objective is
-built. That is exact, not an approximation: with the same `Θ` the residual
-scatter `R = Σ_c (Y_c − Θ X_cᵀ − X_c Θᵀ + Θ Z_c Θᵀ)` is linear in the
-statistics, so summing them first gives the same `R`. An ungrouped fit is one
-unit, which is why there is a single code path.
+Cells agreeing on every version — and on the mode — are pooled into one unit
+before the objective is built. That is exact, not an approximation: with the
+same `Θ` the residual scatter `R = Σ_c (Y_c − Θ X_cᵀ − X_c Θᵀ + Θ Z_c Θᵀ)` is
+linear in the statistics, so summing them first gives the same `R`. An ungrouped
+fit is one unit, which is why there is a single code path. Two modes never pool:
+their statistics are in different coordinates (mixed for `:lqr`, forward for
+`:hold`) and their residuals are different functions of the parameters.
 """
 struct _LQRUnit{T<:Real,HS}
     hs::HS
     v::NTuple{7,Int}
     q::Int
     n::T
+    hold::Bool
 end
 
 """
@@ -844,6 +896,17 @@ Note where the coupling lives: units sharing a noise version pool into one `R_s`
 so a model whose structure varies by group but whose noise does not is *not*
 separable across groups — which is exactly why the objective is built jointly.
 
+`:hold` units sit in the same context. Their residual is
+`Lh z_{t+1} − Θh ω_t` in plant-row / manifold-row coordinates, with `Lh` and
+`Θh` functions of the DARE solution `P` at the unit's `(A, S, Q_h)` copies; it
+pools into the unit's noise version exactly like an `:lqr` residual, and the
+unit carries `−N log det(I + S P)` where an `:lqr` unit's `A` carries
+`−N log|det A|`. So a plant tied across a control state and a hold state is one
+joint solve, with each state's cost its own copy. `hold[ui]` holds a hold unit's
+steady state and gradient scratch (an empty placeholder for an `:lqr` unit), and
+`lqrA[a]` whether any `:lqr` unit uses `A` copy `a` — only those carry the
+`log|det A|` term, and only those need `A` invertible.
+
 `Theta` and `Psi` are per **unit** rather than per version, since a unit's
 assembled block mixes copies that no longer move together. The scratch below them
 is preallocated once and reused across objective evaluations: at a large plant
@@ -852,7 +915,10 @@ dimension L-BFGS makes many evaluations and the `d × d` temporaries dominate.
 struct _LQRMStepCtx{T<:Real,HS,SM}
     pack::_LQRPack
     nq::Int
+    terminal::Bool                   # any model carries a terminal factor
     units::Vector{_LQRUnit{T,HS}}
+    hold::Vector{_HoldUnit{T}}       # [unit]; a 0-dimensional placeholder for `:lqr`
+    lqrA::BitVector                  # `A` copies used by some `:lqr` unit
     sms::Vector{SM}
     owners::Vector{Vector{Vector{Int}}}  # [block][copy] -> models using it
     q_of::Vector{Int}                    # model -> noise version
@@ -901,19 +967,23 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
 end
 
 """
-    _lqr_units(sufs, slots, q_slots) -> Vector{_LQRUnit}
+    _lqr_units(sufs, slots, q_slots[, hold]) -> Vector{_LQRUnit}
 
 Pool the cells into units. `slots[b][c]` is the copy of block `b` that cell `c`
-uses; cells agreeing on every block and on the noise version become one unit.
+uses; cells agreeing on every block, on the noise version and on the mode
+(`hold[c]`) become one unit.
 """
 function _lqr_units(
-    sufs::AbstractVector, slots::NTuple{7,Vector{Int}}, q_slots::AbstractVector{Int}
+    sufs::AbstractVector,
+    slots::NTuple{7,Vector{Int}},
+    q_slots::AbstractVector{Int},
+    hold::AbstractVector{Bool}=falses(length(sufs)),
 )
     T = eltype(first(sufs).nk)
-    keys = NTuple{8,Int}[]
+    keys = NTuple{9,Int}[]
     members = Vector{Int}[]
     for c in eachindex(sufs)
-        key = (ntuple(b -> slots[b][c], _LQR_BLOCK_N)..., q_slots[c])
+        key = (ntuple(b -> slots[b][c], _LQR_BLOCK_N)..., q_slots[c], Int(hold[c]))
         idx = findfirst(isequal(key), keys)
         if idx === nothing
             push!(keys, key)
@@ -932,7 +1002,7 @@ function _lqr_units(
         push!(
             units,
             _LQRUnit{T,eltype(sufs)}(
-                hs, ntuple(b -> key[b], _LQR_BLOCK_N), key[8], sum(hs.nk)
+                hs, ntuple(b -> key[b], _LQR_BLOCK_N), key[8], sum(hs.nk), key[9] == 1
             ),
         )
     end
@@ -1052,13 +1122,21 @@ function _LQRMStepCtx(
     T = eltype(sm1.Σ)
     f = flags === nothing ? sm1.fit_flags : flags
     #=
+    `:hold` and `:lqr` models may share one problem (a switching model's control
+    and hold states). The terminal offset is packed when any of them carries a
+    terminal factor — only `:lqr` models can — and each cell's mode decides which
+    residual its unit contributes.
+    =#
+    terminal = any(sm -> sm.terminal, sms)
+    hold_c = Bool[_is_hold(sm) for sm in sms]
+    #=
     A frozen block is never shared, whatever the tie asks for: freezing means
     "keep your own value", so each cell reads back its own rather than the first
     one on some version it was grouped into. Under `depends_on` this is a no-op —
     cells on a version alias the same array — and with one cell there is nothing
     to distinguish either way.
     =#
-    probe = _LQRPack(sm1, f, ntuple(_ -> 1, _LQR_BLOCK_N))
+    probe = _LQRPack(sm1, f, ntuple(_ -> 1, _LQR_BLOCK_N), [_nregimes(sm1)], terminal)
     ncell = length(slots[1])
     #=
     Bound to a fresh name rather than back onto `slots`: reassigning an argument
@@ -1066,24 +1144,45 @@ function _LQRMStepCtx(
     prove defined.
     =#
     eff = ntuple(b -> probe.w[b] == 0 ? collect(1:ncell) : slots[b], _LQR_BLOCK_N)
-    units = _lqr_units(sufs, eff, q_slots)
+    units = _lqr_units(sufs, eff, q_slots, hold_c)
     nv = ntuple(b -> maximum(eff[b]), _LQR_BLOCK_N)
-    pack = _LQRPack(sm1, f, nv)
-    n, d, m, K = pack.n, pack.d, pack.m, pack.K
+
+    #=
+    Which models use each copy of each block. Two jobs: a frozen block reads its
+    value back from a representative, and the fitted value is written to every
+    model sharing the copy — so a tie is broadcast by construction rather than by
+    a separate pass that has to know which blocks it may touch.
+    =#
+    owners = [[Int[] for _ in 1:nv[b]] for b in 1:_LQR_BLOCK_N]
+    for c in eachindex(eff[1])
+        for b in 1:_LQR_BLOCK_N
+            push!(owners[b][eff[b][c]], c)
+        end
+    end
+    #= Each cost copy carries as many regimes as the most any of its owners has:
+    a hold state's one cost beside an `:lqr` state's running and terminal ones. =#
+    Kq = [
+        maximum(c -> _nregimes(sms[c]), owners[_LQR_BLOCK_Q][v]) for v in 1:nv[_LQR_BLOCK_Q]
+    ]
+    pack = _LQRPack(sm1, f, nv, Kq, terminal)
+    n, d, m = pack.n, pack.d, pack.m
     reg = d + 1 + m
     nq = maximum(q_slots)
 
     #=
     The Jacobian term `−N_a log|det A_a|` is weighted by the transitions the
     models sharing that `A` actually contribute, which under a partial tie is no
-    longer the same grouping as any other block.
+    longer the same grouping as any other block. Hold units carry their own
+    Jacobian, `−N log det(I + S P)`, and contribute nothing here.
     =#
     N_A = zeros(T, nv[_LQR_BLOCK_A])
+    lqrA = falses(nv[_LQR_BLOCK_A])
     N_q = zeros(T, nq)
     Nf_q = zeros(T, nq)
     for u in units
         N_q[u.q] += u.n
-        sm1.terminal && (Nf_q[u.q] += sum(u.hs.term_n))
+        (terminal && !u.hold) && (Nf_q[u.q] += sum(u.hs.term_n))
+        u.hold || (lqrA[u.v[_LQR_BLOCK_A]] = true)
     end
     count_tol = sqrt(eps(T)) * max(maximum(N_q; init=zero(T)), one(T))
     active_q = BitVector(N_q .> count_tol)
@@ -1099,21 +1198,8 @@ function _LQRMStepCtx(
         )
     end
     for u in units
-        active_q[u.q] || continue
+        (active_q[u.q] && !u.hold) || continue
         N_A[u.v[_LQR_BLOCK_A]] += u.n
-    end
-
-    #=
-    Which models use each copy of each block. Two jobs: a frozen block reads its
-    value back from a representative, and the fitted value is written to every
-    model sharing the copy — so a tie is broadcast by construction rather than by
-    a separate pass that has to know which blocks it may touch.
-    =#
-    owners = [[Int[] for _ in 1:nv[b]] for b in 1:_LQR_BLOCK_N]
-    for c in eachindex(eff[1])
-        for b in 1:_LQR_BLOCK_N
-            push!(owners[b][eff[b][c]], c)
-        end
     end
 
     noise_sm = Vector{typeof(sm1)}(undef, nq)
@@ -1128,7 +1214,7 @@ function _LQRMStepCtx(
         end for s in 1:nq
     ]
     Sfinv = [
-        if (profile || !sm1.terminal)
+        if (profile || !terminal)
             zeros(T, n, n)
         else
             Matrix(inv(PDMat(Symmetrize!(Matrix{T}(noise_sm[s].Σf)))))
@@ -1136,10 +1222,14 @@ function _LQRMStepCtx(
     ]
 
     U = length(units)
+    Ku = [length(u.hs.nk) for u in units]
     return _LQRMStepCtx{T,eltype(sufs),typeof(sm1)}(
         pack,
         nq,
+        terminal,
         units,
+        [_HoldUnit(T, u.hold ? n : 0, m) for u in units],
+        lqrA,
         collect(sms),
         owners,
         collect(q_slots),
@@ -1152,18 +1242,18 @@ function _LQRMStepCtx(
         Sfinv,
         [Matrix{T}(undef, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
         [Matrix{T}(undef, n, n) for _ in 1:nv[_LQR_BLOCK_S]],
-        [[Matrix{T}(undef, n, n) for _ in 1:K] for _ in 1:nv[_LQR_BLOCK_Q]],
+        [[Matrix{T}(undef, n, n) for _ in 1:Kq[v]] for v in 1:nv[_LQR_BLOCK_Q]],
         [Vector{T}(undef, d) for _ in 1:nv[_LQR_BLOCK_H]],
         [Matrix{T}(undef, d, m) for _ in 1:nv[_LQR_BLOCK_B]],
         [Matrix{T}(undef, n, m) for _ in 1:nv[_LQR_BLOCK_G]],
         [Vector{T}(undef, n) for _ in 1:nv[_LQR_BLOCK_F]],
-        [[zeros(T, d, reg) for _ in 1:K] for _ in 1:U],
-        [[zeros(T, n, reg) for _ in 1:K] for _ in 1:U],
+        [[zeros(T, d, reg) for _ in 1:Ku[ui]] for ui in 1:U],
+        [[zeros(T, n, reg) for _ in 1:Ku[ui]] for ui in 1:U],
         [Matrix{T}(undef, d, d) for _ in 1:nq],
         [Matrix{T}(undef, n, n) for _ in 1:nq],
         [zeros(T, n, n) for _ in 1:nv[_LQR_BLOCK_A]],
         [zeros(T, n, n) for _ in 1:nv[_LQR_BLOCK_S]],
-        [[zeros(T, n, n) for _ in 1:K] for _ in 1:nv[_LQR_BLOCK_Q]],
+        [[zeros(T, n, n) for _ in 1:Kq[v]] for v in 1:nv[_LQR_BLOCK_Q]],
         [zeros(T, d) for _ in 1:nv[_LQR_BLOCK_H]],
         [zeros(T, d, m) for _ in 1:nv[_LQR_BLOCK_B]],
         [zeros(T, n, m) for _ in 1:nv[_LQR_BLOCK_G]],
@@ -1235,6 +1325,20 @@ end
 end
 
 """
+    _qc_owner(ctx, v, k) -> Int
+
+A model that holds regime `k` of cost copy `v`. Every owner of the copy holds
+regime 1; a higher regime is held only by owners with that many costs (an
+`:lqr` state's terminal cost, beside a `:hold` state's single one).
+"""
+@inline function _qc_owner(ctx::_LQRMStepCtx, v::Int, k::Int)
+    for c in ctx.owners[_LQR_BLOCK_Q][v]
+        _nregimes(ctx.sms[c]) >= k && return c
+    end
+    throw(ArgumentError("no model holds regime $k of cost copy $v"))
+end
+
+"""
     _lqr_pack!(θ, ctx) -> θ
 
 Read the current parameters into `θ`. A block's copy is read from any model that
@@ -1251,9 +1355,9 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
         r = _lqr_blk(p, _LQR_BLOCK_S, v)
         _lqr_pack_psd!(θ, r, ctx.sms[first(o[_LQR_BLOCK_S][v])].S, "S")
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         r = _lqr_blk_q(p, v, k)
-        _lqr_pack_psd!(θ, r, ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k], "Qc[$k]")
+        _lqr_pack_psd!(θ, r, ctx.sms[_qc_owner(ctx, v, k)].Qc[k], "Qc[$k]")
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
         r = _lqr_blk(p, _LQR_BLOCK_H, v)
@@ -1389,10 +1493,10 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
             _lqr_unpack_psd!(ctx.S[v], factor, θ, r)
         end
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K)
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         r = _lqr_blk_q(p, v, k)
         if isempty(r)
-            copyto!(ctx.Qc[v][k], ctx.sms[first(o[_LQR_BLOCK_Q][v])].Qc[k])
+            copyto!(ctx.Qc[v][k], ctx.sms[_qc_owner(ctx, v, k)].Qc[k])
         else
             factor = view(ctx.tmp_dd, 1:n, 1:n)
             _lqr_unpack_psd!(ctx.Qc[v][k], factor, θ, r)
@@ -1437,17 +1541,44 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
     return ctx
 end
 
+"""
+    _lqr_assemble!(ctx) -> Bool
+
+Build every unit's design from the unpacked parameters: `Θ_k` (and the terminal
+`Ψ_k`) for an `:lqr` unit, and for a `:hold` unit its steady state — the DARE
+solution and everything derived from it, see [`_hold_steady_state!`](@ref) —
+with `Lh` and `Θh = [A 0 F; 0 0 G]`.
+
+Returns `false` when some active hold unit has no stabilizing DARE solution at
+these parameters, which the objective reports as an infeasible point.
+"""
 function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     p = ctx.pack
     n, d, m = p.n, p.d, p.m
     xr, lr = 1:n, (n + 1):d
-    terminal = ctx.sms[1].terminal
+    ur = (d + 1):(d + 1 + m)
+    terminal = ctx.terminal
     for (ui, u) in enumerate(ctx.units)
         A = ctx.A[u.v[_LQR_BLOCK_A]]
         S = ctx.S[u.v[_LQR_BLOCK_S]]
         Qs = ctx.Qc[u.v[_LQR_BLOCK_Q]]
         hv = ctx.h[u.v[_LQR_BLOCK_H]]
-        for k in 1:(p.K)
+        if u.hold
+            ctx.active_q[u.q] || continue
+            H = ctx.hold[ui]
+            _hold_steady_state!(
+                H, A, S, Qs[1], hv, ctx.Bu[u.v[_LQR_BLOCK_B]], ctx.Gref[u.v[_LQR_BLOCK_G]]
+            ) || return false
+            Th = ctx.Theta[ui][1]
+            fill!(Th, zero(T))
+            @views begin
+                Th[xr, xr] .= A
+                Th[xr, ur] .= H.F
+                Th[lr, ur] .= H.Gm
+            end
+            continue
+        end
+        for k in eachindex(ctx.Theta[ui])
             Th = ctx.Theta[ui][k]
             @views begin
                 Th[xr, xr] .= A
@@ -1463,7 +1594,7 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             end
         end
         if terminal
-            for k in 1:(p.K)
+            for k in eachindex(ctx.Psi[ui])
                 Psi = ctx.Psi[ui][k]
                 Qf = Qs[k]
                 @views begin
@@ -1480,7 +1611,7 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             end
         end
     end
-    return ctx
+    return true
 end
 
 #=
@@ -1492,10 +1623,13 @@ plant dimension is what this has to be fast for.
 Everything is written through preallocated scratch and 5-argument `mul!`. The
 obvious spelling, `R .-= Th * Xvᵀ` and friends, allocates three `d × d` or
 `d × reg` temporaries per unit and regime on *every* evaluation.
+
+A hold unit's residual is `Lh z_{t+1} − Θh ω_t`, so its scatter is
+`Lh Y Lhᵀ − Lh X Θhᵀ − Θh Xᵀ Lhᵀ + Θh Z Θhᵀ` over the forward statistics
+(`Yv`, `Xv`, `Zw` hold `yy`, `zyᵀ`, `zz` for it; see `_fill_mixed_blocks!`).
 =#
 function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
-    p = ctx.pack
-    terminal = ctx.sms[1].terminal
+    terminal = ctx.terminal
     for s in 1:(ctx.nq)
         fill!(ctx.R[s], zero(T))
         fill!(ctx.Rf[s], zero(T))
@@ -1507,8 +1641,24 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         ctx.active_q[u.q] || continue
         hs = u.hs
         R = ctx.R[u.q]
+        if u.hold
+            H = ctx.hold[ui]
+            Th = ctx.Theta[ui][1]
+            # R += Lh Y Lhᵀ
+            mul!(TX, H.Lh, hs.Yv)
+            mul!(R, TX, transpose(H.Lh), one(T), one(T))
+            # R -= (Lh X) Θhᵀ + its transpose
+            mul!(TZ, H.Lh, hs.Xv[1])
+            mul!(TX, TZ, transpose(Th))
+            R .-= TX
+            R .-= transpose(TX)
+            # R += Θh Z Θhᵀ
+            mul!(TZ, Th, hs.Zw[1])
+            mul!(R, TZ, transpose(Th), one(T), one(T))
+            continue
+        end
         R .+= hs.Yv
-        for k in 1:(p.K)
+        for k in eachindex(ctx.Theta[ui])
             Th = ctx.Theta[ui][k]
             # R -= Θ Xᵀ + (Θ Xᵀ)ᵀ, then R += Θ Z Θᵀ.
             mul!(TX, Th, transpose(hs.Xv[k]))
@@ -1518,7 +1668,7 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             mul!(R, TZ, transpose(Th), one(T), one(T))
         end
         if terminal
-            for k in 1:(p.K)
+            for k in eachindex(ctx.Psi[ui])
                 hs.term_n[k] > zero(T) || continue
                 Psi = ctx.Psi[ui][k]
                 mul!(PO, Psi, hs.Omega[k])
@@ -1533,13 +1683,145 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     return ctx
 end
 
+#=============================================================================
+The hold unit's gradient.
+
+A hold unit contributes `f = (N_eff/2) log det R` (profiled; `½ tr(Σ⁻¹R)`
+otherwise) with `R ∋ Σ_t (Lh z_{t+1} − Θh ω_t)(…)ᵀ`, plus `−N log det(I + S P)`.
+With `𝒲 = N_eff R⁻¹` (or `Σ⁻¹`), the two designs pull back as
+
+    ∂f/∂Lh = 𝒲 (Lh Y − Θh Xᵀ),        ∂f/∂Θh = 𝒲 (Θh Z − Lh X),
+
+(`X = Xv`, `Y = Yv`, `Z = Zw`), and everything else is the chain through the
+steady state, in reverse order of how `_hold_steady_state!` built it:
+
+    Lh = [I S; −P I]            S̄ += L̄h[x, λ],          P̄ −= L̄h[λ, x]
+    Θh = [A 0 F; 0 0 G]         Ā += Θ̄h[x, x],  F̄ = Θ̄h[x, ũ],  Ḡ = Θ̄h[λ, ũ]
+    G = V K                     K̄ = Vᵀ Ḡ,       V̄ = Ḡ Kᵀ
+    K = E + A_clᵀ P F           Ē = K̄,  Ā_cl = P F K̄ᵀ,  P̄ += A_cl K̄ Fᵀ,  F̄ += P A_cl K̄
+    V = (I − A_clᵀ)⁻¹           Ā_cl += V V̄ᵀ V             (dV = V dA_clᵀ V)
+    E = [h_λ  B_λ − Q G_r]      h̄_λ, B̄_λ += Ē;  Q̄ −= Ē_u G_rᵀ;  Ḡ_r −= Q Ē_u
+    F = [h_x  B_x]              h̄_x, B̄_x += F̄
+    A_cl = W A                  Ā += Wᵀ Ā_cl,    W̄ = Ā_cl Aᵀ
+    W = (I + S P)⁻¹             M̄ = −Wᵀ W̄ Wᵀ:   S̄ += M̄ P,  P̄ += S M̄
+    −N log det(I + S P)         S̄ −= N Wᵀ P,     P̄ −= N S Wᵀ
+
+and last, once every route into `P` is accumulated, the DARE itself:
+`dP − A_clᵀ dP A_cl = dQ + dAᵀ P A_cl + A_clᵀ P dA − A_clᵀ P dS P A_cl`, whose
+adjoint is one Stein solve `Y − A_cl Y A_clᵀ = sym(P̄)`, giving
+
+    Q̄ += Y,     Ā += 2 P A_cl Y,     S̄ −= P A_cl Y A_clᵀ P.
+
+Every line is checked against central differences of the packed objective in
+`test/LinearDynamicalSystems/HoldLDS.jl`. The matrix-coordinate gradients land
+in the same `dA`/`dS`/`dQ`/`dh`/`dB`/`dG` buffers the `:lqr` units fill, so the
+PSD chain rule, the cost prior, freezing and ties apply to both unchanged.
+=============================================================================#
+function _hold_unit_gradient!(
+    ctx::_LQRMStepCtx{T}, ui::Int, u::_LQRUnit, Fq::AbstractVector, Neff::AbstractVector{T}
+) where {T<:Real}
+    p = ctx.pack
+    n, d, m = p.n, p.d, p.m
+    xr, lr = 1:n, (n + 1):d
+    ur = (d + 1):(d + 1 + m)
+    H = ctx.hold[ui]
+    hs = u.hs
+    Th = ctx.Theta[ui][1]
+    vA, vS, vQ = u.v[_LQR_BLOCK_A], u.v[_LQR_BLOCK_S], u.v[_LQR_BLOCK_Q]
+    vh, vB, vG = u.v[_LQR_BLOCK_H], u.v[_LQR_BLOCK_B], u.v[_LQR_BLOCK_G]
+    A, S, Q = ctx.A[vA], ctx.S[vS], ctx.Qc[vQ][1]
+    dA, dS, dQ = ctx.dA[vA], ctx.dS[vS], ctx.dQ[vQ][1]
+    dh = ctx.dh[vh]
+    P, W, Acl, V = H.P, H.W, H.Acl, H.V
+    Pbar, Aclbar, Kbar, Fbar = H.Pbar, H.Aclbar, H.Kbar, H.Fbar
+    N = u.n
+
+    # Residual weights: the raw pullbacks, then 𝒲 applied on the left.
+    mul!(H.dd, H.Lh, hs.Yv)
+    mul!(H.dd, Th, transpose(hs.Xv[1]), -one(T), one(T))
+    mul!(H.dr, Th, hs.Zw[1])
+    mul!(H.dr, H.Lh, hs.Xv[1], -one(T), one(T))
+    if ctx.profile
+        copyto!(H.DLh, H.dd)
+        ldiv!(Fq[u.q], H.DLh)
+        H.DLh .*= Neff[u.q]
+        copyto!(H.DTh, H.dr)
+        ldiv!(Fq[u.q], H.DTh)
+        H.DTh .*= Neff[u.q]
+    else
+        mul!(H.DLh, ctx.W[u.q], H.dd)
+        mul!(H.DTh, ctx.W[u.q], H.dr)
+    end
+
+    @views begin
+        # Lh = [I S; −P I]
+        dS .+= H.DLh[xr, lr]
+        Pbar .= .-H.DLh[lr, xr]
+        # Θh = [A 0 F; 0 0 G]
+        dA .+= H.DTh[xr, xr]
+        Fbar .= H.DTh[xr, ur]
+        Gbar = H.DTh[lr, ur]
+
+        # G = V K
+        mul!(Kbar, transpose(V), Gbar)
+
+        # E = [h_λ  B_λ − Q G_r]
+        dh[lr] .+= Kbar[:, 1]
+        if m > 0
+            Kbu = Kbar[:, 2:end]
+            ctx.dB[vB][lr, :] .+= Kbu
+            mul!(dQ, Kbu, transpose(ctx.Gref[vG]), -one(T), one(T))
+            mul!(ctx.dG[vG], Q, Kbu, -one(T), one(T))
+        end
+
+        # K = E + A_clᵀ P F
+        mul!(H.nr, P, H.F)
+        mul!(Aclbar, H.nr, transpose(Kbar))
+        mul!(H.nr, Acl, Kbar)
+        mul!(Pbar, H.nr, transpose(H.F), one(T), one(T))
+        mul!(Fbar, P, H.nr, one(T), one(T))
+
+        # V = (I − A_clᵀ)⁻¹, with V̄ᵀ = K Ḡᵀ
+        mul!(H.nn1, H.K, transpose(Gbar))
+        mul!(H.nn2, V, H.nn1)
+        mul!(Aclbar, H.nn2, V, one(T), one(T))
+
+        # F = [h_x  B_x]
+        dh[xr] .+= Fbar[:, 1]
+        m > 0 && (ctx.dB[vB][xr, :] .+= Fbar[:, 2:end])
+    end
+
+    # A_cl = W A
+    mul!(dA, transpose(W), Aclbar, one(T), one(T))
+    mul!(H.nn1, Aclbar, transpose(A))                  # W̄
+    # W = (I + S P)⁻¹:  M̄ = −Wᵀ W̄ Wᵀ (held negated in nn3)
+    mul!(H.nn2, transpose(W), H.nn1)
+    mul!(H.nn3, H.nn2, transpose(W))
+    mul!(dS, H.nn3, P, -one(T), one(T))
+    mul!(Pbar, S, H.nn3, -one(T), one(T))
+
+    # Jacobian −N log det(I + S P)
+    mul!(dS, transpose(W), P, -N, one(T))
+    mul!(Pbar, S, transpose(W), -N, one(T))
+
+    # The DARE: one adjoint Stein solve, then dQ, dA, dS.
+    _sym!(H.nn2, Pbar)
+    _stein_adjoint!(H.Ybar, Acl, H.nn2, H)
+    dQ .+= H.Ybar
+    mul!(H.nn1, P, Acl)
+    mul!(dA, H.nn1, H.Ybar, T(2), one(T))
+    mul!(H.nn2, H.nn1, H.Ybar)
+    mul!(dS, H.nn2, transpose(H.nn1), -one(T), one(T))
+    return nothing
+end
+
 function _lqr_fg!(
     grad::Union{Nothing,AbstractVector{T}}, θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}
 ) where {T<:Real}
     p = ctx.pack
-    n, d, m, K = p.n, p.d, p.m, p.K
+    n, d, m = p.n, p.d, p.m
     xr, lr = 1:n, (n + 1):d
-    terminal = ctx.sms[1].terminal
+    terminal = ctx.terminal
     nA = p.nv[_LQR_BLOCK_A]
 
     #=
@@ -1561,13 +1843,16 @@ function _lqr_fg!(
             isposdef(Symmetric(ctx.S[v])) ||
             return T(Inf)
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         isempty(_lqr_blk_q(p, v, k)) || isposdef(Symmetric(ctx.Qc[v][k])) || return T(Inf)
     end
 
     fval = zero(T)
     F = Vector{LU{T,Matrix{T},Vector{Int}}}(undef, nA)
     for a in 1:nA
+        #= Only the finite-horizon form inverts `A`; a copy only hold units use
+        carries no `log|det A|` and may be singular. =#
+        ctx.lqrA[a] || continue
         Fa = lu(ctx.A[a]; check=false)
         issuccess(Fa) || return T(Inf)
         logdetA, _ = logabsdet(Fa)
@@ -1576,8 +1861,15 @@ function _lqr_fg!(
         F[a] = Fa
     end
 
-    _lqr_assemble!(ctx)
+    #= A hold unit whose DARE has no stabilizing solution here has no model at
+    all — an infeasible point, like a singular `A`. =#
+    _lqr_assemble!(ctx) || return T(Inf)
     _lqr_residuals!(ctx)
+    # Hold Jacobian: −N log det(I + S P), the analogue of −N log|det A|.
+    for (ui, u) in enumerate(ctx.units)
+        (u.hold && ctx.active_q[u.q]) || continue
+        fval -= u.n * ctx.hold[ui].logdetM
+    end
 
     Fq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
     Ffq = Vector{Cholesky{T,Matrix{T}}}(undef, ctx.nq)
@@ -1628,7 +1920,7 @@ function _lqr_fg!(
     The cost prior's *value*, here rather than in the gradient section below,
     because of the early return on the next line.
     =#
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         pr = _qc_prior(ctx, v, k)
         if pr !== nothing && !isempty(_lqr_blk_q(p, v, k))
             pen = _iw_penalty(ctx.Qc[v][k], pr)
@@ -1645,7 +1937,7 @@ function _lqr_fg!(
     for v in 1:(p.nv[_LQR_BLOCK_S])
         fill!(ctx.dS[v], zero(T))
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         fill!(ctx.dQ[v][k], zero(T))
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
@@ -1667,9 +1959,13 @@ function _lqr_fg!(
     GP = ctx.tmp_nr2
     for (ui, u) in enumerate(ctx.units)
         ctx.active_q[u.q] || continue
+        if u.hold
+            _hold_unit_gradient!(ctx, ui, u, Fq, Neff)
+            continue
+        end
         vA, vS, vQ = u.v[_LQR_BLOCK_A], u.v[_LQR_BLOCK_S], u.v[_LQR_BLOCK_Q]
         vh, vB, vG = u.v[_LQR_BLOCK_H], u.v[_LQR_BLOCK_B], u.v[_LQR_BLOCK_G]
-        for k in 1:K
+        for k in eachindex(ctx.Theta[ui])
             copyto!(E, u.hs.Xv[k])
             mul!(E, ctx.Theta[ui][k], u.hs.Zw[k], one(T), -one(T))
             if ctx.profile
@@ -1703,7 +1999,7 @@ function _lqr_fg!(
         if terminal && ctx.Nf_q[u.q] > zero(T)
             # ∂/∂Ψ_k of each terminal-regime term;
             # Ψ_k = [−Q_k  I  −h_f  Q_k G_r].
-            for k in 1:K
+            for k in eachindex(ctx.Psi[ui])
                 u.hs.term_n[k] > zero(T) || continue
                 mul!(PO, ctx.Psi[ui][k], u.hs.Omega[k])
                 if ctx.profile
@@ -1727,13 +2023,15 @@ function _lqr_fg!(
     end
 
     for a in 1:nA
-        # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_aâ»áµ€.
-        fill!(ctx.tmp_nn, zero(T))
-        for i in 1:n
-            ctx.tmp_nn[i, i] = one(T)
+        # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_a⁻ᵀ.
+        if ctx.lqrA[a]
+            fill!(ctx.tmp_nn, zero(T))
+            for i in 1:n
+                ctx.tmp_nn[i, i] = one(T)
+            end
+            ldiv!(adjoint(F[a]), ctx.tmp_nn)
+            ctx.dA[a] .-= ctx.N_A[a] .* ctx.tmp_nn
         end
-        ldiv!(adjoint(F[a]), ctx.tmp_nn)
-        ctx.dA[a] .-= ctx.N_A[a] .* ctx.tmp_nn
         r = _lqr_blk(p, _LQR_BLOCK_A, a)
         isempty(r) || copyto!(view(grad, r), vec(ctx.dA[a]))
     end
@@ -1753,13 +2051,13 @@ function _lqr_fg!(
     rule below turns `dQ` into a gradient with respect to the packed factor. Its
     value was added above, before the early return.
     =#
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         pr = _qc_prior(ctx, v, k)
         if pr !== nothing && !isempty(_lqr_blk_q(p, v, k))
             _iw_penalty_grad!(ctx.dQ[v][k], ctx.Qc[v][k], pr)
         end
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:K
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         r = _lqr_blk_q(p, v, k)
         if !isempty(r)
             _sym!(ctx.tmp_nn, ctx.dQ[v][k])
@@ -1808,7 +2106,8 @@ function _lqr_writeback!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:
     for v in 1:(p.nv[_LQR_BLOCK_S]), c in o[_LQR_BLOCK_S][v]
         isempty(_lqr_blk(p, _LQR_BLOCK_S, v)) || copyto!(ctx.sms[c].S, ctx.S[v])
     end
-    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.K), c in o[_LQR_BLOCK_Q][v]
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v]), c in o[_LQR_BLOCK_Q][v]
+        _nregimes(ctx.sms[c]) >= k || continue
         isempty(_lqr_blk_q(p, v, k)) || copyto!(ctx.sms[c].Qc[k], ctx.Qc[v][k])
     end
     for v in 1:(p.nv[_LQR_BLOCK_H]), c in o[_LQR_BLOCK_H][v]
@@ -1877,7 +2176,14 @@ function _lqr_structure_mstep!(
     end
 
     _lqr_unpack!(ctx, θ0)
-    _lqr_assemble!(ctx)
+    #= The accepted point always has a stabilizing DARE solution (its objective
+    was finite, or it is the incoming model, which `refresh!` built). =#
+    _lqr_assemble!(ctx) || throw(
+        NumericalStabilityError(
+            "hold",
+            "a hold state's DARE has no stabilizing solution at its current parameters",
+        ),
+    )
     _lqr_residuals!(ctx)
     return ctx
 end
@@ -2051,6 +2357,34 @@ function _free_Q_transition(
     R = _free_residual_scatter(Theta, hs)
     Σ_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σ)))
     return T(-0.5) * (N * (T(d) * log(T(2π)) + logdet(Σ_PD)) + tr(Σ_PD \ R))
+end
+
+"""
+    _forward_Q_transition(sm, hs) -> T
+
+The transition half of the state Q-term computed in forward coordinates from
+the cache, `−½[N(d log2π + log det Q^fwd) + tr((Q^fwd)⁻¹ R^z)]` with `R^z` the
+residual scatter of `z_{t+1} − M z_t − b − B u_t`. Used for a `:hold` model,
+whose cache holds `M = Lh⁻¹[A 0; 0 0]`, `Q^fwd = Lh⁻¹ Σ Lh⁻ᵀ`, … — so this
+equals the M-step's `−½[N(d log2π + log det Σ − 2 log det(I + SP)) +
+tr(Σ⁻¹ R_h)]` term for term, since `R_h = Lh R^z Lhᵀ`.
+"""
+function _forward_Q_transition(
+    sm::LQRStateModel{T}, hs::LQRSufficientStatistics{T}
+) where {T<:Real}
+    N = T(hs.nk[1])
+    N > zero(T) || return zero(T)
+    c = sm.cache
+    d = _state_latent_dim(sm)
+    m = size(sm.Bu, 2)
+    Theta = Matrix{T}(undef, d, d + 1 + m)
+    @views begin
+        Theta[:, 1:d] .= c.M[1]
+        Theta[:, d + 1] .= c.bfwd
+        m > 0 && (Theta[:, (d + 2):(d + 1 + m)] .= c.Bfwd[1])
+    end
+    R = _free_residual_scatter(Theta, hs)
+    return T(-0.5) * (N * (T(d) * log(T(2π)) + logdet(c.Qfwd)) + tr(c.Qfwd \ R))
 end
 
 """
@@ -2369,6 +2703,9 @@ function _lqr_joint_Q_state!(
 
     # `:free` mode has no constrained parameterization to profile through.
     _is_free(sm) && return Q_val + _free_Q_transition(sm, hs)
+    #= `:hold` mode scores its forward transition straight off the cache — the
+    same density the smoother used, so the bound is the smoother's own. =#
+    _is_hold(sm) && return Q_val + _forward_Q_transition(sm, hs)
 
     #=
     Fill the mixed blocks here rather than relying on the caller: this is reached
