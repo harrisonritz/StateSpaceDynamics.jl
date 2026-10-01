@@ -948,11 +948,7 @@ function terminal_normalizer(
     any(sm -> sm.terminal, lqr) || return zeros(T, length(ux))
     variants = _slds_state_trial_variants(slds, length(ux); depends_on=depends_on)
     return _slqr_trial_logz(
-        slds,
-        [Matrix{T}(u) for u in ux],
-        variants;
-        ux0=ux0,
-        smoothing_iters=smoothing_iters,
+        slds, [Matrix{T}(u) for u in ux], variants; ux0=ux0, smoothing_iters=smoothing_iters
     )
 end
 
