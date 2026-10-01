@@ -4430,3 +4430,116 @@ function test_SLDS_warmup_fit(; rng=MersenneTwister(0xD1A5))
     end
     return nothing
 end
+
+# ============================================================================
+# Banded (left-to-right) chains
+# ============================================================================
+
+"""`banded_transition`, `banded_transition_prior` and `median_dwell_stay` build the
+chain and prior they document, and refuse what they cannot represent."""
+function test_SLDS_banded_helpers()
+    @testset "banded chain helpers" begin
+        A, π = banded_transition(3; stay=[0.9, 0.8])
+        @test A ≈ [0.9 0.1 0.0; 0.0 0.8 0.2; 0.0 0.0 1.0] rtol = 1e-12
+        @test π == [1.0, 0.0, 0.0]
+        @test banded_transition(2; stay=0.7)[1] ≈ [0.7 0.3; 0.0 1.0] rtol = 1e-12
+        @test banded_transition(1; stay=Float64[])[1] == ones(1, 1)
+
+        # Half the stage's trials have left it by the median dwell.
+        for d in (1.0, 7.5, 40.0)
+            p = median_dwell_stay(d)
+            @test p^d ≈ 0.5 rtol = 1e-12
+        end
+        @test_throws ArgumentError median_dwell_stay(0)
+
+        α = banded_transition_prior(3; stay=[0.9, 0.6], strength=20.0)
+        @test α ≈ [19.0 3.0 1.0; 1.0 13.0 9.0; 1.0 1.0 1.0] rtol = 1e-12
+        # The prior's mode is the stay probability itself.
+        for k in 1:2
+            stay = (α[k, k] - 1) / (α[k, k] - 1 + α[k, k + 1] - 1)
+            @test stay ≈ [0.9, 0.6][k] rtol = 1e-12
+        end
+        @test banded_transition_prior(3; stay=0.5, strength=0.0) == ones(3, 3)
+
+        @test_throws ArgumentError banded_transition(3; stay=[0.9])
+        @test_throws ArgumentError banded_transition(3; stay=[0.9, 1.0])
+        @test_throws ArgumentError banded_transition(2; stay=0.0)
+        @test_throws ArgumentError banded_transition(0; stay=Float64[])
+        @test_throws ArgumentError banded_transition_prior(2; stay=0.5, strength=-1.0)
+    end
+    return nothing
+end
+
+"""The discrete M-step keeps a band: structural zeros get neither expected counts
+nor pseudo-counts, and the banded prior's MAP is counts plus `α − 1` on the band."""
+function test_SLDS_banded_mstep_keeps_band()
+    @testset "banded chain: M-step keeps the band" begin
+        tsteps = [14, 11, 17]
+        total = sum(tsteps)
+        A0, π0 = banded_transition(3; stay=[0.8, 0.7])
+        logL = 0.8 .* randn(StableRNG(11), 3, total)
+        α = banded_transition_prior(3; stay=[0.9, 0.85], strength=12.0)
+
+        dl, fb, seq_ends = _chain_fb(copy(A0), copy(π0), logL, tsteps)
+        N, n = StateSpaceDynamics._slds_chain_counts(fb, seq_ends, 3, Float64)
+        @test N[2, 1] == 0 && N[3, 1] == 0 && N[3, 2] == 0 && N[1, 3] == 0
+        fit!(dl, fb, collect(1:total); seq_ends=seq_ends, A_prior=α)
+        @test dl.A ≈ (N .+ α .- 1) ./ sum(N .+ α .- 1; dims=2) rtol = 1e-12
+        @test dl.A[2, 1] == 0 && dl.A[3, 1] == 0 && dl.A[3, 2] == 0 && dl.A[1, 3] == 0
+        @test dl.A[3, 3] == 1
+        @test dl.πₖ == [1.0, 0.0, 0.0]
+    end
+    return nothing
+end
+
+"""A state no trial visits has neither counts nor pseudo-counts in its row. It keeps
+its current transition probabilities instead of becoming an all-zero row."""
+function test_SLDS_unvisited_row_kept()
+    @testset "chain M-step: an unvisited state keeps its row" begin
+        tsteps = [10, 12]
+        total = sum(tsteps)
+        A0, π0 = banded_transition(3; stay=[0.95, 0.6])
+        # Evidence pins every bin to stage 1, so stages 2 and 3 are never visited.
+        logL = [k == 1 ? 0.0 : -200.0 for k in 1:3, _ in 1:total]
+        dl, fb, seq_ends = _chain_fb(copy(A0), copy(π0), logL, tsteps)
+        fit!(dl, fb, collect(1:total); seq_ends=seq_ends)
+        @test dl.A[1, :] ≈ [1.0, 0.0, 0.0] atol = 1e-12
+        @test dl.A[2, :] == A0[2, :]
+        @test dl.A[3, :] == A0[3, :]
+        @test all(sum(dl.A; dims=2) .≈ 1)
+    end
+    return nothing
+end
+
+"""End to end: a banded SLDS fitted to banded data keeps its band and its start
+stage exactly, climbs the ELBO, and recovers each stage's dwell."""
+function test_SLDS_banded_fit(; rng=MersenneTwister(0xBA4D))
+    @testset "banded SLDS: fit keeps the band and recovers dwell times" begin
+        K, latent_dim, obs_dim = 3, 2, 4
+        stay_true = [median_dwell_stay(12.0), median_dwell_stay(20.0)]
+        truth = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        for (k, lds) in enumerate(truth.LDSs)
+            lds.obs_model.d .= 4.0 * (k - 2)
+        end
+        truth.A, truth.πₖ = banded_transition(K; stay=stay_true)
+        z, _, y = rand(rng, truth, fill(60, 12))
+
+        model = _distinct_gaussian_slds(K, latent_dim, obs_dim)
+        model.A, model.πₖ = banded_transition(K; stay=0.9)
+        model.A_prior = banded_transition_prior(K; stay=0.9, strength=4.0)
+        elbos = fit!(
+            model, y; max_iter=15, smoothing_iters=4, progress=false, rng=MersenneTwister(3)
+        )
+        @test all(isfinite, elbos)
+        slack = 1e-8 * max(1.0, maximum(abs, elbos))
+        @test all(>=(-slack), diff(elbos))
+        @test model.A[2, 1] == 0 && model.A[3, 1] == 0 && model.A[3, 2] == 0
+        @test model.A[1, 3] == 0 && model.A[3, 3] == 1
+        @test model.πₖ == [1.0, 0.0, 0.0]
+        # Every simulated trial runs through the stages in order.
+        @test all(issorted(zi) for zi in z)
+        @test model.A[1, 1] ≈ stay_true[1] atol = 0.04
+        @test model.A[2, 2] ≈ stay_true[2] atol = 0.04
+    end
+    return nothing
+end

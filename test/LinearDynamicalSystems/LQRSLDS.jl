@@ -2044,3 +2044,26 @@ function test_slds_lqr_terminal_warmup()
     end
     return nothing
 end
+
+"""
+A banded chain survives the terminal-conditioned chain step. That step is not
+Baum–Welch: when the plain update fails to raise `g = Σ N log A − log Ẑ` it ascends
+the softmax logits, and a structural zero is a `−Inf` logit whose gradient is zero
+(no data counts, no probe counts, no pseudo-counts). The band, the absorbing last
+stage and the start stage must all come out exactly as they went in.
+"""
+function test_slds_lqr_banded_conditional_chain()
+    p, tsteps, ntrials = 4, 18, 5
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.9 0.0; 0.0 0.7]]; p=p, terminal=true)
+    @test SSD._slds_condition_terminal(slds)
+    slds.A, slds.πₖ = banded_transition(2; stay=0.85)
+    slds.A_prior = banded_transition_prior(2; stay=0.85, strength=5.0)
+    elbos = _trace(fit!(slds, ys; max_iter=3, progress=false, rng=StableRNG(7)))
+    @test all(isfinite, elbos)
+    @test slds.A[2, 1] == 0
+    @test slds.A[2, 2] == 1
+    @test slds.πₖ == [1.0, 0.0]
+    @test 0 < slds.A[1, 1] < 1
+    return nothing
+end

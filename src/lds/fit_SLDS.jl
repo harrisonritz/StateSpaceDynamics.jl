@@ -406,6 +406,12 @@ function StatsAPI.fit!(
         end
     end
 
+    #= A row with neither expected transitions nor pseudo-counts has nothing to be
+    re-estimated from — a state no trial visited this iteration, which a banded
+    chain makes routine for its later stages. It keeps its current value rather
+    than being normalised from zero, which would leave the chain invalid. =#
+    A_prev = copy(dl.A)
+
     fill!(dl.πₖ, zero(eltype(dl.πₖ)))
     fill!(dl.A, zero(eltype(dl.A)))
     for k in eachindex(seq_ends)
@@ -428,6 +434,8 @@ function StatsAPI.fit!(
         s = sum(view(dl.A, i, :))
         if s > zero(T)
             dl.A[i, :] ./= s
+        else
+            dl.A[i, :] .= view(A_prev, i, :)
         end
     end
 

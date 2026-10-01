@@ -110,6 +110,12 @@ x0_mean_prior
 transition_prior
 ```
 
+```@docs
+banded_transition
+banded_transition_prior
+median_dwell_stay
+```
+
 ## Ancillary parameter dependencies
 
 ```@docs

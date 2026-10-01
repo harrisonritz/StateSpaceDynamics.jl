@@ -197,6 +197,13 @@ using SSDTest
                 test_SLDS_warmup_estep_mstep()
                 test_SLDS_warmup_fit()
             end
+
+            @testset "Banded (left-to-right) chains" begin
+                test_SLDS_banded_helpers()
+                test_SLDS_banded_mstep_keeps_band()
+                test_SLDS_unvisited_row_kept()
+                test_SLDS_banded_fit()
+            end
         end
 
         include("LinearDynamicalSystems/GaussianLDS.jl")
@@ -625,6 +632,7 @@ using SSDTest
             test_slds_lqr_tied_emission_mask()
             test_slds_lqr_tied_prior_counted_once()
             test_lqr_pair_slots()
+            test_slds_lqr_banded_conditional_chain()
             test_slds_lqr_terminal_chain_prior()
             test_slds_lqr_terminal_warmup()
         end
