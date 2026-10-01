@@ -664,6 +664,7 @@ using SSDTest
             test_entry_guard_restores()
             test_entry_validation()
             test_entry_fit()
+            test_entry_with_hold()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

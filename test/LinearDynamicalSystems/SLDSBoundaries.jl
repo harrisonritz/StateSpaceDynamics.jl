@@ -319,21 +319,29 @@ end
 
 """A banded control → free → control model whose last state has an entry prior
 (and both control states bridges)."""
-function _entry_model(; p::Int=4, n::Int=2, stays=[0.85, 0.85])
+function _entry_model(; p::Int=4, n::Int=2, stays=[0.85, 0.85], middle::Symbol=:free)
     c1 = hslds_state([0.4 0.05; 0.05 0.3]; p=p, terminal=true)
     c1.state_model.condition_terminal = false
     c3 = hslds_state([0.6 0.0; 0.0 0.5]; p=p, terminal=true, seed=11)
     c3.state_model.condition_terminal = false
     d = 2n
-    free = LinearDynamicalSystem(
-        free_state_model(
-            0.9 * Matrix(1.0I, d, d), Matrix(0.05I, d, d); P0=Matrix(0.3I, d, d)
-        ),
-        deepcopy(c1.obs_model),
-    )
-    free.state_model.observe_costate = false
+    middle_sm = if middle === :hold
+        # Control → hold → control: the hold state shares the plant.
+        sm1 = c1.state_model
+        hold_state_model(
+            copy(sm1.A),
+            copy(sm1.S),
+            [0.5 0.0; 0.0 0.4],
+            Matrix(0.05I, d, d);
+            P0=Matrix(0.3I, d, d),
+        )
+    else
+        free_state_model(0.9 * Matrix(1.0I, d, d), Matrix(0.05I, d, d); P0=Matrix(0.3I, d, d))
+    end
+    mid = LinearDynamicalSystem(middle_sm, deepcopy(c1.obs_model))
+    mid.state_model.observe_costate = false
     A, πₖ = banded_transition(3; stay=stays)
-    slds = SLDS(; A=A, πₖ=πₖ, LDSs=[c1, free, c3])
+    slds = SLDS(; A=A, πₖ=πₖ, LDSs=[c1, mid, c3])
     set_boundaries!(slds; bridge_states=[1, 3], entry_states=[3], entry_cov=0.5)
     return slds
 end
@@ -394,9 +402,9 @@ The entry swap's objective, gradient and block-tridiagonal Hessian agree by
 finite differences — diagonal *and* off-diagonal blocks — and a zero entry weight
 leaves the smoother's objective exactly as it was.
 """
-function test_entry_smoother_derivatives()
+function test_entry_smoother_derivatives(; middle::Symbol=:free)
     rng = StableRNG(59)
-    slds = _entry_model()
+    slds = _entry_model(; middle=middle)
     slds.boundaries.entry[3].μ .= [0.2, -0.1]
     slds.boundaries.entry[3].K .= [0.3 0.1; -0.2 0.4]
     tsteps = 6
@@ -592,5 +600,38 @@ function test_entry_fit()
         fit!(sampled, ys; max_iter=3, num_samples=2, progress=false, rng=StableRNG(5))
     )
     @test all(isfinite, trace)
+    return nothing
+end
+
+"""
+Control (bridged) → hold → control (bridged, entry prior): the bridge out of state
+1 lands in an infinite-horizon hold, the entry into state 3 leaves one and reads
+its reference, and the guarded structural step fits the hold state jointly with
+the control states. Derivatives agree by finite differences and the fit runs.
+"""
+function test_entry_with_hold()
+    slds = _entry_model(; middle=:hold)
+    @test slds.LDSs[2].state_model.mode === :hold
+    @test_throws ArgumentError set_boundaries!(deepcopy(slds); entry_states=[2])
+    @test_throws ArgumentError set_boundaries!(deepcopy(slds); bridge_states=[2])
+    test_entry_smoother_derivatives(; middle=:hold)
+
+    p, tsteps, ntrials = 4, 36, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = _entry_model(; p=p, middle=:hold)
+    before = elbo(slds, ys)
+    trace = _trace(
+        fit!(slds, ys; max_iter=5, progress=false, rng=StableRNG(5), tied_params=[:A, :S])
+    )
+    after = elbo(slds, ys)
+    @test all(isfinite, trace)
+    @test after > before
+    @test slds.A[2, 1] == 0 && slds.A[3, 1] == 0 && slds.A[3, 2] == 0
+    hold = slds.LDSs[2].state_model
+    @test hold.mode === :hold
+    @test hold.A ≈ slds.LDSs[1].state_model.A
+    @test hold.S ≈ slds.LDSs[3].state_model.S
+    @test maximum(abs, eigvals(closed_loop_dynamics(hold))) < 1
+    @test isposdef(Symmetric(slds.boundaries.entry[3].P))
     return nothing
 end
