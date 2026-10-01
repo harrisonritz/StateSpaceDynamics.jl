@@ -737,6 +737,13 @@ function _slds_lqr_grouped_conditional_mstep!(
         "($(length(units)))",
     )
     sms = [lds.state_model for lds in ldss]
+    any(_is_hold, sms) && throw(
+        ArgumentError(
+            "terminal conditioning is not implemented for a switching model with a " *
+            "`:hold` discrete state; set `condition_terminal=false` on the " *
+            "inverse-LQR states.",
+        ),
+    )
     any(_is_free, sms) && throw(
         ArgumentError(
             "terminal conditioning is not implemented for a switching model that " *
