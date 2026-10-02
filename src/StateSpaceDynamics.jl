@@ -36,6 +36,7 @@ include("stats/priors.jl")
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
+include("lds/lqr_hold.jl")                          # infinite-horizon (hold) DARE primitives
 include("lds/lqr_types.jl")                         # inverse-LQR state model + derived cache
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
 include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
@@ -77,6 +78,8 @@ include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_LQR.jl")
 include("lds/lqr_terminal.jl")
 include("lds/slds_lqr_terminal.jl")
+include("lds/slds_boundaries.jl")   # exit bridges between discrete states
+include("lds/slds_sample_boundaries.jl")   # `rand` with boundary factors
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.
@@ -89,11 +92,13 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
+export set_boundaries!
 export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export SplineGaussianObservationModel
 export CompositeObservationModel
 export IWPrior, MNPrior, x0_mean_prior, transition_prior
+export banded_transition, banded_transition_prior, median_dwell_stay
 
 # Monotonic rational-quadratic splines (the normalizing-flow layer of a
 # `SplineGaussianObservationModel`; usable on their own).
@@ -105,7 +110,7 @@ export FitTrace
 
 # Inverse LQR
 export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
-export free_state_model, plant_dim
+export free_state_model, hold_state_model, plant_dim
 export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
 export simulate_lqr, lqr_riccati_sequence, terminal_logz, terminal_normalizer

@@ -117,7 +117,9 @@ end
 Validate a [`LQRStateModel`](@ref): the LQR structure (`A` square and
 invertible, `S` and every `Qc` symmetric, a schedule that indexes real cost
 matrices), the shapes of the mixed-coordinate noise and bias against the doubled
-latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`.
+latent dimension `2n`, and positive definiteness of `Σ`, `Σf` and `P0`. A
+`:hold` model instead needs exactly one cost, no schedule, no terminal factor
+and a stabilizing DARE solution; its `A` need not be invertible.
 
 # Throws
 - `DimensionMismatchError`, `NotSymmetricError`, `NotPositiveDefiniteError`,
@@ -153,6 +155,24 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
             ArgumentError(
                 "a `:free` state model has no costate to pin, so it cannot carry a " *
                 "terminal condition. Use `:lqr` mode for that.",
+            ),
+        )
+    elseif _is_hold(sm)
+        _check_hold_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
+        _normalize_qc_prior(T, sm.Qc_prior, 1, n)
+        isempty(sm.Mfree) || throw(
+            ArgumentError(
+                "a `:hold` state model has no free transition, but `Mfree` is " *
+                "non-empty. Build it with `hold_state_model`.",
+            ),
+        )
+        _hold_steady_state!(
+            _HoldUnit(T, n, size(sm.Bu, 2)), sm.A, sm.S, sm.Qc[1], sm.h, sm.Bu, sm.Gref
+        ) || throw(
+            NumericalStabilityError(
+                "hold",
+                "the DARE has no stabilizing solution, so the infinite-horizon " *
+                "regulator is undefined (`(A, S)` must be stabilizable)",
             ),
         )
     else
@@ -608,6 +628,7 @@ function _validate_slds_structure(slds::SLDS)
 
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
     _validate_slds_chain_prior(slds)
+    _validate_boundaries(slds)
     return nothing
 end
 
@@ -680,13 +701,35 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     its `observe_costate` is not its own to set in a mixed model: the readout
     mask is set by the LQR states, and `_match_costate_readout!` gives it to the
     free states, so the emission reads the same coordinates in every mode.
+
+    A `:hold` state does have a costate — the same one, on the stable manifold —
+    so it must agree on `observe_costate`. It has no terminal factor, like a free
+    state, so it is left out of the `terminal` comparison: the factor is
+    responsibility-weighted and simply absent while the hold state is active.
+    Terminal conditioning works with it: the probe that normalizes the score
+    switches into the hold state as the data side does.
     =#
     ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
     ref === nothing && return nothing
-    sm1 = slds.LDSs[ref].state_model
+    sm_ref = slds.LDSs[ref].state_model
+    lqr_ref = findfirst(
+        lds -> !_is_free(lds.state_model) && !_is_hold(lds.state_model), slds.LDSs
+    )
+    sm1 = lqr_ref === nothing ? sm_ref : slds.LDSs[lqr_ref].state_model
     for (i, lds) in enumerate(slds.LDSs)
         sm = lds.state_model
         _is_free(sm) && continue
+        if sm.observe_costate != sm_ref.observe_costate
+            throw(
+                ArgumentError(
+                    "LDSs[$i]: `observe_costate` is $(sm.observe_costate) but " *
+                    "LDSs[$ref] has $(sm_ref.observe_costate). The costate readout " *
+                    "mask is applied to the emission, so states that disagree would " *
+                    "zero and fit the same columns in turn.",
+                ),
+            )
+        end
+        _is_hold(sm) && continue
         regimes = _slds_transition_regimes(sm)
         if length(regimes) != 1
             throw(
@@ -718,16 +761,6 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
                     "factor is written against is a property of the trial horizon, " *
                     "not of which state is active, so every discrete state must " *
                     "agree.",
-                ),
-            )
-        end
-        if sm.observe_costate != sm1.observe_costate
-            throw(
-                ArgumentError(
-                    "LDSs[$i]: `observe_costate` is $(sm.observe_costate) but LDSs[1] " *
-                    "has $(sm1.observe_costate). The costate readout mask is applied " *
-                    "to the emission, so states that disagree would zero and fit the " *
-                    "same columns in turn.",
                 ),
             )
         end

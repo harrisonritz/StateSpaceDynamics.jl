@@ -24,7 +24,8 @@ The rule is enforced before sampling by `_validate_slds_state_models`.
 
 As with a single inverse-LQR model, this rolls the model's own forward flow,
 which is unstable by construction — see [`_warn_unstable_rollout`](@ref) and
-prefer `simulate_lqr` for trajectories on the stable manifold.
+prefer `simulate_lqr` for trajectories on the stable manifold. A `:hold` state
+is the exception: its forward flow is the stable closed loop.
 """
 function _extract_state_params(sm::LQRStateModel{T}) where {T<:Real}
     c = sm.cache
@@ -151,14 +152,19 @@ function _slds_aggregate_weighted!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
-    sws::SmoothWorkspace{T},
+    sws::SmoothWorkspace{T};
+    exit_weights::Union{Nothing,AbstractVector}=nothing,
+    dyn_weights::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     # A one-state SLDS has γ ≡ 1 and is exactly an LDS. Use the same batched
     # accumulation in that case: the weighted timestep loop is mathematically
     # identical but differs at roundoff, and the deliberately flat inverse-LQR
     # cost-scale direction can amplify that tiny difference across EM steps.
     # This also makes the K=1 equivalence test a sharp dispatch check again.
-    unit_weights = all(w -> all(isone, w), weights)
+    unit_weights =
+        exit_weights === nothing &&
+        dyn_weights === nothing &&
+        all(w -> all(isone, w), weights)
     if unit_weights
         # The ordinary fit seeds the data-only aggregate blocks once before its
         # EM loop. The switching path normally rebuilds them inside the
@@ -169,7 +175,9 @@ function _slds_aggregate_weighted!(
         _aggregate_lqr_stats!(hs, tfs, lds, data)
     else
         _aggregate_td_suff_stats_weighted!(hs.base, tfs, lds, data, weights, sws)
-        _aggregate_lqr_stats_weighted!(hs, tfs, lds, data, weights)
+        _aggregate_lqr_stats_weighted!(
+            hs, tfs, lds, data, weights; exit_weights, dyn_weights
+        )
     end
     #=
     Same masking the ungrouped `estep!` applies, at the same point: with
@@ -310,6 +318,7 @@ function _slds_state_mstep!(
     ::Int,
     ::Int;
     terminal_probe=nothing,
+    entry_score=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sms = [lds.state_model for lds in ldss]
 
@@ -338,7 +347,8 @@ function _slds_state_mstep!(
             sf_state,
             [ones(Int, K), ones(Int, K), collect(1:K), qslots],
             _lqr_block_slots(tied, K),
-            _SLQRNormalizer(terminal_probe),
+            _SLQRNormalizer(terminal_probe);
+            score_extra=entry_score,
         )
         foreach(refresh!, sms)
         return collect(1:K)
@@ -348,6 +358,11 @@ function _slds_state_mstep!(
     A `:free` state is an ordinary regression, so it is updated on its own rather
     than through the constrained context. Mixing modes across discrete states is
     the whole point of `:free`, so neither branch may assume the other is absent.
+
+    A `:hold` state is *not* updated on its own: its plant and inputs mean what
+    the `:lqr` states' do, so it joins their context, where `tied = [:A, :S]`
+    gives control and hold states one shared plant fitted from both, and each
+    state's cost stays its own copy unless `:Qc` is tied too.
     =#
     for k in 1:K
         if _is_free(sms[k])

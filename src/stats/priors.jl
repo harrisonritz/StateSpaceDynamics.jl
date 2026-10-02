@@ -204,6 +204,136 @@ function transition_prior(K::Integer; concentration::Real=1.0, sticky::Real=0.0)
 end
 
 """
+    median_dwell_stay(median_dwell) -> Real
+
+The self-transition probability `p` of a stage whose dwell time has the given
+median, in bins: a geometric dwell leaves the stage within `d` bins with
+probability `1 − p^d`, so a 50 % chance of having switched by `d` is
+
+    p = 0.5^(1/d).
+
+This is the natural way to put a task timescale on a stage of a
+[`banded_transition`](@ref) chain — "the go cue comes at bin 40 in half the
+trials" becomes `median_dwell_stay(40)` for the stage that ends at the go cue.
+`median_dwell` need not be an integer, and must exceed zero.
+"""
+function median_dwell_stay(median_dwell::Real)
+    median_dwell > 0 || throw(
+        ArgumentError(
+            "median_dwell_stay: median_dwell must be positive, got $median_dwell"
+        ),
+    )
+    return 0.5^(1 / float(median_dwell))
+end
+
+#=
+A stage's stay probabilities, one per non-absorbing stage, from either a scalar
+(every stage the same) or a vector of length `K − 1`.
+=#
+function _banded_stays(K::Integer, stay)
+    K >= 1 || throw(ArgumentError("a banded chain needs K ≥ 1 stages, got $K"))
+    p = stay isa Real ? fill(float(stay), K - 1) : float.(collect(stay))
+    length(p) == K - 1 || throw(
+        ArgumentError(
+            "a banded chain of $K stages takes $(K - 1) stay probabilities (the last " *
+            "stage is absorbing); got $(length(p))",
+        ),
+    )
+    all(x -> 0 < x < 1, p) || throw(
+        ArgumentError(
+            "stay probabilities must lie strictly between 0 and 1 (each stage has to " *
+            "be both enterable and leavable); got $p",
+        ),
+    )
+    return p
+end
+
+"""
+    banded_transition(K; stay) -> (A, πₖ)
+
+A **banded** (left-to-right) discrete chain of `K` stages: stage `k` either stays,
+with probability `stay[k]`, or moves on to stage `k + 1`; it never skips ahead or
+returns, and the last stage is absorbing. Every trial starts in stage 1
+(`πₖ = e₁`).
+
+`stay` is a scalar (every stage the same) or one probability per non-absorbing
+stage (length `K − 1`); [`median_dwell_stay`](@ref) turns a median dwell time in
+bins into one. Pass the result as an [`SLDS`](@ref)'s `A` / `πₖ`, and pair it with
+[`banded_transition_prior`](@ref).
+
+The band is kept by fitting rather than imposed: an entry that starts at zero has
+no expected transitions and no pseudo-counts, so the Baum–Welch / Dirichlet-MAP
+update and the terminal-conditioned chain step both leave it at zero, and the
+initial distribution stays on stage 1 for the same reason. A banded chain is a
+changepoint process with geometric stage durations: each trial runs through the
+stages in order, and inference is over where the boundaries fall.
+
+# Example
+```jldoctest
+julia> A, π = banded_transition(3; stay=[0.75, 0.5]);
+
+julia> A
+3×3 Matrix{Float64}:
+ 0.75  0.25  0.0
+ 0.0   0.5   0.5
+ 0.0   0.0   1.0
+
+julia> π
+3-element Vector{Float64}:
+ 1.0
+ 0.0
+ 0.0
+```
+"""
+function banded_transition(K::Integer; stay)
+    p = _banded_stays(K, stay)
+    T = eltype(p)
+    A = zeros(T, K, K)
+    for k in 1:(K - 1)
+        A[k, k] = p[k]
+        A[k, k + 1] = one(T) - p[k]
+    end
+    A[K, K] = one(T)
+    πₖ = zeros(T, K)
+    πₖ[1] = one(T)
+    return A, πₖ
+end
+
+"""
+    banded_transition_prior(K; stay, strength=10.0) -> Matrix
+
+Dirichlet concentrations for a [`banded_transition`](@ref) chain — pass the result
+as `A_prior`. Only the band carries a prior: row `k` puts `strength · stay[k]`
+pseudo-counts on staying and `strength · (1 − stay[k])` on moving on,
+
+    α[k, k] = 1 + strength · stay[k],    α[k, k+1] = 1 + strength · (1 − stay[k]),
+
+and every other entry is `1` (no pseudo-counts, so the structural zeros stay
+zero). A row of a banded chain has one free parameter, so this is a
+`Beta(1 + strength·p, 1 + strength·(1 − p))` prior on each stage's stay
+probability, whose **mode is exactly `stay[k]`**: with no data the MAP chain is the
+one `stay` describes, and `strength` is how many transitions' worth of evidence
+it takes to move it halfway. The last (absorbing) row is left flat.
+
+With `stay = median_dwell_stay.(d)` the prior says "half the trials have left
+stage `k` within `d[k]` bins of entering it".
+
+`strength = 0` is the flat prior. It must be `≥ 0`.
+"""
+function banded_transition_prior(K::Integer; stay, strength::Real=10.0)
+    p = _banded_stays(K, stay)
+    strength >= 0 ||
+        throw(ArgumentError("banded_transition_prior: strength must be ≥ 0, got $strength"))
+    T = float(promote_type(eltype(p), typeof(strength)))
+    α = ones(T, K, K)
+    for k in 1:(K - 1)
+        α[k, k] += T(strength) * p[k]
+        α[k, k + 1] += T(strength) * (one(T) - p[k])
+    end
+    return α
+end
+
+"""
     dirichlet_logprior_term(p, α) -> Real
 
 `p`-dependent part of `log Dir(p | α)`, summed over the rows of a matrix `p`

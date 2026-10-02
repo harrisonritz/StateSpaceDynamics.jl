@@ -45,7 +45,9 @@ function _make_slds_fb_storage(
     control-input kwargs.
     =#
     obs_seq = 1:total_T
-    control_seq = fill(nothing, total_T)
+    #= The global time index: `SLDSDiscreteLayer`'s transition for `t − 1 → t`
+    reads it to attach exit bridges, and is the plain `A` without them. =#
+    control_seq = 1:total_T
     return HMMs.initialize_forward_backward(
         dl, obs_seq, control_seq; seq_ends=seq_ends, transition_marginals=true
     )
@@ -69,6 +71,20 @@ which per-regime `Bₖ` / `Dₖ` multiplies them):
 - `uy`: observation input consumed by `Dₖ`. Same shape family as `ux`; required
   when the LDS carry a nonzero-column `D`. Supported for both Gaussian and
   Poisson emissions.
+
+Boundary factors ([`set_boundaries!`](@ref)):
+- An entry prior is drawn exactly: on a switch into an entry-prior state the new
+  costate comes from the prior and the state from the entered plant row given it.
+- `conditional`: draw given every goal — each exit bridge and each inverse-LQR
+  state's end-of-trial terminal factor — as `p(z, x, y | goals = 0)`, the model a
+  fit with those factors assumes. Defaults to `true` exactly when the model has
+  exit bridges, and to the plain forward draw otherwise; pass it to override
+  either way. The draw is an MCMC chain with exact conditional steps, run for
+  `gibbs_sweeps` sweeps from the prior chain: on a left-to-right (banded) chain,
+  collapsed Gibbs over the changepoints with the latents integrated out (default
+  20 sweeps); on any other chain, blocked Gibbs alternating `x | z` and `z | x`
+  (default 200, as it mixes more slowly). Its paths sit near each stage's stable
+  manifold instead of following the unstable forward flow.
 """
 function Random.rand(
     rng::AbstractRNG,
@@ -78,6 +94,8 @@ function Random.rand(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    conditional::Union{Nothing,Bool}=nothing,
+    gibbs_sweeps::Union{Nothing,Int}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
@@ -106,12 +124,32 @@ function Random.rand(
     y = _alloc_obs(regimes[1], Ti)
 
     _prepare_slds!(slds, [Ti])
-    _warn_slds_unstable_rollout(slds, Ti)
+    given_goals = _slds_rand_conditional(slds, conditional)
+    given_goals || _warn_slds_unstable_rollout(slds, Ti)
     state_params = [
         _extract_state_params(_trial_initial_model(lds, view(u0, :, 1)).state_model) for
         lds in regimes
     ]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
+
+    if given_goals || _slds_has_entries(slds)
+        cell = grp === nothing ? slds : _slds_cell_sldss(slds, grp)[grp.trial_cell[1]]
+        _sample_slds_boundary_trial!(
+            rng,
+            z,
+            x,
+            y,
+            _trial_initial_model(cell::SLDS, view(u0, :, 1))::SLDS,
+            state_params,
+            obs_params,
+            lds1.obs_model,
+            ux_trial,
+            uy_trial;
+            conditional=given_goals,
+            gibbs_sweeps=gibbs_sweeps,
+        )
+        return z, x, y
+    end
 
     _sample_slds_trial!(
         rng,
@@ -138,6 +176,8 @@ function Random.rand(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    conditional::Union{Nothing,Bool}=nothing,
+    gibbs_sweeps::Union{Nothing,Int}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
@@ -156,8 +196,16 @@ function Random.rand(
     over regimes. Ungrouped, every trial shares the same vector.
     =#
     _prepare_slds!(slds, collect(Int, tsteps_per_trial))
-    _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
+    given_goals = _slds_rand_conditional(slds, conditional)
+    given_goals || _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on)
+    # The trial's own model, which the boundary sampler reads whole.
+    cell_of_trial = if grp === nothing
+        fill(slds, ntrials)
+    else
+        cells = _slds_cell_sldss(slds, grp)
+        [cells[grp.trial_cell[n]] for n in 1:ntrials]
+    end
     if grp === nothing
         base_state = [_extract_state_params(lds.state_model) for lds in slds.LDSs]
         base_obs = [_extract_obs_params(lds.obs_model) for lds in slds.LDSs]
@@ -190,11 +238,29 @@ function Random.rand(
         ]
     end
 
+    boundary_path = given_goals || _slds_has_entries(slds)
     for trial in 1:ntrials
         Ti = Int(tsteps_per_trial[trial])
         z[trial] = Vector{Int}(undef, Ti)
         x[trial] = Matrix{T}(undef, latent_dim, Ti)
         y[trial] = _alloc_obs(alloc_of[trial], Ti)
+        if boundary_path
+            _sample_slds_boundary_trial!(
+                rng,
+                z[trial],
+                x[trial],
+                y[trial],
+                _trial_initial_model(cell_of_trial[trial]::SLDS, view(u0, :, trial))::SLDS,
+                state_of[trial],
+                obs_of[trial],
+                lds1.obs_model,
+                ux_seq[trial],
+                _trial(uy_seq, trial);
+                conditional=given_goals,
+                gibbs_sweeps=gibbs_sweeps,
+            )
+            continue
+        end
         _sample_slds_trial!(
             rng,
             z[trial],
@@ -406,6 +472,12 @@ function StatsAPI.fit!(
         end
     end
 
+    #= A row with neither expected transitions nor pseudo-counts has nothing to be
+    re-estimated from — a state no trial visited this iteration, which a banded
+    chain makes routine for its later stages. It keeps its current value rather
+    than being normalised from zero, which would leave the chain invalid. =#
+    A_prev = copy(dl.A)
+
     fill!(dl.πₖ, zero(eltype(dl.πₖ)))
     fill!(dl.A, zero(eltype(dl.A)))
     for k in eachindex(seq_ends)
@@ -428,6 +500,8 @@ function StatsAPI.fit!(
         s = sum(view(dl.A, i, :))
         if s > zero(T)
             dl.A[i, :] ./= s
+        else
+            dl.A[i, :] .= view(A_prev, i, :)
         end
     end
 
@@ -555,7 +629,10 @@ end
     joint_loglikelihood!(ws, slds, x, y, w[, ux, uy, lognorm_t])
 
 Compute weighted complete-data log-likelihood for SLDS.
-Returns vector of per-timestep log-likelihoods. `ux` / `uy` are the per-trial
+Returns vector of per-timestep log-likelihoods. `ew` (keyword, `K × T`) are the
+exit-bridge weights `q(s_t = k, s_{t+1} ≠ k)` of a model with bridges
+(`set_boundaries!`); `nothing` adds no bridge term. `pw` (keyword, `K × K × T`)
+are the entry weights `q(s_{t-1} = i, s_t = j)` of a model with entry priors. `ux` / `uy` are the per-trial
 control-input matrices (`nothing` or zero-row skips the `Bₖ u` / `Dₖ v` terms).
 
 `lognorm_t` is the trial's Poisson `Σᵢ log(y!)` normalizer (see
@@ -572,7 +649,9 @@ function joint_loglikelihood!(
     w::AbstractMatrix{T},   # K × T responsibilities/weights
     ux::Union{Nothing,AbstractMatrix}=nothing,
     uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
-    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing;
+    ew::Union{Nothing,AbstractMatrix{T}}=nothing,
+    pw::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     Tsteps = _ntsteps(y)
 
@@ -598,6 +677,10 @@ function joint_loglikelihood!(
             ll_vec[t] += w[k, t] * ws.ll_tmp[t]
         end
     end
+    # Exit bridges, each weighted by its exit probability (see `set_boundaries!`).
+    _slds_exit_loglik!(ll_vec, ws, slds, x, ew, ux)
+    # Entry priors, each swapping the entered state's ordinary transition.
+    _slds_entry_loglik!(ll_vec, ws, slds, x, pw, ux)
 
     return view(ll_vec, 1:Tsteps)
 end
@@ -767,7 +850,9 @@ function gradient!(
     y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T},
     ux::Union{Nothing,AbstractMatrix}=nothing,
-    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing;
+    ew::Union{Nothing,AbstractMatrix{T}}=nothing,
+    pw::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     latent_dim, Tsteps = size(x)
     K = length(slds.LDSs)
@@ -839,6 +924,8 @@ function gradient!(
         # `dxt` is free again here, which is what the helper borrows for `r_f`.
         _slds_terminal_gradient!(grad, ws, lds_k, x, view(w, k, :), ux)
     end
+    _slds_exit_gradient!(grad, ws, slds, x, ew, ux)
+    _slds_entry_gradient!(grad, ws, slds, x, pw, ux)
 
     return grad
 end
@@ -977,7 +1064,9 @@ function hessian!(
     x::AbstractMatrix{T},
     y::Union{AbstractMatrix{T},NamedTuple},
     w::AbstractMatrix{T},
-    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing,
+    uy::Union{Nothing,AbstractMatrix,NamedTuple}=nothing;
+    ew::Union{Nothing,AbstractMatrix{T}}=nothing,
+    pw::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     Tsteps = size(x, 2)
     K = length(slds.LDSs)
@@ -1047,6 +1136,8 @@ function hessian!(
             ws, lds_k, cc, x, y, view(w, k, :), uy, Tsteps, z, λ, _regime_obs(ws, k)
         )
     end
+    _slds_exit_hessian!(H_diag, slds, ew, Tsteps)
+    _slds_entry_hessian!(ws.btd, slds, pw, Tsteps)
 
     for t in 1:Tsteps
         Symmetrize!(H_diag[t])
@@ -1071,6 +1162,8 @@ function smooth!(
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
     converged::Union{Nothing,Base.RefValue{Bool}}=nothing,
+    ew::Union{Nothing,AbstractMatrix{T}}=nothing,
+    pw::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     latent_dim = slds.LDSs[1].latent_dim
     tsteps = _ntsteps(y)
@@ -1105,18 +1198,19 @@ function smooth!(
     neg_super_v = view(btd.neg_super, 1:(tsteps - 1))
 
     ϕ!() = begin
-        ll = joint_loglikelihood!(ws, slds, x, y, w, ux, uy, ln)
+        ll = joint_loglikelihood!(ws, slds, x, y, w, ux, uy, ln; ew=ew, pw=pw)
         return sum(ll)
     end
 
-    compute_grad! = (gcur, xcur) -> begin
-        gradient!(ws, slds, xcur, y, w, ux, uy)
-        copyto!(gcur, view(ws.opt.grad_buf, :, 1:tsteps))
-        return nothing
-    end
+    compute_grad! =
+        (gcur, xcur) -> begin
+            gradient!(ws, slds, xcur, y, w, ux, uy; ew=ew, pw=pw)
+            copyto!(gcur, view(ws.opt.grad_buf, :, 1:tsteps))
+            return nothing
+        end
 
     build_hess! = (xcur) -> begin
-        hessian!(ws, slds, xcur, y, w, uy)
+        hessian!(ws, slds, xcur, y, w, uy; ew=ew, pw=pw)
         _negate_blocks!(btd, tsteps)
         return nothing
     end
@@ -1156,7 +1250,7 @@ function smooth!(
     converged === nothing || (converged[] = ok)
 
     # Posterior covariance at the MAP under the Laplace approximation.
-    hessian!(ws, slds, x, y, w, uy)
+    hessian!(ws, slds, x, y, w, uy; ew=ew, pw=pw)
     _negate_blocks!(btd, tsteps)
 
     logdet_precision = block_tridiagonal_inverse_logdet!(
@@ -1380,10 +1474,10 @@ function smooth(
     cell_slds = grp === nothing ? nothing : _slds_cell_sldss(slds, grp)
 
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
-    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
+    dl = _slds_discrete_layer(slds, total_T)
     fb_storage = _make_slds_fb_storage(dl, seq_ends)
     obs_seq = collect(1:total_T)
-    control_seq = fill(nothing, total_T)
+    control_seq = collect(1:total_T)
     pool = _slds_workspace_pool(slds, cell_slds, T_max, ntrials; npool=npool)
     plan = _slds_trial_plan(grp, ntrials, length(pool.slots))
     lognorm = _slds_lognorm_all(slds, y_seq)
@@ -1469,6 +1563,8 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
+            exit_w=(_has_bridges(dl) ? dl.exit_w : nothing),
+            entry_w=(_has_entries(dl) ? dl.entry_w : nothing),
         ),
         _slds_prior_logdensity(slds, tied)
     else
@@ -1486,6 +1582,8 @@ function smooth(
             ux=ux_seq,
             uy=uy_seq,
             lognorm=lognorm,
+            exit_w=(_has_bridges(dl) ? dl.exit_w : nothing),
+            entry_w=(_has_entries(dl) ? dl.entry_w : nothing),
         ),
         _grouped_slds_prior_logdensity(cell_slds::Vector, grp::ParameterGrouping, T, tied)
     end
@@ -1795,6 +1893,10 @@ function _slds_fill_logL!(
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tfs::Union{Nothing,TrialFilterSmooth{T}}=nothing,
+    exit_logL::Union{Nothing,AbstractMatrix{T}}=nothing,
+    bridge::AbstractVector{Bool}=Bool[],
+    entry_logL::Union{Nothing,AbstractArray{T,3}}=nothing,
+    entry::AbstractVector{Bool}=Bool[],
 ) where {T<:Real}
     K = length(slds.LDSs)
     grouped = grp !== nothing && cell_slds !== nothing
@@ -1858,6 +1960,30 @@ function _slds_fill_logL!(
                         _regime_obs(ws_t, k),
                     )
                 end
+                #= A bridged state's exit potential, `E_q[log f_k(z_t)]`, for the
+                time-indexed transition out of it (see `set_boundaries!`). =#
+                if exit_logL !== nothing && bridge[k]
+                    _slds_exit_potentials!(
+                        view(exit_logL, k, t1:t2)::AbstractVector{T},
+                        ws_t,
+                        initial_slds.LDSs[k],
+                        x_src,
+                        ux_trial,
+                        tfs === nothing ? nothing : tfs[trial],
+                    )
+                end
+                # An entry-prior state's potentials on the transitions into it.
+                if entry_logL !== nothing && entry[k]
+                    _slds_entry_potentials!(
+                        view(entry_logL, :, k, t1:t2)::AbstractMatrix{T},
+                        ws_t,
+                        initial_slds,
+                        k,
+                        x_src,
+                        ux_trial,
+                        tfs === nothing ? nothing : tfs[trial],
+                    )
+                end
             end
         end
         return nothing
@@ -1907,6 +2033,8 @@ function _slds_smooth_all!(
     lognorm::Union{Nothing,AbstractVector}=nothing,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
+    ew_of=_ -> nothing,
+    pw_of=_ -> nothing,
 ) where {T<:Real}
     grouped = grp !== nothing && cell_slds !== nothing
     #= Trials whose Newton solve stopped short of the MAP, counted per task slot
@@ -1952,6 +2080,8 @@ function _slds_smooth_all!(
                 max_iter=newton_max_iter,
                 tol=T(newton_tol),
                 converged=ok,
+                ew=ew_of(trial),
+                pw=pw_of(trial),
             )
             ok[] || (unconverged[slot] += 1)
         end
@@ -2137,6 +2267,10 @@ function _vem_alternate!(
     =#
     num_samples = x_samples === nothing ? 1 : size(first(x_samples), 3)
     logL_acc = num_samples > 1 ? similar(dl.logL) : nothing
+    bridges = _has_bridges(dl)
+    exit_acc = (num_samples > 1 && bridges) ? similar(dl.exit_logL) : nothing
+    entries = _has_entries(dl)
+    entry_acc = (num_samples > 1 && entries) ? similar(dl.entry_logL) : nothing
 
     function fill_logL!(x_of)
         return _slds_fill_logL!(
@@ -2154,12 +2288,30 @@ function _vem_alternate!(
             uy=uy,
             lognorm=lognorm,
             tfs=(x_samples === nothing ? tfs : nothing),
+            exit_logL=(bridges ? dl.exit_logL : nothing),
+            bridge=dl.bridge,
+            entry_logL=(entries ? dl.entry_logL : nothing),
+            entry=dl.entry,
         )
     end
 
     function w_of(trial)
         t1, t2 = HMMs.seq_limits(seq_ends, trial)
         return view(fb_storage.γ, :, t1:t2)
+    end
+
+    #= The exit-bridge weights `q(s_t = k, s_{t+1} ≠ k)` of each trial, filled
+    from the forward-backward marginals after every discrete update. =#
+    function ew_of(trial)
+        bridges || return nothing
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        return view(dl.exit_w, :, t1:t2)
+    end
+    # Likewise the entry weights `q(s_{t-1} = i, s_t = j)`.
+    function pw_of(trial)
+        entries || return nothing
+        t1, t2 = HMMs.seq_limits(seq_ends, trial)
+        return view(dl.entry_w, :, :, t1:t2)
     end
 
     # Previous-iteration γ snapshot; only allocated when there is a stopping test.
@@ -2180,8 +2332,11 @@ function _vem_alternate!(
         path gets the spread from the draw itself and passes `tfs = nothing`.
         =#
         if clamp_logL !== nothing
-            #= Discrete warm-up: the evidence is supplied, not scored. =#
+            #= Discrete warm-up: the evidence is supplied, not scored — the bridges'
+            transition potentials included, so the chain sees the plain `A`. =#
             copyto!(dl.logL, clamp_logL)
+            bridges && fill!(dl.exit_logL, zero(T))
+            entries && fill!(dl.entry_logL, zero(T))
         elseif x_samples === nothing
             fill_logL!(trial -> tfs[trial].x_smooth)
         elseif num_samples == 1
@@ -2192,11 +2347,17 @@ function _vem_alternate!(
             # retaining the no-allocation single-sample path.
             acc = something(logL_acc)
             fill!(acc, zero(T))
+            bridges && fill!(something(exit_acc), zero(T))
+            entries && fill!(something(entry_acc), zero(T))
             for s in 1:num_samples
                 fill_logL!(trial -> view(x_samples[trial], :, :, s))
                 acc .+= dl.logL
+                bridges && (something(exit_acc) .+= dl.exit_logL)
+                entries && (something(entry_acc) .+= dl.entry_logL)
             end
             dl.logL .= acc .* inv(T(num_samples))
+            bridges && (dl.exit_logL .= something(exit_acc) .* inv(T(num_samples)))
+            entries && (dl.entry_logL .= something(entry_acc) .* inv(T(num_samples)))
         end
 
         if !all(isfinite, dl.logL)
@@ -2240,6 +2401,8 @@ function _vem_alternate!(
             seq_ends=seq_ends,
             transition_marginals=true,
         )
+        bridges && _slds_exit_weights!(dl.exit_w, fb_storage, seq_ends, dl.bridge)
+        entries && _slds_entry_weights!(dl.entry_w, fb_storage, seq_ends, dl.entry)
 
         #=
         (3) Update q(x) under the fresh γ, drawing the next sample on the way
@@ -2265,6 +2428,8 @@ function _vem_alternate!(
             lognorm=lognorm,
             newton_max_iter=newton_max_iter,
             newton_tol=newton_tol,
+            ew_of=ew_of,
+            pw_of=pw_of,
         )
 
         prog !== nothing && next!(prog)
@@ -2619,7 +2784,9 @@ function _slds_trial_elbo(
     t2::Int,
     ux_trial::Union{Nothing,AbstractMatrix{T}},
     uy_trial::Union{Nothing,AbstractMatrix{T},NamedTuple},
-    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing,
+    lognorm_t::Union{Nothing,AbstractVector{T},NamedTuple}=nothing;
+    ew::Union{Nothing,AbstractMatrix{T}}=nothing,
+    pw::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     K = length(slds.LDSs)
     Tsteps = t2 - t1 + 1
@@ -2656,6 +2823,20 @@ function _slds_trial_elbo(
             trial_elbo += w[k, t] * ll[t]
         end
     end
+    #= Exit bridges, plug-in at the posterior mean and weighted by their exit
+    probability; their curvature joins the covariance correction below through
+    `hessian!`'s `ew`. =#
+    if ew !== nothing
+        fill!(ll, zero(T))
+        _slds_exit_loglik!(ll, slds_ws, slds, x_smooth_trial, ew, ux_trial)
+        trial_elbo += sum(ll)
+    end
+    # Entry priors likewise, as the swap of the entered state's transition.
+    if pw !== nothing
+        fill!(ll, zero(T))
+        _slds_entry_loglik!(ll, slds_ws, slds, x_smooth_trial, pw, ux_trial)
+        trial_elbo += sum(ll)
+    end
 
     #=
     ½ tr(H Σ) covariance correction. H = weighted Hessian (hessian! writes
@@ -2663,7 +2844,7 @@ function _slds_trial_elbo(
     p_smooth_tt1[:,:,t] = Cov(x_t, x_{t-1}) off it. Sum both off-diagonal
     traces rather than doubling one — don't assume exact block symmetry.
     =#
-    hessian!(slds_ws, slds, x_smooth_trial, y_trial, w, uy_trial)
+    hessian!(slds_ws, slds, x_smooth_trial, y_trial, w, uy_trial; ew=ew, pw=pw)
     H_diag = slds_ws.btd.H_diag
     H_sub = slds_ws.btd.H_sub
     H_super = slds_ws.btd.H_super
@@ -2760,6 +2941,8 @@ function elbo!(
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
+    exit_w::Union{Nothing,AbstractMatrix{T}}=nothing,
+    entry_w::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     per_trial = _slds_trial_elbos(
         slds,
@@ -2775,6 +2958,8 @@ function elbo!(
         ux,
         uy,
         lognorm,
+        exit_w,
+        entry_w,
     )
     total = sum(per_trial) + _slds_prior_logdensity(slds, tied)
     #=
@@ -2807,6 +2992,8 @@ function elbo!(
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=_slds_lognorm_all(slds, y),
     tied::AbstractVector{Symbol}=Symbol[],
+    exit_w::Union{Nothing,AbstractMatrix{T}}=nothing,
+    entry_w::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     return elbo!(
         slds,
@@ -2821,6 +3008,8 @@ function elbo!(
         uy=uy,
         lognorm=lognorm,
         tied=tied,
+        exit_w=exit_w,
+        entry_w=entry_w,
     )
 end
 
@@ -2851,6 +3040,8 @@ function _slds_trial_elbos(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     lognorm::Union{Nothing,AbstractVector}=nothing,
+    exit_w::Union{Nothing,AbstractMatrix{T}}=nothing,
+    entry_w::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     per_trial = zeros(T, _ntrials(y))
     grouped = grp !== nothing && cell_slds !== nothing
@@ -2889,7 +3080,9 @@ function _slds_trial_elbos(
                 t2,
                 ux === nothing ? nothing : ux[trial],
                 uy === nothing ? nothing : _trial(uy, trial),
-                lognorm === nothing ? nothing : lognorm[trial],
+                lognorm === nothing ? nothing : lognorm[trial];
+                ew=(exit_w === nothing ? nothing : view(exit_w, :, t1:t2)),
+                pw=(entry_w === nothing ? nothing : view(entry_w, :, :, t1:t2)),
             )
         end
         return nothing
@@ -3346,8 +3539,16 @@ function _slds_aggregate_weighted!(
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
     weights::AbstractVector{<:AbstractVector{T}},
-    sws::SmoothWorkspace{T},
+    sws::SmoothWorkspace{T};
+    exit_weights=nothing,
+    dyn_weights=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
+    (exit_weights === nothing && dyn_weights === nothing) || throw(
+        ArgumentError(
+            "exit bridges and entry priors need inverse-LQR control states; see " *
+            "set_boundaries!",
+        ),
+    )
     return _aggregate_td_suff_stats_weighted!(suf, tfs, lds, data, weights, sws)
 end
 
@@ -3385,6 +3586,7 @@ function _slds_state_mstep!(
     D::Int,
     ux_dim::Int;
     terminal_probe=nothing,
+    entry_score=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     terminal_probe === nothing ||
         throw(ArgumentError("terminal conditioning needs inverse-LQR discrete states"))
@@ -3467,6 +3669,53 @@ function mstep!(
             end for trial in 1:ntrials
         ]
     end
+    #= A bridged state's exit weights, which add its terminal statistics at
+    every exit; `nothing` for every other state. =#
+    function exits_of(k)
+        (_has_bridges(dl) && dl.bridge[k]) || return nothing
+        return [
+            begin
+                t1, t2 = HMMs.seq_limits(seq_ends, trial)
+                view(dl.exit_w, k, t1:t2)
+            end for trial in 1:ntrials
+        ]
+    end
+    #= An entry-prior state's *ordinary* transition weights: `γ_k(t)` less the
+    mass that entered it at `t`, whose transition is the entry one. =#
+    dyn_of(k) = _slds_ordinary_weights(dl, fb_storage, seq_ends, k, 1:ntrials)
+
+    #=
+    Entry priors, before the structural step (which does not read them): the
+    exact weighted regression under the joint objective; under conditioning a
+    proposal judged against `log Ẑ`, which leaves the probe smoothed at whatever
+    it tried last. `entry_Q` is the entries' whole objective at the parameters
+    the model holds when it is called — what the structural step's acceptance
+    adds, since the entries share its parameters without being in its statistics.
+    =#
+    entry_Q = if _has_entries(dl)
+        groups = [1:ntrials]
+        b = slds.boundaries::SLDSBoundaries{T}
+        if probe === nothing
+            _slds_update_entry_priors!(b, _ -> slds, tfs, dat, dl, seq_ends, groups)
+        else
+            _slds_conditional_entry_update!(
+                b, _ -> slds, tfs, dat, dl, seq_ends, groups, [probe], [slds]
+            )
+            probe_current = false
+        end
+        _slds_entry_objective(
+            b,
+            _ -> slds,
+            (j, _) -> slds.LDSs[j].state_model,
+            tfs,
+            dat,
+            dl,
+            seq_ends,
+            groups,
+        )
+    else
+        nothing
+    end
 
     #=
     One γ-weighted sufficient statistic per regime, all built before any update
@@ -3499,7 +3748,14 @@ function mstep!(
             lo > hi && return nothing
             for k in lo:hi
                 _slds_aggregate_weighted!(
-                    sf[k], tfs, slds.LDSs[k], dat, weights_of(k), sws_pool[i]
+                    sf[k],
+                    tfs,
+                    slds.LDSs[k],
+                    dat,
+                    weights_of(k),
+                    sws_pool[i];
+                    exit_weights=exits_of(k),
+                    dyn_weights=dyn_of(k),
                 )
             end
             return nothing
@@ -3540,18 +3796,24 @@ function mstep!(
         _slqr_probe_estep!(probe)
     end
 
-    _slds_state_mstep!(
-        slds.LDSs,
-        sf_state,
-        tied,
-        slots_q,
-        sws,
-        _state_bufs(bf),
-        K,
-        D,
-        lds1.ux_dim;
-        terminal_probe=terminal_probe,
-    )
+    #= Under conditioning the entries join the conditional step's own acceptance
+    score, which also carries `log Ẑ`; under the joint objective they guard it. =#
+    conditional_step = terminal_probe !== nothing
+    _slds_entry_guarded(slds.LDSs, sf_state, conditional_step ? nothing : entry_Q) do
+        _slds_state_mstep!(
+            slds.LDSs,
+            sf_state,
+            tied,
+            slots_q,
+            sws,
+            _state_bufs(bf),
+            K,
+            D,
+            lds1.ux_dim;
+            terminal_probe=terminal_probe,
+            entry_score=conditional_step ? entry_Q : nothing,
+        )
+    end
 
     #=
     The emission half reads the base regression blocks. An LQR model wraps
@@ -4083,12 +4345,12 @@ function fit!(
     # Continuous-state smoother storage (per-trial sized).
     tfs = initialize_FilterSmooth(slds.LDSs[1], tsteps_per_trial)::TrialFilterSmooth{T}
 
-    dl = SLDSDiscreteLayer(slds.A, slds.πₖ, zeros(T, K, total_T))
+    dl = _slds_discrete_layer(slds, total_T)
 
     fb_storage = _make_slds_fb_storage(dl, seq_ends)
 
     obs_seq = collect(1:total_T)
-    control_seq = fill(nothing, total_T)
+    control_seq = collect(1:total_T)
 
     sws = SmoothWorkspace(
         T,
@@ -4300,6 +4562,8 @@ function fit!(
                 uy=uy_seq,
                 lognorm=lognorm,
                 tied=tied,
+                exit_w=(_has_bridges(dl) ? dl.exit_w : nothing),
+                entry_w=(_has_entries(dl) ? dl.entry_w : nothing),
             )
             if spline_state !== nothing
                 elbos[iter] +=
@@ -4401,6 +4665,8 @@ function fit!(
                 lognorm=lognorm,
                 tied=tied,
                 terminal_slds=slds,
+                exit_w=(_has_bridges(dl) ? dl.exit_w : nothing),
+                entry_w=(_has_entries(dl) ? dl.entry_w : nothing),
             )
 
             #=
@@ -4633,6 +4899,7 @@ function _slds_cell_sldss(
             [_cell_lds(slds.LDSs[k], grp, c) for k in 1:K],
             slds.A_prior,
             slds.πₖ_prior,
+            slds.boundaries,
         ) for c in 1:(grp.ncells)
     ]
 end
@@ -4869,6 +5136,8 @@ function _elbo_grouped!(
     lognorm::Union{Nothing,AbstractVector}=nothing,
     tied::AbstractVector{Symbol}=Symbol[],
     terminal_slds::Union{Nothing,SLDS}=nothing,
+    exit_w::Union{Nothing,AbstractMatrix{T}}=nothing,
+    entry_w::Union{Nothing,AbstractArray{T,3}}=nothing,
 ) where {T<:Real}
     per_trial = _slds_trial_elbos(
         cell_slds[1],
@@ -4884,6 +5153,8 @@ function _elbo_grouped!(
         ux,
         uy,
         lognorm,
+        exit_w,
+        entry_w,
     )
     total = sum(per_trial) + _grouped_slds_prior_logdensity(cell_slds, grp, T, tied)
     if terminal_slds !== nothing
@@ -5039,6 +5310,55 @@ function _mstep_grouped!(
         t1, t2 = HMMs.seq_limits(seq_ends, trial)
         return view(fb_storage.γ, k, t1:t2)
     end
+    # A bridged state's per-trial exit weights, as on the ungrouped path.
+    function exits_for(k, trials)
+        (_has_bridges(dl) && dl.bridge[k]) || return nothing
+        return [
+            begin
+                t1, t2 = HMMs.seq_limits(seq_ends, n2)
+                view(dl.exit_w, k, t1:t2)
+            end for n2 in trials
+        ]
+    end
+    dyn_for(k, trials) = _slds_ordinary_weights(dl, fb_storage, seq_ends, k, trials)
+    #= Entry priors: one prior per state, pooled over every cell; the plant-row
+    statistics per cell, since a cell may carry its own structure. =#
+    entry_Q = if _has_entries(dl)
+        cell_of = zeros(Int, length(seq_ends))
+        for c in 1:ncells, n2 in grp.cell_trials[c]
+            cell_of[n2] = c
+        end
+        b = cell_slds[1].boundaries::SLDSBoundaries{T}
+        slds_of = trial -> cell_slds[cell_of[trial]]
+        if probes === nothing
+            _slds_update_entry_priors!(b, slds_of, tfs, data, dl, seq_ends, grp.cell_trials)
+        else
+            _slds_conditional_entry_update!(
+                b,
+                slds_of,
+                tfs,
+                data,
+                dl,
+                seq_ends,
+                grp.cell_trials,
+                probes::AbstractVector,
+                sources::AbstractVector,
+            )
+            probe_current = false
+        end
+        _slds_entry_objective(
+            b,
+            slds_of,
+            (j, c) -> cell_slds[c].LDSs[j].state_model,
+            tfs,
+            data,
+            dl,
+            seq_ends,
+            grp.cell_trials,
+        )
+    else
+        nothing
+    end
 
     unit_lds = [cell_slds[c].LDSs[k] for k in 1:K for c in 1:ncells]
     #=
@@ -5075,7 +5395,9 @@ function _mstep_grouped!(
                     unit_lds[u],
                     cell_data[c],
                     [γ_view(k, n2) for n2 in grp.cell_trials[c]],
-                    cell_sws_pools === nothing ? sws_pool[i] : cell_sws_pools[c][i],
+                    cell_sws_pools === nothing ? sws_pool[i] : cell_sws_pools[c][i];
+                    exit_weights=exits_for(k, grp.cell_trials[c]),
+                    dyn_weights=dyn_for(k, grp.cell_trials[c]),
                 )
             end
             return nothing
@@ -5111,22 +5433,25 @@ function _mstep_grouped!(
             tied,
             probes::AbstractVector,
             sources::AbstractVector,
-            probe_current,
+            probe_current;
+            entry_score=entry_Q,
         )
     else
-        _grouped_slds_state_mstep!(
-            lds1.state_model,
-            unit_lds,
-            unit_suf,
-            grp,
-            K,
-            ncells,
-            tied,
-            slots_ab,
-            slots_q,
-            sws,
-            bf,
-        )
+        _slds_entry_guarded(unit_lds, unit_suf, entry_Q) do
+            _grouped_slds_state_mstep!(
+                lds1.state_model,
+                unit_lds,
+                unit_suf,
+                grp,
+                K,
+                ncells,
+                tied,
+                slots_ab,
+                slots_q,
+                sws,
+                bf,
+            )
+        end
     end
 
     #= The emission side is state-model-agnostic and reads the shared blocks, so

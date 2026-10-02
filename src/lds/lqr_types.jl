@@ -225,9 +225,12 @@ and `S` alone, so `Qfwd`, `bfwd` and `Bfwd` are shared by every regime.
 # Fields
 - `M::Vector{Matrix{T}}`: one `2n × 2n` symplectic transition per cost regime.
 - `G::Matrix{T}`: `[I  S A⁻ᵀ; 0  −A⁻ᵀ]`, the map from mixed-coordinate
-    innovations to forward ones.
-- `AinvT::Matrix{T}`, `logabsdetA::T`: `A⁻ᵀ` and `log|det A|` (the Jacobian term
-    the M-step objective carries).
+    innovations to forward ones. In `:hold` mode it is `Lh⁻¹`, the map from the
+    plant-row / manifold-row innovations; in `:free` mode the identity.
+- `AinvT::Matrix{T}`, `logabsdetA::T`: `A⁻ᵀ` and `log|det G⁻¹|`, the Jacobian
+    term the M-step objective carries — `log|det A|` in `:lqr` mode,
+    `log det(I + S P)` in `:hold` mode (where `AinvT` is unused and holds `I`),
+    and zero in `:free` mode.
 - `Qfwd::DensePDMat{T}`: `G Σ Gᵀ`, the forward process-noise covariance.
 - `bfwd`, `Bfwd`: the forward bias `G h` and the forward input matrices
     `G (B_u - [0; Q_k G_r])`, one per regime. Unlike the noise map, the input
@@ -561,6 +564,38 @@ noisily rather than exactly optimal, a cost that changes within the trial, and
 more trials. This is the well-known ill-posedness of inverse optimal control,
 not an artifact of the parameterization.
 
+## Infinite-horizon hold mode (`mode = :hold`)
+
+[`hold_state_model`](@ref) builds a *stationary* regulator — "hold the state at
+a reference" — instead of a finite-horizon reach. It shares the plant `A`, the
+control authority `S`, the mixed bias `h`, the exogenous input `Bu` and the
+reference map `Gref` with the finite-horizon form, and carries **one** cost
+`Q_h = Qc[1]`. With `P` the stabilizing solution of the DARE
+`P = Q_h + Aᵀ P (I + S P)⁻¹ A`, `W = (I + S P)⁻¹` and `A_cl = W A`, the
+transition is
+
+```math
+\\begin{bmatrix} I & S \\\\ -P & I \\end{bmatrix} z_{t+1}
+  = \\begin{bmatrix} A & 0 & F \\\\ 0 & 0 & G \\end{bmatrix}
+    \\begin{bmatrix} x_t \\\\ \\lambda_t \\\\ \\tilde u_t \\end{bmatrix}
+  + \\varepsilon_t, \\qquad \\varepsilon_t \\sim N(0, \\Sigma),
+```
+
+with `ũ_t = [1; u_t]`, `F = [h_x  B_{u,x}]` and the stationary feedforward
+`G = (I − A_clᵀ)⁻¹ (E + A_clᵀ P F)`, `E = [h_λ  B_{u,λ} − Q_h G_r]`. The first
+row is exactly the plant row of the finite-horizon mixed equation, so `Σ`'s
+leading block keeps its meaning as plant noise; the second places the costate on
+the stable manifold, `λ_{t+1} = P x_{t+1} + g_t + ε^λ_t`, softly. The forward
+transition is `M = [A_cl  0; P A_cl  0]`, stable by construction, so a hold model
+needs no terminal factor — and may not carry one.
+
+The forward and stochastic coordinates differ by `Lh = [I S; −P I]`, whose
+determinant `det(I + S P)` plays the role `det A` plays for the finite-horizon
+form: the M-step objective carries `−N log det(I + S P)`. That objective is
+optimized jointly with any `:lqr` states in the same context, which is what lets
+an [`SLDS`](@ref) tie the plant (`tied = [:A, :S]`) between a control state and a
+hold state while each keeps its own cost.
+
 ## Regularizing the innovation and the cost
 
 `Σ_prior` is an [`IWPrior`](@ref) on the mixed-coordinate innovation. A single
@@ -576,7 +611,10 @@ cost when `schedule[end] == 3`. The vector length must equal `length(Qc)`; its
 meaning follows cost-regime indices, not the number or order of schedule runs.
 
 # Fields
-- `A::M`: `n × n` plant dynamics. Invertible.
+- `mode::Symbol`: `:lqr` (the finite-horizon symplectic form documented above),
+    `:hold` (the infinite-horizon regulator, see [`hold_state_model`](@ref)) or
+    `:free` (an unconstrained transition, see [`free_state_model`](@ref)).
+- `A::M`: `n × n` plant dynamics. Invertible in `:lqr` mode.
 - `S::M`: `n × n` symmetric `B R⁻¹ Bᵀ` — the control authority weighted by the
     control cost. `B` and `R` are not separately identified; only `S` is.
 - `Qc::Vector{M}`: `K` symmetric `n × n` state-cost matrices.
@@ -702,6 +740,15 @@ the symplectic form an LQR implies. See the `mode` field.
 @inline _is_free(sm::LQRStateModel) = sm.mode === :free
 
 """
+    _is_hold(sm) -> Bool
+
+Whether the model is the infinite-horizon regulator of [`hold_state_model`](@ref):
+a stationary transition whose costate lies on the DARE's stable manifold,
+rather than the finite-horizon symplectic form. See the `mode` field.
+"""
+@inline _is_hold(sm::LQRStateModel) = sm.mode === :hold
+
+"""
     _require_lqr(sm, what)
 
 Throw an informative `ArgumentError` when an LQR-only quantity is asked of a
@@ -714,6 +761,25 @@ function _require_lqr(sm::LQRStateModel, what::AbstractString)
             "transition is an unconstrained matrix with no plant, cost or costate " *
             "to read off. Build it with `LQRStateModel(A, S, Qc, Σ)` if you " *
             "want the constrained form.",
+        ),
+    )
+    return nothing
+end
+
+"""
+    _require_finite_horizon(sm, what)
+
+Throw an informative `ArgumentError` when a quantity that exists only for the
+finite-horizon symplectic form is asked of a `:hold` (or `:free`) model.
+"""
+function _require_finite_horizon(sm::LQRStateModel, what::AbstractString)
+    _require_lqr(sm, what)
+    _is_hold(sm) && throw(
+        ArgumentError(
+            "$what belongs to the finite-horizon symplectic form, and this model is " *
+            "in `:hold` mode — a stationary regulator whose forward transition " *
+            "`[A_cl 0; P A_cl 0]` is not symplectic. See `closed_loop_dynamics` and " *
+            "`riccati_solution` for its steady state.",
         ),
     )
     return nothing
@@ -1037,51 +1103,12 @@ function LQRStateModel(
     Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
 
     size(Σ) == (d, d) || throw(DimensionMismatchError("LQR Σ rows", d, size(Σ, 1)))
-    if fixed_costate_sigma !== nothing
-        Σ_prior === nothing ||
-            throw(ArgumentError("fixed_costate_sigma cannot be combined with Σ_prior"))
-        isfinite(fixed_costate_sigma) && fixed_costate_sigma > 0 ||
-            throw(ArgumentError("fixed_costate_sigma must be finite and positive"))
-        v = T(fixed_costate_sigma)
-        isfinite(v) && v > 0 || throw(
-            ArgumentError("fixed_costate_sigma is outside the covariance's numeric range"),
-        )
-        isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
-            isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
-            isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
-            throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
-    end
-
-    h_v = h === nothing ? zeros(T, d) : h
-    Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
-    #=
-    `Gref` sizes itself off whatever input width the model has, so a model with
-    no reference is exactly the regulation problem and one with a reference need
-    only say what the reference is.
-    =#
-    Gref_m = Gref === nothing ? zeros(T, n, size(Bu_m, 2)) : Gref
-    x0_v = x0 === nothing ? zeros(T, d) : x0
-    P0_m = P0 === nothing ? Matrix{T}(I, d, d) : P0
+    fcs = _check_fixed_costate_sigma(T, Σ, fixed_costate_sigma, Σ_prior, n)
+    h_v, Bu_m, Gref_m, x0_v, P0_m, B0_m = _lqr_affine_defaults(
+        T, n, h, Bu, Gref, x0, P0, B0, fit_flags, "LQR"
+    )
     Σf_m = Σf === nothing ? Matrix{T}(I, n, n) : Σf
     hf_v = hf === nothing ? zeros(T, n) : hf
-
-    length(h_v) == d || throw(DimensionMismatchError("LQR h", d, length(h_v)))
-    size(Bu_m, 1) == d || throw(DimensionMismatchError("LQR Bu rows", d, size(Bu_m, 1)))
-    size(Gref_m, 1) == n ||
-        throw(DimensionMismatchError("LQR Gref rows", n, size(Gref_m, 1)))
-    size(Gref_m, 2) == size(Bu_m, 2) || throw(
-        DimensionMismatchError(
-            "LQR Gref columns (must match the input width)",
-            size(Bu_m, 2),
-            size(Gref_m, 2),
-        ),
-    )
-    _check_gref_cols(fit_flags, size(Gref_m, 2), d)
-    length(x0_v) == d || throw(DimensionMismatchError("LQR x0", d, length(x0_v)))
-    B0 === nothing ||
-        size(B0, 1) == d ||
-        throw(DimensionMismatchError("LQR B0 rows", d, size(B0, 1)))
-    size(P0_m) == (d, d) || throw(DimensionMismatchError("LQR P0 rows", d, size(P0_m, 1)))
     size(Σf_m) == (n, n) || throw(DimensionMismatchError("LQR Σf rows", n, size(Σf_m, 1)))
     length(hf_v) == n || throw(DimensionMismatchError("LQR hf", n, length(hf_v)))
 
@@ -1107,7 +1134,7 @@ function LQRStateModel(
         Σf_m,
         hf_v,
         x0_v,
-        B0 === nothing ? zeros(T, d, 0) : Matrix{T}(B0),
+        B0_m,
         P0_m,
         observe_costate,
         fit_flags,
@@ -1115,7 +1142,7 @@ function LQRStateModel(
         P0_prior,
         x0_prior,
         Σ_prior,
-        fixed_costate_sigma === nothing ? nothing : T(fixed_costate_sigma),
+        fcs,
         Qc_prior_value,
         nothing,
         nothing,
@@ -1264,6 +1291,270 @@ function free_state_model(
     return sm
 end
 
+#=
+Structural checks of a `:hold` model, shared by its constructor and
+`validate_LDS`. Unlike the finite-horizon form, `A` need not be invertible —
+the hold transition never inverts it — but the DARE must have a stabilizing
+solution, which `refresh!` checks.
+=#
+function _check_hold_structure(
+    A::AbstractMatrix{T},
+    S::AbstractMatrix{T},
+    Qc::AbstractVector{<:AbstractMatrix{T}},
+    schedule::AbstractVector{Int},
+    terminal::Bool,
+) where {T<:Real}
+    n = size(A, 1)
+    size(A, 2) == n || throw(DimensionMismatchError("hold A columns", n, size(A, 2)))
+    size(S) == (n, n) || throw(DimensionMismatchError("hold S rows", n, size(S, 1)))
+    length(Qc) == 1 || throw(
+        ArgumentError(
+            "a `:hold` model carries exactly one cost `Q_h` (got $(length(Qc))): it is " *
+            "a stationary regulator, so there is no schedule of costs to switch among. " *
+            "Use one hold state per cost, or `:lqr` mode for a time-varying cost.",
+        ),
+    )
+    Q = Qc[1]
+    size(Q) == (n, n) || throw(DimensionMismatchError("hold Q_h rows", n, size(Q, 1)))
+    asym = maximum(abs, Q .- transpose(Q); init=zero(T))
+    asym <= 1e-8 * max(one(T), maximum(abs, Q; init=one(T))) ||
+        throw(NotSymmetricError("Q_h", Float64(asym)))
+    asym_S = maximum(abs, S .- transpose(S); init=zero(T))
+    asym_S <= 1e-8 * max(one(T), maximum(abs, S; init=one(T))) ||
+        throw(NotSymmetricError("S", Float64(asym_S)))
+    isempty(schedule) || throw(
+        ArgumentError(
+            "a `:hold` model has a single stationary cost, so it takes no `schedule`"
+        ),
+    )
+    terminal && throw(
+        ArgumentError(
+            "a `:hold` model cannot carry a terminal factor: its costate already lies " *
+            "on the stable manifold of the infinite-horizon problem, which is what a " *
+            "terminal boundary condition would otherwise select. Use `:lqr` mode for " *
+            "a finite-horizon reach.",
+        ),
+    )
+    return nothing
+end
+
+"""
+    hold_state_model(A, S, Q_h, Σ; kwargs...) -> LQRStateModel
+
+A `LQRStateModel` in `:hold` mode: the **infinite-horizon** regulator that
+holds the state at a reference, with its costate (softly) on the stable
+manifold of the discrete algebraic Riccati equation.
+
+With `P` the stabilizing solution of `P = Q_h + Aᵀ P (I + S P)⁻¹ A`,
+`W = (I + S P)⁻¹` and the closed loop `A_cl = W A` (`ρ(A_cl) < 1`), each
+transition is
+
+```math
+x_{t+1} = A x_t - S \\lambda_{t+1} + h_x + B_{u,x} u_t + \\varepsilon^x_t,
+\\qquad
+\\lambda_{t+1} = P x_{t+1} + G \\tilde u_t + \\varepsilon^\\lambda_t,
+```
+
+`ε_t ~ N(0, Σ)`, `ũ_t = [1; u_t]`. The first row is the plant row of the
+finite-horizon model unchanged, so `Σ[1:n, 1:n]` is plant noise as there; the
+second is the stable-manifold condition. `G = (I − A_clᵀ)⁻¹ (E + A_clᵀ P F)` is
+the stationary feedforward of a quasi-constant forcing, with
+`F = [h_x  B_{u,x}]` the plant drift and disturbance and
+`E = [h_λ  B_{u,λ} − Q_h G_r]` the costate forcing, tracking term
+`−Q_h r_t = −Q_h G_r u_t` included — so a reference input moves the held state
+exactly as it moves the finite-horizon controller's target.
+
+The forward transition `M = [A_cl  0; P A_cl  0]` is stable, so a hold model is
+well behaved over any horizon without a terminal factor, and `rand` samples it
+directly. The plant, cost and reference have the same meaning as in `:lqr`
+mode, which is what lets an [`SLDS`](@ref) tie `A` and `S` across a control
+state and a hold state (`tied = [:A, :S]`) while each keeps its own cost.
+
+## Cost
+
+A hold model carries exactly one cost, `Qc = [Q_h]`; its schedule is empty and
+`_nregimes` is 1. In a switching model whose `:lqr` states carry more cost
+matrices (a running and a terminal cost, say), the structural M-step gives each
+`Qc` copy its own number of regimes, so nothing needs padding. Tying `:Qc` ties
+regime `k` of every state that has one: a hold state's `Q_h` then shares the
+`:lqr` states' `Qc[1]`.
+
+## Gauge
+
+The inverse-optimal-control scaling `λ → cλ` maps `P → cP`, `Q_h → cQ_h`,
+`S → S/c`, the costate rows of `h`/`Bu` and of `x0`/`P0` by `c`, and `Σ`'s
+costate block by `c` on each side; `S P` and hence `A_cl` and `det(I + SP)` are
+unchanged. [`rescale_costate!`](@ref) applies exactly that map, and the
+likelihood is invariant whenever the emission does not read the costate.
+
+# Arguments
+- `A`: `n × n` plant (need not be invertible).
+- `S`: `n × n` symmetric control authority `B R⁻¹ Bᵀ`.
+- `Q_h`: the `n × n` symmetric state cost (or a one-element vector of it).
+- `Σ`: `2n × 2n` positive-definite innovation covariance, in plant-row /
+  manifold-row coordinates.
+
+# Keywords
+`h`, `Bu`, `Gref`, `x0`, `B0`, `P0`, `observe_costate`, `fit_flags`,
+`mstep_iters`, `P0_prior`, `x0_prior`, `Σ_prior`, `fixed_costate_sigma` and
+`Qc_prior` as for [`LQRStateModel`](@ref). `fit_flags.terminal` has nothing to
+gate here. `schedule` must be empty and `terminal` false; they are accepted only
+so that a mistaken request fails with a clear message.
+
+# Throws
+- `ArgumentError` for a terminal factor, a schedule or more than one cost
+- `DimensionMismatchError` when a size disagrees with `n` or `2n`
+- `NumericalStabilityError` when the DARE has no stabilizing solution (`(A, S)`
+  not stabilizable, or `(Q_h, A)` not detectable)
+"""
+function hold_state_model(
+    A::AbstractMatrix{T},
+    S::AbstractMatrix{T},
+    Q_h::Union{AbstractMatrix{T},AbstractVector{<:AbstractMatrix{T}}},
+    Σ::AbstractMatrix{T};
+    schedule::AbstractVector{<:Integer}=Int[],
+    terminal::Bool=false,
+    h::Union{Nothing,AbstractVector{T}}=nothing,
+    Bu::Union{Nothing,AbstractMatrix{T}}=nothing,
+    Gref::Union{Nothing,AbstractMatrix{T}}=nothing,
+    x0::Union{Nothing,AbstractVector{T}}=nothing,
+    B0::Union{Nothing,AbstractMatrix{T}}=nothing,
+    P0::Union{Nothing,AbstractMatrix{T}}=nothing,
+    observe_costate::Bool=false,
+    fit_flags::LQRFitFlags=LQRFitFlags(),
+    mstep_iters::Int=100,
+    P0_prior::Union{Nothing,IWPrior{T}}=nothing,
+    x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}}=nothing,
+    Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
+    fixed_costate_sigma::Union{Nothing,Real}=nothing,
+    Qc_prior=nothing,
+) where {T<:Real}
+    n = size(A, 1)
+    d = 2n
+    Qc_vec = Q_h isa AbstractMatrix ? [Q_h] : collect(Q_h)
+    _check_hold_structure(A, S, Qc_vec, collect(Int, schedule), terminal)
+    Qc_prior_value = _normalize_qc_prior(T, Qc_prior, 1, n)
+
+    size(Σ) == (d, d) || throw(DimensionMismatchError("hold Σ rows", d, size(Σ, 1)))
+    fcs = _check_fixed_costate_sigma(T, Σ, fixed_costate_sigma, Σ_prior, n)
+    h_v, Bu_m, Gref_m, x0_v, P0_m, B0_m = _lqr_affine_defaults(
+        T, n, h, Bu, Gref, x0, P0, B0, fit_flags, "hold"
+    )
+    mstep_iters >= 1 ||
+        throw(ArgumentError("mstep_iters must be at least 1; got $mstep_iters"))
+
+    MT = typeof(A)
+    VT = typeof(h_v)
+    sm = LQRStateModel{T,MT,VT}(
+        :hold,
+        A,
+        similar(A, 0, 0),
+        S,
+        Qc_vec,
+        Int[],
+        false,
+        0,
+        #= No terminal factor, so nothing to condition on. =#
+        false,
+        Σ,
+        h_v,
+        Bu_m,
+        Gref_m,
+        Matrix{T}(I, n, n),
+        zeros(T, n),
+        x0_v,
+        B0_m,
+        P0_m,
+        observe_costate,
+        fit_flags,
+        mstep_iters,
+        P0_prior,
+        x0_prior,
+        Σ_prior,
+        fcs,
+        Qc_prior_value,
+        nothing,
+        nothing,
+        LQRCache(T, n, 1, size(Bu_m, 2)),
+    )
+    refresh!(sm)
+    return sm
+end
+
+#=
+`fixed_costate_sigma` pins the costate block of `Σ` at `v·I` with no
+cross-covariance. Shared by the `:lqr` and `:hold` constructors.
+=#
+function _check_fixed_costate_sigma(
+    ::Type{T}, Σ::AbstractMatrix{T}, fixed, Σ_prior, n::Int
+) where {T<:Real}
+    fixed === nothing && return nothing
+    d = 2n
+    Σ_prior === nothing ||
+        throw(ArgumentError("fixed_costate_sigma cannot be combined with Σ_prior"))
+    isfinite(fixed) && fixed > 0 ||
+        throw(ArgumentError("fixed_costate_sigma must be finite and positive"))
+    v = T(fixed)
+    isfinite(v) && v > 0 || throw(
+        ArgumentError("fixed_costate_sigma is outside the covariance's numeric range")
+    )
+    isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
+        isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
+        isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
+        throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
+    return v
+end
+
+#=
+Defaults and shape checks for the affine pieces and the initial state, shared by
+the `:lqr` and `:hold` constructors (`label` names the mode in messages).
+=#
+function _lqr_affine_defaults(
+    ::Type{T},
+    n::Int,
+    h,
+    Bu,
+    Gref,
+    x0,
+    P0,
+    B0,
+    fit_flags::LQRFitFlags,
+    label::AbstractString,
+) where {T<:Real}
+    d = 2n
+    h_v = h === nothing ? zeros(T, d) : h
+    Bu_m = Bu === nothing ? zeros(T, d, 0) : Bu
+    #=
+    `Gref` sizes itself off whatever input width the model has, so a model with
+    no reference is exactly the regulation problem and one with a reference need
+    only say what the reference is.
+    =#
+    Gref_m = Gref === nothing ? zeros(T, n, size(Bu_m, 2)) : Gref
+    x0_v = x0 === nothing ? zeros(T, d) : x0
+    P0_m = P0 === nothing ? Matrix{T}(I, d, d) : P0
+
+    length(h_v) == d || throw(DimensionMismatchError("$label h", d, length(h_v)))
+    size(Bu_m, 1) == d || throw(DimensionMismatchError("$label Bu rows", d, size(Bu_m, 1)))
+    size(Gref_m, 1) == n ||
+        throw(DimensionMismatchError("$label Gref rows", n, size(Gref_m, 1)))
+    size(Gref_m, 2) == size(Bu_m, 2) || throw(
+        DimensionMismatchError(
+            "$label Gref columns (must match the input width)",
+            size(Bu_m, 2),
+            size(Gref_m, 2),
+        ),
+    )
+    _check_gref_cols(fit_flags, size(Gref_m, 2), d)
+    length(x0_v) == d || throw(DimensionMismatchError("$label x0", d, length(x0_v)))
+    B0 === nothing ||
+        size(B0, 1) == d ||
+        throw(DimensionMismatchError("$label B0 rows", d, size(B0, 1)))
+    size(P0_m) == (d, d) ||
+        throw(DimensionMismatchError("$label P0 rows", d, size(P0_m, 1)))
+    B0_m = B0 === nothing ? zeros(T, d, 0) : Matrix{T}(B0)
+    return h_v, Bu_m, Gref_m, x0_v, P0_m, B0_m
+end
+
 """
     LQRStateModel(latent_dim; mode=:lqr, kwargs...) -> LQRStateModel
 
@@ -1276,14 +1567,15 @@ continuous latent path, so the natural thing to say is "all `K` states are
 state *and* costate together, so it must be even — `latent_dim = 4` is two
 states and two costates.
 
-`mode = :lqr` gives a mildly contractive plant with a unit cost; `mode = :free`
-gives a contractive unconstrained transition (see [`free_state_model`](@ref)).
-Every keyword of the corresponding matrix constructor is accepted and overrides
-the default it names.
+`mode = :lqr` gives a mildly contractive plant with a unit cost; `mode = :hold`
+the same plant, control authority and cost as an infinite-horizon regulator
+(see [`hold_state_model`](@ref)); `mode = :free` a contractive unconstrained
+transition (see [`free_state_model`](@ref)). Every keyword of the corresponding
+matrix constructor is accepted and overrides the default it names.
 
 # Throws
-- `ArgumentError` when `latent_dim` is odd, non-positive, or `mode` is neither
-  `:lqr` nor `:free`
+- `ArgumentError` when `latent_dim` is odd, non-positive, or `mode` is not one
+  of `:lqr`, `:hold` and `:free`
 """
 function LQRStateModel(
     latent_dim::Integer; T::Type{<:Real}=Float64, mode::Symbol=:lqr, kwargs...
@@ -1310,8 +1602,16 @@ function LQRStateModel(
             Matrix{T}(T(0.1) * I, d, d);
             kwargs...,
         )
+    elseif mode === :hold
+        return hold_state_model(
+            Matrix{T}(T(0.95) * I, n, n),
+            Matrix{T}(T(0.05) * I, n, n),
+            Matrix{T}(I, n, n),
+            Matrix{T}(T(0.1) * I, d, d);
+            kwargs...,
+        )
     else
-        throw(ArgumentError("mode must be :lqr or :free; got :$mode"))
+        throw(ArgumentError("mode must be :lqr, :hold or :free; got :$mode"))
     end
 end
 
@@ -1335,7 +1635,8 @@ rather than loudly. Variants hold no variants of their own, so the recursion is
 one level deep.
 
 # Throws
-- `NumericalStabilityError` when `A` has become singular
+- `NumericalStabilityError` when `A` has become singular (`:lqr` mode), or the
+  DARE has no stabilizing solution (`:hold` mode)
 - `PosDefException` when `Σ` or `Σf` is not positive definite
 """
 function refresh!(sm::LQRStateModel{T}) where {T<:Real}
@@ -1344,6 +1645,8 @@ function refresh!(sm::LQRStateModel{T}) where {T<:Real}
     c = sm.cache
     if _is_free(sm)
         _refresh_free_head!(sm, c, n, d)
+    elseif _is_hold(sm)
+        _refresh_hold_head!(sm, c, n, d)
     else
         _refresh_lqr_head!(sm, c, n, d)
     end
@@ -1371,6 +1674,75 @@ function _refresh_free_head!(
     c.Qfwd = PDMat(Symmetrize!(Q))
     copyto!(c.bfwd, sm.h)
     size(sm.Bu, 2) > 0 && copyto!(c.Bfwd[1], sm.Bu)
+    return nothing
+end
+
+#=
+`:hold` mode fills the same cache from the stationary regulator. The model is
+stochastic in plant-row / manifold-row coordinates, `Lh z_{t+1} = Θh ω_t + ε`
+with `Lh = [I S; −P I]` and `Θh = [A 0 F; 0 0 G]`, so the forward transition is
+`Lh⁻¹ Θh`, and `Lh⁻¹` has the closed form
+
+    Lh⁻¹ = [ W     −S Wᵀ ]       W = (I + S P)⁻¹,
+           [ P W     Wᵀ  ]
+
+(check: `(I + SP)W = I`, and `Wᵀ = (I + PS)⁻¹` since `S` and `P` are
+symmetric). It is the hold model's `G`: `M = G [A 0; 0 0] = [A_cl 0; P A_cl 0]`,
+`bfwd = G [h_x; g₀]`, `Bfwd = G [B_{u,x}; G_u]` and `Qfwd = G Σ Gᵀ`. The
+Jacobian `log|det G⁻¹| = log det(I + S P)` goes where `log|det A|` goes for the
+finite-horizon form.
+=#
+function _refresh_hold_head!(
+    sm::LQRStateModel{T}, c::LQRCache{T}, n::Int, d::Int
+) where {T<:Real}
+    m = size(sm.Bu, 2)
+    H = _HoldUnit(T, n, m)
+    _hold_steady_state!(H, sm.A, sm.S, sm.Qc[1], sm.h, sm.Bu, sm.Gref) || throw(
+        NumericalStabilityError(
+            "hold",
+            "the discrete algebraic Riccati equation P = Q_h + Aᵀ P (I + S P)⁻¹ A has " *
+            "no stabilizing solution at these parameters (`(A, S)` must be " *
+            "stabilizable and `(Q_h, A)` detectable), so the infinite-horizon " *
+            "regulator is undefined",
+        ),
+    )
+    c.logabsdetA = H.logdetM
+    copyto!(c.AinvT, I)                    # unused in hold mode; kept finite for `show`
+    xr, lr = 1:n, (n + 1):d
+
+    G = c.G
+    @views begin
+        copyto!(G[xr, xr], H.W)
+        mul!(G[xr, lr], sm.S, transpose(H.W), -one(T), zero(T))
+        mul!(G[lr, xr], H.P, H.W)
+        copyto!(G[lr, lr], transpose(H.W))
+    end
+
+    M = c.M[1]
+    fill!(M, zero(T))
+    @views begin
+        copyto!(M[xr, xr], H.Acl)
+        mul!(M[lr, xr], H.P, H.Acl)
+    end
+
+    # Plant-row / manifold-row bias and input, mapped forward by G.
+    vbuf = Vector{T}(undef, d)
+    @views begin
+        vbuf[xr] .= sm.h[xr]
+        vbuf[lr] .= H.Gm[:, 1]
+    end
+    mul!(c.bfwd, G, vbuf)
+    if m > 0
+        Bmix = Matrix{T}(undef, d, m)
+        @views begin
+            Bmix[xr, :] .= sm.Bu[xr, :]
+            Bmix[lr, :] .= H.Gm[:, 2:end]
+        end
+        mul!(c.Bfwd[1], G, Bmix)
+    end
+
+    Qfwd = G * Matrix{T}(sm.Σ) * transpose(G)
+    c.Qfwd = PDMat(Symmetrize!(Qfwd))
     return nothing
 end
 
@@ -1563,6 +1935,9 @@ end
 The forward transition `M_k` on `z = [x; λ]`, which satisfies `Mᵀ J M = J`. This
 is the matrix the smoother actually propagates; see
 [`symplectic_defect`](@ref) to check it numerically.
+
+In `:hold` mode this is the stationary forward transition `[A_cl 0; P A_cl 0]`,
+which is stable rather than symplectic, and in `:free` mode the stored matrix.
 """
 symplectic_matrix(sm::LQRStateModel, k::Int=1) = copy(sm.cache.M[k])
 
@@ -1599,7 +1974,7 @@ function symplectic_defect(M::AbstractMatrix{T}) where {T<:Real}
 end
 
 function symplectic_defect(sm::LQRStateModel, k::Int=1)
-    _require_lqr(sm, "the symplectic defect")
+    _require_finite_horizon(sm, "the symplectic defect")
     return symplectic_defect(sm.cache.M[k])
 end
 
@@ -1610,16 +1985,39 @@ The recovered control problem: `(A = plant, S = B R⁻¹ Bᵀ, Qc = [state costs
 schedule, terminal)`. `B` and `R` are not separately identified — only their
 combination `S` is — and the overall cost scale is free (see
 [`rescale_costate!`](@ref)).
+
+A `:hold` model adds its infinite-horizon steady state: `P` (the stabilizing
+DARE solution), `A_cl = (I + S P)⁻¹ A` (the closed loop) and `feedforward`, the
+`n × (1 + ux_dim)` map `G` with `λ = P x + G [1; u]` on the stable manifold.
 """
-function lqr_parameters(sm::LQRStateModel)
+function lqr_parameters(sm::LQRStateModel{T}) where {T<:Real}
     _require_lqr(sm, "`lqr_parameters`")
-    return (
+    base = (
         A=copy(sm.A),
         S=copy(sm.S),
         Qc=[copy(Q) for Q in sm.Qc],
         schedule=copy(sm.schedule),
         terminal=sm.terminal,
     )
+    _is_hold(sm) || return base
+    H = _hold_unit_at(sm)
+    return (; base..., P=copy(H.P), A_cl=copy(H.Acl), feedforward=copy(H.Gm))
+end
+
+"""
+    _hold_unit_at(sm) -> _HoldUnit
+
+The steady state of a `:hold` model at its current parameters; throws
+`NumericalStabilityError` when the DARE has no stabilizing solution.
+"""
+function _hold_unit_at(sm::LQRStateModel{T}) where {T<:Real}
+    H = _HoldUnit(T, _plant_dim(sm), size(sm.Bu, 2))
+    _hold_steady_state!(H, sm.A, sm.S, sm.Qc[1], sm.h, sm.Bu, sm.Gref) || throw(
+        NumericalStabilityError(
+            "hold", "the DARE has no stabilizing solution at the current parameters"
+        ),
+    )
+    return H
 end
 
 """
@@ -1639,11 +2037,19 @@ tracks `P x` is one the LQR interpretation fits well.
 Returns the converged `P`; throws `NumericalStabilityError` if the iteration
 does not converge. Nonconvergence alone does not prove that a stabilizing
 solution does not exist; convergence may also be slow or numerically difficult.
+
+For a `:hold` model this is the `P` its transition is built on, computed by
+structure-preserving doubling (quadratically convergent, and checked against the
+equation); `k` must be 1 and `max_iter`/`tol` are not used.
 """
 function riccati_solution(
     sm::LQRStateModel{T}; k::Int=1, max_iter::Int=1000, tol::Real=1e-12
 ) where {T<:Real}
     _require_lqr(sm, "the Riccati solution")
+    if _is_hold(sm)
+        k == 1 || throw(ArgumentError("a `:hold` model has one cost; got k = $k"))
+        return _hold_unit_at(sm).P
+    end
     A = Matrix{T}(sm.A)
     S = Matrix{T}(sm.S)
     P = Matrix{T}(sm.Qc[k])
@@ -1675,7 +2081,8 @@ end
 
 The steady-state closed-loop plant `(I + S P)⁻¹ A` — how the *state* evolves once
 the optimal control `u = −R⁻¹Bᵀλ` is substituted back in. Computable from `S`
-and `P` alone, so it does not need `B` and `R` separately.
+and `P` alone, so it does not need `B` and `R` separately. For a `:hold` model
+it is the state block of the forward transition, `ρ < 1` by construction.
 """
 function closed_loop_dynamics(
     sm::LQRStateModel{T}; k::Int=1, P::AbstractMatrix{T}=riccati_solution(sm; k=k)
@@ -1706,6 +2113,11 @@ described below, and no parameter priors:
   survives the whitening. That direction is unbounded above as `c → 0`.
 
 Parameter-prior penalties can change in any of these cases.
+
+A `:hold` model carries no terminal factor, so its marginal likelihood is
+unchanged. The same map is exact for it: `S P` is invariant (`P → cP`), so the
+closed loop, `det(I + S P)` and the plant row are untouched, the feedforward and
+the manifold row scale by `c`, and so does `Σ`'s costate block on each side.
 
 With `target = :trace` the scale is chosen so that `tr(Qc[1]) == n`; with
 `target = :opnorm`, so that the largest absolute eigenvalue of `Qc[1]` is 1.
@@ -1875,6 +2287,11 @@ feedforward.
 
 The terminal condition is `P_T = Q_{k_T}`, `g_T = h_f` when the model carries a
 terminal factor and `P_T = 0`, `g_T = 0` (a free endpoint) when it does not.
+
+A `:hold` model is stationary, so its sequence is too: `P_t ≡ P` and
+`W_t ≡ (I + S P)⁻¹` from the DARE, and `g_{t+1} = G [1; u_t]` — the feedforward
+of the input in force on the transition into `t + 1`, exactly the manifold row
+of the model — with `g_1 = G [1; u_1]`.
 """
 function lqr_riccati_sequence(
     sm::LQRStateModel{T}, tsteps::Int; ux::Union{Nothing,AbstractMatrix{T}}=nothing
@@ -1882,6 +2299,7 @@ function lqr_riccati_sequence(
     _require_lqr(sm, "the Riccati sequence")
     tsteps >= 2 || throw(ArgumentError("lqr_riccati_sequence needs tsteps ≥ 2"))
     _lqr_lengths_ok(sm, [tsteps])
+    _is_hold(sm) && return _hold_riccati_sequence(sm, tsteps, ux)
     n = _plant_dim(sm)
     d = 2n
     A = Matrix{T}(sm.A)
@@ -1937,6 +2355,29 @@ function lqr_riccati_sequence(
     return P, g, W
 end
 
+#=
+The stationary counterpart of the backward sweep, for a `:hold` model: one DARE
+solution for every step, and the feedforward of each step's own input.
+=#
+function _hold_riccati_sequence(
+    sm::LQRStateModel{T}, tsteps::Int, ux::Union{Nothing,AbstractMatrix{T}}
+) where {T<:Real}
+    H = _hold_unit_at(sm)
+    ux_mat = _lqr_input_matrix(sm, ux, tsteps)
+    m = size(ux_mat, 1)
+    P = [copy(H.P) for _ in 1:tsteps]
+    W = [copy(H.W) for _ in 1:tsteps]
+    g = Vector{Vector{T}}(undef, tsteps)
+    ũ = Vector{T}(undef, 1 + m)
+    ũ[1] = one(T)
+    for t in 1:tsteps
+        s = max(t - 1, 1)                  # the transition into t uses u_{t-1}
+        m > 0 && @views ũ[2:end] .= ux_mat[:, s]
+        g[t] = H.Gm * ũ
+    end
+    return P, g, W
+end
+
 """
     simulate_lqr([rng,] sm, tsteps; x1, process_noise, costate_slack, ux)
 
@@ -1974,6 +2415,11 @@ useful horizon.
   measure-zero set of the model: give a positive value when generating data to
   fit back.
 - `ux`: exogenous input sequence (`ux_dim × tsteps`), when the model has one.
+
+For a `:hold` model the sweep is the stationary one (see
+[`lqr_riccati_sequence`](@ref)), so this follows the infinite-horizon regulator:
+`process_noise` is the plant row's noise and `costate_slack` the manifold row's.
+A hold model's forward flow is itself stable, so `rand` is equally usable for it.
 
 Note what this implies about the model: the exactly-optimal trajectory has a
 *rank-`n`* innovation, supported on the graph of the Riccati map. A full-rank

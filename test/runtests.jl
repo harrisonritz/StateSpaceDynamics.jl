@@ -197,6 +197,13 @@ using SSDTest
                 test_SLDS_warmup_estep_mstep()
                 test_SLDS_warmup_fit()
             end
+
+            @testset "Banded (left-to-right) chains" begin
+                test_SLDS_banded_helpers()
+                test_SLDS_banded_mstep_keeps_band()
+                test_SLDS_unvisited_row_kept()
+                test_SLDS_banded_fit()
+            end
         end
 
         include("LinearDynamicalSystems/GaussianLDS.jl")
@@ -554,6 +561,19 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/HoldLDS.jl")
+        @testset "Hold (infinite-horizon LQR)" begin
+            test_hold_dare()
+            test_hold_cache()
+            test_hold_construction()
+            test_hold_gauge()
+            test_hold_mstep_gradient()
+            test_hold_joint_gradient()
+            test_hold_em_recovery()
+            test_hold_depends_on()
+            test_hold_slds()
+        end
+
         include("LinearDynamicalSystems/InitialInputs.jl")
         @testset "Initial inputs" begin
             test_initial_inputs()
@@ -625,8 +645,36 @@ using SSDTest
             test_slds_lqr_tied_emission_mask()
             test_slds_lqr_tied_prior_counted_once()
             test_lqr_pair_slots()
+            test_slds_lqr_banded_conditional_chain()
             test_slds_lqr_terminal_chain_prior()
             test_slds_lqr_terminal_warmup()
+        end
+
+        include("LinearDynamicalSystems/SLDSBoundaries.jl")
+        @testset "SLDS boundaries (exit bridges, entry priors, conditioning)" begin
+            test_bridge_forward_backward_exact()
+            test_bridge_smoother_derivatives()
+            test_bridge_aggregate_stats()
+            test_bridge_validation()
+            test_bridge_fit()
+            test_bridge_grouped_and_sampled()
+            test_entry_forward_backward_exact()
+            test_entry_smoother_derivatives()
+            test_entry_prior_mstep_exact()
+            test_entry_guard_restores()
+            test_entry_validation()
+            test_entry_fit()
+            test_entry_with_hold()
+            test_conditional_probe_boundaries()
+            test_entry_stats_trial_weight()
+            test_conditional_entry_update_monotone()
+            test_conditional_boundaries_fit()
+            test_rand_entry_draw()
+            test_btd_cholesky_sampler()
+            test_rand_path_given_states()
+            test_rand_conditional_exact()
+            test_rand_boundary_defaults()
+            test_transition_potential_clamp()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

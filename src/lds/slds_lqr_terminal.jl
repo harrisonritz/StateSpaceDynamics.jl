@@ -123,7 +123,9 @@ function _slds_variant_view(
             lds.fit_bool,
         )
     end
-    return SLDS{T,S,O,TM,ISV}(slds.A, slds.πₖ, ldss)
+    return SLDS{T,S,O,TM,ISV}(
+        slds.A, slds.πₖ, ldss, slds.A_prior, slds.πₖ_prior, slds.boundaries
+    )
 end
 
 """
@@ -203,7 +205,7 @@ mutable struct _SLQRProbe{T<:Real,SL,PL,PP,FB,LN,DS,SF}
     plan::PL
     sws::Vector{SmoothWorkspace{T}}
     obs_seq::Vector{Int}
-    control_seq::Vector{Nothing}
+    control_seq::Vector{Int}
     seq_ends::Vector{Int}
     lognorm::LN
     designs::DS
@@ -260,7 +262,13 @@ function _slqr_terminal_probe(
             sm, GaussianObservationModel(zeros(T, 1, d), ones(T, 1, 1), zeros(T, 1))
         )
     end
-    probe_slds = SLDS(; A=copy(slds.A), πₖ=copy(slds.πₖ), LDSs=members)
+    #= The boundary factors are shared by reference: exit bridges are part of the
+    terminal event being conditioned on, and entry priors part of the prior it is
+    normalized under, so the probe must see the live ones — including an entry
+    prior the M-step is in the middle of updating. =#
+    probe_slds = SLDS(;
+        A=copy(slds.A), πₖ=copy(slds.πₖ), LDSs=members, boundaries=slds.boundaries
+    )
 
     uxs = [v.ux for v in designs]
     ys = [zeros(T, 1, size(u, 2)) for u in uxs]
@@ -271,7 +279,7 @@ function _slqr_terminal_probe(
     total_T = last(seq_ends)
     T_max = maximum(data.tsteps)
     tfs = initialize_FilterSmooth(members[1], data.tsteps)::TrialFilterSmooth{T}
-    dl = SLDSDiscreteLayer(probe_slds.A, probe_slds.πₖ, zeros(T, K, total_T))
+    dl = _slds_discrete_layer(probe_slds, total_T)
     fb = _make_slds_fb_storage(dl, seq_ends)
     pool = _slds_workspace_pool(probe_slds, nothing, T_max, ntrials; npool=1)
     plan = _slds_trial_plan(nothing, ntrials, length(pool.slots))
@@ -286,7 +294,7 @@ function _slqr_terminal_probe(
         plan,
         _slds_mstep_pool(probe_slds, T_max, 1),
         collect(1:total_T),
-        fill(nothing, total_T),
+        collect(1:total_T),
         seq_ends,
         _slds_lognorm_all(probe_slds, data.y),
         designs,
@@ -407,15 +415,40 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
         probe.logz += probe.counts[i] * probe.per_design[i]
     end
 
+    #= The same statistics the data side aggregates, each design weighted by how
+    many trials share it: bridged states add their terminal moments at every
+    exit, and entry-prior states count only their ordinary transitions. =#
+    dl, ntr = probe.dl, eachindex(probe.data.tsteps)
     for k in eachindex(probe.slds.LDSs)
-        weights = [
-            begin
-                t1, t2 = HMMs.seq_limits(probe.seq_ends, trial)
-                probe.counts[trial] .* Vector{T}(view(probe.fb.γ, k, t1:t2))
-            end for trial in eachindex(probe.data.tsteps)
-        ]
+        function per_trial(w)
+            return [
+                begin
+                    t1, t2 = HMMs.seq_limits(probe.seq_ends, trial)
+                    probe.counts[trial] .* Vector{T}(view(w, t1:t2))
+                end for trial in ntr
+            ]
+        end
+        weights = per_trial(view(probe.fb.γ, k, :))
+        exits = if _has_bridges(dl) && dl.bridge[k]
+            per_trial(view(dl.exit_w, k, :))
+        else
+            nothing
+        end
+        ordinary = _slds_ordinary_weights(dl, probe.fb, probe.seq_ends, k, ntr)
+        dyn = if ordinary === nothing
+            nothing
+        else
+            [probe.counts[trial] .* ordinary[trial] for trial in ntr]
+        end
         _slds_aggregate_weighted!(
-            probe.sufs[k], probe.tfs, probe.slds.LDSs[k], probe.data, weights, probe.sws[1]
+            probe.sufs[k],
+            probe.tfs,
+            probe.slds.LDSs[k],
+            probe.data,
+            weights,
+            probe.sws[1];
+            exit_weights=exits,
+            dyn_weights=dyn,
         )
     end
     return probe
@@ -585,13 +618,26 @@ function _slqr_chain_mstep!(
     function score!(A, π)
         copyto!(slds.A, A)
         copyto!(slds.πₖ, π)
-        logz = _slqr_probes_logz!(probes, sources)
+        logz = try
+            _slqr_probes_logz!(probes, sources)
+        catch err
+            # A proposal the probe cannot smooth is a rejected one.
+            _lqr_rejectable(err) || rethrow()
+            return -T(Inf)
+        end
         chain = sum(N .* log.(A .+ floor)) + sum(n .* log.(π .+ floor))
         return chain - logz
     end
 
     A0, π0 = copy(slds.A), copy(slds.πₖ)
     base = score!(A0, π0)
+    #= A probe that cannot be smoothed at the incoming chain leaves nothing to
+    compare against; keep the chain, and let the state M-step's own check say so. =#
+    if !isfinite(base)
+        copyto!(slds.A, A0)
+        copyto!(slds.πₖ, π0)
+        return false
+    end
     # The probes' own counts, weighted by how many trials share each design.
     Ξ, ν = zeros(T, K, K), zeros(T, K)
     for probe in probes
@@ -727,7 +773,8 @@ function _slds_lqr_grouped_conditional_mstep!(
     tied::AbstractVector{Symbol},
     probes::AbstractVector{<:_SLQRProbe},
     sources::AbstractVector,
-    probes_current::Bool,
+    probes_current::Bool;
+    entry_score=nothing,
 )
     (; ldss, cells, slots, blockslots, units) = _slds_lqr_variant_units(
         cell_slds, grp, K, tied
@@ -751,7 +798,14 @@ function _slds_lqr_grouped_conditional_mstep!(
         k in 1:K for i in eachindex(cells)
     ]
     probes_current || _slqr_probes_logz!(probes, sources)
-    _lqr_conditional_mstep!(ldss, pooled, slots, blockslots, _SLQRNormalizer(probes, units))
+    _lqr_conditional_mstep!(
+        ldss,
+        pooled,
+        slots,
+        blockslots,
+        _SLQRNormalizer(probes, units);
+        score_extra=entry_score,
+    )
     foreach(refresh!, sms)
     return nothing
 end
