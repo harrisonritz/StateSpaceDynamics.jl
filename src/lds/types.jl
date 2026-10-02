@@ -1024,6 +1024,13 @@ when the chain leaves them) and which start theirs from an
 struct SLDSBoundaries{T<:Real}
     bridge::Vector{Bool}
     entry::Vector{Union{Nothing,EntryPrior{T}}}
+    #= Only the parameterized form: `T` cannot be read off an `entry` holding no
+    prior at all, so an unparameterized constructor would leave it unbound. =#
+    function SLDSBoundaries{T}(
+        bridge::AbstractVector{Bool}, entry::AbstractVector
+    ) where {T<:Real}
+        return new{T}(Vector{Bool}(bridge), Vector{Union{Nothing,EntryPrior{T}}}(entry))
+    end
 end
 
 """
