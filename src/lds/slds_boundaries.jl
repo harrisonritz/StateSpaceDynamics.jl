@@ -82,7 +82,7 @@ Configure what happens at the switches between `slds`'s discrete states.
   entry), covariance `Σf`, offset `hf` and reference `Gref`.
 
 - `entry_states`: the states that start their segment from an
-  [`EntryPrior`](@ref) — a fresh plan — when the chain enters them from another
+  `EntryPrior` — a fresh plan — when the chain enters them from another
   state: `λ_t ~ N(μ + K (x_{t-1} − r⁽ⁱ⁾_{t-1}), P)`, `r⁽ⁱ⁾` the reference of the
   state being left (zero for one without a reference), while the plant moves
   under the entered state's own dynamics driven by that plan. Each must be an
@@ -939,12 +939,15 @@ function _entry_stats(
                 λm = mω[(n + 1):d]
                 Exx = Cω[1:n, 1:n] .+ δ * transpose(δ)
                 Eλx = Cω[(n + 1):d, 1:n] .+ λm * transpose(δ)
+                #= Explicit ranges rather than `end`: Julia 1.10 cannot lower `end`
+                inside an indexed `.+=` under `@views`. =#
+                ψr = 2:(n + 1)
                 st.Sψψ[1, 1] += w
-                @views st.Sψψ[1, 2:end] .+= w .* δ
-                @views st.Sψψ[2:end, 1] .+= w .* δ
-                @views st.Sψψ[2:end, 2:end] .+= w .* Exx
+                @views st.Sψψ[1, ψr] .+= w .* δ
+                @views st.Sψψ[ψr, 1] .+= w .* δ
+                @views st.Sψψ[ψr, ψr] .+= w .* Exx
                 @views st.Sλψ[:, 1] .+= w .* λm
-                @views st.Sλψ[:, 2:end] .+= w .* Eλx
+                @views st.Sλψ[:, ψr] .+= w .* Eλx
                 st.Sλλ .+= w .* (Cω[(n + 1):d, (n + 1):d] .+ λm * transpose(λm))
             end
             st.N[] += wtot
