@@ -24,14 +24,59 @@ every trial workspace, and refreshing it is the only write to it during an
 E-step.
 """
 function _prepare_lqr!(
-    lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}
+    lds::LinearDynamicalSystem{T,S,O},
+    tsteps::AbstractVector{Int},
+    cost_offset::AbstractVector{Int}=Int[],
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     _is_free(sm) || _check_qc_unaliased(sm.Qc)
     refresh!(sm)
-    _lqr_lengths_ok(sm, tsteps)
+    _lqr_lengths_ok(sm, tsteps, cost_offset)
     sm.observe_costate || _zero_costate_readout!(lds.obs_model, _plant_dim(sm))
     return nothing
+end
+
+"""
+    _prepare_lqr!(lds, data; offsets_ok=false)
+
+[`_prepare_lqr!`](@ref) for a validated `Data`, which also carries the trials'
+cost-schedule offsets.
+
+A Gaussian-only emission refuses non-zero offsets unless the caller says it can
+take them (`offsets_ok`). Its *smoother* can — the terminal-conditioning probe
+relies on that, bucketing trials by `(length, offset)` — and so can the
+evaluation paths built on it (`smooth`, `trial_elbos`, an ungrouped `elbo`). What
+cannot is the machinery that shares one covariance per length across the trials
+of a fit: the batched mean pass, the grouped Gaussian ELBO and the Gaussian
+`fit!`. Those are the callers that leave `offsets_ok` off.
+"""
+function _prepare_lqr!(
+    lds::LinearDynamicalSystem{T,S,O}, data::Data; offsets_ok::Bool=false
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    if O <: QuadraticEmission && !offsets_ok && _has_cost_offsets(data)
+        throw(
+            ArgumentError(
+                "per-trial cost offsets are supported with Poisson and composite " *
+                "emissions when fitting, not with a Gaussian-only one: its batched " *
+                "fit shares one covariance across trials of a length, which assumes " *
+                "every trial reads the same stretch of the cost schedule. Fit with a " *
+                "Poisson emission, or give every trial the same start. `smooth`, " *
+                "`trial_elbos` and `elbo` do accept them.",
+            ),
+        )
+    end
+    return _prepare_lqr!(lds, data.tsteps, data.cost_offset)
+end
+
+function _grouped_gaussian_offsets_error()
+    return throw(
+        ArgumentError(
+            "per-trial cost offsets are not supported by the grouped (`depends_on`) " *
+            "ELBO of a Gaussian-only emission, which shares one covariance across the " *
+            "trials of a length. Use `trial_elbos` or `smooth`, or a Poisson or " *
+            "composite emission.",
+        ),
+    )
 end
 
 """
@@ -503,11 +548,13 @@ function fit!(
     rtol::Float64=0.0,
     progress::Bool=true,
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
     ux0_test=nothing,
+    cost_offset_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -519,12 +566,13 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data)
     monitor = _holdout_monitor(
         T,
         y_test;
         ux0_test=ux0_test,
+        cost_offset_test=cost_offset_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -572,15 +620,17 @@ function elbo(
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data; offsets_ok=true)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
+        _has_cost_offsets(data) && _grouped_gaussian_offsets_error()
         sws_pool = _grouped_sws_pool(lds, data)
         state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
         return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
@@ -618,11 +668,14 @@ function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,S,O},
     y::Union{AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}}};
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
-    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy, depends_on=depends_on)
+    return _lqr_loglikelihood(
+        lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset, depends_on=depends_on
+    )
 end
 
 #=
@@ -636,9 +689,12 @@ function StatsAPI.loglikelihood(
     ux0=nothing,
     ux=nothing,
     uy=nothing,
+    cost_offset=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
-    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy, depends_on=depends_on)
+    return _lqr_loglikelihood(
+        lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset, depends_on=depends_on
+    )
 end
 
 function _lqr_loglikelihood(
@@ -647,11 +703,12 @@ function _lqr_loglikelihood(
     ux0=nothing,
     ux=nothing,
     uy=nothing,
+    cost_offset=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data; offsets_ok=true)
     #=
     The same grouping `elbo` resolves, so the two score the same model. The
     grouped ELBO adds each distinct parameter version's prior once (by array
@@ -659,6 +716,7 @@ function _lqr_loglikelihood(
     =#
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
+        _has_cost_offsets(data) && _grouped_gaussian_offsets_error()
         sws_pool = _grouped_sws_pool(lds, data)
         state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
         full = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
@@ -691,13 +749,14 @@ function smooth(
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data; offsets_ok=true)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
@@ -734,13 +793,14 @@ function smooth(
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _grouped_smooth(lds, data, grp, y)
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
@@ -762,6 +822,7 @@ function fit!(
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     max_iter::Int=100,
@@ -773,6 +834,7 @@ function fit!(
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
     ux0_test=nothing,
+    cost_offset_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
@@ -784,12 +846,13 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data)
     monitor = _holdout_monitor(
         T,
         y_test;
         ux0_test=ux0_test,
+        cost_offset_test=cost_offset_test,
         ux_test=ux_test,
         uy_test=uy_test,
         depends_on_test=depends_on_test,
@@ -841,6 +904,7 @@ function elbo(
         AbstractMatrix{T},AbstractArray{T,3},AbstractVector{<:AbstractMatrix{T}},NamedTuple
     };
     ux0=nothing,
+    cost_offset=nothing,
     ux=nothing,
     uy=nothing,
     newton_max_iter::Int=20,
@@ -848,8 +912,8 @@ function elbo(
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
+    _prepare_lqr!(lds, data)
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     if grp !== nothing
         sws_pool = _grouped_sws_pool(lds, data)
@@ -1329,17 +1393,26 @@ function Random.rand(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    cost_offset::Union{Nothing,Integer}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     Ti = Int(tsteps)
-    _prepare_lqr!(lds, [Ti])
+    offset = _normalize_cost_offset(cost_offset, lds.state_model, 1)
+    _prepare_lqr!(lds, [Ti], offset)
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
     u0 = _normalize_ux0(ux0, lds.state_model, 1)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
     z = Matrix{T}(undef, lds.latent_dim, Ti)
-    _sample_lqr_path!(rng, z, _trial_initial_model(lds, view(u0, :, 1)), ux_trial)
+    _sample_lqr_path!(
+        rng,
+        z,
+        _with_cost_offset(
+            _trial_initial_model(lds, view(u0, :, 1)), isempty(offset) ? 0 : offset[1]
+        ),
+        ux_trial,
+    )
     y = _alloc_obs(lds, Ti)
     _sample_lqr_obs!(rng, y, z, lds.obs_model, _extract_obs_params(lds.obs_model), uy_trial)
     return z, y
@@ -1353,13 +1426,15 @@ function Random.rand(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    cost_offset=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     depends_on === nothing ||
         throw(ArgumentError("`depends_on` grouping is not supported for an LQRStateModel"))
     ntrials = length(tsteps_per_trial)
     u0 = _normalize_ux0(ux0, lds.state_model, ntrials)
+    offsets = _normalize_cost_offset(cost_offset, lds.state_model, ntrials)
     lengths = Int[Int(t) for t in tsteps_per_trial]
-    _prepare_lqr!(lds, lengths)
+    _prepare_lqr!(lds, lengths, offsets)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, lengths, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, lengths, T, lds.obs_model)
     obs_params = _extract_obs_params(lds.obs_model)
@@ -1374,7 +1449,10 @@ function Random.rand(
     for i in 1:ntrials
         z[i] = Matrix{T}(undef, lds.latent_dim, lengths[i])
         y[i] = _alloc_obs(lds, lengths[i])
-        _sample_lqr_path!(rng, z[i], _trial_initial_model(lds, view(u0, :, i)), ux_seq[i])
+        trial_lds = _with_cost_offset(
+            _trial_initial_model(lds, view(u0, :, i)), isempty(offsets) ? 0 : offsets[i]
+        )
+        _sample_lqr_path!(rng, z[i], trial_lds, ux_seq[i])
         _sample_lqr_obs!(rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i))
     end
     return z, y

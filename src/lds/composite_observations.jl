@@ -245,7 +245,12 @@ shared and takes the same shapes as before.
 - `DimensionMismatchError` when a member's row count disagrees with its emission
 """
 function Data(
-    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux0=nothing, ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O},
+    y::NamedTuple;
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+    cost_offset=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     models = _models(lds.obs_model)
     obs_keys = keys(models)
@@ -312,7 +317,12 @@ function Data(
     )
 
     return Data(
-        y_seq, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(tsteps))
+        y_seq,
+        ux_seq,
+        uy_seq,
+        tsteps,
+        _normalize_ux0(ux0, lds.state_model, length(tsteps)),
+        _normalize_cost_offset(cost_offset, lds.state_model, length(tsteps)),
     )
 end
 
@@ -956,7 +966,12 @@ its own `Data` is indistinguishable from a single-emission model.
 function _member_datas(data::Data)
     ks = keys(data.y)
     return NamedTuple{ks}(
-        map(k -> Data(data.y[k], data.ux, data.uy[k], data.tsteps, data.ux0), ks)
+        map(
+            k -> Data(
+                data.y[k], data.ux, data.uy[k], data.tsteps, data.ux0, data.cost_offset
+            ),
+            ks,
+        ),
     )
 end
 

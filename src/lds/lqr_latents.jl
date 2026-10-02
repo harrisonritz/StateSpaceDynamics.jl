@@ -28,13 +28,17 @@ kernels below stay on the typed path.
     lds.state_model::S
 
 """
-    _lqr_lengths_ok(sm, tsteps)
+    _lqr_lengths_ok(sm, tsteps[, offsets])
 
-Check that a cost schedule covers every timestep of the longest trial. Called at
-each fitting / smoothing entry point, where the trial lengths are known — the
-model itself is built without reference to any dataset.
+Check that a cost schedule covers every timestep of every trial. A trial that
+starts `offset` bins into the schedule reaches entry `offset + tsteps`, so with
+per-trial offsets it is that sum, not the longest trial alone, that has to fit.
+Called at each fitting / smoothing entry point, where the trial lengths are
+known — the model itself is built without reference to any dataset.
 """
-function _lqr_lengths_ok(sm::LQRStateModel, tsteps::AbstractVector{Int})
+function _lqr_lengths_ok(
+    sm::LQRStateModel, tsteps::AbstractVector{Int}, offsets::AbstractVector{Int}=Int[]
+)
     #=
     A trial needs at least one transition. The state kernels (gradient, Hessian,
     sufficient statistics, the terminal normalizer's backward sweep) are written
@@ -55,14 +59,27 @@ function _lqr_lengths_ok(sm::LQRStateModel, tsteps::AbstractVector{Int})
     )
     isempty(sm.schedule) && return nothing
     T_max = maximum(tsteps)
-    length(sm.schedule) >= T_max || throw(
+    reach = isempty(offsets) ? T_max : maximum(tsteps .+ offsets)
+    length(sm.schedule) >= reach || throw(
         DimensionMismatchError(
-            "cost schedule length (must cover the longest trial)",
-            T_max,
+            if isempty(offsets)
+                "cost schedule length (must cover the longest trial)"
+            else
+                "cost schedule length (must cover every trial's offset plus its length)"
+            end,
+            reach,
             length(sm.schedule),
         ),
     )
     return nothing
+end
+
+function _trial_model(
+    lds::LinearDynamicalSystem{T,S,O}, data::Data, n::Integer
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    return _with_cost_offset(
+        _trial_initial_model(lds, view(data.ux0, :, n)), _trial_cost_offset(data, n)
+    )
 end
 
 """

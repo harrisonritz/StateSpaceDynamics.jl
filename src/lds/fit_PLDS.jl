@@ -657,7 +657,7 @@ function smooth!(
 
     if ntrials == 1
         smooth!(
-            _trial_initial_model(lds, view(data.ux0, :, 1)),
+            _trial_model(lds, data, 1),
             tfs[1],
             _trial(y, 1),
             sws_pool[1],
@@ -684,7 +684,7 @@ function smooth!(
         sws = take!(free)
         try
             smooth!(
-                _trial_initial_model(lds, view(data.ux0, :, trial)),
+                _trial_model(lds, data, trial),
                 tfs[trial],
                 _trial(y, trial),
                 sws,

@@ -79,9 +79,9 @@ grouped path rejected up front. Split out so the quadratic and non-quadratic
 methods differ only in how they smooth.
 """
 function _trial_elbo_setup(
-    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy
+    lds::LinearDynamicalSystem{T,S,O}, y, ux0, ux, uy; cost_offset=nothing
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
-    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
+    data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
     parameter_grouping(lds, length(data.tsteps); y=data.y) === nothing || error(
         "trial_elbos does not support parameter grouping (`depends_on`): a grouped " *
         "model carries one parameter set per cell of trials, and the per-trial " *
@@ -140,12 +140,7 @@ function _accumulate_trial_elbos(
         fs = tfs[n]
         per_trial[n] =
             Q_state!(
-                sws,
-                _trial_initial_model(lds, view(data.ux0, :, n)),
-                fs.E_z,
-                fs.E_zz,
-                fs.E_zz_prev,
-                data.ux[n],
+                sws, _trial_model(lds, data, n), fs.E_z, fs.E_zz, fs.E_zz_prev, data.ux[n]
             ) +
             log2π_per_step * data.tsteps[n] +
             _trial_q_obs(sws, lds, fs, data, n) +
@@ -404,10 +399,11 @@ function trial_elbos(
     ux0=nothing,
     ux=nothing,
     uy=nothing,
+    cost_offset=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy; cost_offset=cost_offset)
+    _prepare_lqr!(lds, data; offsets_ok=true)
     smooth!(lds, tfs, data, sws_pool)
     return _accumulate_lqr_trial_elbos(lds, tfs, data, sws_pool[1])
 end
@@ -430,10 +426,11 @@ function trial_elbos(
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    cost_offset=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
-    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy)
-    _prepare_lqr!(lds, data.tsteps)
+    data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy; cost_offset=cost_offset)
+    _prepare_lqr!(lds, data)
     smooth!(lds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
     return _accumulate_lqr_trial_elbos(lds, tfs, data, sws_pool[1])
 end

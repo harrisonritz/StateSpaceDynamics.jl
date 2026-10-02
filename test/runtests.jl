@@ -561,6 +561,17 @@ using SSDTest
             end
         end
 
+        include("LinearDynamicalSystems/LQRCostOffsets.jl")
+        @testset "LQR per-trial cost schedules" begin
+            test_cost_offset_lookup_and_validation()
+            test_cost_offset_terminal_logz()
+            test_cost_offset_matches_sliced_schedule()
+            test_cost_offset_uniform_equals_slice_fit()
+            test_cost_offset_ragged_fit()
+            test_cost_offset_sampling()
+            test_cost_offset_gaussian_emission()
+        end
+
         include("LinearDynamicalSystems/HoldLDS.jl")
         @testset "Hold (infinite-horizon LQR)" begin
             test_hold_dare()

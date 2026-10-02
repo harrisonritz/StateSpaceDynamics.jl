@@ -1085,6 +1085,7 @@ function _build_variants!(
             Ss[struct_slot(s, _LQR_BLOCK_S)],
             [Qcs[k][struct_slot(s, _LQR_BLOCK_Q)] for k in eachindex(sm.Qc)],
             sm.schedule,
+            0,
             sm.terminal,
             sm.terminal_regime,
             sm.condition_terminal,
@@ -1692,6 +1693,7 @@ function _subset_data(data::Data, trials::AbstractVector{Int})
         _subset_obs(data.uy, trials),
         data.tsteps[trials],
         data.ux0[:, trials],
+        isempty(data.cost_offset) ? Int[] : data.cost_offset[trials],
     )
 end
 

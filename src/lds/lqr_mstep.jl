@@ -97,6 +97,10 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     const terminal_inputs::Vector{Matrix{T}}
     const terminal_counts::Vector{T}
     const terminal_ux0::Vector{Vector{T}}
+    #= Where each design starts on the cost schedule. `log Z` reads the schedule
+    from the trial's end, so the offset is part of what makes two designs the
+    same. Empty for statistics that never saw one (every switching unit). =#
+    const terminal_offsets::Vector{Int}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -148,6 +152,7 @@ function _wrap_lqr_suff_stats(
         Matrix{T}[],
         T[],
         Vector{T}[],
+        Int[],
     )
 end
 
@@ -213,17 +218,20 @@ function _aggregate_lqr_stats!(
     empty!(hs.terminal_inputs)
     empty!(hs.terminal_counts)
     empty!(hs.terminal_ux0)
+    empty!(hs.terminal_offsets)
     if sm.terminal && sm.condition_terminal
-        index = Dict{Tuple{Matrix{T},Vector{T}},Int}()
+        index = Dict{Tuple{Matrix{T},Vector{T},Int},Int}()
         for i in trials
             u = data.ux[i]
             u0 = Vector{T}(view(data.ux0, :, i))
-            slot = get(index, (u, u0), 0)
+            off = _trial_cost_offset(data, i)
+            slot = get(index, (u, u0, off), 0)
             if slot == 0
                 push!(hs.terminal_inputs, Matrix{T}(u))
                 push!(hs.terminal_counts, one(T))
                 push!(hs.terminal_ux0, u0)
-                index[(hs.terminal_inputs[end], u0)] = length(hs.terminal_inputs)
+                push!(hs.terminal_offsets, off)
+                index[(hs.terminal_inputs[end], u0, off)] = length(hs.terminal_inputs)
             else
                 hs.terminal_counts[slot] += one(T)
             end
@@ -252,7 +260,15 @@ function _aggregate_lqr_stats!(
         p = _zero!(partials[slot])
         for j in chunk
             trial = trials[j]
-            _lqr_stats_trial!(p, sm, tfs[trial], data.ux[trial], d, m, reg)
+            _lqr_stats_trial!(
+                p,
+                _with_cost_offset(sm, _trial_cost_offset(data, trial)),
+                tfs[trial],
+                data.ux[trial],
+                d,
+                m,
+                reg,
+            )
         end
         return nothing
     end

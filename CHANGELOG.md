@@ -8,6 +8,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Per-trial cost-schedule offsets for `LQRStateModel`.** A cost schedule is one
+  vector indexed by timestep, so it used to say the same thing about bin `t` of
+  every trial — wrong whenever trials start at different times relative to the
+  event the schedule is timed against (a window that opens at target onset, say).
+  `fit!`, `elbo`, `smooth`, `loglikelihood`, `trial_elbos` and `rand` now take
+  `cost_offset`: one non-negative integer per trial, the number of schedule bins
+  before that trial's first bin, so trial `i`'s transition `t` is under
+  `schedule[t + cost_offset[i]]`. `fit!` also takes `cost_offset_test` for its
+  held-out monitor, and `terminal_normalizer` takes `cost_offset`. The schedule
+  is written once on the shared axis and must cover `offset + length` for every
+  trial; the fitted cost matrices are shared by all trials.
+
+  It costs no extra work per step: the per-regime matrices are cached once per
+  parameter set, and a lookup gains one integer add. It is supported by Poisson
+  and composite emissions and by the terminal-conditioning normalizer, whose
+  backward recursion reads the schedule from each trial's last bin (trials that
+  end at one bin share it however ragged their starts). A Gaussian-only emission
+  fits with one covariance shared across the trials of a length, so its `fit!` and
+  grouped `elbo` / `loglikelihood` throw on non-zero offsets, while its `smooth`,
+  `trial_elbos` and ungrouped `elbo` / `loglikelihood` accept them (trials are
+  bucketed by length and offset);
+  omitting `cost_offset` leaves every existing path bit-identical.
+
 - **`SplineGaussianObservationModel`: manifold discovery by a monotonic
   normalizing flow.** A Gaussian emission composed with a learned, element-wise,
   strictly increasing warp,

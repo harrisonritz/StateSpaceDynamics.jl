@@ -114,11 +114,33 @@ struct Data{T<:Real,YV,UXV<:AbstractVector{<:AbstractMatrix{T}},UYV}
     uy::UYV
     tsteps::Vector{Int}
     ux0::Matrix{T}                  # (initial-input dimension, ntrials)
+    #= Where each trial starts on an LQR cost schedule (`schedule[t + offset]`);
+    empty means every trial starts at the schedule's first entry. =#
+    cost_offset::Vector{Int}
 end
 
 function Data(y, ux::AbstractVector{<:AbstractMatrix{T}}, uy, tsteps) where {T<:Real}
     return Data(y, ux, uy, tsteps, zeros(T, 0, length(tsteps)))
 end
+
+function Data(y, ux::AbstractVector{<:AbstractMatrix{T}}, uy, tsteps, ux0) where {T<:Real}
+    return Data(y, ux, uy, tsteps, ux0, Int[])
+end
+
+"""
+    _trial_cost_offset(data, n) -> Int
+
+Trial `n`'s start on the LQR cost schedule; `0` for a `Data` that carries none.
+"""
+@inline _trial_cost_offset(data::Data, n::Integer) =
+    isempty(data.cost_offset) ? 0 : @inbounds(data.cost_offset[n])
+
+"""
+    _has_cost_offsets(data) -> Bool
+
+Whether any trial starts somewhere other than the schedule's first entry.
+"""
+_has_cost_offsets(data::Data) = any(!iszero, data.cost_offset)
 
 """
     GaussianStateModel{T<:Real, M<:AbstractMatrix{T}, V<:AbstractVector{T}}
@@ -736,6 +758,44 @@ function _trial_initial_model(
     )
 end
 
+"""
+    _trial_model(lds, data, n) -> LinearDynamicalSystem
+
+The model as trial `n` of `data` sees it: its own initial mean (see
+[`_trial_initial_model`](@ref)) and, for an LQR state model, its own start on the
+cost schedule. `lds` itself when neither differs from the fitted model, so a
+dataset without per-trial structure pays nothing. The result shares every fitted
+parameter with `lds` and is for inference only — never an M-step target.
+"""
+function _trial_model(lds::LinearDynamicalSystem, data::Data, n::Integer)
+    return _trial_initial_model(lds, view(data.ux0, :, n))
+end
+
+# Only an LQR state model has a cost schedule to be offset on; its method is in
+# `lqr_types.jl`. Any other model can only be given the offset it already has.
+function _with_cost_offset(lds::LinearDynamicalSystem, offset::Int)
+    iszero(offset) && return lds
+    throw(ArgumentError("a cost-schedule offset applies to an LQR state model only"))
+end
+
+"""
+    _normalize_cost_offset(offset, state_model, ntrials) -> Vector{Int}
+
+The per-trial schedule offsets of a `Data`: empty when none were given. Only an
+LQR state model has a cost schedule for them to index, so any other state model
+rejects a non-zero one rather than ignoring it.
+"""
+function _normalize_cost_offset(offset, ::AbstractStateModel, ntrials::Int)
+    offset === nothing && return Int[]
+    all(iszero, offset) && return Int[]
+    throw(
+        ArgumentError(
+            "`cost_offset` shifts where a trial starts on an LQR cost schedule, and " *
+            "this state model has no cost schedule",
+        ),
+    )
+end
+
 function _normalize_ux0(ux0, sm::AbstractGaussianStateModel{T}, ntrials::Int) where {T}
     q = _state_ux0_dim(sm)
     if ux0 === nothing
@@ -1239,7 +1299,7 @@ Workaround for JET union-split false positive on views with unbound eltype
 # ============================================================================
 
 """
-    Data(lds, y; ux0=nothing, ux=nothing, uy=nothing)
+    Data(lds, y; ux0=nothing, ux=nothing, uy=nothing, cost_offset=nothing)
 
 Validate observations and inputs against `lds` and canonicalize them into the
 internal [`Data`](@ref) container.
@@ -1251,6 +1311,9 @@ lengths allowed). `ux` / `uy` accept the same shape family as `y`, or
 canonicalized to zero-row matrices.
 `ux0` is a `(ux0_dim, ntrials)` matrix with one column per trial, or a vector
 for a single trial. It is required when the state model has a nonempty `B0`.
+`cost_offset` is one non-negative integer per trial, for an LQR state model with a
+cost schedule: trial `i` starts `cost_offset[i]` bins into the schedule (see
+[`LQRStateModel`](@ref)). Omitted, every trial starts at the first entry.
 
 # Throws
 - `DimensionMismatchError` when observation or input dimensions disagree with
@@ -1264,6 +1327,7 @@ function Data(
     ux0=nothing,
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
+    cost_offset=nothing,
 ) where {T<:Real}
     isempty(y) && throw(ArgumentError("y must contain at least one trial"))
     #=
@@ -1281,7 +1345,14 @@ function Data(
     tsteps = Int[size(yt, 2) for yt in y]
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps, T, lds.obs_model)
-    return Data(y, ux_seq, uy_seq, tsteps, _normalize_ux0(ux0, lds.state_model, length(y)))
+    return Data(
+        y,
+        ux_seq,
+        uy_seq,
+        tsteps,
+        _normalize_ux0(ux0, lds.state_model, length(y)),
+        _normalize_cost_offset(cost_offset, lds.state_model, length(y)),
+    )
 end
 
 function Data(
@@ -1290,11 +1361,13 @@ function Data(
     ux0=nothing,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T}}=nothing,
+    cost_offset=nothing,
 ) where {T<:Real}
     return Data(
         lds,
         [y];
         ux0=ux0,
+        cost_offset=cost_offset,
         ux=(ux === nothing ? nothing : [ux]),
         uy=(uy === nothing ? nothing : [uy]),
     )
@@ -1306,12 +1379,14 @@ function Data(
     ux0=nothing,
     ux::Union{Nothing,AbstractArray{T,3}}=nothing,
     uy::Union{Nothing,AbstractArray{T,3}}=nothing,
+    cost_offset=nothing,
 ) where {T<:Real}
     _trials(A) = [view(A, :, :, n) for n in axes(A, 3)]
     return Data(
         lds,
         _trials(y);
         ux0=ux0,
+        cost_offset=cost_offset,
         ux=(ux === nothing ? nothing : _trials(ux)),
         uy=(uy === nothing ? nothing : _trials(uy)),
     )

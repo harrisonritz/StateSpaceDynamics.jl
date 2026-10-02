@@ -211,10 +211,21 @@ function _pool_lqr_state_stats(
     units::AbstractVector{<:LQRSufficientStatistics{T}}
 ) where {T<:Real}
     pooled = deepcopy(first(units))
-    index = Dict{Tuple{Matrix{T},Vector{T}},Int}(
-        (u, u0) => i for
-        (i, (u, u0)) in enumerate(zip(pooled.terminal_inputs, pooled.terminal_ux0))
+    function _offsets(h)
+        return if isempty(h.terminal_offsets)
+            zeros(Int, length(h.terminal_inputs))
+        else
+            h.terminal_offsets
+        end
+    end
+    pooled_offsets = copy(_offsets(pooled))
+    index = Dict{Tuple{Matrix{T},Vector{T},Int},Int}(
+        (u, u0, off) => i for (i, (u, u0, off)) in
+        enumerate(zip(pooled.terminal_inputs, pooled.terminal_ux0, pooled_offsets))
     )
+    # Every pooled design carries its offset, so the vector stays aligned with them.
+    empty!(pooled.terminal_offsets)
+    append!(pooled.terminal_offsets, pooled_offsets)
     for hs in Iterators.drop(units, 1)
         for k in eachindex(pooled.zz)
             pooled.zz[k] .+= hs.zz[k]
@@ -233,13 +244,15 @@ function _pool_lqr_state_stats(
             dst.init_u0u0 .+= src.init_u0u0
             dst.init_yy[] = dst.init_yy[] + src.init_yy[]
         end
-        for (u, u0, c) in zip(hs.terminal_inputs, hs.terminal_ux0, hs.terminal_counts)
-            slot = get(index, (u, u0), 0)
+        for (u, u0, c, off) in
+            zip(hs.terminal_inputs, hs.terminal_ux0, hs.terminal_counts, _offsets(hs))
+            slot = get(index, (u, u0, off), 0)
             if slot == 0
                 push!(pooled.terminal_inputs, copy(u))
                 push!(pooled.terminal_counts, c)
                 push!(pooled.terminal_ux0, copy(u0))
-                index[(pooled.terminal_inputs[end], pooled.terminal_ux0[end])] = length(
+                push!(pooled.terminal_offsets, off)
+                index[(pooled.terminal_inputs[end], pooled.terminal_ux0[end], off)] = length(
                     pooled.terminal_inputs
                 )
             else

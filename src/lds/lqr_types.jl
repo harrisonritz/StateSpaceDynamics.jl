@@ -378,6 +378,31 @@ the terminal factor. A running-plus-terminal cost is
 `cost_schedule(T; terminal=true)`; see [`cost_schedule`](@ref).
 An empty `schedule` means "regime 1 everywhere", which requires `K == 1`.
 
+## Per-trial schedules
+
+By default every trial reads the schedule from its first entry, so bin `t` of
+every trial has the same cost. That is only the right model when trials start at
+the same time relative to whatever the schedule is timed against. When they do
+not — a window that opens at target onset and closes at the go cue starts
+at a different time in each trial — pass `cost_offset` to `fit!`, `elbo`,
+`smooth`, `loglikelihood` and `trial_elbos`: one non-negative integer per trial,
+the number of schedule bins before that trial's first bin. Trial `i`'s
+transition `t` then uses `schedule[t + cost_offset[i]]`, so the schedule is
+written once on the event-relative time axis and each trial reads its own slice.
+
+The schedule must cover `maximum(cost_offset .+ tsteps)`. The fitted cost
+matrices are shared by every trial; only *which* one a bin uses is per trial.
+The terminal factor still follows `schedule[T + offset]` unless `terminal_regime`
+pins it, which is what a ragged-end dataset wants.
+
+Offsets cost nothing at run time: the per-regime matrices are cached once per
+parameter set and a lookup is one extra integer add. `fit!` takes them with
+Poisson and composite emissions (the Laplace smoother treats every trial
+separately). A Gaussian-only emission *fits* with one covariance shared across the
+trials of a length, which assumes a shared start, so its `fit!` and its grouped
+`elbo` throw on non-zero offsets; its `smooth`, `trial_elbos` and ungrouped
+`elbo` accept them, bucketing trials by `(length, offset)`.
+
 ## Tracking a reference
 
 For the tracking problem — cost `½(x_t - r_t)^\\top Q_t (x_t - r_t)` against a
@@ -619,6 +644,11 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
     control cost. `B` and `R` are not separately identified; only `S` is.
 - `Qc::Vector{M}`: `K` symmetric `n × n` state-cost matrices.
 - `schedule::Vector{Int}`: per-timestep cost index, or empty for a single cost.
+- `cost_offset::Int`: where this model's trial starts on the schedule. The cost in
+    force on transition `t` is `schedule[t + cost_offset]`. Always `0` on a fitted
+    model; a per-trial copy carries the trial's own offset, which is how trials
+    that start at different times relative to one event share one event-timed
+    schedule. See "Per-trial schedules" below.
 - `terminal::Bool`: whether the terminal costate factor is active.
 - `terminal_regime::Int`: which cost the terminal factor is written against.
     `0` (the default) means "whatever the schedule says at this trial's own last
@@ -678,6 +708,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     S::M
     Qc::Vector{M}
     schedule::Vector{Int}
+    cost_offset::Int
     terminal::Bool
     terminal_regime::Int
     condition_terminal::Bool
@@ -819,7 +850,59 @@ when the schedule is empty (a single cost everywhere).
 """
 @inline function _regime(sm::LQRStateModel, t::Int)
     sched = sm.schedule
-    return isempty(sched) ? 1 : sched[t]
+    return isempty(sched) ? 1 : sched[t + sm.cost_offset]
+end
+
+"""
+    _regime_at(sm, a) -> Int
+
+Cost index at position `a` *on the schedule* — `_regime(sm, a - sm.cost_offset)`.
+For a caller that already works in schedule coordinates, such as one comparing
+trials with different offsets.
+"""
+@inline function _regime_at(sm::LQRStateModel, a::Int)
+    sched = sm.schedule
+    return isempty(sched) ? 1 : sched[a]
+end
+
+"""
+    _with_cost_offset(sm, offset) -> LQRStateModel
+
+`sm` as seen by a trial that starts `offset` bins into the schedule, so that
+`_regime(sm, t) == schedule[t + offset]` for it. This is the per-trial schedule:
+the schedule is one vector on an event-relative time axis, and each trial reads
+the slice of it its own bins fall on.
+
+Returns `sm` itself when it already carries `offset`, so a dataset with no
+offsets costs nothing. Otherwise it is a shallow copy — every parameter array,
+the schedule and the derived cache are shared by reference, only the offset
+differs — which is why it is safe on a parallel E-step (the cache is read-only
+there) and cheap enough to make once per trial. It is **not** a fit target:
+nothing that updates parameters should be handed one.
+"""
+function _with_cost_offset(sm::LQRStateModel{T,M,V}, offset::Int) where {T,M,V}
+    sm.cost_offset == offset && return sm
+    fields = ntuple(Val(fieldcount(LQRStateModel{T,M,V}))) do i
+        fieldname(LQRStateModel{T,M,V}, i) === :cost_offset ? offset : getfield(sm, i)
+    end
+    return LQRStateModel{T,M,V}(fields...)
+end
+
+"""
+    _with_cost_offset(lds, offset) -> LinearDynamicalSystem
+
+The same, for the whole model: `lds` itself when its state model already carries
+`offset`, and otherwise a copy that shares everything but the state model's
+offset.
+"""
+function _with_cost_offset(
+    lds::LinearDynamicalSystem{T,S,O}, offset::Int
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    sm = _with_cost_offset(lds.state_model, offset)
+    sm === lds.state_model && return lds
+    return LinearDynamicalSystem{T,S,O}(
+        sm, lds.obs_model, lds.latent_dim, lds.obs_dim, lds.ux_dim, lds.uy_dim, lds.fit_bool
+    )
 end
 
 """
@@ -837,9 +920,34 @@ trial ends under a running cost.
 One `Int` compare on a branch taken once per trial, not once per timestep, so
 the default path costs nothing measurable.
 """
+function _normalize_cost_offset(offset, ::LQRStateModel, ntrials::Int)
+    offset === nothing && return Int[]
+    values = collect(Int, offset isa Integer ? [offset] : offset)
+    length(values) == ntrials ||
+        throw(DimensionMismatchError("cost_offset length", ntrials, length(values)))
+    all(>=(0), values) || throw(
+        ArgumentError(
+            "cost_offset counts the schedule bins before each trial's first bin, so " *
+            "it cannot be negative; got a minimum of $(minimum(values))",
+        ),
+    )
+    return values
+end
+
 @inline function _terminal_regime(sm::LQRStateModel, tsteps::Int)
     k = sm.terminal_regime
     return k > 0 ? k : _regime(sm, tsteps)
+end
+
+"""
+    _terminal_regime_at(sm, a) -> Int
+
+[`_terminal_regime`](@ref) for a trial whose last bin is at position `a` on the
+schedule.
+"""
+@inline function _terminal_regime_at(sm::LQRStateModel, a::Int)
+    k = sm.terminal_regime
+    return k > 0 ? k : _regime_at(sm, a)
 end
 
 """
@@ -1152,6 +1260,7 @@ function LQRStateModel(
         S,
         Qc_vec,
         sched,
+        0,
         terminal,
         term_k,
         condition_terminal,
@@ -1287,6 +1396,7 @@ function free_state_model(
         empty_m,
         MT[],
         Int[],
+        0,
         false,
         0,
         false,
@@ -1480,6 +1590,7 @@ function hold_state_model(
         S,
         Qc_vec,
         Int[],
+        0,
         false,
         0,
         #= No terminal factor, so nothing to condition on. =#

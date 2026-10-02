@@ -1022,16 +1022,24 @@ function terminal_normalizer(
     ux::AbstractVector{<:AbstractMatrix};
     ux0=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    cost_offset=nothing,
 ) where {T<:Real,S<:LQRStateModel{T}}
     sm = lds.state_model
     sm.terminal || return zeros(T, length(ux))
     inputs = [Matrix{T}(u) for u in ux]
     u0 = _normalize_ux0(ux0, sm, length(inputs))
+    #= Each trial's own start on the cost schedule, as the fit that produced the
+    model saw it: `log Z` reads the schedule backwards from the trial's end. =#
+    offsets = _normalize_cost_offset(cost_offset, sm, length(inputs))
+    offset_of(n) = isempty(offsets) ? 0 : offsets[n]
     variants = _state_trial_variants(sm, length(inputs); depends_on=depends_on)
     if variants === nothing
-        _lqr_lengths_ok(sm, [size(u, 2) for u in inputs])
+        _lqr_lengths_ok(sm, [size(u, 2) for u in inputs], offsets)
         refresh!(sm)
-        return [_lqr_terminal_logz(sm, u, view(u0, :, i)) for (i, u) in enumerate(inputs)]
+        return [
+            _lqr_terminal_logz(_with_cost_offset(sm, offset_of(i)), u, view(u0, :, i)) for
+            (i, u) in enumerate(inputs)
+        ]
     end
     #= Exact per trial, against the trial's own variant: the non-switching
     normalizer factorizes over trials with nothing shared between them. =#
@@ -1039,10 +1047,14 @@ function terminal_normalizer(
     for v in unique(variants)
         vsm = (sm.variants::Vector{S})[v]
         idx = findall(==(v), variants)
-        _lqr_lengths_ok(vsm, [size(inputs[n], 2) for n in idx])
+        _lqr_lengths_ok(
+            vsm, [size(inputs[n], 2) for n in idx], isempty(offsets) ? Int[] : offsets[idx]
+        )
         refresh!(vsm)
         for n in idx
-            out[n] = _lqr_terminal_logz(vsm, inputs[n], view(u0, :, n))
+            out[n] = _lqr_terminal_logz(
+                _with_cost_offset(vsm, offset_of(n)), inputs[n], view(u0, :, n)
+            )
         end
     end
     return out

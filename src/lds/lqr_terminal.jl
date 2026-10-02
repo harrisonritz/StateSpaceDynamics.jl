@@ -12,9 +12,14 @@ function _lqr_terminal_designs(hs::LQRSufficientStatistics)
     else
         [zeros(eltype(u), 0) for u in hs.terminal_inputs]
     end
+    offsets = if length(hs.terminal_offsets) == length(hs.terminal_inputs)
+        hs.terminal_offsets
+    else
+        zeros(Int, length(hs.terminal_inputs))
+    end
     return [
-        (ux=u, ux0=u0, count=c) for
-        (u, u0, c) in zip(hs.terminal_inputs, u0s, hs.terminal_counts)
+        (ux=u, ux0=u0, off=o, count=c) for
+        (u, u0, o, c) in zip(hs.terminal_inputs, u0s, offsets, hs.terminal_counts)
     ]
 end
 
@@ -28,7 +33,7 @@ function _lqr_terminal_designs(inputs::Vector{Matrix{T}}) where {T}
     for u in inputs
         counts[u] = get(counts, u, 0) + 1
     end
-    return [(ux=u, ux0=zeros(T, 0), count=count) for (u, count) in counts]
+    return [(ux=u, ux0=zeros(T, 0), off=0, count=count) for (u, count) in counts]
 end
 
 function _lqr_terminal_designs(inputs::Vector{Matrix{T}}, ux0::AbstractMatrix{T}) where {T}
@@ -37,7 +42,7 @@ function _lqr_terminal_designs(inputs::Vector{Matrix{T}}, ux0::AbstractMatrix{T}
         key = (inputs[i], Vector{T}(view(ux0, :, i)))
         counts[key] = get(counts, key, 0) + 1
     end
-    return [(ux=u, ux0=u0, count=c) for ((u, u0), c) in counts]
+    return [(ux=u, ux0=u0, off=0, count=c) for ((u, u0), c) in counts]
 end
 
 """Exact log p(terminal=0 | inputs), using backward square-root integration.
@@ -71,6 +76,10 @@ function _lqr_terminal_logz(
            T(0.5) * (T(n) * log(T(2π)) + sum(abs2, residual))
 end
 
+# A design's start on the cost schedule. Designs built without one start at the
+# schedule's first entry, which is every design a dataset without offsets has.
+_design_offset(design) = get(design, :off, 0)
+
 """Sum terminal log normalizers over `designs`, each weighted by its trial count.
 
 The backward square-root recursion of [`_lqr_terminal_logz`](@ref) has an
@@ -79,13 +88,17 @@ input-independent part — the whitened constraint `H_j` and the factor `L_j` af
 input-independent part depends on a trial only through its horizon, and through
 the regimes the backward steps cross.
 
-Whenever every horizon has the same terminal regime and the running regime is
-the same on every transition of the longest trial (a single running cost with the
+Whenever every design has the same terminal regime and the running regime is
+the same on every transition any of them crosses (a single running cost with the
 terminal factor pinned by `terminal_regime` — the ragged-dataset shape), step `j`
-is the *same* for every horizon, so the recursion for a horizon `h` is the first
+is the *same* for every design, so the recursion for a horizon `h` is the first
 `h - 1` steps of the longest one. It is then computed once, and each horizon adds
-only its closing factor against `P0`. Otherwise each distinct horizon runs its
-own recursion, as before.
+only its closing factor against `P0`. Otherwise designs are grouped by where
+their last bin falls on the cost schedule, `offset + h`: the recursion reads the
+schedule backwards from there, so designs with one end share every step. For
+trials that all end at one event but start at different times that is a single
+group, however ragged the starts, and with no offsets it is the same as grouping
+by horizon.
 
 Either way the mean recursion runs over all designs at once: sorted by
 decreasing horizon, the designs still active at backward step `j` (`h > j`) are a
@@ -96,21 +109,27 @@ function _lqr_terminal_logz_sum(sm::LQRStateModel{T}, designs) where {T}
     sm.terminal || return zero(T)
     isempty(designs) && return zero(T)
     horizons = [size(d.ux, 2) for d in designs]
-    kfs = [_terminal_regime(sm, h) for h in horizons]
-    hmax = maximum(horizons)
-    k1 = _regime(sm, 1)
-    shared = all(==(kfs[1]), kfs) && all(t -> _regime(sm, t) == k1, 1:(hmax - 1))
+    offsets = [_design_offset(d) for d in designs]
+    #= Position of each design's last bin on the schedule. The backward recursion
+    reads the schedule from there, so two designs whose ends coincide cross the
+    same regimes at every backward step, whatever their lengths and offsets. =#
+    ends = horizons .+ offsets
+    kfs = [_terminal_regime_at(sm, e) for e in ends]
+    k1 = _regime_at(sm, minimum(offsets) + 1)
+    shared =
+        all(==(kfs[1]), kfs) &&
+        all(a -> _regime_at(sm, a) == k1, (minimum(offsets) + 1):(maximum(ends) - 1))
     chol = _lqr_logz_factors(sm)
     total = zero(T)
     if shared
         total += _lqr_terminal_logz_batch(sm, chol, designs, collect(eachindex(designs)))
     else
-        by_horizon = Dict{Int,Vector{Int}}()
-        for (i, h) in enumerate(horizons)
-            push!(get!(by_horizon, h, Int[]), i)
+        by_end = Dict{Int,Vector{Int}}()
+        for (i, e) in enumerate(ends)
+            push!(get!(by_end, e, Int[]), i)
         end
-        for h in sort!(collect(keys(by_horizon)); rev=true)
-            total += _lqr_terminal_logz_batch(sm, chol, designs, by_horizon[h])
+        for e in sort!(collect(keys(by_end)); rev=true)
+            total += _lqr_terminal_logz_batch(sm, chol, designs, by_end[e])
         end
     end
     return total
@@ -141,7 +160,9 @@ function _lqr_terminal_logz_batch(
     nd = length(order)
     hs = [size(designs[i].ux, 2) for i in order]
     hmax = hs[1]
-    kf = _terminal_regime(sm, hmax)
+    # Last bin of the longest design on the schedule; step `j` crosses `end - j`.
+    last_bin = hmax + _design_offset(designs[order[1]])
+    kf = _terminal_regime_at(sm, last_bin)
     m = size(c.Ftrm[kf], 2)
 
     #=
@@ -149,8 +170,8 @@ function _lqr_terminal_logz_batch(
     before step `j`, `Ls[:, :, j]` that step's lower factor, and `cum[j]` the
     log-determinant after `j - 1` steps, summed in step order exactly as the
     per-horizon recursion does. Step `j` of a trial of horizon `h` is the
-    transition `t = h - j`; the regime is read at the longest trial's `t`, which
-    is the same regime for every trial by the caller's grouping.
+    transition `t = h - j`; the regime is read at the longest trial's `t` (plus
+    its offset), which is the same regime for every trial by the caller's grouping.
 
     Each factor is the `R` of a QR of `[I; (H Lq)ᵀ]`, taken in place on one
     preallocated buffer: this runs on every objective evaluation of the M-step,
@@ -167,7 +188,7 @@ function _lqr_terminal_logz_batch(
     ldiv!(view(Hs, :, :, 1), Lf, c.Lf[kf])
     cum[1] = -sum(log, abs.(diag(Lf)))
     for j in 1:J
-        k = _regime(sm, hmax - j)
+        k = _regime_at(sm, last_bin - j)
         ks[j] = k
         Hj = view(Hs, :, :, j)
         mul!(G, Hj, Lq)
@@ -308,7 +329,7 @@ function _lqr_terminal_probe(sm::LQRStateModel{T}, hs) where {T}
     ux = [v.ux for v in designs]
     ys = [zeros(T, 1, size(u, 2)) for u in ux]
     ux0 = hcat((v.ux0 for v in designs)...)
-    data = Data(lds, ys; ux0=ux0, ux=ux)
+    data = Data(lds, ys; ux0=ux0, ux=ux, cost_offset=[v.off for v in designs])
     tfs = initialize_FilterSmooth(lds, data.tsteps)
     pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -371,7 +392,8 @@ function _same_designs(designs, hs)
         (
             d.count == c &&
             d.ux == u &&
-            (isempty(hs.terminal_ux0) || d.ux0 == hs.terminal_ux0[i])
+            (isempty(hs.terminal_ux0) || d.ux0 == hs.terminal_ux0[i]) &&
+            d.off == (isempty(hs.terminal_offsets) ? 0 : hs.terminal_offsets[i])
         ) || return false
     end
     return true
@@ -521,11 +543,26 @@ function _lqr_probe_aggregate!(
         p = _zero!(partials[slot])
         for item in chunk
             if item <= ngroups
-                _probe_cov_item!(p, sm, tfs[group_first[item]], group_weight[item], d)
+                i = group_first[item]
+                _probe_cov_item!(
+                    p,
+                    _with_cost_offset(sm, _trial_cost_offset(data, i)),
+                    tfs[i],
+                    group_weight[item],
+                    d,
+                )
             else
                 i = item - ngroups
                 _probe_mean_item!(
-                    p, sm, tfs[i], data.ux[i], view(data.ux0, :, i), counts[i], d, m, reg
+                    p,
+                    _with_cost_offset(sm, _trial_cost_offset(data, i)),
+                    tfs[i],
+                    data.ux[i],
+                    view(data.ux0, :, i),
+                    counts[i],
+                    d,
+                    m,
+                    reg,
                 )
             end
         end

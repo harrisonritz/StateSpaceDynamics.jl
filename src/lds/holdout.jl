@@ -79,6 +79,7 @@ mutable struct HoldoutMonitor{T<:Real,Y,UX0,UX,UY,NT<:NamedTuple}
     ux0::UX0
     ux::UX
     uy::UY
+    cost_offset::Union{Nothing,AbstractVector{Int}}
     depends_on::Union{Nothing,NamedTuple}
     kwargs::NT
     every::Int
@@ -96,7 +97,7 @@ mutable struct HoldoutMonitor{T<:Real,Y,UX0,UX,UY,NT<:NamedTuple}
 end
 
 """
-    _holdout_monitor(T, y_test; ux_test, uy_test, depends_on_test, test_every,
+    _holdout_monitor(T, y_test; ux_test, uy_test, cost_offset_test, depends_on_test, test_every,
                      early_stopping, patience, min_delta, restore_best, test_kwargs)
 
 Build the monitor, or return `nothing` when no held-out data was given. Every
@@ -108,6 +109,7 @@ function _holdout_monitor(
     ux0_test=nothing,
     ux_test=nothing,
     uy_test=nothing,
+    cost_offset_test=nothing,
     depends_on_test::Union{Nothing,NamedTuple}=nothing,
     test_every::Int=1,
     early_stopping::Bool=false,
@@ -132,6 +134,7 @@ function _holdout_monitor(
         ux0_test,
         ux_test,
         uy_test,
+        cost_offset_test === nothing ? nothing : collect(Int, cost_offset_test),
         depends_on_test,
         test_kwargs,
         test_every,
@@ -175,6 +178,8 @@ the best by more than `min_delta` for `patience` consecutive scored iterations
 and `early_stopping` is on.
 """
 function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Real}
+    # Only an LQR model takes `cost_offset`, so it is passed only when one was given.
+    offset = mon.cost_offset === nothing ? (;) : (; cost_offset=mon.cost_offset)
     v = T(
         elbo(
             model,
@@ -183,6 +188,7 @@ function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Re
             ux=mon.ux,
             uy=mon.uy,
             depends_on=mon.depends_on,
+            offset...,
             mon.kwargs...,
         ),
     )

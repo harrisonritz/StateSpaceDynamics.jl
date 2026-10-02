@@ -308,7 +308,7 @@ function smooth!(
 
     if ntrials == 1
         smooth!(
-            _trial_initial_model(lds, view(data.ux0, :, 1)),
+            _trial_model(lds, data, 1),
             tfs[1],
             _trial(y, 1),
             sws_pool[1],
@@ -317,6 +317,15 @@ function smooth!(
         )
         return tfs
     end
+
+    #=
+    Per-trial cost-schedule offsets (LQR only). The smoothed covariance depends on
+    which stretch of the schedule a trial reads, so it is shared only by trials of
+    one length *and* one offset, and the leading blocks of different lengths agree
+    only when their offsets do. None of the shortcuts below hold, so each
+    (length, offset) bucket runs its own covariance pass.
+    =#
+    _has_cost_offsets(data) && return _smooth_offset_buckets!(lds, tfs, data, sws_pool)
 
     #=
     Equal-length fast path: the BT Hessian (and its inverse) is observation-
@@ -369,7 +378,7 @@ function smooth!(
                 sws = sws_pool[i]
                 for trial in lo:hi
                     _smooth_mean_only!(
-                        _trial_initial_model(lds, view(data.ux0, :, trial)),
+                        _trial_model(lds, data, trial),
                         tfs[trial],
                         _trial(y, trial),
                         sws,
@@ -429,7 +438,7 @@ function smooth!(
                 for j in lo:hi
                     local trial = trials[j]
                     _smooth_mean_only!(
-                        _trial_initial_model(lds, view(data.ux0, :, trial)),
+                        _trial_model(lds, data, trial),
                         tfs[trial],
                         _trial(y, trial),
                         sws,
@@ -442,6 +451,47 @@ function smooth!(
         end
     end
 
+    return tfs
+end
+
+"""
+    _smooth_offset_buckets!(lds, tfs, data, sws_pool)
+
+Smooth a dataset whose trials start at different places on an LQR cost schedule.
+
+Trials are bucketed by `(length, offset)`: the block-tridiagonal precision, and so
+the smoothed covariance, is the same for every trial in a bucket and for no other.
+Each bucket does a whole covariance pass on one workspace, with the bucket's
+offset applied to the model, then the per-trial mean solves against it. Buckets
+run in parallel, largest first, one workspace each; a dataset whose trials all
+fall in a few buckets therefore parallelizes less than the equal-length path does.
+"""
+function _smooth_offset_buckets!(
+    lds::LinearDynamicalSystem{T,S,O},
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    sws_pool::Vector{SmoothWorkspace{T}},
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    by_bucket = Dict{Tuple{Int,Int},Vector{Int}}()
+    for (trial, tsteps) in enumerate(data.tsteps)
+        push!(get!(by_bucket, (tsteps, _trial_cost_offset(data, trial)), Int[]), trial)
+    end
+    buckets = sort!(collect(by_bucket); by=b -> (-b.first[1], b.first[2]))
+    ntasks = min(length(buckets), length(sws_pool))
+    free = Channel{SmoothWorkspace{T}}(ntasks)
+    foreach(i -> put!(free, sws_pool[i]), 1:ntasks)
+    tforeach(buckets; scheduler=:greedy, ntasks=ntasks) do bucket
+        (tsteps, offset), trials = bucket
+        ws = take!(free)
+        try
+            _smooth_bucket!(
+                _with_cost_offset(lds, offset), tfs, data, ws, sws_pool, tsteps, trials
+            )
+        finally
+            put!(free, ws)
+        end
+        return nothing
+    end
     return tfs
 end
 
@@ -633,7 +683,7 @@ function _smooth_bucket!(
     end
     for trial in trials
         _smooth_mean_only!(
-            _trial_initial_model(lds, view(data.ux0, :, trial)),
+            _trial_model(lds, data, trial),
             tfs[trial],
             _trial(y, trial),
             sws,
@@ -717,7 +767,7 @@ function _smooth_ragged_prefix!(
             for j in lo:hi
                 trial = trials[j]
                 _smooth_mean_only!(
-                    _trial_initial_model(lds, view(data.ux0, :, trial)),
+                    _trial_model(lds, data, trial),
                     tfs[trial],
                     _trial(y, trial),
                     ws,
@@ -1714,7 +1764,7 @@ function StatsAPI.loglikelihood(
             S_chol, K = _filter_cov_pass(lds_c, maximum(data.tsteps[n] for n in trials))
             for n in trials
                 total_ll += _filter_ll_trial(
-                    _trial_initial_model(lds_c, view(data.ux0, :, n)),
+                    _trial_model(lds_c, data, n),
                     data.y[n],
                     data.ux[n],
                     data.uy[n],
@@ -1731,12 +1781,7 @@ function StatsAPI.loglikelihood(
     total_ll = zero(T)
     for n in eachindex(data.y)
         total_ll += _filter_ll_trial(
-            _trial_initial_model(lds, view(data.ux0, :, n)),
-            data.y[n],
-            data.ux[n],
-            data.uy[n],
-            S_chol,
-            K,
+            _trial_model(lds, data, n), data.y[n], data.ux[n], data.uy[n], S_chol, K
         )
     end
     return total_ll
