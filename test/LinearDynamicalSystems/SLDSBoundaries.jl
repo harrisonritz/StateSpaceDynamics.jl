@@ -1059,3 +1059,33 @@ function test_rand_boundary_defaults()
     @test a[1] == b[1] && a[2] == b[2]
     return nothing
 end
+
+"""
+A transition that leaves a bridged state straight into an entry-prior one carries
+both potentials, and their sum is what is clamped: two large ones cannot overflow
+the row to `Inf`, which forward filtering would turn into `NaN`. A forward pass
+that underflows anyway (every reachable state far below an unreachable one) is a
+rejectable point for the conditional M-step, not an error.
+"""
+function test_transition_potential_clamp()
+    K = 3
+    A, π = banded_transition(K; stay=[0.5, 0.5])
+    dl = _SB.SLDSDiscreteLayer(copy(A), copy(π), zeros(K, 4))
+    dl.bridge = [true, true, false]
+    dl.exit_logL = fill(400.0, K, 4)
+    dl.entry = [false, true, true]
+    dl.entry_logL = fill(400.0, K, K, 4)
+    At = _SB.HMMs.transition_matrix(dl, 2)
+    @test all(isfinite, At)
+    @test At[1, 2] ≈ A[1, 2] * exp(500.0)
+    @test At[1, 1] == A[1, 1] && At[2, 1] == 0
+    dl.exit_logL .= -400.0
+    dl.entry_logL .= 100.0
+    @test _SB.HMMs.transition_matrix(dl, 2)[1, 2] ≈ A[1, 2] * exp(-300.0)
+
+    @test _SB._lqr_rejectable(
+        ArgumentError("isfinite(logL[k]) must hold. Got\nlogL[k] => NaN")
+    )
+    @test !_SB._lqr_rejectable(ArgumentError("something else"))
+    return nothing
+end

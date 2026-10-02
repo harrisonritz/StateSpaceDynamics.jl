@@ -753,6 +753,13 @@ Unwraps the task wrappers on the way down. The probe's smoother runs its trials
 through `tforeach`, so a LAPACK failure inside one arrives as a
 `TaskFailedException` around the real cause, and a predicate that only matched
 the leaf types would let a perfectly ordinary rejected step kill the whole fit.
+
+A switching probe's forward-backward reports the same kind of failure as an
+`ArgumentError` from its finiteness check: at a candidate point every state the
+chain can reach (a banded chain cannot reach back) may score hundreds of nats
+below one it cannot, the scaled forward pass underflows to zero, and the
+sequence likelihood comes out non-finite. That is a point out of numerical
+reach, not a bug.
 """
 function _lqr_rejectable(err)
     err isa PosDefException && return true
@@ -760,6 +767,7 @@ function _lqr_rejectable(err)
     err isa LAPACKException && return true
     err isa NumericalStabilityError && return true
     err isa DomainError && return true
+    err isa ArgumentError && occursin("isfinite(logL", err.msg) && return true
     err isa TaskFailedException && return _lqr_rejectable(err.task.result)
     err isa CompositeException &&
         return !isempty(err.exceptions) && all(_lqr_rejectable, err.exceptions)

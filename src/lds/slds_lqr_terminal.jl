@@ -618,13 +618,26 @@ function _slqr_chain_mstep!(
     function score!(A, π)
         copyto!(slds.A, A)
         copyto!(slds.πₖ, π)
-        logz = _slqr_probes_logz!(probes, sources)
+        logz = try
+            _slqr_probes_logz!(probes, sources)
+        catch err
+            # A proposal the probe cannot smooth is a rejected one.
+            _lqr_rejectable(err) || rethrow()
+            return -T(Inf)
+        end
         chain = sum(N .* log.(A .+ floor)) + sum(n .* log.(π .+ floor))
         return chain - logz
     end
 
     A0, π0 = copy(slds.A), copy(slds.πₖ)
     base = score!(A0, π0)
+    #= A probe that cannot be smoothed at the incoming chain leaves nothing to
+    compare against; keep the chain, and let the state M-step's own check say so. =#
+    if !isfinite(base)
+        copyto!(slds.A, A0)
+        copyto!(slds.πₖ, π0)
+        return false
+    end
     # The probes' own counts, weighted by how many trials share each design.
     Ξ, ν = zeros(T, K, K), zeros(T, K)
     for probe in probes

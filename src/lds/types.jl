@@ -1178,33 +1178,27 @@ are then exactly those of the chain with the factor attached. A trial's first
 index is never asked for a transition (its α comes from `πₖ`), so `t − 1` never
 crosses into the previous trial.
 
-The potential is clamped at ±500 nats so that a bridge scored far outside its
-posterior cannot underflow a whole row to zero; nothing within ±500 of a
-realistic bridge log-density is affected.
+Entering an entry-prior state `j` from `i` at `t` likewise multiplies entry
+`(i, j)` by `exp(entry_logL[i, j, t])`. A transition can carry both — leaving a
+bridged state straight into an entry-prior one — and their *sum* is clamped at
+±500 nats, so that a potential scored far outside its posterior cannot underflow
+a whole row to zero, and two at once cannot overflow it to `Inf` (which forward
+filtering would turn into `NaN`). Nothing within ±500 of a realistic log-density
+is affected.
 =#
 function HMMs.transition_matrix(dl::SLDSDiscreteLayer{T}, t::Integer) where {T}
     ((_has_bridges(dl) || _has_entries(dl)) && t > 1) || return dl.A
     trans = Matrix{T}(dl.A)
     K = size(trans, 1)
-    if _has_bridges(dl)
-        for i in 1:K
-            dl.bridge[i] || continue
-            f = exp(clamp(dl.exit_logL[i, t - 1], -T(500), T(500)))
-            for j in 1:K
-                j == i || (trans[i, j] *= f)
-            end
-        end
-    end
-    #= Entering `j` from `i` swaps `j`'s ordinary transition into `t` (already
-    in `logL[j, t]`) for the entry one: the difference rides on the transition. =#
-    if _has_entries(dl)
-        for j in 1:K
-            dl.entry[j] || continue
-            for i in 1:K
-                i == j && continue
-                trans[i, j] *= exp(clamp(dl.entry_logL[i, j, t], -T(500), T(500)))
-            end
-        end
+    bridges, entries = _has_bridges(dl), _has_entries(dl)
+    for i in 1:K, j in 1:K
+        i == j && continue
+        φ = zero(T)
+        bridges && dl.bridge[i] && (φ += dl.exit_logL[i, t - 1])
+        #= Entering `j` from `i` swaps `j`'s ordinary transition into `t` (already
+        in `logL[j, t]`) for the entry one: the difference rides on the transition. =#
+        entries && dl.entry[j] && (φ += dl.entry_logL[i, j, t])
+        iszero(φ) || (trans[i, j] *= exp(clamp(φ, -T(500), T(500))))
     end
     return trans
 end

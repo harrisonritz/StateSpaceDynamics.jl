@@ -674,6 +674,7 @@ using SSDTest
             test_rand_path_given_states()
             test_rand_conditional_exact()
             test_rand_boundary_defaults()
+            test_transition_potential_clamp()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")
