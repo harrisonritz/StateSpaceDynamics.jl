@@ -79,6 +79,7 @@ include("lds/fit_LQR.jl")
 include("lds/lqr_terminal.jl")
 include("lds/slds_lqr_terminal.jl")
 include("lds/slds_boundaries.jl")   # exit bridges between discrete states
+include("lds/slds_sample_boundaries.jl")   # `rand` with boundary factors
 
 # ELBO split by trial. Last of the LDS files: it dispatches on every state model
 # above, so its signatures need all of their types to exist.

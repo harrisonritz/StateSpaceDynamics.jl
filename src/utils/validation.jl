@@ -706,21 +706,11 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     so it must agree on `observe_costate`. It has no terminal factor, like a free
     state, so it is left out of the `terminal` comparison: the factor is
     responsibility-weighted and simply absent while the hold state is active.
-    Terminal *conditioning* is another matter — its normalizer is not
-    implemented for a chain that can switch into a hold state — and is refused.
+    Terminal conditioning works with it: the probe that normalizes the score
+    switches into the hold state as the data side does.
     =#
     ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
     ref === nothing && return nothing
-    if any(lds -> _is_hold(lds.state_model), slds.LDSs) && _slds_condition_terminal(slds)
-        throw(
-            ArgumentError(
-                "terminal conditioning (`condition_terminal = true` on a state with a " *
-                "terminal factor) is not implemented for a switching model with a " *
-                "`:hold` discrete state. Set `condition_terminal = false` on the " *
-                "inverse-LQR states, or drop their terminal factor.",
-            ),
-        )
-    end
     sm_ref = slds.LDSs[ref].state_model
     lqr_ref = findfirst(
         lds -> !_is_free(lds.state_model) && !_is_hold(lds.state_model), slds.LDSs

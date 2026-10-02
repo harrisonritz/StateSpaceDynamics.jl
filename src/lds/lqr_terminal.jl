@@ -796,7 +796,8 @@ function _lqr_conditional_problem(
     sufs::AbstractVector{<:LQRSufficientStatistics{T}},
     slots::AbstractVector{<:AbstractVector{Int}},
     blockslots::NTuple{7,Vector{Int}},
-    backend,
+    backend;
+    score_extra=nothing,
 ) where {T<:Real}
     sms = [lds.state_model for lds in ldss]
     d, n = _state_latent_dim(sms[1]), _plant_dim(sms[1])
@@ -939,6 +940,13 @@ function _lqr_conditional_problem(
             else
                 _terminal_extra_value(backend, sms)
             end
+            #=
+            Terms of the data's objective that share these parameters but are not
+            in the statistics (a switching model's entry priors, whose plant row
+            and reference move with the structure). Value only, so they judge a
+            step without steering it — as the joint objective's guard does.
+            =#
+            score && score_extra !== nothing && (value -= score_extra())
             # Initial state and its priors, including cross-group x0/P0 pairs.
             for (c, (sm, hs)) in enumerate(zip(sms, sufs))
                 base = _state_suf(hs.base)
@@ -1094,10 +1102,14 @@ function _lqr_conditional_mstep!(
     sufs::AbstractVector{<:LQRSufficientStatistics{T}},
     slots::AbstractVector{<:AbstractVector{Int}},
     blockslots::NTuple{7,Vector{Int}},
-    backend,
+    backend;
+    score_extra=nothing,
 ) where {T<:Real}
     return _lqr_conditional_mstep!(
-        _lqr_conditional_problem(ldss, sufs, slots, blockslots, backend), ldss
+        _lqr_conditional_problem(
+            ldss, sufs, slots, blockslots, backend; score_extra=score_extra
+        ),
+        ldss,
     )
 end
 

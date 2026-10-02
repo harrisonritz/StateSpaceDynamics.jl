@@ -71,6 +71,20 @@ which per-regime `Bₖ` / `Dₖ` multiplies them):
 - `uy`: observation input consumed by `Dₖ`. Same shape family as `ux`; required
   when the LDS carry a nonzero-column `D`. Supported for both Gaussian and
   Poisson emissions.
+
+Boundary factors ([`set_boundaries!`](@ref)):
+- An entry prior is drawn exactly: on a switch into an entry-prior state the new
+  costate comes from the prior and the state from the entered plant row given it.
+- `conditional`: draw given every goal — each exit bridge and each inverse-LQR
+  state's end-of-trial terminal factor — as `p(z, x, y | goals = 0)`, the model a
+  fit with those factors assumes. Defaults to `true` exactly when the model has
+  exit bridges, and to the plain forward draw otherwise; pass it to override
+  either way. The draw is an MCMC chain with exact conditional steps, run for
+  `gibbs_sweeps` sweeps from the prior chain: on a left-to-right (banded) chain,
+  collapsed Gibbs over the changepoints with the latents integrated out (default
+  20 sweeps); on any other chain, blocked Gibbs alternating `x | z` and `z | x`
+  (default 200, as it mixes more slowly). Its paths sit near each stage's stable
+  manifold instead of following the unstable forward flow.
 """
 function Random.rand(
     rng::AbstractRNG,
@@ -80,6 +94,8 @@ function Random.rand(
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
     uy::Union{Nothing,AbstractMatrix{T},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    conditional::Union{Nothing,Bool}=nothing,
+    gibbs_sweeps::Union{Nothing,Int}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
@@ -108,12 +124,32 @@ function Random.rand(
     y = _alloc_obs(regimes[1], Ti)
 
     _prepare_slds!(slds, [Ti])
-    _warn_slds_unstable_rollout(slds, Ti)
+    given_goals = _slds_rand_conditional(slds, conditional)
+    given_goals || _warn_slds_unstable_rollout(slds, Ti)
     state_params = [
         _extract_state_params(_trial_initial_model(lds, view(u0, :, 1)).state_model) for
         lds in regimes
     ]
     obs_params = [_extract_obs_params(lds.obs_model) for lds in regimes]
+
+    if given_goals || _slds_has_entries(slds)
+        cell = grp === nothing ? slds : _slds_cell_sldss(slds, grp)[grp.trial_cell[1]]
+        _sample_slds_boundary_trial!(
+            rng,
+            z,
+            x,
+            y,
+            _trial_initial_model(cell::SLDS, view(u0, :, 1))::SLDS,
+            state_params,
+            obs_params,
+            lds1.obs_model,
+            ux_trial,
+            uy_trial;
+            conditional=given_goals,
+            gibbs_sweeps=gibbs_sweeps,
+        )
+        return z, x, y
+    end
 
     _sample_slds_trial!(
         rng,
@@ -140,6 +176,8 @@ function Random.rand(
     ux::Union{Nothing,AbstractVector{<:AbstractMatrix{T}}}=nothing,
     uy::Union{Nothing,AbstractVector{<:AbstractMatrix{T}},NamedTuple}=nothing,
     depends_on::Union{Nothing,NamedTuple}=nothing,
+    conditional::Union{Nothing,Bool}=nothing,
+    gibbs_sweeps::Union{Nothing,Int}=nothing,
 ) where {T<:Real,S<:AbstractStateModel,O<:AbstractObservationModel}
     lds1 = slds.LDSs[1]
     latent_dim = lds1.latent_dim
@@ -158,8 +196,16 @@ function Random.rand(
     over regimes. Ungrouped, every trial shares the same vector.
     =#
     _prepare_slds!(slds, collect(Int, tsteps_per_trial))
-    _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
+    given_goals = _slds_rand_conditional(slds, conditional)
+    given_goals || _warn_slds_unstable_rollout(slds, maximum(tsteps_per_trial))
     grp = _slds_parameter_grouping(slds, ntrials; depends_on=depends_on)
+    # The trial's own model, which the boundary sampler reads whole.
+    cell_of_trial = if grp === nothing
+        fill(slds, ntrials)
+    else
+        cells = _slds_cell_sldss(slds, grp)
+        [cells[grp.trial_cell[n]] for n in 1:ntrials]
+    end
     if grp === nothing
         base_state = [_extract_state_params(lds.state_model) for lds in slds.LDSs]
         base_obs = [_extract_obs_params(lds.obs_model) for lds in slds.LDSs]
@@ -192,11 +238,29 @@ function Random.rand(
         ]
     end
 
+    boundary_path = given_goals || _slds_has_entries(slds)
     for trial in 1:ntrials
         Ti = Int(tsteps_per_trial[trial])
         z[trial] = Vector{Int}(undef, Ti)
         x[trial] = Matrix{T}(undef, latent_dim, Ti)
         y[trial] = _alloc_obs(alloc_of[trial], Ti)
+        if boundary_path
+            _sample_slds_boundary_trial!(
+                rng,
+                z[trial],
+                x[trial],
+                y[trial],
+                _trial_initial_model(cell_of_trial[trial]::SLDS, view(u0, :, trial))::SLDS,
+                state_of[trial],
+                obs_of[trial],
+                lds1.obs_model,
+                ux_seq[trial],
+                _trial(uy_seq, trial);
+                conditional=given_goals,
+                gibbs_sweeps=gibbs_sweeps,
+            )
+            continue
+        end
         _sample_slds_trial!(
             rng,
             z[trial],
@@ -3522,6 +3586,7 @@ function _slds_state_mstep!(
     D::Int,
     ux_dim::Int;
     terminal_probe=nothing,
+    entry_score=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     terminal_probe === nothing ||
         throw(ArgumentError("terminal conditioning needs inverse-LQR discrete states"))
@@ -3620,14 +3685,33 @@ function mstep!(
     dyn_of(k) = _slds_ordinary_weights(dl, fb_storage, seq_ends, k, 1:ntrials)
 
     #=
-    Entry priors: the exact update of each entered state's prior, from the
-    current posterior, before the structural step (which does not read it).
-    The same pass collects the entries' plant-row statistics, which the
-    structural step's acceptance test below needs.
+    Entry priors, before the structural step (which does not read them): the
+    exact weighted regression under the joint objective; under conditioning a
+    proposal judged against `log Ẑ`, which leaves the probe smoothed at whatever
+    it tried last. `entry_Q` is the entries' whole objective at the parameters
+    the model holds when it is called — what the structural step's acceptance
+    adds, since the entries share its parameters without being in its statistics.
     =#
-    entry_stats = if _has_entries(dl)
-        _slds_update_entry_priors!(
-            slds.boundaries, _ -> slds, tfs, dat, dl, seq_ends, [1:ntrials]
+    entry_Q = if _has_entries(dl)
+        groups = [1:ntrials]
+        b = slds.boundaries::SLDSBoundaries{T}
+        if probe === nothing
+            _slds_update_entry_priors!(b, _ -> slds, tfs, dat, dl, seq_ends, groups)
+        else
+            _slds_conditional_entry_update!(
+                b, _ -> slds, tfs, dat, dl, seq_ends, groups, [probe], [slds]
+            )
+            probe_current = false
+        end
+        _slds_entry_objective(
+            b,
+            _ -> slds,
+            (j, _) -> slds.LDSs[j].state_model,
+            tfs,
+            dat,
+            dl,
+            seq_ends,
+            groups,
         )
     else
         nothing
@@ -3712,7 +3796,10 @@ function mstep!(
         _slqr_probe_estep!(probe)
     end
 
-    _slds_entry_guarded(slds.LDSs, sf_state, entry_stats, k -> (k, 1)) do
+    #= Under conditioning the entries join the conditional step's own acceptance
+    score, which also carries `log Ẑ`; under the joint objective they guard it. =#
+    conditional_step = terminal_probe !== nothing
+    _slds_entry_guarded(slds.LDSs, sf_state, conditional_step ? nothing : entry_Q) do
         _slds_state_mstep!(
             slds.LDSs,
             sf_state,
@@ -3724,6 +3811,7 @@ function mstep!(
             D,
             lds1.ux_dim;
             terminal_probe=terminal_probe,
+            entry_score=conditional_step ? entry_Q : nothing,
         )
     end
 
@@ -5235,14 +5323,33 @@ function _mstep_grouped!(
     dyn_for(k, trials) = _slds_ordinary_weights(dl, fb_storage, seq_ends, k, trials)
     #= Entry priors: one prior per state, pooled over every cell; the plant-row
     statistics per cell, since a cell may carry its own structure. =#
-    entry_stats = if _has_entries(dl)
+    entry_Q = if _has_entries(dl)
         cell_of = zeros(Int, length(seq_ends))
         for c in 1:ncells, n2 in grp.cell_trials[c]
             cell_of[n2] = c
         end
-        _slds_update_entry_priors!(
-            cell_slds[1].boundaries,
-            trial -> cell_slds[cell_of[trial]],
+        b = cell_slds[1].boundaries::SLDSBoundaries{T}
+        slds_of = trial -> cell_slds[cell_of[trial]]
+        if probes === nothing
+            _slds_update_entry_priors!(b, slds_of, tfs, data, dl, seq_ends, grp.cell_trials)
+        else
+            _slds_conditional_entry_update!(
+                b,
+                slds_of,
+                tfs,
+                data,
+                dl,
+                seq_ends,
+                grp.cell_trials,
+                probes::AbstractVector,
+                sources::AbstractVector,
+            )
+            probe_current = false
+        end
+        _slds_entry_objective(
+            b,
+            slds_of,
+            (j, c) -> cell_slds[c].LDSs[j].state_model,
             tfs,
             data,
             dl,
@@ -5326,12 +5433,11 @@ function _mstep_grouped!(
             tied,
             probes::AbstractVector,
             sources::AbstractVector,
-            probe_current,
+            probe_current;
+            entry_score=entry_Q,
         )
     else
-        #= Unit `u = (k - 1)·ncells + c`; its entry plant-row statistics are
-        cell `c`'s for state `k`. =#
-        _slds_entry_guarded(unit_lds, unit_suf, entry_stats, u -> fldmod1(u, ncells)) do
+        _slds_entry_guarded(unit_lds, unit_suf, entry_Q) do
             _grouped_slds_state_mstep!(
                 lds1.state_model,
                 unit_lds,

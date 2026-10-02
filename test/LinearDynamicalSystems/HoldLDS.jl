@@ -542,12 +542,14 @@ function test_hold_slds()
     @test sum(1 .- hold_share[1:t1]) / t1 > 0.35
     @test sum(hold_share[(t1 + 2):end]) / (t2 - 1) > 0.75
 
-    # A terminal factor on the control state is fine unconditioned...
+    # A terminal factor on the control state is fine unconditioned, and conditioned:
+    # the probe that normalizes the score switches into the hold state too.
     @test validate_SLDS(hold_slds(; terminal=true)) === nothing
-    # ...but terminal conditioning is not implemented with a hold state, and says so.
     cond = hold_slds(; terminal=true, condition_terminal=true)
-    @test_throws ArgumentError validate_SLDS(cond)
-    @test_throws ArgumentError fit!(cond, ys; max_iter=2, progress=false, rng=StableRNG(7))
+    @test validate_SLDS(cond) === nothing
+    trace = fit!(cond, ys; max_iter=2, progress=false, rng=StableRNG(7))
+    @test all(isfinite, trace isa Tuple ? trace[1] : trace)
+    @test isfinite(terminal_logz(cond, ys))
     return nothing
 end
 

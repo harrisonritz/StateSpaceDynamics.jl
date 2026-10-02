@@ -318,6 +318,7 @@ function _slds_state_mstep!(
     ::Int,
     ::Int;
     terminal_probe=nothing,
+    entry_score=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sms = [lds.state_model for lds in ldss]
 
@@ -332,13 +333,6 @@ function _slds_state_mstep!(
     the wrong problem. The caller skips it when a probe is supplied.
     =#
     if terminal_probe !== nothing
-        any(_is_hold, sms) && throw(
-            ArgumentError(
-                "terminal conditioning is not implemented for a switching model with a " *
-                "`:hold` discrete state; set `condition_terminal=false` on the " *
-                "inverse-LQR states.",
-            ),
-        )
         any(_is_free, sms) && throw(
             ArgumentError(
                 "terminal conditioning is not implemented for a switching model that " *
@@ -353,7 +347,8 @@ function _slds_state_mstep!(
             sf_state,
             [ones(Int, K), ones(Int, K), collect(1:K), qslots],
             _lqr_block_slots(tied, K),
-            _SLQRNormalizer(terminal_probe),
+            _SLQRNormalizer(terminal_probe);
+            score_extra=entry_score,
         )
         foreach(refresh!, sms)
         return collect(1:K)

@@ -651,7 +651,7 @@ using SSDTest
         end
 
         include("LinearDynamicalSystems/SLDSBoundaries.jl")
-        @testset "SLDS boundaries (exit bridges, entry priors)" begin
+        @testset "SLDS boundaries (exit bridges, entry priors, conditioning)" begin
             test_bridge_forward_backward_exact()
             test_bridge_smoother_derivatives()
             test_bridge_aggregate_stats()
@@ -665,6 +665,15 @@ using SSDTest
             test_entry_validation()
             test_entry_fit()
             test_entry_with_hold()
+            test_conditional_probe_boundaries()
+            test_entry_stats_trial_weight()
+            test_conditional_entry_update_monotone()
+            test_conditional_boundaries_fit()
+            test_rand_entry_draw()
+            test_btd_cholesky_sampler()
+            test_rand_path_given_states()
+            test_rand_conditional_exact()
+            test_rand_boundary_defaults()
         end
 
         include("LinearDynamicalSystems/Stitching.jl")

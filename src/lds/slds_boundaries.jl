@@ -52,12 +52,18 @@ transition statistics; and their plant row — which shares `j`'s structure — 
 honoured by accepting the structural step only if it does not lower the
 complete-data objective with that row included (a generalized M-step).
 
-Generative semantics. With bridges the model is the joint over the chain, the
-latents and the bridge pseudo-observations, as the terminal factor is under
-`condition_terminal = false`; the reported score is `log p(y, bridges = 0)`.
-Conditioning on the bridges (dividing by their probability) needs a normalizer
-over the switching paths and is not implemented yet, so a model with bridges or
-entry priors must score the joint objective.
+Generative semantics. A bridge is a terminal pseudo-observation like the
+end-of-trial factor, "the goal is reached here", applied at every exit. Under
+`condition_terminal = false` the model is the joint over the chain, the latents
+and those pseudo-observations, and the reported score is `log p(y, goals = 0)`.
+Under `condition_terminal = true` the score is `log p(y | goals = 0)`: the joint
+less `log p(goals = 0 | θ)`, estimated by the terminal probe (an E-step on an
+observation-free copy of the model), which carries the bridges and the entry
+priors like the data side does. Every exit and the trial end are conditioned on,
+so the probe's normalizer depends on the switching times, and the chain is
+fitted against it (see `_slqr_chain_mstep!`). An entry prior is part of the prior
+the normalizer integrates over, so under conditioning its update is a proposal
+judged against the normalizer as well (`_slds_conditional_entry_update!`).
 =============================================================================#
 
 """
@@ -84,9 +90,10 @@ Configure what happens at the switches between `slds`'s discrete states.
   `K = 0`, `P = entry_cov · I` and is fitted by EM; `entry_gain = false` keeps
   `K` at zero, so only the costate's mean offset and spread are learned.
 
-Bridges and entry priors score the joint objective `log p(y, bridges = 0)`, so
-the model may not condition on its terminal factor (`condition_terminal = false`
-on every inverse-LQR state that has one).
+Either objective works: with `condition_terminal = false` the score is the joint
+`log p(y, goals = 0)`, and with `condition_terminal = true` (on every inverse-LQR
+state with a terminal factor) it is `log p(y | goals = 0)`, the goals being every
+exit's bridge and the trial's end.
 
 Passing no states clears the configuration. Returns `slds`.
 
@@ -153,8 +160,8 @@ _slds_has_bridges(slds::SLDS) = slds.boundaries !== nothing && any(slds.boundari
     _validate_boundaries(slds)
 
 Refuse a boundary configuration the model cannot honour: a bridge on a state
-with no terminal factor to apply, on a non-LQR or `:free` state, or under the
-conditional objective (whose normalizer does not yet carry bridges).
+with no terminal factor to apply, or on a non-LQR, `:free` or `:hold` state, and
+an entry prior on anything but a control state.
 """
 function _validate_boundaries(slds::SLDS)
     b = slds.boundaries
@@ -197,13 +204,6 @@ function _validate_boundaries(slds::SLDS)
             ArgumentError("the entry prior of state $k has a non-positive-definite P")
         )
     end
-    _slds_condition_terminal(slds) && throw(
-        ArgumentError(
-            "exit bridges and entry priors score the joint objective `log p(y, " *
-            "bridges = 0)`, but this model conditions on its terminal factor. Set " *
-            "`condition_terminal = false` on its inverse-LQR states.",
-        ),
-    )
     return nothing
 end
 
@@ -868,6 +868,7 @@ function _entry_stats(
     entry_w::AbstractArray{T,3},
     seq_ends::AbstractVector{Int};
     trials=eachindex(seq_ends),
+    trial_weight::Union{Nothing,AbstractVector}=nothing,
 ) where {T<:Real}
     slds1 = slds_of(first(trials))
     K = length(slds1.LDSs)
@@ -888,11 +889,13 @@ function _entry_stats(
         x = fs.x_smooth
         ux = data.ux[trial]
         slds_t = slds_of(trial)
+        # A design standing for several trials (the terminal probe) counts for each.
+        scale = trial_weight === nothing ? one(T) : T(trial_weight[trial])
         for t in 2:(t2 - t1 + 1)
             g = t1 + t - 1
             wtot = zero(T)
             for i in 1:K
-                i == j || (wtot += entry_w[i, j, g])
+                i == j || (wtot += scale * entry_w[i, j, g])
             end
             iszero(wtot) && continue
             # Means and covariance of ω under q.
@@ -927,7 +930,7 @@ function _entry_stats(
             # The prior's regression, per source (its reference differs).
             for i in 1:K
                 i == j && continue
-                w = entry_w[i, j, g]
+                w = scale * entry_w[i, j, g]
                 iszero(w) && continue
                 _state_reference!(
                     rref, slds_t.LDSs[i].state_model, m > 0 ? view(ux, :, t - 1) : nothing
@@ -1099,15 +1102,32 @@ function _slds_ordinary_weights(
 end
 
 """
-    _slds_update_entry_priors!(boundaries, slds_of, tfs, data, dl, seq_ends, groups)
+    _pooled_entry_stats(per_group) -> _EntryStats
+
+The entry prior's statistics pooled over trial groups (the prior is one per
+state, whatever the groups' structure). The plant-row blocks are left as the
+first group's: they are per group, and read per group.
+"""
+function _pooled_entry_stats(per_group::AbstractVector{<:_EntryStats})
+    length(per_group) == 1 && return per_group[1]
+    pooled = deepcopy(per_group[1])
+    for st in per_group[2:end]
+        pooled.Sψψ .+= st.Sψψ
+        pooled.Sλψ .+= st.Sλψ
+        pooled.Sλλ .+= st.Sλλ
+        pooled.N[] += st.N[]
+    end
+    return pooled
+end
+
+"""
+    _slds_entry_group_stats(b, slds_of, tfs, data, dl, seq_ends, groups)
         -> Vector{Union{Nothing,Vector{_EntryStats}}}
 
-Collect every entry-prior state's statistics per trial group (one group
-ungrouped, one per cell under `depends_on`), update each state's prior from the
-groups pooled — the prior is one per state — and return the per-group statistics
-for the structural step's acceptance test.
+Every entry-prior state's statistics per trial group (one group ungrouped, one
+per cell under `depends_on`), at the references the model holds now.
 """
-function _slds_update_entry_priors!(
+function _slds_entry_group_stats(
     b::SLDSBoundaries{T},
     slds_of,
     tfs::TrialFilterSmooth{T},
@@ -1119,64 +1139,260 @@ function _slds_update_entry_priors!(
     K = length(b.entry)
     out = Vector{Union{Nothing,Vector{_EntryStats{T}}}}(nothing, K)
     for j in 1:K
-        ep = b.entry[j]
-        ep === nothing && continue
-        per_group = [
+        b.entry[j] === nothing && continue
+        out[j] = [
             _entry_stats(slds_of, j, tfs, data, dl.entry_w, seq_ends; trials=g) for
             g in groups
         ]
-        pooled = per_group[1]
-        if length(per_group) > 1
-            pooled = deepcopy(per_group[1])
-            for st in per_group[2:end]
-                pooled.Sψψ .+= st.Sψψ
-                pooled.Sλψ .+= st.Sλψ
-                pooled.Sλλ .+= st.Sλλ
-                pooled.N[] += st.N[]
-            end
-        end
-        _update_entry_prior!(ep, pooled)
-        out[j] = per_group
     end
     return out
 end
 
 """
-    _slds_entry_guarded(step!, ldss, sufs, entry_stats, unit_key)
+    _slds_update_entry_priors!(boundaries, slds_of, tfs, data, dl, seq_ends, groups)
+
+The joint objective's entry-prior update: each state's exact weighted
+regression ([`_update_entry_prior!`](@ref)) on its statistics pooled over the
+trial groups.
+"""
+function _slds_update_entry_priors!(
+    b::SLDSBoundaries{T},
+    slds_of,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    dl::SLDSDiscreteLayer{T},
+    seq_ends::AbstractVector{Int},
+    groups,
+) where {T<:Real}
+    stats = _slds_entry_group_stats(b, slds_of, tfs, data, dl, seq_ends, groups)
+    for (ep, per_group) in zip(b.entry, stats)
+        per_group === nothing && continue
+        _update_entry_prior!(ep, _pooled_entry_stats(per_group))
+    end
+    return nothing
+end
+
+"""
+    _entry_lambda_Q(ep, st) -> T
+
+The entry prior's own expected log-density over the entries `st` pools:
+`−½[N (n log 2π + log det P) + tr(P⁻¹ R)]`, `R` the residual scatter of
+`λ_t ≈ [μ K] [1; x_{t−1} − r]`.
+"""
+function _entry_lambda_Q(ep::EntryPrior{T}, st::_EntryStats{T}) where {T<:Real}
+    N = st.N[]
+    iszero(N) && return zero(T)
+    n = length(ep.μ)
+    R = _entry_residual_scatter(hcat(ep.μ, ep.K), st.Sψψ, st.Sλψ, st.Sλλ)
+    Pc = cholesky(Symmetric(Matrix{T}(ep.P)); check=false)
+    issuccess(Pc) || return -T(Inf)
+    return -T(0.5) * (N * (T(n) * log(T(2π)) + logdet(Pc)) + tr(Pc \ R))
+end
+
+function _entry_residual_scatter(Θ, Sψψ, Sλψ, Sλλ)
+    return Sλλ .- Θ * transpose(Sλψ) .- Sλψ * transpose(Θ) .+ Θ * Sψψ * transpose(Θ)
+end
+
+"""
+    _slds_entry_objective(b, slds_of, sm_of, tfs, data, dl, seq_ends, groups) -> Function
+
+A closure returning the entries' whole expected complete-data log-density at the
+parameters the model holds *when it is called*: each entry prior's own row (whose
+regressor `x_{t−1} − r⁽ⁱ⁾` moves with the left state's `Gref`) and the plant row
+of the entered state (`sm_of(j, g)`, group `g`'s version of state `j`), both
+recomputed from the current posterior. The structural step does not see these
+terms, so its acceptance adds them: the joint objective's guard
+([`_slds_entry_guarded`](@ref)) and the conditional one's score
+(`_lqr_conditional_problem`'s `score_extra`).
+"""
+function _slds_entry_objective(
+    b::SLDSBoundaries{T}, slds_of, sm_of, tfs, data, dl, seq_ends, groups
+) where {T<:Real}
+    return function ()
+        stats = _slds_entry_group_stats(b, slds_of, tfs, data, dl, seq_ends, groups)
+        total = zero(T)
+        for (j, per_group) in enumerate(stats)
+            per_group === nothing && continue
+            total += _entry_lambda_Q(b.entry[j], _pooled_entry_stats(per_group))
+            for (g, st) in enumerate(per_group)
+                total += _entry_plant_Q(sm_of(j, g), st)
+            end
+        end
+        return total
+    end
+end
+
+"""
+    _slds_entry_guarded(step!, ldss, sufs, entry_Q)
 
 Run the structural/noise step `step!` and keep its result only if the units'
 complete-data objective — their transitions and terminal factors (what `step!`
-improves) plus the entries' plant row (which shares their structure but which
-`step!` does not see) — did not go down. Otherwise every unit is restored to
-its incoming parameters, which is a legitimate generalized M-step: the bound
-cannot decrease either way. `unit_key(u)` names unit `u`'s `(state, group)` in
-`entry_stats`. A model without entry priors runs `step!` unguarded.
+improves) plus the entries' terms `entry_Q()` (which share their structure but
+which `step!` does not see; see [`_slds_entry_objective`](@ref)) — did not go
+down. Otherwise every unit is restored to its incoming parameters, which is a
+legitimate generalized M-step: the bound cannot decrease either way. A model
+without entry priors (`entry_Q === nothing`) runs `step!` unguarded.
 """
-function _slds_entry_guarded(step!, ldss, sufs, entry_stats, unit_key)
-    entry_stats === nothing && return step!()
-    q0 = _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+function _slds_entry_guarded(step!, ldss, sufs, entry_Q)
+    entry_Q === nothing && return step!()
+    q0 = _slds_units_Q(ldss, sufs) + entry_Q()
     snaps = [_lqr_struct_snapshot(l.state_model) for l in ldss]
     result = step!()
-    q1 = _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+    q1 = _slds_units_Q(ldss, sufs) + entry_Q()
     tol = sqrt(eps(typeof(q0))) * max(one(q0), abs(q0))
     if !(q1 >= q0 - tol)
         for (l, snap) in zip(ldss, snaps)
             _lqr_struct_restore!(l.state_model, snap)
         end
-        @debug "structural step lowered the objective once entries' plant row counted; kept the incoming parameters" q0 q1
+        @debug "structural step lowered the objective once the entries counted; kept the incoming parameters" q0 q1
     end
     return result
 end
 
-function _slds_units_Q(ldss, sufs, entry_stats, unit_key)
+function _slds_units_Q(ldss, sufs)
     T = eltype(first(sufs).nk)
     total = zero(T)
     for (u, l) in enumerate(ldss)
-        sm = l.state_model
-        total += _state_transition_Q(sm, sufs[u])
-        j, g = unit_key(u)
-        st = entry_stats[j]
-        st === nothing || (total += _entry_plant_Q(sm, st[g]))
+        total += _state_transition_Q(l.state_model, sufs[u])
     end
     return total
+end
+
+"""
+    _slds_conditional_entry_update!(b, slds_of, tfs, data, dl, seq_ends, groups,
+                                    probes, sources; max_halvings=12) -> Bool
+
+The entry priors' update when the model conditions on its goals. The score is
+`ELBO(y, goals = 0) − log Ẑ`, and an entry prior is part of the prior `log Ẑ`
+integrates over, so with `q` fixed its part of the score is
+
+    G(μ, K, P) = Σⱼ E_q[log N(λ; μ_j + K_j ψ, P_j)] − log Ẑ(μ, K, P),
+
+`log Ẑ` from probes restarted as fresh ones would be. As for the chain
+([`_slqr_chain_mstep!`](@ref)), holding the probe's posterior fixed would leave a
+difference of two regressions that need not be bounded, so there is no
+closed-form step. Two proposals instead, each kept only if `G` rises:
+
+1. The joint objective's weighted regression, which maximizes the data half.
+2. Otherwise an ascent step along the gradient of `G` at the probe's stationary
+   posterior (Danskin): the data's entry statistics less the probe's, mapped
+   through the regression's own metric (`ΔΘ = ΔSλψ − Θ ΔSψψ`, `ΔP = ΔR − ΔN P`,
+   both ascent directions since `P ≻ 0`), halved until `G` rises by an Armijo
+   fraction of what the gradient promises and `P` stays positive definite.
+
+If neither improves `G` the priors stay put. Returns whether they moved; either
+way the probes are left smoothed at some proposal, not necessarily the kept one,
+so the caller re-smooths them before reusing them.
+"""
+function _slds_conditional_entry_update!(
+    b::SLDSBoundaries{T},
+    slds_of,
+    tfs::TrialFilterSmooth{T},
+    data::Data{T},
+    dl::SLDSDiscreteLayer{T},
+    seq_ends::AbstractVector{Int},
+    groups,
+    probes::AbstractVector,
+    sources::AbstractVector;
+    max_halvings::Int=12,
+) where {T<:Real}
+    states = [j for j in eachindex(b.entry) if b.entry[j] !== nothing]
+    isempty(states) && return false
+    stats = _slds_entry_group_stats(b, slds_of, tfs, data, dl, seq_ends, groups)
+    data_st = Dict(j => _pooled_entry_stats(stats[j]) for j in states)
+    saved = Dict(j => deepcopy(b.entry[j]) for j in states)
+    function restore!()
+        for j in states
+            ep, s0 = b.entry[j], saved[j]
+            ep.μ .= s0.μ
+            ep.K .= s0.K
+            ep.P .= s0.P
+        end
+    end
+    function score()
+        data_part = sum(_entry_lambda_Q(b.entry[j], data_st[j]) for j in states)
+        isfinite(data_part) || return -T(Inf)
+        logz = try
+            _slqr_probes_logz!(probes, sources)
+        catch err
+            _lqr_rejectable(err) || rethrow()
+            return -T(Inf)
+        end
+        return data_part - logz
+    end
+
+    base = score()
+    isfinite(base) || return false
+    #= The probes are now smoothed at the incoming priors: their entry statistics,
+    each design weighted by its trial count, are the gradient's other half. =#
+    probe_st = Dict{Int,_EntryStats{T}}()
+    for j in states
+        parts = [
+            _entry_stats(
+                _ -> probe.slds,
+                j,
+                probe.tfs,
+                probe.data,
+                probe.dl.entry_w,
+                probe.seq_ends;
+                trial_weight=probe.counts,
+            ) for probe in probes
+        ]
+        probe_st[j] = _pooled_entry_stats(parts)
+    end
+
+    for j in states
+        _update_entry_prior!(b.entry[j], data_st[j])
+    end
+    gain = score() - base
+    if isfinite(gain) && gain >= 0
+        @debug "terminal-conditioned entry step" proposal = :regression gain
+        return true
+    end
+    restore!()
+
+    directions = Dict{Int,Tuple{Matrix{T},Matrix{T}}}()
+    slope = zero(T)
+    for j in states
+        ep, dst, pst = b.entry[j], data_st[j], probe_st[j]
+        Θ = hcat(ep.μ, ep.K)
+        ΔSψψ, ΔSλψ, ΔSλλ = dst.Sψψ - pst.Sψψ, dst.Sλψ - pst.Sλψ, dst.Sλλ - pst.Sλλ
+        ΔN = dst.N[] - pst.N[]
+        dΘ = ΔSλψ .- Θ * ΔSψψ
+        ep.fit_gain || (dΘ[:, 2:end] .= zero(T))
+        R = _entry_residual_scatter(Θ, ΔSψψ, ΔSλψ, ΔSλλ)
+        dP = (R .+ transpose(R)) ./ 2 .- ΔN .* ep.P
+        scale = one(T) / max(dst.N[], sqrt(eps(T)))
+        dΘ .*= scale
+        dP .*= scale
+        Pinv = inv(cholesky(Symmetric(Matrix{T}(ep.P))))
+        slope += dot(Pinv * dΘ, dΘ) / scale + T(0.5) * dot(Pinv * dP * Pinv, dP) / scale
+        directions[j] = (dΘ, dP)
+    end
+    if isfinite(slope) && slope > zero(T)
+        step = one(T)
+        for _ in 0:max_halvings
+            feasible = true
+            for j in states
+                ep, s0 = b.entry[j], saved[j]
+                dΘ, dP = directions[j]
+                ep.μ .= s0.μ .+ step .* dΘ[:, 1]
+                ep.K .= s0.K .+ step .* dΘ[:, 2:end]
+                P = s0.P .+ step .* dP
+                ep.P .= (P .+ transpose(P)) ./ 2
+                feasible &= isposdef(Symmetric(Matrix{T}(ep.P)))
+            end
+            if feasible
+                gain = score() - base
+                if isfinite(gain) && gain >= T(1e-4) * step * slope
+                    @debug "terminal-conditioned entry step" proposal = :gradient step gain
+                    return true
+                end
+            end
+            step /= 2
+        end
+    end
+    restore!()
+    @debug "terminal-conditioned entry step rejected" base
+    return false
 end

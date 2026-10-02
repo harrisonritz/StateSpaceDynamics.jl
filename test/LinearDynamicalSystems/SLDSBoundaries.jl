@@ -226,10 +226,24 @@ function test_bridge_validation()
     bad.boundaries = nothing
     bad.LDSs[1].state_model.terminal = false
     @test_throws ArgumentError set_boundaries!(bad; bridge_states=[1])
-    # The conditional objective's normalizer does not carry bridges yet.
+    # Bridges work under conditioning, when every terminal state agrees on it.
     cond = deepcopy(slds)
-    cond.LDSs[1].state_model.condition_terminal = true
-    @test_throws ArgumentError validate_SLDS(cond)
+    for lds in cond.LDSs
+        sm = lds.state_model
+        sm isa LQRStateModel && sm.terminal && (sm.condition_terminal = true)
+    end
+    @test validate_SLDS(cond) === nothing
+    mixed = deepcopy(cond)
+    last_terminal = findlast(
+        lds -> lds.state_model isa LQRStateModel && lds.state_model.terminal, mixed.LDSs
+    )
+    first_terminal = findfirst(
+        lds -> lds.state_model isa LQRStateModel && lds.state_model.terminal, mixed.LDSs
+    )
+    if last_terminal != first_terminal
+        mixed.LDSs[last_terminal].state_model.condition_terminal = false
+        @test_throws ArgumentError validate_SLDS(mixed)
+    end
     # Clearing.
     cleared = set_boundaries!(deepcopy(slds); bridge_states=Int[])
     @test cleared.boundaries === nothing
@@ -319,11 +333,18 @@ end
 
 """A banded control → free → control model whose last state has an entry prior
 (and both control states bridges)."""
-function _entry_model(; p::Int=4, n::Int=2, stays=[0.85, 0.85], middle::Symbol=:free)
+function _entry_model(;
+    p::Int=4,
+    n::Int=2,
+    stays=[0.85, 0.85],
+    middle::Symbol=:free,
+    entries::Bool=true,
+    condition::Bool=false,
+)
     c1 = hslds_state([0.4 0.05; 0.05 0.3]; p=p, terminal=true)
-    c1.state_model.condition_terminal = false
+    c1.state_model.condition_terminal = condition
     c3 = hslds_state([0.6 0.0; 0.0 0.5]; p=p, terminal=true, seed=11)
-    c3.state_model.condition_terminal = false
+    c3.state_model.condition_terminal = condition
     d = 2n
     middle_sm = if middle === :hold
         # Control → hold → control: the hold state shares the plant.
@@ -342,7 +363,9 @@ function _entry_model(; p::Int=4, n::Int=2, stays=[0.85, 0.85], middle::Symbol=:
     mid.state_model.observe_costate = false
     A, πₖ = banded_transition(3; stay=stays)
     slds = SLDS(; A=A, πₖ=πₖ, LDSs=[c1, mid, c3])
-    set_boundaries!(slds; bridge_states=[1, 3], entry_states=[3], entry_cov=0.5)
+    set_boundaries!(
+        slds; bridge_states=[1, 3], entry_states=entries ? [3] : Int[], entry_cov=0.5
+    )
     return slds
 end
 
@@ -522,25 +545,40 @@ function test_entry_guard_restores()
     seq_ends = cumsum(fill(T, 3))
     entry_w = zeros(3, 3, last(seq_ends))
     entry_w[1, 3, 3] = entry_w[1, 3, T + 3] = 1.0
-    st = [_SB._entry_stats(_ -> slds, 3, tfs, data, entry_w, seq_ends)]
+    dl = _SB._slds_discrete_layer(slds, last(seq_ends))
+    dl.entry_w .= entry_w
+    entry_Q = _SB._slds_entry_objective(
+        slds.boundaries,
+        _ -> slds,
+        (j, _) -> slds.LDSs[j].state_model,
+        tfs,
+        data,
+        dl,
+        seq_ends,
+        [1:3],
+    )
+    # The objective is the prior's row plus the entered state's plant row.
+    st = _SB._entry_stats(_ -> slds, 3, tfs, data, entry_w, seq_ends)
+    ep = slds.boundaries.entry[3]
+    @test entry_Q() ≈ _SB._entry_lambda_Q(ep, st) + _SB._entry_plant_Q(sm, st)
+    @test st.N[] ≈ 2
     hs = _SB._initialize_td_sufficient_statistics(Float64, lds, fill(T, 3))
     _SB._aggregate_lqr_stats_weighted!(hs, tfs, lds, data, [ones(T) for _ in 1:3])
-    stats = Union{Nothing,Vector{eltype(st)}}[nothing, nothing, st]
     A0 = copy(sm.A)
 
     # A step that wrecks the plant is undone.
-    _SB._slds_entry_guarded([lds], [hs], stats, u -> (3, 1)) do
+    _SB._slds_entry_guarded([lds], [hs], entry_Q) do
         sm.A .*= 3.0
         refresh!(sm)
     end
     @test sm.A == A0
     # A step that changes nothing is kept (trivially).
-    _SB._slds_entry_guarded([lds], [hs], stats, u -> (3, 1)) do
+    _SB._slds_entry_guarded([lds], [hs], entry_Q) do
         nothing
     end
     @test sm.A == A0
-    # Without entry statistics the step runs unguarded.
-    _SB._slds_entry_guarded([lds], [hs], nothing, u -> (3, 1)) do
+    # Without entry priors the step runs unguarded.
+    _SB._slds_entry_guarded([lds], [hs], nothing) do
         sm.A .*= 1.01
         refresh!(sm)
     end
@@ -559,10 +597,11 @@ function test_entry_validation()
     @test_throws ArgumentError set_boundaries!(
         deepcopy(slds); entry_states=[3], entry_cov=0.0
     )
+    # Entry priors work under conditioning too.
     cond = deepcopy(slds)
     cond.LDSs[1].state_model.condition_terminal = true
     cond.LDSs[3].state_model.condition_terminal = true
-    @test_throws ArgumentError validate_SLDS(cond)
+    @test validate_SLDS(cond) === nothing
     return nothing
 end
 
@@ -633,5 +672,390 @@ function test_entry_with_hold()
     @test hold.S ≈ slds.LDSs[3].state_model.S
     @test maximum(abs, eigvals(closed_loop_dynamics(hold))) < 1
     @test isposdef(Symmetric(slds.boundaries.entry[3].P))
+    return nothing
+end
+
+"""
+The terminal probe of a conditioned model carries its boundaries: it shares the
+live `boundaries` (so an entry prior the M-step moves is the one it normalizes
+under), its discrete layer carries the bridge and entry potentials, and its
+bridged states' terminal moments count every exit, each design weighted by its
+trials. More goals to reach makes them less probable: the bridged normalizer is
+below the plain one.
+"""
+function test_conditional_probe_boundaries()
+    p, tsteps, ntrials = 4, 12, 3
+    slds = _entry_model(; p=p, middle=:hold, condition=true)
+    ux = [zeros(0, tsteps) for _ in 1:ntrials]
+    probe = _SB._slqr_terminal_probe(slds, ux)
+    @test probe.slds.boundaries === slds.boundaries
+    @test probe.dl.bridge == [true, false, true]
+    @test probe.dl.entry == [false, false, true]
+    _SB._slqr_probe_estep!(probe)
+    @test isfinite(probe.logz)
+    @test probe.counts == [3.0]          # one design standing for three trials
+    # Bridged terminal moments: the trial end (γ at T) plus every exit.
+    γT = probe.fb.γ[1, tsteps]
+    exits = sum(probe.dl.exit_w[1, 1:tsteps])
+    @test sum(probe.sufs[1].term_n) ≈ 3 * (γT + exits) rtol = 1e-10
+    @test exits > 0
+
+    plain = deepcopy(slds)
+    set_boundaries!(plain)
+    @test terminal_logz(slds, [zeros(p, tsteps) for _ in 1:ntrials]) < terminal_logz(plain, [zeros(p, tsteps) for _ in 1:ntrials])
+    return nothing
+end
+
+"""
+Entry statistics weight each trial by `trial_weight` exactly as if the trial were
+repeated, which is how the probe's designs stand for their trials.
+"""
+function test_entry_stats_trial_weight()
+    rng = StableRNG(71)
+    slds = _entry_model()
+    lds = slds.LDSs[3]
+    T = 6
+    ys = [zeros(4, T) for _ in 1:2]
+    data = _SB.Data(lds, ys)
+    tfs = _SB.initialize_FilterSmooth(lds, fill(T, 2))
+    for i in 1:2
+        tfs[i].x_smooth .= 0.3 .* randn(rng, 4, T)
+    end
+    seq_ends = cumsum(fill(T, 2))
+    entry_w = zeros(3, 3, last(seq_ends))
+    entry_w[1, 3, 3] = 0.7
+    entry_w[2, 3, T + 4] = 0.4
+    weighted = _SB._entry_stats(
+        _ -> slds, 3, tfs, data, entry_w, seq_ends; trial_weight=[3.0, 2.0]
+    )
+    # The same trials repeated 3 and 2 times.
+    rep = [1, 1, 1, 2, 2]
+    data_r = _SB.Data(lds, ys[rep])
+    tfs_r = _SB.TrialFilterSmooth([deepcopy(tfs[i]) for i in rep])
+    seq_r = cumsum(fill(T, 5))
+    w_r = zeros(3, 3, last(seq_r))
+    for (n, i) in enumerate(rep)
+        w_r[:, :, (seq_r[n] - T + 1):seq_r[n]] .= entry_w[
+            :, :, (seq_ends[i] - T + 1):seq_ends[i]
+        ]
+    end
+    repeated = _SB._entry_stats(_ -> slds, 3, tfs_r, data_r, w_r, seq_r)
+    for f in (:Sψψ, :Sλψ, :Sλλ, :Zx, :Xx, :Yx)
+        @test getfield(weighted, f) ≈ getfield(repeated, f)
+    end
+    @test weighted.N[] ≈ repeated.N[]
+    return nothing
+end
+
+"""
+Under conditioning the entry update is judged against `log Ẑ`: whatever it
+returns, the score `Σ E_q[log entry] − log Ẑ` (from a freshly smoothed probe) is
+no lower than where it started, and the priors move only when it says they did.
+"""
+function test_conditional_entry_update_monotone()
+    rng = StableRNG(73)
+    slds = _entry_model(; condition=true)
+    lds = slds.LDSs[3]
+    n, d, T = 2, 4, 8
+    ys = [zeros(4, T) for _ in 1:4]
+    data = _SB.Data(lds, ys)
+    tfs = _SB.initialize_FilterSmooth(lds, fill(T, 4))
+    for i in 1:4
+        tfs[i].x_smooth .= 0.4 .* randn(rng, d, T)
+        for t in 1:T
+            tfs[i].p_smooth[:, :, t] .= 0.02I(d)
+        end
+    end
+    seq_ends = cumsum(fill(T, 4))
+    dl = _SB._slds_discrete_layer(slds, last(seq_ends))
+    for i in 1:4
+        dl.entry_w[1, 3, seq_ends[i] - T + 4] = 0.8
+        dl.entry_w[2, 3, seq_ends[i] - T + 5] = 0.2
+    end
+    probes, sources, _ = _SB._slqr_terminal_probes(
+        slds, [zeros(0, T) for _ in 1:4], nothing
+    )
+    b = slds.boundaries
+    stats = _SB._slds_entry_group_stats(b, _ -> slds, tfs, data, dl, seq_ends, [1:4])
+    st = _SB._pooled_entry_stats(stats[3])
+    G() = _SB._entry_lambda_Q(b.entry[3], st) - _SB._slqr_probes_logz!(probes, sources)
+    before = G()
+    ep0 = deepcopy(b.entry[3])
+    moved = _SB._slds_conditional_entry_update!(
+        b, _ -> slds, tfs, data, dl, seq_ends, [1:4], probes, sources
+    )
+    after = G()
+    @test isfinite(before) && isfinite(after)
+    @test after >= before - 1e-8 * abs(before)
+    changed = b.entry[3].μ != ep0.μ || b.entry[3].K != ep0.K || b.entry[3].P != ep0.P
+    @test moved == changed
+    @test isposdef(Symmetric(b.entry[3].P))
+    return nothing
+end
+
+"""
+End to end under conditioning: control (bridged) → hold → control (bridged,
+entry prior) fits on the conditional score `log p(y | goals = 0)`, improves it,
+keeps the band, and fits the entry prior and the hold state.
+"""
+function test_conditional_boundaries_fit()
+    p, tsteps, ntrials = 4, 36, 6
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = _entry_model(; p=p, middle=:hold, condition=true)
+    @test _SB._slds_condition_terminal(slds)
+    before = elbo(slds, ys)
+    trace = _trace(
+        fit!(slds, ys; max_iter=4, progress=false, rng=StableRNG(5), tied_params=[:A, :S])
+    )
+    after = elbo(slds, ys)
+    @test all(isfinite, trace)
+    @test after > before
+    @test slds.A[2, 1] == 0 && slds.A[3, 1] == 0 && slds.A[3, 2] == 0
+    @test slds.LDSs[2].state_model.A ≈ slds.LDSs[1].state_model.A
+    @test isposdef(Symmetric(slds.boundaries.entry[3].P))
+    @test isfinite(terminal_logz(slds, ys))
+    # The grouped path conditions too.
+    labels = [:a, :a, :a, :b, :b, :b]
+    grouped = _entry_model(; p=p, middle=:hold, condition=true)
+    for lds in grouped.LDSs
+        lds.obs_model.depends_on = (C=labels, d=labels)
+    end
+    trace = _trace(fit!(grouped, ys; max_iter=2, progress=false, rng=StableRNG(5)))
+    @test all(isfinite, trace)
+    return nothing
+end
+
+"""
+An entry draw is the entry density: `λ` from the prior about the left state's
+reference, `x` from the entered plant row given `λ` — checked by moments.
+"""
+function test_rand_entry_draw()
+    rng = StableRNG(81)
+    slds = _entry_model()
+    ep = slds.boundaries.entry[3]
+    ep.μ .= [0.4, -0.2]
+    ep.K .= [0.3 0.1; -0.2 0.5]
+    ep.P .= [0.2 0.05; 0.05 0.1]
+    sm1, sm3 = slds.LDSs[1].state_model, slds.LDSs[3].state_model
+    zprev = [0.5, -0.3, 0.1, 0.2]
+    N = 40_000
+    draws = zeros(4, N)
+    for n in 1:N
+        _SB._draw_entry!(rng, view(draws, :, n), zprev, sm1, sm3, ep, nothing)
+    end
+    λ = draws[3:4, :]
+    x = draws[1:2, :]
+    @test vec(mean(λ; dims=2)) ≈ ep.μ .+ ep.K * zprev[1:2] atol = 0.01
+    @test cov(λ; dims=2) ≈ ep.P atol = 0.01
+    # x − (A x_prev − S λ + h_x) is the plant noise, independent of λ.
+    resid = x .- (sm3.A * zprev[1:2] .+ sm3.h[1:2]) .+ sm3.S * λ
+    @test vec(mean(resid; dims=2)) ≈ zeros(2) atol = 0.01
+    @test cov(resid; dims=2) ≈ sm3.Σ[1:2, 1:2] atol = 0.01
+    return nothing
+end
+
+"""The block Cholesky solve and draw agree with dense linear algebra."""
+function test_btd_cholesky_sampler()
+    rng = StableRNG(83)
+    d, Ti = 3, 5
+    Λ = zeros(d * Ti, d * Ti)
+    for t in 1:Ti
+        B = randn(rng, d, d)
+        Λ[((t - 1) * d + 1):(t * d), ((t - 1) * d + 1):(t * d)] .= B * B' + 4I
+        if t < Ti
+            S = 0.5 .* randn(rng, d, d)
+            Λ[(t * d + 1):((t + 1) * d), ((t - 1) * d + 1):(t * d)] .= S
+            Λ[((t - 1) * d + 1):(t * d), (t * d + 1):((t + 1) * d)] .= S'
+        end
+    end
+    @test isposdef(Symmetric(Λ))
+    D = [Λ[((t - 1) * d + 1):(t * d), ((t - 1) * d + 1):(t * d)] for t in 1:Ti]
+    S = [Λ[(t * d + 1):((t + 1) * d), ((t - 1) * d + 1):(t * d)] for t in 1:(Ti - 1)]
+    L, C = _SB._btd_cholesky(D, S)
+    g = randn(rng, d, Ti)
+    @test vec(_SB._btd_solve(L, C, g)) ≈ Λ \ vec(g)
+    # 𝐋⁻ᵀ ε has covariance Λ⁻¹: 𝐋ᵀ (𝐋⁻ᵀ ε) = ε for the dense factor.
+    ε = randn(rng, d, Ti)
+    η = _SB._btd_draw(L, C, ε)
+    Ld = zeros(d * Ti, d * Ti)
+    for t in 1:Ti
+        Ld[((t - 1) * d + 1):(t * d), ((t - 1) * d + 1):(t * d)] .= L[t]
+        t < Ti && (Ld[(t * d + 1):((t + 1) * d), ((t - 1) * d + 1):(t * d)] .= C[t])
+    end
+    @test Ld * Ld' ≈ Λ
+    @test Ld' * vec(η) ≈ vec(ε)
+    return nothing
+end
+
+# log ∫ exp ℓ_s(z) dz for a fixed path: exact, since ℓ_s is quadratic in z.
+function _test_path_evidence(goal, s, Ti)
+    d = goal.LDSs[1].latent_dim
+    ws = _SB.SLDSSmoothWorkspace(Float64, goal, Ti)
+    w, ew, pw = _SB._path_weights(goal, s)
+    y = zeros(1, Ti)
+    origin = zeros(d, Ti)
+    g = copy(_SB.gradient!(ws, goal, origin, y, w, nothing, nothing; ew=ew, pw=pw))
+    _SB.hessian!(ws, goal, origin, y, w, nothing; ew=ew, pw=pw)
+    D = [Matrix(-ws.btd.H_diag[t]) for t in 1:Ti]
+    S = [Matrix(-ws.btd.H_sub[t]) for t in 1:(Ti - 1)]
+    L, C = _SB._btd_cholesky(D, S)
+    zhat = _SB._btd_solve(L, C, g)
+    ℓ = sum(_SB.joint_loglikelihood!(ws, goal, zhat, y, w; ew=ew, pw=pw))
+    logdetΛ = 2 * sum(sum(log, diag(Lt)) for Lt in L)
+    return ℓ + d * Ti / 2 * log(2π) - logdetΛ / 2, zhat, L, C
+end
+
+"""
+Given a path, the latent draw is exactly `N(ẑ, Λ⁻¹)`: the smoother's Newton
+mean and precision, checked by moments against the dense inverse.
+"""
+function test_rand_path_given_states()
+    rng = StableRNG(87)
+    slds = _entry_model(; middle=:hold)
+    goal = _SB._goal_model(slds)
+    Ti = 5
+    _SB._prepare_slds!(goal, [Ti])
+    s = [1, 1, 2, 3, 3]
+    _, zhat, L, C = _test_path_evidence(goal, s, Ti)
+    d = goal.LDSs[1].latent_dim
+    Ld = zeros(d * Ti, d * Ti)
+    for t in 1:Ti
+        Ld[((t - 1) * d + 1):(t * d), ((t - 1) * d + 1):(t * d)] .= L[t]
+        t < Ti && (Ld[(t * d + 1):((t + 1) * d), ((t - 1) * d + 1):(t * d)] .= C[t])
+    end
+    Σ = inv(Ld * Ld')
+    ws = _SB.SLDSSmoothWorkspace(Float64, goal, Ti)
+    N = 20_000
+    draws = zeros(d * Ti, N)
+    z = zeros(d, Ti)
+    for n in 1:N
+        _SB._sample_path_given_states!(rng, z, ws, goal, s, nothing)
+        draws[:, n] .= vec(z)
+    end
+    sd = sqrt.(diag(Σ))
+    @test maximum(abs.(vec(mean(draws; dims=2)) .- vec(zhat)) ./ sd) < 0.05
+    @test maximum(abs.(cov(draws; dims=2) .- Σ) ./ (sd * sd')) < 0.05
+    return nothing
+end
+
+"""Exact path probabilities `p(s | goals = 0) ∝ p(s) Z(s)` over `paths`."""
+function _exact_path_posterior(slds, goal, paths, Ti)
+    logp = map(paths) do s
+        lp = log(slds.πₖ[s[1]])
+        for t in 2:Ti
+            lp += log(slds.A[s[t - 1], s[t]])
+        end
+        lp + _test_path_evidence(goal, collect(s), Ti)[1]
+    end
+    p = exp.(logp .- maximum(logp))
+    return p ./ sum(p)
+end
+
+function _path_frequencies(rng, slds, paths, Ti, N; sweeps)
+    index = Dict(collect(s) => i for (i, s) in enumerate(paths))
+    counts = zeros(length(paths))
+    for _ in 1:N
+        s, _, _ = rand(rng, slds, Ti; gibbs_sweeps=sweeps)
+        counts[index[s]] += 1
+    end
+    return counts ./ N
+end
+
+"""
+The conditional draw targets `p(s, z | goals = 0)` exactly: its path frequencies
+match the exact posterior over paths, `p(s) ∫ p(z, goals | s) dz`, whose integral
+is Gaussian for every path and so enumerable — on a banded chain (collapsed
+changepoint Gibbs, a few sweeps) and on a full one (blocked Gibbs, more sweeps).
+"""
+function test_rand_conditional_exact()
+    Ti = 4
+    slds = _entry_model(; middle=:hold, stays=[0.6, 0.6])
+    goal = _SB._goal_model(slds)
+    _SB._prepare_slds!(goal, [Ti])
+    @test _SB._is_left_to_right(goal)
+    ws = _SB.SLDSSmoothWorkspace(Float64, goal, Ti)
+    for s in ([1, 1, 2, 3], [1, 2, 2, 2])
+        @test _SB._path_log_evidence(ws, goal, s, nothing) ≈
+            _test_path_evidence(goal, s, Ti)[1]
+    end
+    paths = [
+        s for s in Iterators.product(ntuple(_ -> 1:3, Ti)...) if
+        s[1] == 1 && all(s[t + 1] - s[t] in (0, 1) for t in 1:(Ti - 1))
+    ]
+    p_exact = _exact_path_posterior(slds, goal, paths, Ti)
+    N = 3000
+    freq = _path_frequencies(StableRNG(89), slds, paths, Ti, N; sweeps=3)
+    se = sqrt.(p_exact .* (1 .- p_exact) ./ N)
+    @test all(abs.(freq .- p_exact) .<= 4 .* se .+ 0.005)
+    @test count(>(0.05), p_exact) >= 2
+
+    # A full chain: every path, blocked Gibbs.
+    full = deepcopy(slds)
+    full.A .= [0.6 0.25 0.15; 0.15 0.6 0.25; 0.2 0.2 0.6]
+    full.πₖ .= [0.5, 0.3, 0.2]
+    goal = _SB._goal_model(full)
+    _SB._prepare_slds!(goal, [Ti])
+    @test !_SB._is_left_to_right(goal)
+    paths = collect(Iterators.product(ntuple(_ -> 1:3, Ti)...))[:]
+    p_exact = _exact_path_posterior(full, goal, paths, Ti)
+    N = 2000
+    freq = _path_frequencies(StableRNG(97), full, paths, Ti, N; sweeps=40)
+    se = sqrt.(p_exact .* (1 .- p_exact) ./ N)
+    @test all(abs.(freq .- p_exact) .<= 4 .* se .+ 0.01)
+    return nothing
+end
+
+"""
+`rand` draws given the goals by default exactly when the model has bridges; the
+override works both ways; entry-only models take the forward draw with entries;
+multi-trial and grouped draws run, and a model without boundaries is untouched.
+"""
+function test_rand_boundary_defaults()
+    slds = _entry_model(; middle=:hold)
+    @test _SB._slds_rand_conditional(slds, nothing)
+    @test !_SB._slds_rand_conditional(slds, false)
+    entry_only = deepcopy(slds)
+    set_boundaries!(entry_only; entry_states=[3])
+    @test !_SB._slds_rand_conditional(entry_only, nothing)
+
+    rng = StableRNG(91)
+    s, z, y = rand(rng, slds, 20; gibbs_sweeps=5)
+    @test s[1] == 1 && all(diff(s) .>= 0) && all(diff(s) .<= 1)
+    @test all(isfinite, z) && all(isfinite, y)
+    s, z, y = rand(rng, slds, 20; conditional=false)
+    @test all(isfinite, y)
+    s, z, y = rand(rng, entry_only, 20)
+    @test all(isfinite, z)
+    ss, zs, ys = rand(rng, slds, [10, 14]; gibbs_sweeps=3)
+    @test length.(ss) == [10, 14] && all(all(isfinite, zz) for zz in zs)
+
+    # Conditioned draws meet the goals better than forward ones at every exit.
+    function gaps(model; kw...)
+        out = Float64[]
+        r = StableRNG(93)
+        for _ in 1:60
+            s, z, _ = rand(r, model, 16; kw...)
+            for t in 1:15
+                k = s[t]
+                (model.boundaries.bridge[k] && s[t + 1] != k) || continue
+                rf = zeros(2)
+                push!(
+                    out, -_SB._bridge_loglik(model.LDSs[k].state_model, z, t, nothing, rf)
+                )
+            end
+        end
+        return out
+    end
+    conditioned = gaps(slds; gibbs_sweeps=5)
+    forward = gaps(slds; conditional=false)
+    @test !isempty(conditioned) && !isempty(forward)
+    @test median(conditioned) < median(forward)
+
+    # A model without boundaries draws exactly as before.
+    plain = deepcopy(slds)
+    set_boundaries!(plain)
+    a = rand(StableRNG(5), plain, 12)
+    b = rand(StableRNG(5), plain, 12; conditional=false)
+    @test a[1] == b[1] && a[2] == b[2]
     return nothing
 end
