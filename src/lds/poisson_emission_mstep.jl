@@ -71,6 +71,7 @@ struct PoissonMStepBuffers{T<:Real}
     H::Array{T,3}          # (reg_dim × reg_dim × obs_dim)
     grad::Matrix{T}        # (reg_dim × obs_dim)
     fval::Vector{T}        # (obs_dim,)
+    Pscratch::Array{T,3}   # (latent_dim × latent_dim × tsteps) a compact trial's Pₜ, unpacked
 end
 
 function PoissonMStepBuffers(
@@ -108,6 +109,7 @@ function PoissonMStepBuffers(
         z3(reg_dim, reg_dim, obs_dim),
         z2(reg_dim, obs_dim),
         zeros(T, obs_dim),
+        zeros(T, latent_dim, latent_dim, tsteps),
     )
 end
 
@@ -322,7 +324,15 @@ function _poisson_mstep_pass!(
             uy_k = uy === nothing ? nothing : uy[k]
             w_k = w === nothing ? nothing : w[k]
             _poisson_mstep_trial!(
-                buf, W, fs.x_smooth, fs.p_smooth, y[k], uy_k, w_k, curvature, active
+                buf,
+                W,
+                fs.x_smooth,
+                smoothed_covariances(fs, buf.Pscratch),
+                y[k],
+                uy_k,
+                w_k,
+                curvature,
+                active,
             )
         end
         return nothing

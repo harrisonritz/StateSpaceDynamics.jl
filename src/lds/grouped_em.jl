@@ -296,8 +296,10 @@ function _grouped_fit_state(
     #=
     Per-trial smoother storage. `cov_alias` is decided per cell: the smoother
     aliases every equal-length trial's `p_smooth` to the shared cache, so those
-    trials would otherwise each carry a dead (D, D, T) allocation.
+    trials would otherwise each carry a dead (D, D, T) allocation. A Laplace
+    fit that is not aliased keeps its posteriors compact (see `FilterSmooth`).
     =#
+    compact = _compact_posteriors(lds)
     fs_all = Vector{FilterSmooth{T}}(undef, ntrials)
     cell_batched = Vector{Union{Nothing,BatchedBuffers{T}}}(undef, ncells)
     for c in 1:ncells
@@ -306,7 +308,9 @@ function _grouped_fit_state(
         equal_len = length(trials) > 1 && all(t -> t == tsteps[1], tsteps)
         alias = batched && equal_len
         for (i, n) in enumerate(trials)
-            fs_all[n] = initialize_FilterSmooth(lds, tsteps[i]; cov_alias=alias)
+            fs_all[n] = initialize_FilterSmooth(
+                lds, tsteps[i]; cov_alias=alias, compact=compact && !alias
+            )
         end
         cell_batched[c] = if batched && equal_len && _supports_batched(lds)
             #=

@@ -299,7 +299,15 @@ function _td_stats_trial!(
     td_dyn_xy, td_obs_xy = acc.dyn_xy, acc.obs_xy
 
     # Per-trial cov sums when not on the cov-cache fast path.
-    if !cov_cache
+    if !cov_cache && is_compact(fs)
+        #= Compact layout: the same sums, formed on the packed columns (each
+        entry summed over t in the same order) and unpacked once. =#
+        packed = fs.p_packed::Matrix{T}
+        _add_packed!(acc.cov_all, packed, 1:T_n)
+        _add_packed!(acc.cov_prev, packed, 1:(T_n - 1))
+        _add_packed!(acc.cov_next, packed, 2:T_n)
+        acc.xcov .+= fs.xcov_sum
+    elseif !cov_cache
         @views for t in 1:T_n
             acc.cov_all .+= p_smooth[:, :, t]
             if t < T_n
@@ -359,6 +367,27 @@ function _td_stats_trial!(
         mul!(view(Szz_Cd, 1:D, (D + 2):obs_reg_dim), x, uy_trial', one(T), one(T))
     end
     return nothing
+end
+
+"""
+    _add_packed!(M, packed, steps)
+
+`M += Σ_{t ∈ steps} Pₜ` for covariances stored packed (`FilterSmooth`'s compact
+layout).
+"""
+function _add_packed!(
+    M::AbstractMatrix{T}, packed::AbstractMatrix{T}, steps::AbstractUnitRange{Int}
+) where {T<:Real}
+    D = size(M, 1)
+    @inbounds for t in steps
+        k = 0
+        for j in 1:D, i in j:D
+            v = packed[k += 1, t]
+            M[i, j] += v
+            i == j || (M[j, i] += v)
+        end
+    end
+    return M
 end
 
 """
@@ -511,7 +540,12 @@ function _aggregate_td_suff_stats!(
         @views S0_sum .+= T(ntrials) .* (tfs[1].p_smooth::Array{T,3})[:, :, 1]
     else
         @views for trial in 1:ntrials
-            S0_sum .+= (tfs[trial].p_smooth::Array{T,3})[:, :, 1]
+            fs = tfs[trial]
+            if is_compact(fs)
+                _add_packed!(S0_sum, fs.p_packed::Matrix{T}, 1:1)
+            else
+                S0_sum .+= (fs.p_smooth::Array{T,3})[:, :, 1]
+            end
         end
     end
     @views Szz_Ab[1:D, 1:D] .+= sum_cov_prev

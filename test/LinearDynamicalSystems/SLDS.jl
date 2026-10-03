@@ -1123,12 +1123,15 @@ function test_SLDS_estep_basic(; rng=MersenneTwister(0xC0FFEE))
     @test isfinite(elbo)
 
     for trial in 1:ntrials
+        #= `E_zz` / `E_zz_prev` are stubs until `sufficient_statistics!`
+        materializes them; what the E-step itself writes are the smoothed
+        covariances. =#
         @test size(tfs[trial].E_z) == (latent_dim, tsteps)
-        @test size(tfs[trial].E_zz) == (latent_dim, latent_dim, tsteps)
-        @test size(tfs[trial].E_zz_prev) == (latent_dim, latent_dim, tsteps)
+        @test size(tfs[trial].p_smooth) == (latent_dim, latent_dim, tsteps)
+        @test size(tfs[trial].p_smooth_tt1) == (latent_dim, latent_dim, tsteps)
         @test all(isfinite, tfs[trial].E_z)
-        @test all(isfinite, tfs[trial].E_zz)
-        @test all(isfinite, tfs[trial].E_zz_prev)
+        @test all(isfinite, tfs[trial].p_smooth)
+        @test all(isfinite, tfs[trial].p_smooth_tt1)
     end
 
     # Check batched γ has reasonable shape and probabilities sum to 1 per timestep.

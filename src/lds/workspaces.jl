@@ -36,6 +36,26 @@ may differ.
 - `E_zz::Array{T,3}`: second moment `E[zₜzₜ']` `(latent_dim × latent_dim × T_trial)`
 - `E_zz_prev::Array{T,3}`: second moment `E[zₜzₜ₋₁']` `(latent_dim × latent_dim × T_trial)`
 - `entropy::T`: posterior entropy `H[q(x)]` for this trial
+- `p_packed::Matrix{T}`: `p_smooth` in packed form `(latent_dim(latent_dim+1)/2 ×
+  T_trial)` — see "Compact posterior storage" below
+- `xcov_sum::Matrix{T}`: `Σₜ₌₂ p_smooth_tt1[:, :, t]` `(latent_dim × latent_dim)`
+
+`E_zz` / `E_zz_prev` are `(0, 0, 0)` stubs until `sufficient_statistics!` fills
+them: no fit path reads them, and at `latent_dim²·T` each they were the two
+largest allocations of a fit.
+
+# Compact posterior storage
+
+A fit that only ever reads the smoothed covariances as per-step matrices for the
+emission and as time sums for the dynamics (a Poisson LDS with a plain
+`GaussianStateModel`, see [`_compact_posteriors`](@ref)) allocates its
+`FilterSmooth`s with `compact = true`: `p_smooth` and `p_smooth_tt1` are then
+`(0, 0, 0)` stubs, the covariances live in `p_packed` (each symmetric `Pₜ` as
+its lower triangle, column-major, `i ≥ j`), and the lag-one covariances only as
+their sum `xcov_sum`. That is `latent_dim(latent_dim+1)/2 · T` numbers per trial
+in place of `4 · latent_dim² · T`. Read the covariances through
+[`smoothed_covariances`](@ref), which returns `p_smooth` when it is stored and
+unpacks `p_packed` into a caller-supplied buffer when it is not.
 """
 mutable struct FilterSmooth{T<:Real}
     x_smooth::Matrix{T}
@@ -45,6 +65,105 @@ mutable struct FilterSmooth{T<:Real}
     E_zz::Array{T,3}
     E_zz_prev::Array{T,3}
     entropy::T
+    p_packed::Matrix{T}
+    xcov_sum::Matrix{T}
+end
+
+# The full-storage layout, as `FilterSmooth` was constructed before the compact
+# fields existed.
+function FilterSmooth(
+    x_smooth::Matrix{T},
+    p_smooth::Array{T,3},
+    p_smooth_tt1::Array{T,3},
+    E_z::Matrix{T},
+    E_zz::Array{T,3},
+    E_zz_prev::Array{T,3},
+    entropy::Real,
+) where {T<:Real}
+    return FilterSmooth{T}(
+        x_smooth,
+        p_smooth,
+        p_smooth_tt1,
+        E_z,
+        E_zz,
+        E_zz_prev,
+        T(entropy),
+        zeros(T, 0, 0),
+        zeros(T, 0, 0),
+    )
+end
+
+"""
+    is_compact(fs::FilterSmooth) -> Bool
+
+Whether `fs` holds its covariances in the compact layout (`p_packed` /
+`xcov_sum`) rather than as `p_smooth` / `p_smooth_tt1`.
+"""
+is_compact(fs::FilterSmooth) = isempty(fs.p_smooth) && !isempty(fs.p_packed)
+
+"""
+    _pack_covariances!(packed, P, tsteps)
+
+Lower triangle (`i ≥ j`, column-major) of each `P[:, :, t]` into `packed[:, t]`.
+"""
+function _pack_covariances!(
+    packed::AbstractMatrix{T}, P::AbstractArray{T,3}, tsteps::Int
+) where {T<:Real}
+    D = size(P, 1)
+    @inbounds for t in 1:tsteps
+        k = 0
+        for j in 1:D, i in j:D
+            packed[k += 1, t] = P[i, j, t]
+        end
+    end
+    return packed
+end
+
+"""
+    _unpack_covariances!(P, packed, tsteps) -> view
+
+The symmetric matrices `packed` holds, into `P[:, :, 1:tsteps]`.
+"""
+function _unpack_covariances!(
+    P::AbstractArray{T,3}, packed::AbstractMatrix{T}, tsteps::Int
+) where {T<:Real}
+    D = size(P, 1)
+    @inbounds for t in 1:tsteps
+        k = 0
+        for j in 1:D, i in j:D
+            v = packed[k += 1, t]
+            P[i, j, t] = v
+            P[j, i, t] = v
+        end
+    end
+    return view(P, :, :, 1:tsteps)
+end
+
+"""
+    smoothed_covariances(fs, buffer) -> AbstractArray{T,3}
+
+The smoothed covariances `Pₜ` of one trial as a `(latent_dim, latent_dim, T)`
+array: `fs.p_smooth` itself when it is stored, otherwise `fs.p_packed` unpacked
+into `buffer` (which must have at least `T` slices, and is overwritten).
+"""
+function smoothed_covariances(fs::FilterSmooth{T}, buffer::AbstractArray{T,3}) where {T}
+    is_compact(fs) || return fs.p_smooth
+    return _unpack_covariances!(buffer, fs.p_packed, size(fs.x_smooth, 2))
+end
+
+"""
+    _lag_covariance_sum(fs) -> Matrix
+
+`Σₜ₌₂ Cov(xₜ, xₜ₋₁)` for one trial, from whichever layout `fs` holds.
+"""
+function _lag_covariance_sum(fs::FilterSmooth{T}) where {T}
+    is_compact(fs) && return fs.xcov_sum
+    D, tsteps = size(fs.x_smooth)
+    total = zeros(T, D, D)
+    @views for t in 2:tsteps
+        total .+= fs.p_smooth_tt1[:, :, t]
+    end
+    return total
 end
 
 function Base.show(io::IO, fs::FilterSmooth; gap="")
@@ -960,33 +1079,44 @@ function _extract_state_params(state_model::GaussianStateModel{T}) where {T}
 end
 
 """
-    initialize_FilterSmooth(model, tsteps::Int)
+    initialize_FilterSmooth(model, tsteps::Int; cov_alias=false, compact=false)
 
 Initialize a per-trial `FilterSmooth` buffer sized for `tsteps` timesteps.
+
+`E_zz` / `E_zz_prev` always start as `(0, 0, 0)` stubs (`sufficient_statistics!`
+allocates them on the rare path that reads them). `cov_alias` stubs `p_smooth` /
+`p_smooth_tt1` too, for the Gaussian cov-cache path that aliases them to shared
+storage. `compact` stubs them and allocates the packed layout instead — see
+`FilterSmooth`'s "Compact posterior storage"; only a smoother that writes it
+(the Laplace smoother) and consumers that read through `smoothed_covariances`
+may be handed one.
 """
 function initialize_FilterSmooth(
-    model::LinearDynamicalSystem{T,S,O}, tsteps::Int; cov_alias::Bool=false
+    model::LinearDynamicalSystem{T,S,O},
+    tsteps::Int;
+    cov_alias::Bool=false,
+    compact::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     D = model.latent_dim
-    if cov_alias
+    if cov_alias || compact
         p_smooth = zeros(T, 0, 0, 0)
         p_smooth_tt1 = zeros(T, 0, 0, 0)
-        E_zz = zeros(T, 0, 0, 0)
-        E_zz_prev = zeros(T, 0, 0, 0)
     else
         p_smooth = zeros(T, D, D, tsteps)
         p_smooth_tt1 = zeros(T, D, D, tsteps)
-        E_zz = zeros(T, D, D, tsteps)
-        E_zz_prev = zeros(T, D, D, tsteps)
     end
+    p_packed = compact ? zeros(T, D * (D + 1) ÷ 2, tsteps) : zeros(T, 0, 0)
+    xcov_sum = compact ? zeros(T, D, D) : zeros(T, 0, 0)
     return FilterSmooth{T}(
         zeros(T, D, tsteps),       # x_smooth
         p_smooth,
         p_smooth_tt1,
         zeros(T, D, tsteps),       # E_z
-        E_zz,
-        E_zz_prev,
+        zeros(T, 0, 0, 0),         # E_zz (materialized by sufficient_statistics!)
+        zeros(T, 0, 0, 0),         # E_zz_prev
         zero(T),                   # entropy
+        p_packed,
+        xcov_sum,
     )
 end
 
@@ -1003,11 +1133,15 @@ every per-trial `p_smooth` / `p_smooth_tt1` is allocated as a `(0, 0, 0)` stub
 because `smooth!` aliases them to `sws.p_smooth_shared` on every E-step. The
 SLDS / Poisson / ragged paths invoke the per-trial smoother directly and
 write into `fs.p_smooth`, so they must keep the default `cov_alias=false`.
+
+`compact=true` allocates the packed layout described under `FilterSmooth`; the
+fitting entry points ask for it through `_compact_posteriors(model)`.
 """
 function initialize_FilterSmooth(
     model::LinearDynamicalSystem{T,S,O},
     tsteps_per_trial::AbstractVector{<:Integer};
     cov_alias::Bool=false,
+    compact::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
     # if tsteps_per_trial has varying lengths, we can't alias the cov caches to a shared zero-array
     if cov_alias && length(unique(tsteps_per_trial)) != 1
@@ -1018,7 +1152,7 @@ function initialize_FilterSmooth(
         )
     end
     filter_smooths = [
-        initialize_FilterSmooth(model, Int(t); cov_alias=cov_alias) for
+        initialize_FilterSmooth(model, Int(t); cov_alias=cov_alias, compact=compact) for
         t in tsteps_per_trial
     ]
     return TrialFilterSmooth(filter_smooths)
