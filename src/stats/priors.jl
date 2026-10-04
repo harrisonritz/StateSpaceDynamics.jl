@@ -122,16 +122,28 @@ end
 """
     mn_logprior_term(W, Σ, prior) -> Real
 
-W-dependent part of the matrix-normal log prior `log p(W | Σ)` evaluated at the
-current `(W, Σ)`. Drops Σ- and Λ-only constants that the IW prior + the `mn_map`
-M-step already cover, leaving the quadratic term
+The quadratic, `W`-dependent part of a matrix-normal log prior on a `d × q`
+coefficient matrix `W` with row covariance `Σ`, evaluated at the current
+`(W, Σ)`:
 
     -½ tr(Σ^{-1} (W - M₀) Λ (W - M₀)')
 
-This is the contribution the ELBO needs to display the true MAP objective when
-an `MNPrior` is set on a regression coefficient (e.g. `[A b B]` or `[C d D]`).
-Without it, EM is still maximizing the right thing internally, but the displayed
-ELBO can decrease under strong shrinkage — see git log for the fix context.
+This is what the M-steps optimize and what the ELBO reports when an `MNPrior` is
+set on a regression coefficient (e.g. `[A b B]` or `[C d D]`), so the displayed
+objective and the fitted parameters agree.
+
+**It is not the full normalized density `log p(W | Σ)`.** That also carries
+`-(q/2) log det Σ`, which depends on `Σ` and so matters whenever `Σ` is fitted;
+the covariance updates (`(Ψ + R)/(ν + N + d + 1)`, or `R/N` without an
+inverse-Wishart prior) omit it consistently. The estimator is therefore exactly
+the joint MAP under a normal–inverse-Wishart prior whose inverse-Wishart degrees
+of freedom are `ν − q` rather than `ν` — equivalently, a covariance-weighted ridge
+penalty on `W` — and not the MAP under the stated `MN × IW` pair. With `Σ` held
+fixed, or a coefficient prior on an emission with no covariance (Poisson), the
+two coincide. The difference is `O(q/N)` in the covariance estimate, negligible
+for long recordings but not for a few short trials. Constants independent of
+`(W, Σ)` are dropped as well, so this is a within-fit objective term: compare
+objectives across prior settings or dimensions only on held-out data.
 """
 @inline function mn_logprior_term(
     W::AbstractMatrix{T}, Σ::AbstractMatrix{T}, prior::MNPrior{T}

@@ -35,6 +35,24 @@ each fitting / smoothing entry point, where the trial lengths are known — the
 model itself is built without reference to any dataset.
 """
 function _lqr_lengths_ok(sm::LQRStateModel, tsteps::AbstractVector{Int})
+    #=
+    A trial needs at least one transition. The state kernels (gradient, Hessian,
+    sufficient statistics, the terminal normalizer's backward sweep) are written
+    for a chain with a first and a last step that differ, and a one-bin trial
+    carries nothing about the plant or the running cost anyway — only the prior,
+    one emission and the terminal factor. Refuse it here, at the one check every
+    entry point (fit, smooth, score, the switching wrappers) already runs, rather
+    than fail with an index error inside a kernel.
+    =#
+    isempty(tsteps) && throw(ArgumentError("no trials to fit or score"))
+    T_min, i_min = findmin(tsteps)
+    T_min >= 2 || throw(
+        ArgumentError(
+            "trial $i_min has $T_min timestep(s); an inverse-LQR model needs at least " *
+            "2 per trial, since a trial without a transition says nothing about the " *
+            "dynamics or the running cost. Drop or merge single-bin trials.",
+        ),
+    )
     isempty(sm.schedule) && return nothing
     T_max = maximum(tsteps)
     length(sm.schedule) >= T_max || throw(
@@ -312,8 +330,9 @@ priors move the parameters — which on a `Σ` prior strong enough to matter is 
 a rounding error. Every site that already adds `P0_prior`'s term adds this one.
 
 The cost prior is counted once per distinct `Qc[k]` array rather than once per
-regime index, so a model whose regimes alias one array (`Qc = [Q, Q]`) does not
-pay for it twice.
+regime index. Aliased entries (`Qc = [Q, Q]`) are refused at construction and at
+every M-step (see `_check_qc_unaliased`), so this is a guard rather than a
+supported way to share a cost: share one by pointing schedule entries at it.
 """
 function _lqr_structural_logprior(sm::LQRStateModel{T}) where {T<:Real}
     total = zero(T)

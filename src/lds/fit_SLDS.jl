@@ -693,8 +693,11 @@ Add the second-order term that turns a plug-in per-timestep log-likelihood into
 
 For a factor Hessian `H^{(k,t)}` and smoothed covariance `Σ`, the correction is
 `½ tr(H^{(k,t)} Σ)`. Summing it against `γ` reproduces the covariance term
-in [`elbo!`](@ref). The expansion is exact for Gaussian emissions and
-second-order for Poisson emissions.
+in [`elbo!`](@ref). That is exact for every quadratic factor — the Gaussian
+dynamics, prior, terminal factor and Gaussian emissions. A Poisson emission is
+not quadratic, but its expectation under a Gaussian marginal is still closed
+form, `E[exp η] = exp(μ + v/2)`, so the second-order term is topped up to it by
+[`_emission_moment_excess`](@ref) rather than left as an approximation.
 
 Uses the same factor-at-`t` convention as `joint_loglikelihood!` and `hessian!`:
 `ll[t]` covers the emission at `t` plus the dynamics factor coupling
@@ -749,10 +752,107 @@ function _add_cov_correction!(
 
         t == Tsteps && (corr += _slds_terminal_cov_correction(lds_k, fs, Tsteps))
 
-        ll[t] += T(0.5) * corr
+        ll[t] +=
+            T(0.5) * corr +
+            _emission_moment_excess(ws, lds_k.obs_model, x, y, t, uy, Σ_tt, obs_scratch)
     end
 
     return ll
+end
+
+"""
+    _emission_moment_excess!(η, v, om, x, y, t, uy, Σ_tt) -> Real
+
+What the exact Gaussian expectation of an emission's log-density at `t` adds to
+the plug-in-plus-`½ tr(H Σ)` value the covariance correction already gives.
+
+For a quadratic emission that value is already exact, so this is zero. For a
+Poisson emission with log rate `η = cᵀx + d + D u` and `η ~ N(μ, v)` under `q`,
+
+    E_q[y η − exp η] = y μ − exp(μ + ρ),        ρ = v/2,
+
+while the second-order expansion gives `y μ − exp(μ)(1 + ρ)`; this returns the
+difference `−exp(μ)(exp(ρ) − 1 − ρ) ≤ 0` summed over units. Without it the
+switching score sits above the ELBO of its own Gaussian `q` by exactly that
+amount, and disagrees with the lognormal moment the Poisson observation M-step
+already optimizes — so a step that improves the M-step objective need not improve
+the reported score. A composite emission sums its members'.
+"""
+function _emission_moment_excess!(
+    ::AbstractVector, ::AbstractVector, ::AbstractObservationModel{T}, x, y, t, uy, Σ
+) where {T}
+    return zero(T)
+end
+
+#=
+`η` and `v` are length-`obs_dim` scratch: the log rate and its variance
+`v_i = c_iᵀ Σ c_i`, the latter accumulated a column of `C` at a time so the
+inner loop runs down contiguous memory. `O(p d²)` per call, the same order as
+the emission curvature computed beside it.
+=#
+function _emission_moment_excess!(
+    η::AbstractVector{T},
+    v::AbstractVector{T},
+    om::PoissonObservationModel,
+    x::AbstractMatrix{T},
+    ::AbstractMatrix,
+    t::Int,
+    uy::Union{Nothing,AbstractMatrix},
+    Σ::AbstractMatrix,
+) where {T<:Real}
+    C = om.C
+    @views mul!(η, C, x[:, t])
+    uy === nothing || @views mul!(η, om.D, uy[:, t], one(T), one(T))
+    η .+= om.d
+    fill!(v, zero(T))
+    @inbounds for b in axes(C, 2), a in axes(C, 2)
+        s = Σ[a, b]
+        iszero(s) && continue
+        @simd for i in axes(C, 1)
+            v[i] += C[i, a] * s * C[i, b]
+        end
+    end
+    acc = zero(T)
+    @inbounds for i in eachindex(η)
+        ρ = v[i] / 2
+        acc -= exp(η[i]) * (expm1(ρ) - ρ)
+    end
+    return acc
+end
+
+# Through a workspace: a single emission uses the Newton scratch, a composite
+# each member's own (both are free once the curvature has been read).
+function _emission_moment_excess(
+    ws::SLDSSmoothWorkspace{T}, om, x, y::AbstractMatrix, t, uy, Σ, ::Nothing
+) where {T<:Real}
+    return _emission_moment_excess!(ws.opt.dyt, ws.opt.temp_dy, om, x, y, t, uy, Σ)
+end
+
+function _emission_moment_excess(
+    ::SLDSSmoothWorkspace{T},
+    om::CompositeObservationModel,
+    x,
+    y::NamedTuple,
+    t,
+    uy,
+    Σ,
+    obs_scratch::Vector{ObsScratch{T}},
+) where {T<:Real}
+    total = zero(T)
+    for (i, member) in enumerate(values(_models(om)))
+        sc = obs_scratch[i]
+        total += _emission_moment_excess!(
+            sc.buf1, sc.buf2, member, x, y[i], t, _member_at(uy, i), Σ
+        )
+    end
+    return total
+end
+
+# Allocating form, for checks outside a workspace.
+function _emission_moment_excess(om::AbstractObservationModel, x, y, t, uy, Σ)
+    p = _obs_dim(om)
+    T = eltype(x)
+    return _emission_moment_excess!(zeros(T, p), zeros(T, p), om, x, y, t, uy, Σ)
 end
 
 """
@@ -1380,8 +1480,8 @@ held-out data.
   same `tied_params` reports. No effect without priors.
 
 # Returns
-A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz, converged,
-newton_unconverged, iterations)`. For a single-trial matrix `y`, `x` is
+A `NamedTuple` `(; x, γ, elbo, trial_elbo, p, terminal_logz, elbo_joint, log_prior,
+converged, newton_unconverged, iterations)`. For a single-trial matrix `y`, `x` is
 `latent_dim × T`, `γ` is `K × T`, and `p` is `latent_dim × latent_dim × T`; for a 3-D
 array or a vector of matrices, each is a `Vector` with one entry per trial. `elbo` is
 always a scalar, and `p` is `nothing` unless `return_cov=true`.
@@ -1391,10 +1491,25 @@ per trial (a single-trial `y` included). It sums to `elbo` up to the parameter
 log-prior, which belongs to no trial — see [`trial_elbos`](@ref).
 
 `terminal_logz` is the terminal normalizer already subtracted from `elbo` when the
-inverse-LQR discrete states condition on their terminal factor, and zero otherwise. It
-is reported because it is a *variational estimate* for a switching model, which makes
-`elbo` a difference of two bounds rather than a bound: read the two together before
-attributing a score gap to fit quality. See [`terminal_logz`](@ref).
+inverse-LQR discrete states condition on their terminal factor, and zero otherwise.
+`elbo_joint = elbo + terminal_logz` is the bound before that subtraction, and
+`log_prior` the parameter log-prior included in both. Under conditioning the three
+mean different things, and only one of them is a bound:
+
+- `elbo_joint` is a genuine lower bound on `log p(y, terminal = 0) + log p(θ)`.
+- `terminal_logz` is a variational *lower-bound estimate* of `log p(terminal = 0)`,
+  from the same structured family run on a zero-loading probe.
+- `elbo` is their difference. Its error is `δ_terminal − δ_data`, the probe's
+  variational gap minus the data side's, which has no fixed sign: it is **neither
+  a likelihood nor a lower bound**, and can exceed the exact conditional
+  `log p(y | terminal = 0)`. More probe iterations shrink optimization error, not
+  the gap of the variational family itself.
+
+So a score difference between two conditioned switching fits may be a difference
+in how well each denominator was approximated. Compare `elbo_joint` and
+`terminal_logz` separately, and prefer held-out predictive scores for model
+selection (regime count, dimension, noise model). `elbo_joint - log_prior` is the
+data-only bound. See [`terminal_logz`](@ref).
 
 `converged` says whether the alternation met its stopping rule (always `false` with
 `tol=0`), and `newton_unconverged` counts the trials whose Newton solve stopped short
@@ -1623,7 +1738,9 @@ function smooth(
         terminal_logz,
         converged,
         newton_unconverged,
-        iterations,
+        iterations;
+        elbo_joint=total_elbo + terminal_logz,
+        log_prior=prior_logdensity,
     )
 end
 
@@ -1647,7 +1764,9 @@ function _collect_slds_smooth_output(
     terminal_logz,
     converged,
     newton_unconverged,
-    iterations,
+    iterations;
+    elbo_joint=total_elbo + terminal_logz,
+    log_prior=zero(total_elbo),
 )
     return (;
         x=x[1],
@@ -1656,6 +1775,8 @@ function _collect_slds_smooth_output(
         trial_elbo=trial_elbo,
         p=(p === nothing ? nothing : p[1]),
         terminal_logz=terminal_logz,
+        elbo_joint=elbo_joint,
+        log_prior=log_prior,
         converged=converged,
         newton_unconverged=newton_unconverged,
         iterations=iterations,
@@ -1672,7 +1793,9 @@ function _collect_slds_smooth_output(
     terminal_logz,
     converged,
     newton_unconverged,
-    iterations,
+    iterations;
+    elbo_joint=total_elbo + terminal_logz,
+    log_prior=zero(total_elbo),
 )
     return (;
         x=x,
@@ -1681,6 +1804,8 @@ function _collect_slds_smooth_output(
         trial_elbo=trial_elbo,
         p=p,
         terminal_logz=terminal_logz,
+        elbo_joint=elbo_joint,
+        log_prior=log_prior,
         converged=converged,
         newton_unconverged=newton_unconverged,
         iterations=iterations,
@@ -2856,6 +2981,28 @@ function _slds_trial_elbo(
         trial_elbo += T(0.5) * _tr_prod(H_super[t - 1], Σ_ttm1)
         trial_elbo += T(0.5) * _tr_prod(H_sub[t - 1], transpose(Σ_ttm1))
     end
+    #= The emission half of that correction is second-order; a Poisson member's
+    expectation is closed form, so top it up to the exact lognormal moment,
+    each regime's at its own responsibility (zero for quadratic emissions). =#
+    for k in 1:K
+        om_k = slds.LDSs[k].obs_model
+        scratch_k = _regime_obs(slds_ws, k)
+        for t in 1:Tsteps
+            wkt = w[k, t]
+            iszero(wkt) && continue
+            trial_elbo +=
+                wkt * _emission_moment_excess(
+                    slds_ws,
+                    om_k,
+                    x_smooth_trial,
+                    y_trial,
+                    t,
+                    uy_trial,
+                    view(fs.p_smooth, :, :, t),
+                    scratch_k,
+                )
+        end
+    end
 
     # E_q[log p(z_1)].
     for k in 1:K
@@ -2910,9 +3057,12 @@ forward-backward chain posterior:
   posterior mean plus the covariance correction `½ tr(H Σ)`, where `H` is the
   weighted Hessian over `x₁:T` and `Σ` the block-tridiagonal posterior
   covariance. Exact for Gaussian emissions (the weighted log-density is
-  quadratic in `x`); the standard second-order/Laplace approximation for
-  Poisson. `_add_cov_correction!` applies the same term per regime and timestep
-  during the deterministic discrete update.
+  quadratic in `x`). For a Poisson emission the expectation is the exact
+  lognormal moment `E[exp η] = exp(μ + v/2)` (see `_emission_moment_excess`),
+  so the score is a genuine ELBO for the Gaussian `q(x)` the Laplace step
+  returns — though, as for any Laplace E-step, that `q` is not the one that
+  maximizes it. `_add_cov_correction!` applies the same terms per regime and
+  timestep during the deterministic discrete update.
 - `E_q[log p(z)]` uses the FB marginals `γ` (initial) and pairwise `ξ`
   (transitions).
 - `H[q(z)]` is the Markov-chain entropy of the FB posterior,
@@ -3143,13 +3293,23 @@ end
 """
     loglikelihood(slds, y; kwargs...)
 
-Variational lower bound on the marginal log-likelihood of an `SLDS`, i.e.
-[`elbo`](@ref)`(slds, y)`.
+The variational score of an `SLDS`, i.e. [`elbo`](@ref)`(slds, y)` — not a
+likelihood.
 
 The exact marginal `log p(y)` is intractable for a switching model — it requires
-summing over all `K^T` discrete regime sequences — so this returns the ELBO instead.
-Values are comparable across models fit to the same data, but are lower bounds, not
-likelihoods. Accepts the same keywords as [`elbo`](@ref).
+summing over all `K^T` discrete regime sequences — so this returns the ELBO instead,
+**including** the parameter log-priors (a MAP objective, not a data-only score;
+`smooth(slds, y).log_prior` is the amount to remove). Without terminal conditioning
+it is a lower bound on `log p(y) + log p(θ)`.
+
+With inverse-LQR states that condition on their terminal factor it is the
+difference of two variational bounds, `log p(y, terminal = 0)` minus an estimate of
+`log p(terminal = 0)`, and so **neither a likelihood nor a bound** on the
+conditional likelihood: its error has no fixed sign. [`smooth`](@ref) returns the
+two halves (`elbo_joint`, `terminal_logz`); read them separately before comparing
+models, and prefer held-out predictive scores for selecting the number of regimes,
+the latent dimension or the noise model. Accepts the same keywords as
+[`elbo`](@ref).
 """
 function StatsAPI.loglikelihood(slds::SLDS, y; kwargs...)
     return elbo(slds, y; kwargs...)
@@ -4299,6 +4459,7 @@ function fit!(
     =#
     data = Data(slds.LDSs[1], y; ux0=ux0, ux=ux, uy=uy)
     _prepare_slds!(slds, data.tsteps)
+    _check_slds_lqr_fit_layout(slds)
     #=
     A warped emission fits on its embedding. `target` stays the model the caller
     holds (and the one the held-out monitor scores and restores); everything
@@ -5664,7 +5825,14 @@ function _grouped_slds_state_mstep!(
         [grp.cell_slot[_G_Q][cell_of(u)] for u in lqr],
     )
 
-    ctx = _LQRMStepCtx([unit_suf[u] for u in lqr], sms[lqr], ab_slots, q_slots, fit_noise)
+    ctx = _LQRMStepCtx(
+        [unit_suf[u] for u in lqr],
+        sms[lqr],
+        ab_slots,
+        q_slots,
+        fit_noise;
+        flags=_lqr_structure_flags(sms[lqr[1]], fit_structure),
+    )
     _lqr_structure_mstep!(ctx, fit_structure, maximum(sms[u].mstep_iters for u in lqr))
     fit_noise && _lqr_noise_mstep!(ctx)
     for u in lqr

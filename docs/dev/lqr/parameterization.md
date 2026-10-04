@@ -31,7 +31,11 @@ model**. Writing the stationarity conditions as
 ```
 
 makes the transition **linear in `A`, `S` and every `Qc`**, which is why EM
-works at all and why the M-step in `lqr_mstep.jl` is closed-form. That is a real
+works at all and why the M-step in `lqr_mstep.jl` has cheap exact gradients.
+(It is not closed-form: the `log|det A|` Jacobian, the `L Lᵀ` parameterization
+that keeps `S` and `Qc` positive semidefinite, the profiled or conditioned noise
+and, under `condition_terminal`, the subtracted `log Z(θ)` make it a numerical
+L-BFGS step accepted only on improvement — a generalized M-step.) That is a real
 and non-obvious achievement. But it buys linearity by promoting the Lagrange
 multiplier `λ` from a *function of the trajectory* to a *latent variable with
 its own process noise*, and the three problems the harness spends most of its
@@ -746,7 +750,7 @@ downsides directly.
 | noise on the costate | **required**, non-estimable | none | none | none | none |
 | suboptimality modelled as | costate innovation | control noise `Ξ` | `Ξ = [β(R+BᵗPB)]⁻¹` | trajectory temperature | stage-1 residual |
 | optimal agent in the class? | no (measure-zero limit) | yes (`Ξ → 0`) | yes | yes | yes |
-| cost M-step | **closed form**, linear | non-convex, closed-form gradient | same | **concave** (SDP) | linear + PSD (SDP) |
+| cost M-step | linear in the mixed coordinates; L-BFGS over a PSD factor (generalized EM) | non-convex, closed-form gradient | same | **concave** (SDP) | linear + PSD (SDP) |
 | cold-start conditioning | scale pinned by `q0`, which is flat | scale drifts along a shallow direction (§2.5); wants a C-style init or a scale prior | shallow, but max-ent ties the scale to variability | same | convex — no initializer needed |
 | cost scale | exact gauge; needs a prior | identified (§2.1) | identified, plus variability | identified | reported as a cone |
 | reference `Gref` | trades against the cost | identified with the cost | same | same | in stage 1 |
@@ -796,7 +800,7 @@ downsides directly.
    model comparison.
 5. **Adopt A′** where behavioural variability is signal.
 6. **Keep H** for what it is uniquely good at: a horizon-agnostic model over
-   *any* symplectic transition, with a closed-form M-step, for exploratory fits
+   *any* symplectic transition, with a linear-in-parameters M-step, for exploratory fits
    where Riccati consistency is not yet something you want to assume.
 
 ## 7. Reproducing the numbers
