@@ -64,8 +64,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LQRStateModel`, `LQRFitFlags`, and `lqr_matrix`; source files, internal
   helpers, tests, and tutorials follow the same convention. This is a complete
   API rename without compatibility aliases; model behavior is unchanged.
+- **`simulate_lqr` adds plant noise causally.** The plant noise now lands after
+  the closed-loop step, `x_{t+1} = W_{t+1}(A x_t + c_t − S g_{t+1}) + ε_t`, which
+  is ordinary certainty-equivalent stochastic LQR (`Cov(x_{t+1} | x_t) = Σ_xx`).
+  The old rollout passed `ε_t` through `W_{t+1}`, as if the control reacted to the
+  realized noise (`W Σ_xx Wᵀ`); `noise_timing = :implicit` reproduces it.
+  Simulations with `process_noise = true` change.
+- **Inverse-LQR models refuse single-timestep trials** with an `ArgumentError` at
+  every entry point, instead of an index error inside the state kernels.
+- **Aliased cost matrices are refused.** `LQRStateModel(A, S, [Q, Q], Σ)` (the
+  same array at two indices) is an error at construction and at every M-step;
+  share a cost by pointing schedule entries at one index.
+- **The switching `smooth` result carries `elbo_joint` and `log_prior`.** Under
+  terminal conditioning `elbo` is a difference of two variational bounds and is
+  neither a likelihood nor a bound; the docstrings of `loglikelihood(::SLDS)`,
+  `smooth` and the normalizer now say so, and the joint bound is reported beside
+  the normalizer so the two can be read separately.
+- **`mn_logprior_term` documents its target.** It omits the `−(q/2) log det Σ`
+  normalizer of a matrix-normal prior, consistently with the covariance
+  updates; the fitted values are the MAP under an inverse-Wishart prior with
+  `ν − q` degrees of freedom, not the stated `MN × IW` pair.
 
 ### Fixed
+- **Switching models score Poisson emissions with the exact lognormal
+  moment.** The deterministic regime update and the reported ELBO used a
+  second-order expansion, `y μ − exp(μ)(1 + v/2)`, which overstates
+  `E_q[log p(y | x)] = y μ − exp(μ + v/2)` by `exp(μ)(e^{v/2} − 1 − v/2)` per unit
+  and bin — and disagreed with the exact moment the Poisson observation M-step
+  optimizes. A one-regime switching model now scores exactly what the
+  non-switching model does. Held-out co-smoothing scores of switching Poisson
+  models, a difference of two such ELBOs, were inflated by the excess on the
+  held-out units.
+- **Terminal-conditioned switching fits honour every state's freezes.** The
+  conditioned M-step returned before the checks that inverse-LQR states agree on
+  `fit_flags` and `fit_bool`, then read both off the first state — so a cost
+  another state had frozen moved. The checks now run at `fit!` entry (before
+  any parameter moves) and in every joint M-step, and under conditioning also
+  cover the initial-state switches.
+- **Inverse-LQR `loglikelihood` scores grouped models under their variants.** It
+  ignored `depends_on` and evaluated the parent model; it now resolves the
+  grouping as `elbo` does, accepts `depends_on`, and removes each distinct
+  version's prior once.
+- **A structural group frozen by `fit_bool[3] = false` is packed as frozen.** A
+  known singular `S` or `Qc` was still packed through a Cholesky factor and
+  refused as "fitted".
 - **`refresh!` now rebuilds a grouped model's variant caches.** A
   `LQRStateModel` with `depends_on` builds one variant per cell, aliasing
   the parent's arrays for every group that does not vary — so a write to the

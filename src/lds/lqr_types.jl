@@ -888,6 +888,33 @@ function cost_schedule(
     return sched
 end
 
+"""
+    _check_qc_unaliased(Qc)
+
+Refuse a cost vector two of whose entries are the same array.
+
+The M-step packs one parameter block per cost *index* and writes each back to
+`Qc[k]`, so `Qc = [Q, Q]` would have its two copies optimized independently and
+then overwritten by whichever is written last — the stored model would not be the
+one the optimizer accepted, and EM could decrease. A shared cost is expressed by
+pointing several `schedule` entries at one index instead.
+"""
+function _check_qc_unaliased(Qc::AbstractVector)
+    for j in 2:length(Qc), i in 1:(j - 1)
+        Qc[i] === Qc[j] && throw(
+            ArgumentError(
+                "Qc[$i] and Qc[$j] are the same array. Each cost index is fitted as " *
+                "its own parameter, so aliased entries would be optimized separately " *
+                "and overwritten on writeback. To reuse one cost across epochs, point " *
+                "the schedule entries at a single index (e.g. `schedule = [1, 1, 2]` " *
+                "rather than `Qc = [Q, Q, Qf]`), or pass `copy(Q)` if the costs " *
+                "should be fitted separately.",
+            ),
+        )
+    end
+    return nothing
+end
+
 #=
 Structural checks shared by the constructor and `validate_LDS`. Kept separate
 from `_validate_state_model` so the constructor can fail before building a cache
@@ -906,6 +933,7 @@ function _check_lqr_structure(
     size(S) == (n, n) || throw(DimensionMismatchError("LQR S rows", n, size(S, 1)))
     isempty(Qc) &&
         throw(ArgumentError("an LQRStateModel needs at least one cost matrix `Qc`"))
+    _check_qc_unaliased(Qc)
     for (k, Q) in enumerate(Qc)
         size(Q) == (n, n) || throw(DimensionMismatchError("LQR Qc[$k] rows", n, size(Q, 1)))
         asym = maximum(abs, Q .- transpose(Q); init=zero(T))
@@ -2392,9 +2420,13 @@ lives on the stable manifold — the boundary condition is exactly what selects 
 sweep and the closed-loop forward map
 
 ```math
-x_{t+1} = W_{t+1}(A x_t + c_t - S g_{t+1} + \\varepsilon_t),
-\\qquad \\lambda_t = P_t x_t + g_t .
+x_{t+1} = W_{t+1}(A x_t + c_t - S g_{t+1}) + \\varepsilon_t,
+\\qquad \\lambda_t = P_t x_t + g_t ,
 ```
+
+with `W_{t+1} = (I + S P_{t+1})^{-1}`. This is ordinary causal stochastic LQR: the
+agent chooses `u_t` from what it knows at `t` (certainty equivalence), and the
+plant noise `ε_t` arrives afterwards, unfiltered by the controller.
 
 Rolling the forward transition `z_{t+1} = M z_t + w` instead — which is what
 `rand` does, that being the model's own generative form — diverges over any
@@ -2407,6 +2439,14 @@ useful horizon.
   the mixed-coordinate innovation. That is genuine plant noise: the optimal
   policy is unchanged by it (certainty equivalence), so the costate still tracks
   `P x + g` exactly.
+- `noise_timing = :causal`: when the plant noise enters. `:causal` adds it after
+  the closed-loop step, as above, so `Cov(x_{t+1} | x_t) = Σ_xx` — the process a
+  feedback controller under plant noise generates. `:implicit` reproduces the
+  rollout used before this option existed, `x_{t+1} = W_{t+1}(A x_t + c_t −
+  S g_{t+1} + ε_t)`: the noise is passed through `W_{t+1}`, as if the control
+  already reacted to the realized `ε_t` (variance `W Σ_xx Wᵀ`). That is a
+  perturbed solution of the stationarity conditions rather than a causal agent;
+  keep it only to reproduce old simulations.
 - `costate_slack = 0`: standard deviation of the perturbation `ν_t` on the
   agent's costate — how far from exactly optimal the behavior is. The agent
   *acts* on the perturbed costate (`u_t = −R⁻¹Bᵀλ_{t+1}`), so the slack moves
@@ -2425,6 +2465,15 @@ Note what this implies about the model: the exactly-optimal trajectory has a
 *rank-`n`* innovation, supported on the graph of the Riccati map. A full-rank
 `Σ` — which the smoother requires — contains that only as a limit. That is the
 precise sense in which the costate must carry process noise.
+
+It also means data from this function are **not** draws from the model the
+inverse-LQR fit assumes. Under causal plant noise the mixed-coordinate residual
+the fit models as `N(0, Σ)` is `[I + S P_{t+1}; −Aᵀ P_{t+1}] ε_t`-shaped: rank `n`,
+correlated between state and costate rows, and time-varying through `P_{t+1}`.
+Fitting a constant full-rank `Σ` to it is a misspecified (if often useful)
+approximation, so recovery from `simulate_lqr` tests robustness to that
+misspecification, while recovery from `rand` tests self-consistency. Report
+which.
 """
 function simulate_lqr(
     rng::AbstractRNG,
@@ -2434,8 +2483,12 @@ function simulate_lqr(
     process_noise::Bool=true,
     costate_slack::Real=0,
     ux::Union{Nothing,AbstractMatrix{T}}=nothing,
+    noise_timing::Symbol=:causal,
 ) where {T<:Real}
     _require_lqr(sm, "`simulate_lqr`")
+    noise_timing in (:causal, :implicit) || throw(
+        ArgumentError("noise_timing must be :causal or :implicit, got :$noise_timing")
+    )
     Ti = Int(tsteps)
     n = _plant_dim(sm)
     d = 2n
@@ -2479,10 +2532,16 @@ function simulate_lqr(
         has_input && mul!(vbuf, sm.Bu, view(ux_mat, :, t), one(T), one(T))
         # Only the *state* half of the affine term enters the forward map; the
         # costate half is already folded into `g` by the backward sweep.
-        # (I + S P_{t+1}) x_{t+1} = A x_t + c_t − S(g_{t+1} + ν_{t+1}) + ε_t
+        # (I + S P_{t+1}) x̄_{t+1} = A x_t + c_t − S(g_{t+1} + ν_{t+1}), the step
+        # the agent plans from what it knows at t; plant noise lands on top.
         @views rhs = A * x .+ vbuf[1:n] .- S * (g[t + 1] .+ ν[t + 1])
-        process_noise && (rhs .+= rand(rng, noise))
-        x = W[t + 1] * rhs
+        if noise_timing === :implicit
+            process_noise && (rhs .+= rand(rng, noise))
+            x = W[t + 1] * rhs
+        else
+            x = W[t + 1] * rhs
+            process_noise && (x .+= rand(rng, noise))
+        end
     end
     return z
 end

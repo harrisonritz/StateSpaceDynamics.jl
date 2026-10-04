@@ -307,6 +307,77 @@ function _lqr_block_slots(tied::AbstractVector{Symbol}, n::Int)
     )
 end
 
+"""
+    _check_lqr_joint_layout(ldss, idx; conditional)
+
+Refuse a set of inverse-LQR models that the M-step would optimize as one packed
+problem but that disagree on what may move.
+
+The constrained step reads the block layout (`fit_flags`) and the structural and
+noise switches (`fit_bool[3]`, `fit_bool[4]`) off the first model and applies
+them to all of them. Under terminal conditioning the initial state is in the same
+problem, so `fit_bool[1]` and `fit_bool[2]` must agree too. Quietly taking the
+first model's choices would fit a block another model froze, which is worse than
+an error. Free states are updated one at a time and are not in `idx`.
+
+Called at `fit!` entry, before any parameter moves, and again by each M-step
+that builds a joint problem, so no branch can bypass it.
+"""
+function _check_lqr_joint_layout(
+    ldss::AbstractVector, idx::AbstractVector{Int}; conditional::Bool
+)
+    isempty(idx) && return nothing
+    ref = ldss[idx[1]]
+    switches = conditional ? (1:4) : (3:4)
+    names = ("`:x0`", "`:P0`", "`:A`", "`:Q`")
+    why = if conditional
+        " (the terminal-conditioned M-step fits the initial state jointly with the dynamics)"
+    else
+        ""
+    end
+    for k in idx
+        lds = ldss[k]
+        for i in switches
+            lds.fit_bool[i] == ref.fit_bool[i] || throw(
+                ArgumentError(
+                    "LDSs[$k]: inverse-LQR discrete states are optimized together, " *
+                    "so they must agree on the $(names[i]) entry of `fit_bool`$why" *
+                    ". Freeze the same groups on every such state, or use `:free` " *
+                    "states, which are updated one at a time and may differ.",
+                ),
+            )
+        end
+        lds.state_model.fit_flags == ref.state_model.fit_flags || throw(
+            ArgumentError(
+                "LDSs[$k]: inverse-LQR discrete states share one packed parameter " *
+                "layout in the M-step, so they must agree on `fit_flags` and freeze " *
+                "the same structural blocks.",
+            ),
+        )
+    end
+    return nothing
+end
+
+"""
+    _check_slds_lqr_fit_layout(slds)
+
+`fit!`-entry form of [`_check_lqr_joint_layout`](@ref) over a switching model's
+inverse-LQR states, so a configuration the M-step would refuse is refused before
+the first E-step rather than after the chain or emission has already moved.
+"""
+function _check_slds_lqr_fit_layout(slds::SLDS)
+    idx = [
+        k for (k, lds) in enumerate(slds.LDSs) if
+        lds.state_model isa LQRStateModel && !_is_free(lds.state_model)
+    ]
+    isempty(idx) && return nothing
+    conditional = any(
+        slds.LDSs[k].state_model.terminal && slds.LDSs[k].state_model.condition_terminal for
+        k in idx
+    )
+    return _check_lqr_joint_layout(slds.LDSs, idx; conditional=conditional)
+end
+
 function _slds_state_mstep!(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
     sf_state::AbstractVector,
@@ -325,6 +396,15 @@ function _slds_state_mstep!(
     for k in 1:K
         _fill_mixed_blocks!(sf_state[k], sms[k])
     end
+
+    #=
+    Validated before either branch, so the terminal-conditioned update cannot
+    skip it: both optimize every inverse-LQR state in one packed problem whose
+    layout and switches are read off the first state.
+    =#
+    _check_lqr_joint_layout(
+        ldss, [k for k in 1:K if !_is_free(sms[k])]; conditional=terminal_probe !== nothing
+    )
 
     #=
     Terminal conditioning replaces the whole state-side update, initial state
@@ -373,49 +453,16 @@ function _slds_state_mstep!(
 
     lqr = [k for k in 1:K if !_is_free(sms[k])]
     if !isempty(lqr)
-        #=
-        The constrained step optimizes every inverse-LQR state in one context, so
-        the two structural/noise switches apply to all of them at once. Rather
-        than quietly taking the first state's, refuse a set that disagrees — a
-        frozen state that silently gets fitted is worse than an error.
-        =#
         fit_structure = ldss[lqr[1]].fit_bool[3]
         fit_noise = ldss[lqr[1]].fit_bool[4]
-        for k in lqr
-            (ldss[k].fit_bool[3] == fit_structure && ldss[k].fit_bool[4] == fit_noise) ||
-                throw(
-                    ArgumentError(
-                        "LDSs[$k]: inverse-LQR discrete states are optimized together, " *
-                        "so they must agree on the `:A` and `:Q` entries of " *
-                        "`fit_bool`. Freeze the same groups on every such state, or " *
-                        "use `:free` states, which are updated one at a time and may " *
-                        "differ.",
-                    ),
-                )
-        end
-        #=
-        One packed layout covers every inverse-LQR state, so which blocks are
-        free has to be the same for all of them too — the context reads the
-        flags off the first model. A state whose freezes were quietly replaced
-        by another's is the same failure as above, and gets the same refusal.
-        =#
-        flags = sms[lqr[1]].fit_flags
-        for k in lqr
-            sms[k].fit_flags == flags || throw(
-                ArgumentError(
-                    "LDSs[$k]: inverse-LQR discrete states share one packed " *
-                    "parameter layout in the M-step, so they must agree on " *
-                    "`fit_flags` and freeze the same structural blocks.",
-                ),
-            )
-        end
         nl = length(lqr)
         ctx = _LQRMStepCtx(
             [sf_state[k] for k in lqr],
             sms[lqr],
             _lqr_block_slots(tied, nl),
             (:noise in tied) ? ones(Int, nl) : collect(1:nl),
-            fit_noise,
+            fit_noise;
+            flags=_lqr_structure_flags(sms[lqr[1]], fit_structure),
         )
         _lqr_structure_mstep!(ctx, fit_structure, maximum(sms[k].mstep_iters for k in lqr))
         fit_noise && _lqr_noise_mstep!(ctx)

@@ -411,7 +411,7 @@ function test_lqr_construction_errors()
     @test_throws Exception LinearDynamicalSystem(sm_bad_dep, om)
 
     # A schedule that does not cover the longest trial is caught at fit entry.
-    sm_short = LQRStateModel(A, Sm, [Qc, Qc], Σ; schedule=cost_schedule(5))
+    sm_short = LQRStateModel(A, Sm, [Qc, copy(Qc)], Σ; schedule=cost_schedule(5))
     lds_short = LinearDynamicalSystem(
         sm_short, GaussianObservationModel(randn(rng, 3, d), Matrix(0.1I, 3, 3), zeros(3))
     )
@@ -2403,7 +2403,7 @@ function test_lqr_single_trial_and_edge_cases()
     Sm = [0.06 0.01; 0.01 0.05]
     Qc = [0.25 0.04; 0.04 0.18]
     @test_logs (:warn, r"never used") match_mode = :any LQRStateModel(
-        A, Sm, [Qc, Qc], Matrix(0.03I, 4, 4); schedule=fill(1, 8)
+        A, Sm, [Qc, copy(Qc)], Matrix(0.03I, 4, 4); schedule=fill(1, 8)
     )
 
     # `depends_on` is refused at every entry point rather than silently ignored.

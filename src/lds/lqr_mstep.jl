@@ -1162,6 +1162,11 @@ function _LQRMStepCtx(
     sm1 = sms[1]
     T = eltype(sm1.Σ)
     f = flags === nothing ? sm1.fit_flags : flags
+    #= Checked again here, not only at construction: `Qc` is a mutable vector,
+    and an alias introduced afterwards would break writeback just the same. =#
+    for sm in sms
+        _is_free(sm) || _check_qc_unaliased(sm.Qc)
+    end
     #=
     `:hold` and `:lqr` models may share one problem (a switching model's control
     and hold states). The terminal offset is packed when any of them carries a
@@ -1312,8 +1317,30 @@ function _LQRMStepCtx(
 end
 
 # Ungrouped convenience: one unit, one structural version, one noise version.
-function _LQRMStepCtx(hs, sm::LQRStateModel, profile::Bool)
-    return _LQRMStepCtx([hs], [sm], [1], [1], profile)
+function _LQRMStepCtx(
+    hs, sm::LQRStateModel, profile::Bool; flags::Union{Nothing,LQRFitFlags}=nothing
+)
+    return _LQRMStepCtx([hs], [sm], [1], [1], profile; flags=flags)
+end
+
+"""
+    _lqr_structure_flags(sm, fit_structure) -> LQRFitFlags
+
+The block layout the structural M-step should pack: the model's own `fit_flags`
+when the structural group is being fitted, and every block frozen when
+`fit_bool[3]` switches the whole group off.
+
+Packing is not free of side conditions — a fitted `S` or `Qc` is packed through
+a Cholesky factor and must be positive definite — so a group frozen by the
+enclosing switch has to be packed as frozen too. Otherwise a legitimately
+singular known block (`S = 0`, a rank-deficient cost) is refused by a fit that
+was never going to move it.
+"""
+function _lqr_structure_flags(sm::LQRStateModel, fit_structure::Bool)
+    fit_structure && return sm.fit_flags
+    return LQRFitFlags(;
+        A=false, S=false, Qc=false, h=false, Bu=false, Gref=false, terminal=false
+    )
 end
 
 """
@@ -2319,7 +2346,9 @@ function _lqr_state_mstep!(
         return nothing
     end
     _fill_mixed_blocks!(hs, sm)
-    ctx = _LQRMStepCtx(hs, sm, lds.fit_bool[4])
+    ctx = _LQRMStepCtx(
+        hs, sm, lds.fit_bool[4]; flags=_lqr_structure_flags(sm, lds.fit_bool[3])
+    )
     _lqr_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
     lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
     refresh!(sm)

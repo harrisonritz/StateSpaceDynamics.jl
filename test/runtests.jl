@@ -650,6 +650,18 @@ using SSDTest
             test_slds_lqr_terminal_warmup()
         end
 
+        include("LinearDynamicalSystems/LQRReviewRegressions.jl")
+        @testset "Inverse-LQR review regressions" begin
+            test_lqr_review_qc_alias_rejected()
+            test_lqr_review_whole_freeze_singular()
+            test_lqr_review_short_trials()
+            test_lqr_review_grouped_loglikelihood()
+            test_lqr_review_simulate_causal_noise()
+            test_slds_lqr_review_layout_checked_before_conditioning()
+            test_slds_review_poisson_exact_moment()
+            test_slds_lqr_review_conditional_score_halves()
+        end
+
         include("LinearDynamicalSystems/SLDSBoundaries.jl")
         @testset "SLDS boundaries (exit bridges, entry priors, conditioning)" begin
             test_bridge_forward_backward_exact()
