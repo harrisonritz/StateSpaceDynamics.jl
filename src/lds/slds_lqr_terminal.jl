@@ -12,12 +12,23 @@ That makes the reported score
 
     ELBO(y, terminal = 0)  −  ELBO-hat(terminal = 0)
 
-a difference of two bounds, not a bound itself. It is still the right thing to
-compare across plant dimensions and costate gauges — the confounds the joint
-score carries are removed by the subtraction whether or not either term is
-tight — but it is no longer a quantity anyone should call a likelihood. Both
-halves are therefore reported separately: see `terminal_logz` and the
-`terminal_logz` field `smooth` returns.
+a difference of two bounds, not a bound itself. Writing `δ_y` and `δ_0` for the
+two variational gaps, the score is `log p(y | terminal = 0) − δ_y + δ_0`: its
+error has no fixed sign, and it can exceed the exact conditional density — an
+exact enumeration over all `K^T` paths of a two-regime, five-step model finds
+it 0.35 nats above, with the data-side gap at 0.001 and the probe's at 0.35, all
+factors Gaussian. Raising `_SLQR_PROBE_ITERS` does not close that: it is the gap
+of the variational family (one Gaussian path plus a separate chain, rather than
+the path-dependent Gaussian mixture), not unfinished optimization.
+
+What the subtraction does remove is the *systematic* part of the joint score's
+confounds — the terminal density of an unread plant dimension, the `log|c|`
+drift under a costate rescaling — to the extent the two bounds are equally tight
+in those directions. It does not make scores of models with different regime
+counts, dimensions or noise models comparable as evidence: a change that loosens
+the probe's bound raises the score. Both halves are therefore reported
+separately: see `terminal_logz` and the `terminal_logz` / `elbo_joint` fields
+`smooth` returns, and select models on held-out predictive scores.
 
 `log p(terminal = 0 | θ)` factorizes over trials given the chain, and reads only
 the state side. So a `depends_on` grouping that splits the state parameters — a

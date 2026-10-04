@@ -27,6 +27,7 @@ function _prepare_lqr!(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::AbstractVector{Int}
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
+    _is_free(sm) || _check_qc_unaliased(sm.Qc)
     refresh!(sm)
     _lqr_lengths_ok(sm, tsteps)
     sm.observe_costate || _zero_costate_readout!(lds.obs_model, _plant_dim(sm))
@@ -604,6 +605,14 @@ transition read straight off the model and has no place for the terminal factor,
 neither of which holds here. Instead this is the ELBO at the exact posterior —
 identical to the marginal likelihood for a linear-Gaussian model — with the
 parameter log-priors removed, so it is a likelihood and not a MAP objective.
+
+A model with parameter groups (`depends_on`, declared on the model or passed
+here) is scored under each group's own parameters, exactly as [`elbo`](@ref)
+scores it, and each distinct parameter version's prior is removed once. With no
+priors the two agree.
+
+Under `condition_terminal` this is `log p(y | terminal = 0)`, the conditional
+likelihood the fit maximizes.
 """
 function StatsAPI.loglikelihood(
     lds::LinearDynamicalSystem{T,S,O},
@@ -611,8 +620,9 @@ function StatsAPI.loglikelihood(
     ux0=nothing,
     ux=nothing,
     uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
-    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy, depends_on=depends_on)
 end
 
 #=
@@ -621,16 +631,42 @@ specificity, so this method has to match it there — otherwise the two are
 ambiguous, each more specific in a different argument.
 =#
 function StatsAPI.loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y::NamedTuple; ux0=nothing, ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O},
+    y::NamedTuple;
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:CompositeObservationModel{T,true}}
-    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy)
+    return _lqr_loglikelihood(lds, y; ux0=ux0, ux=ux, uy=uy, depends_on=depends_on)
 end
 
 function _lqr_loglikelihood(
-    lds::LinearDynamicalSystem{T,S,O}, y; ux0=nothing, ux=nothing, uy=nothing
+    lds::LinearDynamicalSystem{T,S,O},
+    y;
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+    depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
+    _reject_spline_lqr(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     _prepare_lqr!(lds, data.tsteps)
+    #=
+    The same grouping `elbo` resolves, so the two score the same model. The
+    grouped ELBO adds each distinct parameter version's prior once (by array
+    identity), and the same two helpers remove exactly that amount here.
+    =#
+    grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    if grp !== nothing
+        sws_pool = _grouped_sws_pool(lds, data)
+        state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
+        full = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
+        return full - _grouped_state_prior_logdensity(state.cell_lds, grp.cell_slot, T) -
+               _grouped_obs_prior_logdensity(
+            state.cell_lds[1], state.cell_lds, grp.cell_slot, T
+        )
+    end
     tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
     sws_pool = _lqr_sws_pool(lds, data)
     hs = _initialize_td_sufficient_statistics(T, lds, data.tsteps)
@@ -912,7 +948,12 @@ function _grouped_state_mstep!(
     total for the rest — the same layout a partial tie across discrete states
     uses, and the same single solve. =#
     ctx = _LQRMStepCtx(
-        sufs, sms, _lqr_cell_slots(sms, slots[_G_AB]), slots[_G_Q], lds1.fit_bool[4]
+        sufs,
+        sms,
+        _lqr_cell_slots(sms, slots[_G_AB]),
+        slots[_G_Q],
+        lds1.fit_bool[4];
+        flags=_lqr_structure_flags(lds1.state_model, lds1.fit_bool[3]),
     )
     _lqr_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
     lds1.fit_bool[4] && _lqr_noise_mstep!(ctx)

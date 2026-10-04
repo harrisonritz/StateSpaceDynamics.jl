@@ -808,15 +808,15 @@ function _lqr_conditional_problem(
     score_extra=nothing,
 ) where {T<:Real}
     sms = [lds.state_model for lds in ldss]
+    #= Every caller — ungrouped, `depends_on`, switching, grouped switching —
+    funnels through here, and everything below reads its switches off
+    `ldss[1]`; refuse a set that disagrees before anything is written. =#
+    _check_lqr_joint_layout(ldss, collect(eachindex(ldss)); conditional=true)
     d, n = _state_latent_dim(sms[1]), _plant_dim(sms[1])
     initkey = isempty(sms[1].B0) ? :x0 : :B0
     q0 = size(_initial_coefficients(sms[1]), 2)
     fit = ldss[1].fit_bool
-    flags = if fit[3]
-        sms[1].fit_flags
-    else
-        LQRFitFlags(; A=false, S=false, Qc=false, h=false, Bu=false, Gref=false, terminal=false)
-    end
+    flags = _lqr_structure_flags(sms[1], fit[3])
     probe_weight = _terminal_probe_weight(backend)
     for (hs, sm) in zip(sufs, sms)
         _fill_mixed_blocks!(hs, sm)

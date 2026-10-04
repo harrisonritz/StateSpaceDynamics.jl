@@ -2015,7 +2015,10 @@ function test_SLDS_smooth_elbo_monotone(; rng=MersenneTwister(0xACE8))
 end
 
 function test_SLDS_cov_correction_matches_elbo_hessian(; rng=MersenneTwister(0xACEF))
-    # The weighted per-factor corrections must equal elbo!'s ½ tr(HΣ) term.
+    #= The weighted per-factor corrections must equal what the ELBO adds to the
+    plug-in: elbo!'s ½ tr(HΣ) term plus, for a Poisson emission, the top-up from
+    the second-order expansion to the exact lognormal moment. The discrete update
+    and the reported score then read the same expectation. =#
     K = 2
     latent_dim = 2
     obs_dim = 3
@@ -2075,6 +2078,7 @@ function test_SLDS_cov_correction_matches_elbo_hessian(; rng=MersenneTwister(0xA
 
         from_hessian = 0.0
         from_correction = 0.0
+        from_moment = 0.0
         for trial in 1:ntrials
             t1 = trial == 1 ? 1 : seq_ends[trial - 1] + 1
             t2 = seq_ends[trial]
@@ -2107,11 +2111,26 @@ function test_SLDS_cov_correction_matches_elbo_hessian(; rng=MersenneTwister(0xA
                 )
                 for t in 1:Tsteps
                     from_correction += w[k, t] * c[t]
+                    from_moment +=
+                        w[k, t] * StateSpaceDynamics._emission_moment_excess(
+                            slds.LDSs[k].obs_model,
+                            fs.x_smooth,
+                            y_t,
+                            t,
+                            uy_t,
+                            view(fs.p_smooth, :, :, t),
+                        )
                 end
             end
         end
 
-        @test isapprox(from_correction, from_hessian; rtol=1e-10)
+        @test isapprox(from_correction, from_hessian + from_moment; rtol=1e-10)
+        # Exact for a quadratic emission; strictly below the expansion otherwise.
+        if make_lds === _make_gaussian_lds_dense
+            @test from_moment == 0
+        else
+            @test from_moment < 0
+        end
     end
     return nothing
 end
