@@ -1789,7 +1789,7 @@ function _collect_slds_smooth_output(
     p,
     total_elbo,
     trial_elbo,
-    _,
+    ::Any,               # not `_`: Julia 1.10 cannot lower `_` beside keywords
     terminal_logz,
     converged,
     newton_unconverged,
