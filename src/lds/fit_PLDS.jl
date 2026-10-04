@@ -374,7 +374,7 @@ function gradient_observation_model!(
                 d,
                 D_obs,
                 fs.x_smooth,
-                fs.p_smooth,
+                smoothed_covariances(fs, sws.agg.p_smooth_shared),
                 y[k],
                 isnothing(uy) ? nothing : uy[k],
                 isnothing(w) ? nothing : w[k],
@@ -457,7 +457,12 @@ function _poisson_q_obs_total(
         for trial in lo:hi
             fs = tfs[trial]
             per_trial[trial] = Q_obs!(
-                sws, plds, fs.x_smooth, fs.p_smooth, y[trial], uy[trial]
+                sws,
+                plds,
+                fs.x_smooth,
+                smoothed_covariances(fs, sws.agg.p_smooth_shared),
+                y[trial],
+                uy[trial],
             )
         end
         return nothing
@@ -607,14 +612,32 @@ function smooth!(
     hessian!(sws, lds, x, y, uy)
     _negate_blocks!(btd, tsteps)
 
+    #=
+    A compact `fs` (see `FilterSmooth`) has no per-step storage of its own: the
+    inverse is written into the workspace's covariance buffers, then packed, and
+    the lag-one blocks are kept only as their sum — all the dynamics M-step and
+    the ELBO read of them.
+    =#
+    compact = is_compact(fs)
+    P = compact ? view(sws.agg.p_smooth_shared, :, :, 1:tsteps) : fs.p_smooth
+    P_lag = compact ? view(sws.agg.p_smooth_tt1_shared, :, :, 1:tsteps) : fs.p_smooth_tt1
+
     logdet_precision = block_tridiagonal_inverse_logdet!(
-        fs.p_smooth, fs.p_smooth_tt1, neg_sub_v, neg_diag_v, neg_super_v, btd
+        P, P_lag, neg_sub_v, neg_diag_v, neg_super_v, btd
     )
 
     fs.entropy = gaussian_entropy_from_logdet(logdet_precision, n_active)
 
     @views for i in 1:tsteps
-        Symmetrize!(fs.p_smooth[:, :, i])
+        Symmetrize!(P[:, :, i])
+    end
+
+    if compact
+        _pack_covariances!(fs.p_packed, P, tsteps)
+        fill!(fs.xcov_sum, zero(T))
+        @views for t in 2:tsteps
+            fs.xcov_sum .+= P_lag[:, :, t]
+        end
     end
 
     return fs
@@ -817,7 +840,9 @@ function elbo(
             state, grp, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
         )
     end
-    tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
+    tfs = initialize_FilterSmooth(
+        plds, data.tsteps; compact=_compact_posteriors(plds)
+    )::TrialFilterSmooth{T}
     npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
@@ -1040,6 +1065,23 @@ function fit!(
 end
 
 """
+    _compact_posteriors(lds) -> Bool
+
+Whether a Laplace fit of `lds` may keep its per-trial posteriors in the compact
+layout (`FilterSmooth`'s "Compact posterior storage"): true for a plain
+`GaussianStateModel` under a non-conjugate emission, whose E-step, M-step and
+ELBO read the smoothed covariances only per step through `smoothed_covariances`
+and the lag-one covariances only as a sum. State models whose M-step reads the
+lag-one covariances per step (the inverse-LQR models) keep the full layout.
+"""
+_compact_posteriors(::LinearDynamicalSystem) = false
+function _compact_posteriors(
+    ::LinearDynamicalSystem{T,<:GaussianStateModel{T},<:NonQuadraticEmission{T}}
+) where {T<:Real}
+    return true
+end
+
+"""
     _fit_laplace!(plds, data; max_iter, tol, progress, newton_max_iter, newton_tol)
 
 The ungrouped Laplace-EM loop, split out from `fit!` so a state model with its
@@ -1062,7 +1104,9 @@ function _fit_laplace!(
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
 
-    tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
+    tfs = initialize_FilterSmooth(
+        plds, data.tsteps; compact=_compact_posteriors(plds)
+    )::TrialFilterSmooth{T}
 
     npool = Threads.maxthreadid()
     sws_pool = [

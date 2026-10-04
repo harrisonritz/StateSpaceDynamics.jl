@@ -175,7 +175,13 @@ function _update_observation_model_lbfgs!(
             # `x_smooth` is the same value as `E_z` for a Gaussian state model
             # — see `gradient_observation_model!` for context.
             acc += Q_obs!(
-                sws, plds, fs.x_smooth, fs.p_smooth, y[trial], uy_trial; weights=weights
+                sws,
+                plds,
+                fs.x_smooth,
+                smoothed_covariances(fs, sws.agg.p_smooth_shared),
+                y[trial],
+                uy_trial;
+                weights=weights,
             )
         end
 

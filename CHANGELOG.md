@@ -87,6 +87,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `LQRStateModel`, `LQRFitFlags`, and `lqr_matrix`; source files, internal
   helpers, tests, and tutorials follow the same convention. This is a complete
   API rename without compatibility aliases; model behavior is unchanged.
+- **Smaller E-step storage.** `FilterSmooth.E_zz` / `E_zz_prev` are now
+  `(0, 0, 0)` stubs until `sufficient_statistics!` materializes them (no fit
+  path reads them; they were half of a fit's `4·latent_dim²·T` posterior
+  storage). A Laplace fit of a plain `GaussianStateModel` (Poisson or composite
+  emission, grouped or not) also keeps its posteriors compact: each `Pₜ` packed
+  as its lower triangle in `p_packed`, and the lag-one covariances only as their
+  sum `xcov_sum`, read through the new `smoothed_covariances`. Together that is
+  `latent_dim(latent_dim+1)/2·T` numbers per trial instead of `4·latent_dim²·T`
+  — at `latent_dim = 128` and 500 000 bins, 33 GB instead of 262 GB. Fits are
+  unchanged (bit-identical on the test problems). Inverse-LQR and switching
+  fits, whose M-steps read the lag-one covariances per step, keep the full
+  layout; `smooth` still returns full covariances.
 - **`simulate_lqr` adds plant noise causally.** The plant noise now lands after
   the closed-loop step, `x_{t+1} = W_{t+1}(A x_t + c_t − S g_{t+1}) + ε_t`, which
   is ordinary certainty-equivalent stochastic LQR (`Cov(x_{t+1} | x_t) = Σ_xx`).
