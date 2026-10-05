@@ -326,6 +326,11 @@ function smooth!(
     (length, offset) bucket runs its own covariance pass.
     =#
     _has_cost_offsets(data) && return _smooth_offset_buckets!(lds, tfs, data, sws_pool)
+    #= Schedule boundaries make the precision depend on whether a trial crosses
+    each switch, so lengths no longer share a prefix and the batched mean pass
+    (which has no boundary terms) does not apply; the bucket path reads the
+    per-trial kernels throughout. =#
+    _has_switches(lds) && return _smooth_offset_buckets!(lds, tfs, data, sws_pool)
 
     #=
     Equal-length fast path: the BT Hessian (and its inverse) is observation-

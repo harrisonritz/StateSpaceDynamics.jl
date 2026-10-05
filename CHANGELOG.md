@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Known epoch boundaries for `LQRStateModel`: bridges, entry priors and a
+  per-regime reference gate.** A cost schedule is a switching model whose
+  switches are known, and the two boundary factors `set_boundaries!` gives a
+  switching model now attach to a schedule's switches with
+  `set_schedule_boundaries!(lds; bridges=[pos => k], entries=[pos])` (or the
+  constructor keywords of the same names). `pos` is the first schedule position
+  of the next epoch. A **bridge** ends the epoch being left with a terminal factor
+  `λ_pos = Qc[k] (x_pos − r_pos) + hf` against a cost of its own (the trial end's
+  `Σf`, `hf`), conditioned on under `condition_terminal` exactly like the trial's
+  end. An **entry** replaces the transition `pos → pos+1` with a fresh plan,
+  `λ ~ N(μ + K (x − r), P)` and the model's own plant row, fitted by EM (the
+  exact regression under the joint objective; against the exact normalizer
+  under the conditional one), with the structural step guarded so the entries'
+  plant row cannot lower the objective. The entry density is linear-Gaussian in
+  `(z_pos, z_{pos+1})`, so it is held as one more forward transition and the
+  smoother, the ELBO, the exact terminal normalizer and `rand` read it like any
+  other. A trial applies a boundary only where it crosses it.
+
+  `gref_gate` (`set_gref_gate!`) is a cost regime × input column mask: regime
+  `k` reads the reference `Gref D_k u`, so one `Gref` holds a separate map per
+  regime (or per group of regimes) without the inputs being zeroed per bin —
+  which could not express a bridge, whose bin feeds two references at once.
+
+  Models without switches or a gate are untouched: every kernel checks first and
+  keeps its original path. `lqr_riccati_sequence` / `simulate_lqr` refuse a
+  model with switches, and a switching model refuses members carrying them.
+
 - **Per-trial cost-schedule offsets for `LQRStateModel`.** A cost schedule is one
   vector indexed by timestep, so it used to say the same thing about bin `t` of
   every trial — wrong whenever trials start at different times relative to the

@@ -101,6 +101,11 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     from the trial's end, so the offset is part of what makes two designs the
     same. Empty for statistics that never saw one (every switching unit). =#
     const terminal_offsets::Vector{Int}
+    #= One block per `sm.switches` entry (unused unless it carries an entry
+    prior): `Σ E[ω ωᵀ]` over the trials that cross it, `ω = [z_b; z_{b+1}; 1; u_b]`,
+    and their count. The entry transition is in these and in no regime's `zz`. =#
+    const entry_ww::Vector{Matrix{T}}
+    const entry_n::Vector{T}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -153,6 +158,8 @@ function _wrap_lqr_suff_stats(
         T[],
         Vector{T}[],
         Int[],
+        [zeros(T, 2d + 1 + m, 2d + 1 + m) for _ in sm.switches],
+        zeros(T, length(sm.switches)),
     )
 end
 
@@ -168,6 +175,7 @@ aggregator do the mean-side work with one GEMM per run instead of one rank-1
 update per timestep.
 """
 function _regime_runs(sm::LQRStateModel, tsteps::Int)
+    isempty(sm.switches) || return _regime_runs_switched(sm, tsteps)
     runs = Tuple{Int,Int,Int}[]
     tsteps >= 2 || return runs
     t0 = 1
@@ -256,6 +264,8 @@ function _aggregate_lqr_stats!(
         fill!(hs.term_zz[k], zero(T))
         hs.term_n[k] = zero(T)
     end
+    foreach(Z -> fill!(Z, zero(T)), hs.entry_ww)
+    fill!(hs.entry_n, zero(T))
     function accumulate!(slot, chunk)
         p = _zero!(partials[slot])
         for j in chunk
@@ -281,6 +291,10 @@ function _aggregate_lqr_stats!(
             hs.nk[k] += p.nk[k]
             hs.term_zz[k] .+= p.term_zz[k]
             hs.term_n[k] += p.term_n[k]
+        end
+        for e in eachindex(hs.entry_ww)
+            hs.entry_ww[e] .+= p.entry_ww[e]
+            hs.entry_n[e] += p.entry_n[e]
         end
         return nothing
     end
@@ -309,6 +323,8 @@ struct _LQRStatsPartial{T<:Real}
     nk::Vector{T}
     term_zz::Vector{Matrix{T}}
     term_n::Vector{T}
+    entry_ww::Vector{Matrix{T}}
+    entry_n::Vector{T}
 end
 
 function _LQRStatsPartial(hs::LQRSufficientStatistics{T}) where {T<:Real}
@@ -319,6 +335,8 @@ function _LQRStatsPartial(hs::LQRSufficientStatistics{T}) where {T<:Real}
         similar(hs.nk),
         [similar(Z) for Z in hs.term_zz],
         similar(hs.term_n),
+        [similar(Z) for Z in hs.entry_ww],
+        similar(hs.entry_n),
     )
 end
 
@@ -329,6 +347,8 @@ function _zero!(p::_LQRStatsPartial{T}) where {T}
     fill!(p.nk, zero(T))
     foreach(Z -> fill!(Z, zero(T)), p.term_zz)
     fill!(p.term_n, zero(T))
+    foreach(Z -> fill!(Z, zero(T)), p.entry_ww)
+    fill!(p.entry_n, zero(T))
     return p
 end
 
@@ -421,6 +441,7 @@ function _lqr_stats_trial!(
         end
         acc.term_n[kT] += w
     end
+    isempty(sm.switches) || _lqr_switch_stats_trial!(acc, sm, fs, ux, d, m, w, with_cov)
     return nothing
 end
 
@@ -1081,6 +1102,10 @@ function _pool_lqr_stats(sufs::AbstractVector, idx::AbstractVector{Int})
             out.Omega[k] .+= s.Omega[k]
             out.term_n[k] += s.term_n[k]
         end
+        for e in eachindex(out.entry_ww)
+            out.entry_ww[e] .+= s.entry_ww[e]
+            out.entry_n[e] += s.entry_n[e]
+        end
     end
     return out
 end
@@ -1642,6 +1667,7 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     xr, lr = 1:n, (n + 1):d
     ur = (d + 1):(d + 1 + m)
     terminal = ctx.terminal
+    gate = ctx.sms[1].gref_gate
     for (ui, u) in enumerate(ctx.units)
         A = ctx.A[u.v[_LQR_BLOCK_A]]
         S = ctx.S[u.v[_LQR_BLOCK_S]]
@@ -1673,7 +1699,13 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
                 if m > 0
                     Bcol = Th[:, (d + 2):(d + 1 + m)]
                     Bcol .= ctx.Bu[u.v[_LQR_BLOCK_B]]
-                    mul!(Bcol[lr, :], Qs[k], ctx.Gref[u.v[_LQR_BLOCK_G]], -one(T), one(T))
+                    mul!(
+                        Bcol[lr, :],
+                        Qs[k],
+                        _gated(ctx.Gref[u.v[_LQR_BLOCK_G]], gate, k),
+                        -one(T),
+                        one(T),
+                    )
                 end
             end
         end
@@ -1689,8 +1721,11 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
                     end
                     Psi[:, d + 1] .= .-ctx.hf[u.v[_LQR_BLOCK_F]]
                     # Terminal reference: the residual carries +Q_f G_r u_T.
-                    m > 0 &&
-                        mul!(Psi[:, (d + 2):(d + 1 + m)], Qf, ctx.Gref[u.v[_LQR_BLOCK_G]])
+                    m > 0 && mul!(
+                        Psi[:, (d + 2):(d + 1 + m)],
+                        Qf,
+                        _gated(ctx.Gref[u.v[_LQR_BLOCK_G]], gate, k),
+                    )
                 end
             end
         end
@@ -2041,6 +2076,7 @@ function _lqr_fg!(
     Gk = ctx.tmp_dr2         # W (Θ Z − X)
     PO = ctx.tmp_nr
     GP = ctx.tmp_nr2
+    gate = ctx.sms[1].gref_gate
     for (ui, u) in enumerate(ctx.units)
         ctx.active_q[u.q] || continue
         if u.hold
@@ -2073,10 +2109,22 @@ function _lqr_fg!(
                     =#
                     dBk = Gk[:, (d + 2):(d + 1 + m)]
                     ctx.dB[vB] .+= dBk
+                    #= Under a reference gate regime `k` reads `G_r D_k`, so its
+                    share of `∂G_r` keeps only the columns `D_k` opens. =#
                     mul!(
-                        ctx.dQ[vQ][k], dBk[lr, :], transpose(ctx.Gref[vG]), -one(T), one(T)
+                        ctx.dQ[vQ][k],
+                        dBk[lr, :],
+                        transpose(_gated(ctx.Gref[vG], gate, k)),
+                        -one(T),
+                        one(T),
                     )
-                    mul!(ctx.dG[vG], ctx.Qc[vQ][k], dBk[lr, :], -one(T), one(T))
+                    mul!(
+                        ctx.dG[vG],
+                        ctx.Qc[vQ][k],
+                        _gated(dBk[lr, :], gate, k),
+                        -one(T),
+                        one(T),
+                    )
                 end
             end
         end
@@ -2097,8 +2145,16 @@ function _lqr_fg!(
                     ctx.dQ[vQ][k] .-= GP[:, xr]
                     if m > 0
                         dPu = GP[:, (d + 2):(d + 1 + m)]
-                        mul!(ctx.dQ[vQ][k], dPu, transpose(ctx.Gref[vG]), one(T), one(T))
-                        mul!(ctx.dG[vG], ctx.Qc[vQ][k], dPu, one(T), one(T))
+                        mul!(
+                            ctx.dQ[vQ][k],
+                            dPu,
+                            transpose(_gated(ctx.Gref[vG], gate, k)),
+                            one(T),
+                            one(T),
+                        )
+                        mul!(
+                            ctx.dG[vG], ctx.Qc[vQ][k], _gated(dPu, gate, k), one(T), one(T)
+                        )
                     end
                     ctx.dhf[u.v[_LQR_BLOCK_F]] .-= GP[:, d + 1]
                 end
@@ -2362,6 +2418,20 @@ function _lqr_state_mstep!(
         return nothing
     end
     _fill_mixed_blocks!(hs, sm)
+    if _has_entries(sm)
+        #= Entry priors first (an exact update), then the structure, guarded by
+        the score that also counts the entries' plant row. =#
+        _lqr_entry_update!([sm], [hs])
+        _lqr_entry_guarded([lds], [hs]) do
+            ctx = _LQRMStepCtx(
+                hs, sm, lds.fit_bool[4]; flags=_lqr_structure_flags(sm, lds.fit_bool[3])
+            )
+            _lqr_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
+            lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
+        end
+        refresh!(sm)
+        return nothing
+    end
     ctx = _LQRMStepCtx(
         hs, sm, lds.fit_bool[4]; flags=_lqr_structure_flags(sm, lds.fit_bool[3])
     )
@@ -2709,7 +2779,7 @@ function _lqr_current_residuals(
             if m > 0
                 Bcol = Th[:, (d + 2):reg]
                 Bcol .= sm.Bu
-                mul!(Bcol[lr, :], sm.Qc[k], sm.Gref, -one(T), one(T))
+                mul!(Bcol[lr, :], sm.Qc[k], _gref_for(sm, k), -one(T), one(T))
             end
         end
         TX = Th * transpose(hs.Xv[k])
@@ -2730,7 +2800,7 @@ function _lqr_current_residuals(
                     Psi[i, n + i] = one(T)
                 end
                 Psi[:, d + 1] .= .-sm.hf
-                m > 0 && mul!(Psi[:, (d + 2):reg], sm.Qc[k], sm.Gref)
+                m > 0 && mul!(Psi[:, (d + 2):reg], sm.Qc[k], _gref_for(sm, k))
             end
             Rf .+= Psi * hs.Omega[k] * transpose(Psi)
         end
@@ -2816,6 +2886,8 @@ function _lqr_joint_Q_state!(
         Σf_PD = PDMat(Symmetrize!(Matrix{T}(sm.Σf)))
         Q_val += T(-0.5) * (Nf * (T(n) * log2π + logdet(Σf_PD)) + tr(Σf_PD \ Rf))
     end
+    # Entry transitions, which the regime statistics left out.
+    _has_entries(sm) && (Q_val += _lqr_entry_Q(sm, hs))
 
     return Q_val
 end

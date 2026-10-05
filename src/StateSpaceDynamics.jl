@@ -74,6 +74,7 @@ include("lds/fit_slds_spline.jl")       # ... and for a warped emission in an SL
 # Inverse-LQR M-step + driver glue. After the drivers, since it specialises
 # their `estep!` / `elbo!` / `mstep!` / `fit!` hooks.
 include("lds/lqr_mstep.jl")
+include("lds/lqr_switches.jl")   # known epoch boundaries: bridges, entries, gated references
 include("lds/slds_lqr.jl")     # inverse-LQR discrete states in an SLDS
 include("lds/fit_LQR.jl")
 include("lds/lqr_terminal.jl")
@@ -93,6 +94,7 @@ export InvalidProbabilityVectorError, NumericalStabilityError
 # Models and Types
 export ProbabilisticPCA, SLDS, LinearDynamicalSystem
 export set_boundaries!
+export set_schedule_boundaries!, set_gref_gate!, LQRSwitch
 export AbstractStateModel, AbstractGaussianStateModel, AbstractObservationModel
 export GaussianStateModel, GaussianObservationModel, PoissonObservationModel
 export SplineGaussianObservationModel

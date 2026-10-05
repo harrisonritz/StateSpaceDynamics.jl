@@ -98,6 +98,8 @@ Requires `t ≥ 2`.
 ) where {T<:Real,T0<:Real,S<:LQRStateModel{T0},O<:AbstractObservationModel{T0}}
     sm = _lqr(lds)
     c = sm.cache
+    e = _entry_into(sm, t)
+    e == 0 || return _entry_residual!(out, c.switch[e], x, t, ux)
     k = _regime(sm, t - 1)
     @views mul!(out, c.M[k], x[:, t - 1])
     if ux !== nothing && size(c.Bfwd[k], 2) > 0
@@ -164,8 +166,21 @@ function state_loglikelihood!(
         cc.cP0 - T(0.5) * sum(abs2, dxt)
     else
         _transition_residual!(tmp, lds, x, t, ux)
-        _whiten!(c.Qfwd.chol, tmp)
-        T(c.cQ) - T(0.5) * sum(abs2, tmp)
+        e = _entry_into(sm, t)
+        if e == 0
+            _whiten!(c.Qfwd.chol, tmp)
+            T(c.cQ) - T(0.5) * sum(abs2, tmp)
+        else
+            ec = c.switch[e]
+            _whiten!(ec.Q.chol, tmp)
+            T(ec.cQ) - T(0.5) * sum(abs2, tmp)
+        end
+    end
+
+    #= A bridge at `t` (only on a model with schedule boundaries). =#
+    if !isempty(sm.switches)
+        kb = _bridge_at(sm, t, tsteps)
+        kb == 0 || (total += _factor_loglik!(tmp, sm, x, t, kb, ux))
     end
 
     if sm.terminal && t == tsteps
@@ -201,6 +216,7 @@ function _state_gradient!(
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
     sm = _lqr(lds)
+    isempty(sm.switches) || return _state_gradient_switched!(grad, ws, lds, x, ux)
     c = sm.cache
 
     neg_P0_inv = ws.consts.x_t     # −P0⁻¹ (initial-state term is model-agnostic)
@@ -253,6 +269,7 @@ adds `−Λfᵀ Σf⁻¹ Λf` to the last diagonal block.
 function _state_hessian_blocks!(
     btd, cc::SmoothConstants{T}, sm::LQRStateModel, tsteps::Int
 ) where {T<:Real}
+    isempty(sm.switches) || return _state_hessian_switched!(btd, cc, sm, tsteps)
     c = sm.cache
     for i in 1:(tsteps - 1)
         k = _regime(sm, i)

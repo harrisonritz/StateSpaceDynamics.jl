@@ -92,6 +92,7 @@ smooth, a score and `rand` all see the same, valid model.
 """
 function _prepare_slds!(slds::SLDS, tsteps::AbstractVector{Int})
     _validate_slds_structure(slds)
+    _refuse_slds_switches(slds)
     _match_costate_readout!(slds)
     for lds in slds.LDSs
         _prepare_slds_regime!(lds, tsteps)

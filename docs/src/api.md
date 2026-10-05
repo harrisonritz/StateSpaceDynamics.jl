@@ -123,6 +123,12 @@ set_boundaries!
 ```
 
 ```@docs
+set_schedule_boundaries!
+set_gref_gate!
+LQRSwitch
+```
+
+```@docs
 banded_transition
 banded_transition_prior
 median_dwell_stay
