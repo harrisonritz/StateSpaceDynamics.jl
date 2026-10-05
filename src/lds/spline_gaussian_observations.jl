@@ -548,7 +548,9 @@ Under an `IWPrior` the restricted density is
 `∏_j R_jj^{-(ν+p+1)/2} exp(-½ Ψ_jj / R_jj)`, an independent inverse-gamma per
 channel, whose MAP is `R_jj = (Ψ_jj + S_jj) / (ν + N + p + 1)` — the same
 denominator as [`iw_map`](@ref), which is why the two agree when `S` and `Ψ`
-happen to be diagonal.
+happen to be diagonal. A normalized matrix-normal `CD_prior` restricted to a
+diagonal `R` contributes `∏_j R_jj^{-q/2}`, so `N` here is the effective count
+(bins plus `q`) exactly as for the full update.
 """
 function _finalize_R_diag!(
     glds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
@@ -594,10 +596,11 @@ function _spline_update_R!(
     fill!(S_res, zero(T))
     _accumulate_obs_scatter!(S_res, glds, suf, sws)
     _accumulate_cd_prior_scatter!(S_res, glds, sws)
+    N = T(suf.obs_n) + T(_cd_prior_width(glds))
     if om.R_structure === :diagonal
-        _finalize_R_diag!(glds, S_res, T(suf.obs_n))
+        _finalize_R_diag!(glds, S_res, N)
     else
-        _finalize_R!(glds, S_res, T(suf.obs_n))
+        _finalize_R!(glds, S_res, N)
     end
     _apply_R_floor!(glds.obs_model.R, om.R_floor)
     return nothing

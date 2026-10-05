@@ -866,6 +866,7 @@ function _grouped_update_P0!(
         end
         for u in _distinct_by_slot(slots_x0, units)
             _accumulate_x0_prior_scatter!(S0, ldss[u])
+            N += T(_x0_prior_width(ldss[u]))
         end
         Symmetrize!(S0)
         _finalize_P0!(ldss[units[1]], S0, N)
@@ -941,12 +942,38 @@ function _share_slot_obs!(ldss::AbstractVector, units::AbstractVector{Int})
     return nothing
 end
 
+"""
+    _owned_prior_cols(tied_cols, width, K, nunits) -> Vector or nothing
+
+Which columns of a stacked regression's matrix-normal prior each of the
+`nunits` regime-major units prices, when the regression is tied across the `K`
+discrete states on `tied_cols` only.
+
+A partial tie fits the shared columns once, under the first regime's prior and
+noise, and each regime's free columns under its own (see
+[`_partial_tied_regression`](@ref)). The prior is then one factor on the shared
+block plus one per regime on its free block, and the covariance update and the
+ELBO must count it the same way: the first regime's units own every column, the
+others only their free ones. With nothing tied, or everything, each unit's
+regression is one whole matrix under one prior, and this returns `nothing`.
+"""
+function _owned_prior_cols(tied_cols::AbstractVector{Int}, width::Int, K::Int, nunits::Int)
+    (isempty(tied_cols) || length(tied_cols) == width) && return nothing
+    ncells = nunits ÷ K
+    free = setdiff(1:width, tied_cols)
+    return Union{Nothing,Vector{Int}}[u <= ncells ? nothing : free for u in 1:nunits]
+end
+
+@inline _unit_prior_cols(::Nothing, ::Int) = nothing
+@inline _unit_prior_cols(cols::AbstractVector, u::Int) = cols[u]
+
 function _grouped_update_Q!(
     ldss::AbstractVector,
     sufs::AbstractVector,
     slots::AbstractVector{Int},
     slots_ab::AbstractVector{Int},
-    sws::SmoothWorkspace{T},
+    sws::SmoothWorkspace{T};
+    prior_cols=nothing,
 ) where {T<:Real}
     ldss[1].fit_bool[_G_Q] || return nothing
     S_res = sws.reg.Q_sum
@@ -958,7 +985,9 @@ function _grouped_update_Q!(
             N += T(sufs[u].dyn_n)
         end
         for u in _distinct_by_slot(slots_ab, units)
-            _accumulate_ab_prior_scatter!(S_res, ldss[u], sws)
+            cols = _unit_prior_cols(prior_cols, u)
+            _accumulate_ab_prior_scatter!(S_res, ldss[u], sws, cols)
+            N += T(_ab_prior_width(ldss[u], cols))
         end
         _finalize_Q!(ldss[units[1]], S_res, N)
     end
@@ -1019,6 +1048,7 @@ function _grouped_update_R!(
     slots_cd::AbstractVector{Int},
     sws::SmoothWorkspace{T};
     unit_sws::Union{Nothing,AbstractVector}=nothing,
+    prior_cols=nothing,
 ) where {T<:Real}
     ldss[1].fit_bool[_G_R] || return nothing
     for units in _units_by_slot(slots)
@@ -1032,7 +1062,9 @@ function _grouped_update_R!(
             N += T(sufs[u].obs_n)
         end
         for u in _distinct_by_slot(slots_cd, units)
-            _accumulate_cd_prior_scatter!(S_res, ldss[u], _unit_ws(unit_sws, sws, u))
+            cols = _unit_prior_cols(prior_cols, u)
+            _accumulate_cd_prior_scatter!(S_res, ldss[u], _unit_ws(unit_sws, sws, u), cols)
+            N += T(_cd_prior_width(ldss[u], cols))
         end
         _finalize_R!(ldss[units[1]], S_res, N)
     end
@@ -1126,11 +1158,16 @@ function _grouped_obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O},
     unit_ldss::AbstractVector,
     cell_slot::AbstractVector{Vector{Int}},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
     ord = _obs_slot_ordinals(lds.obs_model)[1]
     return _grouped_gaussian_obs_prior_logdensity(
-        unit_ldss, cell_slot[ord[1]], cell_slot[ord[2]], T
+        unit_ldss,
+        cell_slot[ord[1]],
+        cell_slot[ord[2]],
+        T;
+        cd_cols=(cd_cols === nothing ? nothing : cd_cols(nothing)),
     )
 end
 
@@ -1138,7 +1175,8 @@ function _grouped_obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O},
     unit_ldss::AbstractVector,
     cell_slot::AbstractVector{Vector{Int}},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:PoissonObservationModel{T}}
     ord = _obs_slot_ordinals(lds.obs_model)[1]
     return _grouped_poisson_obs_prior_logdensity(unit_ldss, cell_slot[ord[1]], T)
@@ -1148,13 +1186,18 @@ function _grouped_obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O},
     unit_ldss::AbstractVector,
     cell_slot::AbstractVector{Vector{Int}},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:CompositeObservationModel{T}}
     ords = _obs_slot_ordinals(lds.obs_model)
     total = zero(T)
     for (m, key) in enumerate(_obs_keys(lds.obs_model))
         total += _member_obs_prior_logdensity(
-            _member_unit_views(unit_ldss, key), cell_slot, ords[m], T
+            _member_unit_views(unit_ldss, key),
+            cell_slot,
+            ords[m],
+            T;
+            cd_cols=(cd_cols === nothing ? nothing : cd_cols(key)),
         )
     end
     return total
@@ -1164,10 +1207,11 @@ function _member_obs_prior_logdensity(
     views::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
     cell_slot::AbstractVector{Vector{Int}},
     ord::UnitRange{Int},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:GaussianObservationModel{T}}
     return _grouped_gaussian_obs_prior_logdensity(
-        views, cell_slot[ord[1]], cell_slot[ord[2]], T
+        views, cell_slot[ord[1]], cell_slot[ord[2]], T; cd_cols=cd_cols
     )
 end
 
@@ -1175,7 +1219,8 @@ function _member_obs_prior_logdensity(
     views::AbstractVector{<:LinearDynamicalSystem{T,S,O}},
     cell_slot::AbstractVector{Vector{Int}},
     ord::UnitRange{Int},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real,S<:AbstractStateModel{T},O<:PoissonObservationModel{T}}
     return _grouped_poisson_obs_prior_logdensity(views, cell_slot[ord[1]], T)
 end
@@ -1324,7 +1369,7 @@ per covariance version, the MN terms once per distinct regression/covariance
 pair.
 """
 function _grouped_state_prior_logdensity(
-    ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}
+    ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}; ab_cols=nothing
 ) where {T<:Real}
     total = zero(T)
     for u in _slot_representatives(slots[_G_P0])
@@ -1346,7 +1391,14 @@ function _grouped_state_prior_logdensity(
         sm.AB_prior === nothing && continue
         D = lds.latent_dim
         W_ab = _pack_dyn_W!(Matrix{T}(undef, D, D + 1 + lds.ux_dim), lds)
-        total += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
+        cols = _unit_prior_cols(ab_cols, u)
+        if cols === nothing
+            total += mn_logprior_term(W_ab, sm.Q, sm.AB_prior)
+        else
+            total += mn_logprior_term(
+                W_ab[:, cols], sm.Q, _restrict_mn_prior(sm.AB_prior, cols)
+            )
+        end
     end
     return total
 end
@@ -1360,7 +1412,8 @@ function _grouped_gaussian_obs_prior_logdensity(
     ldss::AbstractVector,
     slots_cd::AbstractVector{Int},
     slots_r::AbstractVector{Int},
-    ::Type{T},
+    ::Type{T};
+    cd_cols=nothing,
 ) where {T<:Real}
     total = zero(T)
     for u in _slot_representatives(slots_r)
@@ -1374,10 +1427,12 @@ function _grouped_gaussian_obs_prior_logdensity(
         D = lds.latent_dim
         W_cd = _pack_obs_V!(Matrix{T}(undef, lds.obs_dim, D + 1 + lds.uy_dim), lds)
         mask = _costate_range(lds)
-        if mask === nothing
+        owned = _unit_prior_cols(cd_cols, u)
+        if mask === nothing && owned === nothing
             total += mn_logprior_term(W_cd, om.R, om.CD_prior)
         else
-            free = setdiff(axes(W_cd, 2), mask)
+            free = owned === nothing ? collect(axes(W_cd, 2)) : collect(owned)
+            mask === nothing || (free = setdiff(free, mask))
             total += mn_logprior_term(
                 W_cd[:, free], om.R, _restrict_mn_prior(om.CD_prior, free)
             )

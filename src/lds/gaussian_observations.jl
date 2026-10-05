@@ -250,23 +250,52 @@ end
 
 Add the `CD_prior` contribution `Wm Λ Wm'` (`Wm = [C d D] - M₀`) to the IW
 posterior scale of `R`. One call per distinct `[C d D]`.
+
+`cols` restricts the prior to the columns this unit owns (see
+[`_owned_prior_cols`](@ref)); `nothing` is all of them.
 """
 function _accumulate_cd_prior_scatter!(
-    S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    S_res::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    sws::SmoothWorkspace{T},
+    cols=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     CD_prior = lds.obs_model.CD_prior
     CD_prior === nothing && return S_res
     V = _pack_obs_V!(sws.reg.CD, lds)
-    Wm = V .- CD_prior.M₀
-    S_res .+= Wm * CD_prior.Λ * Wm'
+    if cols === nothing
+        Wm = V .- CD_prior.M₀
+        S_res .+= Wm * CD_prior.Λ * Wm'
+    else
+        prior = _restrict_mn_prior(CD_prior, cols)
+        Wm = V[:, cols] .- prior.M₀
+        S_res .+= Wm * prior.Λ * Wm'
+    end
     return S_res
+end
+
+"""
+    _cd_prior_width(lds) -> Int
+
+Columns `q` of `[C d D]` the `CD_prior` prices (`D + 1 + uy_dim`, fewer for an
+inverse-LQR model whose emission may not read the costate), or `0` without one:
+what each distinct emission regression adds to the `R` MAP's count under the
+normalized matrix-normal prior. See [`_x0_prior_width`](@ref).
+"""
+function _cd_prior_width(lds::LinearDynamicalSystem, cols=nothing)
+    prior = lds.obs_model.CD_prior
+    prior === nothing && return 0
+    return cols === nothing ? size(prior.Λ, 1) : length(cols)
 end
 
 """
     _finalize_R!(lds, S_res, N)
 
-Symmetrize an accumulated emission residual scatter and turn it into `R`: MLE
+Symmetrize an accumulated emission residual scatter and turn it into `R`:
 `S_res / N`, or the IW MAP under an `R_prior`.
+
+`N` is the effective count: bins plus the width of every distinct `CD_prior`
+folded into `S_res` ([`_cd_prior_width`](@ref)).
 """
 function _finalize_R!(
     lds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
@@ -295,7 +324,7 @@ function update_R!(
     fill!(S_res, zero(T))
     _accumulate_obs_scatter!(S_res, lds, suf, sws)
     _accumulate_cd_prior_scatter!(S_res, lds, sws)
-    _finalize_R!(lds, S_res, T(suf.obs_n))
+    _finalize_R!(lds, S_res, T(suf.obs_n) + T(_cd_prior_width(lds)))
     return nothing
 end
 

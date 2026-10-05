@@ -269,6 +269,7 @@ function Data(
     ref = y_seq[ref_key]
     isempty(ref) && throw(ArgumentError("y[:$ref_key] must contain at least one trial"))
     tsteps = Int[size(yt, 2) for yt in ref]
+    _check_trial_lengths(tsteps)
 
     for key in obs_keys
         yk = y_seq[key]

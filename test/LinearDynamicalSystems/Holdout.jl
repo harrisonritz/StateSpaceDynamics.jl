@@ -133,7 +133,7 @@ end
 The value recorded at iteration `k` is the held-out ELBO at the parameters the
 *training* ELBO at iteration `k` was computed from — i.e. before that
 iteration's M-step. Checked against an independent `elbo` call on a model
-fitted for `k-1` iterations.
+fitted with `max_iter = k` (`k − 1` M-steps), which returns exactly that iterate.
 """
 function test_holdout_matches_standalone_elbo()
     y_tr, y_te = _ho_gaussian_data()
@@ -141,7 +141,7 @@ function test_holdout_matches_standalone_elbo()
 
     for k in (1, 5, 12)
         ref = _ho_lds(0.5, 3)
-        k > 1 && fit!(ref, y_tr; max_iter=k - 1, progress=false)
+        fit!(ref, y_tr; max_iter=k, progress=false)
         @test isapprox(tr.test[k], elbo(ref, y_te); rtol=1e-10)
     end
 

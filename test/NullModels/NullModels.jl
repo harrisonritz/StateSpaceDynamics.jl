@@ -265,8 +265,10 @@ function test_null_mn_prior_shifts_logmap_by_mn_term(rng=MersenneTwister(10))
     null = AffineNullModel{T}(:inputs, obs_dim; input_dim=v_dim, W_prior=prior)
     fit!(null, y; inputs=v)
 
+    # The normalized matrix-normal log prior: `-(q/2) log det R` plus the quadratic.
     W = hcat(null.d, null.D)
-    expected = -0.5 * tr(null.R \ ((W .- M₀) * Λ * (W .- M₀)'))
+    q = size(W, 2)
+    expected = -0.5 * (q * logdet(null.R) + tr(null.R \ ((W .- M₀) * Λ * (W .- M₀)')))
     delta = SSD._null_logmap(null, y; inputs=v) - loglikelihood(null, y; inputs=v)
     @test delta ≈ expected atol = 1e-8
 

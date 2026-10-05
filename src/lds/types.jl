@@ -1299,6 +1299,36 @@ Workaround for JET union-split false positive on views with unbound eltype
 # ============================================================================
 
 """
+    _check_trial_lengths(tsteps)
+
+Refuse trials too short to fit or score: every state-space entry point needs at
+least two timesteps per trial.
+
+A one-bin trial has a well-defined posterior — the initial prior conditioned on
+one emission — but no transition, and the state kernels (gradient, Hessian
+blocks, sufficient statistics, the batched and bucketed smoothers) are written for
+a chain whose first and last steps differ: the first-bin gradient reads the
+transition into bin 2, and the last-bin Hessian block overwrites the prior block.
+Rather than fail with an index error deep inside one of them — or, worse, compute
+a covariance from the wrong block — the domain is stated here, at the one
+validation site every `fit!`, `smooth`, `elbo`, `loglikelihood` and held-out score
+passes through. Merge or drop single-bin trials before fitting.
+"""
+function _check_trial_lengths(tsteps::AbstractVector{<:Integer})
+    for (i, t) in enumerate(tsteps)
+        t >= 2 || throw(
+            ArgumentError(
+                "trial $i has $t timestep$(t == 1 ? "" : "s"); state-space fitting and " *
+                "scoring need at least 2 per trial (a trial without a transition " *
+                "carries no information about the dynamics). Drop or merge " *
+                "trials shorter than 2 bins.",
+            ),
+        )
+    end
+    return nothing
+end
+
+"""
     Data(lds, y; ux0=nothing, ux=nothing, uy=nothing, cost_offset=nothing)
 
 Validate observations and inputs against `lds` and canonicalize them into the
@@ -1319,7 +1349,8 @@ cost schedule: trial `i` starts `cost_offset[i]` bins into the schedule (see
 - `DimensionMismatchError` when observation or input dimensions disagree with
   the model, or input trial lengths disagree with `y`
 - `ArgumentError` when inputs are omitted for a model that requires them
-  (`ux_dim > 0` / `uy_dim > 0`)
+  (`ux_dim > 0` / `uy_dim > 0`), or when a trial has fewer than 2 timesteps
+  (see [`_check_trial_lengths`](@ref))
 """
 function Data(
     lds::LinearDynamicalSystem{T},
@@ -1343,6 +1374,7 @@ function Data(
         end
     end
     tsteps = Int[size(yt, 2) for yt in y]
+    _check_trial_lengths(tsteps)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, tsteps, T, "ux")
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, tsteps, T, lds.obs_model)
     return Data(

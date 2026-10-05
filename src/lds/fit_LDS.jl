@@ -1216,7 +1216,11 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
       trial lengths may differ
 
 # Keywords
-- `max_iter::Int=100`: maximum EM iterations
+- `max_iter::Int=100`: maximum number of scored iterations.
+  Every entry of the returned trace is the ELBO of a set of parameters, and
+  the fit stops right after scoring — on convergence or at `max_iter` — so the
+  last entry is the ELBO of the model handed back. A fit therefore runs at most
+  `max_iter − 1` M-steps (`max_iter = 1` only scores the initial model).
 - `tol::Float64=1e-6`: convergence tolerance on the ELBO change between
   iterations, absolute (in nats)
 - `rtol::Float64=0.0`: the same, relative to the ELBO's magnitude. The fit stops
@@ -1417,7 +1421,6 @@ function _fit_tridiag_grouped!(
     rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
-    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(lds, data)
     state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
@@ -1447,7 +1450,9 @@ function _fit_tridiag_grouped!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
-        if align_final && (converged || iter == max_iter)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)
@@ -1465,12 +1470,6 @@ function _fit_tridiag_grouped!(
         )
 
         prog !== nothing && next!(prog)
-
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, lds)
-        end
     end
 
     prog !== nothing && finish!(prog)
@@ -1485,7 +1484,6 @@ function _fit_tridiag!(
     rtol::Float64=0.0,
     progress::Bool=true,
     monitor=nothing,
-    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
@@ -1559,7 +1557,9 @@ function _fit_tridiag!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
-        if align_final && (converged || iter == max_iter)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)
@@ -1570,13 +1570,6 @@ function _fit_tridiag!(
 
         # print progress
         prog !== nothing && next!(prog)
-
-        # check convergence
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, lds)
-        end
     end
 
     prog !== nothing && finish!(prog)

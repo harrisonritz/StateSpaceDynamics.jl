@@ -405,6 +405,13 @@ function _fit_spline!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
 
         # CM-step 1: state parameters and the linear half of the emission.
         _spline_linear_mstep!(lds, glds, suf, sws_pool[1])
@@ -420,12 +427,6 @@ function _fit_spline!(
         )
 
         prog !== nothing && next!(prog)
-
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, lds)
-        end
     end
 
     prog !== nothing && finish!(prog)

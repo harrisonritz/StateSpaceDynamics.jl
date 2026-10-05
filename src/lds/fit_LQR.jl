@@ -218,17 +218,36 @@ end
 # The covariance update and displayed MAP objective must use the same restricted
 # prior as the constrained coefficient update above.
 function _accumulate_cd_prior_scatter!(
-    S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    S_res::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    sws::SmoothWorkspace{T},
+    cols=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     prior = lds.obs_model.CD_prior
     prior === nothing && return S_res
     V = _pack_obs_V!(sws.reg.CD, lds)
-    mask = _costate_range(lds)
-    free = mask === nothing ? collect(axes(V, 2)) : setdiff(axes(V, 2), mask)
+    free = _lqr_cd_prior_cols(lds, size(V, 2), cols)
     restricted = _restrict_mn_prior(prior, free)
     Wm = V[:, free] .- restricted.M₀
     S_res .+= Wm * restricted.Λ * transpose(Wm)
     return S_res
+end
+
+# The columns of `[C d D]` an inverse-LQR emission's prior prices: those it owns
+# (`cols`, all by default) that the costate mask leaves free.
+function _lqr_cd_prior_cols(lds::LinearDynamicalSystem, width::Int, cols)
+    owned = cols === nothing ? collect(1:width) : collect(cols)
+    mask = _costate_range(lds)
+    return mask === nothing ? owned : setdiff(owned, mask)
+end
+
+# The restricted prior's width, matching the scatter above.
+function _cd_prior_width(
+    lds::LinearDynamicalSystem{T,S,O}, cols=nothing
+) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
+    prior = lds.obs_model.CD_prior
+    prior === nothing && return 0
+    return length(_lqr_cd_prior_cols(lds, size(prior.Λ, 1), cols))
 end
 
 function _obs_prior_logdensity(
@@ -593,17 +612,9 @@ function fit!(
         rtol=rtol,
         progress=progress,
         monitor=monitor,
-        align_final=!_is_free(lds.state_model),
     )
     return _fit_tridiag!(
-        lds,
-        data;
-        max_iter=max_iter,
-        tol=tol,
-        rtol=rtol,
-        progress=progress,
-        monitor=monitor,
-        align_final=!_is_free(lds.state_model),
+        lds, data; max_iter=max_iter, tol=tol, rtol=rtol, progress=progress, monitor=monitor
     )
 end
 
@@ -875,7 +886,6 @@ function fit!(
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
         monitor=monitor,
-        align_final=!_is_free(lds.state_model),
     )
     return _fit_laplace!(
         lds,
@@ -887,7 +897,6 @@ function fit!(
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
         monitor=monitor,
-        align_final=!_is_free(lds.state_model),
     )
 end
 

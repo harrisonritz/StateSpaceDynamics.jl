@@ -33,6 +33,12 @@ unaffected — and it carries the held-out trace alongside.
   scored). This is the answer to "how many iterations before I overfit?".
 - `stopped_early::Bool`: whether the fit stopped on the held-out criterion
   rather than running to `max_iter` or meeting the training tolerance.
+- `returned_iter::Int`: the iteration whose parameters the fitted model holds on
+  return, so `train[returned_iter]` is their training ELBO. Every driver returns a
+  scored iterate, so this is `length(train)` — except after an early stop with
+  `restore_best`, when the model is rolled back to `best_iter`'s parameters and
+  this is `best_iter`; the held-out score of the returned model is then
+  `test[findfirst(==(returned_iter), test_iters)]`.
 
 ```julia
 trace = fit!(lds, y_train; y_test=y_test)
@@ -48,6 +54,7 @@ struct FitTrace{T<:Real} <: AbstractVector{T}
     test_iters::Vector{Int}
     best_iter::Int
     stopped_early::Bool
+    returned_iter::Int
 end
 
 Base.size(tr::FitTrace) = size(tr.train)
@@ -60,6 +67,8 @@ function Base.show(io::IO, ::MIME"text/plain", tr::FitTrace{T}) where {T}
         print(io, ", $(length(tr.test)) held-out evaluations, best at iteration ")
         print(io, tr.best_iter)
         tr.stopped_early && print(io, " (stopped early)")
+        tr.returned_iter == length(tr.train) ||
+            print(io, "; model restored to iteration ", tr.returned_iter)
     end
     return nothing
 end
@@ -238,10 +247,14 @@ at its final iterate, as it always was.
 _fit_result(::Nothing, elbos::Vector, ::Any) = elbos
 
 function _fit_result(mon::HoldoutMonitor{T}, elbos::Vector{T}, model) where {T<:Real}
+    returned = length(elbos)
     if mon.restore_best && mon.stopped_early && mon.snapshot !== nothing
         _restore_params!(model, mon.snapshot)
+        returned = mon.best_iter
     end
-    return FitTrace{T}(elbos, mon.values, mon.iters, mon.best_iter, mon.stopped_early)
+    return FitTrace{T}(
+        elbos, mon.values, mon.iters, mon.best_iter, mon.stopped_early, returned
+    )
 end
 
 # ============================================================================

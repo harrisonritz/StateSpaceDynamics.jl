@@ -814,10 +814,47 @@ function _emission_moment_excess!(
     end
     acc = zero(T)
     @inbounds for i in eachindex(η)
-        ρ = v[i] / 2
-        acc -= exp(η[i]) * (expm1(ρ) - ρ)
+        acc -= _lognormal_excess(η[i], v[i] / 2)
     end
     return acc
+end
+
+"""
+    _lognormal_excess(μ, ρ) -> Real
+
+`exp(μ) (exp(ρ) − 1 − ρ)`: how far the exact lognormal moment `exp(μ + ρ)` sits
+above its second-order expansion `exp(μ)(1 + ρ)`, evaluated without the two ways
+the literal expression fails.
+
+- **`0 × Inf`.** A very negative mean with a very large half-variance (a strongly
+  loaded unit with an uncertain latent) has a finite moment — `μ = −800, ρ = 800`
+  gives `exp(μ + ρ) = 1` — but `exp(μ)` underflows and `expm1(ρ)` overflows. For
+  `ρ ≥ ½` the exponents are combined first, `exp(μ + ρ) (1 − (1 + ρ) e^{−ρ})`,
+  whose second factor lies in `(0, 1)`; this overflows only when the moment
+  itself does.
+- **Cancellation.** For small `ρ`, `expm1(ρ) − ρ ≈ ρ²/2` loses half the digits;
+  `|ρ| < ½` sums the series `Σ_{k≥2} ρᵏ/k!` instead.
+
+A negative `ρ` below `−½` cannot come from a covariance and keeps the literal form,
+which is finite there.
+"""
+@inline function _lognormal_excess(μ::T, ρ::T) where {T<:Real}
+    if abs(ρ) < T(0.5)
+        term = ρ * ρ / 2
+        total = term
+        k = 2
+        while k < 40
+            k += 1
+            term *= ρ / k
+            total += term
+            abs(term) <= eps(T) * abs(total) && break
+        end
+        return exp(μ) * total
+    elseif ρ > 0
+        return exp(μ + ρ) * (one(T) - (one(T) + ρ) * exp(-ρ))
+    else
+        return exp(μ) * (expm1(ρ) - ρ)
+    end
 end
 
 # Through a workspace: a single emission uses the Newton scratch, a composite
@@ -2802,8 +2839,24 @@ function _slds_units_prior_logdensity(
 ) where {T<:Real}
     lds1 = unit_lds[1]
     slots = _slds_unit_slots(lds1, cell_slot, K, tied)
-    state = _slds_state_prior_logdensity(lds1.state_model, unit_lds, slots, K, tied, T)
-    return state + _grouped_obs_prior_logdensity(lds1, unit_lds, slots, T)
+    D = lds1.latent_dim
+    nunits = length(unit_lds)
+    #= A partial tie prices its shared columns once — see `_owned_prior_cols` —
+    exactly as the regression and the noise updates do. =#
+    ab_cols = _owned_prior_cols(
+        _tied_dyn_cols(tied, D, lds1.ux_dim), D + 1 + lds1.ux_dim, K, nunits
+    )
+    function cd_cols(key)
+        member = key === nothing ? lds1 : _obs_view(lds1, key)
+        width = D + 1 + member.uy_dim
+        return _owned_prior_cols(
+            _tied_obs_cols(tied, D, member.uy_dim, key), width, K, nunits
+        )
+    end
+    state = _slds_state_prior_logdensity(
+        lds1.state_model, unit_lds, slots, K, tied, T; ab_cols=ab_cols
+    )
+    return state + _grouped_obs_prior_logdensity(lds1, unit_lds, slots, T; cd_cols=cd_cols)
 end
 
 """
@@ -2812,8 +2865,9 @@ end
 For every parameter group, in `cell_slot`'s layout, the version each of the
 `K · ncells` regime-major units uses. `x0`/`P0` are always shared across
 regimes. A stacked regression counts as tied only when it is tied whole: a
-partial tie leaves each regime a matrix of its own, and its noise update counts
-each one's prior.
+partial tie leaves each regime a matrix of its own, whose prior prices its free
+columns, while the shared columns' prior is counted once, on the first regime
+(see [`_owned_prior_cols`](@ref)).
 """
 function _slds_unit_slots(
     lds1::LinearDynamicalSystem,
@@ -2849,9 +2903,10 @@ function _slds_state_prior_logdensity(
     slots::AbstractVector{Vector{Int}},
     ::Int,
     ::AbstractVector{Symbol},
-    ::Type{T},
+    ::Type{T};
+    ab_cols=nothing,
 ) where {T<:Real}
-    return _grouped_state_prior_logdensity(unit_lds, slots, T)
+    return _grouped_state_prior_logdensity(unit_lds, slots, T; ab_cols=ab_cols)
 end
 
 #=
@@ -2869,7 +2924,8 @@ function _slds_state_prior_logdensity(
     slots::AbstractVector{Vector{Int}},
     K::Int,
     tied::AbstractVector{Symbol},
-    ::Type{T},
+    ::Type{T};
+    ab_cols=nothing,   # an inverse-LQR state has no `[A b B]` regression prior
 ) where {T<:Real}
     ncells = length(unit_lds) ÷ K
     regime(k) = view(unit_lds, ((k - 1) * ncells + 1):(k * ncells))
@@ -3754,7 +3810,14 @@ function _slds_state_mstep!(
     slots_ab = _slds_update_regression!(
         _DynBlock(), ldss, sf_state, dyn_cols, slots_q, sws, bufs, K
     )
-    _grouped_update_Q!(ldss, sf_state, slots_q, slots_ab, sws)
+    _grouped_update_Q!(
+        ldss,
+        sf_state,
+        slots_q,
+        slots_ab,
+        sws;
+        prior_cols=_owned_prior_cols(dyn_cols, D + 1 + ux_dim, K, length(ldss)),
+    )
     return slots_ab
 end
 
@@ -4184,7 +4247,15 @@ function _slds_gaussian_obs_mstep!(
     slots_cd = _slds_update_regression!(
         _ObsBlock(), ldss, sufs, obs_cols, slots_r, sws, bufs, K
     )
-    _grouped_update_R!(ldss, sufs, slots_r, slots_cd, sws)
+    width = lds1.latent_dim + 1 + lds1.uy_dim
+    _grouped_update_R!(
+        ldss,
+        sufs,
+        slots_r,
+        slots_cd,
+        sws;
+        prior_cols=_owned_prior_cols(obs_cols, width, K, length(ldss)),
+    )
     return nothing
 end
 
@@ -4233,7 +4304,9 @@ end
 
 Fit an SLDS using variational Laplace EM and return the per-iteration ELBO.
 Fitting always runs `max_iter` iterations because posterior sampling makes the
-trace noisy.
+trace noisy. Each trace entry scores the parameters the E-step ran at, and no
+M-step follows the last one, so the model is returned at the parameters
+`trace[end]` describes: `max_iter` scored iterations, `max_iter − 1` M-steps.
 
 Each E-step runs `smoothing_iters` discrete↔continuous alternations before the
 M-step. The default of 1 is the standard vLEM update; larger values hand the
@@ -4615,9 +4688,8 @@ function fit!(
         nothing
     end
     elbos = Vector{T}(undef, max_iter)
-    # LQR fits report a parameter-aligned final ELBO: the last scored iterate is
-    # returned unchanged rather than taking one unscored structural M-step.
-    align_final = S <: LQRStateModel && any(lds -> !_is_free(lds.state_model), slds.LDSs)
+    #= Every fit reports a parameter-aligned final ELBO: the last scored iterate
+    is returned unchanged rather than taking one unscored M-step after it. =#
 
     #=
     Warm-start: smooth each trial once with uniform weights, drawing the first
@@ -4742,7 +4814,7 @@ function fit!(
                 resize!(elbos, iter)
                 return _fit_result(monitor, elbos, target)
             end
-            if align_final && iter == max_iter
+            if iter == max_iter
                 prog !== nothing && next!(prog)
                 continue
             end
@@ -4841,7 +4913,7 @@ function fit!(
                 resize!(elbos, iter)
                 return _fit_result(monitor, elbos, target)
             end
-            if align_final && iter == max_iter
+            if iter == max_iter
                 prog !== nothing && next!(prog)
                 continue
             end

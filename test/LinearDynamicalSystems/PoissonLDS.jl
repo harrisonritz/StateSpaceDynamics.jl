@@ -722,8 +722,9 @@ function test_EM_matlab()
         @test isapprox(tfs[i].p_smooth, Vsm_3d, atol=1e-10)
         @test isapprox(tfs[i].p_smooth_tt1[:, :, 2:end], VVsm_3d, atol=1e-10)
     end
-    # now test the params after one EM step
-    fit!(plds, y; max_iter=1)
+    # now test the params after one EM step (`max_iter` counts scored
+    # iterates, so one M-step is `max_iter = 2`)
+    fit!(plds, y; max_iter=2)
     params_obj = params["params"]["model"]
     @test isapprox(plds.state_model.A, params_obj["A"], atol=1e-5)
     @test isapprox(plds.state_model.Q, params_obj["Q"], atol=1e-5)

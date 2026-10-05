@@ -303,17 +303,20 @@ function _null_fit_regression(
     S = E * transpose(E)
     Symmetrize!(S)
 
-    # MN-prior contribution to the IW posterior scale (matches `update_R!`).
+    #= MN-prior contribution to the IW posterior scale, and its width to the
+    count: the normalized prior's `-(q/2) log det R` (matches `update_R!`). =#
+    n_eff = T(n)
     if W_prior !== nothing
         Wm = W .- W_prior.M₀
         S .+= Wm * W_prior.Λ * transpose(Wm)
         Symmetrize!(S)
+        n_eff += T(size(W_prior.Λ, 1))
     end
 
     R = if R_prior === nothing
-        S ./ T(n)
+        S ./ n_eff
     else
-        iw_map(R_prior.Ψ, R_prior.ν, S, T(n), obs_dim)
+        iw_map(R_prior.Ψ, R_prior.ν, S, n_eff, obs_dim)
     end
     return W, R
 end

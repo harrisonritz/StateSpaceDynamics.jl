@@ -83,6 +83,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than automatic differentiation.
 
 ### Changed
+- **Matrix-normal priors are normalized MNIW priors.** `mn_logprior_term` now
+  includes the `-(q/2) log det Σ` of `W | Σ ~ MN(M₀, Σ, Λ⁻¹)`, and every
+  covariance M-step that folds a coefficient prior in adds that prior's width `q`
+  to its count: `Q`, `R` and `P0` (ungrouped, `depends_on`, switching, composite
+  and spline emissions, the null models) are now the joint MAP of the normalized
+  `MN × IW` pair — `(Ψ + S + WmΛWmᵀ)/(ν + N + q + d + 1)`, or `(S + WmΛWmᵀ)/(N + q)`
+  without an IW half — instead of a covariance-weighted ridge. The inverse-LQR
+  terminal-conditioned M-step's `P0` gradient carries the same term. A partial
+  tie of a regression across `SLDS` states now prices the shared columns once (on
+  the first state, as the regression already did) in the covariance updates and
+  the ELBO, instead of once per state. Fits with an `AB_prior`, `CD_prior` (on a
+  Gaussian emission) or `x0_prior` and a fitted covariance change by `O(q/N)`.
+- **Every EM driver returns a scored iterate.** The last trace entry is now
+  always the ELBO of the returned parameters: a fit stops right after scoring, on
+  convergence or at `max_iter`, instead of taking one more, unscored M-step.
+  `max_iter` therefore counts scored iterations, and a fit runs at most
+  `max_iter − 1` M-steps (previously `max_iter` for Gaussian, Poisson, composite
+  and spline LDS fits and for non-LQR `SLDS` fits; inverse-LQR fits already
+  behaved this way, and the `align_final` keyword is gone). `FitTrace` gains
+  `returned_iter`, the entry scoring the returned model — `best_iter` after an
+  early stop that restored the best parameters.
+- **Trials shorter than two timesteps are refused** by every LDS-family entry
+  point with an `ArgumentError` (they used to reach the state kernels and fail
+  with a `BoundsError`, or, for the Hessian, overwrite the prior block).
 - **The inverse optimal control model now uses LQR naming throughout.** Use
   `LQRStateModel`, `LQRFitFlags`, and `lqr_matrix`; source files, internal
   helpers, tests, and tutorials follow the same convention. This is a complete
@@ -121,6 +145,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ν − q` degrees of freedom, not the stated `MN × IW` pair.
 
 ### Fixed
+- **Shared-covariance aggregation is per bucket.** The sufficient-statistics
+  aggregator took the shared-covariance shortcut for *every* trial whenever the
+  first two trials shared storage, so a ragged dataset whose first two trials had
+  the same length — or equal-length LQR trials at mixed cost offsets — was
+  mis-weighted: the ELBO could exceed the exact likelihood (by 3.5 nats in a
+  three-trial example) and fitted parameters changed with trial order. Trials are
+  now grouped by the storage they actually alias, each group's covariance added
+  once and scaled by its size.
+- **The exact Poisson moment correction no longer returns `NaN`** for a finite
+  expectation whose factors under- and overflow (`μ = −800, ρ = 800`): it is
+  evaluated as `exp(μ + ρ)(1 − (1 + ρ)e^{−ρ})` for `ρ ≥ ½` and by series below.
 - **Switching models score Poisson emissions with the exact lognormal
   moment.** The deterministic regime update and the reported ELBO used a
   second-order expansion, `y μ − exp(μ)(1 + v/2)`, which overstates

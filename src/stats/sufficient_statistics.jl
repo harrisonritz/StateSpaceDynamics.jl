@@ -272,11 +272,11 @@ function _zero!(acc::_TDStatsPartial{T}) where {T}
 end
 
 """
-    _td_stats_trial!(acc, fs, y, ux, uy, D, ux_dim, uy_dim, dyn_reg_dim, obs_reg_dim, cov_cache)
+    _td_stats_trial!(acc, fs, y, ux, uy, D, ux_dim, uy_dim, dyn_reg_dim, obs_reg_dim, skip_cov)
 
 One trial's contribution to `_aggregate_td_suff_stats!`, added into the chunk
-partial `acc`. The covariance sums are skipped on the cov-cache path, where the
-caller adds the shared covariance once for all trials.
+partial `acc`. With `skip_cov` the covariance sums are left out: the trial shares
+its covariance storage with others, and the caller adds that group's once.
 """
 function _td_stats_trial!(
     acc::_TDStatsPartial{T},
@@ -289,7 +289,7 @@ function _td_stats_trial!(
     uy_dim::Int,
     dyn_reg_dim::Int,
     obs_reg_dim::Int,
-    cov_cache::Bool,
+    skip_cov::Bool,
 ) where {T<:Real}
     x = fs.x_smooth::Matrix{T}
     p_smooth = fs.p_smooth::Array{T,3}
@@ -299,7 +299,7 @@ function _td_stats_trial!(
     td_dyn_xy, td_obs_xy = acc.dyn_xy, acc.obs_xy
 
     # Per-trial cov sums when not on the cov-cache fast path.
-    if !cov_cache && is_compact(fs)
+    if !skip_cov && is_compact(fs)
         #= Compact layout: the same sums, formed on the packed columns (each
         entry summed over t in the same order) and unpacked once. =#
         packed = fs.p_packed::Matrix{T}
@@ -307,7 +307,7 @@ function _td_stats_trial!(
         _add_packed!(acc.cov_prev, packed, 1:(T_n - 1))
         _add_packed!(acc.cov_next, packed, 2:T_n)
         acc.xcov .+= fs.xcov_sum
-    elseif !cov_cache
+    elseif !skip_cov
         @views for t in 1:T_n
             acc.cov_all .+= p_smooth[:, :, t]
             if t < T_n
@@ -391,6 +391,55 @@ function _add_packed!(
 end
 
 """
+    _shared_cov_groups(tfs) -> (group_of, groups)
+
+Partition trials by the covariance storage they actually alias.
+
+The smoother hands every trial of a bucket — trials whose block-tridiagonal
+precision is the same: one length, and for an LQR schedule one cost offset — the
+same `p_smooth` / `p_smooth_tt1` arrays, so a bucket's covariance sums need
+forming only once. Which trials share is read off the arrays themselves (both of
+them, and the trial length), never inferred from a pair of trials: a ragged or
+mixed-offset dataset has several buckets in any order, and treating the first
+two trials' agreement as the whole dataset's mis-weights every other bucket.
+Compact-layout trials hold no per-step covariance and are never grouped.
+
+`groups` lists `(representative, count)` for each storage shared by at least two
+trials, and `group_of[n]` is the index of trial `n`'s group, or `0` for a trial
+whose covariance is summed on its own.
+"""
+function _shared_cov_groups(tfs::TrialFilterSmooth)
+    ntrials = length(tfs)
+    group_of = zeros(Int, ntrials)
+    groups = Tuple{Int,Int}[]
+    ntrials > 1 || return group_of, groups
+    seen = Dict{Tuple{UInt,UInt,Int},Int}()
+    first_trial = Dict{Tuple{UInt,UInt,Int},Int}()
+    for n in 1:ntrials
+        fs = tfs[n]
+        (is_compact(fs) || isempty(fs.p_smooth)) && continue
+        key = (objectid(fs.p_smooth), objectid(fs.p_smooth_tt1), size(fs.x_smooth, 2))
+        g = get(seen, key, 0)
+        if g == 0
+            if haskey(first_trial, key)
+                push!(groups, (first_trial[key], 2))
+                g = length(groups)
+                seen[key] = g
+                group_of[first_trial[key]] = g
+                group_of[n] = g
+            else
+                first_trial[key] = n
+            end
+        else
+            rep, count = groups[g]
+            groups[g] = (rep, count + 1)
+            group_of[n] = g
+        end
+    end
+    return group_of, groups
+end
+
+"""
     _aggregate_td_suff_stats!(suf, tfs, lds, data, sws)
 
 Aggregate per-trial smoother output (`x_smooth`, `p_smooth`, `p_smooth_tt1`)
@@ -398,8 +447,10 @@ into `suf` using per-trial GEMM/SYRK. Replaces the per-timestep, per-trial
 loops formerly done inside `Q_state!`, `Q_obs!`, and the `update_*!`
 functions.
 
-Uses the cov-cache fast-path shortcut when all trials' `p_smooth` arrays
-are aliased to the same shared storage (equal-length multi-trial fit).
+Trials whose smoothed covariances are aliased to one shared array (the
+smoother shares one per length bucket, or per length-and-offset bucket for an
+LQR schedule) add that covariance once, scaled by the bucket's size; every
+other trial adds its own. See [`_shared_cov_groups`](@ref).
 """
 function _aggregate_td_suff_stats!(
     suf::SufficientStatistics{T},
@@ -438,8 +489,8 @@ function _aggregate_td_suff_stats!(
     sum_cov_all = sws.agg.sum_smooth_cov_all::Matrix{T}
     sum_xcov = sws.agg.sum_smooth_xcov::Matrix{T}
 
-    # Detect cov-cache fast path (equal-length trials share p_smooth storage).
-    cov_cache = ntrials > 1 && tfs[1].p_smooth === tfs[2].p_smooth
+    # Trials whose covariance storage is shared: summed once per group below.
+    group_of, groups = _shared_cov_groups(tfs)
 
     fill!(td_init_xy, zero(T))
     fill!(S0_sum, zero(T))                  # init_yy
@@ -457,27 +508,23 @@ function _aggregate_td_suff_stats!(
     copyto!(R_sum, td_obs_yy_const)
     copyto!(td_obs_xy, td_obs_xy_const)
 
-    if cov_cache
-        fs1 = tfs[1]
+    for (rep, count) in groups
+        fs1 = tfs[rep]
         T_shared = size(fs1.x_smooth, 2)
         p_smooth1 = fs1.p_smooth::Array{T,3}
         p_smooth_tt11 = fs1.p_smooth_tt1::Array{T,3}
+        N_T = T(count)
         @views for t in 1:T_shared
-            sum_cov_all .+= p_smooth1[:, :, t]
+            sum_cov_all .+= N_T .* p_smooth1[:, :, t]
             if t < T_shared
-                sum_cov_prev .+= p_smooth1[:, :, t]
+                sum_cov_prev .+= N_T .* p_smooth1[:, :, t]
             end
             if t > 1
-                sum_cov_next .+= p_smooth1[:, :, t]
-                sum_xcov .+= p_smooth_tt11[:, :, t]
+                sum_cov_next .+= N_T .* p_smooth1[:, :, t]
+                sum_xcov .+= N_T .* p_smooth_tt11[:, :, t]
             end
         end
-        # Scale to total across N trials.
-        N_T = T(ntrials)
-        sum_cov_all .*= N_T
-        sum_cov_prev .*= N_T
-        sum_cov_next .*= N_T
-        sum_xcov .*= N_T
+        @views S0_sum .+= N_T .* p_smooth1[:, :, 1]
     end
 
     #=
@@ -504,7 +551,7 @@ function _aggregate_td_suff_stats!(
                 uy_dim,
                 dyn_reg_dim,
                 obs_reg_dim,
-                cov_cache,
+                group_of[trial] != 0,
             )
         end
         return nothing
@@ -518,12 +565,11 @@ function _aggregate_td_suff_stats!(
         td_dyn_xy .+= acc.dyn_xy
         Q_sum .+= acc.dyn_yy
         td_obs_xy .+= acc.obs_xy
-        if !cov_cache
-            sum_cov_all .+= acc.cov_all
-            sum_cov_prev .+= acc.cov_prev
-            sum_cov_next .+= acc.cov_next
-            sum_xcov .+= acc.xcov
-        end
+        # Grouped trials skipped these sums, so a partial holds the rest's only.
+        sum_cov_all .+= acc.cov_all
+        sum_cov_prev .+= acc.cov_prev
+        sum_cov_next .+= acc.cov_next
+        sum_xcov .+= acc.xcov
         return nothing
     end
     if nbuf == 1
@@ -535,17 +581,14 @@ function _aggregate_td_suff_stats!(
         _foreach_chunk_wave(accumulate!, reduce!, chunks, nbuf)
     end
 
-    # init_yy: need Σ_n P_smooth[n,:,:,1].
-    if cov_cache
-        @views S0_sum .+= T(ntrials) .* (tfs[1].p_smooth::Array{T,3})[:, :, 1]
-    else
-        @views for trial in 1:ntrials
-            fs = tfs[trial]
-            if is_compact(fs)
-                _add_packed!(S0_sum, fs.p_packed::Matrix{T}, 1:1)
-            else
-                S0_sum .+= (fs.p_smooth::Array{T,3})[:, :, 1]
-            end
+    # init_yy: need Σ_n P_smooth[n,:,:,1]; the shared groups added theirs above.
+    @views for trial in 1:ntrials
+        group_of[trial] == 0 || continue
+        fs = tfs[trial]
+        if is_compact(fs)
+            _add_packed!(S0_sum, fs.p_packed::Matrix{T}, 1:1)
+        else
+            S0_sum .+= (fs.p_smooth::Array{T,3})[:, :, 1]
         end
     end
     @views Szz_Ab[1:D, 1:D] .+= sum_cov_prev

@@ -1076,8 +1076,9 @@ function _lqr_conditional_problem(
                 W = inv(cholesky(Symmetric(sm.P0)))
                 delta = _initial_coefficients(sm) - pr.M₀
                 gradients[initkey][slots[_G_X0][c]] .+= W * delta * pr.Λ
-                gradients[:P0][slots[_G_P0][c]] .-=
-                    T(0.5) .* (W * delta * pr.Λ * delta' * W)
+                # Normalized matrix-normal: `(q/2) log det P0` beside the quadratic.
+                gradients[:P0][slots[_G_P0][c]] .+=
+                    T(0.5) .* (size(delta, 2) .* W .- W * delta * pr.Λ * delta' * W)
             end
             for block in extras
                 g = gradients[block.key][block.slot]

@@ -941,7 +941,11 @@ Fit a Poisson LDS via Laplace-EM.
 - `uy`: observation inputs feeding the `D v_t` emission term; same shapes as `y`
   with `uy_dim` rows. Required when `size(obs_model.D, 2) > 0`; `nothing`
   (default) means no inputs.
-- `max_iter`: maximum EM iterations
+- `max_iter`: maximum number of scored iterations.
+  Every entry of the returned trace is the ELBO of a set of parameters, and
+  the fit stops right after scoring — on convergence or at `max_iter` — so the
+  last entry is the ELBO of the model handed back. A fit therefore runs at most
+  `max_iter − 1` M-steps (`max_iter = 1` only scores the initial model).
 - `tol`: convergence tolerance on the ELBO change between iterations, absolute
 - `rtol = 0.0`: the same, relative to the ELBO's magnitude; the fit stops once the
   change is below `max(tol, rtol * |ELBO|)`, so the default is the absolute test
@@ -1100,7 +1104,6 @@ function _fit_laplace!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     monitor=nothing,
-    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
 
@@ -1153,7 +1156,9 @@ function _fit_laplace!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
-        if align_final && (converged || iter == max_iter)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, plds)
@@ -1164,13 +1169,6 @@ function _fit_laplace!(
 
         # print progress
         prog !== nothing && next!(prog)
-
-        # check convergence
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, plds)
-        end
     end
 
     prog !== nothing && finish!(prog)
@@ -1410,7 +1408,6 @@ function _fit_plds_grouped!(
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
     monitor=nothing,
-    align_final::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
     state = _grouped_fit_state(plds, data, grp, sws_pool)
@@ -1441,7 +1438,9 @@ function _fit_plds_grouped!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
-        if align_final && (converged || iter == max_iter)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, plds)
@@ -1457,12 +1456,6 @@ function _fit_plds_grouped!(
         _grouped_update_observation_model!(state, grp, data, sws_pool)
 
         prog !== nothing && next!(prog)
-
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, plds)
-        end
     end
 
     prog !== nothing && finish!(prog)

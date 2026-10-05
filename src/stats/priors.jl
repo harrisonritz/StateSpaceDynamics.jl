@@ -20,10 +20,15 @@ p(Σ) ∝ |Σ|^{-(ν + d + 1)/2} exp(-½ tr(Ψ Σ^{-1})) for d = size(Σ,1).
 
 # Fields
 - `Ψ::M`: Scale matrix (d×d, SPD).
-- `ν::T`: Degrees of freedom (must satisfy `ν > d + 1` for a proper mode).
+- `ν::T`: Degrees of freedom (`ν > d - 1` for a proper prior, `ν > d + 1` for a finite mean).
 
 # Notes
 - The MAP update for a posterior IW(Ψ + S, ν + n) is `(Ψ + S) / (ν + n + d + 1)`.
+- Paired with an [`MNPrior`](@ref) on a `d × q` regression coefficient whose row
+  covariance is this Σ, the joint MAP of the normalized MNIW prior is
+  `(Ψ + S + (W - M₀) Λ (W - M₀)ᵀ) / (ν + n + q + d + 1)`: each distinct
+  coefficient matrix priced under Σ adds its width `q` to the count.
+- `ν > d - 1` makes the prior proper; the mode above exists for any `ν ≥ 0`.
 """
 Base.@kwdef struct IWPrior{T<:Real,M<:AbstractMatrix}
     Ψ::M
@@ -59,10 +64,19 @@ appearing in a linear regression `Y = W X + ε` with row-noise covariance Σ:
 W | Σ ~ MN(M₀, Σ ⊗ Λ⁻¹)
 ```
 
-equivalently `vec(W) ~ N(vec(M₀), Λ⁻¹ ⊗ Σ)`. Σ is the regression's row
-covariance (paired with `IWPrior` when both halves of an MNIW prior are
-desired); Λ is the column precision and is the only piece that enters the MAP
-update for W.
+equivalently `vec(W) ~ N(vec(M₀), Λ⁻¹ ⊗ Σ)`, with density
+
+```math
+p(W \\mid Σ) = (2π)^{-kp/2} |Λ|^{k/2} |Σ|^{-p/2}
+    \\exp\\!\\left(-\\tfrac12 \\operatorname{tr}\\!\\left[Σ^{-1}(W - M₀) Λ (W - M₀)^\\top\\right]\\right).
+```
+
+Σ is the regression's row covariance (paired with `IWPrior` when both halves of
+an MNIW prior are desired); Λ is the column precision and is the only piece that
+enters the MAP update for W. The `|Σ|^{-p/2}` factor is kept: when Σ is fitted,
+each coefficient matrix under this prior adds its width `p` to the count in the
+covariance MAP (see [`IWPrior`](@ref)), so the fit is the MAP of the normalized
+MNIW prior rather than a covariance-weighted ridge.
 
 # Fields
 - `M₀::M`: prior mean (`k × p`, same shape as W). Use a zero matrix for plain
@@ -122,28 +136,28 @@ end
 """
     mn_logprior_term(W, Σ, prior) -> Real
 
-The quadratic, `W`-dependent part of a matrix-normal log prior on a `d × q`
-coefficient matrix `W` with row covariance `Σ`, evaluated at the current
-`(W, Σ)`:
+The normalized matrix-normal log prior `log p(W | Σ)` of a `d × q` coefficient
+matrix `W` with row covariance `Σ`, up to a constant independent of `(W, Σ)`:
 
-    -½ tr(Σ^{-1} (W - M₀) Λ (W - M₀)')
+    -(q/2) log det Σ  -  ½ tr(Σ^{-1} (W - M₀) Λ (W - M₀)')
 
-This is what the M-steps optimize and what the ELBO reports when an `MNPrior` is
-set on a regression coefficient (e.g. `[A b B]` or `[C d D]`), so the displayed
-objective and the fitted parameters agree.
+This is what the ELBO reports when an `MNPrior` is set on a regression
+coefficient (e.g. `[A b B]` or `[C d D]`), and it is the objective the M-steps
+maximize: the coefficient update `(XYᵀ + M₀Λ)(XX + Λ)⁻¹` does not involve `Σ`,
+and every covariance MAP adds `q` per distinct coefficient matrix to its count —
+`(Ψ + S + WmΛWmᵀ)/(ν + N + q + d + 1)` under an inverse-Wishart prior, or
+`(S + WmΛWmᵀ)/(N + q)` without one — which is the stationary point of this term
+plus the likelihood and `iw_logprior_term`. Together with an [`IWPrior`](@ref) on
+the same `Σ` that is the joint MAP of the normalized MNIW prior.
 
-**It is not the full normalized density `log p(W | Σ)`.** That also carries
-`-(q/2) log det Σ`, which depends on `Σ` and so matters whenever `Σ` is fitted;
-the covariance updates (`(Ψ + R)/(ν + N + d + 1)`, or `R/N` without an
-inverse-Wishart prior) omit it consistently. The estimator is therefore exactly
-the joint MAP under a normal–inverse-Wishart prior whose inverse-Wishart degrees
-of freedom are `ν − q` rather than `ν` — equivalently, a covariance-weighted ridge
-penalty on `W` — and not the MAP under the stated `MN × IW` pair. With `Σ` held
-fixed, or a coefficient prior on an emission with no covariance (Poisson), the
-two coincide. The difference is `O(q/N)` in the covariance estimate, negligible
-for long recordings but not for a few short trials. Constants independent of
-`(W, Σ)` are dropped as well, so this is a within-fit objective term: compare
-objectives across prior settings or dimensions only on held-out data.
+`q` is read off `W`, so a caller restricting the prior to free columns (see
+`_restrict_mn_prior`) passes the restricted `W` and gets the restricted width.
+
+Dropped constants: `-(dq/2) log 2π + (d/2) log det Λ`. They depend on the prior's
+hyperparameters and shape only, so they move no estimate, but they do differ
+between prior settings and model dimensions — as do `iw_logprior_term`'s — so a
+MAP objective is a within-fit criterion: compare across prior settings or
+dimensions on held-out data.
 """
 @inline function mn_logprior_term(
     W::AbstractMatrix{T}, Σ::AbstractMatrix{T}, prior::MNPrior{T}
@@ -153,7 +167,8 @@ objectives across prior settings or dimensions only on held-out data.
     # on shape, but both are k × k after the trace, so just go left-to-right.
     M = Wm * prior.Λ * Wm'
     F = cholesky(Symmetric(Σ))
-    return -T(0.5) * tr(F \ M)
+    q = size(W, 2)
+    return -T(0.5) * (q * logdet(F) + tr(F \ M))
 end
 
 @inline mn_logprior_term(W::AbstractMatrix, ::AbstractMatrix, ::Nothing) = zero(eltype(W))

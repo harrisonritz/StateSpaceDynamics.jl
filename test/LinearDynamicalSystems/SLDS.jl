@@ -3554,8 +3554,9 @@ function test_SLDS_tied_params_partial_prior(; rng=MersenneTwister(0x71F6))
         for lds in coupled.LDSs
             lds.state_model.AB_prior = MNPrior(zeros(latent_dim, m), copy(Λ))
         end
+        # `max_iter = 2`: the first M-step follows the second scored iterate.
         @test_throws ArgumentError fit!(
-            coupled, y; max_iter=1, progress=false, tied_params=:A
+            coupled, y; max_iter=2, progress=false, tied_params=:A
         )
         # Tying the whole regression needs no split, so it is fine.
         @test fit!(coupled, y; max_iter=2, progress=false, tied_params=(:A, :b)) isa Vector
@@ -4409,7 +4410,9 @@ function test_SLDS_warmup_fit(; rng=MersenneTwister(0xD1A5))
 
         # After the warm-up the chain is fitted as usual.
         m3 = _chain_model()
-        fit!(m3, y; max_iter=3, progress=false, discrete_warmup=2, warmup_logL=evidence)
+        # Two warm-up iterations, then one M-step that fits the chain (the fit
+        # returns at its last scored iterate, so that needs a fourth).
+        fit!(m3, y; max_iter=4, progress=false, discrete_warmup=2, warmup_logL=evidence)
         @test m3.A != A0
 
         # Grouped (`depends_on`) path.
@@ -4424,7 +4427,7 @@ function test_SLDS_warmup_fit(; rng=MersenneTwister(0xD1A5))
         )
         @test all(isfinite, els_g)
         @test g.A == A0 && g.πₖ == π0
-        fit!(g, y; max_iter=1, progress=false)
+        fit!(g, y; max_iter=2, progress=false)
         @test g.A != A0
 
         # Validation.
