@@ -331,18 +331,19 @@ function _fit_spline_composite!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
 
         _spline_composite_mstep!(
             lds, glds, suf, sws_pool, tfs, sdata, sites; spline_iters=spline_iters
         )
 
         prog !== nothing && next!(prog)
-
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, lds)
-        end
     end
 
     prog !== nothing && finish!(prog)
@@ -501,18 +502,19 @@ function _fit_spline_laplace!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
+        #= Return a scored iterate: the trace's last entry is always the score of
+        the parameters handed back, so no M-step runs after it. =#
+        if converged || iter == max_iter
+            prog !== nothing && finish!(prog)
+            resize!(elbos, iter)
+            return _fit_result(monitor, elbos, lds)
+        end
 
         _spline_composite_mstep!(
             lds, glds, suf, sws_pool, tfs, sdata, sites; spline_iters=spline_iters
         )
 
         prog !== nothing && next!(prog)
-
-        if converged
-            prog !== nothing && finish!(prog)
-            resize!(elbos, iter)
-            return _fit_result(monitor, elbos, lds)
-        end
     end
 
     prog !== nothing && finish!(prog)

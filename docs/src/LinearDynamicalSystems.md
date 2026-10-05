@@ -480,8 +480,8 @@ fit!(lds, Y; max_iter=20, progress=false)
 The M-step updates for the dynamics and emission parameters are (multivariate) linear
 regressions: the dynamics update fits the stacked coefficient matrix ``[A\; b]`` and the
 emission update fits ``[C\; d]``. StateSpaceDynamics.jl supports a **matrix-normal (MN)**
-prior on these coefficient matrices, turning each regression into a MAP (ridge-style)
-update:
+prior on these coefficient matrices, turning each regression into a MAP update (a ridge
+regression when ``M_0 = 0``):
 
 ```math
 W_{\text{MAP}} = (XY^\top + M_0 \Lambda)(XX + \Lambda)^{-1}
@@ -581,6 +581,31 @@ fit!(lds, Y; max_iter=20, progress=false)
 ```
 
 Any subset works.
+
+### What is being estimated
+
+The matrix-normal halves are **normalized** priors, `W | Σ ~ MN(M₀, Σ, Λ⁻¹)`, whose
+density carries a factor ``|Σ|^{-q/2}`` for a coefficient matrix with ``q`` columns. When
+``Σ`` is fitted that factor matters, and the covariance updates are the joint MAP of the
+full prior: under an MNIW pair
+
+```math
+\hat\Sigma = \frac{\Psi + S + (W - M_0)\,\Lambda\,(W - M_0)^\top}{\nu + N + q + d + 1},
+```
+
+with ``S`` the residual scatter over ``N`` observations, and
+``(S + (W - M_0)\Lambda(W - M_0)^\top)/(N + q)`` with no inverse-Wishart half — the
+``+1`` of the textbook normal–inverse-Wishart mode is the ``q = 1`` case of ``x_0``. The
+coefficient update above does not involve ``\Sigma``, so it is unchanged. A covariance
+shared by several coefficient versions (a `depends_on` group, or a covariance tied across
+the states of an [`SLDS`](@ref)) adds each version's ``q``; under a partial tie of a
+regression across discrete states the shared columns carry one prior factor, on the
+first state, and each state's free columns one each.
+
+The reported ELBO includes these log-priors up to constants that depend only on the
+hyperparameters (``2\pi`` and ``\Lambda`` factors, the inverse-Wishart normalizer), so it is
+the MAP objective the fit maximizes. Compare it across fits with the same prior; across
+prior settings or dimensions, compare held-out scores.
 
 ## Parameters that depend on an ancillary variable
 

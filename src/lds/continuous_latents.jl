@@ -775,10 +775,31 @@ function _accumulate_x0_prior_scatter!(
 end
 
 """
+    _x0_prior_width(lds) -> Int
+
+Columns `q` of the initial-state coefficient the `x0_prior` is a matrix-normal
+prior on (`1` for a plain `x0`, the width of `B0` otherwise), or `0` without one.
+
+A normalized prior `x0 | P0 ~ MN(M₀, P0, Λ⁻¹)` carries `-(q/2) log det P0`, so
+each distinct coefficient version it prices adds `q` to the count the `P0` MAP
+divides by — the `+1` of the textbook normal–inverse-Wishart mode
+`(Ψ + S + κ₀(x̄ − μ₀)(x̄ − μ₀)') / (ν + N + D + 2)`.
+"""
+function _x0_prior_width(lds::LinearDynamicalSystem)
+    prior = lds.state_model.x0_prior
+    return prior === nothing ? 0 : size(prior.Λ, 1)
+end
+
+"""
     _finalize_P0!(lds, S0, N)
 
-Turn an accumulated initial-state scatter into `P0`: MLE `S0 / N`, or the IW MAP
+Turn an accumulated initial-state scatter into `P0`: `S0 / N`, or the IW MAP
 `(Ψ + S0) / (ν + N + D + 1)` when a `P0_prior` is set.
+
+`N` is the *effective* count: the trials pooled into `S0` plus the width `q` of
+every distinct matrix-normal coefficient prior folded into it (see
+[`_x0_prior_width`](@ref)), which is what makes this the MAP under the normalized
+MNIW prior rather than a covariance-weighted ridge.
 """
 function _finalize_P0!(
     lds::LinearDynamicalSystem{T,S,O}, S0::AbstractMatrix{T}, N::T
@@ -808,7 +829,7 @@ function update_initial_state_covariance!(
     _accumulate_init_scatter!(S0, lds, suf)
     _accumulate_x0_prior_scatter!(S0, lds)
     Symmetrize!(S0)
-    _finalize_P0!(lds, S0, T(suf.init_n))
+    _finalize_P0!(lds, S0, T(suf.init_n) + T(_x0_prior_width(lds)))
     return nothing
 end
 
@@ -935,23 +956,51 @@ end
 
 Add the `AB_prior` contribution `Wm Λ Wm'` (`Wm = [A b B] - M₀`) to the IW
 posterior scale of `Q`. One call per distinct `[A b B]`.
+
+`cols` restricts the prior to the columns this unit owns (see
+[`_owned_prior_cols`](@ref)); `nothing` is all of them.
 """
 function _accumulate_ab_prior_scatter!(
-    S_res::AbstractMatrix{T}, lds::LinearDynamicalSystem{T,S,O}, sws::SmoothWorkspace{T}
+    S_res::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    sws::SmoothWorkspace{T},
+    cols=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     AB_prior = lds.state_model.AB_prior
     AB_prior === nothing && return S_res
     W = _pack_dyn_W!(sws.reg.AB, lds)
-    Wm = W .- AB_prior.M₀
-    S_res .+= Wm * AB_prior.Λ * Wm'
+    if cols === nothing
+        Wm = W .- AB_prior.M₀
+        S_res .+= Wm * AB_prior.Λ * Wm'
+    else
+        prior = _restrict_mn_prior(AB_prior, cols)
+        Wm = W[:, cols] .- prior.M₀
+        S_res .+= Wm * prior.Λ * Wm'
+    end
     return S_res
+end
+
+"""
+    _ab_prior_width(lds) -> Int
+
+Columns `q` of `[A b B]` under the `AB_prior` (`D + 1 + ux_dim`), or `0` without
+one: what each distinct dynamics regression adds to the `Q` MAP's count under the
+normalized matrix-normal prior. See [`_x0_prior_width`](@ref).
+"""
+function _ab_prior_width(lds::LinearDynamicalSystem, cols=nothing)
+    prior = lds.state_model.AB_prior
+    prior === nothing && return 0
+    return cols === nothing ? size(prior.Λ, 1) : length(cols)
 end
 
 """
     _finalize_Q!(lds, S_res, N)
 
-Symmetrize an accumulated dynamics residual scatter and turn it into `Q`: MLE
+Symmetrize an accumulated dynamics residual scatter and turn it into `Q`:
 `S_res / N`, or the IW MAP `(Ψ + S_res) / (ν + N + D + 1)` under a `Q_prior`.
+
+`N` is the effective count: transitions plus the width of every distinct
+`AB_prior` folded into `S_res` ([`_ab_prior_width`](@ref)).
 """
 function _finalize_Q!(
     lds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
@@ -997,6 +1046,6 @@ function update_Q!(
     fill!(S_res, zero(T))
     _accumulate_dyn_scatter!(S_res, lds, suf, sws)
     _accumulate_ab_prior_scatter!(S_res, lds, sws)
-    _finalize_Q!(lds, S_res, T(suf.dyn_n))
+    _finalize_Q!(lds, S_res, T(suf.dyn_n) + T(_ab_prior_width(lds)))
     return nothing
 end

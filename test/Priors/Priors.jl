@@ -49,11 +49,12 @@ function test_mn_prior_helpers()
     W_strong = StateSpaceDynamics.mn_map(XX, XY, strong)
     @test norm(W_strong - M₀) < norm(W - M₀)
 
-    # mn_logprior_term: -½ tr(Σ⁻¹ (W - M₀) Λ (W - M₀)').
+    # mn_logprior_term: the normalized density's (W, Σ)-dependent part,
+    # -½ (p log|Σ| + tr(Σ⁻¹ (W - M₀) Λ (W - M₀)')) for a k × p coefficient.
     E = randn(rng, k, k)
     Σ = Matrix(Symmetric(E * E' + k * I))      # row covariance (k×k)
     Wm = W - M₀
-    ref = -0.5 * tr(inv(Σ) * (Wm * Λ * Wm'))
+    ref = -0.5 * (p * logdet(Σ) + tr(inv(Σ) * (Wm * Λ * Wm')))
     @test StateSpaceDynamics.mn_logprior_term(W, Σ, prior) ≈ ref
 
     # No prior contributes nothing to the objective.

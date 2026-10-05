@@ -580,7 +580,9 @@ function test_x0_niw_prior_map_and_degradation()
         x0e = (msum .+ κ₀ .* μ₀) ./ κn
         Ψn = Ψ .+ SS .+ κ₀ .* (μ₀ * μ₀') .- κn .* (x0e * x0e')
         @test lds.state_model.x0 ≈ x0e
-        @test lds.state_model.P0 ≈ Ψn ./ (ν + N + D + 1)
+        # The normalized NIW joint mode: `x0 | P0 ~ N(μ₀, P0/κ₀)` carries
+        # `-(1/2) log det P0`, so the IW denominator gains `q = 1`.
+        @test lds.state_model.P0 ≈ Ψn ./ (ν + N + D + 2)
         @test issymmetric(lds.state_model.P0)
 
         # (3) no priors ⇒ MLE
@@ -603,7 +605,7 @@ function test_x0_niw_prior_map_and_degradation()
         @test all(isfinite, ldsd.state_model.x0)
         @test all(isfinite, ldsd.state_model.P0)
         @test ldsd.state_model.x0 ≈ μ₀
-        @test ldsd.state_model.P0 ≈ Ψ ./ (ν + D + 1)
+        @test ldsd.state_model.P0 ≈ Ψ ./ (ν + D + 2)
     end
     return nothing
 end

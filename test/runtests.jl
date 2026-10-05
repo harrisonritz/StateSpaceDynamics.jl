@@ -661,6 +661,19 @@ using SSDTest
             test_slds_lqr_terminal_warmup()
         end
 
+        include("LinearDynamicalSystems/FittingReviewRegressions.jl")
+        @testset "Fitting review regressions" begin
+            test_r2_ragged_aggregation_order_invariant()
+            test_r2_lqr_offset_aggregation()
+            test_r2_lognormal_excess_stable()
+            test_r2_short_trials_refused()
+            test_r2_trace_scores_returned_model()
+            test_r2_mn_logprior_normalized()
+            test_r2_mniw_covariance_is_map()
+            test_r2_null_model_mniw_map()
+            test_r2_partial_tie_prior_counted_once()
+        end
+
         include("LinearDynamicalSystems/LQRReviewRegressions.jl")
         @testset "Inverse-LQR review regressions" begin
             test_lqr_review_qc_alias_rejected()
