@@ -210,6 +210,26 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
         "  terminal cost:   Qc[$(lqr_sm.terminal_regime)] pinned " *
         "(every trial's own last step, whatever its length)",
     )
+    for s in lqr_sm.switches
+        parts = String[]
+        s.bridge == 0 || push!(parts, "bridge against Qc[$(s.bridge)]")
+        s.entry === nothing ||
+            push!(parts, "entry prior" * (s.entry.fit_gain ? "" : " (gain held)"))
+        println(io, gap, "  switch at position $(s.pos): " * join(parts, ", "))
+    end
+    isempty(lqr_sm.gref_gate) || println(
+        io,
+        gap,
+        "  reference gate:  each regime reads " *
+        join(
+            (
+                "Qc[$k]: $(count(view(lqr_sm.gref_gate, k, :)))" for
+                k in axes(lqr_sm.gref_gate, 1)
+            ),
+            ", ",
+        ) *
+        " input column(s)",
+    )
 
     println(io, gap, " Noise (mixed coordinates on [x_{t+1}; λ_t]):")
     println(io, gap, "  size(Σ)  = ($(size(lqr_sm.Σ,1)), $(size(lqr_sm.Σ,2)))")

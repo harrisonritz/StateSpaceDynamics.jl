@@ -108,6 +108,7 @@ with many right-hand sides instead of a small allocating solve per design.
 function _lqr_terminal_logz_sum(sm::LQRStateModel{T}, designs) where {T}
     sm.terminal || return zero(T)
     isempty(designs) && return zero(T)
+    _has_switches(sm) && return _lqr_switched_logz_sum(sm, designs)
     horizons = [size(d.ux, 2) for d in designs]
     offsets = [_design_offset(d) for d in designs]
     #= Position of each design's last bin on the schedule. The backward recursion
@@ -361,6 +362,8 @@ function _lqr_probe_signature(sm::LQRStateModel)
         sm.terminal,
         sm.terminal_regime,
         sm.fixed_costate_sigma,
+        copy(sm.gref_gate),
+        [(s.pos, s.bridge, s.entry !== nothing) for s in sm.switches],
         Threads.maxthreadid(),
     )
 end
@@ -407,6 +410,7 @@ function _lqr_sync_probe!(probe, sm)
     for k in eachindex(sm.Qc)
         copyto!(target.Qc[k], sm.Qc[k])
     end
+    _sync_entries!(target, sm)
     refresh!(target)
     return probe
 end
@@ -532,6 +536,8 @@ function _lqr_probe_aggregate!(
         fill!(hs.term_zz[k], zero(T))
         hs.term_n[k] = zero(T)
     end
+    foreach(Z -> fill!(Z, zero(T)), hs.entry_ww)
+    fill!(hs.entry_n, zero(T))
     init_x = zeros(T, d)
     init_yy = zeros(T, d, d)
     init_n = Ref(zero(T))
@@ -579,6 +585,10 @@ function _lqr_probe_aggregate!(
             hs.term_zz[k] .+= q.term_zz[k]
             hs.term_n[k] += q.term_n[k]
         end
+        for e in eachindex(hs.entry_ww)
+            hs.entry_ww[e] .+= q.entry_ww[e]
+            hs.entry_n[e] += q.entry_n[e]
+        end
         init_x .+= p.init_x
         init_yy .+= p.init_yy
         init_n[] += p.init_n[]
@@ -615,6 +625,7 @@ function _probe_cov_item!(
     P1 = fs.p_smooth_tt1::Array{T,3}
     T_n = size(P, 3)
     for t in 1:(T_n - 1)
+        _entry_into(sm, t + 1) == 0 || continue      # an entry's, in `entry_ww`
         k = _regime(sm, t)
         zz, zy, yy = p.lqr.zz[k], p.lqr.zy[k], p.lqr.yy[k]
         @views begin
@@ -627,6 +638,7 @@ function _probe_cov_item!(
         kT = _terminal_regime(sm, T_n)
         @views p.lqr.term_zz[kT][1:d, 1:d] .+= w .* P[:, :, T_n]
     end
+    isempty(sm.switches) || _lqr_switch_cov_item!(p.lqr, sm, P, P1, w, d)
     @views p.init_yy .+= w .* P[:, :, 1]
     return nothing
 end
@@ -1114,7 +1126,9 @@ function _lqr_conditional_problem(
             _terminal_restore!(backend, saved)
         end
     end
-    rescores = _terminal_rescores(backend)
+    #= A value-only extra term can only judge a step if the acceptance re-scores
+    candidates, which an exact backend otherwise skips. =#
+    rescores = _terminal_rescores(backend) || score_extra !== nothing
     return (; theta, evaluate!, write!, score!, rescores)
 end
 
@@ -1140,6 +1154,22 @@ function _lqr_conditional_mstep!(
     sufs::AbstractVector{<:LQRSufficientStatistics{T}},
     slots::AbstractVector{<:AbstractVector{Int}},
 ) where {T<:Real}
+    sms = [lds.state_model for lds in ldss]
+    if _has_entries(sms[1])
+        #= Entry priors first, judged against the exact normalizer; then the
+        structure, whose acceptance also scores the entries' plant row and
+        reference (value only: the statistics do not carry them). =#
+        _lqr_conditional_entry_update!(ldss, sufs)
+        probes = [_lqr_terminal_probe_cached(sm, hs) for (sm, hs) in zip(sms, sufs)]
+        return _lqr_conditional_mstep!(
+            ldss,
+            sufs,
+            slots,
+            _lqr_cell_slots(sms, slots[_G_AB]),
+            _LQRExactNormalizer(probes);
+            score_extra=_lqr_entry_score(sms, sufs),
+        )
+    end
     return _lqr_conditional_mstep!(_lqr_conditional_problem(ldss, sufs, slots), ldss)
 end
 

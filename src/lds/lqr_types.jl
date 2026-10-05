@@ -212,6 +212,65 @@ function _check_gref_cols(f::LQRFitFlags, m::Int, d::Int)
 end
 
 """
+    _LQREntryCache{T}
+
+The forward transition an entry prior puts in place of the ordinary one: for the
+fresh plan `λ' = μ + K (x − r) + e₁`, `e₁ ~ N(0, P)`, and the plant row
+`x' = A x − S λ' + h_x + B_{u,x} u + e₂`, `e₂ ~ N(0, Σ_xx)`, the pair
+`z' = [x'; λ']` is
+
+    z' = M z + b + B u + w,    w ~ N(0, Q),
+
+with `M = [A − S K  0; K  0]`, `b = [h_x − S μ; μ]`,
+`B = [B_{u,x} + S K G; −K G]` (`G` the reference map of the epoch being left,
+so `r = G u`), and `Q = [Σ_xx + S P S  −S P; −P S  P]`. The change of variables
+from `(e₁, e₂)` is unit-triangular, so this *is* the entry density, not an
+approximation of it, and every kernel that reads an ordinary transition reads
+this one the same way. The derived blocks mirror [`LQRCache`](@ref)'s.
+"""
+mutable struct _LQREntryCache{T<:Real}
+    M::Matrix{T}
+    b::Vector{T}
+    B::Matrix{T}
+    Q::DensePDMat{T}
+    negQinv::Matrix{T}
+    QinvM::Matrix{T}
+    MtQinv::Matrix{T}
+    negMtQinvM::Matrix{T}
+    cQ::T
+end
+
+"""
+    LQRSwitch{T}
+
+A known boundary between two epochs of an [`LQRStateModel`](@ref)'s cost
+schedule, at schedule position `pos`: the first position of the new epoch, so
+the epoch being left ends at bin `pos` (its last transition is `pos − 1 → pos`)
+and the new one's first transition is `pos → pos + 1`. This is the
+deterministic counterpart of a switching model's discrete transition, and it
+carries the same two boundary factors (see [`set_boundaries!`](@ref) for the
+switching version and [`set_schedule_boundaries!`](@ref) for this one):
+
+- `bridge`: a cost regime (`0` for none). The epoch being left then ends with a
+  terminal factor `λ_pos = Q_b (x_pos − r_pos) + h_f`, `Q_b = Qc[bridge]`, with
+  the trial-end factor's `Σf` and `hf` and the reference `G_b u_pos`. Under
+  `condition_terminal` it is conditioned on, like the trial's end.
+- `entry`: an [`EntryPrior`](@ref) (or `nothing`). The transition `pos → pos+1`
+  then starts a fresh plan, `λ_{pos+1} ~ N(μ + K (x_pos − r_pos), P)` with `r`
+  the reference of the epoch being left, in place of the costate carried through
+  the adjoint equation; the plant row keeps the model's own `A`, `S`, plant drift
+  and plant noise.
+
+A trial applies a boundary only where it holds the transition `pos → pos + 1`:
+one that starts after `pos` or ends at or before it never crosses it.
+"""
+mutable struct LQRSwitch{T<:Real}
+    pos::Int
+    bridge::Int
+    entry::Union{Nothing,EntryPrior{T}}
+end
+
+"""
     LQRCache{T}
 
 Everything the smoother and the ELBO need, derived from a
@@ -265,6 +324,8 @@ mutable struct LQRCache{T<:Real}
     const negLtSL::Vector{Matrix{T}}
     const LtSinv::Vector{Matrix{T}}
     cF::T
+    # One per `sm.switches` entry; only those carrying an entry prior are filled.
+    switch::Vector{_LQREntryCache{T}}
 end
 
 function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
@@ -289,6 +350,7 @@ function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
         [zeros(T, d, d) for _ in 1:nregimes],
         [zeros(T, d, n) for _ in 1:nregimes],
         zero(T),
+        _LQREntryCache{T}[],
     )
 end
 
@@ -731,6 +793,8 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
+    gref_gate::Matrix{Bool}
+    switches::Vector{LQRSwitch{T}}
     cache::LQRCache{T}
 end
 
@@ -1034,7 +1098,8 @@ function _check_lqr_structure(
     Qc::AbstractVector{<:AbstractMatrix{T}},
     schedule::AbstractVector{Int},
     terminal::Bool,
-    terminal_regime::Int=0,
+    terminal_regime::Int=0;
+    bridge_regimes::AbstractVector{Int}=Int[],
 ) where {T<:Real}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatchError("LQR A columns", n, size(A, 2)))
@@ -1099,6 +1164,8 @@ function _check_lqr_structure(
         # than by any schedule entry, so it is used even when nothing points at
         # it -- and warning that it is not would be exactly backwards.
         terminal && push!(used, terminal_regime > 0 ? terminal_regime : schedule[end])
+        # So is a bridge's cost, read only at the switch it ends.
+        union!(used, bridge_regimes)
         for k in 1:K
             k in used || @warn(
                 "Qc[$k] is never used by the cost schedule, so the M-step cannot move " *
@@ -1179,6 +1246,11 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
   vector aligned with `Qc` whose entries are inverse-Wishart priors or `nothing`.
   The last scheduled cost can therefore have its own terminal prior. See
   "Regularizing the innovation and the cost" on the type.
+- `gref_gate`: a `length(Qc) × ux_dim` `Bool` matrix giving each cost regime its
+  own reference columns; see [`set_gref_gate!`](@ref).
+- `bridges`, `entries`, `entry_gain`, `entry_cov`: boundary factors at the
+  schedule's epoch switches; see [`set_schedule_boundaries!`](@ref). A bridge's
+  cost regime counts as used.
 
 Everything derived (the symplectic transitions, the forward noise) is built
 here; you never pass it in.
@@ -1208,6 +1280,11 @@ function LQRStateModel(
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
     fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
+    gref_gate::Union{Nothing,AbstractMatrix{Bool}}=nothing,
+    bridges=Pair{Int,Int}[],
+    entries=Int[],
+    entry_gain::Bool=true,
+    entry_cov::Real=1.0,
 ) where {T<:Real}
     n = size(A, 1)
     d = 2n
@@ -1215,7 +1292,9 @@ function LQRStateModel(
     sched = collect(Int, schedule)
 
     term_k = Int(terminal_regime)
-    _check_lqr_structure(A, S, Qc_vec, sched, terminal, term_k)
+    _check_lqr_structure(
+        A, S, Qc_vec, sched, terminal, term_k; bridge_regimes=Int[last(p) for p in bridges]
+    )
     #=
     Pinning the terminal cost only means anything when there is a terminal
     factor to pin, and it has to name a cost that exists. Both are mistakes
@@ -1283,9 +1362,17 @@ function LQRStateModel(
         Qc_prior_value,
         nothing,
         nothing,
+        _normalize_gref_gate(gref_gate, length(Qc_vec), size(Bu_m, 2)),
+        LQRSwitch{T}[],
         LQRCache(T, n, length(Qc_vec), size(Bu_m, 2)),
     )
-    refresh!(sm)
+    if isempty(bridges) && isempty(entries)
+        refresh!(sm)
+    else
+        set_schedule_boundaries!(
+            sm; bridges=bridges, entries=entries, entry_gain=entry_gain, entry_cov=entry_cov
+        )
+    end
     return sm
 end
 
@@ -1423,6 +1510,8 @@ function free_state_model(
         nothing,
         nothing,
         nothing,
+        Matrix{Bool}(undef, 0, 0),
+        LQRSwitch{T}[],
         LQRCache(T, n, 1, size(Bu_m, 2)),
     )
     refresh!(sm)
@@ -1614,6 +1703,8 @@ function hold_state_model(
         Qc_prior_value,
         nothing,
         nothing,
+        Matrix{Bool}(undef, 0, 0),
+        LQRSwitch{T}[],
         LQRCache(T, n, 1, size(Bu_m, 2)),
     )
     refresh!(sm)
@@ -1949,7 +2040,7 @@ function _refresh_lqr_head!(
         Bmix = Matrix{T}(undef, d, m)
         for k in eachindex(sm.Qc)
             copyto!(Bmix, sm.Bu)
-            @views mul!(Bmix[(n + 1):d, :], sm.Qc[k], sm.Gref, -one(T), one(T))
+            @views mul!(Bmix[(n + 1):d, :], sm.Qc[k], _gref_for(sm, k), -one(T), one(T))
             mul!(c.Bfwd[k], G, Bmix)
         end
     end
@@ -2002,7 +2093,7 @@ function _refresh_tail!(
             end
             # Terminal tracking: λ_T = Q_k (x_T - r_T), so the residual
             # carries +Q_k G_r u_T.
-            size(Ftrm, 2) > 0 && mul!(Ftrm, sm.Qc[k], sm.Gref)
+            size(Ftrm, 2) > 0 && mul!(Ftrm, sm.Qc[k], _gref_for(sm, k))
             copyto!(LtSinv, transpose(Lf))
             rdiv!(LtSinv, c.Sf_PD.chol)             # Λfᵀ Σf⁻¹  (d × n)
             mul!(negLtSL, LtSinv, Lf)
@@ -2010,6 +2101,7 @@ function _refresh_tail!(
         end
     end
     c.cF = -T(0.5) * (T(n) * log(T(2π)) + logdet(c.Sf_PD))
+    _refresh_switches!(sm)
 
     #= Last, so a variant is rebuilt only from a parent whose own cache is
     already current — they alias its arrays, so the order is what makes the two
@@ -2439,6 +2531,12 @@ function lqr_riccati_sequence(
     tsteps >= 2 || throw(ArgumentError("lqr_riccati_sequence needs tsteps ≥ 2"))
     _lqr_lengths_ok(sm, [tsteps])
     _is_hold(sm) && return _hold_riccati_sequence(sm, tsteps, ux)
+    _has_switches(sm) && throw(
+        ArgumentError(
+            "lqr_riccati_sequence (and simulate_lqr) do not model schedule boundaries; " *
+            "sample a model with bridges or entries with `rand`",
+        ),
+    )
     n = _plant_dim(sm)
     d = 2n
     A = Matrix{T}(sm.A)
@@ -2463,7 +2561,7 @@ function lqr_riccati_sequence(
         copyto!(g[tsteps], sm.hf)
         # Terminal reference: λ_T = Q_f(x_T − r_T) + h_f, so g_T = h_f − Q_f r_T.
         if has_input
-            g[tsteps] .-= sm.Qc[kT] * (sm.Gref * view(ux_mat, :, tsteps))
+            g[tsteps] .-= sm.Qc[kT] * (_gref_for(sm, kT) * view(ux_mat, :, tsteps))
         end
     end
     W[tsteps] = (Imat + S * P[tsteps]) \ Imat
@@ -2476,9 +2574,8 @@ function lqr_riccati_sequence(
         if has_input
             u_t = view(ux_mat, :, t)
             mul!(vbuf, sm.Bu, u_t, one(T), one(T))
-            mul!(
-                view(vbuf, (n + 1):d), sm.Qc[_regime(sm, t)], sm.Gref * u_t, -one(T), one(T)
-            )
+            k = _regime(sm, t)
+            mul!(view(vbuf, (n + 1):d), sm.Qc[k], _gref_for(sm, k) * u_t, -one(T), one(T))
         end
         return (view(vbuf, 1:n), view(vbuf, (n + 1):d))
     end

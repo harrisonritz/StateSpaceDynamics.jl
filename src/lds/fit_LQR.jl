@@ -1020,16 +1020,26 @@ function _grouped_state_mstep!(
     #= One copy per group for the pieces the declaration named, one copy in
     total for the rest — the same layout a partial tie across discrete states
     uses, and the same single solve. =#
-    ctx = _LQRMStepCtx(
-        sufs,
-        sms,
-        _lqr_cell_slots(sms, slots[_G_AB]),
-        slots[_G_Q],
-        lds1.fit_bool[4];
-        flags=_lqr_structure_flags(lds1.state_model, lds1.fit_bool[3]),
-    )
-    _lqr_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
-    lds1.fit_bool[4] && _lqr_noise_mstep!(ctx)
+    function step!()
+        ctx = _LQRMStepCtx(
+            sufs,
+            sms,
+            _lqr_cell_slots(sms, slots[_G_AB]),
+            slots[_G_Q],
+            lds1.fit_bool[4];
+            flags=_lqr_structure_flags(lds1.state_model, lds1.fit_bool[3]),
+        )
+        _lqr_structure_mstep!(ctx, lds1.fit_bool[3], lds1.state_model.mstep_iters)
+        lds1.fit_bool[4] && _lqr_noise_mstep!(ctx)
+        return nothing
+    end
+    if _has_entries(lds1.state_model)
+        # Shared entry priors first, then the guarded structure; see `_lqr_state_mstep!`.
+        _lqr_entry_update!(sms, sufs)
+        _lqr_entry_guarded(step!, ldss, sufs)
+    else
+        step!()
+    end
     for lds in ldss
         refresh!(lds.state_model)
     end
@@ -1126,6 +1136,12 @@ function gradient_batched!(
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     tsteps = size(x, 2)
     sm = lds.state_model
+    _has_switches(sm) && throw(
+        ArgumentError(
+            "the batched LQR gradient has no schedule-boundary terms; a model with " *
+            "switches must take the per-trial smoother",
+        ),
+    )
     c = sm.cache
     x0 = sm.x0
     bf = c.bfwd
@@ -1242,6 +1258,18 @@ function _sample_lqr_path!(
     z[:, 1] = rand(rng, P0)
     has_input = size(ux, 1) > 0
     for t in 2:tsteps
+        e = _entry_into(sm, t)
+        if e != 0
+            # An entry: a fresh plan, from its own transition (see `_LQREntryCache`).
+            ec = c.switch[e]
+            @views begin
+                mul!(z[:, t], ec.M, z[:, t - 1])
+                z[:, t] .+= ec.b
+                has_input && mul!(z[:, t], ec.B, ux[:, t - 1], one(T), one(T))
+                z[:, t] .+= rand(rng, MvNormal(zeros(T, size(z, 1)), Matrix(ec.Q)))
+            end
+            continue
+        end
         k = _regime(sm, t - 1)
         @views begin
             mul!(z[:, t], c.M[k], z[:, t - 1])

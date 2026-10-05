@@ -1108,6 +1108,11 @@ function _build_variants!(
             sm.Qc_prior,
             nothing,
             nothing,
+            #= The gate and the boundaries are structure, not parameters: every
+            variant shares the parent's (the entry priors included, which are
+            fitted from all of the trials). =#
+            sm.gref_gate,
+            sm.switches,
             LQRCache(T, n, _nregimes(sm), size(sm.Bu, 2)),
         )
         refresh!(v)

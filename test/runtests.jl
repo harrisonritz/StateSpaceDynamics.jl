@@ -687,6 +687,17 @@ using SSDTest
             test_slds_lqr_review_conditional_score_halves()
         end
 
+        include("LinearDynamicalSystems/LQRScheduleBoundaries.jl")
+        @testset "LQR schedule boundaries" begin
+            test_lqr_switches_dense()
+            test_lqr_gref_gate_cache()
+            test_lqr_switches_em()
+            test_lqr_switches_conditional_gradient()
+            test_lqr_switches_grouped()
+            test_lqr_switches_rand_forward()
+            test_lqr_switches_validation()
+        end
+
         include("LinearDynamicalSystems/SLDSBoundaries.jl")
         @testset "SLDS boundaries (exit bridges, entry priors, conditioning)" begin
             test_bridge_forward_backward_exact()

@@ -177,8 +177,15 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
         )
     else
         _check_lqr_structure(
-            sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal, sm.terminal_regime
+            sm.A,
+            sm.S,
+            sm.Qc,
+            sm.schedule,
+            sm.terminal,
+            sm.terminal_regime;
+            bridge_regimes=_bridge_regimes(sm),
         )
+        _validate_switches(sm)
         _normalize_qc_prior(T, sm.Qc_prior, length(sm.Qc), n)
     end
 
@@ -629,6 +636,7 @@ function _validate_slds_structure(slds::SLDS)
     _validate_slds_state_models(slds.LDSs[1].state_model, slds)
     _validate_slds_chain_prior(slds)
     _validate_boundaries(slds)
+    _refuse_slds_switches(slds)
     return nothing
 end
 
