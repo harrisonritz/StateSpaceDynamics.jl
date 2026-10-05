@@ -364,7 +364,10 @@ function _slqr_probe_estep!(probe::_SLQRProbe{T}) where {T<:Real}
     moved would smooth under the old ones and score under the new.
     =#
     refresh_slds_pool!(probe.pool, probe.slds)
-    if !probe.started
+    #= The alternation scores the means it is handed before it smooths, so a
+    non-finite one left by an evaluation that aborted partway has to be smoothed
+    again first; the smoother restarts it from the prior. =#
+    if !probe.started || !all(fs -> all(isfinite, fs.x_smooth), probe.tfs.FilterSmooths)
         _slds_warmstart!(
             probe.slds,
             nothing,
@@ -476,8 +479,16 @@ reseeded.
 from the same place. The reported score builds its probe fresh, so an M-step
 that judges proposals with a probe carried over from the last point it visited
 would be judging them on a different number.
+
+That includes the smoothed means: a fresh probe's are zero, which the smoother
+reads as "start from the prior". Left in place, they would carry the last
+evaluation into this one — and a rejected proposal can abort partway through a
+smooth, leaving some trials' means non-finite.
 """
 function _slqr_restart!(probe::_SLQRProbe)
+    for fs in probe.tfs.FilterSmooths
+        fill!(fs.x_smooth, zero(eltype(fs.x_smooth)))
+    end
     probe.started = false
     Random.seed!(probe.rng, _SLQR_PROBE_SEED)
     return probe

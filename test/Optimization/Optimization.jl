@@ -181,3 +181,44 @@ function test_newton_smooth_returns_false_on_max_iter()
     end
     return nothing
 end
+
+function test_backtracking_nonfinite_direction_leaves_x()
+    @testset "backtracking! refuses a non-finite direction without touching x" begin
+        #=
+        A rejected trial point is undone by subtracting the step back off, and
+        `x + NaN - NaN` is NaN: before the guard, a direction from an overflowed
+        Hessian solve left `x` NaN, which no later Newton step could leave.
+        =#
+        ls = SSDopt.BackTrackingLS{Float64}()
+        for bad in (NaN, Inf, -Inf)
+            x = [1.0, 2.0]
+            p = [bad, 0.5]
+            ϕ!() = -sum(abs2, x)
+            α, ϕ_new = SSDopt.backtracking!(Val(:max), ls, x, p, ϕ!, ϕ!(), 1.0)
+            @test α == 0
+            @test ϕ_new == -5.0
+            @test x == [1.0, 2.0]
+        end
+    end
+    return nothing
+end
+
+function test_newton_smooth_nonfinite_gradient_stalls()
+    @testset "newton_smooth! stops on a non-finite gradient with x untouched" begin
+        for ls in (nothing, SSDopt.BackTrackingLS{Float64}())
+            x = [1.0, 2.0]
+            g = similar(x)
+            p = similar(x)
+            compute_grad!(gv, _xv) = (gv .= [NaN, 1.0])
+            build_hess!(_xv) = nothing
+            solve_dir!(pv, gv) = (pv .= gv)
+            ϕ!() = -sum(abs2, x)
+            converged = SSDopt.newton_smooth!(
+                Val(:max), x, g, p, compute_grad!, build_hess!, solve_dir!, ϕ!, ls
+            )
+            @test converged == false
+            @test x == [1.0, 2.0]
+        end
+    end
+    return nothing
+end

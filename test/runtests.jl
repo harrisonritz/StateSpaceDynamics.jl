@@ -638,6 +638,7 @@ using SSDTest
             test_slds_lqr_terminal_conditioning()
             test_slds_lqr_terminal_chain_step()
             test_slds_lqr_probe_resmoothing()
+            test_slds_lqr_probe_nonfinite_recovery()
             test_slds_lqr_conditional_score_gradient()
             test_slds_lqr_validation()
             test_slds_lqr_prior_vs_optimal_data()
@@ -775,6 +776,8 @@ using SSDTest
         test_newton_smooth_no_linesearch_converges()
         test_newton_smooth_returns_false_on_linesearch_stall()
         test_newton_smooth_returns_false_on_max_iter()
+        test_backtracking_nonfinite_direction_leaves_x()
+        test_newton_smooth_nonfinite_gradient_stalls()
     end
 
     # Utilities Tests

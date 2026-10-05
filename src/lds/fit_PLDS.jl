@@ -542,9 +542,10 @@ function smooth!(
     #=
     Warm-start the Newton iteration from the previous EM iteration's smoothed
     mean. If the smoothed mean is all zeros (e.g., first EM iteration), use the
-    prior mean x0 instead.
+    prior mean x0 instead — and likewise if any of it is non-finite, which no
+    Newton step can move off.
     =#
-    if all(x .== 0)
+    if all(iszero, x) || !all(isfinite, x)
         x .= lds.state_model.x0
     end
 

@@ -1321,9 +1321,12 @@ function smooth!(
 
     #=
     Warm-start the Newton iteration from the previous EM iteration's smoothed
-    mean. If the smoothed mean is all zeros, use the first LDS's prior mean.
+    mean. If the smoothed mean is all zeros, use the first LDS's prior mean —
+    and likewise if any of it is non-finite: Newton cannot move off a NaN start,
+    and a trial's mean persists across E-steps, so one bad solve would otherwise
+    poison that trial for the rest of the fit.
     =#
-    if all(iszero, x)
+    if all(iszero, x) || !all(isfinite, x)
         x .= slds.LDSs[1].state_model.x0
     end
 
@@ -2541,8 +2544,14 @@ function _vem_alternate!(
                     xs in x_samples
                 )
             end
-            error(
-                "diagnostic: non-finite regime log densities at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max",
+            #= A `NumericalStabilityError`, so that a line search scoring a
+            candidate through a switching probe rejects that candidate (see
+            `_lqr_rejectable`) rather than ending the fit. =#
+            throw(
+                NumericalStabilityError(
+                    "regime log densities",
+                    "non-finite at VEM iteration $iter; counts=$counts nans=$nans +inf=$pinfs -inf=$ninfs first=$first_bad sample_bad=$sample_bad sample_max=$sample_max",
+                ),
             )
         end
         if !all(isfinite, dl.A) ||

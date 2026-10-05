@@ -57,6 +57,15 @@ function backtracking!(
 ) where {T<:Real,F}
     @assert ls.order == 2 || ls.order == 3
 
+    #=
+    Every rejected trial point is undone by subtracting the step back off, which
+    only restores `x` when `p` is finite: `x + NaN - NaN` and `x + Inf - Inf` are
+    both NaN. A direction from a Hessian solve that overflowed would otherwise
+    leave `x` NaN for good, and a NaN start is one no later Newton step can leave.
+    No step is the only safe answer; the caller reads `α == 0` as a stall.
+    =#
+    (isnan(ϕ0) || !isfinite(dϕ0) || !all(isfinite, p)) && return zero(T), ϕ0
+
     α1 = one(T)
     α2 = one(T)
 
@@ -171,12 +180,15 @@ function newton_smooth!(
         if gn < tol
             return true
         end
+        # A non-finite gradient has no direction to offer; stop with `x` untouched.
+        isfinite(gn) || return false
 
         build_hess!(x)
         solve_dir!(p, g)  # p is Newton direction
 
         # step selection
         if ls === nothing
+            all(isfinite, p) || return false
             @. x = x + p
             ϕ_prev = ϕ!()
         else

@@ -631,6 +631,65 @@ function test_slds_lqr_probe_resmoothing()
     return nothing
 end
 
+"""A probe whose smoothed means were left non-finite still scores its
+normalizer, and non-finite regime scores reach the line search as a rejectable
+failure.
+
+A proposal the M-step rejects can abort the probe's smooth partway, leaving some
+trials' means NaN. The restart used to keep them, the smoother could not move
+off a NaN start, and the next evaluation died on a plain `error` from the
+finiteness check, which the line search did not recognise as a rejected point.
+"""
+function test_slds_lqr_probe_nonfinite_recovery()
+    p, tsteps, ntrials = 4, 20, 4
+    ys = hslds_data(p, tsteps, ntrials)
+    slds = hslds_model([[0.25 0.04; 0.04 0.18], [0.8 0.0; 0.0 0.6]]; p=p, terminal=true)
+    data = SSD.Data(slds.LDSs[1], ys)
+    probe = SSD._slqr_terminal_probe(slds, data.ux)
+    SSD._slqr_sync_probe!(probe, slds)
+    SSD._slqr_probe_estep!(probe)
+    clean = probe.logz
+    @test isfinite(clean)
+
+    poison!() = fill!(probe.tfs[1].x_smooth, NaN)
+    # Restarted, as every scoring path does: the means are cleared.
+    poison!()
+    sms = [lds.state_model for lds in slds.LDSs]
+    @test SSD._terminal_score_logz(SSD._SLQRNormalizer(probe), sms) ≈ clean rtol = 1e-10
+    # Not restarted: the smoother itself restarts a non-finite mean from the prior.
+    poison!()
+    SSD._slqr_probe_estep!(probe)
+    @test probe.logz ≈ clean rtol = 1e-8
+
+    bad = fill(NaN, size(probe.dl.logL))
+    err = try
+        SSD._vem_alternate!(
+            probe.slds,
+            nothing,
+            nothing,
+            probe.tfs,
+            probe.fb,
+            probe.dl,
+            probe.data.y,
+            probe.pool,
+            probe.plan;
+            obs_seq=probe.obs_seq,
+            control_seq=probe.control_seq,
+            seq_ends=probe.seq_ends,
+            ux0=probe.data.ux0,
+            ux=probe.data.ux,
+            smoothing_iters=1,
+            clamp_logL=bad,
+        )
+        nothing
+    catch e
+        e
+    end
+    @test err isa NumericalStabilityError
+    @test SSD._lqr_rejectable(err)
+    return nothing
+end
+
 """The switching surrogate the M-step descends has the scored objective's
 gradient at the point it was built.
 
