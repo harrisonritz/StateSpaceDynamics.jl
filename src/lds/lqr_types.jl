@@ -818,8 +818,10 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
 
 # Fields
 - `mode::Symbol`: `:lqr` (the finite-horizon symplectic form documented above),
-    `:hold` (the infinite-horizon regulator, see [`hold_state_model`](@ref)) or
-    `:free` (an unconstrained transition, see [`free_state_model`](@ref)).
+    `:causal` (the finite-horizon *feedback* controller with plant and costate
+    noise, see [`causal_state_model`](@ref)), `:hold` (the infinite-horizon
+    regulator, see [`hold_state_model`](@ref)) or `:free` (an unconstrained
+    transition, see [`free_state_model`](@ref)).
 - `A::M`: `n × n` plant dynamics. Invertible in `:lqr` mode.
 - `S::M`: `n × n` symmetric `B R⁻¹ Bᵀ` — the control authority weighted by the
     control cost. `B` and `R` are not separately identified; only `S` is.
@@ -870,6 +872,8 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
   including the terminal regime. See below.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
+- `causal::CausalOptions`: the noise and horizon options of the `:causal` mode
+    (see [`CausalOptions`](@ref)); unused in the other modes.
 - `cache::LQRCache{T}`: derived forward parameters. Rebuilt by
     [`refresh!`](@ref), which the constructors and the M-step call for you —
     call it yourself after mutating a field by hand.

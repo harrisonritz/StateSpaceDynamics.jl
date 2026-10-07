@@ -8,6 +8,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A causal (closed-loop) mode for `LQRStateModel`: `causal_state_model`.** The
+  finite-horizon feedback controller of the control problem, as a state model:
+  sweeping each trial's stretch of the cost schedule backward gives `P_t`, `W_t`
+  and the feedforward, the plant row is the closed loop
+  `x_{t+1} = W_{t+1}(A x_t + c − S(g_{t+1} + ν_{t+1})) + ε_t` and the costate sits
+  on the Riccati graph, `λ_{t+1} = P_{t+1} x_{t+1} + g_{t+1} + ν_{t+1}`. Plant noise
+  `Σ` and costate noise `Ω` are independent, each dense or diagonal
+  (`plant_noise`, `costate_noise`); their coupling is the one the theory implies,
+  through `P_t` (and through `−W S ν` when `slack_drives_state`, the default — the
+  agent acts on its perturbed costate; `false` makes `ν` a readout). This is what
+  `simulate_lqr` generates, so causal data are no longer fitted through the
+  misspecified constant mixed-coordinate `Σ` of `:lqr` mode.
+
+  The chain on `z = [x; λ]` is stable: no terminal factor, no normalizer, and
+  `rand` samples it exactly. Its transition varies with the steps left, so the
+  model caches one Riccati sweep per `(cost offset, trial length)` horizon. In the
+  coordinates `(ε_t, ν_{t+1})` the noise is constant with unit Jacobian, so the
+  M-step profiles `Σ` and `Ω` in closed form (dense, diagonal, with the
+  block-marginal of a `Σ_prior`, or `Ω` pinned by `fixed_costate_sigma`), and the
+  structural gradient is an exact reverse sweep through the Riccati and
+  feedforward recursions. Schedules, `terminal_cost`/`terminal_regime`, per-trial
+  cost offsets, ragged lengths, `h`/`Bu`/`Gref` with a `gref_gate` (inputs
+  constant within a trial), initial inputs, `depends_on` grouping, priors,
+  Gaussian/Poisson/composite emissions, held-out scoring and `rescale_costate!`
+  are supported; schedule boundaries and switching models (`SLDS`) are refused for
+  now.
+
 - **Known epoch boundaries for `LQRStateModel`: bridges, entry priors and a
   per-regime reference gate.** A cost schedule is a switching model whose
   switches are known, and the two boundary factors `set_boundaries!` gives a

@@ -72,8 +72,30 @@ simulate_lqr
 rescale_costate!
 free_state_model
 hold_state_model
+causal_state_model
+CausalOptions
 plant_dim
 ```
+
+### Causal (closed-loop) mode
+
+`causal_state_model` fits the finite-horizon **feedback controller** rather than
+the two-point boundary-value form: each trial's backward Riccati sweep gives
+`P_t` and the feedforward, the costate sits on the Riccati graph
+`λ_t = P_t x_t + g_t` up to a costate noise `ν ~ N(0, Ω)`, and the plant noise
+`ε ~ N(0, Σ)` arrives after the control is chosen. The innovation is therefore
+the one the theory implies — the costate innovation is `P_{t+1}` times the state
+innovation plus `ν` — rather than a free mixed-coordinate `Σ`, and the forward
+chain is stable, so there is no terminal factor and `rand` samples the model
+directly. `slack_drives_state` chooses whether the agent acts on its perturbed
+costate (the slack moves the state by `−W_{t+1} S ν`) or `ν` is a pure readout;
+`plant_noise` and `costate_noise` choose dense or diagonal `Σ` and `Ω`.
+
+On data from a causal controller this is the generative model, whereas `:lqr`
+mode is a misspecified approximation of it whose cost estimates can be biased
+(see `docs/dev/lqr/noise_prototype.md` on the `claude/costate-noise-prototype`
+branch). Inputs must be constant within a trial, and the mode does not yet
+support schedule boundaries or switching models.
 
 ### Switching
 

@@ -369,6 +369,22 @@ function _register_causal_horizons!(
 end
 
 """
+    _trial_cache_copy(c::LQRCache)
+
+A per-trial model (one with its own initial mean, see `_trial_initial_model`)
+copies the cache; a `:causal` model's horizons are read-only during the E-step
+and can be large, so the copy shares them instead of duplicating every horizon
+for every trial.
+"""
+function _trial_cache_copy(c::LQRCache)
+    isempty(c.causal) && return deepcopy(c)
+    seen = IdDict{Any,Any}(
+        c.causal => c.causal, c.causal_index => c.causal_index, c.causal_keys => c.causal_keys
+    )
+    return Base.deepcopy_internal(c, seen)
+end
+
+"""
     _causal_horizon(sm, tsteps) -> _CausalHorizon
 
 The horizon of a trial of length `tsteps`, for `sm` as the trial sees it (its
