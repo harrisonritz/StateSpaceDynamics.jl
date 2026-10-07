@@ -27,7 +27,9 @@ plant noise. That is the user's `W_t` exactly, read causally.
    identifies — the position-cost contrast between conditions, Fisher SE 0.10 —
    with a log error of 0.7–1.0, i.e. off by a factor of 2–2.6, at 7–10 standard
    errors. Its closed-loop gains are 2–4× worse than either structured model's.
-   This is not an optimizer artifact: 8000 further iterations change neither.
+   This is not an optimizer artifact (8000 further iterations change neither),
+   and it survives fixing `A` at the truth, where the error grows to over ten
+   standard errors.
 2. **Both structured models fix it** — and with half the parameters. They also
    score better on held-out data, by 0.003–0.004 nats/bin on every seed, but be
    clear what that is: mostly parameter count. A correctly specified MLE loses
@@ -36,8 +38,9 @@ plant noise. That is the user's `W_t` exactly, read causally.
    beyond that is only 0.0006–0.0017 nats/bin. **The case against M0 is the
    bias, not the fit:** a model can predict nearly as well as the truth and still
    misread the controller by a factor of two.
-3. **M1 and M2 are close on each other's data** (≤ 0.0014 nats/bin), each winning
-   on its own. Choosing between them is therefore not a fit question but a
+3. **M1 and M2 are close on each other's data** (≤ 0.0020 nats/bin), each winning
+   on its own — distinguishably so on M1 draws once the plant is known, where M2
+   also misreads the costs. Choosing between them is therefore not a fit question but a
    modelling and cost question, and both point the same way:
    - M1's costate noise is **non-causal** (below): the control error at `t`
      depends on costate innovations after `t`, pinned to vanish at the deadline.
@@ -165,7 +168,40 @@ Paired held-out differences (same test set, mean ± sd over seeds, nats/bin):
 | G2 | +0.0029 ± 0.0003 | +0.0035 ± 0.0003 | −0.0006 ± 0.0004 |
 | G3 | +0.0038 ± 0.0017 | +0.0024 ± 0.0017 | +0.0014 ± 0.0008 |
 
-KNOWN_A_PLACEHOLDER
+### A known
+
+Fixing `A` at the truth removes the plant–cost trade-off (and 4 parameters).
+Position costs become identified in absolute terms (SE 0.31), and the picture
+sharpens rather than changes:
+
+| data | model | params | dtest | Q pos (│log│) | contrast pos (│log│) | gains | slack share [true] |
+|---|---|---|---|---|---|---|---|
+| G1 | M0 | 50 | −0.0058 ± 0.0013 | 0.78 | 1.06 | 7.2 % | — |
+| G1 | M1 | 23 | −0.0017 ± 0.0003 | 0.27 | 0.09 | 2.1 % | 0.002 [0] |
+| G1 | M2 | 20 | −0.0013 ± 0.0005 | 0.23 | 0.08 | 1.8 % | 0.115 [0] |
+| G2 | M0 | 50 | −0.0042 ± 0.0010 | 0.76 | 0.99 | 6.0 % | — |
+| G2 | M1 | 23 | −0.0019 ± 0.0009 | 0.42 | 0.09 | 1.9 % | 0.007 [0.26] |
+| G2 | M2 | 20 | −0.0011 ± 0.0005 | 0.34 | 0.09 | 1.9 % | 0.549 [0.26] |
+| G3 | M0 | 50 | −0.0056 ± 0.0027 | 0.70 | 0.87 | 6.3 % | — |
+| G3 | M1 | 23 | −0.0019 ± 0.0011 | 0.34 | 0.04 | 2.5 % | 0.041 [0.042] |
+| G3 | M2 | 20 | −0.0039 ± 0.0011 | 0.41 | 0.19 | 3.3 % | 0.306 [0.042] |
+
+| data | M1 − M0 | M2 − M0 | M1 − M2 |
+|---|---|---|---|
+| G1 | +0.0042 ± 0.0013 | +0.0045 ± 0.0008 | −0.0003 ± 0.0006 |
+| G2 | +0.0023 ± 0.0010 | +0.0030 ± 0.0006 | −0.0008 ± 0.0006 |
+| G3 | +0.0037 ± 0.0017 | +0.0018 ± 0.0018 | +0.0020 ± 0.0005 |
+
+- M0's contrast error is now 0.87–1.06 against an SE of 0.084 — over ten
+  standard errors on every generator, including its own nearest relative (G3).
+  Its absolute position cost is off by a factor of about 2 (SE 0.31); M1 and M2
+  sit at about one SE.
+- On M1 draws (G3), M2 is now distinguishable (+0.0020 ± 0.0005 nats/bin) and
+  visibly misspecified: its velocity cost runs off (log error 4.0) and it reports
+  a slack share of 0.31 against 0.04 — it explains persistent costate error as
+  white slack. So the causal-vs-planning question *is* testable on data like
+  these, by comparing the two fits; it does not have to be assumed.
+- M2's plant-noise/slack split stays unreliable (Σ error 0.66 on G2).
 
 ### Robustness of the M0 numbers
 
@@ -239,7 +275,9 @@ normalizer is where the work and the numerical risk are.
    data: on causal-agent data its cost estimates are biased at many standard
    errors.
 3. Leave M1 unbuilt unless the open-loop-planning hypothesis becomes the one
-   under test; §2 is how to build it if so.
+   under test; §2 is how to build it if so. The known-plant G3 rows say that
+   test has power: a feedback model fitted to planning data loses measurably
+   and misreads the cost.
 4. Before interpreting costs from any model, run the `fisher` section on your
    own design. Here only the position contrast and the closed loop were
    identified; absolute costs were not, by any model.
