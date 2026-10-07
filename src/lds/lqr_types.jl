@@ -1882,8 +1882,8 @@ function _check_fixed_costate_sigma(
         ArgumentError("fixed_costate_sigma is outside the covariance's numeric range")
     )
     isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
-    isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
-    isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
+        isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
+        isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
         throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
     return v
 end
@@ -2336,7 +2336,16 @@ is the matrix the smoother actually propagates; see
 In `:hold` mode this is the stationary forward transition `[A_cl 0; P A_cl 0]`,
 which is stable rather than symplectic, and in `:free` mode the stored matrix.
 """
-symplectic_matrix(sm::LQRStateModel, k::Int=1) = copy(sm.cache.M[k])
+function symplectic_matrix(sm::LQRStateModel, k::Int=1)
+    _is_causal(sm) && throw(
+        ArgumentError(
+            "a `:causal` model has no per-regime transition: its forward map changes " *
+            "with the steps left in the trial. Read it per step from " *
+            "`lqr_riccati_sequence` (Φ_t = W_{t+1} A).",
+        ),
+    )
+    return copy(sm.cache.M[k])
+end
 
 """
     symplectic_form(n) -> Matrix

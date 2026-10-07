@@ -34,13 +34,21 @@ function causal_lds(n, emission)
     A, S, Q, C = problem(n)
     d = 2n
     sm = causal_state_model(
-        A, S, Q, Matrix(0.01I, n, n), Matrix(0.5I, n, n);
-        terminal_cost=true, x0=vcat(ones(n), zeros(n)), P0=Matrix(0.1I, d, d),
+        A,
+        S,
+        Q,
+        Matrix(0.01I, n, n),
+        Matrix(0.5I, n, n);
+        terminal_cost=true,
+        x0=vcat(ones(n), zeros(n)),
+        P0=Matrix(0.1I, d, d),
     )
     Cz = hcat(C, zeros(3n, n))
-    om = emission === :gaussian ?
-         GaussianObservationModel(Cz, Matrix(0.05I, 3n, 3n), zeros(3n)) :
-         PoissonObservationModel(0.3 .* Cz, fill(0.5, 3n))
+    om = if emission === :gaussian
+        GaussianObservationModel(Cz, Matrix(0.05I, 3n, 3n), zeros(3n))
+    else
+        PoissonObservationModel(0.3 .* Cz, fill(0.5, 3n))
+    end
     return LinearDynamicalSystem(sm, om)
 end
 
@@ -48,14 +56,23 @@ function lqr_lds(n, emission)
     A, S, Q, C = problem(n)
     d = 2n
     sm = LQRStateModel(
-        A, S, [Q, copy(Q)], Matrix(0.05I, d, d);
-        schedule=cost_schedule(400; terminal=true), terminal=true, terminal_regime=2,
-        Σf=Matrix(0.01I, n, n), x0=vcat(ones(n), zeros(n)), P0=Matrix(0.1I, d, d),
+        A,
+        S,
+        [Q, copy(Q)],
+        Matrix(0.05I, d, d);
+        schedule=cost_schedule(400; terminal=true),
+        terminal=true,
+        terminal_regime=2,
+        Σf=Matrix(0.01I, n, n),
+        x0=vcat(ones(n), zeros(n)),
+        P0=Matrix(0.1I, d, d),
     )
     Cz = hcat(C, zeros(3n, n))
-    om = emission === :gaussian ?
-         GaussianObservationModel(Cz, Matrix(0.05I, 3n, 3n), zeros(3n)) :
-         PoissonObservationModel(0.3 .* Cz, fill(0.5, 3n))
+    om = if emission === :gaussian
+        GaussianObservationModel(Cz, Matrix(0.05I, 3n, 3n), zeros(3n))
+    else
+        PoissonObservationModel(0.3 .* Cz, fill(0.5, 3n))
+    end
     return LinearDynamicalSystem(sm, om)
 end
 
@@ -70,7 +87,13 @@ function iteration_cost(lds, y; reps=QUICK ? 2 : 4)
     pool = SSD._lqr_sws_pool(lds, data)
     hs = SSD._initialize_td_sufficient_statistics(T, lds, data.tsteps)
     SSD._td_init_const_blocks!(pool[1], lds, data)
-    estep() = quad ? SSD.estep!(lds, hs, tfs, data, pool) : SSD.estep!(lds, hs, tfs, data, pool)
+    function estep()
+        return if quad
+            SSD.estep!(lds, hs, tfs, data, pool)
+        else
+            SSD.estep!(lds, hs, tfs, data, pool)
+        end
+    end
     function elbo_()
         if quad
             ent = sum(fs.entropy for fs in tfs.FilterSmooths)
@@ -101,15 +124,33 @@ function row(label, n, lengths; emission=:gaussian)
     end
     for mode in (:lqr, :causal)
         c = out[mode]
-        @printf("%-26s %-7s %8.1f %8.2f %8.1f %9.1f %8.1f %8.1f\n", label, mode,
-                1e3 * c.e, 1e3 * c.l, 1e3 * c.m, 1e3 * (c.e + c.l + c.m), c.ae, c.am)
+        @printf(
+            "%-26s %-7s %8.1f %8.2f %8.1f %9.1f %8.1f %8.1f\n",
+            label,
+            mode,
+            1e3 * c.e,
+            1e3 * c.l,
+            1e3 * c.m,
+            1e3 * (c.e + c.l + c.m),
+            c.ae,
+            c.am
+        )
     end
-    flush(stdout)
+    return flush(stdout)
 end
 
 println("one EM iteration, median over repetitions, single thread")
-@printf("%-26s %-7s %8s %8s %8s %9s %8s %8s\n", "case", "mode", "E (ms)", "ELBO", "M (ms)",
-        "total", "E (MB)", "M (MB)")
+@printf(
+    "%-26s %-7s %8s %8s %8s %9s %8s %8s\n",
+    "case",
+    "mode",
+    "E (ms)",
+    "ELBO",
+    "M (ms)",
+    "total",
+    "E (MB)",
+    "M (MB)"
+)
 row("n=2  N=100  T=30", 2, fill(30, 100))
 row("n=2  N=1000 T=30", 2, fill(30, QUICK ? 300 : 1000))
 row("n=2  N=100  T=100", 2, fill(100, 100))

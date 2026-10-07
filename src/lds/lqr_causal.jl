@@ -61,10 +61,11 @@ x_{t+1} = W_{t+1}\\big(A x_t + c - S(g_{t+1} + \\nu_{t+1})\\big) + \\varepsilon_
 \\lambda_{t+1} = P_{t+1} x_{t+1} + g_{t+1} + \\nu_{t+1},
 ```
 
-`ε_t ~ N(0, Σ)`, `ν_t ~ N(0, Ω)`, independent. This is exactly what
-[`simulate_lqr`](@ref) generates with `costate_slack`: the agent plans from what
-it knows (certainty equivalence), *acts* on its own perturbed costate, and the
-plant noise lands afterwards. Its innovation therefore has the structure the
+`ε_t ~ N(0, Σ)`, `ν_t ~ N(0, Ω)`, independent. With `slack_drives_state` and
+`Ω = σ²I` this is exactly what [`simulate_lqr`](@ref) generates with
+`costate_slack = σ`: the agent plans from what it knows (certainty
+equivalence), *acts* on its own perturbed costate, and the plant noise lands
+afterwards. `rand` samples the general model. Its innovation therefore has the structure the
 theory implies rather than a free covariance — the costate innovation is
 `P_{t+1}` times the state innovation plus `ν`, and the slack moves the state by
 `−W_{t+1} S ν`:
@@ -193,9 +194,7 @@ function causal_state_model(
     Qc_prior_value = _normalize_qc_prior(T, Qc_prior, length(Qc_vec), n)
     Σfull = _causal_noise_matrix(Σ, Ω, opts, n)
     fcs = _check_fixed_costate_sigma(T, Σfull, fixed_costate_sigma, Σ_prior, n)
-    Σ_prior === nothing ||
-        size(Σ_prior.Ψ) == (d, d) ||
-        throw(DimensionMismatchError("causal Σ_prior scale", (d, d), size(Σ_prior.Ψ)))
+    _check_causal_sigma_prior(Σ_prior, n)
     h_v, Bu_m, Gref_m, x0_v, P0_m, B0_m = _lqr_affine_defaults(
         T, n, h, Bu, Gref, x0, P0, B0, fit_flags, "causal"
     )
@@ -278,6 +277,28 @@ function _causal_noise_matrix(
     return full
 end
 
+#=
+The `Σ_prior` of a causal model acts through its marginals on the two blocks,
+`IW(Ψ_bb, ν − (2n − q))` for a `q`-dimensional block (`q = 1` per entry of a
+diagonal one). Those are proper — and their pseudo-counts positive — only when
+`ν > 2n − 1`; a weaker prior would *inflate* the noise rather than shrink it, and
+on a small fit drive the effective count negative.
+=#
+function _check_causal_sigma_prior(Σ_prior, n::Int)
+    Σ_prior === nothing && return nothing
+    d = 2n
+    size(Σ_prior.Ψ) == (d, d) ||
+        throw(DimensionMismatchError("causal Σ_prior scale", (d, d), size(Σ_prior.Ψ)))
+    Σ_prior.ν > d - 1 || throw(
+        ArgumentError(
+            "a causal model's Σ_prior acts through its marginals on the plant and " *
+            "costate blocks, which are proper only for ν > 2n − 1 = $(d - 1); got " *
+            "ν = $(Σ_prior.ν)",
+        ),
+    )
+    return nothing
+end
+
 """
     _check_causal_structure(sm)
 
@@ -318,6 +339,11 @@ function _check_causal_structure(sm::LQRStateModel{T}) where {T<:Real}
         ),
     )
     _causal_noise_matrix(Σ[1:n, 1:n], Σ[(n + 1):(2n), (n + 1):(2n)], sm.causal, n)
+    v = sm.fixed_costate_sigma
+    v === nothing ||
+        Σ[(n + 1):(2n), (n + 1):(2n)] ≈ v * I ||
+        throw(ArgumentError("fixed_costate_sigma = $v requires Ω = $v·I"))
+    _check_causal_sigma_prior(sm.Σ_prior, n)
     return nothing
 end
 
@@ -361,9 +387,10 @@ function _register_causal_horizons!(
 )
     _is_causal(sm) || return sm
     reg = sm.cache.causal_keys
+    seen = Set(reg)
     for (i, Ti) in enumerate(tsteps)
         key = _causal_key(sm, isempty(offsets) ? 0 : offsets[i], Ti)
-        key in reg || push!(reg, key)
+        key in seen || (push!(reg, key); push!(seen, key))
     end
     return sm
 end
@@ -379,7 +406,9 @@ for every trial.
 function _trial_cache_copy(c::LQRCache)
     isempty(c.causal) && return deepcopy(c)
     seen = IdDict{Any,Any}(
-        c.causal => c.causal, c.causal_index => c.causal_index, c.causal_keys => c.causal_keys
+        c.causal => c.causal,
+        c.causal_index => c.causal_index,
+        c.causal_keys => c.causal_keys,
     )
     return Base.deepcopy_internal(c, seen)
 end
@@ -431,11 +460,15 @@ function _refresh_causal_head!(
     for key in c.causal_keys
         slot = get(c.causal_index, key, 0)
         if slot == 0
-            push!(c.causal, _CausalHorizon(T, n, m, key[1], key[2]))
-            slot = length(c.causal)
-            c.causal_index[key] = slot
+            #= Filled before it is indexed: a sweep that throws must not leave an
+            all-zero horizon behind for a caller that catches the error. =#
+            H = _CausalHorizon(T, n, m, key[1], key[2])
+            _fill_causal_horizon!(H, sm, c.Qfwd)
+            push!(c.causal, H)
+            c.causal_index[key] = length(c.causal)
+        else
+            _fill_causal_horizon!(c.causal[slot], sm, c.Qfwd)
         end
-        _fill_causal_horizon!(c.causal[slot], sm, c.Qfwd)
     end
     return nothing
 end
@@ -453,6 +486,29 @@ schedule.
 @inline function _causal_terminal_regime(sm::LQRStateModel, offset::Int, tsteps::Int)
     sm.terminal_regime > 0 && return sm.terminal_regime
     return _causal_regime(sm, offset, tsteps)
+end
+
+"""Scratch for one causal sweep, so an M-step evaluation sweeps without allocating."""
+struct _SweepBuffers{T<:Real}
+    K::Matrix{T}
+    AK::Matrix{T}
+    Mn::Matrix{T}
+    V::Matrix{T}
+    Ct::Matrix{T}
+    Gk::Vector{Matrix{T}}
+    ipiv::Vector{LinearAlgebra.BlasInt}
+end
+
+function _SweepBuffers(::Type{T}, n::Int, m::Int, K::Int=8) where {T}
+    return _SweepBuffers{T}(
+        zeros(T, n, n),
+        zeros(T, n, n),
+        zeros(T, n, n),
+        zeros(T, n, 1 + m),
+        zeros(T, n, 1 + m),
+        [zeros(T, n, m) for _ in 1:K],
+        zeros(LinearAlgebra.BlasInt, n),
+    )
 end
 
 """
@@ -491,54 +547,77 @@ function _causal_sweep!(
     sm::LQRStateModel,
     offset::Int,
     tsteps::Int,
+    buf::_SweepBuffers{T}=_SweepBuffers(T, size(A, 1), size(Bu, 2), length(Qc)),
 ) where {T<:Real}
     n = size(A, 1)
     m = size(Bu, 2)
     xr, lr = 1:n, (n + 1):(2n)
-    Imat = Matrix{T}(I, n, n)
     gate = sm.gref_gate
+    K, AK, V, Ct = buf.K, buf.AK, buf.V, buf.Ct
+    # The reference map each regime reads, gated once per sweep rather than per step.
+    if m > 0
+        for k in eachindex(Qc)
+            copyto!(buf.Gk[k], _gated(Gref, gate, k))
+        end
+    end
     kT = _causal_terminal_regime(sm, offset, tsteps)
     if sm.causal.terminal_cost
         copyto!(P[tsteps], Qc[kT])
         @views G[tsteps][:, 1] .= hf
-        m > 0 && @views mul!(
-            G[tsteps][:, 2:end], Qc[kT], _gated(Gref, gate, kT), -one(T), zero(T)
-        )
+        m > 0 && @views mul!(G[tsteps][:, 2:end], Qc[kT], buf.Gk[kT], -one(T), zero(T))
     else
         fill!(P[tsteps], zero(T))
         fill!(G[tsteps], zero(T))
     end
-    _causal_inv_step!(W[tsteps], S, P[tsteps], Imat) || return false
-    Ct = Matrix{T}(undef, n, 1 + m)
+    _causal_inv_step!(W[tsteps], S, P[tsteps], buf) || return false
     @views Ct[:, 1] .= h[xr]
     m > 0 && @views Ct[:, 2:end] .= Bu[xr, :]
     for s in (tsteps - 1):-1:1
         k = _causal_regime(sm, offset, s)
-        K = P[s + 1] * W[s + 1]
-        P[s] .= Qc[k] .+ transpose(A) * K * A
+        mul!(K, P[s + 1], W[s + 1])
+        mul!(AK, transpose(A), K)
+        copyto!(P[s], Qc[k])
+        mul!(P[s], AK, A, one(T), one(T))
         Symmetrize!(P[s])
         all(isfinite, P[s]) || return false
-        V = K * Ct .+ transpose(W[s + 1]) * G[s + 1]
+        mul!(V, K, Ct)
+        mul!(V, transpose(W[s + 1]), G[s + 1], one(T), one(T))
         mul!(G[s], transpose(A), V)
         @views G[s][:, 1] .+= h[lr]
         if m > 0
             @views G[s][:, 2:end] .+= Bu[lr, :]
-            @views mul!(G[s][:, 2:end], Qc[k], _gated(Gref, gate, k), -one(T), one(T))
+            @views mul!(G[s][:, 2:end], Qc[k], buf.Gk[k], -one(T), one(T))
         end
         all(isfinite, G[s]) || return false
-        _causal_inv_step!(W[s], S, P[s], Imat) || return false
+        _causal_inv_step!(W[s], S, P[s], buf) || return false
     end
     return true
 end
 
 """`W = (I + S P)⁻¹` in place; `false` when it is singular or not finite."""
-function _causal_inv_step!(W::AbstractMatrix{T}, S, P, Imat) where {T<:Real}
-    M = Imat + S * P
+function _causal_inv_step!(
+    W::AbstractMatrix{T}, S, P, buf::_SweepBuffers{T}
+) where {T<:Real}
+    M = buf.Mn
+    mul!(M, S, P)
+    for i in axes(M, 1)
+        M[i, i] += one(T)
+    end
     all(isfinite, M) || return false
-    F = lu(M; check=false)
-    issuccess(F) || return false
-    copyto!(W, Imat)
-    ldiv!(F, W)
+    fill!(W, zero(T))
+    for i in axes(W, 1)
+        W[i, i] = one(T)
+    end
+    if T <: LinearAlgebra.BlasFloat
+        # Pivoted LU into the preallocated pivots: no allocation per step.
+        _, ipiv, info = LAPACK.getrf!(M, buf.ipiv; check=false)
+        info == 0 || return false
+        LAPACK.getrs!('N', M, ipiv, W)
+    else
+        F = lu!(M; check=false)
+        issuccess(F) || return false
+        ldiv!(F, W)
+    end
     return all(isfinite, W)
 end
 
@@ -637,7 +716,8 @@ function _check_causal_inputs(sm::LQRStateModel, ux::AbstractMatrix, what::Abstr
     u1 = view(ux, :, 1)
     tol =
         sqrt(eps(float(eltype(ux)))) * max(one(float(eltype(ux))), maximum(abs, u1; init=0))
-    for t in 2:size(ux, 2)
+    # The transitions read columns 1:T-1; the last one is never used.
+    for t in 2:(size(ux, 2) - 1)
         maximum(abs, view(ux, :, t) .- u1; init=0) <= tol || throw(
             ArgumentError(
                 "$what: a `:causal` model needs each trial's input to be constant " *
@@ -949,6 +1029,7 @@ function _aggregate_causal_stats!(
     end
     w = Vector{T}(undef, reg)
     ntrans = zero(T)
+    index = Dict{NTuple{2,Int},Int}(k => i for (i, k) in enumerate(hs.causal_keys))
     for trial in trials
         fs = tfs[trial]
         x = fs.x_smooth::Matrix{T}
@@ -956,7 +1037,11 @@ function _aggregate_causal_stats!(
         p_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
         key = _causal_key(sm, _trial_cost_offset(data, trial), T_n)
-        h = _causal_stats_slot!(hs, key, T_n, d, reg)
+        h = get(index, key, 0)
+        if h == 0
+            h = _causal_stats_slot!(hs, key, T_n, d, reg)
+            index[key] = h
+        end
         hs.causal_n[h] += one(T)
         ntrans += T(T_n - 1)
         ux = data.ux[trial]
@@ -1069,9 +1154,12 @@ struct _CausalScratch{T<:Real}
     nn::Matrix{T}
     nn2::Matrix{T}
     Imat::Matrix{T}
+    sweep::_SweepBuffers{T}
 end
 
-function _CausalScratch(::Type{T}, keys::Vector{NTuple{2,Int}}, n::Int, m::Int) where {T}
+function _CausalScratch(
+    ::Type{T}, keys::Vector{NTuple{2,Int}}, n::Int, m::Int, K::Int=1
+) where {T}
     d = 2n
     reg = d + 1 + m
     per(f) = [[f() for _ in 1:key[2]] for key in keys]
@@ -1101,10 +1189,11 @@ function _CausalScratch(::Type{T}, keys::Vector{NTuple{2,Int}}, n::Int, m::Int) 
         nn(),
         nn(),
         Matrix{T}(I, n, n),
+        _SweepBuffers(T, n, m, K),
     )
 end
 
-_CausalScratch(::Type{T}) where {T} = _CausalScratch(T, NTuple{2,Int}[], 0, 0)
+_CausalScratch(::Type{T}) where {T} = _CausalScratch(T, NTuple{2,Int}[], 0, 0, 0)
 
 """
     _causal_sweep_scratch!(sc, A, S, Qs, h, Bu, Gref, hf, sm) -> Bool
@@ -1120,8 +1209,9 @@ function _causal_sweep_scratch!(
     @views sc.Ct[:, 1] .= hv[1:n]
     m > 0 && @views sc.Ct[:, 2:end] .= Bu[1:n, :]
     for (h, key) in enumerate(sc.keys)
-        _causal_sweep!(sc.P[h], sc.W[h], sc.G[h], A, S, Qs, hv, Bu, Gref, hf, sm, key...) ||
-            return false
+        _causal_sweep!(
+            sc.P[h], sc.W[h], sc.G[h], A, S, Qs, hv, Bu, Gref, hf, sm, key..., sc.sweep
+        ) || return false
     end
     return true
 end
@@ -1134,12 +1224,17 @@ end
 function _causal_design!(
     sc::_CausalScratch{T}, h::Int, t::Int, A, S, slack::Bool
 ) where {T<:Real}
+    s = t + 1
+    return _causal_design!(sc, sc.W[h][s], sc.P[h][s], sc.G[h][s], A, S, slack)
+end
+
+function _causal_design!(
+    sc::_CausalScratch{T}, Ws, Ps, Gs, A, S, slack::Bool
+) where {T<:Real}
     n = size(A, 1)
     d = 2n
     xr, lr = 1:n, (n + 1):d
     ur = (d + 1):size(sc.Th, 2)
-    s = t + 1
-    Ws, Ps, Gs = sc.W[h][s], sc.P[h][s], sc.G[h][s]
     L, Th = sc.L, sc.Th
     fill!(L, zero(T))
     fill!(Th, zero(T))
@@ -1172,13 +1267,25 @@ end
 Add every transition's residual scatter of the unit into `R`.
 """
 function _causal_add_scatter!(
-    R::AbstractMatrix{T}, sc::_CausalScratch{T}, hs, A, S, slack::Bool
+    R::AbstractMatrix{T},
+    sc::_CausalScratch{T},
+    hs,
+    A,
+    S,
+    slack::Bool,
+    Wv=sc.W,
+    Pv=sc.P,
+    Gv=sc.G,
 ) where {T<:Real}
-    for (h, key) in enumerate(sc.keys)
-        hh = findfirst(==(key), hs.causal_keys)
+    #= `Wv[h]`, `Pv[h]`, `Gv[h]` are horizon `h`'s sweep, in the order of
+    `hs.causal_keys` — the scratch's own (built in that order) in the M-step, the
+    cache's in the ELBO. A horizon no trial reached adds nothing and is skipped. =#
+    for (h, key) in enumerate(hs.causal_keys)
+        hs.causal_n[h] > zero(T) || continue
         for t in 1:(key[2] - 1)
-            _causal_design!(sc, h, t, A, S, slack)
-            zz, zy, yy = hs.causal_zz[hh][t], hs.causal_zy[hh][t], hs.causal_yy[hh][t]
+            s = t + 1
+            _causal_design!(sc, Wv[h][s], Pv[h][s], Gv[h][s], A, S, slack)
+            zz, zy, yy = hs.causal_zz[h][t], hs.causal_zy[h][t], hs.causal_yy[h][t]
             # R += L Y Lᵀ − (L Zyᵀ Θᵀ + its transpose) + Θ Z Θᵀ
             mul!(sc.dd, sc.L, yy)
             mul!(R, sc.dd, transpose(sc.L), one(T), one(T))
@@ -1227,7 +1334,8 @@ function _causal_unit_gradient!(
     fill!(sc.Ctbar, zero(T))
     for (h, key) in enumerate(sc.keys)
         off, Tn = key
-        hh = findfirst(==(key), hs.causal_keys)
+        hh = h                  # the scratch was built in `hs.causal_keys` order
+        hs.causal_n[h] > zero(T) || continue
         P, W, G = sc.P[h], sc.W[h], sc.G[h]
         Pbar, Wbar, Gbar = sc.Pbar[h], sc.Wbar[h], sc.Gbar[h]
         foreach(X -> fill!(X, zero(T)), Pbar)
@@ -1500,24 +1608,25 @@ function _causal_Q_transition(sm::LQRStateModel{T}, hs) where {T<:Real}
     d = 2n
     m = size(sm.Bu, 2)
     c = sm.cache
-    sc = _CausalScratch(T, hs.causal_keys, n, m)
+    sc = _CausalScratch(T, NTuple{2,Int}[], n, m)       # design buffers only
     @views sc.Ct[:, 1] .= sm.h[1:n]
     m > 0 && @views sc.Ct[:, 2:end] .= sm.Bu[1:n, :]
+    nh = length(hs.causal_keys)
+    Wv = Vector{Vector{Matrix{T}}}(undef, nh)
+    Pv = Vector{Vector{Matrix{T}}}(undef, nh)
+    Gv = Vector{Vector{Matrix{T}}}(undef, nh)
     N = zero(T)
-    for (h, key) in enumerate(sc.keys)
+    for (h, key) in enumerate(hs.causal_keys)
+        hs.causal_n[h] > zero(T) || continue
         slot = get(c.causal_index, key, 0)
         slot == 0 && _causal_missing_horizon(_with_cost_offset(sm, key[1]), key[2])
         H = c.causal[slot]
-        for s in 1:key[2]
-            copyto!(sc.P[h][s], H.P[s])
-            copyto!(sc.W[h][s], H.W[s])
-            copyto!(sc.G[h][s], H.G[s])
-        end
+        Wv[h], Pv[h], Gv[h] = H.W, H.P, H.G
         N += hs.causal_n[h] * T(key[2] - 1)
     end
     N > zero(T) || return zero(T)
     R = zeros(T, d, d)
-    _causal_add_scatter!(R, sc, hs, sm.A, sm.S, sm.causal.slack_drives_state)
+    _causal_add_scatter!(R, sc, hs, sm.A, sm.S, sm.causal.slack_drives_state, Wv, Pv, Gv)
     Symmetrize!(R)
     B = c.Qfwd
     return T(-0.5) * (N * (T(d) * log(T(2π)) + logdet(B)) + tr(B \ R))

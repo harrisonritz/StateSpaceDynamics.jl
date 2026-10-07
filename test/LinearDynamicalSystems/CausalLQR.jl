@@ -231,8 +231,19 @@ function test_causal_construction()
         CAUSAL_A, CAUSAL_S, I2, I2, I2; fixed_costate_sigma=0.5
     )
 
+    #= A `Σ_prior` acts through its block marginals, IW(Ψ_bb, ν − (2n − q)),
+    which are proper (positive pseudo-counts) only for ν > 2n − 1. =#
+    weak = IWPrior(; Ψ=Matrix(0.05I, 4, 4), ν=3.0)
+    @test_throws ArgumentError causal_state_model(
+        CAUSAL_A, CAUSAL_S, I2, I2, I2; Σ_prior=weak
+    )
+    @test causal_state_model(
+        CAUSAL_A, CAUSAL_S, I2, I2, I2; Σ_prior=IWPrior(; Ψ=Matrix(0.05I, 4, 4), ν=3.5)
+    ).mode === :causal
+
     # Symplectic-only readouts refuse; the steady state is still available.
     @test_throws ArgumentError symplectic_defect(sm)
+    @test_throws ArgumentError symplectic_matrix(sm)
     @test size(closed_loop_dynamics(sm; k=2)) == (2, 2)
     # No schedule boundaries yet; a reference gate is fine.
     @test_throws ArgumentError set_schedule_boundaries!(sm; entries=[5])
@@ -506,6 +517,9 @@ function test_causal_em()
     @test_throws ArgumentError fit!(
         lds, y; ux=[randn(rng, 2, 12) for _ in 1:6], max_iter=2, progress=false
     )
+    # The last column is never read by a transition, so it may differ.
+    ux_last = [hcat(u[:, 1:(end - 1)], randn(rng, 2)) for u in ux]
+    @test loglikelihood(lds, y; ux=ux_last) ≈ loglikelihood(lds, y; ux=ux) rtol = 1e-12
 
     # Poisson emission with per-trial cost offsets.
     rng = StableRNG(52)
@@ -636,5 +650,8 @@ function test_causal_rejections()
     bad = deepcopy(sm)
     bad.Σ[1, 3] = bad.Σ[3, 1] = 0.01
     @test_throws ArgumentError StateSpaceDynamics._check_causal_structure(bad)
+    smf, _ = causal_fixture(StableRNG(92); fixed=0.4)
+    smf.Σ[3, 3] = 0.7
+    @test_throws ArgumentError StateSpaceDynamics._check_causal_structure(smf)
     return nothing
 end

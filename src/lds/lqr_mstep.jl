@@ -1370,8 +1370,11 @@ function _LQRMStepCtx(
         units,
         [_HoldUnit(T, u.hold ? n : 0, m) for u in units],
         [
-            u.causal ? _CausalScratch(T, u.hs.causal_keys, n, m) : _CausalScratch(T) for
-            u in units
+            if u.causal
+                _CausalScratch(T, u.hs.causal_keys, n, m, pack.K)
+            else
+                _CausalScratch(T)
+            end for u in units
         ],
         BitVector([any(u -> u.causal && u.q == s, units) for s in 1:nq]),
         lqrA,

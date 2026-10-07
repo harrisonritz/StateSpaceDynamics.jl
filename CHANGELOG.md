@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Σ` and costate noise `Ω` are independent, each dense or diagonal
   (`plant_noise`, `costate_noise`); their coupling is the one the theory implies,
   through `P_t` (and through `−W S ν` when `slack_drives_state`, the default — the
-  agent acts on its perturbed costate; `false` makes `ν` a readout). This is what
-  `simulate_lqr` generates, so causal data are no longer fitted through the
-  misspecified constant mixed-coordinate `Σ` of `:lqr` mode.
+  agent acts on its perturbed costate; `false` makes `ν` a readout). With an
+  isotropic `Ω` this is what `simulate_lqr` generates, so causal data are no
+  longer fitted through the misspecified constant mixed-coordinate `Σ` of `:lqr`
+  mode.
 
   The chain on `z = [x; λ]` is stable: no terminal factor, no normalizer, and
   `rand` samples it exactly. Its transition varies with the steps left, so the
