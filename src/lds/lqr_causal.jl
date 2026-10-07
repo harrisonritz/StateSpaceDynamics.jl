@@ -443,6 +443,10 @@ with `C̃ = [h_x  B_{u,x}]` and `F̃_s = [h_λ  B_{u,λ} − Q_{k(s)} G_{k(s)}]`
 recursion with `g_t = G_t ũ`: `K(C̃ − S G) + G = K C̃ + (I − P W S) G` and
 `I − P W S = Wᵀ`. The parameters are passed explicitly so the M-step can sweep
 at a trial point without writing it to the model.
+
+Returns `false` (leaving the buffers partly filled) when the sweep stops being
+finite or `I + S P` is singular — a point the optimizer should reject, which a
+line search probing far from the current parameters can reach.
 """
 function _causal_sweep!(
     P::AbstractVector{<:AbstractMatrix{T}},
@@ -473,7 +477,7 @@ function _causal_sweep!(
         fill!(P[tsteps], zero(T))
         fill!(G[tsteps], zero(T))
     end
-    W[tsteps] = (Imat + S * P[tsteps]) \ Imat
+    _causal_inv_step!(W[tsteps], S, P[tsteps], Imat) || return false
     Ct = Matrix{T}(undef, n, 1 + m)
     @views Ct[:, 1] .= h[xr]
     m > 0 && @views Ct[:, 2:end] .= Bu[xr, :]
@@ -482,6 +486,7 @@ function _causal_sweep!(
         K = P[s + 1] * W[s + 1]
         P[s] .= Qc[k] .+ transpose(A) * K * A
         Symmetrize!(P[s])
+        all(isfinite, P[s]) || return false
         V = K * Ct .+ transpose(W[s + 1]) * G[s + 1]
         mul!(G[s], transpose(A), V)
         @views G[s][:, 1] .+= h[lr]
@@ -489,9 +494,21 @@ function _causal_sweep!(
             @views G[s][:, 2:end] .+= Bu[lr, :]
             @views mul!(G[s][:, 2:end], Qc[k], _gated(Gref, gate, k), -one(T), one(T))
         end
-        W[s] = (Imat + S * P[s]) \ Imat
+        all(isfinite, G[s]) || return false
+        _causal_inv_step!(W[s], S, P[s], Imat) || return false
     end
-    return nothing
+    return true
+end
+
+"""`W = (I + S P)⁻¹` in place; `false` when it is singular or not finite."""
+function _causal_inv_step!(W::AbstractMatrix{T}, S, P, Imat) where {T<:Real}
+    M = Imat + S * P
+    all(isfinite, M) || return false
+    F = lu(M; check=false)
+    issuccess(F) || return false
+    copyto!(W, Imat)
+    ldiv!(F, W)
+    return all(isfinite, W)
 end
 
 """
@@ -522,6 +539,12 @@ function _fill_causal_horizon!(
         sm,
         H.offset,
         H.tsteps,
+    ) || throw(
+        NumericalStabilityError(
+            "causal",
+            "the backward Riccati sweep over a horizon of $(H.tsteps) steps is not " *
+            "finite at the current parameters (or I + S P is singular)",
+        ),
     )
     slack = sm.causal.slack_drives_state
     Ct = Matrix{T}(undef, n, 1 + m)
@@ -1067,10 +1090,8 @@ function _causal_sweep_scratch!(
     @views sc.Ct[:, 1] .= hv[1:n]
     m > 0 && @views sc.Ct[:, 2:end] .= Bu[1:n, :]
     for (h, key) in enumerate(sc.keys)
-        _causal_sweep!(sc.P[h], sc.W[h], sc.G[h], A, S, Qs, hv, Bu, Gref, hf, sm, key...)
-        for s in 2:key[2]
-            (all(isfinite, sc.P[h][s]) && all(isfinite, sc.W[h][s])) || return false
-        end
+        _causal_sweep!(sc.P[h], sc.W[h], sc.G[h], A, S, Qs, hv, Bu, Gref, hf, sm, key...) ||
+            return false
     end
     return true
 end
