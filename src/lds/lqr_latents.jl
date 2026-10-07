@@ -98,6 +98,7 @@ Requires `t ≥ 2`.
 ) where {T<:Real,T0<:Real,S<:LQRStateModel{T0},O<:AbstractObservationModel{T0}}
     sm = _lqr(lds)
     c = sm.cache
+    _is_causal(sm) && return _causal_residual!(out, _causal_horizon(sm, size(x, 2)), x, t, ux)
     e = _entry_into(sm, t)
     e == 0 || return _entry_residual!(out, c.switch[e], x, t, ux)
     k = _regime(sm, t - 1)
@@ -164,6 +165,8 @@ function state_loglikelihood!(
         @views dxt .= x[:, 1] .- sm.x0
         _whiten!(cc.P0_PD.chol, dxt)
         cc.cP0 - T(0.5) * sum(abs2, dxt)
+    elseif _is_causal(sm)
+        _causal_transition_loglik!(dxt, tmp, sm, x, t, ux)
     else
         _transition_residual!(tmp, lds, x, t, ux)
         e = _entry_into(sm, t)
@@ -216,6 +219,7 @@ function _state_gradient!(
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     tsteps = size(x, 2)
     sm = _lqr(lds)
+    _is_causal(sm) && return _state_gradient_causal!(grad, ws, sm, x, ux)
     isempty(sm.switches) || return _state_gradient_switched!(grad, ws, lds, x, ux)
     c = sm.cache
 
@@ -269,6 +273,7 @@ adds `−Λfᵀ Σf⁻¹ Λf` to the last diagonal block.
 function _state_hessian_blocks!(
     btd, cc::SmoothConstants{T}, sm::LQRStateModel, tsteps::Int
 ) where {T<:Real}
+    _is_causal(sm) && return _state_hessian_causal!(btd, cc, sm, tsteps)
     isempty(sm.switches) || return _state_hessian_switched!(btd, cc, sm, tsteps)
     c = sm.cache
     for i in 1:(tsteps - 1)
@@ -370,7 +375,11 @@ supported way to share a cost: share one by pointing schedule entries at it.
 """
 function _lqr_structural_logprior(sm::LQRStateModel{T}) where {T<:Real}
     total = zero(T)
-    sm.Σ_prior === nothing || (total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior))
+    if _is_causal(sm)
+        total += _causal_noise_logprior(sm)
+    elseif sm.Σ_prior !== nothing
+        total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
+    end
     if sm.Qc_prior !== nothing && !_is_free(sm)
         seen = Base.IdSet()
         for (k, Q) in enumerate(sm.Qc)

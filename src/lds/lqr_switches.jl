@@ -83,8 +83,9 @@ example an epoch's running cost and the bridge that ends it).
 difference. Must be set before `depends_on` variants are built.
 """
 function set_gref_gate!(sm::LQRStateModel, gate)
-    sm.mode === :lqr ||
-        throw(ArgumentError("a reference gate needs a finite-horizon (`:lqr`) model"))
+    sm.mode in (:lqr, :causal) || throw(
+        ArgumentError("a reference gate needs a finite-horizon (`:lqr` or `:causal`) model")
+    )
     sm.variants === nothing || throw(
         ArgumentError(
             "set the reference gate before `depends_on` variants are built; they share it",

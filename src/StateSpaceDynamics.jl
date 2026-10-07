@@ -38,6 +38,7 @@ include("lds/types.jl")                             # abstract types, model stru
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
 include("lds/lqr_hold.jl")                          # infinite-horizon (hold) DARE primitives
 include("lds/lqr_types.jl")                         # inverse-LQR state model + derived cache
+include("lds/lqr_causal.jl")                        # causal (closed-loop) inverse-LQR mode
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
 include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
 include("utils/show.jl")
@@ -112,7 +113,7 @@ export FitTrace
 
 # Inverse LQR
 export LQRStateModel, LQRFitFlags, cost_schedule, refresh!
-export free_state_model, hold_state_model, plant_dim
+export free_state_model, hold_state_model, causal_state_model, CausalOptions, plant_dim
 export lqr_matrix, symplectic_matrix, symplectic_form, symplectic_defect
 export lqr_parameters, riccati_solution, closed_loop_dynamics, rescale_costate!
 export simulate_lqr, lqr_riccati_sequence, terminal_logz, terminal_normalizer

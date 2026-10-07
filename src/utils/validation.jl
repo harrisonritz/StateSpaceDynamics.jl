@@ -157,6 +157,9 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
                 "terminal condition. Use `:lqr` mode for that.",
             ),
         )
+    elseif _is_causal(sm)
+        _check_causal_structure(sm)
+        _normalize_qc_prior(T, sm.Qc_prior, length(sm.Qc), n)
     elseif _is_hold(sm)
         _check_hold_structure(sm.A, sm.S, sm.Qc, sm.schedule, sm.terminal)
         _normalize_qc_prior(T, sm.Qc_prior, 1, n)
@@ -717,6 +720,15 @@ function _validate_slds_state_models(::LQRStateModel, slds::SLDS)
     Terminal conditioning works with it: the probe that normalizes the score
     switches into the hold state as the data side does.
     =#
+    for (i, lds) in enumerate(slds.LDSs)
+        _is_causal(lds.state_model) && throw(
+            ArgumentError(
+                "LDSs[$i] is a `:causal` inverse-LQR state, which switching models " *
+                "(`SLDS`) do not support yet. Fit it on its own, or use `:lqr` / " *
+                "`:hold` states in the switching model.",
+            ),
+        )
+    end
     ref = findfirst(lds -> !_is_free(lds.state_model), slds.LDSs)
     ref === nothing && return nothing
     sm_ref = slds.LDSs[ref].state_model
