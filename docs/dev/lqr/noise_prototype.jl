@@ -42,7 +42,7 @@ Needs Optim, LineSearches and ForwardDiff on the load path:
   julia --project=<env with Optim, LineSearches, ForwardDiff> -t 4 \
         docs/dev/lqr/noise_prototype.jl [--selftest] [--quick] [--only=a,b]
 
-Sections: selftest, timing, fisher, fit. The fit runs as independent processes:
+Sections: selftest, timing, fisher, profile, em, fit. The fit runs as independent processes:
 
   for i in 1 2 3 4; do julia --project=<env> noise_prototype.jl --only=fit \
       --shard=$i/4 --out=fit_$i.jls & done; wait
@@ -155,8 +155,8 @@ function spec_M0(par, k, obs, T)
     Qn = sym(G * par.Σmix * G')
     Tp = eltype(M)
     return (F=fill(M, T - 1), Qn=fill(Qn, T - 1), m1=par.m0[k], V1=par.V0[k],
-            H=[obs.C zeros(NY, NX)], d=obs.d, R=obs.R,
-            Hf=[-Q eye(Tp, NX)], Σf=par.Σf)
+            H=[obs.C zeros(size(obs.C, 1), size(Q, 1))], d=obs.d, R=obs.R,
+            Hf=[-Q eye(Tp, size(Q, 1))], Σf=par.Σf)
 end
 
 function spec_M1(par, k, obs, T)
@@ -169,8 +169,8 @@ function spec_M1(par, k, obs, T)
     Tp = eltype(M)
     return (F=fill(M, T - 1), Qn=Qn, m1=vcat(par.μ1, P[1] * par.μ1),
             V1=sym(L1 * blkdiag(par.V1, par.Ω) * L1'),
-            H=[obs.C zeros(NY, NX)], d=obs.d, R=obs.R,
-            Hf=[-Q eye(Tp, NX)], Σf=par.Σf)
+            H=[obs.C zeros(size(obs.C, 1), size(Q, 1))], d=obs.d, R=obs.R,
+            Hf=[-Q eye(Tp, size(Q, 1))], Σf=par.Σf)
 end
 
 function spec_M2(par, k, obs, T)
@@ -183,7 +183,22 @@ function spec_M2(par, k, obs, T)
             Hf=nothing, Σf=nothing)
 end
 
-const SPECS = (M0=spec_M0, M1=spec_M1, M2=spec_M2)
+"""M2 with *implicit* noise timing — what `:hold` mode assumes: the plant noise
+enters before the controller's `W_{t+1}` (`simulate_lqr(; noise_timing = :implicit)`),
+so the innovation is `W_{t+1}(Σ + S Ω S)W_{t+1}ᵀ`. In the plant-row/manifold-row
+coordinates that makes the noise the constant `blkdiag(Σ, Ω)`, which is what lets
+`:hold` profile it in closed form. Causal data are misspecified for it."""
+function spec_M2i(par, k, obs, T)
+    Q = par.Qs[k]
+    _, W = riccati(par.A, par.S, Q, Q, T)
+    F = [W[t + 1] * par.A for t in 1:(T - 1)]
+    B = par.Σ + par.S * par.Ω * par.S'
+    Qn = [sym(W[t + 1] * B * W[t + 1]') for t in 1:(T - 1)]
+    return (F=F, Qn=Qn, m1=par.μ1, V1=par.V1, H=obs.C, d=obs.d, R=obs.R,
+            Hf=nothing, Σf=nothing)
+end
+
+const SPECS = (M0=spec_M0, M1=spec_M1, M2=spec_M2, M2i=spec_M2i)
 
 # =========================================================================
 # Likelihoods
@@ -734,7 +749,10 @@ function score(row)
                        spread=abs(row.nll[1] - row.nll[2])))
 end
 
-const TASKS = [(gen, seed, model) for model in (:M0, :M1, :M2)
+const MODELS = let m = arg("models")
+    m === nothing ? (:M0, :M1, :M2) : Tuple(Symbol.(split(m, ",")))
+end
+const TASKS = [(gen, seed, model) for model in MODELS
                for gen in (:G1, :G2, :G3) for seed in 1:NSEEDS]
 
 function fitshard()
@@ -770,7 +788,7 @@ function report(rows)
     @printf("\n%-3s %-3s %3s %-18s %8s %6s %6s %6s %6s %6s %6s %-14s %8s %5s %s\n", "gen", "mod",
             "np", "dtest (mean±sd)", "dtrain", "Qpos", "Qvel", "ctr p", "ctr v", "gain",
             "Σerr", "slack [true]", "spread", "secs", "conv")
-    for gen in (:G1, :G2, :G3), model in (:M0, :M1, :M2)
+    for gen in (:G1, :G2, :G3), model in (:M0, :M1, :M2, :M2i)
         rs = filter(r -> r.gen === gen && r.model === model, rows)
         isempty(rs) && continue
         med(f) = median(f.(rs))
@@ -787,7 +805,7 @@ function report(rows)
                    if r1.gen === gen && r2.gen === gen && r1.seed == r2.seed &&
                       r1.model === a && r2.model === b]
         parts = String[]
-        for (a, b) in ((:M1, :M0), (:M2, :M0), (:M1, :M2))
+        for (a, b) in ((:M1, :M0), (:M2, :M0), (:M1, :M2), (:M2i, :M2))
             x = d(a, b)
             isempty(x) || push!(parts, @sprintf("%s−%s %+.4f±%.4f", a, b, mean(x), std(x)))
         end
@@ -799,6 +817,212 @@ function report(rows)
                 r.gen, r.seed, r.model, r.dtest, r.cost_lo, r.cost_hi, r.contr_lo, r.contr_hi,
                 r.gain, r.slack, string(r.iters))
     end
+end
+
+
+# =========================================================================
+# EM for M2, and where the time goes
+# =========================================================================
+#
+# The fits above maximize log p(y) directly, so every objective evaluation reruns
+# the Riccati sweep *and* the Kalman filter over all N trials, and ForwardDiff
+# differentiates through both. That is the simplest exact thing, not the cheap
+# one. EM separates them: the smoother runs once per iteration and reduces the
+# data to per-transition sufficient statistics; the M-step then needs only the
+# Riccati sweep, at a cost independent of N.
+
+"""RTS smoother for a spec without terminal factor, all N trials sharing it (so
+the covariance recursions run once). Returns log p(y) and the sufficient
+statistics summed over trials, kept *per transition* because the M2 transition
+varies with t: `S00[t] = Σᵢ E[x_t x_tᵀ]`, `S10[t] = Σᵢ E[x_{t+1} x_tᵀ]`,
+`S11[t] = Σᵢ E[x_{t+1} x_{t+1}ᵀ]`, and the initial-state sums `s1`, `S1`."""
+function rts_stats(sp, Y)
+    _, T, N = size(Y)
+    mf = Vector{Matrix{Float64}}(undef, T)
+    Vf = Vector{Matrix{Float64}}(undef, T)
+    Vp = Vector{Matrix{Float64}}(undef, T)
+    m = repeat(sp.m1, 1, N)
+    V = sp.V1
+    ll = 0.0
+    for t in 1:T
+        if t > 1
+            m = sp.F[t - 1] * m
+            V = sym(sp.F[t - 1] * V * sp.F[t - 1]' + sp.Qn[t - 1])
+            Vp[t] = V
+        end
+        ch = cholesky(Symmetric(sym(sp.H * V * sp.H' + sp.R)))
+        E = Y[:, t, :] .- (sp.H * m .+ sp.d)
+        ll += gauss_ll(ch, E)
+        K = transpose(ch \ (sp.H * V))
+        m = m + K * E
+        V = sym(V - K * sp.H * V)
+        mf[t], Vf[t] = m, V
+    end
+    ms, Vs = mf[T], Vf[T]
+    S00 = Vector{Matrix{Float64}}(undef, T - 1)
+    S10 = similar(S00)
+    S11 = similar(S00)
+    for t in (T - 1):-1:1
+        J = transpose(cholesky(Symmetric(Vp[t + 1])) \ (sp.F[t] * Vf[t]))
+        msn = mf[t] + J * (ms - sp.F[t] * mf[t])
+        Vsn = sym(Vf[t] + J * (Vs - Vp[t + 1]) * J')
+        S11[t] = N * Vs + ms * ms'
+        S10[t] = N * Vs * J' + ms * msn'
+        S00[t] = N * Vsn + msn * msn'
+        ms, Vs = msn, Vsn
+    end
+    return (; S00, S10, S11, s1=vec(sum(ms; dims=2)), S1=N * Vs + ms * ms', N, ll)
+end
+
+"""Expected complete-data log-likelihood of the M2 dynamics and initial state
+(the emission terms are constant: C, d, R are fixed). Reads only the statistics,
+so one evaluation costs one Riccati sweep per condition — no trial loop."""
+function mstep_objective(θ, stats, model)
+    par = unpack(:M2, θ)
+    q = zero(eltype(θ))
+    for k in eachindex(stats)
+        st = stats[k]
+        sp = SPECS[model](par, k, TRUE_G1, TT)
+        for t in 1:(TT - 1)
+            Φ = sp.F[t]
+            ch = cholesky(Symmetric(sp.Qn[t]))
+            M = st.S11[t] - Φ * st.S10[t]' - st.S10[t] * Φ' + Φ * st.S00[t] * Φ'
+            q -= (st.N * 2 * sum(log, diag(ch.U)) + tr(ch \ M)) / 2
+        end
+        chV = cholesky(Symmetric(par.V1))
+        M1 = st.S1 - par.μ1 * st.s1' - st.s1 * par.μ1' + st.N * par.μ1 * par.μ1'
+        q -= (st.N * 2 * sum(log, diag(chV.U)) + tr(chV \ M1)) / 2
+    end
+    return q
+end
+
+"""Generalized EM: smoother → statistics → a warm-started L-BFGS M-step on the
+statistics alone. Each M-step only has to improve Q(θ | θ′), so log p(y) cannot
+decrease; the trace checks that."""
+function em_fit(model, θ0, data; iters=500, inner=25, tol=1e-10)
+    θ = copy(θ0)
+    trace = Float64[]
+    tE = tM = 0.0
+    for it in 1:iters
+        tE += @elapsed stats = [rts_stats(SPECS[model](unpack(:M2, θ), k, TRUE_G1, TT), data[k])
+                                for k in eachindex(data)]
+        push!(trace, sum(s.ll for s in stats))
+        it > 1 && abs(trace[end] - trace[end - 1]) < tol * abs(trace[end]) && break
+        f(θ) = (v = try
+                    -mstep_objective(θ, stats, model)
+                catch e
+                    e isa InterruptException && rethrow()
+                    Inf
+                end;
+                isfinite(v) ? v : convert(eltype(θ), Inf))
+        cfg = ForwardDiff.GradientConfig(f, θ)
+        g!(G, θ) = ForwardDiff.gradient!(G, f, θ, cfg)
+        tM += @elapsed res = Optim.optimize(f, g!, θ, LBFGS(; linesearch=BackTracking()),
+                                            Optim.Options(; iterations=inner))
+        Optim.minimum(res) <= f(θ) && (θ = Optim.minimizer(res))
+    end
+    return (; θ, trace, tE, tM)
+end
+
+"A random n-dimensional stand-in for timing at larger plant dimension."
+function scaled_problem(n, T; seed=1)
+    rng = MersenneTwister(seed)
+    A = 0.95I + 0.05 .* randn(rng, n, n) ./ sqrt(n)
+    B = randn(rng, n, n) ./ sqrt(n)
+    S = 0.05 .* (B * B') + 1e-3I
+    Q = Matrix(1.0I, n, n)
+    p = 2n + 2
+    C = randn(rng, p, n) ./ sqrt(n)
+    par = (; A, S, Qs=[Q], Σ=0.01 * Matrix(1.0I, n, n), Ω=0.01 * Matrix(1.0I, n, n),
+           μ1=ones(n), V1=0.1 * Matrix(1.0I, n, n), Σmix=0.01 * Matrix(1.0I, 2n, 2n),
+           m0=[zeros(2n)], V0=[Matrix(1.0I, 2n, 2n)], Σf=1e-3 * Matrix(1.0I, n, n))
+    obs = (; C, d=zeros(p), R=0.05 * Matrix(1.0I, p, p))
+    return par, obs, p
+end
+
+besttime(f; reps=5) = (f(); minimum(@elapsed(f()) for _ in 1:reps))
+mb(f) = (f(); (@allocated f()) / 2^20)
+
+function profile()
+    section("profile: Riccati vs Kalman vs gradients (one thread, Float64 unless noted)")
+    println("""
+    Two Riccati recursions are in play and they are different objects:
+      control  P_t = Q + Aᵀ P_{t+1}(I + S P_{t+1})⁻¹ A, backward, from the parameters
+               alone — gives Φ_t and the noise; shared by every trial of a condition
+      filter   predicted/filtered covariances of the Kalman filter, forward, also
+               parameter-only (C, R, Φ_t, Q_t) — shared by every trial of a length
+    Only the filter's *means* touch the data: O(N T (d p + p²)) per pass.""")
+
+    println("\n(1) control Riccati sweep, one condition")
+    @printf("  %4s %5s %12s %10s\n", "n", "T", "time (μs)", "alloc (KB)")
+    for n in (2, 4, 8, 16), T in (30, 100)
+        par, _, _ = scaled_problem(n, T)
+        f() = riccati(par.A, par.S, par.Qs[1], par.Qs[1], T)
+        @printf("  %4d %5d %12.1f %10.1f\n", n, T, 1e6 * besttime(f; reps=500), 1024 * mb(f))
+    end
+
+    println("\n(2) exact log p(y), one condition, T = 30: closed loop on x (M2, d = n) vs")
+    println("    Hamiltonian chain on [x; λ] with terminal normalizer (M0/M1, d = 2n)")
+    @printf("  %4s %6s %14s %10s %14s %10s\n", "n", "N", "M2 (ms)", "MB", "M0 (ms)", "MB")
+    for n in (2, 8), N in (10, 100, 1000)
+        par, obs, p = scaled_problem(n, 30)
+        Y = randn(MersenneTwister(2), p, 30, N)
+        f2() = kf_loglik(spec_M2(par, 1, obs, 30), Y)
+        f0() = kf_loglik(spec_M0(par, 1, obs, 30), Y)
+        @printf("  %4d %6d %14.3f %10.2f %14.3f %10.2f\n", n, N, 1e3 * besttime(f2),
+                mb(f2), 1e3 * besttime(f0), mb(f0))
+    end
+
+    println("\n(3) direct fitting: ForwardDiff gradient of log p(y) through Riccati + filter,")
+    println("    M2, n = 2, both conditions (24 parameters) — scales with N")
+    @printf("  %6s %14s %10s\n", "N", "gradient (ms)", "MB")
+    for N in (10, 100, 1000)
+        data = [simulate_causal(MersenneTwister(3), TRUE_G1, k, N, TT) for k in 1:2]
+        θ = init_params(:M2, :truth, TRUE_G1, data, TRUE_G1)
+        f(θ) = -total_loglik(:M2, unpack(:M2, θ), data, TRUE_G1)
+        cfg = ForwardDiff.GradientConfig(f, θ)
+        G = similar(θ)
+        g() = ForwardDiff.gradient!(G, f, θ, cfg)
+        @printf("  %6d %14.2f %10.1f\n", N, 1e3 * besttime(g; reps=3), mb(g))
+    end
+
+    println("\n(4) EM pieces, M2, n = 2, both conditions")
+    @printf("  %6s %16s %10s %18s %18s\n", "N", "E-step (ms)", "MB", "M-step value (ms)", "M-step grad (ms)")
+    for N in (10, 100, 1000)
+        data = [simulate_causal(MersenneTwister(3), TRUE_G1, k, N, TT) for k in 1:2]
+        θ = init_params(:M2, :truth, TRUE_G1, data, TRUE_G1)
+        par = unpack(:M2, θ)
+        e() = [rts_stats(spec_M2(par, k, TRUE_G1, TT), data[k]) for k in 1:2]
+        stats = e()
+        fq(θ) = -mstep_objective(θ, stats, :M2)
+        cfg = ForwardDiff.GradientConfig(fq, θ)
+        G = similar(θ)
+        @printf("  %6d %16.3f %10.2f %18.3f %18.3f\n", N, 1e3 * besttime(e), mb(e),
+                1e3 * besttime(() -> fq(θ); reps=20),
+                1e3 * besttime(() -> ForwardDiff.gradient!(G, fq, θ, cfg); reps=5))
+    end
+    println("  statistics kept: 3 n×n matrices per transition per condition + initial sums")
+    @printf("  = %.1f KB at n = 2, T = 30, 2 conditions — independent of N\n",
+            (3 * (TT - 1) * NX^2 + NX + NX^2) * 2 * 8 / 1024)
+end
+
+function emcheck()
+    section("em: generalized EM for M2 vs the direct fit, G1 seed 1, $(NTRAIN) trials/condition")
+    train, _ = make_data(:G1, 1)
+    θ0 = init_params(:M2, :naive, TRUE_G1, train, TRUE_G1)
+    nbins = 2 * NTRAIN * TT
+    em = em_fit(:M2, θ0, train)
+    drops = count(<(-1e-8), diff(em.trace))
+    t_direct = @elapsed dr = fit(:M2, θ0, train, TRUE_G1)
+    @printf("  EM:     %4d iterations, log p(y)/bin %.6f, E-step %.1fs, M-step %.1fs, decreases: %d\n",
+            length(em.trace), em.trace[end] / nbins, em.tE, em.tM, drops)
+    @printf("  direct: %4d iterations, log p(y)/bin %.6f, %.1fs\n", dr.iters, -dr.nll, t_direct)
+    pe, pd = unpack(:M2, em.θ), unpack(:M2, dr.θ)
+    @printf("  contrast (position) |log err|: EM %.3f  direct %.3f;  gain err: EM %.3f  direct %.3f\n",
+            contrast_err(pe, TRUE_G1)[1], contrast_err(pd, TRUE_G1)[1],
+            gain_err(pe, TRUE_G1), gain_err(pd, TRUE_G1))
+    first = findfirst(>=(em.trace[end] - 1e-4 * nbins), em.trace)
+    @printf("  EM reaches within 1e-4 nats/bin of its end after %d iterations\n", first)
 end
 
 # =========================================================================
@@ -816,5 +1040,7 @@ if abspath(PROGRAM_FILE) == @__FILE__
     want("selftest") && (selftest() || exit(1))
     want("timing") && timing()
     want("fisher") && fisher()
+    want("profile") && profile()
+    want("em") && emcheck()
     want("fit") && report(fitshard())
 end
