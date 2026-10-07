@@ -84,7 +84,9 @@ difference. Must be set before `depends_on` variants are built.
 """
 function set_gref_gate!(sm::LQRStateModel, gate)
     sm.mode in (:lqr, :causal) || throw(
-        ArgumentError("a reference gate needs a finite-horizon (`:lqr` or `:causal`) model")
+        ArgumentError(
+            "a reference gate needs a finite-horizon (`:lqr` or `:causal`) model"
+        ),
     )
     sm.variants === nothing || throw(
         ArgumentError(

@@ -239,7 +239,9 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
     if causal
         o = lqr_sm.causal
         println(io, gap, " Noise (plant ε, costate slack ν, independent):")
-        println(io, gap, "  Σ (plant):   $(o.plant_noise),  Ω (costate): $(o.costate_noise)")
+        println(
+            io, gap, "  Σ (plant):   $(o.plant_noise),  Ω (costate): $(o.costate_noise)"
+        )
         println(
             io,
             gap,
@@ -291,7 +293,9 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
     )
     println(io, gap, "  observe_costate = $(lqr_sm.observe_costate)")
     causal || println(
-        io, gap, "  symplectic defect = $(round(symplectic_defect(lqr_sm), sigdigits=3))"
+        io,
+        gap,
+        "  symplectic defect = $(round(symplectic_defect(lqr_sm), sigdigits=3))",
     )
 
     return nothing

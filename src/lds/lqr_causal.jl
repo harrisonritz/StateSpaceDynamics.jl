@@ -256,7 +256,8 @@ function _causal_noise_matrix(
     Σ::AbstractMatrix{T}, Ω::AbstractMatrix{T}, opts::CausalOptions, n::Int
 ) where {T<:Real}
     for (name, X, form) in (("Σ", Σ, opts.plant_noise), ("Ω", Ω, opts.costate_noise))
-        size(X) == (n, n) || throw(DimensionMismatchError("causal $name rows", n, size(X, 1)))
+        size(X) == (n, n) ||
+            throw(DimensionMismatchError("causal $name rows", n, size(X, 1)))
         asym = maximum(abs, X .- transpose(X); init=zero(T))
         asym <= 1e-8 * max(one(T), maximum(abs, X; init=one(T))) ||
             throw(NotSymmetricError(name, Float64(asym)))
@@ -301,9 +302,8 @@ function _check_causal_structure(sm::LQRStateModel{T}) where {T<:Real}
             "`terminal_cost` in the sweep. Build it with `causal_state_model`.",
         ),
     )
-    isempty(sm.switches) || throw(
-        ArgumentError("a `:causal` model does not support schedule boundaries yet")
-    )
+    isempty(sm.switches) ||
+        throw(ArgumentError("a `:causal` model does not support schedule boundaries yet"))
     isempty(sm.Mfree) || throw(
         ArgumentError(
             "a `:causal` state model has no free transition, but `Mfree` is non-empty"
@@ -324,6 +324,19 @@ end
 # ============================================================================
 # Horizons: registry, construction, lookup
 # ============================================================================
+
+"""
+    _time_to_go_dynamics(lds) -> Bool
+
+Whether the model's transition at step `t` depends on the steps *left* in the
+trial rather than only on `t` — true of a `:causal` LQR model, whose Riccati
+sweep runs back from each trial's end. The ragged-length smoother shares the
+leading precision blocks of different lengths, which is only valid when this is
+false.
+"""
+_time_to_go_dynamics(::Any) = false
+_time_to_go_dynamics(sm::LQRStateModel) = _is_causal(sm)
+_time_to_go_dynamics(lds::LinearDynamicalSystem) = _time_to_go_dynamics(lds.state_model)
 
 """
     _causal_key(sm, offset, tsteps) -> NTuple{2,Int}
@@ -472,7 +485,9 @@ function _causal_sweep!(
     if sm.causal.terminal_cost
         copyto!(P[tsteps], Qc[kT])
         @views G[tsteps][:, 1] .= hf
-        m > 0 && @views mul!(G[tsteps][:, 2:end], Qc[kT], _gated(Gref, gate, kT), -one(T), zero(T))
+        m > 0 && @views mul!(
+            G[tsteps][:, 2:end], Qc[kT], _gated(Gref, gate, kT), -one(T), zero(T)
+        )
     else
         fill!(P[tsteps], zero(T))
         fill!(G[tsteps], zero(T))
@@ -604,7 +619,8 @@ function _check_causal_inputs(sm::LQRStateModel, ux::AbstractMatrix, what::Abstr
     _is_causal(sm) || return nothing
     size(ux, 1) == 0 && return nothing
     u1 = view(ux, :, 1)
-    tol = sqrt(eps(float(eltype(ux)))) * max(one(float(eltype(ux))), maximum(abs, u1; init=0))
+    tol =
+        sqrt(eps(float(eltype(ux)))) * max(one(float(eltype(ux))), maximum(abs, u1; init=0))
     for t in 2:size(ux, 2)
         maximum(abs, view(ux, :, t) .- u1; init=0) <= tol || throw(
             ArgumentError(
@@ -863,9 +879,7 @@ The slot of horizon `key` in `hs`, allocating its per-transition blocks the
 first time it is seen. Slots persist across EM iterations (the blocks are zeroed,
 not reallocated), so a fit allocates them once.
 """
-function _causal_stats_slot!(
-    hs, key::NTuple{2,Int}, tsteps::Int, d::Int, reg::Int
-)
+function _causal_stats_slot!(hs, key::NTuple{2,Int}, tsteps::Int, d::Int, reg::Int)
     T = eltype(hs.nk)
     slot = findfirst(==(key), hs.causal_keys)
     slot === nothing || return slot
@@ -1396,7 +1410,9 @@ end
 Write the noise maximizer given the structure into `sm.Σ = blkdiag(Σ, Ω)` — the
 same per-block formulas the profiled objective assumed, so the two agree.
 """
-function _causal_noise_update!(sm::LQRStateModel{T}, R::AbstractMatrix{T}, N::T) where {T<:Real}
+function _causal_noise_update!(
+    sm::LQRStateModel{T}, R::AbstractMatrix{T}, N::T
+) where {T<:Real}
     N > zero(T) || return sm
     n = _plant_dim(sm)
     Σ = sm.Σ

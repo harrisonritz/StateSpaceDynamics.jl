@@ -674,7 +674,7 @@ end
 function _check_dirichlet_concentration(α::AbstractArray, name::String)
     bad = findfirst(a -> !(isfinite(a) && a >= one(a)), α)
     bad === nothing && return nothing
-    throw(
+    return throw(
         ArgumentError(
             "$name: every Dirichlet concentration must be finite and ≥ 1, got " *
             "$(α[bad]) at index $(Tuple(bad)). The MAP update adds `α − 1` " *

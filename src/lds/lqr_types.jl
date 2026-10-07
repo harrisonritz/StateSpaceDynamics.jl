@@ -234,7 +234,9 @@ struct CausalOptions
     costate_noise::Symbol
     terminal_cost::Bool
     function CausalOptions(
-        slack_drives_state::Bool, plant_noise::Symbol, costate_noise::Symbol,
+        slack_drives_state::Bool,
+        plant_noise::Symbol,
+        costate_noise::Symbol,
         terminal_cost::Bool,
     )
         for (name, s) in (("plant_noise", plant_noise), ("costate_noise", costate_noise))
@@ -1082,7 +1084,11 @@ nothing that updates parameters should be handed one.
 function _with_cost_offset(sm::LQRStateModel{T,M,V}, offset::Int) where {T,M,V}
     sm.cost_offset == offset && return sm
     fields = ntuple(Val(fieldcount(LQRStateModel{T,M,V}))) do i
-        fieldname(LQRStateModel{T,M,V}, i) === :cost_offset ? offset : getfield(sm, i)
+        return if fieldname(LQRStateModel{T,M,V}, i) === :cost_offset
+            offset
+        else
+            getfield(sm, i)
+        end
     end
     return LQRStateModel{T,M,V}(fields...)
 end
@@ -1872,8 +1878,8 @@ function _check_fixed_costate_sigma(
         ArgumentError("fixed_costate_sigma is outside the covariance's numeric range")
     )
     isapprox(Σ[1:n, (n + 1):d], zeros(T, n, n); atol=zero(T)) &&
-        isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
-        isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
+    isapprox(Σ[(n + 1):d, 1:n], zeros(T, n, n); atol=zero(T)) &&
+    isapprox(Σ[(n + 1):d, (n + 1):d], Matrix{T}(v * I, n, n)) ||
         throw(ArgumentError("fixed_costate_sigma requires Σ = blockdiag(Σ_state, v*I)"))
     return v
 end
@@ -2453,7 +2459,7 @@ function riccati_solution(
             return P
         end
     end
-    throw(
+    return throw(
         NumericalStabilityError(
             "Qc[$k]",
             "the discrete Riccati iteration did not converge in $max_iter steps; this " *

@@ -585,6 +585,21 @@ using SSDTest
             test_hold_slds()
         end
 
+        include("LinearDynamicalSystems/CausalLQR.jl")
+        @testset "Causal (closed-loop) LQR" begin
+            test_causal_construction()
+            test_causal_horizons()
+            test_causal_exact_loglikelihood()
+            test_causal_sampling()
+            test_causal_mstep_gradient()
+            test_causal_noise_update()
+            test_causal_em()
+            test_causal_depends_on()
+            test_causal_invariances()
+            test_causal_recovery()
+            test_causal_rejections()
+        end
+
         include("LinearDynamicalSystems/InitialInputs.jl")
         @testset "Initial inputs" begin
             test_initial_inputs()

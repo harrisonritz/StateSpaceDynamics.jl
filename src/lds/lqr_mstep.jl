@@ -1234,7 +1234,8 @@ function _LQRMStepCtx(
     # structure at the current covariance, then update the free state block.
     #= A `:causal` model profiles its plant block and holds a pinned costate
     block in the same objective, so it keeps the profile either way. =#
-    profile = profile && all(sm.fixed_costate_sigma === nothing || _is_causal(sm) for sm in sms)
+    profile =
+        profile && all(sm.fixed_costate_sigma === nothing || _is_causal(sm) for sm in sms)
     sm1 = sms[1]
     T = eltype(sm1.Σ)
     f = flags === nothing ? sm1.fit_flags : flags
@@ -1263,7 +1264,9 @@ function _LQRMStepCtx(
             ),
         )
         all(sm -> sm.causal == sm1.causal, sms) || throw(
-            ArgumentError("the `:causal` states of one fit must share their causal options"),
+            ArgumentError(
+                "the `:causal` states of one fit must share their causal options"
+            ),
         )
     end
     #=
@@ -1366,7 +1369,10 @@ function _LQRMStepCtx(
         terminal,
         units,
         [_HoldUnit(T, u.hold ? n : 0, m) for u in units],
-        [u.causal ? _CausalScratch(T, u.hs.causal_keys, n, m) : _CausalScratch(T) for u in units],
+        [
+            u.causal ? _CausalScratch(T, u.hs.causal_keys, n, m) : _CausalScratch(T) for
+            u in units
+        ],
         BitVector([any(u -> u.causal && u.q == s, units) for s in 1:nq]),
         lqrA,
         collect(sms),
@@ -2100,7 +2106,12 @@ function _lqr_fg!(
         ctx.active_q[s] || continue
         if ctx.causal_q[s]
             fs = _causal_noise_objective!(
-                ctx.W[s], ctx.R[s], ctx.N_q[s], _noise_owner(ctx, s), ctx.profile, ctx.Sinv[s]
+                ctx.W[s],
+                ctx.R[s],
+                ctx.N_q[s],
+                _noise_owner(ctx, s),
+                ctx.profile,
+                ctx.Sinv[s],
             )
             isfinite(fs) || return T(Inf)
             fval += fs
@@ -2548,7 +2559,7 @@ function _lqr_state_mstep!(
                 hs, sm, lds.fit_bool[4]; flags=_lqr_structure_flags(sm, lds.fit_bool[3])
             )
             _lqr_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
-            lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
+            return lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
         end
         refresh!(sm)
         return nothing

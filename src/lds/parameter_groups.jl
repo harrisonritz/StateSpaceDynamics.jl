@@ -1116,9 +1116,7 @@ function _build_variants!(
             sm.causal,
             #= A `:causal` model's horizon registry is shared by reference, so a
             horizon registered on the parent is built for every variant too. =#
-            LQRCache(
-                T, n, _nregimes(sm), size(sm.Bu, 2); causal_keys=sm.cache.causal_keys
-            ),
+            LQRCache(T, n, _nregimes(sm), size(sm.Bu, 2); causal_keys=sm.cache.causal_keys),
         )
         refresh!(v)
         variants[cell] = v

@@ -98,7 +98,8 @@ Requires `t ≥ 2`.
 ) where {T<:Real,T0<:Real,S<:LQRStateModel{T0},O<:AbstractObservationModel{T0}}
     sm = _lqr(lds)
     c = sm.cache
-    _is_causal(sm) && return _causal_residual!(out, _causal_horizon(sm, size(x, 2)), x, t, ux)
+    _is_causal(sm) &&
+        return _causal_residual!(out, _causal_horizon(sm, size(x, 2)), x, t, ux)
     e = _entry_into(sm, t)
     e == 0 || return _entry_residual!(out, c.switch[e], x, t, ux)
     k = _regime(sm, t - 1)
