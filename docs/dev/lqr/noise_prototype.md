@@ -17,10 +17,11 @@ Numbers come from `noise_prototype.jl`, which imports nothing from `src/`
 
 ## Verdict
 
-**Go — but build option (b), not option (a).** Concretely: a finite-horizon
-generalization of the existing `:hold` mode, in which the costate sits on the
-Riccati graph `λ_{t+1} = P_{t+1} x_{t+1} + ν` and the plant row carries the
-plant noise. That is the user's `W_t` exactly, read causally.
+**Go — but build option (b), not option (a), and keep its noise causal.**
+Concretely: a finite-horizon closed-loop mode in which the costate sits on the
+Riccati graph `λ_{t+1} = P_{t+1} x_{t+1} + ν` and the plant noise arrives *after*
+the controller acts. That is the user's `W_t` exactly, read causally. It borrows
+`:hold`'s structure but **not its noise timing** (§5).
 
 1. **The current noise model biases the controller.** On data from a causal
    LQR agent, M0 (today's model) recovers the one cost quantity the design
@@ -45,14 +46,23 @@ plant noise. That is the user's `W_t` exactly, read causally.
    - M1's costate noise is **non-causal** (below): the control error at `t`
      depends on costate innovations after `t`, pinned to vanish at the deadline.
      M2's is the causal agent of `simulate_lqr`.
-   - M2 needs no terminal factor and no conditional normalizer, and drops into
-     the `:hold` machinery that already exists. M1 needs both, under
-     time-varying noise.
-4. **The noise is time-varying in `z`, constant in the right coordinates.** For
-   M2 those are the plant-row/manifold-row coordinates `:hold` already uses; for
-   M1 they are `(x, δ = λ − P x)`. Either way `P_t` is one Riccati sweep per
-   cost regime and trial length — `O(T n³)`, shared by every trial — and the
-   M-step keeps profiling the noise out in closed form.
+   - M2 needs no terminal factor and no conditional normalizer. M1 needs
+     both, under time-varying noise.
+4. **Noise timing matters as much as noise structure.** M2 with `:hold`'s
+   timing (plant noise entering before `W_{t+1}`) is as biased as M0 on causal
+   data (contrast error 0.30–0.36, about 4 SE) and loses 0.003–0.005 nats/bin to
+   causal M2. So `:hold`'s noise model cannot be reused as is.
+5. **The noise is time-varying in `z`, constant in the right coordinates.** For
+   causal M2, keeping `λ` as a hidden state, they are
+   `ε_t = W_{t+1}(x_{t+1} + S λ_{t+1} − A x_t)` and `ν_{t+1} = λ_{t+1} − P_{t+1}x_{t+1}`:
+   independent, covariances `Σ` and `Ω` constant, unit Jacobian. For M1 they are
+   `(x, δ = λ − P x)`. Either way `P_t` is one Riccati sweep per cost regime and
+   trial length — about 20 μs at `n = 2, T = 30` — and the M-step can profile the
+   noise out in closed form, as today.
+6. **EM keeps the data out of the gradient loop.** The smoother runs once per EM
+   iteration and reduces the data to per-transition statistics (5.5 KB here); the
+   M-step's objective and gradient then cost the same at `N = 10` and
+   `N = 1000`. Prototype EM reaches the direct maximum-likelihood fit (§6).
 
 What does **not** come out of this: the slack. With full-state observations M2
 over-reads slack on G2 (share 0.61 vs 0.26) and reports a spurious 0.12 on G1;
@@ -230,61 +240,192 @@ residual (plus, on G2, the slack's lag-one correlation between rows `t` and
 `t+1`), and the cost absorbs the error. Predictive scores will not flag it;
 recovery on simulated data does.
 
-## 5. Cost of building it
+## 5. Noise timing: causal, not `:hold`'s
+
+`:hold` puts the plant noise in the plant row before the controller's gain,
+`x_{t+1} = W(A x_t − S ν + ε)` — what `simulate_lqr` calls `:implicit` timing — so
+the innovation is `W(Σ + SΩS)Wᵀ`, constant in plant/manifold coordinates. A
+causal agent's noise arrives after the control is chosen:
+`x_{t+1} = W(A x_t − S ν) + ε`, innovation `Σ + W S Ω S Wᵀ`. With a stationary
+`W` the two are the same model class (`Σ ↦ W Σ Wᵀ`); with the finite-horizon
+`W_{t+1}` they are not. Fitting the `:hold`-timed version (M2i) to the same data,
+4 seeds:
+
+| | data | contrast pos (│log│) M2 → M2i | gains M2 → M2i | Σ error M2 → M2i | dtest M2i − M2 |
+|---|---|---|---|---|---|
+| A free | G1 | 0.13 → 0.35 | 2.4 → 3.6 % | 0.18 → 0.54 | −0.0044 ± 0.0005 |
+| | G2 | 0.10 → 0.32 | 2.7 → 3.2 % | 0.71 → 0.67 | −0.0033 ± 0.0008 |
+| | G3 | 0.27 → 0.08 | 4.3 → 4.6 % | 0.19 → 0.76 | −0.0053 ± 0.0007 |
+| A known | G1 | 0.08 → 0.36 | 1.8 → 3.1 % | 0.17 → 0.64 | −0.0050 ± 0.0006 |
+| | G2 | 0.09 → 0.30 | 1.9 → 2.7 % | 0.66 → 0.80 | −0.0036 ± 0.0007 |
+| | G3 | 0.19 → 0.13 | 3.3 → 3.5 % | 0.45 → 0.83 | −0.0051 ± 0.0007 |
+
+On causal data (G1, G2) the wrong timing costs as much held-out likelihood as
+M0 does, with a third of its parameters, and biases the contrast by about 4 SE.
+It fits worse than the truth even on training data (`dtrain` −0.001 to −0.005):
+plain misspecification, not variance.
+
+Causal timing is therefore required, and it does **not** cost the closed-form
+noise update, provided the costate stays in the state. On `z = [x; λ]` the
+causal model is
+
+```math
+z_{t+1} = \begin{bmatrix} \Phi_t & 0 \\ P_{t+1}\Phi_t & 0 \end{bmatrix} z_t + \text{noise},
+\qquad
+\begin{bmatrix} \varepsilon_t \\ \nu_{t+1} \end{bmatrix}
+ = \underbrace{\begin{bmatrix} W_{t+1} & W_{t+1}S \\ -P_{t+1} & I \end{bmatrix}}_{\det = 1} z_{t+1}
+ - \begin{bmatrix} \Phi_t & 0 \\ 0 & 0 \end{bmatrix} z_t
+ \sim N\big(0, \mathrm{blkdiag}(\Sigma, \Omega)\big),
+```
+
+so `ε_t` is `W_{t+1}` times `:hold`'s own plant-row residual and `ν` its manifold
+row. Checked numerically: the `2n` chain gives the same `log p(y)` as the `n`-dim
+closed loop to 1e-13, and the map above reproduces `blkdiag(Σ, Ω)` to 5e-16 with
+determinant 1. The expected complete-data log-likelihood is then two
+independent Gaussian blocks with constant covariance, and both `Σ` and `Ω`
+profile out exactly as `Σ` does today:
+
+```math
+g(\theta) = \tfrac{N}{2}\log\det \textstyle\sum_t W_{t+1}\,\mathbb{E}[r^p_t r^{p\top}_t]\,W_{t+1}^\top
+          + \tfrac{N}{2}\log\det \sum_t \mathbb{E}[r^m_t r^{m\top}_t] ,
+```
+
+with `r^p`, `r^m` the plant and manifold rows — no Jacobian term at all. On `x`
+alone the innovation `Σ + W S Ω S Wᵀ` is a sum, and no closed form exists: that is
+the price of marginalizing `λ`, and the reason to keep it.
+
+## 6. Compute and memory
+
+All single-threaded, Float64, this machine; the prototype's filter allocates
+freely, so its absolute numbers are upper bounds on a careful implementation.
+
+**Two different Riccati recursions.** The *control* Riccati sweep
+(`P_t = Q + AᵀP_{t+1}(I + S P_{t+1})⁻¹A`, backward) maps the parameters to the
+controller `Φ_t` and the noise; it never sees data. The *filter's* covariance
+recursion (forward) is also parameter-only, so it is shared by every trial of a
+length and condition. Only the filter's means touch the data. So a likelihood
+evaluation is one control sweep + one filter covariance pass + a pass over the
+means of all `N` trials.
+
+Control sweep, one condition:
+
+| n | T = 30 | T = 100 |
+|---|---|---|
+| 2 | 22 μs, 66 KB | 78 μs, 220 KB |
+| 4 | 42 μs, 121 KB | 131 μs, 403 KB |
+| 8 | 61 μs, 281 KB | 205 μs, 943 KB |
+| 16 | 180 μs, 804 KB | 553 μs, 2.7 MB |
+
+Exact `log p(y)`, one condition, `T = 30`: closed loop on `x` (d = n) vs the
+Hamiltonian chain on `[x; λ]` with its terminal normalizer (d = 2n):
+
+| n | N | M2 on x | M0 on [x; λ] |
+|---|---|---|---|
+| 2 | 10 | 0.12 ms | 0.12 ms |
+| 2 | 100 | 0.31 ms | 0.39 ms |
+| 2 | 1000 | 2.4 ms, 7 MB | 2.8 ms, 8.5 MB |
+| 8 | 100 | 1.2 ms | 1.5 ms |
+| 8 | 1000 | 8.7 ms, 23 MB | 8.5 ms, 29 MB |
+
+The trial-mean pass dominates, so doubling the state costs far less than the
+`8×` a `d³` count suggests at these sizes.
+
+**Direct fitting re-filters on every step.** The fits in §4 maximize `log p(y)`
+with L-BFGS and ForwardDiff through the sweep *and* the filter, so every
+objective and gradient re-runs both over all trials: the M2 gradient (24
+parameters, two conditions) is 2.2 ms at `N = 10`, 11 ms at `N = 100`, 80 ms and
+300 MB at `N = 1000`. Simple and exact, not cheap.
+
+**EM does not.** The smoother runs once per iteration; after it, the M-step
+objective reads only per-transition statistics (three `n × n` matrices per
+transition per condition — 5.5 KB here, independent of `N`):
+
+| N | E-step (smoother + stats) | M-step value | M-step gradient |
+|---|---|---|---|
+| 10 | 0.36 ms | 0.15 ms | 0.5 ms |
+| 100 | 0.97 ms | 0.16 ms | 0.5–1.0 ms |
+| 1000 | 5.7 ms, 18 MB | 0.14 ms | 0.5 ms |
+
+Checked end to end (`--only=em`, G1, 100 trials per condition, naive start):
+generalized EM never decreased `log p(y)` over 500 iterations, came within 1e-4
+nats/bin of its final value after 46, and finished 1e-6 nats/bin from the direct
+fit, with the same contrast (0.239) and gain errors (1.6 %).
+
+**The package's EM today (M0), for scale** — `fit!` on the same plant, 4 Julia
+threads, BLAS single-threaded, per iteration:
+
+| N | T | total | E-step | M-step | allocated |
+|---|---|---|---|---|---|
+| 30 | 30 | 18 ms | 1.0 ms | 16 ms | 6.6 MB |
+| 100 | 30 | 16 ms | 3.5 ms | 18–28 ms* | 6.6 MB |
+| 1000 | 30 | 25 ms | 27 ms* | 18 ms | 6.8 MB |
+| 100 | 100 | 44 ms | 7.5 ms | 39 ms | 12 MB |
+
+(*E/M split timed separately from the totals; medians, noisy.) The M-step —
+an L-BFGS over the structural parameters on summed statistics — dominates up to
+a few hundred trials and is flat in `N`; the E-step grows linearly, about 27 μs
+per trial at `T = 30`. Causal M2 changes neither shape: its E-step is the same
+smoother on the same `2n` state, and its M-step adds one control sweep and its
+adjoint per evaluation (tens of μs at these sizes) while keeping statistics per
+transition instead of summed (`O(T (2n)²)` memory instead of `O((2n)²)`,
+kilobytes).
+
+## 7. Cost of building it
 
 The current M-step profiles a constant `Σ` out (`Σ = R(θ)/N`) and runs L-BFGS on
 `g(θ) = (N/2) log det R(θ) − N log|det A|` over statistics summed within each
-cost regime (`lqr_mstep.jl`). `:hold` mode already does the same with
+cost regime (`lqr_mstep.jl`). `:hold` mode does the same with
 `L_h = [I S; −P I]`, `−N log det(I + S P)`, and one adjoint Stein solve through
 the DARE.
 
-**M2 (recommended)** = `:hold` with the finite-horizon `P_{t+1}` in place of the
-DARE solution:
+**Causal M2 (recommended)**:
 
-- noise stays constant in plant/manifold coordinates, so `Σ` is still profiled
-  in closed form (full 2n×2n, so plant–manifold correlation is available, and
-  the slack block is `Ω`);
-- statistics must be kept per time-to-go `τ = T − t` rather than summed, because
-  `L_{h,t}` varies with `t`; with a constant schedule `P` depends only on `τ`, so
-  trials of different lengths still share them — memory `O(T_max (2n)²)`;
-- the Jacobian becomes `Σ_t log det(I + S P_{t+1})`;
-- the gradient through `P_t` is a backward–forward adjoint of the Riccati
-  recursion instead of a Stein solve — standard and cheap;
+- the residual is `:hold`'s plant row left-multiplied by `W_{t+1}`, and its
+  manifold row; `Σ` and `Ω` profile out separately (§5), with no Jacobian term;
+- statistics must be kept per transition (or per time-to-go `τ = T − t`, which is
+  what `P` depends on under a constant schedule, so trials of different lengths
+  still pool) rather than summed;
+- the gradient through `P_t` is a backward adjoint of the Riccati recursion
+  instead of a Stein solve — standard and cheap;
 - **no terminal factor and no normalizer**: the chain is stable, `p(y)` is the
   score, and `rand` works directly (no more `simulate_lqr` vs `rand` split);
+- `Ω` must stay positive definite for the `2n` smoother (as `Σ`'s costate block
+  must today), and EM slows as `Ω → 0`, the usual price of a nearly
+  deterministic latent;
 - schedules with per-trial offsets need statistics keyed by the trial's
   schedule window instead of `τ` alone.
 
-Per-iteration compute: one Riccati sweep per (regime, length) — negligible next
-to the smoother. In the prototype the M2 gradient is 23 ms against M0's 190 ms,
-mostly because it carries less than half the parameters; the E-step can stay on
-`z = [x; λ]` (reusing everything) or drop to `x` alone (8× cheaper in `d³`).
+**M1** would need the terminal factor and the conditional normalizer
+`log p(f = 0)` under time-varying noise, with its gradient; its own coordinates
+help (unit Jacobian, block-diagonal noise) but the normalizer is where the work
+and the numerical risk are.
 
-**M1** would need all of the above *plus* the terminal factor and the
-conditional normalizer `log p(f = 0)` under time-varying noise, with its
-gradient; its own coordinates help (unit Jacobian, block-diagonal noise) but the
-normalizer is where the work and the numerical risk are.
+## 8. Recommendation
 
-## 6. Recommendation
-
-1. Implement M2 as a finite-horizon closed-loop mode (`mode = :causal`, say),
-   generalizing `:hold`. Keep the 2n state so plant-row/manifold-row noise and
-   all the downstream machinery carry over.
-2. Keep M0 for what it is good at — the exactly-solvable regression tests and
+1. Implement causal M2 as a finite-horizon closed-loop mode (`mode = :causal`,
+   say) on the `2n` state: `:hold`'s structure with the finite-horizon sweep, the
+   causal residual of §5, and per-transition statistics. The `2n` state is not
+   just for reuse (emissions, `SLDS` units sharing a latent dimension with
+   `:lqr`/`:hold` states, grouping, priors): it is what keeps the noise update
+   in closed form.
+2. Do not reuse `:hold`'s noise timing for it (§5). For `:hold` itself the
+   timing is a reparameterization, not a bias, because its `W` is constant.
+3. Keep M0 for what it is good at — the exactly-solvable regression tests and
    historical fits — and stop recommending it for inverse control on behavioral
    data: on causal-agent data its cost estimates are biased at many standard
    errors.
-3. Leave M1 unbuilt unless the open-loop-planning hypothesis becomes the one
+4. Leave M1 unbuilt unless the open-loop-planning hypothesis becomes the one
    under test; §2 is how to build it if so. The known-plant G3 rows say that
    test has power: a feedback model fitted to planning data loses measurably
    and misreads the cost.
-4. Before interpreting costs from any model, run the `fisher` section on your
+5. Before interpreting costs from any model, run the `fisher` section on your
    own design. Here only the position contrast and the closed loop were
    identified; absolute costs were not, by any model.
-5. Treat the fitted slack as a nuisance until a threshold sweep on your design
+6. Treat the fitted slack as a nuisance until a threshold sweep on your design
    (`biological.jl --only=threshold`) says otherwise.
 
 Caveats: one plant, one cost pair, `n = 2`, a full-rank `C` held at the truth, no
 offsets or inputs, 4 seeds. The structure of the result (M0's bias is a
-misspecification effect; M1 vs M2 is a causality choice) does not depend on
-those, but the magnitudes do.
+misspecification effect; noise timing matters once `W` varies; M1 vs M2 is a
+causality choice) does not depend on those, but the magnitudes do. The §4 fits
+of M2 run on `x` alone; the `2n` form is the same likelihood (§5).
