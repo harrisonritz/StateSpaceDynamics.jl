@@ -24,7 +24,7 @@ function problem(n; seed=1)
     rng = MersenneTwister(seed)
     A = Matrix(0.97I, n, n) .+ 0.04 .* randn(rng, n, n) ./ sqrt(n)
     B = randn(rng, n, n) ./ sqrt(n)
-    S = 0.05 .* (B * B') .+ 0.01I
+    S = 0.05 .* (B * B') + 0.01I
     Q = Matrix(1.0I, n, n)
     C = randn(rng, 3n, n) ./ sqrt(n)
     return A, Matrix(S), Q, C

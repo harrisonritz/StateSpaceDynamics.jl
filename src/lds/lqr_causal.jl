@@ -1030,27 +1030,39 @@ function _aggregate_causal_stats!(
     w = Vector{T}(undef, reg)
     ntrans = zero(T)
     index = Dict{NTuple{2,Int},Int}(k => i for (i, k) in enumerate(hs.causal_keys))
+    #=
+    Without a schedule the sweep depends only on the steps left, so transition
+    `t` of a trial of length `T_n` is transition `t + (L − T_n)` of the longest
+    trial's horizon `L`: every trial is aligned at the end of that one horizon.
+    The M-step then visits `L − 1` transitions however ragged the data are,
+    rather than one block per (length, step). With a schedule the sweep reads
+    the trial's own stretch of it, and each horizon keeps its own statistics.
+    =#
+    align = isempty(sm.schedule)
+    L = align ? maximum(t -> size(tfs[t].x_smooth, 2), trials; init=0) : 0
     for trial in trials
         fs = tfs[trial]
         x = fs.x_smooth::Matrix{T}
         p_smooth = fs.p_smooth::Array{T,3}
         p_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
-        key = _causal_key(sm, _trial_cost_offset(data, trial), T_n)
+        Th = align ? L : T_n
+        shift = Th - T_n
+        key = _causal_key(sm, _trial_cost_offset(data, trial), Th)
         h = get(index, key, 0)
         if h == 0
-            h = _causal_stats_slot!(hs, key, T_n, d, reg)
+            h = _causal_stats_slot!(hs, key, Th, d, reg)
             index[key] = h
         end
-        hs.causal_n[h] += one(T)
+        hs.causal_n[h] += T(T_n - 1)
         ntrans += T(T_n - 1)
         ux = data.ux[trial]
         w[d + 1] = one(T)
         m > 0 && @views w[(d + 2):reg] .= ux[:, 1]
         for t in 1:(T_n - 1)
-            zz = hs.causal_zz[h][t]
-            zy = hs.causal_zy[h][t]
-            yy = hs.causal_yy[h][t]
+            zz = hs.causal_zz[h][t + shift]
+            zy = hs.causal_zy[h][t + shift]
+            yy = hs.causal_yy[h][t + shift]
             @views w[1:d] .= x[:, t]
             z_next = tview(x, :, t + 1)
             BLAS.ger!(one(T), w, w, zz)
@@ -1622,7 +1634,7 @@ function _causal_Q_transition(sm::LQRStateModel{T}, hs) where {T<:Real}
         slot == 0 && _causal_missing_horizon(_with_cost_offset(sm, key[1]), key[2])
         H = c.causal[slot]
         Wv[h], Pv[h], Gv[h] = H.W, H.P, H.G
-        N += hs.causal_n[h] * T(key[2] - 1)
+        N += hs.causal_n[h]
     end
     N > zero(T) || return zero(T)
     R = zeros(T, d, d)

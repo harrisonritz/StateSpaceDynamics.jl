@@ -371,11 +371,11 @@ function test_causal_sampling()
 end
 
 """The packed M-step objective and gradient of a fixture, at a perturbed point."""
-function causal_mstep_context(; profile::Bool=true, kw...)
+function causal_mstep_context(; profile::Bool=true, ragged::Bool=false, kw...)
     rng = StableRNG(40)
     sm, lds = causal_fixture(rng; kw...)
     m = size(sm.Bu, 2)
-    lengths = fill(12, 16)
+    lengths = ragged ? [12, 7, 9, 12, 5, 10, 8, 11] : fill(12, 16)
     ux = m > 0 ? causal_inputs(rng, m, lengths) : nothing
     _, y = rand(rng, lds, lengths; ux=ux)
     data = StateSpaceDynamics.Data(lds, y; ux=ux)
@@ -403,6 +403,9 @@ function test_causal_mstep_gradient()
         (; prior=true, plant_noise=:diagonal),
         (; fixed=0.4),
         (; nreg=3, m=2, prior=true, slack=false, costate_noise=:diagonal),
+        # Ragged with no schedule: every trial aligned on the longest horizon.
+        (; ragged=true, m=1),
+        (; ragged=true, nreg=2, m=1),
     )
     for cfg in configs, profile in (true, false)
         ctx, = causal_mstep_context(; profile=profile, cfg...)
