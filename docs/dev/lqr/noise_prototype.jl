@@ -42,7 +42,13 @@ Needs Optim, LineSearches and ForwardDiff on the load path:
   julia --project=<env with Optim, LineSearches, ForwardDiff> -t 4 \
         docs/dev/lqr/noise_prototype.jl [--selftest] [--quick] [--only=a,b]
 
-Sections: selftest, timing, fit.
+Sections: selftest, timing, fisher, fit. The fit runs as independent processes:
+
+  for i in 1 2 3 4; do julia --project=<env> noise_prototype.jl --only=fit \
+      --shard=$i/4 --out=fit_$i.jls & done; wait
+  julia --project=<env> noise_prototype.jl --merge=fit_1.jls,fit_2.jls,fit_3.jls,fit_4.jls
+
+(add `--plant=known` to every command for the known-plant variant).
 =============================================================================#
 
 using LinearAlgebra, Random, Statistics, Printf
@@ -72,7 +78,7 @@ const NY = 6          # observation dimension
 const TT = 30         # trial length
 const NTRAIN = QUICK ? 40 : 100   # trials per condition
 const NTEST = 100
-const NSEEDS = QUICK ? 1 : 5
+const NSEEDS = QUICK ? 1 : 4
 
 function truth(; slack2=0.0, Ωg3=nothing)
     A = [1.0 0.1; 0.0 0.9]
@@ -468,22 +474,26 @@ end
 # Metrics (all invariant to the gauges left open)
 # =========================================================================
 
-"max |log ratio| of the spectra of S Q_k (scale- and similarity-invariant cost)."
+"""|log ratio| of the spectra of S Q_k (scale- and similarity-invariant cost),
+as (smaller eigenvalue, larger eigenvalue), each the worse of k = 1, 2. Reported
+apart because they are not equally identified: see the `fisher` section."""
 function cost_err(par, tr)
-    e = 0.0
+    lo = hi = 0.0
     for k in 1:2
         a = sort(real(eigvals(par.S * par.Qs[k])))
         b = sort(real(eigvals(tr.S * tr.Qs[k])))
-        e = max(e, maximum(abs.(log.(max.(a, 1e-12) ./ b))))
+        e = abs.(log.(max.(a, 1e-300) ./ b))
+        lo, hi = max(lo, e[1]), max(hi, e[2])
     end
-    return e
+    return lo, hi
 end
 
-"max |log ratio| of the generalized eigenvalues of (Q₂, Q₁) — the contrast."
+"|log ratio| of the generalized eigenvalues of (Q₂, Q₁), (smaller, larger) — the contrast."
 function contrast_err(par, tr)
     a = sort(real(eigvals(par.Qs[2], par.Qs[1])))
     b = sort(real(eigvals(tr.Qs[2], tr.Qs[1])))
-    return maximum(abs.(log.(max.(a, 1e-12) ./ b)))
+    e = abs.(log.(max.(a, 1e-300) ./ b))
+    return e[1], e[2]
 end
 
 "mean_t,k ‖Φ_t − Φ_t*‖_F / ‖Φ_t*‖_F (C is fixed, so the gauge is pinned)."
@@ -606,84 +616,177 @@ function timing()
 end
 
 # =========================================================================
-# Fit comparison
+# Identifiability: expected Fisher information under the true model
 # =========================================================================
 
-function run_job(gen, seed)
+eig2(M) = (t = (M[1, 1] + M[2, 2]) / 2; d = M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1];
+           r = sqrt(max(t^2 - d, zero(t))); [t - r, t + r])
+
+"""Delta-method standard errors of the cost summaries for M2 fitted to G1 at the
+truth, from the exact Gaussian Fisher information of vec(y_{1:T})
+(`Jμᵀ C⁻¹ Jμ + ½ tr(C⁻¹ ∂C C⁻¹ ∂C)`), for 100 trials per condition. Ω is held at
+its true value 0 (a boundary). This is the floor any noise model inherits: a
+cost summary with a standard error near 1 cannot discriminate models."""
+function fisher()
+    section("fisher: what this design can identify (M2 at the G1 truth, $(KNOWN_A ? "A known" : "A free"))")
+    tr0 = TRUE_G1
+    lay, np = layout(:M2)
+    θ0 = pack(:M2, merge(tr0, (; Ω=1e-3 * Matrix(1.0I, NX, NX))))
+    keep = setdiff(1:np, lay[:Ω])
+    full(φ) = (θ = convert(Vector{eltype(φ)}, θ0); θ[keep] = φ; θ)
+    function ymoments(φ, k)
+        par = merge(unpack(:M2, full(φ)), (; Ω=zeros(NX, NX)))
+        sp = spec_M2(par, k, tr0, TT)
+        μz, Σz, _ = dense_z(sp, TT)
+        Hb = kron(Matrix(1.0I, TT, TT), sp.H)
+        return Hb * μz, Hb * Σz * Hb' + kron(Matrix(1.0I, TT, TT), sp.R)
+    end
+    φ0 = θ0[keep]
+    F = zeros(length(φ0), length(φ0))
+    for k in 1:2
+        _, C = ymoments(φ0, k)
+        Jμ = ForwardDiff.jacobian(φ -> ymoments(φ, k)[1], φ0)
+        JC = ForwardDiff.jacobian(φ -> vec(ymoments(φ, k)[2]), φ0)
+        Ci = inv(Symmetric(C))
+        F .+= Jμ' * Ci * Jμ
+        D = [Ci * reshape(JC[:, i], size(C)) for i in eachindex(φ0)]
+        for i in eachindex(φ0), j in eachindex(φ0)
+            F[i, j] += tr(D[i] * D[j]) / 2
+        end
+    end
+    F .*= 100
+    # tr(S) is fixed, so the raw scale of S's factor is an exact null direction;
+    # every summary below is invariant along it, which makes the pseudo-inverse exact.
+    Σφ = pinv(Symmetric(F); rtol=1e-10)
+    g(φ) = (p = unpack(:M2, full(φ));
+            vcat([log.(eig2(p.S * p.Qs[k])) for k in 1:2]..., log.(eig2(p.Qs[1] \ p.Qs[2]))))
+    J = ForwardDiff.jacobian(g, φ0)
+    se = sqrt.(diag(J * Σφ * J'))
+    @printf("  SE of log eig(S Q₁)   small %.3f   large %.3f\n", se[1], se[2])
+    @printf("  SE of log eig(S Q₂)   small %.3f   large %.3f\n", se[3], se[4])
+    @printf("  SE of log eig(Q₂, Q₁) small %.3f   large %.3f\n", se[5], se[6])
+    ev = sort(eigvals(Symmetric(F)))
+    @printf("  Fisher spectrum: null %.1e, then %.3g, %.3g, … , %.3g\n", ev[1], ev[2], ev[3], ev[end])
+end
+
+# =========================================================================
+# Fit comparison
+# =========================================================================
+#
+# Work is split into tasks (gen, seed, model), each fitting from both starts and
+# keeping the better training objective. `--shard=i/n` runs every n-th task in
+# its own process (Julia's GC contends badly across threads on this allocation-
+# heavy dual-number code), `--out=file` serializes the rows with the fitted θ,
+# and `--merge=f1,f2,…` reads shards back and prints the tables.
+
+using Serialization
+
+arg(name) = (a = filter(s -> startswith(s, "--$name="), ARGS); isempty(a) ? nothing : split(a[1], "=")[2])
+
+function make_data(gen, seed)
+    g = GENS[gen]
+    rng = MersenneTwister(1000 * seed + Int(gen === :G2) + 2 * Int(gen === :G3))
+    train = [g.sim(rng, g.truth, k, NTRAIN, TT) for k in 1:2]
+    test = [g.sim(rng, g.truth, k, NTEST, TT) for k in 1:2]
+    return train, test
+end
+
+function run_task(gen, seed, model)
     g = GENS[gen]
     tr = g.truth
-    obs = tr
-    rng = MersenneTwister(1000 * seed + Int(gen === :G2) + 2 * Int(gen === :G3))
-    train = [g.sim(rng, tr, k, NTRAIN, TT) for k in 1:2]
-    test = [g.sim(rng, tr, k, NTEST, TT) for k in 1:2]
-    ntest = 2 * NTEST * TT
-    ll_true_test = total_loglik(g.model, tr, test, obs)
-    ll_true_train = total_loglik(g.model, tr, train, obs) / (2 * NTRAIN * TT)
-    rows = []
-    for model in (:M0, :M1, :M2)
-        fits = [(how, fit(model, init_params(model, how, tr, train, obs), train, obs))
-                for how in (:truth, :naive)]
-        best = argmin(r -> r[2].nll, fits)[2]
-        spread = abs(fits[1][2].nll - fits[2][2].nll)
-        par = unpack(model, best.θ)
-        push!(rows, (gen=gen, seed=seed, model=model, np=length(best.θ),
-                     dtest=(total_loglik(model, par, test, obs) - ll_true_test) / ntest,
-                     dtrain=-best.nll - ll_true_train,
-                     cost=cost_err(par, tr), contrast=contrast_err(par, tr),
-                     gain=gain_err(par, tr), sigma=sigma_err(par, tr),
-                     slack=slack_ratio(par), spread=spread,
-                     secs=sum(r[2].secs for r in fits), iters=best.iters,
-                     conv=all(r[2].converged for r in fits)))
+    train, test = make_data(gen, seed)
+    fits = [(how, fit(model, init_params(model, how, tr, train, tr), train, tr))
+            for how in (:truth, :naive)]
+    best = argmin(r -> r[2].nll, fits)[2]
+    return (gen=gen, seed=seed, model=model, known_A=KNOWN_A, θ=best.θ,
+            nll=[r[2].nll for r in fits], iters=[r[2].iters for r in fits],
+            conv=[r[2].converged for r in fits], secs=[r[2].secs for r in fits])
+end
+
+"Everything reported is recomputed from the stored θ, so metrics can change
+without refitting."
+function score(row)
+    g = GENS[row.gen]
+    tr = g.truth
+    train, test = make_data(row.gen, row.seed)
+    par = unpack(row.model, row.θ)
+    ntest, ntrain = 2 * NTEST * TT, 2 * NTRAIN * TT
+    dtest = (total_loglik(row.model, par, test, tr) - total_loglik(g.model, tr, test, tr)) / ntest
+    dtrain = (total_loglik(row.model, par, train, tr) - total_loglik(g.model, tr, train, tr)) / ntrain
+    clo, chi = cost_err(par, tr)
+    qlo, qhi = contrast_err(par, tr)
+    return merge(row, (; np=length(row.θ), dtest, dtrain, cost_lo=clo, cost_hi=chi,
+                       contr_lo=qlo, contr_hi=qhi, gain=gain_err(par, tr),
+                       sigma=sigma_err(par, tr), slack=slack_ratio(par),
+                       spread=abs(row.nll[1] - row.nll[2])))
+end
+
+const TASKS = [(gen, seed, model) for model in (:M0, :M1, :M2)
+               for gen in (:G1, :G2, :G3) for seed in 1:NSEEDS]
+
+function fitshard()
+    sh = arg("shard")
+    i, n = sh === nothing ? (1, 1) : parse.(Int, split(sh, "/"))
+    out = arg("out")
+    mine = TASKS[i:n:end]
+    section("fit ($(KNOWN_A ? "A known" : "A free")), shard $i/$n: $(length(mine)) tasks")
+    rows = Any[]
+    for t in mine
+        r = run_task(t...)
+        push!(rows, r)
+        @printf("  done %s s%d %s  nll %s  iters %s  conv %s  %.0fs\n", r.gen, r.seed, r.model,
+                string(round.(r.nll; digits=5)), string(r.iters), string(r.conv), sum(r.secs))
+        flush(stdout)
+        out === nothing || serialize(out, rows)
     end
     return rows
 end
 
-function fitcompare()
-    section("fit ($(KNOWN_A ? "A known" : "A free")): $(NSEEDS) seeds × {G1, G2, G3} × {M0, M1, M2}, best of truth/naive init")
+function report(rows)
+    rows = [score(r) for r in rows]
+    section("results ($(rows[1].known_A ? "A known" : "A free")), $(maximum(r.seed for r in rows)) seeds, $(NTRAIN) train / $(NTEST) test trials per condition, T = $TT")
     println("""
-    dtest   held-out log-lik per bin minus the generating model's (nats; 0 = as good as truth)
-    dtrain  same on the training data (positive = overfits relative to truth)
-    cost    max |log ratio| of eig(S Q_k), k = 1, 2   (scale/similarity invariant)
-    contr   max |log ratio| of eig(Q₂, Q₁)            (true: 2, 5)
-    gain    mean relative error of the closed-loop maps Φ_t
-    Σerr    relative error of the plant noise Σ
-    slack   eig(Σ⁻¹ S Ω S)  (true: G1 0, G2 0.5, G3 $(round(0.0025*0.25/0.01; digits=4)))
-    spread  |nll(truth init) − nll(naive init)| per bin (0 = both inits agree)
-    """)
-    jobs = [(gen, seed) for gen in (:G1, :G2, :G3) for seed in 1:NSEEDS]
-    results = Vector{Any}(undef, length(jobs))
-    lk = ReentrantLock()
-    Threads.@threads :dynamic for j in eachindex(jobs)
-        results[j] = run_job(jobs[j]...)
-        lock(lk) do
-            for r in results[j]
-                @printf("  done %s s%d %s  dtest %+.4f  cost %.3f  contr %.3f  gain %.3f  %.0fs\n",
-                        r.gen, r.seed, r.model, r.dtest, r.cost, r.contrast, r.gain, r.secs)
-            end
-            flush(stdout)
-        end
-    end
-    rows = vcat(results...)
-    @printf("\n%-3s %-3s %3s %-17s %9s %6s %6s %6s %6s %-15s %8s %6s %s\n", "gen", "mod", "np",
-            "dtest (mean±sd)", "dtrain", "cost", "contr", "gain", "Σerr", "slack (median)",
-            "spread", "secs", "conv")
+    dtest    held-out log-lik per bin minus the generating model's (nats; 0 = as good as truth)
+    dtrain   same on the training data
+    SQ lo/hi |log ratio| of the smaller / larger eigenvalue of S Q_k (worse k)
+    ctr lo/hi same for the generalized eigenvalues of (Q₂, Q₁)      (true 2, 5)
+    gain     mean relative error of the closed-loop maps Φ_t
+    Σerr     relative error of the plant noise Σ
+    slack    eig(Σ⁻¹ S Ω S)   (true: G1 0, G2 0.5, G3 0.0625; M1 and M2 read Ω differently)
+    spread   |nll(truth start) − nll(naive start)| per bin""")
+    @printf("\n%-3s %-3s %3s %-18s %8s %6s %6s %6s %6s %6s %6s %-14s %8s %5s %s\n", "gen", "mod",
+            "np", "dtest (mean±sd)", "dtrain", "SQ lo", "SQ hi", "ctr lo", "ctr hi", "gain",
+            "Σerr", "slack (med)", "spread", "secs", "conv")
     for gen in (:G1, :G2, :G3), model in (:M0, :M1, :M2)
         rs = filter(r -> r.gen === gen && r.model === model, rows)
+        isempty(rs) && continue
         med(f) = median(f.(rs))
         sl = [median(getindex.(getfield.(rs, :slack), i)) for i in 1:2]
-        @printf("%-3s %-3s %3d %+8.4f±%-8.4f %+9.4f %6.3f %6.3f %6.3f %6.3f %6.3f,%-8.3f %8.1e %6.1f %d/%d\n",
+        @printf("%-3s %-3s %3d %+8.4f±%-9.4f %+8.4f %6.2f %6.3f %6.2f %6.3f %6.3f %6.3f %6.3f,%-7.3f %8.1e %5.0f %d/%d\n",
                 gen, model, rs[1].np, mean(r.dtest for r in rs), std(r.dtest for r in rs),
-                med(r -> r.dtrain), med(r -> r.cost), med(r -> r.contrast), med(r -> r.gain),
-                med(r -> r.sigma), sl[1], sl[2], med(r -> r.spread), med(r -> r.secs),
-                count(r -> r.conv, rs), length(rs))
+                med(r -> r.dtrain), med(r -> r.cost_lo), med(r -> r.cost_hi),
+                med(r -> r.contr_lo), med(r -> r.contr_hi), med(r -> r.gain),
+                med(r -> r.sigma), sl[1], sl[2], med(r -> r.spread),
+                med(r -> sum(r.secs)), count(r -> any(r.conv), rs), length(rs))
+    end
+    println("\npaired held-out differences (same test set), mean ± sd over seeds, nats/bin:")
+    for gen in (:G1, :G2, :G3)
+        d(a, b) = [r1.dtest - r2.dtest for r1 in rows, r2 in rows
+                   if r1.gen === gen && r2.gen === gen && r1.seed == r2.seed &&
+                      r1.model === a && r2.model === b]
+        parts = String[]
+        for (a, b) in ((:M1, :M0), (:M2, :M0), (:M1, :M2))
+            x = d(a, b)
+            isempty(x) || push!(parts, @sprintf("%s−%s %+.4f±%.4f", a, b, mean(x), std(x)))
+        end
+        println("  ", gen, "  ", join(parts, "   "))
     end
     println("\nper seed:")
-    for r in rows
-        @printf("  %s s%d %s  dtest %+.4f  cost %.3f  contr %.3f  gain %.3f  slack %s  iters %d\n",
-                r.gen, r.seed, r.model, r.dtest, r.cost, r.contrast, r.gain,
-                string(round.(r.slack; digits=3)), r.iters)
+    for r in sort(rows; by=r -> (r.gen, r.model, r.seed))
+        @printf("  %s s%d %s  dtest %+.4f  SQ %.2f/%.3f  ctr %.2f/%.3f  gain %.3f  slack %s  iters %s\n",
+                r.gen, r.seed, r.model, r.dtest, r.cost_lo, r.cost_hi, r.contr_lo, r.contr_hi,
+                r.gain, string(round.(r.slack; digits=3)), string(r.iters))
     end
-    return rows
 end
 
 # =========================================================================
@@ -693,7 +796,13 @@ if abspath(PROGRAM_FILE) == @__FILE__
     if SELFTEST
         exit(selftest() ? 0 : 1)
     end
+    mg = arg("merge")
+    if mg !== nothing
+        report(vcat([deserialize(String(f)) for f in split(mg, ",")]...))
+        exit(0)
+    end
     want("selftest") && (selftest() || exit(1))
     want("timing") && timing()
-    want("fit") && fitcompare()
+    want("fisher") && fisher()
+    want("fit") && report(fitshard())
 end
