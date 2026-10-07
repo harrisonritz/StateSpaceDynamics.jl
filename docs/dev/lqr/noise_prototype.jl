@@ -474,25 +474,24 @@ end
 # Metrics (all invariant to the gauges left open)
 # =========================================================================
 
-"""|log ratio| of the spectra of S Q_k (scale- and similarity-invariant cost),
-as (smaller eigenvalue, larger eigenvalue), each the worse of k = 1, 2. Reported
-apart because they are not equally identified: see the `fisher` section."""
+#=
+Cost is compared entrywise. C is fixed at the truth, so x is in fixed coordinates
+and the only gauge left is the S/Q scale, which `tr(S)` pins: Q_k[1,1] is the
+position cost and Q_k[2,2] the velocity cost, both directly comparable.
+(Sorted eigenvalues are not: when a poorly identified cost runs off, it changes
+rank, and the "large eigenvalue" error then reports the wrong direction.)
+=#
+
+"|log ratio| of the (position, velocity) diagonal cost, worse of k = 1, 2."
 function cost_err(par, tr)
-    lo = hi = 0.0
-    for k in 1:2
-        a = sort(real(eigvals(par.S * par.Qs[k])))
-        b = sort(real(eigvals(tr.S * tr.Qs[k])))
-        e = abs.(log.(max.(a, 1e-300) ./ b))
-        lo, hi = max(lo, e[1]), max(hi, e[2])
-    end
-    return lo, hi
+    e = [maximum(abs(log(max(par.Qs[k][i, i], 1e-300) / tr.Qs[k][i, i])) for k in 1:2) for i in 1:NX]
+    return e[1], e[2]
 end
 
-"|log ratio| of the generalized eigenvalues of (Q₂, Q₁), (smaller, larger) — the contrast."
+"|log ratio| of the cost contrast Q₂[i,i]/Q₁[i,i], (position, velocity); true 5, 2."
 function contrast_err(par, tr)
-    a = sort(real(eigvals(par.Qs[2], par.Qs[1])))
-    b = sort(real(eigvals(tr.Qs[2], tr.Qs[1])))
-    e = abs.(log.(max.(a, 1e-300) ./ b))
+    r(p, i) = p.Qs[2][i, i] / p.Qs[1][i, i]
+    e = [abs(log(max(r(par, i), 1e-300) / r(tr, i))) for i in 1:NX]
     return e[1], e[2]
 end
 
@@ -510,8 +509,23 @@ function gain_err(par, tr)
     return e
 end
 
-"Eigenvalues of Σ⁻¹ S Ω S: slack (or costate-noise) power relative to plant noise."
-slack_ratio(par) = haskey(par, :Ω) ? sort(real(eigvals(par.Σ \ (par.S * par.Ω * par.S)))) : [NaN, NaN]
+"""Slack share of the closed-loop innovation, `tr(W S Ω S Wᵀ) / tr(Σ + W S Ω S Wᵀ)`
+averaged over t and k — what the data can see of Ω. (Ω in a direction the
+controller drives to zero is invisible: eig(Σ⁻¹ S Ω S) can be in the thousands
+while this is not.) For M1 it is a nominal number: there ν is a persistent
+costate error, not white slack."""
+function slack_share(par)
+    haskey(par, :Ω) || return NaN
+    s = 0.0
+    for k in 1:2
+        _, W = riccati(par.A, par.S, par.Qs[k], par.Qs[k], TT)
+        for t in 2:TT
+            V = W[t] * par.S * par.Ω * par.S' * W[t]'
+            s += tr(V) / (tr(par.Σ) + tr(V)) / (2 * (TT - 1))
+        end
+    end
+    return s
+end
 sigma_err(par, tr) = haskey(par, :Σ) ? norm(par.Σ - tr.Σ) / norm(tr.Σ) : NaN
 
 # =========================================================================
@@ -619,9 +633,6 @@ end
 # Identifiability: expected Fisher information under the true model
 # =========================================================================
 
-eig2(M) = (t = (M[1, 1] + M[2, 2]) / 2; d = M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1];
-           r = sqrt(max(t^2 - d, zero(t))); [t - r, t + r])
-
 """Delta-method standard errors of the cost summaries for M2 fitted to G1 at the
 truth, from the exact Gaussian Fisher information of vec(y_{1:T})
 (`Jμᵀ C⁻¹ Jμ + ½ tr(C⁻¹ ∂C C⁻¹ ∂C)`), for 100 trials per condition. Ω is held at
@@ -659,12 +670,13 @@ function fisher()
     # every summary below is invariant along it, which makes the pseudo-inverse exact.
     Σφ = pinv(Symmetric(F); rtol=1e-10)
     g(φ) = (p = unpack(:M2, full(φ));
-            vcat([log.(eig2(p.S * p.Qs[k])) for k in 1:2]..., log.(eig2(p.Qs[1] \ p.Qs[2]))))
+            vcat([log(p.Qs[k][i, i]) for k in 1:2 for i in 1:NX],
+                 [log(p.Qs[2][i, i] / p.Qs[1][i, i]) for i in 1:NX]))
     J = ForwardDiff.jacobian(g, φ0)
     se = sqrt.(diag(J * Σφ * J'))
-    @printf("  SE of log eig(S Q₁)   small %.3f   large %.3f\n", se[1], se[2])
-    @printf("  SE of log eig(S Q₂)   small %.3f   large %.3f\n", se[3], se[4])
-    @printf("  SE of log eig(Q₂, Q₁) small %.3f   large %.3f\n", se[5], se[6])
+    @printf("  SE of log Q₁[i,i]          position %.3f   velocity %.3f\n", se[1], se[2])
+    @printf("  SE of log Q₂[i,i]          position %.3f   velocity %.3f\n", se[3], se[4])
+    @printf("  SE of log Q₂[i,i]/Q₁[i,i]  position %.3f   velocity %.3f\n", se[5], se[6])
     ev = sort(eigvals(Symmetric(F)))
     @printf("  Fisher spectrum: null %.1e, then %.3g, %.3g, … , %.3g\n", ev[1], ev[2], ev[3], ev[end])
 end
@@ -717,7 +729,8 @@ function score(row)
     qlo, qhi = contrast_err(par, tr)
     return merge(row, (; np=length(row.θ), dtest, dtrain, cost_lo=clo, cost_hi=chi,
                        contr_lo=qlo, contr_hi=qhi, gain=gain_err(par, tr),
-                       sigma=sigma_err(par, tr), slack=slack_ratio(par),
+                       sigma=sigma_err(par, tr), slack=slack_share(par),
+                       slack_true=slack_share(merge(tr, (; Ω=GENS[row.gen].truth.Ω))),
                        spread=abs(row.nll[1] - row.nll[2])))
 end
 
@@ -748,25 +761,24 @@ function report(rows)
     println("""
     dtest    held-out log-lik per bin minus the generating model's (nats; 0 = as good as truth)
     dtrain   same on the training data
-    SQ lo/hi |log ratio| of the smaller / larger eigenvalue of S Q_k (worse k)
-    ctr lo/hi same for the generalized eigenvalues of (Q₂, Q₁)      (true 2, 5)
+    Qpos/vel |log ratio| of the position / velocity cost Q_k[i,i] (worse k)
+    ctr p/v  |log ratio| of the contrast Q₂[i,i]/Q₁[i,i]         (true 5, 2)
     gain     mean relative error of the closed-loop maps Φ_t
     Σerr     relative error of the plant noise Σ
-    slack    eig(Σ⁻¹ S Ω S)   (true: G1 0, G2 0.5, G3 0.0625; M1 and M2 read Ω differently)
+    slack    slack share of the closed-loop innovation (true in brackets; nominal for M1)
     spread   |nll(truth start) − nll(naive start)| per bin""")
     @printf("\n%-3s %-3s %3s %-18s %8s %6s %6s %6s %6s %6s %6s %-14s %8s %5s %s\n", "gen", "mod",
-            "np", "dtest (mean±sd)", "dtrain", "SQ lo", "SQ hi", "ctr lo", "ctr hi", "gain",
-            "Σerr", "slack (med)", "spread", "secs", "conv")
+            "np", "dtest (mean±sd)", "dtrain", "Qpos", "Qvel", "ctr p", "ctr v", "gain",
+            "Σerr", "slack [true]", "spread", "secs", "conv")
     for gen in (:G1, :G2, :G3), model in (:M0, :M1, :M2)
         rs = filter(r -> r.gen === gen && r.model === model, rows)
         isempty(rs) && continue
         med(f) = median(f.(rs))
-        sl = [median(getindex.(getfield.(rs, :slack), i)) for i in 1:2]
-        @printf("%-3s %-3s %3d %+8.4f±%-9.4f %+8.4f %6.2f %6.3f %6.2f %6.3f %6.3f %6.3f %6.3f,%-7.3f %8.1e %5.0f %d/%d\n",
+        @printf("%-3s %-3s %3d %+8.4f±%-9.4f %+8.4f %6.3f %6.2f %6.3f %6.2f %6.3f %6.3f %6.3f [%.3f] %8.1e %5.0f %d/%d\n",
                 gen, model, rs[1].np, mean(r.dtest for r in rs), std(r.dtest for r in rs),
                 med(r -> r.dtrain), med(r -> r.cost_lo), med(r -> r.cost_hi),
                 med(r -> r.contr_lo), med(r -> r.contr_hi), med(r -> r.gain),
-                med(r -> r.sigma), sl[1], sl[2], med(r -> r.spread),
+                med(r -> r.sigma), med(r -> r.slack), rs[1].slack_true, med(r -> r.spread),
                 med(r -> sum(r.secs)), count(r -> any(r.conv), rs), length(rs))
     end
     println("\npaired held-out differences (same test set), mean ± sd over seeds, nats/bin:")
@@ -783,9 +795,9 @@ function report(rows)
     end
     println("\nper seed:")
     for r in sort(rows; by=r -> (r.gen, r.model, r.seed))
-        @printf("  %s s%d %s  dtest %+.4f  SQ %.2f/%.3f  ctr %.2f/%.3f  gain %.3f  slack %s  iters %s\n",
+        @printf("  %s s%d %s  dtest %+.4f  Q pos/vel %.3f/%.2f  ctr %.3f/%.2f  gain %.3f  slack %.3f  iters %s\n",
                 r.gen, r.seed, r.model, r.dtest, r.cost_lo, r.cost_hi, r.contr_lo, r.contr_hi,
-                r.gain, string(round.(r.slack; digits=3)), string(r.iters))
+                r.gain, r.slack, string(r.iters))
     end
 end
 
