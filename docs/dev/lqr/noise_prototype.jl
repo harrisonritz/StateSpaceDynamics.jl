@@ -1,0 +1,699 @@
+#=============================================================================
+noise_prototype.jl — should the costate innovation inherit the plant noise?
+
+Step 0 before touching `src/`: three exact likelihoods for the same data, the
+costate hidden throughout and only `y_t = C x_t + d + r_t` observed.
+
+  M0  what `LQRStateModel` fits today. Hamiltonian forward map, a constant
+      full-rank N(0, Σ_mix) on the mixed residual, a free 2n initial prior per
+      condition, the soft terminal `λ_T = Q x_T`, scored as p(y | f = 0).
+  M1  option (a). Same Hamiltonian mean and terminal; the forward innovation is
+      the causal agent's, `[ε; P_{t+1} ε + ν]`, so its covariance is
+      `L_{t+1} blkdiag(Σ, Ω) L_{t+1}ᵀ` with `L = [I 0; P I]` — shared plant noise
+      plus costate-specific noise, full rank, time-varying through the Riccati
+      sweep. `λ_1 = P_1 x_1 + ν_1`.
+  M2  option (b). The causal closed loop on x alone,
+      `x_{t+1} = Φ_t x_t + noise`, `Cov = Σ + W_{t+1} S Ω S W_{t+1}ᵀ` — plant noise
+      plus control slack (an agent acting on a perturbed costate).
+
+and three generators:
+
+  G1  causal LQR agent, plant noise only     (`simulate_lqr`, the default)
+  G2  causal LQR agent + costate slack        (`simulate_lqr(; costate_slack)`)
+  G3  draws from M1 itself                    (terminal-conditioned, dense)
+
+G1 and G2 are exact draws from M2 (G1 at Ω = 0), G3 from M1. M1 at Ω = 0 is M2
+at Ω = 0 — checked in `--selftest` — so the models nest where they should.
+
+What M1 is, in the (x, δ = λ − P x) coordinates (derivation in the companion
+`noise_prototype.md`): `x_{t+1} = Φ_t x_t − S A⁻ᵀ δ_t + ε_t`,
+`δ_{t+1} = Φ_t⁻ᵀ δ_t + ν_t`, pinned by `δ_T ≈ 0`. Its costate noise is a
+*persistent, anticipatory* control error — a backward-stable process that
+vanishes at the deadline — where M2's slack is white.
+
+Everything is self-contained, as `biological.jl` is: nothing is imported from
+StateSpaceDynamics. The observation model (C, d, R) is fixed at the truth in
+every fit so the comparison is about the dynamics alone; it also pins the
+similarity gauge, so plant matrices are compared directly. `tr(S)` is fixed at
+its true value (the S/Q scale gauge).
+
+Needs Optim, LineSearches and ForwardDiff on the load path:
+
+  julia --project=<env with Optim, LineSearches, ForwardDiff> -t 4 \
+        docs/dev/lqr/noise_prototype.jl [--selftest] [--quick] [--only=a,b]
+
+Sections: selftest, timing, fit.
+=============================================================================#
+
+using LinearAlgebra, Random, Statistics, Printf
+using Optim, LineSearches, ForwardDiff
+
+BLAS.set_num_threads(1)
+
+const ONLY = let
+    a = filter(s -> startswith(s, "--only="), ARGS)
+    isempty(a) ? nothing : Set(split(split(a[1], "=")[2], ","))
+end
+const QUICK = "--quick" in ARGS
+# `--plant=known` fixes A at the truth in every fit: what is left is the cost, the
+# noise and the initial state, which separates "the noise model trades cost
+# against plant" from "the noise model biases the cost".
+const KNOWN_A = "--plant=known" in ARGS
+const SELFTEST = "--selftest" in ARGS
+want(s) = ONLY === nothing || s in ONLY
+section(t) = (println(); println("="^78); println(t); println("="^78))
+
+# =========================================================================
+# Truth
+# =========================================================================
+
+const NX = 2          # plant dimension
+const NY = 6          # observation dimension
+const TT = 30         # trial length
+const NTRAIN = QUICK ? 40 : 100   # trials per condition
+const NTEST = 100
+const NSEEDS = QUICK ? 1 : 5
+
+function truth(; slack2=0.0, Ωg3=nothing)
+    A = [1.0 0.1; 0.0 0.9]
+    S = 0.05 * Matrix(1.0I, NX, NX)
+    Qs = [Diagonal([1.0, 0.2]) |> Matrix, Diagonal([5.0, 0.4]) |> Matrix]
+    Σ = 0.01 * Matrix(1.0I, NX, NX)
+    Ω = Ωg3 === nothing ? slack2 * Matrix(1.0I, NX, NX) : Ωg3
+    μ1 = [1.0, 0.0]
+    V1 = 0.1 * Matrix(1.0I, NX, NX)
+    C = randn(MersenneTwister(20261007), NY, NX) ./ sqrt(NX)
+    d = zeros(NY)
+    R = 0.05 * Matrix(1.0I, NY, NY)
+    Σf = 1e-3 * Matrix(1.0I, NX, NX)
+    return (; A, S, Qs, Σ, Ω, μ1, V1, C, d, R, Σf)
+end
+
+const TRUE_G1 = truth()
+const TRUE_G2 = truth(; slack2=2.0)                    # S Ω S = Σ/2
+const TRUE_G3 = truth(; Ωg3=0.25 * Matrix(1.0I, NX, NX))
+
+# =========================================================================
+# Control algebra (generic in the element type, for ForwardDiff)
+# =========================================================================
+
+sym(M) = (M + M') / 2
+eye(T, k) = Matrix{T}(I, k, k)
+blkdiag(X, Y) = [X zeros(eltype(X), size(X, 1), size(Y, 2));
+                 zeros(eltype(X), size(Y, 1), size(X, 2)) Y]
+
+"""Finite-horizon Riccati sweep with terminal cost `Qf`: `P[t]` for t = 1..T and
+`W[t] = (I + S P[t])⁻¹` (W[1] is computed but only W[2:T] enter the dynamics)."""
+function riccati(A, S, Q, Qf, T)
+    Tp = promote_type(eltype(A), eltype(S), eltype(Q), eltype(Qf))
+    P = Vector{Matrix{Tp}}(undef, T)
+    W = Vector{Matrix{Tp}}(undef, T)
+    P[T] = Matrix{Tp}(Qf)
+    Id = eye(Tp, size(A, 1))
+    for t in T:-1:2
+        W[t] = inv(Id + S * P[t])
+        P[t - 1] = sym(Q + A' * P[t] * W[t] * A)
+    end
+    W[1] = inv(Id + S * P[1])
+    return P, W
+end
+
+"Forward Hamiltonian map, the `M_t` of `LQRStateModel`'s docstring."
+function hamiltonian(A, S, Q)
+    Ait = inv(A)'
+    return [A + S * Ait * Q  -S * Ait;
+            -Ait * Q          Ait]
+end
+
+"Mixed → forward noise map `G = [I  S A⁻ᵀ; 0  −A⁻ᵀ]`."
+function gmix(A, S)
+    Ait = inv(A)'
+    k = size(A, 1)
+    return [eye(eltype(Ait), k) S * Ait; zeros(eltype(Ait), k, k) -Ait]
+end
+
+ltrigraph(P) = (k = size(P, 1); [eye(eltype(P), k) zeros(eltype(P), k, k); P eye(eltype(P), k)])
+
+# =========================================================================
+# The three models as linear-Gaussian chains ("specs")
+# =========================================================================
+#
+# A spec is z_1 ~ N(m1, V1), z_{t+1} = F[t] z_t + w_t, w_t ~ N(0, Qn[t]),
+# y_t = H z_t + d + r_t, and optionally a terminal pseudo-observation
+# 0 = Hf z_T + e_f, e_f ~ N(0, Σf), scored as p(y | f = 0).
+
+function spec_M0(par, k, obs, T)
+    Q = par.Qs[k]
+    M = hamiltonian(par.A, par.S, Q)
+    G = gmix(par.A, par.S)
+    Qn = sym(G * par.Σmix * G')
+    Tp = eltype(M)
+    return (F=fill(M, T - 1), Qn=fill(Qn, T - 1), m1=par.m0[k], V1=par.V0[k],
+            H=[obs.C zeros(NY, NX)], d=obs.d, R=obs.R,
+            Hf=[-Q eye(Tp, NX)], Σf=par.Σf)
+end
+
+function spec_M1(par, k, obs, T)
+    Q = par.Qs[k]
+    P, _ = riccati(par.A, par.S, Q, Q, T)
+    M = hamiltonian(par.A, par.S, Q)
+    B = blkdiag(par.Σ, par.Ω)
+    Qn = [sym(ltrigraph(P[t + 1]) * B * ltrigraph(P[t + 1])') for t in 1:(T - 1)]
+    L1 = ltrigraph(P[1])
+    Tp = eltype(M)
+    return (F=fill(M, T - 1), Qn=Qn, m1=vcat(par.μ1, P[1] * par.μ1),
+            V1=sym(L1 * blkdiag(par.V1, par.Ω) * L1'),
+            H=[obs.C zeros(NY, NX)], d=obs.d, R=obs.R,
+            Hf=[-Q eye(Tp, NX)], Σf=par.Σf)
+end
+
+function spec_M2(par, k, obs, T)
+    Q = par.Qs[k]
+    _, W = riccati(par.A, par.S, Q, Q, T)
+    F = [W[t + 1] * par.A for t in 1:(T - 1)]
+    SΩS = par.S * par.Ω * par.S'
+    Qn = [sym(par.Σ + W[t + 1] * SΩS * W[t + 1]') for t in 1:(T - 1)]
+    return (F=F, Qn=Qn, m1=par.μ1, V1=par.V1, H=obs.C, d=obs.d, R=obs.R,
+            Hf=nothing, Σf=nothing)
+end
+
+const SPECS = (M0=spec_M0, M1=spec_M1, M2=spec_M2)
+
+# =========================================================================
+# Likelihoods
+# =========================================================================
+
+"Σ_i log N(E[:, i]; 0, LLᵀ) for a Cholesky factor `ch`."
+function gauss_ll(ch, E)
+    Z = ch.L \ E
+    k, N = size(E, 1), size(E, 2)
+    return -(N * (2 * sum(log, diag(ch.U)) + k * log(2π)) + sum(abs2, Z)) / 2
+end
+
+"""Exact log p(y | f = 0) summed over the trials in `Y` (NY × T × N). Trials
+share the spec, so the covariance recursion runs once and only the means are
+per trial."""
+function kf_loglik(sp, Y)
+    _, T, N = size(Y)
+    m = repeat(sp.m1, 1, N)
+    V = sp.V1
+    ll = zero(eltype(V))
+    for t in 1:T
+        if t > 1
+            m = sp.F[t - 1] * m
+            V = sym(sp.F[t - 1] * V * sp.F[t - 1]' + sp.Qn[t - 1])
+        end
+        ch = cholesky(Symmetric(sym(sp.H * V * sp.H' + sp.R)))
+        E = Y[:, t, :] .- (sp.H * m .+ sp.d)
+        ll += gauss_ll(ch, E)
+        K = transpose(ch \ (sp.H * V))
+        m = m + K * E
+        V = sym(V - K * sp.H * V)
+    end
+    sp.Hf === nothing && return ll
+    # numerator: the terminal pseudo-observation f = 0 on the filtered z_T
+    chf = cholesky(Symmetric(sym(sp.Hf * V * sp.Hf' + sp.Σf)))
+    ll += gauss_ll(chf, -(sp.Hf * m))
+    # normalizer: N × log p(f = 0) from the prior chain alone
+    mp, Vp = sp.m1, sp.V1
+    for t in 1:(T - 1)
+        mp = sp.F[t] * mp
+        Vp = sym(sp.F[t] * Vp * sp.F[t]' + sp.Qn[t])
+    end
+    chp = cholesky(Symmetric(sym(sp.Hf * Vp * sp.Hf' + sp.Σf)))
+    ll -= N * gauss_ll(chp, reshape(-(sp.Hf * mp), :, 1))
+    return ll
+end
+
+"Joint mean and covariance of vec(z_{1:T}) under a spec (no terminal)."
+function dense_z(sp, T)
+    D = length(sp.m1)
+    Tp = eltype(sp.V1)
+    μ = Vector{Vector{Tp}}(undef, T)
+    V = Vector{Matrix{Tp}}(undef, T)
+    μ[1], V[1] = sp.m1, sp.V1
+    for t in 2:T
+        μ[t] = sp.F[t - 1] * μ[t - 1]
+        V[t] = sp.F[t - 1] * V[t - 1] * sp.F[t - 1]' + sp.Qn[t - 1]
+    end
+    Σz = zeros(Tp, D * T, D * T)
+    blk(t) = ((t - 1) * D + 1):(t * D)
+    for t in 1:T
+        Φ = Matrix{Tp}(I, D, D)
+        for s in t:T
+            s > t && (Φ = sp.F[s - 1] * Φ)
+            Σz[blk(s), blk(t)] = Φ * V[t]
+            Σz[blk(t), blk(s)] = (Φ * V[t])'
+        end
+    end
+    return vcat(μ...), Σz, blk
+end
+
+"Brute-force log p(y | f = 0) for one trial (NY × T): the reference for `kf_loglik`."
+function dense_loglik(sp, y)
+    T = size(y, 2)
+    μz, Σz, blk = dense_z(sp, T)
+    Hb = kron(Matrix(1.0I, T, T), sp.H)
+    μy = Hb * μz .+ repeat(sp.d, T)
+    Cyy = Hb * Σz * Hb' + kron(Matrix(1.0I, T, T), sp.R)
+    if sp.Hf !== nothing
+        μf = sp.Hf * μz[blk(T)]
+        Cff = sp.Hf * Σz[blk(T), blk(T)] * sp.Hf' + sp.Σf
+        Cyf = Hb * Σz[:, blk(T)] * sp.Hf'
+        μy = μy + Cyf * (Cff \ (-μf))
+        Cyy = Cyy - Cyf * (Cff \ Cyf')
+    end
+    ch = cholesky(Symmetric(Cyy))
+    return gauss_ll(ch, reshape(vec(y) - μy, :, 1))
+end
+
+# =========================================================================
+# Generators
+# =========================================================================
+
+"The causal agent of `simulate_lqr` (`noise_timing = :causal`), with optional
+isotropic costate slack of variance `tr.Ω[1,1]`."
+function simulate_causal(rng, tr, k, N, T)
+    Q = tr.Qs[k]
+    P, W = riccati(tr.A, tr.S, Q, Q, T)
+    LΣ = cholesky(tr.Σ).L
+    LV = cholesky(tr.V1).L
+    LR = cholesky(tr.R).L
+    slack = sqrt(tr.Ω[1, 1])
+    Y = zeros(NY, T, N)
+    for i in 1:N
+        x = tr.μ1 + LV * randn(rng, NX)
+        ν = [slack .* randn(rng, NX) for _ in 1:T]
+        for t in 1:T
+            Y[:, t, i] = tr.C * x + tr.d + LR * randn(rng, NY)
+            t == T && break
+            x = W[t + 1] * (tr.A * x - tr.S * ν[t + 1]) + LΣ * randn(rng, NX)
+        end
+    end
+    return Y
+end
+
+"Exact draws from M1 given f = 0, through the dense joint."
+function simulate_M1(rng, tr, k, N, T)
+    sp = spec_M1(tr, k, tr, T)
+    μz, Σz, blk = dense_z(sp, T)
+    Czf = Σz[:, blk(T)] * sp.Hf'
+    Cff = sp.Hf * Σz[blk(T), blk(T)] * sp.Hf' + sp.Σf
+    μc = μz + Czf * (Cff \ (-(sp.Hf * μz[blk(T)])))
+    Σc = Symmetric(Σz - Czf * (Cff \ Czf'))
+    Lc = cholesky(Σc + 1e-10 * I).L
+    LR = cholesky(tr.R).L
+    D = 2NX
+    Y = zeros(NY, T, N)
+    for i in 1:N
+        z = μc + Lc * randn(rng, D * T)
+        for t in 1:T
+            Y[:, t, i] = tr.C * z[blk(t)][1:NX] + tr.d + LR * randn(rng, NY)
+        end
+    end
+    return Y
+end
+
+const GENS = (
+    G1=(truth=TRUE_G1, sim=simulate_causal, model=:M2),
+    G2=(truth=TRUE_G2, sim=simulate_causal, model=:M2),
+    G3=(truth=TRUE_G3, sim=simulate_M1, model=:M1),
+)
+
+# =========================================================================
+# Parameterization
+# =========================================================================
+
+ntri(k) = k * (k + 1) ÷ 2
+function ltri(v, k)
+    L = zeros(eltype(v), k, k)
+    idx = 0
+    for j in 1:k, i in j:k
+        idx += 1
+        L[i, j] = i == j ? exp(v[idx]) : v[idx]
+    end
+    return L
+end
+pdm(v, k) = (L = ltri(v, k); L * L')
+function unpdm(M)
+    k = size(M, 1)
+    L = cholesky(Symmetric(Matrix(M))).L
+    return [i == j ? log(L[i, j]) : L[i, j] for j in 1:k for i in j:k]
+end
+
+const S_TRACE = tr(TRUE_G1.S)
+
+function layout(model)
+    blocks = Pair{Symbol,Int}[:S => ntri(NX), :Q1 => ntri(NX), :Q2 => ntri(NX)]
+    KNOWN_A || pushfirst!(blocks, :A => NX^2)
+    if model === :M0
+        append!(blocks, [:Σmix => ntri(2NX), :m01 => 2NX, :m02 => 2NX,
+                         :V01 => ntri(2NX), :V02 => ntri(2NX), :Σf => ntri(NX)])
+    else
+        append!(blocks, [:Σ => ntri(NX), :Ω => ntri(NX), :μ1 => NX, :V1 => ntri(NX)])
+        model === :M1 && push!(blocks, :Σf => ntri(NX))
+    end
+    r = Dict{Symbol,UnitRange{Int}}()
+    o = 0
+    for (k, w) in blocks
+        r[k] = (o + 1):(o + w)
+        o += w
+    end
+    return r, o
+end
+
+function unpack(model, θ)
+    lay, _ = layout(model)
+    g(k) = θ[lay[k]]
+    A = KNOWN_A ? TRUE_G1.A : reshape(g(:A), NX, NX)
+    St = pdm(g(:S), NX)
+    S = (S_TRACE / tr(St)) * St
+    Qs = [pdm(g(:Q1), NX), pdm(g(:Q2), NX)]
+    if model === :M0
+        return (; A, S, Qs, Σmix=pdm(g(:Σmix), 2NX), m0=[g(:m01), g(:m02)],
+                V0=[pdm(g(:V01), 2NX), pdm(g(:V02), 2NX)], Σf=pdm(g(:Σf), NX))
+    end
+    base = (; A, S, Qs, Σ=pdm(g(:Σ), NX), Ω=pdm(g(:Ω), NX), μ1=g(:μ1), V1=pdm(g(:V1), NX))
+    return model === :M1 ? merge(base, (; Σf=pdm(g(:Σf), NX))) : base
+end
+
+"Pack a parameter NamedTuple (as `unpack` returns) into θ."
+function pack(model, par)
+    lay, np = layout(model)
+    θ = zeros(np)
+    KNOWN_A || (θ[lay[:A]] = vec(par.A))
+    θ[lay[:S]] = unpdm(par.S)
+    θ[lay[:Q1]] = unpdm(par.Qs[1])
+    θ[lay[:Q2]] = unpdm(par.Qs[2])
+    if model === :M0
+        θ[lay[:Σmix]] = unpdm(par.Σmix)
+        θ[lay[:m01]], θ[lay[:m02]] = par.m0
+        θ[lay[:V01]], θ[lay[:V02]] = unpdm(par.V0[1]), unpdm(par.V0[2])
+        θ[lay[:Σf]] = unpdm(par.Σf)
+    else
+        θ[lay[:Σ]], θ[lay[:Ω]] = unpdm(par.Σ), unpdm(par.Ω)
+        θ[lay[:μ1]], θ[lay[:V1]] = par.μ1, unpdm(par.V1)
+        model === :M1 && (θ[lay[:Σf]] = unpdm(par.Σf))
+    end
+    return θ
+end
+
+"""Starting points. `:truth` puts the shared blocks at the generating values and
+M0's mixed noise at the time-average of the causal agent's mixed residual
+covariance (plus slack, plus a ridge). `:naive` knows nothing about the plant."""
+function init_params(model, how, tr, data, obs)
+    floorΩ = 1e-4 * Matrix(1.0I, NX, NX)
+    if how === :truth
+        A, S, Qs, Σ, V1, μ1 = tr.A, tr.S, tr.Qs, tr.Σ, tr.V1, tr.μ1
+        Ω = tr.Ω + floorΩ
+    else
+        A = KNOWN_A ? TRUE_G1.A : 0.95 * Matrix(1.0I, NX, NX)
+        S = (S_TRACE / NX) * Matrix(1.0I, NX, NX)
+        Qs = [Matrix(1.0I, NX, NX), Matrix(1.0I, NX, NX)]
+        Σ = 0.03 * Matrix(1.0I, NX, NX)
+        Ω = 0.1 * Matrix(1.0I, NX, NX)
+        Cp = pinv(obs.C)
+        x1 = hcat([Cp * (Y[:, 1, :] .- obs.d) for Y in data]...)
+        μ1 = vec(mean(x1; dims=2))
+        V1 = Matrix(Symmetric(cov(x1'))) + 0.01I
+    end
+    if model === :M0
+        Σmix = zeros(2NX, 2NX)
+        m0 = Vector{Vector{Float64}}(undef, 2)
+        V0 = Vector{Matrix{Float64}}(undef, 2)
+        for k in 1:2
+            P, _ = riccati(A, S, Qs[k], Qs[k], TT)
+            for t in 1:(TT - 1)
+                Km = [Matrix(1.0I, NX, NX) + S * P[t + 1]; -A' * P[t + 1]]
+                Σmix += Km * Σ * Km' / (2 * (TT - 1))
+            end
+            m0[k] = vcat(μ1, P[1] * μ1)
+            L1 = ltrigraph(P[1])
+            V0[k] = sym(L1 * blkdiag(V1, Ω) * L1') + 1e-3I
+        end
+        Σmix += blkdiag(zeros(NX, NX), Ω + A' * Ω * A) + 1e-3 * LinearAlgebra.tr(Σmix) * I
+        return pack(model, (; A, S, Qs, Σmix, m0, V0, Σf=tr.Σf))
+    end
+    return pack(model, (; A, S, Qs, Σ, Ω, μ1, V1, Σf=tr.Σf))
+end
+
+total_loglik(model, par, data, obs) =
+    sum(kf_loglik(SPECS[model](par, k, obs, TT), data[k]) for k in eachindex(data))
+
+# =========================================================================
+# Fitting
+# =========================================================================
+
+function fit(model, θ0, data, obs; iters=QUICK ? 300 : 2000)
+    nbins = sum(size(Y, 2) * size(Y, 3) for Y in data)
+    function f(θ)
+        v = try
+            -total_loglik(model, unpack(model, θ), data, obs) / nbins
+        catch e
+            e isa InterruptException && rethrow()
+            convert(eltype(θ), Inf)
+        end
+        return isfinite(v) ? v : convert(eltype(θ), Inf)
+    end
+    cfg = ForwardDiff.GradientConfig(f, θ0)
+    g!(G, θ) = ForwardDiff.gradient!(G, f, θ, cfg)
+    t0 = time()
+    res = Optim.optimize(f, g!, θ0, LBFGS(; linesearch=BackTracking()),
+                         Optim.Options(; iterations=iters, g_abstol=1e-6, f_reltol=1e-11))
+    return (θ=Optim.minimizer(res), nll=Optim.minimum(res), iters=Optim.iterations(res),
+            converged=Optim.converged(res), secs=time() - t0)
+end
+
+# =========================================================================
+# Metrics (all invariant to the gauges left open)
+# =========================================================================
+
+"max |log ratio| of the spectra of S Q_k (scale- and similarity-invariant cost)."
+function cost_err(par, tr)
+    e = 0.0
+    for k in 1:2
+        a = sort(real(eigvals(par.S * par.Qs[k])))
+        b = sort(real(eigvals(tr.S * tr.Qs[k])))
+        e = max(e, maximum(abs.(log.(max.(a, 1e-12) ./ b))))
+    end
+    return e
+end
+
+"max |log ratio| of the generalized eigenvalues of (Q₂, Q₁) — the contrast."
+function contrast_err(par, tr)
+    a = sort(real(eigvals(par.Qs[2], par.Qs[1])))
+    b = sort(real(eigvals(tr.Qs[2], tr.Qs[1])))
+    return maximum(abs.(log.(max.(a, 1e-12) ./ b)))
+end
+
+"mean_t,k ‖Φ_t − Φ_t*‖_F / ‖Φ_t*‖_F (C is fixed, so the gauge is pinned)."
+function gain_err(par, tr)
+    e = 0.0
+    for k in 1:2
+        _, W = riccati(par.A, par.S, par.Qs[k], par.Qs[k], TT)
+        _, Wt = riccati(tr.A, tr.S, tr.Qs[k], tr.Qs[k], TT)
+        for t in 1:(TT - 1)
+            Φ, Φt = W[t + 1] * par.A, Wt[t + 1] * tr.A
+            e += norm(Φ - Φt) / norm(Φt) / (2 * (TT - 1))
+        end
+    end
+    return e
+end
+
+"Eigenvalues of Σ⁻¹ S Ω S: slack (or costate-noise) power relative to plant noise."
+slack_ratio(par) = haskey(par, :Ω) ? sort(real(eigvals(par.Σ \ (par.S * par.Ω * par.S)))) : [NaN, NaN]
+sigma_err(par, tr) = haskey(par, :Σ) ? norm(par.Σ - tr.Σ) / norm(tr.Σ) : NaN
+
+# =========================================================================
+# Selftest
+# =========================================================================
+
+bigify(nt) = map(v -> v isa AbstractArray ?
+                      (eltype(v) <: AbstractArray ? [big.(x) for x in v] : big.(v)) : v, nt)
+
+function selftest()
+    setprecision(BigFloat, 256)
+    section("selftest: Kalman vs dense brute force; nesting; generators")
+    rng = MersenneTwister(1)
+    obs = TRUE_G1
+    ok = true
+    for model in (:M0, :M1, :M2)
+        _, np = layout(model)
+        θ = init_params(model, :truth, TRUE_G2, nothing, obs) .+ 0.05 .* randn(rng, np)
+        par = unpack(model, θ)
+        y = simulate_causal(rng, TRUE_G2, 2, 1, TT)
+        for k in 1:2
+            # the reference runs in 256-bit: the Hamiltonian chain's prior covariance
+            # grows like ρ(M)^{2T} and the dense conditioning loses ~1e-4 nats of it
+            # in Float64 (the filter does not)
+            sp = SPECS[model](par, k, obs, TT)
+            spb = SPECS[model](bigify(par), k, bigify(obs), TT)
+            a, b = kf_loglik(sp, y), Float64(dense_loglik(spb, big.(y[:, :, 1])))
+            pass = abs(a - b) < 1e-6 * max(1, abs(b))
+            ok &= pass
+            @printf("  %s cond %d   Kalman %.8f   dense %.8f   %s\n", model, k, a, b,
+                    pass ? "ok" : "MISMATCH")
+        end
+    end
+    # M1 at Ω = 0 is M2 at Ω = 0 (the terminal factor becomes independent of y)
+    p1 = merge(TRUE_G1, (; Ω=zeros(NX, NX)))
+    y = simulate_causal(rng, TRUE_G1, 1, 20, TT)
+    a = kf_loglik(spec_M1(p1, 1, p1, TT), y)
+    b = kf_loglik(spec_M2(p1, 1, p1, TT), y)
+    pass = abs(a - b) < 1e-6 * abs(b)
+    ok &= pass
+    @printf("  M1(Ω=0) %.8f   M2(Ω=0) %.8f   %s\n", a, b, pass ? "ok" : "MISMATCH")
+    # generators match their models' one-step moments: empirical y-covariance at
+    # the last bin vs the model's marginal
+    for (name, g) in pairs(GENS)
+        Y = g.sim(MersenneTwister(2), g.truth, 2, 4000, TT)
+        sp = SPECS[g.model](g.truth, 2, g.truth, TT)
+        μz, Σz, blk = dense_z(sp, TT)
+        if sp.Hf !== nothing
+            Czf = Σz[:, blk(TT)] * sp.Hf'
+            Cff = sp.Hf * Σz[blk(TT), blk(TT)] * sp.Hf' + sp.Σf
+            μz = μz + Czf * (Cff \ (-(sp.Hf * μz[blk(TT)])))
+            Σz = Σz - Czf * (Cff \ Czf')
+        end
+        for t in (2, TT ÷ 2, TT)
+            Cm = sp.H * Σz[blk(t), blk(t)] * sp.H' + sp.R
+            Ce = cov(Y[:, t, :]')
+            rel = norm(Ce - Cm) / norm(Cm)
+            mrel = norm(vec(mean(Y[:, t, :]; dims=2)) - sp.H * μz[blk(t)]) / sqrt(tr(Cm))
+            pass = rel < 0.1 && mrel < 0.1
+            ok &= pass
+            @printf("  %s t=%2d   cov rel err %.3f   mean err/sd %.3f   %s\n", name, t, rel,
+                    mrel, pass ? "ok" : "CHECK")
+        end
+    end
+    # ForwardDiff gradient vs central differences on the objective
+    for model in (:M0, :M1, :M2)
+        data = [simulate_causal(rng, TRUE_G2, k, 10, TT) for k in 1:2]
+        θ = init_params(model, :truth, TRUE_G2, data, obs)
+        f(θ) = -total_loglik(model, unpack(model, θ), data, obs)
+        g = ForwardDiff.gradient(f, θ)
+        h = 1e-6
+        gd = [(f(θ + h * e) - f(θ - h * e)) / 2h for e in eachcol(Matrix(1.0I, length(θ), length(θ)))]
+        rel = norm(g - gd) / norm(gd)
+        pass = rel < 1e-5
+        ok &= pass
+        @printf("  %s gradient rel err %.2e   %s\n", model, rel, pass ? "ok" : "MISMATCH")
+    end
+    println(ok ? "\nselftest passed" : "\nselftest FAILED")
+    return ok
+end
+
+# =========================================================================
+# Timing
+# =========================================================================
+
+function timing()
+    section("timing: one objective and one gradient over 2 × $NTRAIN trials × $TT bins")
+    rng = MersenneTwister(3)
+    obs = TRUE_G1
+    data = [simulate_causal(rng, TRUE_G2, k, NTRAIN, TT) for k in 1:2]
+    @printf("%-4s %6s %14s %14s\n", "", "params", "value (ms)", "gradient (ms)")
+    for model in (:M0, :M1, :M2)
+        θ = init_params(model, :truth, TRUE_G2, data, obs)
+        f(θ) = -total_loglik(model, unpack(model, θ), data, obs)
+        cfg = ForwardDiff.GradientConfig(f, θ)
+        G = similar(θ)
+        f(θ); ForwardDiff.gradient!(G, f, θ, cfg)
+        tv = minimum(@elapsed(f(θ)) for _ in 1:20)
+        tg = minimum(@elapsed(ForwardDiff.gradient!(G, f, θ, cfg)) for _ in 1:5)
+        @printf("%-4s %6d %14.3f %14.3f\n", model, length(θ), 1e3tv, 1e3tg)
+    end
+end
+
+# =========================================================================
+# Fit comparison
+# =========================================================================
+
+function run_job(gen, seed)
+    g = GENS[gen]
+    tr = g.truth
+    obs = tr
+    rng = MersenneTwister(1000 * seed + Int(gen === :G2) + 2 * Int(gen === :G3))
+    train = [g.sim(rng, tr, k, NTRAIN, TT) for k in 1:2]
+    test = [g.sim(rng, tr, k, NTEST, TT) for k in 1:2]
+    ntest = 2 * NTEST * TT
+    ll_true_test = total_loglik(g.model, tr, test, obs)
+    ll_true_train = total_loglik(g.model, tr, train, obs) / (2 * NTRAIN * TT)
+    rows = []
+    for model in (:M0, :M1, :M2)
+        fits = [(how, fit(model, init_params(model, how, tr, train, obs), train, obs))
+                for how in (:truth, :naive)]
+        best = argmin(r -> r[2].nll, fits)[2]
+        spread = abs(fits[1][2].nll - fits[2][2].nll)
+        par = unpack(model, best.θ)
+        push!(rows, (gen=gen, seed=seed, model=model, np=length(best.θ),
+                     dtest=(total_loglik(model, par, test, obs) - ll_true_test) / ntest,
+                     dtrain=-best.nll - ll_true_train,
+                     cost=cost_err(par, tr), contrast=contrast_err(par, tr),
+                     gain=gain_err(par, tr), sigma=sigma_err(par, tr),
+                     slack=slack_ratio(par), spread=spread,
+                     secs=sum(r[2].secs for r in fits), iters=best.iters,
+                     conv=all(r[2].converged for r in fits)))
+    end
+    return rows
+end
+
+function fitcompare()
+    section("fit ($(KNOWN_A ? "A known" : "A free")): $(NSEEDS) seeds × {G1, G2, G3} × {M0, M1, M2}, best of truth/naive init")
+    println("""
+    dtest   held-out log-lik per bin minus the generating model's (nats; 0 = as good as truth)
+    dtrain  same on the training data (positive = overfits relative to truth)
+    cost    max |log ratio| of eig(S Q_k), k = 1, 2   (scale/similarity invariant)
+    contr   max |log ratio| of eig(Q₂, Q₁)            (true: 2, 5)
+    gain    mean relative error of the closed-loop maps Φ_t
+    Σerr    relative error of the plant noise Σ
+    slack   eig(Σ⁻¹ S Ω S)  (true: G1 0, G2 0.5, G3 $(round(0.0025*0.25/0.01; digits=4)))
+    spread  |nll(truth init) − nll(naive init)| per bin (0 = both inits agree)
+    """)
+    jobs = [(gen, seed) for gen in (:G1, :G2, :G3) for seed in 1:NSEEDS]
+    results = Vector{Any}(undef, length(jobs))
+    lk = ReentrantLock()
+    Threads.@threads :dynamic for j in eachindex(jobs)
+        results[j] = run_job(jobs[j]...)
+        lock(lk) do
+            for r in results[j]
+                @printf("  done %s s%d %s  dtest %+.4f  cost %.3f  contr %.3f  gain %.3f  %.0fs\n",
+                        r.gen, r.seed, r.model, r.dtest, r.cost, r.contrast, r.gain, r.secs)
+            end
+            flush(stdout)
+        end
+    end
+    rows = vcat(results...)
+    @printf("\n%-3s %-3s %3s %-17s %9s %6s %6s %6s %6s %-15s %8s %6s %s\n", "gen", "mod", "np",
+            "dtest (mean±sd)", "dtrain", "cost", "contr", "gain", "Σerr", "slack (median)",
+            "spread", "secs", "conv")
+    for gen in (:G1, :G2, :G3), model in (:M0, :M1, :M2)
+        rs = filter(r -> r.gen === gen && r.model === model, rows)
+        med(f) = median(f.(rs))
+        sl = [median(getindex.(getfield.(rs, :slack), i)) for i in 1:2]
+        @printf("%-3s %-3s %3d %+8.4f±%-8.4f %+9.4f %6.3f %6.3f %6.3f %6.3f %6.3f,%-8.3f %8.1e %6.1f %d/%d\n",
+                gen, model, rs[1].np, mean(r.dtest for r in rs), std(r.dtest for r in rs),
+                med(r -> r.dtrain), med(r -> r.cost), med(r -> r.contrast), med(r -> r.gain),
+                med(r -> r.sigma), sl[1], sl[2], med(r -> r.spread), med(r -> r.secs),
+                count(r -> r.conv, rs), length(rs))
+    end
+    println("\nper seed:")
+    for r in rows
+        @printf("  %s s%d %s  dtest %+.4f  cost %.3f  contr %.3f  gain %.3f  slack %s  iters %d\n",
+                r.gen, r.seed, r.model, r.dtest, r.cost, r.contrast, r.gain,
+                string(round.(r.slack; digits=3)), r.iters)
+    end
+    return rows
+end
+
+# =========================================================================
+
+if abspath(PROGRAM_FILE) == @__FILE__
+    @printf("threads: %d   QUICK: %s   A known: %s\n", Threads.nthreads(), QUICK, KNOWN_A)
+    if SELFTEST
+        exit(selftest() ? 0 : 1)
+    end
+    want("selftest") && (selftest() || exit(1))
+    want("timing") && timing()
+    want("fit") && fitcompare()
+end
