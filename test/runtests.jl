@@ -546,6 +546,7 @@ using SSDTest
                 test_lqr_poisson_emission()
                 test_lqr_composite_emission()
                 test_lqr_depends_on()
+                test_lqr_qc_scale()
                 test_lqr_tracking_control()
                 test_lqr_tracking_mstep()
                 test_lqr_gref_columns()
@@ -584,6 +585,7 @@ using SSDTest
             test_hold_joint_gradient()
             test_hold_em_recovery()
             test_hold_depends_on()
+            test_hold_qc_scale()
             test_hold_slds()
         end
 
@@ -597,6 +599,7 @@ using SSDTest
             test_causal_noise_update()
             test_causal_em()
             test_causal_depends_on()
+            test_causal_qc_scale()
             test_causal_invariances()
             test_causal_recovery()
             test_causal_rejections()
@@ -665,6 +668,7 @@ using SSDTest
             test_slds_lqr_noise_version_lookup()
             test_slds_lqr_zero_count_noise_version()
             test_slds_lqr_grouped()
+            test_slds_lqr_qc_scale()
             test_slds_lqr_grouped_conditional()
             test_slds_lqr_state_grouped_conditional()
             test_slds_lqr_state_grouped_initial_inputs()

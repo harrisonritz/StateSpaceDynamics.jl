@@ -663,3 +663,24 @@ function test_hold_depends_on()
     @test v1.Qc[1] != v2.Qc[1]               # the cost is not
     return nothing
 end
+
+"""`(Qc_scale = labels,)` on a hold regulator: the tied objective, its gradient, EM."""
+function test_hold_qc_scale()
+    labels = repeat([1, 2, 3]; inner=4)
+    ux = [randn(StableRNG(10 + i), 2, 15) for i in 1:12]
+    for profile in (true, false)
+        sm, lds = hold_fixture(StableRNG(5))
+        _, y = rand(StableRNG(6), lds, fill(15, 12); ux=ux)
+        check_qc_scale_objective(sm, lds.obs_model, y, ux, labels; profile=profile)
+    end
+    sm, lds = hold_fixture(StableRNG(5))
+    _, y = rand(StableRNG(6), lds, fill(15, 12); ux=ux)
+    set_depends_on!(sm, (Qc_scale=labels,))
+    els = fit!(
+        LinearDynamicalSystem(sm, lds.obs_model), y; ux=ux, max_iter=8, progress=false
+    )
+    @test minimum(diff(collect(els))) > -1e-8
+    r = group_parameter(sm, :Qc_scale, 2)
+    @test group_variant(sm, :Qc_scale, 2).Qc[1] ≈ r[1] .* sm.Qc[1]
+    return nothing
+end

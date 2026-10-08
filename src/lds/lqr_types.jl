@@ -127,6 +127,23 @@ carries a per-block count of copies (that is how an SLDS ties `A` and `S` while
 """
 const _LQR_STRUCT_NAMES = (:A, :S, :Qc, :h, :Bu, :Gref, :terminal)
 
+"""
+    _QcScaleTag(id, ref)
+
+Marks a cell model of a `(Qc_scale = labels,)` fit, whose costs are tied to a
+reference cell's by one positive scale per regime: `Qc_k = r_k · Qc_k^{ref}`.
+
+`id` names the tie — every cell built from one declared model carries the same
+`id` — and `ref` says whether this cell is the reference (`r ≡ 1`). It is a value
+rather than a shared array on purpose: the terminal normalizer deep-copies cell
+models one at a time, which keeps a value but splits an alias, and the M-step
+has to recover the same tie from the copies as from the originals.
+"""
+struct _QcScaleTag
+    id::UInt64
+    ref::Bool
+end
+
 #=
 `Gref_cols` makes the flags no longer a plain-data struct, and the default `==`
 on those falls back to `===` — which would call two separately built but
@@ -923,6 +940,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
+    qc_scale::Union{Nothing,_QcScaleTag}
     gref_gate::Matrix{Bool}
     switches::Vector{LQRSwitch{T}}
     causal::CausalOptions
@@ -1034,6 +1052,8 @@ end
 Which pieces of the structural block get one copy per `depends_on` group, in
 `_LQR_BLOCK_*` order. All of them for `(structure = labels,)`, exactly the named ones
 for `(Qc = labels,)`, and none at all when nothing groups the structural block.
+`(Qc_scale = labels,)` gives the cost a copy per group too — the copies are then
+tied by scale in the M-step (see [`_QcScaleTag`](@ref)), not stored differently.
 
 Every piece not named here is a single array shared by every variant, so it is
 estimated jointly from all the trials — shared *and* fitted, which freezing it
@@ -1044,7 +1064,16 @@ function _lqr_struct_varies(sm::LQRStateModel)
     dep === nothing && return ntuple(_ -> false, length(_LQR_STRUCT_NAMES))
     names = keys(dep)
     :structure in names && return ntuple(_ -> true, length(_LQR_STRUCT_NAMES))
-    return ntuple(b -> _LQR_STRUCT_NAMES[b] in names, length(_LQR_STRUCT_NAMES))
+    return ntuple(
+        b -> _LQR_STRUCT_NAMES[b] in names || (b == _LQR_BLOCK_Q && :Qc_scale in names),
+        length(_LQR_STRUCT_NAMES),
+    )
+end
+
+"""Whether `sm`'s declaration ties its per-group costs by scale (`:Qc_scale`)."""
+function _lqr_qc_scaled(sm::LQRStateModel)
+    dep = sm.depends_on
+    return dep !== nothing && :Qc_scale in keys(dep) && !_is_free(sm)
 end
 
 """
@@ -1519,6 +1548,7 @@ function LQRStateModel(
         Qc_prior_value,
         nothing,
         nothing,
+        nothing,
         _normalize_gref_gate(gref_gate, length(Qc_vec), size(Bu_m, 2)),
         LQRSwitch{T}[],
         CausalOptions(),
@@ -1665,6 +1695,7 @@ function free_state_model(
         A `:free` model has no cost, so a cost prior would have nothing to act
         on. It is rejected above rather than silently carried.
         =#
+        nothing,
         nothing,
         nothing,
         nothing,
@@ -1860,6 +1891,7 @@ function hold_state_model(
         Σ_prior,
         fcs,
         Qc_prior_value,
+        nothing,
         nothing,
         nothing,
         Matrix{Bool}(undef, 0, 0),

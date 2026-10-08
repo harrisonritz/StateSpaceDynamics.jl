@@ -237,6 +237,7 @@ function causal_state_model(
         Qc_prior_value,
         nothing,
         nothing,
+        nothing,
         _normalize_gref_gate(gref_gate, length(Qc_vec), size(Bu_m, 2)),
         LQRSwitch{T}[],
         opts,

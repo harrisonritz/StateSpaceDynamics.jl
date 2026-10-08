@@ -116,6 +116,16 @@ That is the model an inverse-LQR fit usually wants of a task variable: one arm,
 an objective per condition. Naming `:structure` gives every piece its own copy,
 which says the plant itself changed with the condition.
 
+`(Qc_scale = reward,)` is narrower than `(Qc = reward,)`: one cost shared by every
+group, times a positive scale per group and regime, `Qc_k = r_k · Qc_k^{ref}`,
+with the first label's group the reference (`r ≡ 1`). A scale changes how hard
+the controller works but not where it is driving to — `r Qc (x − G_r u)` keeps
+its reference — whereas a free per-group cost can also tilt the effective
+reference `Qc⁻¹ Qc_j G_r`. It is identified through the feedback gains, which
+`G_r` does not enter, so it composes with `(Gref = reward,)`; it does not compose
+with a per-group `S`, which absorbs it exactly. `group_parameter(sm, :Qc_scale,
+label)` reads the scales back.
+
 `LQRFitFlags` freezes pieces within the block, and composes with either:
 a frozen piece keeps its starting value in every group. Freezing and sharing are
 different, though — a shared piece is still fitted, from all the trials at once.
@@ -136,12 +146,13 @@ function _param_group(::LQRStateModel, name::Symbol)
     name === :noise && return :Q
     name in (:x0, :P0) && return name
     name in _LQR_STRUCT_NAMES && return :A
+    name === :Qc_scale && return :A
     return nothing
 end
 
 function _valid_param_names(::LQRStateModel)
-    return ":x0, :P0, :structure, :noise, and the individual structural blocks " *
-           ":A, :S, :Qc, :h, :Bu, :Gref, :terminal"
+    return ":x0, :P0, :structure, :noise, the individual structural blocks " *
+           ":A, :S, :Qc, :h, :Bu, :Gref, :terminal, and :Qc_scale"
 end
 
 #=
@@ -150,9 +161,28 @@ are fitted jointly, but jointly is not indivisibly: the M-step packs a separate
 number of copies per block, so "one plant, a cost per group" is a model it
 solves in one pass rather than a split it cannot represent. Every other group on
 this model has a single member, so nothing here can be named in part.
+
+`:Qc_scale` is the one combination refused. It says the cost of each group is
+one shared cost times a positive scale per regime, `Qc_k = r_k · Qc_k^{ref}`,
+which is a narrower claim than `:Qc` (and `:structure`) make about the same
+matrices, so naming both is a contradiction rather than a refinement. With `:S`
+it is unidentifiable: the costate gauge `Qc → cQc, S → S/c` would then act per
+group, and `r` is exactly that `c`.
 =#
 function _require_whole_groups(::LQRStateModel, named, context::AbstractString)
-    return nothing
+    :Qc_scale in named || return nothing
+    clash = [n for n in (:Qc, :structure, :S) if n in named]
+    isempty(clash) && return nothing
+    return throw(
+        ArgumentError(
+            "$context: `:Qc_scale` cannot be combined with " *
+            join((":$n" for n in clash), ", ") *
+            ". `:Qc_scale` ties every group's cost to one shared cost by a scale per " *
+            "regime; `:Qc` and `:structure` give each group a free cost instead, and " *
+            "a per-group `S` would absorb the scale exactly (the costate gauge " *
+            "`Qc → cQc, S → S/c`).",
+        ),
+    )
 end
 
 """
@@ -1050,13 +1080,21 @@ function _build_variants!(
 ) where {T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}}
     ncells = prod(dep.nslots)
     existing = sm.variants
-    if existing !== nothing && length(existing) == ncells
+    scaled = _lqr_qc_scaled(sm)
+    if existing !== nothing &&
+        length(existing) == ncells &&
+        (first(existing).qc_scale !== nothing) == scaled
         return existing
     end
 
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
     B0s = _slot_arrays(sm.B0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
+    #= Under `:Qc_scale` the cells keep a cost copy each, as under `:Qc`, and are
+    tagged with one tie: the structural slot-1 cells, which alias the declared
+    model's own cost, are the reference whose scale is pinned at one. Every cell
+    starts as a copy of that cost, so the tie holds exactly from the start. =#
+    tie_id = UInt64(objectid(sm))
     #= Slot 3 is the structural block and slot 4 the noise. A structural piece
     the declaration did not name takes one slot however many the block has, and
     every variant then reads the same array. =#
@@ -1108,6 +1146,7 @@ function _build_variants!(
             sm.Qc_prior,
             nothing,
             nothing,
+            scaled ? _QcScaleTag(tie_id, s[3] == 1) : nothing,
             #= The gate and the boundaries are structure, not parameters: every
             variant shares the parent's (the entry priors included, which are
             fitted from all of the trials). =#
@@ -1749,6 +1788,36 @@ directly in that case) or when `label` is not one of its groups.
 """
 function group_parameter(model::DependentModel, name::Symbol, label)
     return _group_readout(group_variant(model, name, label), name)
+end
+
+#=
+`:Qc_scale` is not a field: it is read off the group's cost against the declared
+model's own, which is the reference group's (its cost arrays alias the
+reference cell's), so the reference reads back ones.
+=#
+function group_parameter(model::LQRStateModel, name::Symbol, label)
+    name === :Qc_scale || return _group_readout(group_variant(model, name, label), name)
+    dep = model.depends_on
+    _lqr_qc_scaled(model) || throw(
+        ArgumentError(
+            "`:Qc_scale` is only read off a model whose `depends_on` names it; this " *
+            "one declares $(dep === nothing ? "no dependence" : keys(dep))",
+        ),
+    )
+    v = group_variant(model, name, label)
+    return [_qc_scale_of(v.Qc[k], model.Qc[k]) for k in eachindex(model.Qc)]
+end
+
+"""
+    _qc_scale_of(Q, Qref) -> Real
+
+The scale `r` with `Q ≈ r · Qref` in the Frobenius least-squares sense — exact
+for a scale-tied cost. One for a zero reference, whose scale nothing determines.
+"""
+function _qc_scale_of(Q::AbstractMatrix{T}, Qref::AbstractMatrix{T}) where {T<:Real}
+    den = dot(Qref, Qref)
+    den > zero(T) || return one(T)
+    return dot(Q, Qref) / den
 end
 
 """
