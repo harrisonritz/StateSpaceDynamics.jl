@@ -583,6 +583,7 @@ using SSDTest
             test_hold_joint_gradient()
             test_hold_em_recovery()
             test_hold_depends_on()
+            test_hold_qc_scale()
             test_hold_slds()
         end
 
