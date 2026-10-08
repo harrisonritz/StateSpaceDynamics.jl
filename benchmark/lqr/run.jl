@@ -4,7 +4,7 @@ Benchmark / profile driver for the inverse-LQR EM fit.
     julia --project=benchmark/lqr -t 16 benchmark/lqr/run.jl [options]
 
 Options (all optional):
-  --workload=plqr,plqr_joint,slqr   which workloads (default: plqr)
+  --workload=plqr,plqr_joint,plqr_offsets,slqr   workloads (default: plqr)
   --tier=small                      tiny | small | medium | smoulder
   --iters=3                         EM iterations per timed fit (convergence off)
   --reps=1                          timed repetitions (min is reported)

@@ -356,3 +356,90 @@ function test_cost_offset_gaussian_emission()
     @test_throws ArgumentError elbo(grouped, ys; cost_offset=CO_OFFSETS)
     return nothing
 end
+
+"""Variable starts share a backward precision suffix only within one endpoint.
+
+Compare every mean, covariance, lag covariance and entropy to independent
+single-trial smooths, including fresh initial means and a second parameter set.
+The one-workspace path is the full-factorization reference; larger pools take
+the shared suffix path and must keep different endpoints in different buckets.
+"""
+function test_cost_offset_shared_suffix()
+    lengths = [24, 20, 20, 15, 10, 8, 5, 3, 23, 20, 14, 9, 7, 4, 2]
+    offsets = vcat(24 .- lengths[1:8], 23 .- lengths[9:end])
+    for terminal in (false, true), pin in (false, true), width in (1, 2, 4)
+        rng = StableRNG(20261008)
+        sm, lds = _co_model(rng; poisson=false, pin=pin)
+        sm.terminal = terminal
+        sm.B0 = 0.1 .* randn(rng, lds.latent_dim, 2)
+        ux0 = randn(rng, 2, length(lengths))
+        ux = [randn(rng, lds.ux_dim, h) for h in lengths]
+        ys = [randn(rng, lds.obs_dim, h) for h in lengths]
+        data = SSD.Data(lds, ys; ux=ux, ux0=ux0, cost_offset=offsets)
+        SSD._prepare_lqr!(lds, data; offsets_ok=true)
+        pool = SSD._lqr_sws_pool(lds, data)
+        while length(pool) < width
+            push!(pool, deepcopy(first(pool)))
+        end
+        pool = pool[1:width]
+        tfs = SSD.initialize_FilterSmooth(lds, lengths)
+        for repeat in 1:2
+            if repeat == 2
+                sm.A .*= 0.99
+                sm.Qc[1] .*= 1.1
+                sm.Σf .*= 1.2
+                refresh!(sm)
+            end
+            SSD.smooth!(lds, tfs, data, pool)
+            @test tfs[2].p_smooth === tfs[3].p_smooth
+            @test tfs[2].p_smooth !== tfs[10].p_smooth
+            for i in eachindex(ys)
+                model = SSD._trial_model(lds, data, i)
+                ref = SSD.initialize_FilterSmooth(model, [lengths[i]])[1]
+                ws = SSD.SmoothWorkspace(Float64, lds.latent_dim, lds.obs_dim, lengths[i])
+                SSD.smooth!(model, ref, ys[i], ws, ux[i], SSD._trial(data.uy, i))
+                @test tfs[i].x_smooth ≈ ref.x_smooth rtol = 1e-10 atol = 1e-10
+                @test tfs[i].p_smooth ≈ ref.p_smooth rtol = 1e-10 atol = 1e-10
+                @test tfs[i].p_smooth_tt1[:, :, 2:end] ≈ ref.p_smooth_tt1[:, :, 2:end] rtol =
+                    1e-10 atol = 1e-10
+                @test tfs[i].entropy ≈ ref.entropy rtol = 1e-12
+            end
+        end
+    end
+    return nothing
+end
+
+"""The shared-suffix probe's Fisher gradient matches the exact QR normalizer."""
+function test_cost_offset_shared_suffix_gradient()
+    rng = StableRNG(20261009)
+    sm, lds = _co_model(rng; poisson=false)
+    sm.B0 = 0.05 .* randn(rng, lds.latent_dim, 2)
+    lengths = [24, 20, 15, 9, 23, 19, 14, 8]
+    offsets = vcat(24 .- lengths[1:4], 23 .- lengths[5:end])
+    ys = [0.2 .* randn(rng, lds.obs_dim, h) for h in lengths]
+    ux = [randn(rng, lds.ux_dim, h) for h in lengths]
+    data = SSD.Data(lds, ys; ux=ux, ux0=randn(rng, 2, length(lengths)), cost_offset=offsets)
+    SSD._prepare_lqr!(lds, data; offsets_ok=true)
+    tfs = SSD.initialize_FilterSmooth(lds, lengths)
+    pool = SSD._lqr_sws_pool(lds, data)
+    hs = SSD._initialize_td_sufficient_statistics(Float64, lds, lengths)
+    SSD._td_init_const_blocks!(pool[1], lds, data)
+    SSD.estep!(lds, hs, tfs, data, pool)
+    slots = [ones(Int, 1) for _ in 1:4]
+    problem = SSD._lqr_conditional_problem([lds], [hs], slots)
+    theta = copy(problem.theta)
+    analytic = similar(theta)
+    @test isfinite(problem.evaluate!(analytic, theta))
+    fd = similar(theta)
+    for i in eachindex(theta)
+        step = 1e-6 * max(1.0, abs(theta[i]))
+        up, down = copy(theta), copy(theta)
+        up[i] += step
+        down[i] -= step
+        fd[i] =
+            (problem.evaluate!(nothing, up) - problem.evaluate!(nothing, down)) / (2step)
+    end
+    problem.write!(theta)
+    @test maximum(abs, analytic - fd) / max(1.0, maximum(abs, fd)) < 1e-7
+    return nothing
+end

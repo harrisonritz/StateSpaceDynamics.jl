@@ -570,6 +570,8 @@ using SSDTest
             test_cost_offset_ragged_fit()
             test_cost_offset_sampling()
             test_cost_offset_gaussian_emission()
+            test_cost_offset_shared_suffix()
+            test_cost_offset_shared_suffix_gradient()
         end
 
         include("LinearDynamicalSystems/HoldLDS.jl")

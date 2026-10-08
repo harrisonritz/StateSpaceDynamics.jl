@@ -16,6 +16,8 @@ Workloads
                 (the default — the exact `log Z` normalizer and its probe).
 * `:plqr_joint` Same model with `condition_terminal = false`. The difference
                 between the two is the price of terminal conditioning.
+* `:plqr_offsets` Same conditional problem, with variable starts aligned on one
+                schedule endpoint, to exercise the offset probe's smoother.
 * `:slqr`       Two-state switching model (LQR + `:free`), Poisson, `Qc` grouped
                 by reward, `C`/`d` tied, terminal conditioning on.
 
@@ -41,7 +43,7 @@ const TIERS = Dict(
     :smoulder => (n=12, ntrials=1000, tmedian=100, tmin=40, tmax=250, obs_dim=150),
 )
 
-const WORKLOADS = (:plqr, :plqr_joint, :slqr)
+const WORKLOADS = (:plqr, :plqr_joint, :plqr_offsets, :slqr)
 
 """
     ragged_lengths(rng, N; tmedian, tmin, tmax, spread=0.35) -> Vector{Int}
@@ -331,6 +333,13 @@ function build_workload(
         lds, (; ux=ux, progress=false, tol=-1.0)
     end
     fit_kwargs = Base.structdiff(fit_kwargs, NamedTuple{(:tol_kw,)})
+    # Event-aligned variable starts: preserve the same observations and initial
+    # parameters, but place each trial on a common schedule endpoint. This
+    # exercises the offset probe's covariance path independently of the data
+    # generator. The single running cost is unchanged by that alignment.
+    if name === :plqr_offsets
+        fit_kwargs = merge(fit_kwargs, (; cost_offset=tmax .- lengths))
+    end
 
     meta = (;
         n,

@@ -30,6 +30,7 @@ AirspeedVelocity) carries a small slice of the same workload, `LQR-ragged`.
 |---|---|
 | `plqr` | Poisson LQR, `Qc` grouped by reward, terminal factor pinned to its own cost (`terminal_regime = 2`), `condition_terminal = true` |
 | `plqr_joint` | the same with `condition_terminal = false` — the difference is the price of terminal conditioning |
+| `plqr_offsets` | the same conditional model and observations with variable starts on a shared schedule endpoint; exercises covariance reuse for per-trial cost offsets |
 | `slqr` | two-state switching model (LQR + `:free`), Poisson, `Qc` grouped by reward, `C`/`d` tied |
 
 | tier | plant `n` (latent `2n`) | trials | median length (range) | channels |
@@ -127,3 +128,6 @@ terminal normalizer agrees with the per-trial one to 1e-12.
 
 See [`RESULTS.md`](RESULTS.md) for the measurements behind the changes this
 harness was built to find, and what is left.
+
+See [the October 8 regression audit](PERFORMANCE_AUDIT_2026-10-08.md) for the
+PR comparisons and the shared backward-factorization repair for variable starts.

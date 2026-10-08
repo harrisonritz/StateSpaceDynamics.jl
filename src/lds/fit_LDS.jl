@@ -478,6 +478,12 @@ Each bucket does a whole covariance pass on one workspace, with the bucket's
 offset applied to the model, then the per-trial mean solves against it. Buckets
 run in parallel, largest first, one workspace each; a dataset whose trials all
 fall in a few buckets therefore parallelizes less than the equal-length path does.
+
+For ordinary LQR trials with many starts but few endpoints, the backward Schur
+complements after the first block are shared within each endpoint. In that case
+one backward sweep per endpoint replaces the full factorization per bucket;
+each bucket adds its initial-prior block and a forward covariance recursion.
+Schedule boundaries and time-to-go dynamics keep their independent bucket path.
 """
 function _smooth_offset_buckets!(
     lds::LinearDynamicalSystem{T,S,O},
@@ -488,6 +494,25 @@ function _smooth_offset_buckets!(
     by_bucket = Dict{Tuple{Int,Int},Vector{Int}}()
     for (trial, tsteps) in enumerate(data.tsteps)
         push!(get!(by_bucket, (tsteps, _trial_cost_offset(data, trial)), Int[]), trial)
+    end
+    # Variable starts at a common endpoint share a suffix of their precision.
+    # The ordinary forward prefix cannot be reused here, but a backward sweep
+    # can: only the first block changes with the initial-state prior.
+    if length(sws_pool) >= 2 &&
+        minimum(data.tsteps) >= 2 &&
+        !_has_switches(lds) &&
+        !_time_to_go_dynamics(lds)
+        by_end = Dict{Int,Vector{Pair{Tuple{Int,Int},Vector{Int}}}}()
+        for bucket in by_bucket
+            h, off = bucket.first
+            push!(get!(by_end, h + off, Pair{Tuple{Int,Int},Vector{Int}}[]), bucket)
+        end
+        if length(by_bucket) >= 2length(by_end)
+            for endpoint in sort!(collect(keys(by_end)))
+                _smooth_shared_suffix!(lds, tfs, data, sws_pool, by_end[endpoint])
+            end
+            return tfs
+        end
     end
     buckets = sort!(collect(by_bucket); by=b -> (-b.first[1], b.first[2]))
     ntasks = min(length(buckets), length(sws_pool))
@@ -504,6 +529,148 @@ function _smooth_offset_buckets!(
             put!(free, ws)
         end
         return nothing
+    end
+    return tfs
+end
+
+# The reverse counterpart of `_prefix_forward!`. At a common schedule endpoint
+# every block after the first is independent of the trial's start. `D[i]` now
+# holds K_i^-1 A_{i-1}, where K_i is the backward Schur complement, and the
+# workspace's covariance buffer temporarily holds K_i^-1.
+function _suffix_backward!(
+    src::SmoothWorkspace{T}, lds::LinearDynamicalSystem, h::Int
+) where {T<:Real}
+    compute_smooth_constants!(src, lds)
+    _fill_hessian_blocks!(src, lds.state_model, h)
+    btd = src.btd
+    _negate_blocks!(btd, h)
+    invs = src.agg.p_smooth_shared::Array{T,3}
+    logs = zeros(T, h + 1)
+    for i in h:-1:2
+        Mi = btd.chol_factors[i]
+        copyto!(Mi, btd.neg_diag[i])
+        i == h || mul!(Mi, btd.neg_super[i], btd.D[i + 1], -one(T), one(T))
+        F = cholesky!(Symmetric(Mi, :U))
+        acc = logs[i + 1]
+        for j in 1:(btd.block_size)
+            acc += 2log(Mi[j, j])
+        end
+        logs[i] = acc
+        ldiv!(btd.D[i], F, btd.neg_sub[i - 1])
+        Ki_inv = tview(invs, :, :, i)
+        copyto!(Ki_inv, btd.Ibs)
+        ldiv!(F, Ki_inv)
+    end
+    return logs
+end
+
+function _bucket_from_suffix!(
+    ws::SmoothWorkspace{T},
+    src::SmoothWorkspace{T},
+    lds::LinearDynamicalSystem,
+    h::Int,
+    shift::Int,
+    logs::AbstractVector{T},
+) where {T<:Real}
+    _mirror_smooth_constants!(ws, src, lds)
+    _fill_hessian_blocks!(ws, lds.state_model, h)
+    btd = ws.btd
+    _negate_blocks!(btd, h)
+    for i in 2:h
+        copyto!(btd.chol_factors[i], src.btd.chol_factors[shift + i])
+        copyto!(btd.D[i], src.btd.D[shift + i])
+    end
+    M1 = btd.chol_factors[1]
+    copyto!(M1, btd.neg_diag[1])
+    h == 1 || mul!(M1, btd.neg_super[1], btd.D[2], -one(T), one(T))
+    F = cholesky!(Symmetric(M1, :U))
+    logdet_precision = logs[shift + 2]
+    for j in 1:(btd.block_size)
+        logdet_precision += 2log(M1[j, j])
+    end
+    P = ws.agg.p_smooth_shared::Array{T,3}
+    Q = ws.agg.p_smooth_tt1_shared::Array{T,3}
+    copyto!(tview(P, :, :, 1), btd.Ibs)
+    ldiv!(F, tview(P, :, :, 1))
+    fill!(tview(Q, :, :, 1), zero(T))
+    for i in 2:h
+        Pi, Qi = tview(P, :, :, i), tview(Q, :, :, i)
+        mul!(Qi, btd.D[i], tview(P, :, :, i - 1), -one(T), zero(T))
+        copyto!(Pi, tview(src.agg.p_smooth_shared, :, :, shift + i))
+        mul!(Pi, Qi, transpose(btd.D[i]), -one(T), one(T))
+    end
+    for i in 1:h
+        Symmetrize!(tview(P, :, :, i))
+    end
+    return gaussian_entropy_from_logdet(logdet_precision, lds.latent_dim * h)
+end
+
+# Solve against a backward factorization, using the same storage as the ordinary
+# forward solve. The first pass goes from the end to the start; substitution
+# then goes forward. No factorization is repeated for a design's mean.
+function _backsubst_suffix!(x, b, btd, h::Int)
+    d = btd.block_size
+    for i in h:-1:1
+        xi = view(x, ((i - 1) * d + 1):(i * d))
+        copyto!(xi, view(b, ((i - 1) * d + 1):(i * d)))
+        if i < h
+            mul!(
+                xi,
+                btd.neg_super[i],
+                view(x, (i * d + 1):((i + 1) * d)),
+                -one(eltype(x)),
+                one(eltype(x)),
+            )
+        end
+        F = LinearAlgebra.Cholesky(btd.chol_factors[i], 'U', 0)
+        ldiv!(F, xi)
+    end
+    for i in 2:h
+        mul!(
+            view(x, ((i - 1) * d + 1):(i * d)),
+            btd.D[i],
+            view(x, ((i - 2) * d + 1):((i - 1) * d)),
+            -one(eltype(x)),
+            one(eltype(x)),
+        )
+    end
+    return x
+end
+
+function _smooth_shared_suffix!(lds, tfs, data, pool, buckets)
+    sort!(buckets; by=b -> -b.first[1])
+    hmax, offmin = first(buckets).first
+    src = pool[1]
+    logs = _suffix_backward!(src, _with_cost_offset(lds, offmin), hmax)
+    workers = pool[2:end]
+    ntasks = min(length(buckets), length(workers))
+    free = Channel{eltype(pool)}(ntasks)
+    foreach(i -> put!(free, workers[i]), 1:ntasks)
+    tforeach(buckets; scheduler=:greedy, ntasks=ntasks) do bucket
+        (h, off), trials = bucket
+        ws = take!(free)
+        try
+            model = _with_cost_offset(lds, off)
+            entropy = _bucket_from_suffix!(ws, src, model, h, off - offmin, logs)
+            p, q = _bucket_cov_storage(tfs[first(trials)], ws, pool, h)
+            for trial in trials
+                tfs[trial].p_smooth = p
+                tfs[trial].p_smooth_tt1 = q
+                tfs[trial].entropy = entropy
+                _smooth_mean_only!(
+                    _trial_model(lds, data, trial),
+                    tfs[trial],
+                    _trial(data.y, trial),
+                    ws,
+                    data.ux[trial],
+                    _trial(data.uy, trial),
+                    ws;
+                    reverse=true,
+                )
+            end
+        finally
+            put!(free, ws)
+        end
     end
     return tfs
 end
@@ -866,7 +1033,8 @@ function _smooth_mean_only!(
     sws::SmoothWorkspace{T},
     ux::AbstractMatrix{T},
     uy::Union{AbstractMatrix{T},NamedTuple},
-    source_sws::SmoothWorkspace{T},
+    source_sws::SmoothWorkspace{T};
+    reverse::Bool=false,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
@@ -894,7 +1062,11 @@ function _smooth_mean_only!(
     end
 
     fs.x_smooth .= x_mat
-    block_tridiagonal_backsubst!(X0, neg_sub_v, grad_vec, shared_btd, tsteps)
+    if reverse
+        _backsubst_suffix!(X0, grad_vec, shared_btd, tsteps)
+    else
+        block_tridiagonal_backsubst!(X0, neg_sub_v, grad_vec, shared_btd, tsteps)
+    end
     step_mat = reshape(X0, D, tsteps)
     fs.x_smooth .-= step_mat
 
