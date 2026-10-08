@@ -1797,10 +1797,11 @@ reference cell's), so the reference reads back ones.
 =#
 function group_parameter(model::LQRStateModel, name::Symbol, label)
     name === :Qc_scale || return _group_readout(group_variant(model, name, label), name)
+    dep = model.depends_on
     _lqr_qc_scaled(model) || throw(
         ArgumentError(
             "`:Qc_scale` is only read off a model whose `depends_on` names it; this " *
-            "one declares $(model.depends_on === nothing ? "no dependence" : keys(model.depends_on))",
+            "one declares $(dep === nothing ? "no dependence" : keys(dep))",
         ),
     )
     v = group_variant(model, name, label)

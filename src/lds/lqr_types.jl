@@ -1072,7 +1072,8 @@ end
 
 """Whether `sm`'s declaration ties its per-group costs by scale (`:Qc_scale`)."""
 function _lqr_qc_scaled(sm::LQRStateModel)
-    return sm.depends_on !== nothing && :Qc_scale in keys(sm.depends_on) && !_is_free(sm)
+    dep = sm.depends_on
+    return dep !== nothing && :Qc_scale in keys(dep) && !_is_free(sm)
 end
 
 """
