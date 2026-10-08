@@ -613,8 +613,13 @@ function _causal_inv_step!(
         W[i, i] = one(T)
     end
     if T <: LinearAlgebra.BlasFloat
-        # Pivoted LU into the preallocated pivots: no allocation per step.
-        _, ipiv, info = LAPACK.getrf!(M, buf.ipiv; check=false)
+        # Pivoted LU into the preallocated pivots: no allocation per step. The
+        # method taking `ipiv` arrived in Julia 1.11; before it, LAPACK allocates.
+        _, ipiv, info = @static if VERSION >= v"1.11"
+            LAPACK.getrf!(M, buf.ipiv; check=false)
+        else
+            LAPACK.getrf!(M; check=false)
+        end
         info == 0 || return false
         LAPACK.getrs!('N', M, ipiv, W)
     else

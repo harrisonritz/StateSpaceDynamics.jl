@@ -370,6 +370,13 @@ mutable struct LQRSwitch{T<:Real}
     pos::Int
     bridge::Int
     entry::Union{Nothing,EntryPrior{T}}
+    #= Inner, so there is no outer `LQRSwitch(pos, bridge, entry)`: with
+    `entry = nothing` it could not determine `T` (Aqua's unbound parameter). =#
+    function LQRSwitch{T}(
+        pos::Integer, bridge::Integer, entry::Union{Nothing,EntryPrior{T}}
+    ) where {T<:Real}
+        return new{T}(pos, bridge, entry)
+    end
 end
 
 """
