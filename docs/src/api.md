@@ -148,6 +148,7 @@ set_boundaries!
 set_schedule_boundaries!
 set_gref_gate!
 LQRSwitch
+StateSpaceDynamics.EntryPrior
 ```
 
 ```@docs

@@ -878,6 +878,14 @@ function _LQRPack(sm::LQRStateModel)
     return _LQRPack(sm, sm.fit_flags, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
 
+"""Whether any of `sms` is a `:causal` model planning against a terminal cost."""
+function _any_causal_terminal_cost(sms)::Bool
+    for sm in sms
+        _is_causal(sm) && sm.causal.terminal_cost && return true
+    end
+    return false
+end
+
 function _LQRPack(sm::LQRStateModel, f::LQRFitFlags)
     return _LQRPack(sm, f, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
@@ -1257,7 +1265,7 @@ function _LQRMStepCtx(
     causal_c = Bool[_is_causal(sm) for sm in sms]
     #= A causal model with a terminal cost reads `h_f` in its sweep's start, so
     the offset is packed for it too, although it carries no terminal factor. =#
-    pack_terminal = terminal || any(sm -> _is_causal(sm) && sm.causal.terminal_cost, sms)
+    pack_terminal = terminal || _any_causal_terminal_cost(sms)
     if any(causal_c)
         all(causal_c) || throw(
             ArgumentError(
@@ -2495,7 +2503,10 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
                 continue
             end
             pr = sm.Σ_prior
-            if sm.fixed_costate_sigma !== nothing
+            fixed_costate = sm.fixed_costate_sigma
+            # `isa`, not `!== nothing`: the field's type is a UnionAll, which only
+            # an `isa` test narrows for inference (and JET).
+            if fixed_costate isa Real
                 n = _plant_dim(sm)
                 if ctx.N_q[s] > zero(T)
                     @views sm.Σ[1:n, 1:n] .= ctx.R[s][1:n, 1:n] ./ ctx.N_q[s]
@@ -2503,9 +2514,11 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
                 @views Symmetrize!(view(sm.Σ, 1:n, 1:n))
                 @views sm.Σ[1:n, (n + 1):(2n)] .= zero(T)
                 @views sm.Σ[(n + 1):(2n), 1:n] .= zero(T)
-                @views sm.Σ[(n + 1):(2n), (n + 1):(2n)] .= Matrix{T}(
-                    sm.fixed_costate_sigma * I, n, n
-                )
+                costate_block = view(sm.Σ, (n + 1):(2n), (n + 1):(2n))
+                fill!(costate_block, zero(T))
+                for i in 1:n
+                    costate_block[i, i] = fixed_costate
+                end
             elseif pr === nothing
                 if ctx.N_q[s] > zero(T)
                     copyto!(sm.Σ, ctx.R[s])

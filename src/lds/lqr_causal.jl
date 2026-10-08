@@ -564,7 +564,10 @@ function _causal_sweep!(
     if sm.causal.terminal_cost
         copyto!(P[tsteps], Qc[kT])
         @views G[tsteps][:, 1] .= hf
-        m > 0 && @views mul!(G[tsteps][:, 2:end], Qc[kT], buf.Gk[kT], -one(T), zero(T))
+        # Bound first: `@views` on a chained index with `end` does not lower
+        # before Julia 1.11.
+        GT = G[tsteps]
+        m > 0 && @views mul!(GT[:, 2:end], Qc[kT], buf.Gk[kT], -one(T), zero(T))
     else
         fill!(P[tsteps], zero(T))
         fill!(G[tsteps], zero(T))
@@ -585,8 +588,9 @@ function _causal_sweep!(
         mul!(G[s], transpose(A), V)
         @views G[s][:, 1] .+= h[lr]
         if m > 0
-            @views G[s][:, 2:end] .+= Bu[lr, :]
-            @views mul!(G[s][:, 2:end], Qc[k], buf.Gk[k], -one(T), one(T))
+            Gs = G[s]
+            @views Gs[:, 2:end] .+= Bu[lr, :]
+            @views mul!(Gs[:, 2:end], Qc[k], buf.Gk[k], -one(T), one(T))
         end
         all(isfinite, G[s]) || return false
         _causal_inv_step!(W[s], S, P[s], buf) || return false

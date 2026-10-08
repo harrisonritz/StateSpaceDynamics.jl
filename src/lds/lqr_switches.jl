@@ -967,7 +967,7 @@ function _lqr_entry_prior_stats(
 end
 
 """Every entry switch's prior statistics, pooled over the cells `sms`/`sufs`."""
-function _lqr_pooled_entry_stats(sms, sufs, e::Int)
+function _lqr_pooled_entry_stats(sms::AbstractVector, sufs::AbstractVector, e::Int)
     return _pooled_entry_stats([
         _lqr_entry_prior_stats(sm, hs, e) for (sm, hs) in zip(sms, sufs)
     ])
@@ -1063,7 +1063,9 @@ of `G` (the data's entry statistics less the goal-conditioned prior's, which the
 terminal probe supplies), halved until `G` rises by an Armijo fraction and `P`
 stays positive definite. Returns whether the priors moved.
 """
-function _lqr_conditional_entry_update!(ldss, sufs; max_halvings::Int=12)
+function _lqr_conditional_entry_update!(
+    ldss::AbstractVector, sufs::AbstractVector; max_halvings::Int=12
+)
     sms = [lds.state_model for lds in ldss]
     sm1 = first(sms)
     T = eltype(first(sufs).nk)
