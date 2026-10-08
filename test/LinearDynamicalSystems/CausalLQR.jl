@@ -596,6 +596,44 @@ function test_causal_depends_on()
     return nothing
 end
 
+"""
+`(Qc_scale = labels,)` on the causal controller: the tied objective and its
+gradient, and the direction of a per-group cost scale recovered from data whose
+second group plans against a scaled copy of the first group's costs.
+"""
+function test_causal_qc_scale()
+    labels = repeat([1, 2, 3]; inner=4)
+    for cfg in ((;), (; nreg=3, m=2, prior=true)), profile in (true, false)
+        sm, lds = causal_fixture(StableRNG(40); cfg...)
+        m = size(sm.Bu, 2)
+        ux = m > 0 ? causal_inputs(StableRNG(5), m, fill(12, 12)) : nothing
+        _, y = rand(StableRNG(6), lds, fill(12, 12); ux=ux)
+        check_qc_scale_objective(sm, lds.obs_model, y, ux, labels; profile=profile)
+    end
+
+    # Reaches a slow EM's way towards (2.5, 0.5); 400 iterations get (2.73, 0.56).
+    ntr = 100
+    _, lds1 = causal_fixture(StableRNG(80); nreg=2, affine=false, tmax=20)
+    lds2 = deepcopy(lds1)
+    lds2.state_model.Qc[1] .*= 2.5
+    lds2.state_model.Qc[2] .*= 0.5
+    refresh!(lds2.state_model)
+    _, y1 = rand(StableRNG(81), lds1, fill(20, ntr))
+    _, y2 = rand(StableRNG(82), lds2, fill(20, ntr))
+    fitm = deepcopy(lds1)
+    set_depends_on!(fitm.state_model, (Qc_scale=vcat(fill(1, ntr), fill(2, ntr)),))
+    els = fit!(
+        LinearDynamicalSystem(fitm.state_model, fitm.obs_model),
+        vcat(y1, y2);
+        max_iter=40,
+        progress=false,
+    )
+    @test minimum(diff(collect(els))) > -1e-7
+    r = group_parameter(fitm.state_model, :Qc_scale, 2)
+    @test r[1] > 1.4 && r[2] < 0.9
+    return nothing
+end
+
 function test_causal_invariances()
     rng = StableRNG(70)
     sm, lds = causal_fixture(rng; m=1)

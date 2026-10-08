@@ -2268,6 +2268,132 @@ function test_lqr_depends_on()
     return nothing
 end
 
+"""
+One cell's E-step statistics, in the coordinates the structural M-step reads.
+"""
+function lqr_cell_stats(v, obs, ys, ux)
+    lds = LinearDynamicalSystem(v, obs)
+    data = SSD.Data(lds, ys; ux=ux)
+    SSD._prepare_lqr!(lds, data)
+    tfs = SSD.initialize_FilterSmooth(lds, data.tsteps)
+    pool = SSD._lqr_sws_pool(lds, data)
+    hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+    SSD._td_init_const_blocks!(pool[1], lds, data)
+    SSD.estep!(lds, hs, tfs, data, pool)
+    SSD._fill_mixed_blocks!(hs, v)
+    return hs
+end
+
+"""
+The `(Qc_scale = labels,)` structural objective on `sm`'s cells: it equals the
+untied objective at the same costs, packs fewer parameters, and its gradient —
+through the per-regime `log r` and back into the reference's factor — matches
+central differences. The cells are given distinct scales first, so the tie is
+not checked only at `r = 1`.
+"""
+function check_qc_scale_objective(sm, obs, ys, ux, labels; profile::Bool=true)
+    set_depends_on!(sm, (Qc_scale=labels,))
+    LinearDynamicalSystem(sm, obs)
+    groups = unique(labels)
+    vs = [group_variant(sm, :Qc_scale, l) for l in groups]
+    for (j, v) in enumerate(vs), k in eachindex(v.Qc)
+        j == 1 || (v.Qc[k] .= (1 + 0.3 * (j - 1) + 0.1k) .* sm.Qc[k])
+    end
+    foreach(refresh!, vs)
+    sufs = [
+        lqr_cell_stats(
+            v, obs, ys[labels .== l], ux === nothing ? nothing : ux[labels .== l]
+        ) for (v, l) in zip(vs, groups)
+    ]
+    slots = SSD._lqr_cell_slots(vs, collect(eachindex(vs)))
+    qs = ones(Int, length(vs))
+    ctx = SSD._LQRMStepCtx(sufs, vs, slots, qs, profile)
+    @test ctx.pack.qscale == [0; fill(1, length(vs) - 1)]
+    θ = zeros(ctx.pack.np)
+    SSD._lqr_pack!(θ, ctx)
+    @test θ[SSD._lqr_blk_q(ctx.pack, 2, 1)] ≈ [log(1.4)]
+
+    tags = [v.qc_scale for v in vs]
+    foreach(v -> (v.qc_scale = nothing), vs)
+    untied = SSD._LQRMStepCtx(sufs, vs, slots, qs, profile)
+    foreach(((v, t),) -> (v.qc_scale = t), zip(vs, tags))
+    θu = zeros(untied.pack.np)
+    SSD._lqr_pack!(θu, untied)
+    @test SSD._lqr_fg!(nothing, θ, ctx) ≈ SSD._lqr_fg!(nothing, θu, untied) rtol = 1e-10
+    @test ctx.pack.np < untied.pack.np
+
+    np = ctx.pack.np
+    θ .+= 0.01 .* randn(StableRNG(41), np)
+    g = similar(θ)
+    @test isfinite(SSD._lqr_fg!(g, θ, ctx))
+    h = 1e-6
+    gd = map(1:np) do i
+        e = zeros(np)
+        e[i] = h
+        return (SSD._lqr_fg!(nothing, θ .+ e, ctx) - SSD._lqr_fg!(nothing, θ .- e, ctx)) / 2h
+    end
+    @test norm(g - gd) / norm(gd) < 1e-6
+    return nothing
+end
+
+"""
+`(Qc_scale = labels,)`: one cost shared by every group up to a positive scale
+per group and regime, the first group the reference.
+"""
+function test_lqr_qc_scale()
+    tsteps, ntrials = 14, 12
+    labels = repeat([1, 2, 3]; inner=4)
+    sm, lds = lqr_fixture(StableRNG(74); nregimes=2, terminal=true, tsteps=tsteps)
+    ys = [randn(StableRNG(i), lds.obs_dim, tsteps) .* 0.4 for i in 1:ntrials]
+    set_depends_on!(sm, (Qc_scale=labels,))
+    lds2 = LinearDynamicalSystem(sm, lds.obs_model)
+    els = fit!(lds2, ys; max_iter=10, progress=false)
+    @test minimum(diff(els)) > -1e-8
+    @test group_parameter(sm, :Qc_scale, 1) == [1.0, 1.0]
+    scales = [group_parameter(sm, :Qc_scale, l) for l in 2:3]
+    @test all(r -> all(>(0), r) && !(r ≈ [1.0, 1.0]), scales)
+    for (l, r) in zip(2:3, scales), k in 1:2
+        @test group_variant(sm, :Qc_scale, l).Qc[k] ≈ r[k] .* sm.Qc[k] rtol = 1e-12
+    end
+    v1, v2 = group_variant(sm, :Qc_scale, 1), group_variant(sm, :Qc_scale, 2)
+    @test v1.Qc[1] === sm.Qc[1]                    # the reference is the declared cost
+    @test v1.A === v2.A && v1.S === v2.S && v1.Gref === v2.Gref
+    @test_throws ArgumentError group_parameter(lqr_fixture(StableRNG(1))[1], :Qc_scale, 1)
+
+    # One group reproduces the ungrouped fit exactly.
+    smA, ldsA = lqr_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    set_depends_on!(smA, (Qc_scale=fill(1, ntrials),))
+    elsA = fit!(LinearDynamicalSystem(smA, ldsA.obs_model), ys; max_iter=8, progress=false)
+    _, ldsB = lqr_fixture(StableRNG(76); nregimes=1, tsteps=tsteps)
+    @test maximum(abs, elsA .- fit!(ldsB, ys; max_iter=8, progress=false)) < 1e-8
+
+    # A free per-group cost, or a per-group `S` (which absorbs the scale), is refused.
+    for bad in (
+        (Qc_scale=labels, Qc=labels),
+        (Qc_scale=labels, S=labels),
+        (Qc_scale=labels, structure=labels),
+    )
+        smE, ldsE = lqr_fixture(StableRNG(73); nregimes=1, tsteps=tsteps)
+        set_depends_on!(smE, bad)
+        @test_throws ArgumentError LinearDynamicalSystem(smE, ldsE.obs_model)
+    end
+
+    # The objective and gradient, with a terminal factor, a reference and a cost prior.
+    smG, ldsG = lqr_fixture(
+        StableRNG(31); terminal=true, nregimes=3, tsteps=15, onset=9, ux_dim=2
+    )
+    smG.Gref .= 0.3 .* randn(StableRNG(3), size(smG.Gref)...)
+    smG.Qc_prior = IWPrior(Matrix(0.4I, 2, 2), 9.0)
+    yG = [randn(StableRNG(i), ldsG.obs_dim, 15) .* 0.4 for i in 1:ntrials]
+    uG = [randn(StableRNG(100 + i), 2, 15) for i in 1:ntrials]
+    for profile in (true, false)
+        check_qc_scale_objective(
+            deepcopy(smG), deepcopy(ldsG.obs_model), yG, uG, labels; profile=profile
+        )
+    end
+    return nothing
+end
+
 function test_lqr_show()
     rng = StableRNG(47)
     sm, lds = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=12)

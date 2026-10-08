@@ -1341,6 +1341,36 @@ function test_slds_lqr_zero_count_noise_version()
 end
 
 """
+`(Qc_scale = labels,)` in a switching model: each discrete state's cost is tied
+to its own reference group, and tying `:Qc` across states shares the scales too.
+"""
+function test_slds_lqr_qc_scale()
+    Qcs = [[0.25 0.04; 0.04 0.18], [0.8 0.0; 0.0 0.6]]
+    tsteps = 16
+    labels = repeat([:lo, :mid, :hi]; inner=4)
+    ys = [randn(StableRNG(i), 4, tsteps) .* 0.5 for i in 1:12]
+    for terminal in (false, true), tied in (Symbol[], [:A, :S], [:A, :S, :Qc])
+        slds = hslds_model(Qcs; p=4, terminal=terminal)
+        for lds in slds.LDSs
+            lds.state_model.depends_on = (Qc_scale=labels,)
+        end
+        els = fit!(slds, ys; max_iter=6, progress=false, rng=StableRNG(3), tied_params=tied)
+        @test all(isfinite, els)
+        @test minimum(diff(collect(els))) > -1e-6
+        scales = map(slds.LDSs) do lds
+            sm = lds.state_model
+            for l in (:mid, :hi), k in eachindex(sm.Qc)
+                r = group_parameter(sm, :Qc_scale, l)
+                @test group_variant(sm, :Qc_scale, l).Qc[k] ≈ r[k] .* sm.Qc[k]
+            end
+            return group_parameter(sm, :Qc_scale, :hi)
+        end
+        @test (scales[1] ≈ scales[2]) == (:Qc in tied)
+    end
+    return nothing
+end
+
+"""
     test_slds_lqr_grouped()
 
 Switching inverse LQR whose *emission* is grouped: the stitched fit, where one

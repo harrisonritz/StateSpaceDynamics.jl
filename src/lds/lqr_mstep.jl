@@ -838,6 +838,7 @@ struct _LQRPack
     brows::Vector{Int}     # mixed-coordinate rows of `Bu` that are packed
     Kq::Vector{Int}        # regimes per `Qc` copy
     qoff::Vector{Int}      # 0-based offset of each `Qc` copy within its block
+    qscale::Vector{Int}    # per `Qc` copy: its reference copy if scale-tied, else 0
 end
 
 # Block ordinals, in layout order.
@@ -865,11 +866,12 @@ end
 """
     _lqr_blk_q(p, v, k) -> UnitRange
 
-Slots holding regime `k` of copy `v` of the cost block.
+Slots holding regime `k` of copy `v` of the cost block: its Cholesky factor, or
+for a scale-tied copy the single slot holding `log r_k`.
 """
 @inline function _lqr_blk_q(p::_LQRPack, v::Int, k::Int)
     (p.w[_LQR_BLOCK_Q] == 0 || k > p.Kq[v]) && return 1:0
-    nc = p.n * (p.n + 1) ÷ 2
+    nc = p.qscale[v] == 0 ? p.n * (p.n + 1) ÷ 2 : 1
     off = p.base[_LQR_BLOCK_Q] + p.qoff[v] + (k - 1) * nc
     return (off + 1):(off + nc)
 end
@@ -903,12 +905,16 @@ function _LQRPack(
     nv::NTuple{7,Int},
     Kq::AbstractVector{Int}=fill(_nregimes(sm), nv[_LQR_BLOCK_Q]),
     terminal::Bool=sm.terminal,
+    qscale::AbstractVector{Int}=zeros(Int, nv[_LQR_BLOCK_Q]),
 )
     n = _plant_dim(sm)
     d = 2n
     m = size(sm.Bu, 2)
     length(Kq) == nv[_LQR_BLOCK_Q] ||
         throw(DimensionMismatchError("regimes per Qc copy", nv[_LQR_BLOCK_Q], length(Kq)))
+    length(qscale) == nv[_LQR_BLOCK_Q] || throw(
+        DimensionMismatchError("scale ties per Qc copy", nv[_LQR_BLOCK_Q], length(qscale)),
+    )
     K = maximum(Kq; init=_nregimes(sm))
     #= `Gref` is the one block that can be free in part: `Gref_cols` names the
     input columns the reference is a function of, and the rest are packed no
@@ -930,7 +936,8 @@ function _LQRPack(
     acc = 0
     for v in eachindex(Kq)
         qoff[v] = acc
-        acc += f.Qc ? Kq[v] * nc : 0
+        #= A scale-tied copy packs one `log r` per regime, not a factor. =#
+        acc += f.Qc ? Kq[v] * (qscale[v] == 0 ? nc : 1) : 0
     end
     bases = zeros(Int, _LQR_BLOCK_N)
     pos = 0
@@ -952,6 +959,7 @@ function _LQRPack(
         brows,
         collect(Int, Kq),
         qoff,
+        collect(Int, qscale),
     )
 end
 
@@ -1226,6 +1234,43 @@ function _lqr_cell_slots(sms::AbstractVector, cell_slots::AbstractVector{Int})
 end
 
 """
+    _lqr_qc_ties(sms, owners) -> Vector{Int}
+
+For each cost copy, the copy it is scale-tied to under `(Qc_scale = labels,)`,
+or `0` for a copy packed in full — an untied cost, or the reference of a tie.
+
+The tie is read off the cells' [`_QcScaleTag`](@ref)s rather than off array
+identity, so a set of deep copies (the terminal normalizer's probes) resolves to
+the same layout as the cells they were copied from. A copy shared across
+discrete states (`tied_params = [:Qc]`) is owned by cells of several ties; it
+follows its first owner's, whose reference is then shared the same way.
+"""
+function _lqr_qc_ties(sms::AbstractVector, owners)
+    oq = owners[_LQR_BLOCK_Q]
+    ties = zeros(Int, length(oq))
+    for v in eachindex(oq)
+        tag = sms[first(oq[v])].qc_scale
+        (tag === nothing || tag.ref) && continue
+        b = findfirst(
+            w -> any(c -> sms[c].qc_scale == _QcScaleTag(tag.id, true), oq[w]),
+            eachindex(oq),
+        )
+        b === nothing && throw(
+            ArgumentError(
+                "a `Qc_scale` cell's reference cell is missing from this M-step; " *
+                "the reference group (the first label) must have trials",
+            ),
+        )
+        b == v || (ties[v] = b)
+    end
+    for v in eachindex(ties)
+        (ties[v] == 0 || ties[ties[v]] == 0) ||
+            throw(ArgumentError("`Qc_scale` reference copies must not be scale-tied"))
+    end
+    return ties
+end
+
+"""
     _LQRMStepCtx(sufs, sms, slots, q_slots, profile; flags)
 
 `slots[b][c]` is the copy of block `b` that cell `c` uses. Equal across blocks is
@@ -1314,7 +1359,12 @@ function _LQRMStepCtx(
     Kq = [
         maximum(c -> _nregimes(sms[c]), owners[_LQR_BLOCK_Q][v]) for v in 1:nv[_LQR_BLOCK_Q]
     ]
-    pack = _LQRPack(sm1, f, nv, Kq, pack_terminal)
+    qscale = if probe.w[_LQR_BLOCK_Q] == 0
+        zeros(Int, nv[_LQR_BLOCK_Q])
+    else
+        _lqr_qc_ties(sms, owners)
+    end
+    pack = _LQRPack(sm1, f, nv, Kq, pack_terminal, qscale)
     n, d, m = pack.n, pack.d, pack.m
     reg = d + 1 + m
     nq = maximum(q_slots)
@@ -1537,7 +1587,17 @@ function _lqr_pack!(θ::AbstractVector{T}, ctx::_LQRMStepCtx{T}) where {T<:Real}
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
         r = _lqr_blk_q(p, v, k)
-        _lqr_pack_psd!(θ, r, ctx.sms[_qc_owner(ctx, v, k)].Qc[k], "Qc[$k]")
+        b = p.qscale[v]
+        if b == 0
+            _lqr_pack_psd!(θ, r, ctx.sms[_qc_owner(ctx, v, k)].Qc[k], "Qc[$k]")
+        elseif !isempty(r)
+            #= The cells are built as copies of the reference, so this is the exact
+            ratio; a cost written by hand since is projected onto the tie. =#
+            sc = _qc_scale_of(
+                ctx.sms[_qc_owner(ctx, v, k)].Qc[k], ctx.sms[_qc_owner(ctx, b, k)].Qc[k]
+            )
+            θ[first(r)] = sc > zero(T) ? log(sc) : zero(T)
+        end
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
         r = _lqr_blk(p, _LQR_BLOCK_H, v)
@@ -1682,6 +1742,7 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
         end
     end
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
+        p.qscale[v] == 0 || continue
         r = _lqr_blk_q(p, v, k)
         if isempty(r)
             copyto!(ctx.Qc[v][k], ctx.sms[_qc_owner(ctx, v, k)].Qc[k])
@@ -1689,6 +1750,13 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
             factor = view(ctx.tmp_dd, 1:n, 1:n)
             _lqr_unpack_psd!(ctx.Qc[v][k], factor, θ, r)
         end
+    end
+    # Scale-tied copies after their references: `Qc_k = exp(ρ_k) Qc_k^{ref}`.
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
+        b = p.qscale[v]
+        b == 0 && continue
+        r = _lqr_blk_q(p, v, k)
+        ctx.Qc[v][k] .= exp(θ[first(r)]) .* ctx.Qc[b][k]
     end
     for v in 1:(p.nv[_LQR_BLOCK_H])
         r = _lqr_blk(p, _LQR_BLOCK_H, v)
@@ -2338,7 +2406,21 @@ function _lqr_fg!(
             _iw_penalty_grad!(ctx.dQ[v][k], ctx.Qc[v][k], pr)
         end
     end
+    #=
+    A scale-tied copy is `exp(ρ) Qc^{ref}`: its gradient gives `∂/∂ρ = exp(ρ)⟨dQ,
+    Qc^{ref}⟩` and passes `exp(ρ) dQ` on to the reference, before the reference's
+    own PSD chain rule below. Its cost prior has already been folded into `dQ`.
+    =#
     for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
+        b = p.qscale[v]
+        b == 0 && continue
+        r = _lqr_blk_q(p, v, k)
+        sc = exp(θ[first(r)])
+        grad[first(r)] = sc * dot(ctx.dQ[v][k], ctx.Qc[b][k])
+        ctx.dQ[b][k] .+= sc .* ctx.dQ[v][k]
+    end
+    for v in 1:(p.nv[_LQR_BLOCK_Q]), k in 1:(p.Kq[v])
+        p.qscale[v] == 0 || continue
         r = _lqr_blk_q(p, v, k)
         if !isempty(r)
             _sym!(ctx.tmp_nn, ctx.dQ[v][k])
