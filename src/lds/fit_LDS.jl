@@ -331,6 +331,14 @@ function smooth!(
     (which has no boundary terms) does not apply; the bucket path reads the
     per-trial kernels throughout. =#
     _has_switches(lds) && return _smooth_offset_buckets!(lds, tfs, data, sws_pool)
+    #= A `:causal` LQR model's transition at step `t` depends on the steps left
+    (its Riccati sweep runs back from the trial's own end), so trials of
+    different lengths share no leading blocks either: the ragged prefix
+    shortcut below would smooth every shorter trial with the longest one's
+    dynamics. Equal lengths keep the batched path. =#
+    if _time_to_go_dynamics(lds) && !all(==(data.tsteps[1]), data.tsteps)
+        return _smooth_offset_buckets!(lds, tfs, data, sws_pool)
+    end
 
     #=
     Equal-length fast path: the BT Hessian (and its inverse) is observation-

@@ -83,8 +83,11 @@ example an epoch's running cost and the bridge that ends it).
 difference. Must be set before `depends_on` variants are built.
 """
 function set_gref_gate!(sm::LQRStateModel, gate)
-    sm.mode === :lqr ||
-        throw(ArgumentError("a reference gate needs a finite-horizon (`:lqr`) model"))
+    sm.mode in (:lqr, :causal) || throw(
+        ArgumentError(
+            "a reference gate needs a finite-horizon (`:lqr` or `:causal`) model"
+        ),
+    )
     sm.variants === nothing || throw(
         ArgumentError(
             "set the reference gate before `depends_on` variants are built; they share it",
@@ -964,7 +967,7 @@ function _lqr_entry_prior_stats(
 end
 
 """Every entry switch's prior statistics, pooled over the cells `sms`/`sufs`."""
-function _lqr_pooled_entry_stats(sms, sufs, e::Int)
+function _lqr_pooled_entry_stats(sms::AbstractVector, sufs::AbstractVector, e::Int)
     return _pooled_entry_stats([
         _lqr_entry_prior_stats(sm, hs, e) for (sm, hs) in zip(sms, sufs)
     ])
@@ -1060,7 +1063,9 @@ of `G` (the data's entry statistics less the goal-conditioned prior's, which the
 terminal probe supplies), halved until `G` rises by an Armijo fraction and `P`
 stays positive definite. Returns whether the priors moved.
 """
-function _lqr_conditional_entry_update!(ldss, sufs; max_halvings::Int=12)
+function _lqr_conditional_entry_update!(
+    ldss::AbstractVector, sufs::AbstractVector; max_halvings::Int=12
+)
     sms = [lds.state_model for lds in ldss]
     sm1 = first(sms)
     T = eltype(first(sufs).nk)

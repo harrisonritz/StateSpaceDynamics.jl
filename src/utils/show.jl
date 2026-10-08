@@ -176,7 +176,8 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
         return _show_free_state_model(io, lqr_sm, n; gap=gap)
     end
     _is_hold(lqr_sm) && return _show_hold_state_model(io, lqr_sm, n; gap=gap)
-    println(io, gap, "LQR State Model:")
+    causal = _is_causal(lqr_sm)
+    println(io, gap, causal ? "Causal LQR State Model:" : "LQR State Model:")
     println(io, gap, "--------------------------------------")
     println(io, gap, " Plant dim n = $n, latent dim 2n = $(2n)   [z = (x; λ)]")
 
@@ -203,7 +204,11 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
             io, gap, "  $(length(lqr_sm.schedule)) timesteps; per-regime counts = $counts"
         )
     end
-    println(io, gap, "  terminal factor: $(lqr_sm.terminal)")
+    if causal
+        println(io, gap, "  terminal cost:   $(lqr_sm.causal.terminal_cost)")
+    else
+        println(io, gap, "  terminal factor: $(lqr_sm.terminal)")
+    end
     lqr_sm.terminal_regime > 0 && println(
         io,
         gap,
@@ -231,8 +236,22 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
         " input column(s)",
     )
 
-    println(io, gap, " Noise (mixed coordinates on [x_{t+1}; λ_t]):")
-    println(io, gap, "  size(Σ)  = ($(size(lqr_sm.Σ,1)), $(size(lqr_sm.Σ,2)))")
+    if causal
+        o = lqr_sm.causal
+        println(io, gap, " Noise (plant ε, costate slack ν, independent):")
+        println(
+            io, gap, "  Σ (plant):   $(o.plant_noise),  Ω (costate): $(o.costate_noise)"
+        )
+        println(
+            io,
+            gap,
+            "  slack drives state: $(o.slack_drives_state)" *
+            (o.slack_drives_state ? "   [agent acts on its costate]" : "   [readout]"),
+        )
+    else
+        println(io, gap, " Noise (mixed coordinates on [x_{t+1}; λ_t]):")
+        println(io, gap, "  size(Σ)  = ($(size(lqr_sm.Σ,1)), $(size(lqr_sm.Σ,2)))")
+    end
     lqr_sm.terminal &&
         println(io, gap, "  size(Σf) = ($(size(lqr_sm.Σf,1)), $(size(lqr_sm.Σf,2)))")
 
@@ -262,15 +281,21 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
                     ("h", f.h),
                     ("Bu", f.Bu),
                     ("Gref", f.Gref && size(lqr_sm.Gref, 2) > 0),
-                    ("terminal", f.terminal && lqr_sm.terminal),
+                    (
+                        "terminal",
+                        f.terminal &&
+                            (causal ? lqr_sm.causal.terminal_cost : lqr_sm.terminal),
+                    ),
                 ) if on
             ],
             ", ",
         ),
     )
     println(io, gap, "  observe_costate = $(lqr_sm.observe_costate)")
-    println(
-        io, gap, "  symplectic defect = $(round(symplectic_defect(lqr_sm), sigdigits=3))"
+    causal || println(
+        io,
+        gap,
+        "  symplectic defect = $(round(symplectic_defect(lqr_sm), sigdigits=3))",
     )
 
     return nothing

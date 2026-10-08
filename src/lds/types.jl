@@ -729,6 +729,15 @@ function _initial_coefficients(sm::AbstractGaussianStateModel)
     return isempty(sm.B0) ? reshape(sm.x0, :, 1) : sm.B0
 end
 
+"""
+    _trial_cache_copy(cache)
+
+The derived cache a per-trial copy of a state model gets. A deep copy, so the
+trial can never write through to the shared model; a state model whose cache
+holds large read-only pieces specializes this to share them.
+"""
+_trial_cache_copy(cache) = deepcopy(cache)
+
 """Give one trial its own initial mean without changing the shared fitted model."""
 function _trial_initial_model(
     lds::LinearDynamicalSystem{T,S,O}, u0
@@ -740,7 +749,7 @@ function _trial_initial_model(
         if name === :x0
             copy(sm.x0)
         elseif name === :cache
-            deepcopy(sm.cache)
+            _trial_cache_copy(sm.cache)
         else
             getfield(sm, i)
         end

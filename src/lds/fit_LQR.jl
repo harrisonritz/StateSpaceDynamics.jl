@@ -30,8 +30,11 @@ function _prepare_lqr!(
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     _is_free(sm) || _check_qc_unaliased(sm.Qc)
-    refresh!(sm)
     _lqr_lengths_ok(sm, tsteps, cost_offset)
+    #= A causal model's per-horizon caches are built by `refresh!` for every
+    registered horizon, so this dataset's go in first. =#
+    _register_causal_horizons!(sm, tsteps, cost_offset)
+    refresh!(sm)
     sm.observe_costate || _zero_costate_readout!(lds.obs_model, _plant_dim(sm))
     return nothing
 end
@@ -65,6 +68,7 @@ function _prepare_lqr!(
             ),
         )
     end
+    _check_causal_inputs(lds.state_model, data)
     return _prepare_lqr!(lds, data.tsteps, data.cost_offset)
 end
 
@@ -1085,7 +1089,11 @@ function _grouped_state_prior_logdensity(
         sm = lds.state_model
         if sigma && sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
             push!(seen_sigma, sm.Σ)
-            total += iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
+            total += if _is_causal(sm)
+                _causal_noise_logprior(sm)
+            else
+                iw_logprior_term(Matrix{T}(sm.Σ), sm.Σ_prior)
+            end
         end
         if qc && sm.Qc_prior !== nothing && !_is_free(sm)
             for (k, Q) in enumerate(sm.Qc)
@@ -1142,6 +1150,7 @@ function gradient_batched!(
             "switches must take the per-trial smoother",
         ),
     )
+    _is_causal(sm) && return _gradient_batched_causal!(ws, lds, x, y, ux, uy)
     c = sm.cache
     x0 = sm.x0
     bf = c.bfwd
@@ -1240,6 +1249,7 @@ function _sample_lqr_path!(
     ux::AbstractMatrix{T},
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
+    _is_causal(sm) && return _sample_causal_path!(rng, z, sm, ux)
     #=
     Without a terminal factor the state factors form an ordinary Markov chain, so
     the forward recursion *is* the model's distribution and is O(T d²). With one,
@@ -1359,7 +1369,7 @@ A `:hold` model's forward transition is the stable closed loop, so it never
 warns.
 """
 function _warn_unstable_rollout(sm::LQRStateModel{T}, tsteps::Int) where {T<:Real}
-    _is_hold(sm) && return nothing
+    (_is_hold(sm) || _is_causal(sm)) && return nothing
     ρ = maximum(abs, eigvals(sm.cache.M[_regime(sm, 1)]))
     growth = ρ^tsteps
     if growth > 1 / sqrt(eps(T))
@@ -1438,6 +1448,7 @@ function Random.rand(
     offset = _normalize_cost_offset(cost_offset, lds.state_model, 1)
     _prepare_lqr!(lds, [Ti], offset)
     ux_trial = _check_ux(ux, lds.ux_dim, Ti, "ux", T)
+    _check_causal_inputs(lds.state_model, ux_trial, "ux")
     u0 = _normalize_ux0(ux0, lds.state_model, 1)
     uy_trial = _check_uy(uy, lds.uy_dim, Ti, lds.obs_model)
 
@@ -1473,6 +1484,9 @@ function Random.rand(
     lengths = Int[Int(t) for t in tsteps_per_trial]
     _prepare_lqr!(lds, lengths, offsets)
     ux_seq = _normalize_multitrial_ux(ux, lds.ux_dim, lengths, T, "ux")
+    for (i, u) in enumerate(ux_seq)
+        _check_causal_inputs(lds.state_model, u, "ux[$i]")
+    end
     uy_seq = _normalize_multitrial_uy(uy, lds.uy_dim, lengths, T, lds.obs_model)
     obs_params = _extract_obs_params(lds.obs_model)
 

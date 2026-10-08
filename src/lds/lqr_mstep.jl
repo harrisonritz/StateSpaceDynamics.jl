@@ -106,6 +106,19 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     and their count. The entry transition is in these and in no regime's `zz`. =#
     const entry_ww::Vector{Matrix{T}}
     const entry_n::Vector{T}
+    #= A `:causal` model's statistics, per horizon (`causal_keys`, the
+    `(offset, length)` pairs of `_causal_key`) and per transition `t` of it — its
+    transition and noise vary with `t`, so they cannot be summed over time.
+    Over `w̃ = [z_t; 1; u]`: `causal_zz[h][t] = Σ E[w̃ w̃ᵀ]`,
+    `causal_zy[h][t] = Σ E[w̃ z_{t+1}ᵀ]`, `causal_yy[h][t] = Σ E[z_{t+1} z_{t+1}ᵀ]`,
+    and `causal_n[h]` the transitions it holds. Without a schedule every trial
+    is aligned at the end of the longest one's horizon (see
+    `_aggregate_causal_stats!`). Empty in every other mode. =#
+    const causal_keys::Vector{NTuple{2,Int}}
+    const causal_zz::Vector{Vector{Matrix{T}}}
+    const causal_zy::Vector{Vector{Matrix{T}}}
+    const causal_yy::Vector{Vector{Matrix{T}}}
+    const causal_n::Vector{T}
 end
 
 function _initialize_td_sufficient_statistics(
@@ -160,6 +173,11 @@ function _wrap_lqr_suff_stats(
         Int[],
         [zeros(T, 2d + 1 + m, 2d + 1 + m) for _ in sm.switches],
         zeros(T, length(sm.switches)),
+        NTuple{2,Int}[],
+        Vector{Matrix{T}}[],
+        Vector{Matrix{T}}[],
+        Vector{Matrix{T}}[],
+        T[],
     )
 end
 
@@ -218,6 +236,7 @@ function _aggregate_lqr_stats!(
     serial_below::Int=_AGGREGATE_SERIAL_WORK,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
+    _is_causal(sm) && return _aggregate_causal_stats!(hs, tfs, lds, data, trials)
     d = lds.latent_dim
     m = lds.ux_dim
     reg = d + 1 + m
@@ -685,6 +704,7 @@ function _fill_mixed_blocks!(
     `Lh z_{t+1}` on the same `[z_t; 1; u_t]`, and since `Lh` is a parameter it is
     applied inside the objective, so its blocks are the forward ones too.
     =#
+    _is_causal(sm) && return hs              # read per horizon by the causal unit
     if _is_free(sm) || _is_hold(sm)
         copyto!(hs.Zw[1], hs.zz[1])
         copyto!(hs.Xv[1], transpose(hs.zy[1]))
@@ -858,6 +878,14 @@ function _LQRPack(sm::LQRStateModel)
     return _LQRPack(sm, sm.fit_flags, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
 
+"""Whether any of `sms` is a `:causal` model planning against a terminal cost."""
+function _any_causal_terminal_cost(sms)::Bool
+    for sm in sms
+        _is_causal(sm) && sm.causal.terminal_cost && return true
+    end
+    return false
+end
+
 function _LQRPack(sm::LQRStateModel, f::LQRFitFlags)
     return _LQRPack(sm, f, ntuple(_ -> 1, _LQR_BLOCK_N))
 end
@@ -949,6 +977,7 @@ struct _LQRUnit{T<:Real,HS}
     q::Int
     n::T
     hold::Bool
+    causal::Bool
 end
 
 """
@@ -996,6 +1025,8 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     terminal::Bool                   # any model carries a terminal factor
     units::Vector{_LQRUnit{T,HS}}
     hold::Vector{_HoldUnit{T}}       # [unit]; a 0-dimensional placeholder for `:lqr`
+    causal::Vector{_CausalScratch{T}}  # [unit]; empty unless the unit is `:causal`
+    causal_q::BitVector              # noise versions owned by `:causal` units
     lqrA::BitVector                  # `A` copies used by some `:lqr` unit
     sms::Vector{SM}
     owners::Vector{Vector{Vector{Int}}}  # [block][copy] -> models using it
@@ -1056,12 +1087,18 @@ function _lqr_units(
     slots::NTuple{7,Vector{Int}},
     q_slots::AbstractVector{Int},
     hold::AbstractVector{Bool}=falses(length(sufs)),
+    causal::AbstractVector{Bool}=falses(length(sufs)),
 )
     T = eltype(first(sufs).nk)
-    keys = NTuple{9,Int}[]
+    keys = NTuple{10,Int}[]
     members = Vector{Int}[]
     for c in eachindex(sufs)
-        key = (ntuple(b -> slots[b][c], _LQR_BLOCK_N)..., q_slots[c], Int(hold[c]))
+        key = (
+            ntuple(b -> slots[b][c], _LQR_BLOCK_N)...,
+            q_slots[c],
+            Int(hold[c]),
+            Int(causal[c]),
+        )
         idx = findfirst(isequal(key), keys)
         if idx === nothing
             push!(keys, key)
@@ -1080,7 +1117,12 @@ function _lqr_units(
         push!(
             units,
             _LQRUnit{T,eltype(sufs)}(
-                hs, ntuple(b -> key[b], _LQR_BLOCK_N), key[8], sum(hs.nk), key[9] == 1
+                hs,
+                ntuple(b -> key[b], _LQR_BLOCK_N),
+                key[8],
+                sum(hs.nk),
+                key[9] == 1,
+                key[10] == 1,
             ),
         )
     end
@@ -1106,6 +1148,7 @@ function _pool_lqr_stats(sufs::AbstractVector, idx::AbstractVector{Int})
             out.entry_ww[e] .+= s.entry_ww[e]
             out.entry_n[e] += s.entry_n[e]
         end
+        _pool_causal_stats!(out, s)
     end
     return out
 end
@@ -1199,7 +1242,10 @@ function _LQRMStepCtx(
 )
     # A pinned costate block has no unconstrained full-matrix profile. Optimize
     # structure at the current covariance, then update the free state block.
-    profile = profile && all(sm.fixed_costate_sigma === nothing for sm in sms)
+    #= A `:causal` model profiles its plant block and holds a pinned costate
+    block in the same objective, so it keeps the profile either way. =#
+    profile =
+        profile && all(sm.fixed_costate_sigma === nothing || _is_causal(sm) for sm in sms)
     sm1 = sms[1]
     T = eltype(sm1.Σ)
     f = flags === nothing ? sm1.fit_flags : flags
@@ -1216,6 +1262,23 @@ function _LQRMStepCtx(
     =#
     terminal = any(sm -> sm.terminal, sms)
     hold_c = Bool[_is_hold(sm) for sm in sms]
+    causal_c = Bool[_is_causal(sm) for sm in sms]
+    #= A causal model with a terminal cost reads `h_f` in its sweep's start, so
+    the offset is packed for it too, although it carries no terminal factor. =#
+    pack_terminal = terminal || _any_causal_terminal_cost(sms)
+    if any(causal_c)
+        all(causal_c) || throw(
+            ArgumentError(
+                "`:causal` inverse-LQR states cannot share a structural M-step with " *
+                "other modes yet",
+            ),
+        )
+        all(sm -> sm.causal == sm1.causal, sms) || throw(
+            ArgumentError(
+                "the `:causal` states of one fit must share their causal options"
+            ),
+        )
+    end
     #=
     A frozen block is never shared, whatever the tie asks for: freezing means
     "keep your own value", so each cell reads back its own rather than the first
@@ -1223,7 +1286,7 @@ function _LQRMStepCtx(
     cells on a version alias the same array — and with one cell there is nothing
     to distinguish either way.
     =#
-    probe = _LQRPack(sm1, f, ntuple(_ -> 1, _LQR_BLOCK_N), [_nregimes(sm1)], terminal)
+    probe = _LQRPack(sm1, f, ntuple(_ -> 1, _LQR_BLOCK_N), [_nregimes(sm1)], pack_terminal)
     ncell = length(slots[1])
     #=
     Bound to a fresh name rather than back onto `slots`: reassigning an argument
@@ -1231,7 +1294,7 @@ function _LQRMStepCtx(
     prove defined.
     =#
     eff = ntuple(b -> probe.w[b] == 0 ? collect(1:ncell) : slots[b], _LQR_BLOCK_N)
-    units = _lqr_units(sufs, eff, q_slots, hold_c)
+    units = _lqr_units(sufs, eff, q_slots, hold_c, causal_c)
     nv = ntuple(b -> maximum(eff[b]), _LQR_BLOCK_N)
 
     #=
@@ -1251,7 +1314,7 @@ function _LQRMStepCtx(
     Kq = [
         maximum(c -> _nregimes(sms[c]), owners[_LQR_BLOCK_Q][v]) for v in 1:nv[_LQR_BLOCK_Q]
     ]
-    pack = _LQRPack(sm1, f, nv, Kq, terminal)
+    pack = _LQRPack(sm1, f, nv, Kq, pack_terminal)
     n, d, m = pack.n, pack.d, pack.m
     reg = d + 1 + m
     nq = maximum(q_slots)
@@ -1268,8 +1331,8 @@ function _LQRMStepCtx(
     Nf_q = zeros(T, nq)
     for u in units
         N_q[u.q] += u.n
-        (terminal && !u.hold) && (Nf_q[u.q] += sum(u.hs.term_n))
-        u.hold || (lqrA[u.v[_LQR_BLOCK_A]] = true)
+        (terminal && !u.hold && !u.causal) && (Nf_q[u.q] += sum(u.hs.term_n))
+        (u.hold || u.causal) || (lqrA[u.v[_LQR_BLOCK_A]] = true)
     end
     count_tol = sqrt(eps(T)) * max(maximum(N_q; init=zero(T)), one(T))
     active_q = BitVector(N_q .> count_tol)
@@ -1285,7 +1348,7 @@ function _LQRMStepCtx(
         )
     end
     for u in units
-        (active_q[u.q] && !u.hold) || continue
+        (active_q[u.q] && !u.hold && !u.causal) || continue
         N_A[u.v[_LQR_BLOCK_A]] += u.n
     end
 
@@ -1316,6 +1379,14 @@ function _LQRMStepCtx(
         terminal,
         units,
         [_HoldUnit(T, u.hold ? n : 0, m) for u in units],
+        [
+            if u.causal
+                _CausalScratch(T, u.hs.causal_keys, n, m, pack.K)
+            else
+                _CausalScratch(T)
+            end for u in units
+        ],
+        BitVector([any(u -> u.causal && u.q == s, units) for s in 1:nq]),
         lqrA,
         collect(sms),
         owners,
@@ -1518,6 +1589,14 @@ cost prior once per *block copy*, so a tie that shares one array across discrete
 states counts its prior once rather than once per state.
 =============================================================================#
 
+"""A model on noise version `s` (they agree on everything the noise reads)."""
+@inline function _noise_owner(ctx::_LQRMStepCtx, s::Int)
+    for (c, sm) in enumerate(ctx.sms)
+        ctx.q_of[c] == s && return sm
+    end
+    throw(ArgumentError("no model on noise version $s"))
+end
+
 """The `Σ` prior in force for noise version `s`, or `nothing`."""
 @inline function _sigma_prior(ctx::_LQRMStepCtx, s::Int)
     for (c, sm) in enumerate(ctx.sms)
@@ -1673,6 +1752,21 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         S = ctx.S[u.v[_LQR_BLOCK_S]]
         Qs = ctx.Qc[u.v[_LQR_BLOCK_Q]]
         hv = ctx.h[u.v[_LQR_BLOCK_H]]
+        if u.causal
+            ctx.active_q[u.q] || continue
+            _causal_sweep_scratch!(
+                ctx.causal[ui],
+                A,
+                S,
+                Qs,
+                hv,
+                ctx.Bu[u.v[_LQR_BLOCK_B]],
+                ctx.Gref[u.v[_LQR_BLOCK_G]],
+                ctx.hf[u.v[_LQR_BLOCK_F]],
+                ctx.sms[1],
+            ) || return false
+            continue
+        end
         if u.hold
             ctx.active_q[u.q] || continue
             H = ctx.hold[ui]
@@ -1760,6 +1854,17 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         ctx.active_q[u.q] || continue
         hs = u.hs
         R = ctx.R[u.q]
+        if u.causal
+            _causal_add_scatter!(
+                R,
+                ctx.causal[ui],
+                hs,
+                ctx.A[u.v[_LQR_BLOCK_A]],
+                ctx.S[u.v[_LQR_BLOCK_S]],
+                ctx.sms[1].causal.slack_drives_state,
+            )
+            continue
+        end
         if u.hold
             H = ctx.hold[ui]
             Th = ctx.Theta[ui][1]
@@ -2003,6 +2108,7 @@ function _lqr_fg!(
     for s in 1:(ctx.nq)
         Neff[s] = ctx.N_q[s]
         ctx.active_q[s] || continue
+        ctx.causal_q[s] && continue          # its blocks fold their own priors
         ctx.profile || continue
         pr = _sigma_prior(ctx, s)
         pr === nothing && continue
@@ -2011,6 +2117,20 @@ function _lqr_fg!(
     end
     for s in 1:(ctx.nq)
         ctx.active_q[s] || continue
+        if ctx.causal_q[s]
+            fs = _causal_noise_objective!(
+                ctx.W[s],
+                ctx.R[s],
+                ctx.N_q[s],
+                _noise_owner(ctx, s),
+                ctx.profile,
+                ctx.Sinv[s],
+            )
+            isfinite(fs) || return T(Inf)
+            fval += fs
+            fill!(ctx.Wf[s], zero(T))
+            continue
+        end
         if ctx.profile
             chol = cholesky(Symmetric(ctx.R[s]); check=false)
             issuccess(chol) || return T(Inf)
@@ -2079,6 +2199,27 @@ function _lqr_fg!(
     gate = ctx.sms[1].gref_gate
     for (ui, u) in enumerate(ctx.units)
         ctx.active_q[u.q] || continue
+        if u.causal
+            vQ, vG = u.v[_LQR_BLOCK_Q], u.v[_LQR_BLOCK_G]
+            _causal_unit_gradient!(
+                ctx.causal[ui],
+                u.hs,
+                ctx.W[u.q],
+                ctx.A[u.v[_LQR_BLOCK_A]],
+                ctx.S[u.v[_LQR_BLOCK_S]],
+                ctx.Qc[vQ],
+                ctx.Gref[vG],
+                ctx.sms[1],
+                ctx.dA[u.v[_LQR_BLOCK_A]],
+                ctx.dS[u.v[_LQR_BLOCK_S]],
+                ctx.dQ[vQ],
+                ctx.dh[u.v[_LQR_BLOCK_H]],
+                ctx.dB[u.v[_LQR_BLOCK_B]],
+                ctx.dG[vG],
+                ctx.dhf[u.v[_LQR_BLOCK_F]],
+            )
+            continue
+        end
         if u.hold
             _hold_unit_gradient!(ctx, ui, u, Fq, Neff)
             continue
@@ -2357,8 +2498,15 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         ctx.active_q[s] || continue
         for (c, sm) in enumerate(ctx.sms)
             ctx.q_of[c] == s || continue
+            if _is_causal(sm)
+                _causal_noise_update!(sm, ctx.R[s], ctx.N_q[s])
+                continue
+            end
             pr = sm.Σ_prior
-            if sm.fixed_costate_sigma !== nothing
+            fixed_costate = sm.fixed_costate_sigma
+            # `isa`, not `!== nothing`: the field's type is a UnionAll, which only
+            # an `isa` test narrows for inference (and JET).
+            if fixed_costate isa Real
                 n = _plant_dim(sm)
                 if ctx.N_q[s] > zero(T)
                     @views sm.Σ[1:n, 1:n] .= ctx.R[s][1:n, 1:n] ./ ctx.N_q[s]
@@ -2366,9 +2514,11 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
                 @views Symmetrize!(view(sm.Σ, 1:n, 1:n))
                 @views sm.Σ[1:n, (n + 1):(2n)] .= zero(T)
                 @views sm.Σ[(n + 1):(2n), 1:n] .= zero(T)
-                @views sm.Σ[(n + 1):(2n), (n + 1):(2n)] .= Matrix{T}(
-                    sm.fixed_costate_sigma * I, n, n
-                )
+                costate_block = view(sm.Σ, (n + 1):(2n), (n + 1):(2n))
+                fill!(costate_block, zero(T))
+                for i in 1:n
+                    costate_block[i, i] = fixed_costate
+                end
             elseif pr === nothing
                 if ctx.N_q[s] > zero(T)
                     copyto!(sm.Σ, ctx.R[s])
@@ -2427,7 +2577,7 @@ function _lqr_state_mstep!(
                 hs, sm, lds.fit_bool[4]; flags=_lqr_structure_flags(sm, lds.fit_bool[3])
             )
             _lqr_structure_mstep!(ctx, lds.fit_bool[3], sm.mstep_iters)
-            lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
+            return lds.fit_bool[4] && _lqr_noise_mstep!(ctx)
         end
         refresh!(sm)
         return nothing
@@ -2862,6 +3012,7 @@ function _lqr_joint_Q_state!(
     #= `:hold` mode scores its forward transition straight off the cache — the
     same density the smoother used, so the bound is the smoother's own. =#
     _is_hold(sm) && return Q_val + _forward_Q_transition(sm, hs)
+    _is_causal(sm) && return Q_val + _causal_Q_transition(sm, hs)
 
     #=
     Fill the mixed blocks here rather than relying on the caller: this is reached

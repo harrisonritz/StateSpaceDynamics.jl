@@ -212,6 +212,108 @@ function _check_gref_cols(f::LQRFitFlags, m::Int, d::Int)
 end
 
 """
+    CausalOptions(; slack_drives_state=true, plant_noise=:dense,
+                    costate_noise=:dense, terminal_cost=false)
+
+The noise and horizon options of a `:causal` [`LQRStateModel`](@ref) (see
+[`causal_state_model`](@ref)); ignored in every other mode.
+
+- `slack_drives_state`: whether the agent *acts* on its perturbed costate. With
+  `true` the costate slack `ν` moves the state, `x_{t+1} = Φ_t x_t + ε_t − W_{t+1} S ν_{t+1}`;
+  with `false` it is a pure readout of the costate and never reaches the state.
+- `plant_noise`, `costate_noise`: `:dense` or `:diagonal` — the structure of the
+  plant noise `Σ` and of the costate noise `Ω`.
+- `terminal_cost`: whether the Riccati sweep starts from the terminal cost,
+  `P_T = Q_{k_T}` (with feedforward `g_T = h_f − Q_{k_T} G_r u`), or from a free
+  endpoint, `P_T = 0`, `g_T = 0`. The `:causal` mode has no terminal *factor*; this
+  is the cost the controller plans against.
+"""
+struct CausalOptions
+    slack_drives_state::Bool
+    plant_noise::Symbol
+    costate_noise::Symbol
+    terminal_cost::Bool
+    function CausalOptions(
+        slack_drives_state::Bool,
+        plant_noise::Symbol,
+        costate_noise::Symbol,
+        terminal_cost::Bool,
+    )
+        for (name, s) in (("plant_noise", plant_noise), ("costate_noise", costate_noise))
+            s in (:dense, :diagonal) ||
+                throw(ArgumentError("$name must be :dense or :diagonal; got :$s"))
+        end
+        return new(slack_drives_state, plant_noise, costate_noise, terminal_cost)
+    end
+end
+
+function CausalOptions(;
+    slack_drives_state::Bool=true,
+    plant_noise::Symbol=:dense,
+    costate_noise::Symbol=:dense,
+    terminal_cost::Bool=false,
+)
+    return CausalOptions(slack_drives_state, plant_noise, costate_noise, terminal_cost)
+end
+
+"""
+    _CausalHorizon{T}
+
+Everything the smoother needs for one *horizon* of a `:causal` model — the trials
+that share a cost-schedule offset and a length, and therefore the same backward
+Riccati sweep.
+
+With `s = t + 1`, `W_s = (I + S P_s)⁻¹`, `Φ_t = W_s A`, the trial's constant
+input `ũ = [1; u]` and the feedforward `g_s = G_s ũ`, transition `t` is
+
+    z_{t+1} = M_t z_t + B_t ũ + L_t [ε_t; ν_{t+1}],   [ε; ν] ~ N(0, blkdiag(Σ, Ω)),
+    M_t = [Φ_t  0; P_s Φ_t  0],   B_t = [b_t; P_s b_t + G_s],   b_t = W_s (C̃ − S G_s),
+
+with `C̃ = [h_x  B_{u,x}]`. `Rz[t] = L_t⁻¹` maps a forward residual back to the
+independent innovations: `[W_s  W_s S; −P_s  I]` when the slack drives the state,
+`[I 0; −P_s I]` when it does not. Both have unit determinant, so the forward
+noise's normalizing constant is the same at every step (the cache's `cQ`).
+
+- `P`, `W`, `G`: the sweep, `1:tsteps` (`G` is `n × (1 + ux_dim)`)
+- `M`, `B`, `Rz`: per transition, `1:tsteps-1`
+- `negQinv`, `QinvM`, `MtQinv`, `negMtQinvM`: the smoother's gradient and
+  Hessian templates per transition, with `Q_t⁻¹ = Rzᵀ blkdiag(Σ, Ω)⁻¹ Rz`
+"""
+struct _CausalHorizon{T<:Real}
+    offset::Int
+    tsteps::Int
+    P::Vector{Matrix{T}}
+    W::Vector{Matrix{T}}
+    G::Vector{Matrix{T}}
+    M::Vector{Matrix{T}}
+    B::Vector{Matrix{T}}
+    Rz::Vector{Matrix{T}}
+    negQinv::Vector{Matrix{T}}
+    QinvM::Vector{Matrix{T}}
+    MtQinv::Vector{Matrix{T}}
+    negMtQinvM::Vector{Matrix{T}}
+end
+
+function _CausalHorizon(::Type{T}, n::Int, m::Int, offset::Int, tsteps::Int) where {T}
+    d = 2n
+    sq(k, r, c) = [zeros(T, r, c) for _ in 1:k]
+    return _CausalHorizon{T}(
+        offset,
+        tsteps,
+        sq(tsteps, n, n),
+        sq(tsteps, n, n),
+        sq(tsteps, n, 1 + m),
+        sq(tsteps - 1, d, d),
+        sq(tsteps - 1, d, 1 + m),
+        sq(tsteps - 1, d, d),
+        sq(tsteps - 1, d, d),
+        sq(tsteps - 1, d, d),
+        sq(tsteps - 1, d, d),
+        sq(tsteps - 1, d, d),
+    )
+end
+
+"""
     _LQREntryCache{T}
 
 The forward transition an entry prior puts in place of the ordinary one: for the
@@ -268,6 +370,13 @@ mutable struct LQRSwitch{T<:Real}
     pos::Int
     bridge::Int
     entry::Union{Nothing,EntryPrior{T}}
+    #= Inner, so there is no outer `LQRSwitch(pos, bridge, entry)`: with
+    `entry = nothing` it could not determine `T` (Aqua's unbound parameter). =#
+    function LQRSwitch{T}(
+        pos::Integer, bridge::Integer, entry::Union{Nothing,EntryPrior{T}}
+    ) where {T<:Real}
+        return new{T}(pos, bridge, entry)
+    end
 end
 
 """
@@ -298,6 +407,11 @@ and `S` alone, so `Qfwd`, `bfwd` and `Bfwd` are shared by every regime.
 - `Ftrm`: one `Q_k G_r` terminal-factor input block per cost regime.
 - `negQinv`, `QinvM`, `MtQinv`, `negMtQinvM`, `cQ`: Cholesky-derived templates
     for the gradient and Hessian blocks, the per-regime ones indexed by regime.
+- `causal_keys`, `causal`, `causal_index`: a `:causal` model's horizons — the
+    `(offset, length)` keys it has been asked to smooth (a registry shared by
+    reference with its parameter-group variants, so a horizon registered on the
+    parent is built for every variant), one [`_CausalHorizon`](@ref) per key, and
+    the key → horizon lookup. Empty in every other mode.
 - `Sf_PD`, `Lf`, `negLtSL`, `LtSinv`, `cF`: the terminal factor's covariance,
     per-regime design matrices `Λf[k] = [−Q_k  I]`, and their derived
     curvature / gradient templates. Present (as identity placeholders) even when
@@ -326,9 +440,18 @@ mutable struct LQRCache{T<:Real}
     cF::T
     # One per `sm.switches` entry; only those carrying an entry prior are filled.
     switch::Vector{_LQREntryCache{T}}
+    const causal_keys::Vector{NTuple{2,Int}}
+    const causal::Vector{_CausalHorizon{T}}
+    const causal_index::Dict{NTuple{2,Int},Int}
 end
 
-function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
+function LQRCache(
+    ::Type{T},
+    n::Int,
+    nregimes::Int,
+    ux_dim::Int;
+    causal_keys::Vector{NTuple{2,Int}}=NTuple{2,Int}[],
+) where {T<:Real}
     d = 2n
     return LQRCache{T}(
         n,
@@ -351,6 +474,9 @@ function LQRCache(::Type{T}, n::Int, nregimes::Int, ux_dim::Int) where {T<:Real}
         [zeros(T, d, n) for _ in 1:nregimes],
         zero(T),
         _LQREntryCache{T}[],
+        causal_keys,
+        _CausalHorizon{T}[],
+        Dict{NTuple{2,Int},Int}(),
     )
 end
 
@@ -699,8 +825,10 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
 
 # Fields
 - `mode::Symbol`: `:lqr` (the finite-horizon symplectic form documented above),
-    `:hold` (the infinite-horizon regulator, see [`hold_state_model`](@ref)) or
-    `:free` (an unconstrained transition, see [`free_state_model`](@ref)).
+    `:causal` (the finite-horizon *feedback* controller with plant and costate
+    noise, see [`causal_state_model`](@ref)), `:hold` (the infinite-horizon
+    regulator, see [`hold_state_model`](@ref)) or `:free` (an unconstrained
+    transition, see [`free_state_model`](@ref)).
 - `A::M`: `n × n` plant dynamics. Invertible in `:lqr` mode.
 - `S::M`: `n × n` symmetric `B R⁻¹ Bᵀ` — the control authority weighted by the
     control cost. `B` and `R` are not separately identified; only `S` is.
@@ -751,6 +879,8 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
   including the terminal regime. See below.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
+- `causal::CausalOptions`: the noise and horizon options of the `:causal` mode
+    (see [`CausalOptions`](@ref)); unused in the other modes.
 - `cache::LQRCache{T}`: derived forward parameters. Rebuilt by
     [`refresh!`](@ref), which the constructors and the M-step call for you —
     call it yourself after mutating a field by hand.
@@ -795,6 +925,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
     gref_gate::Matrix{Bool}
     switches::Vector{LQRSwitch{T}}
+    causal::CausalOptions
     cache::LQRCache{T}
 end
 
@@ -844,6 +975,15 @@ rather than the finite-horizon symplectic form. See the `mode` field.
 @inline _is_hold(sm::LQRStateModel) = sm.mode === :hold
 
 """
+    _is_causal(sm) -> Bool
+
+Whether the model is the finite-horizon *causal* controller of
+[`causal_state_model`](@ref): the closed loop of the backward Riccati sweep, with
+the costate on its graph, rather than the two-point boundary-value form.
+"""
+@inline _is_causal(sm::LQRStateModel) = sm.mode === :causal
+
+"""
     _require_lqr(sm, what)
 
 Throw an informative `ArgumentError` when an LQR-only quantity is asked of a
@@ -869,6 +1009,14 @@ finite-horizon symplectic form is asked of a `:hold` (or `:free`) model.
 """
 function _require_finite_horizon(sm::LQRStateModel, what::AbstractString)
     _require_lqr(sm, what)
+    _is_causal(sm) && throw(
+        ArgumentError(
+            "$what belongs to the symplectic two-point boundary-value form, and this " *
+            "model is in `:causal` mode — a closed-loop controller whose forward " *
+            "transition `[Φ_t 0; P_{t+1} Φ_t 0]` is not symplectic. See " *
+            "`lqr_riccati_sequence` for its per-step controller.",
+        ),
+    )
     _is_hold(sm) && throw(
         ArgumentError(
             "$what belongs to the finite-horizon symplectic form, and this model is " *
@@ -947,7 +1095,11 @@ nothing that updates parameters should be handed one.
 function _with_cost_offset(sm::LQRStateModel{T,M,V}, offset::Int) where {T,M,V}
     sm.cost_offset == offset && return sm
     fields = ntuple(Val(fieldcount(LQRStateModel{T,M,V}))) do i
-        fieldname(LQRStateModel{T,M,V}, i) === :cost_offset ? offset : getfield(sm, i)
+        return if fieldname(LQRStateModel{T,M,V}, i) === :cost_offset
+            offset
+        else
+            getfield(sm, i)
+        end
     end
     return LQRStateModel{T,M,V}(fields...)
 end
@@ -1100,6 +1252,7 @@ function _check_lqr_structure(
     terminal::Bool,
     terminal_regime::Int=0;
     bridge_regimes::AbstractVector{Int}=Int[],
+    require_invertible::Bool=true,
 ) where {T<:Real}
     n = size(A, 1)
     size(A, 2) == n || throw(DimensionMismatchError("LQR A columns", n, size(A, 2)))
@@ -1120,20 +1273,24 @@ function _check_lqr_structure(
     #=
     Invertibility is not a numerical nicety: the forward symplectic transition
     is built from `A⁻ᵀ`, so a singular plant has no forward Markov
-    representation at all and the smoother cannot run.
+    representation at all and the smoother cannot run. (A `:causal` model only
+    ever applies `A` forward, so it skips this.)
     =#
-    F = lu(Matrix(A); check=false)
-    issuccess(F) || throw(
-        NumericalStabilityError(
-            "A",
-            "the LQR plant matrix is singular. The forward symplectic " *
-            "transition is built from A⁻ᵀ, so `A` must be invertible; a discretized " *
-            "plant (A = exp(Aᶜ·dt)) always is",
-        ),
-    )
-    logdetA, _ = logabsdet(F)
-    isfinite(logdetA) ||
-        throw(NumericalStabilityError("A", "the plant matrix has a non-finite log|det|"))
+    if require_invertible
+        F = lu(Matrix(A); check=false)
+        issuccess(F) || throw(
+            NumericalStabilityError(
+                "A",
+                "the LQR plant matrix is singular. The forward symplectic " *
+                "transition is built from A⁻ᵀ, so `A` must be invertible; a discretized " *
+                "plant (A = exp(Aᶜ·dt)) always is",
+            ),
+        )
+        logdetA, _ = logabsdet(F)
+        isfinite(logdetA) || throw(
+            NumericalStabilityError("A", "the plant matrix has a non-finite log|det|")
+        )
+    end
 
     K = length(Qc)
     if isempty(schedule)
@@ -1364,6 +1521,7 @@ function LQRStateModel(
         nothing,
         _normalize_gref_gate(gref_gate, length(Qc_vec), size(Bu_m, 2)),
         LQRSwitch{T}[],
+        CausalOptions(),
         LQRCache(T, n, length(Qc_vec), size(Bu_m, 2)),
     )
     if isempty(bridges) && isempty(entries)
@@ -1512,6 +1670,7 @@ function free_state_model(
         nothing,
         Matrix{Bool}(undef, 0, 0),
         LQRSwitch{T}[],
+        CausalOptions(),
         LQRCache(T, n, 1, size(Bu_m, 2)),
     )
     refresh!(sm)
@@ -1705,6 +1864,7 @@ function hold_state_model(
         nothing,
         Matrix{Bool}(undef, 0, 0),
         LQRSwitch{T}[],
+        CausalOptions(),
         LQRCache(T, n, 1, size(Bu_m, 2)),
     )
     refresh!(sm)
@@ -1799,13 +1959,15 @@ states and two costates.
 
 `mode = :lqr` gives a mildly contractive plant with a unit cost; `mode = :hold`
 the same plant, control authority and cost as an infinite-horizon regulator
-(see [`hold_state_model`](@ref)); `mode = :free` a contractive unconstrained
+(see [`hold_state_model`](@ref)); `mode = :causal` the same as a finite-horizon
+feedback controller with plant and costate noise `0.1 I` (see
+[`causal_state_model`](@ref)); `mode = :free` a contractive unconstrained
 transition (see [`free_state_model`](@ref)). Every keyword of the corresponding
 matrix constructor is accepted and overrides the default it names.
 
 # Throws
 - `ArgumentError` when `latent_dim` is odd, non-positive, or `mode` is not one
-  of `:lqr`, `:hold` and `:free`
+  of `:lqr`, `:hold`, `:causal` and `:free`
 """
 function LQRStateModel(
     latent_dim::Integer; T::Type{<:Real}=Float64, mode::Symbol=:lqr, kwargs...
@@ -1840,8 +2002,17 @@ function LQRStateModel(
             Matrix{T}(T(0.1) * I, d, d);
             kwargs...,
         )
+    elseif mode === :causal
+        return causal_state_model(
+            Matrix{T}(T(0.95) * I, n, n),
+            Matrix{T}(T(0.05) * I, n, n),
+            Matrix{T}(I, n, n),
+            Matrix{T}(T(0.1) * I, n, n),
+            Matrix{T}(T(0.1) * I, n, n);
+            kwargs...,
+        )
     else
-        throw(ArgumentError("mode must be :lqr, :hold or :free; got :$mode"))
+        throw(ArgumentError("mode must be :lqr, :hold, :causal or :free; got :$mode"))
     end
 end
 
@@ -1877,6 +2048,8 @@ function refresh!(sm::LQRStateModel{T}) where {T<:Real}
         _refresh_free_head!(sm, c, n, d)
     elseif _is_hold(sm)
         _refresh_hold_head!(sm, c, n, d)
+    elseif _is_causal(sm)
+        _refresh_causal_head!(sm, c, n, d)
     else
         _refresh_lqr_head!(sm, c, n, d)
     end
@@ -2170,7 +2343,16 @@ is the matrix the smoother actually propagates; see
 In `:hold` mode this is the stationary forward transition `[A_cl 0; P A_cl 0]`,
 which is stable rather than symplectic, and in `:free` mode the stored matrix.
 """
-symplectic_matrix(sm::LQRStateModel, k::Int=1) = copy(sm.cache.M[k])
+function symplectic_matrix(sm::LQRStateModel, k::Int=1)
+    _is_causal(sm) && throw(
+        ArgumentError(
+            "a `:causal` model has no per-regime transition: its forward map changes " *
+            "with the steps left in the trial. Read it per step from " *
+            "`lqr_riccati_sequence` (Φ_t = W_{t+1} A).",
+        ),
+    )
+    return copy(sm.cache.M[k])
+end
 
 """
     symplectic_form(n) -> Matrix
@@ -2228,7 +2410,7 @@ function lqr_parameters(sm::LQRStateModel{T}) where {T<:Real}
         S=copy(sm.S),
         Qc=[copy(Q) for Q in sm.Qc],
         schedule=copy(sm.schedule),
-        terminal=sm.terminal,
+        terminal=_is_causal(sm) ? sm.causal.terminal_cost : sm.terminal,
     )
     _is_hold(sm) || return base
     H = _hold_unit_at(sm)
@@ -2297,7 +2479,7 @@ function riccati_solution(
             return P
         end
     end
-    throw(
+    return throw(
         NumericalStabilityError(
             "Qc[$k]",
             "the discrete Riccati iteration did not converge in $max_iter steps; this " *
@@ -2517,7 +2699,9 @@ where `c_t` and `f_t` are the state and costate halves of the affine term
 feedforward.
 
 The terminal condition is `P_T = Q_{k_T}`, `g_T = h_f` when the model carries a
-terminal factor and `P_T = 0`, `g_T = 0` (a free endpoint) when it does not.
+terminal factor and `P_T = 0`, `g_T = 0` (a free endpoint) when it does not. A
+`:causal` model starts from its terminal cost when `terminal_cost` is set; its
+transitions are exactly this sweep's closed loop.
 
 A `:hold` model is stationary, so its sequence is too: `P_t ≡ P` and
 `W_t ≡ (I + S P)⁻¹` from the DARE, and `g_{t+1} = G [1; u_t]` — the feedforward
@@ -2555,7 +2739,9 @@ function lqr_riccati_sequence(
     ux_mat = _lqr_input_matrix(sm, ux, tsteps)
     has_input = size(ux_mat, 1) > 0
 
-    if sm.terminal
+    #= A `:causal` model has no terminal factor, but plans against a terminal
+    cost when `causal.terminal_cost` is set — the same start for the sweep. =#
+    if (_is_causal(sm) ? sm.causal.terminal_cost : sm.terminal)
         kT = _terminal_regime(sm, tsteps)
         copyto!(P[tsteps], sm.Qc[kT])
         copyto!(g[tsteps], sm.hf)
