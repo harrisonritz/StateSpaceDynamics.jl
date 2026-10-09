@@ -237,7 +237,9 @@ function _aggregate_lqr_stats!(
     serial_below::Int=_AGGREGATE_SERIAL_WORK,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
-    _is_causal(sm) && return _aggregate_causal_stats!(hs, tfs, lds, data, trials)
+    _is_causal(sm) && return _aggregate_causal_stats!(
+        hs, tfs, lds, data, trials; serial_below=serial_below
+    )
     d = lds.latent_dim
     m = lds.ux_dim
     reg = d + 1 + m
@@ -1799,15 +1801,44 @@ function _lqr_unpack!(ctx::_LQRMStepCtx{T}, θ::AbstractVector{T}) where {T<:Rea
 end
 
 """
+    _causal_sweeps!(ctx) -> Bool
+
+Every active `:causal` unit's backward sweeps at the unpacked parameters, each
+into its own scratch, so a grouped fit's units sweep in parallel. `false` when
+any sweep is not finite.
+"""
+function _causal_sweeps!(ctx::_LQRMStepCtx)
+    us = [ui for (ui, u) in enumerate(ctx.units) if u.causal && ctx.active_q[u.q]]
+    function sweep(ui)
+        v = ctx.units[ui].v
+        return _causal_sweep_scratch!(
+            ctx.causal[ui],
+            ctx.A[v[_LQR_BLOCK_A]],
+            ctx.S[v[_LQR_BLOCK_S]],
+            ctx.Qc[v[_LQR_BLOCK_Q]],
+            ctx.h[v[_LQR_BLOCK_H]],
+            ctx.Bu[v[_LQR_BLOCK_B]],
+            ctx.Gref[v[_LQR_BLOCK_G]],
+            ctx.hf[v[_LQR_BLOCK_F]],
+            ctx.sms[1],
+        )
+    end
+    (length(us) <= 1 || Threads.nthreads() == 1) && return all(sweep, us)
+    return tmapreduce(sweep, &, us)
+end
+
+"""
     _lqr_assemble!(ctx) -> Bool
 
 Build every unit's design from the unpacked parameters: `Θ_k` (and the terminal
-`Ψ_k`) for an `:lqr` unit, and for a `:hold` unit its steady state — the DARE
-solution and everything derived from it, see [`_hold_steady_state!`](@ref) —
-with `Lh` and `Θh = [A 0 F; 0 0 G]`.
+`Ψ_k`) for an `:lqr` unit, the backward sweeps for a `:causal` one (see
+`_causal_sweeps!`), and for a `:hold` unit its steady state — the DARE solution
+and everything derived from it, see [`_hold_steady_state!`](@ref) — with `Lh`
+and `Θh = [A 0 F; 0 0 G]`.
 
-Returns `false` when some active hold unit has no stabilizing DARE solution at
-these parameters, which the objective reports as an infeasible point.
+Returns `false` when some active hold unit has no stabilizing DARE solution, or
+some causal sweep is not finite, at these parameters, which the objective
+reports as an infeasible point.
 """
 function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     p = ctx.pack
@@ -1816,26 +1847,13 @@ function _lqr_assemble!(ctx::_LQRMStepCtx{T}) where {T<:Real}
     ur = (d + 1):(d + 1 + m)
     terminal = ctx.terminal
     gate = ctx.sms[1].gref_gate
+    _causal_sweeps!(ctx) || return false
     for (ui, u) in enumerate(ctx.units)
         A = ctx.A[u.v[_LQR_BLOCK_A]]
         S = ctx.S[u.v[_LQR_BLOCK_S]]
         Qs = ctx.Qc[u.v[_LQR_BLOCK_Q]]
         hv = ctx.h[u.v[_LQR_BLOCK_H]]
-        if u.causal
-            ctx.active_q[u.q] || continue
-            _causal_sweep_scratch!(
-                ctx.causal[ui],
-                A,
-                S,
-                Qs,
-                hv,
-                ctx.Bu[u.v[_LQR_BLOCK_B]],
-                ctx.Gref[u.v[_LQR_BLOCK_G]],
-                ctx.hf[u.v[_LQR_BLOCK_F]],
-                ctx.sms[1],
-            ) || return false
-            continue
-        end
+        u.causal && continue                 # swept above
         if u.hold
             ctx.active_q[u.q] || continue
             H = ctx.hold[ui]

@@ -458,20 +458,56 @@ function _refresh_causal_head!(
     fill!(c.bfwd, zero(T))
     c.Qfwd = PDMat(Symmetrize!(Matrix{T}(sm.Σ)))
     m = size(sm.Bu, 2)
+    fresh = Pair{NTuple{2,Int},_CausalHorizon{T}}[]
+    targets = _CausalHorizon{T}[]
     for key in c.causal_keys
         slot = get(c.causal_index, key, 0)
         if slot == 0
-            #= Filled before it is indexed: a sweep that throws must not leave an
-            all-zero horizon behind for a caller that catches the error. =#
             H = _CausalHorizon(T, n, m, key[1], key[2])
-            _fill_causal_horizon!(H, sm, c.Qfwd)
-            push!(c.causal, H)
-            c.causal_index[key] = length(c.causal)
+            push!(fresh, key => H)
+            push!(targets, H)
         else
-            _fill_causal_horizon!(c.causal[slot], sm, c.Qfwd)
+            push!(targets, c.causal[slot])
         end
     end
+    _fill_causal_horizons!(targets, sm, c.Qfwd)
+    #= Indexed only once filled: a sweep that throws must not leave an all-zero
+    horizon behind for a caller that catches the error. =#
+    for (key, H) in fresh
+        push!(c.causal, H)
+        c.causal_index[key] = length(c.causal)
+    end
     return nothing
+end
+
+"""
+    _fill_causal_horizons!(Hs, sm, B)
+
+`_fill_causal_horizon!` for every horizon of `Hs`, in parallel when there
+are several: each reads only the model and writes only its own horizon. A
+failure is rethrown as itself (the first, in `Hs` order), not wrapped in a task
+error, since callers tell an infeasible point by its type.
+"""
+function _fill_causal_horizons!(
+    Hs::AbstractVector{<:_CausalHorizon}, sm::LQRStateModel, B::PDMat
+)
+    if length(Hs) <= 1 || Threads.nthreads() == 1
+        foreach(H -> _fill_causal_horizon!(H, sm, B), Hs)
+        return Hs
+    end
+    failures = Vector{Any}(nothing, length(Hs))
+    tforeach(eachindex(Hs)) do i
+        try
+            _fill_causal_horizon!(Hs[i], sm, B)
+        catch err
+            failures[i] = err
+        end
+        return nothing
+    end
+    for err in failures
+        err === nothing || throw(err)
+    end
+    return Hs
 end
 
 """
@@ -998,7 +1034,7 @@ function _causal_stats_slot!(hs, key::NTuple{2,Int}, tsteps::Int, d::Int, reg::I
 end
 
 """
-    _aggregate_causal_stats!(hs, tfs, lds, data[, trials]) -> hs
+    _aggregate_causal_stats!(hs, tfs, lds, data[, trials]; serial_below) -> hs
 
 Per-horizon, per-transition statistics of a `:causal` model from the smoother
 output (see the `causal_*` fields of [`LQRSufficientStatistics`](@ref)), one
@@ -1007,14 +1043,16 @@ exactly the given trials' — which is what lets [`trial_elbos`](@ref) score one
 trial through the same path.
 
 `nk[1]` is set to the total transition count, which is what the M-step's units
-and noise versions count; the other regime blocks stay zero.
+and noise versions count; the other regime blocks stay zero. The blocks are
+filled in parallel from `serial_below` units of work (transitions × reg²).
 """
 function _aggregate_causal_stats!(
     hs,
     tfs::TrialFilterSmooth{T},
     lds::LinearDynamicalSystem{T,S,O},
     data::Data{T},
-    trials::AbstractVector{Int}=Base.OneTo(length(tfs)),
+    trials::AbstractVector{Int}=Base.OneTo(length(tfs));
+    serial_below::Int=_AGGREGATE_SERIAL_WORK,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     d = lds.latent_dim
@@ -1038,7 +1076,6 @@ function _aggregate_causal_stats!(
         foreach(Z -> fill!(Z, zero(T)), hs.causal_yy[h])
         hs.causal_n[h] = zero(T)
     end
-    w = Vector{T}(undef, reg)
     ntrans = zero(T)
     index = Dict{NTuple{2,Int},Int}(k => i for (i, k) in enumerate(hs.causal_keys))
     #=
@@ -1062,15 +1099,12 @@ function _aggregate_causal_stats!(
         e = ending(trial)
         longest[e] = max(get(longest, e, 0), size(tfs[trial].x_smooth, 2))
     end
+    # Each trial's horizon and its shift on it.
+    members = Dict{Int,Vector{NTuple{2,Int}}}()
     for trial in trials
-        fs = tfs[trial]
-        x = fs.x_smooth::Matrix{T}
-        p_smooth = fs.p_smooth::Array{T,3}
-        p_tt1 = fs.p_smooth_tt1::Array{T,3}
-        T_n = size(x, 2)
+        T_n = size(tfs[trial].x_smooth, 2)
         e = ending(trial)
         Th = longest[e]
-        shift = Th - T_n
         #= The longest trial's own key, so the horizon is one the entry point
         registered (the cache's sweep is what the ELBO term reads). =#
         key = _causal_key(sm, e - Th, Th)
@@ -1079,15 +1113,27 @@ function _aggregate_causal_stats!(
             h = _causal_stats_slot!(hs, key, Th, d, reg)
             index[key] = h
         end
+        push!(get!(() -> NTuple{2,Int}[], members, h), (trial, Th - T_n))
         hs.causal_n[h] += T(T_n - 1)
         ntrans += T(T_n - 1)
-        ux = data.ux[trial]
+    end
+
+    #= Block `(h, s)` is a sum over the trials of horizon `h` that cover step
+    `s`, taken in trial order, and no two blocks share an array: the blocks run
+    in parallel and give the serial sums' bits. =#
+    blocks = NTuple{2,Int}[(h, s) for h in sort!(collect(keys(members))) for
+                           s in 1:(hs.causal_keys[h][2] - 1)]
+    function fill_block!(w, h, s)
+        zz, zy, yy = hs.causal_zz[h][s], hs.causal_zy[h][s], hs.causal_yy[h][s]
         w[d + 1] = one(T)
-        m > 0 && @views w[(d + 2):reg] .= ux[:, 1]
-        for t in 1:(T_n - 1)
-            zz = hs.causal_zz[h][t + shift]
-            zy = hs.causal_zy[h][t + shift]
-            yy = hs.causal_yy[h][t + shift]
+        for (trial, shift) in members[h]
+            fs = tfs[trial]
+            x = fs.x_smooth::Matrix{T}
+            t = s - shift                    # the trial's own transition
+            1 <= t <= size(x, 2) - 1 || continue
+            p_smooth = fs.p_smooth::Array{T,3}
+            p_tt1 = fs.p_smooth_tt1::Array{T,3}
+            m > 0 && @views w[(d + 2):reg] .= data.ux[trial][:, 1]
             @views w[1:d] .= x[:, t]
             z_next = tview(x, :, t + 1)
             BLAS.ger!(one(T), w, w, zz)
@@ -1099,6 +1145,20 @@ function _aggregate_causal_stats!(
                 zy[1:d, :] .+= adjoint(p_tt1[:, :, t + 1])
             end
         end
+        return nothing
+    end
+    function fill_chunk!(chunk)
+        w = Vector{T}(undef, reg)
+        for i in chunk
+            fill_block!(w, blocks[i]...)
+        end
+        return nothing
+    end
+    chunks = _reduction_chunks(length(blocks))
+    if ntrans * reg^2 < serial_below || Threads.nthreads() == 1
+        foreach(fill_chunk!, chunks)
+    else
+        tforeach(fill_chunk!, chunks)
     end
     isempty(hs.nk) || (hs.nk[1] = ntrans)
     return hs

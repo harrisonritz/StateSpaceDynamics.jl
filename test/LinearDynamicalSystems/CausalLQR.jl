@@ -463,6 +463,12 @@ function test_causal_end_alignment()
         # Each end bin's longest trial: its own key, so a registered horizon.
         @test sort(hs.causal_keys) == [(0, 12), (0, 14), (1, 12), (2, 14)]
         @test sum(hs.causal_n) == sum(lengths .- 1)
+        # The blocks filled in parallel, forced here: the serial sums' bits.
+        par = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+        SSD._aggregate_causal_stats!(par, tfs, lds, data; serial_below=0)
+        @test par.causal_keys == hs.causal_keys
+        @test par.causal_zz == hs.causal_zz && par.causal_zy == hs.causal_zy
+        @test par.causal_yy == hs.causal_yy && par.causal_n == hs.causal_n
 
         ref = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
         one = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
