@@ -111,9 +111,10 @@ mutable struct LQRSufficientStatistics{T<:Real,B}
     transition and noise vary with `t`, so they cannot be summed over time.
     Over `w̃ = [z_t; 1; u]`: `causal_zz[h][t] = Σ E[w̃ w̃ᵀ]`,
     `causal_zy[h][t] = Σ E[w̃ z_{t+1}ᵀ]`, `causal_yy[h][t] = Σ E[z_{t+1} z_{t+1}ᵀ]`,
-    and `causal_n[h]` the transitions it holds. Without a schedule every trial
-    is aligned at the end of the longest one's horizon (see
-    `_aggregate_causal_stats!`). Empty in every other mode. =#
+    and `causal_n[h]` the transitions it holds. Trials ending on the same
+    schedule bin (without a schedule, every trial) are aligned at the end of the
+    longest one's horizon (see `_aggregate_causal_stats!`). Empty in every other
+    mode. =#
     const causal_keys::Vector{NTuple{2,Int}}
     const causal_zz::Vector{Vector{Matrix{T}}}
     const causal_zy::Vector{Vector{Matrix{T}}}
@@ -2503,10 +2504,19 @@ function _lqr_structure_mstep!(
                 _lqr_fg!(G, θ, ctx)
                 return G
             end
+            #= The gradient pass computes the objective on the way. Given only `f`
+            and `g!`, Optim builds the pair the line search asks for as `g!` then
+            `f`, paying for the objective twice at nearly every point. =#
+            fg_obj!(G, θ) = _lqr_fg!(G, θ, ctx)
             opts = Optim.Options(;
                 x_abstol=1e-10, g_abstol=1e-9, f_reltol=1e-12, iterations=mstep_iters
             )
-            result = optimize(f_obj, g_obj!, θ0, LBFGS(; linesearch=HagerZhang()), opts)
+            result = optimize(
+                Optim.OnceDifferentiable(f_obj, g_obj!, fg_obj!, θ0),
+                θ0,
+                LBFGS(; linesearch=HagerZhang()),
+                opts,
+            )
             θ1 = Optim.minimizer(result)
             f1 = _lqr_fg!(nothing, θ1, ctx)
             #=
