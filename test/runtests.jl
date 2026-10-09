@@ -596,6 +596,7 @@ using SSDTest
             test_causal_exact_loglikelihood()
             test_causal_sampling()
             test_causal_mstep_gradient()
+            test_causal_end_alignment()
             test_causal_noise_update()
             test_causal_em()
             test_causal_depends_on()

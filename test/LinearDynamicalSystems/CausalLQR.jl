@@ -437,6 +437,75 @@ function test_causal_mstep_gradient()
     return nothing
 end
 
+"""
+Trials ending on the same schedule bin share their sweep, so their statistics
+are aligned at that bin, one horizon per end bin. Everything the M-step and the
+ELBO read must be what the per-trial layout — one horizon per `(offset, length)`,
+each trial alone, pooled by key — gives.
+"""
+function test_causal_end_alignment()
+    for slack in (true, false)
+        rng = StableRNG(45)
+        sm, lds = causal_fixture(rng; nreg=3, m=1, tmax=16, slack=slack)
+        # Ends at 12, 12, 12, 14, 14, 16, 13, 16: four end bins, eight (offset, length).
+        offs = [0, 2, 1, 0, 3, 2, 1, 4]
+        lengths = [12, 10, 11, 14, 11, 14, 12, 12]
+        ux = causal_inputs(rng, 1, lengths)
+        _, y = rand(rng, lds, lengths; ux=ux, cost_offset=offs)
+        data = SSD.Data(lds, y; ux=ux, cost_offset=offs)
+        # The smoother buckets trials by (length, offset), as `elbo` does.
+        SSD._prepare_lqr!(lds, data; offsets_ok=true)
+        tfs = SSD.initialize_FilterSmooth(lds, data.tsteps)
+        pool = SSD._lqr_sws_pool(lds, data)
+        hs = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+        SSD._td_init_const_blocks!(pool[1], lds, data)
+        SSD.estep!(lds, hs, tfs, data, pool)
+        # Each end bin's longest trial: its own key, so a registered horizon.
+        @test sort(hs.causal_keys) == [(0, 12), (0, 14), (1, 12), (2, 14)]
+        @test sum(hs.causal_n) == sum(lengths .- 1)
+
+        ref = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+        one = SSD._initialize_td_sufficient_statistics(Float64, lds, data.tsteps)
+        for i in eachindex(lengths)
+            SSD._aggregate_causal_stats!(one, tfs, lds, data, [i])
+            SSD._pool_causal_stats!(ref, one)
+        end
+        ref.nk .= hs.nk
+        @test length(ref.causal_keys) == 8
+        q, qref = SSD._causal_Q_transition(sm, hs), SSD._causal_Q_transition(sm, ref)
+        @test q ≈ qref rtol = 1e-12
+
+        for profile in (true, false)
+            ctx = SSD._LQRMStepCtx(hs, sm, profile)
+            cref = SSD._LQRMStepCtx(ref, sm, profile)
+            np = SSD._lqr_nparams(ctx)
+            θ = zeros(np)
+            SSD._lqr_pack!(θ, ctx)
+            θ .+= 0.01 .* randn(StableRNG(46), np)
+            g, gr = similar(θ), similar(θ)
+            f = SSD._lqr_fg!(g, θ, ctx)
+            @test f ≈ SSD._lqr_fg!(gr, θ, cref) rtol = 1e-12
+            @test g ≈ gr rtol = 1e-10
+            #= The per-transition loops run in fixed chunks, threaded when there
+            is work enough: forced here, they give the serial loops' bits. =#
+            foreach(sc -> sc.serial_below[] = 0, ctx.causal)
+            gt = similar(θ)
+            @test SSD._lqr_fg!(gt, θ, ctx) == f
+            @test gt == g
+            h = 1e-6
+            gd = map(1:np) do i
+                e = zeros(np)
+                e[i] = h
+                fp = SSD._lqr_fg!(nothing, θ .+ e, ctx)
+                fm = SSD._lqr_fg!(nothing, θ .- e, ctx)
+                return (fp - fm) / 2h
+            end
+            @test norm(g - gd) / norm(gd) < 1e-6
+        end
+    end
+    return nothing
+end
+
 function test_causal_noise_update()
     # Dense, no prior: R/N per block; the cross blocks stay zero.
     for (pn, cn, prior, fixed) in (

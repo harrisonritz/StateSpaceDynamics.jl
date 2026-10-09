@@ -1001,9 +1001,10 @@ end
     _aggregate_causal_stats!(hs, tfs, lds, data[, trials]) -> hs
 
 Per-horizon, per-transition statistics of a `:causal` model from the smoother
-output (see the `causal_*` fields of [`LQRSufficientStatistics`](@ref)). Every
-block is zeroed first, so the result is exactly the given trials' — which is
-what lets [`trial_elbos`](@ref) score one trial through the same path.
+output (see the `causal_*` fields of [`LQRSufficientStatistics`](@ref)), one
+horizon per bin the trials end on. Every block is zeroed first, so the result is
+exactly the given trials' — which is what lets [`trial_elbos`](@ref) score one
+trial through the same path.
 
 `nk[1]` is set to the total transition count, which is what the M-step's units
 and noise versions count; the other regime blocks stay zero.
@@ -1041,24 +1042,38 @@ function _aggregate_causal_stats!(
     ntrans = zero(T)
     index = Dict{NTuple{2,Int},Int}(k => i for (i, k) in enumerate(hs.causal_keys))
     #=
-    Without a schedule the sweep depends only on the steps left, so transition
-    `t` of a trial of length `T_n` is transition `t + (L − T_n)` of the longest
-    trial's horizon `L`: every trial is aligned at the end of that one horizon.
-    The M-step then visits `L − 1` transitions however ragged the data are,
-    rather than one block per (length, step). With a schedule the sweep reads
-    the trial's own stretch of it, and each horizon keeps its own statistics.
+    The sweep at step `s` of a horizon reads the schedule from bin `s + offset`
+    to the trial's last bin, and starts from that bin's terminal cost, so two
+    trials ending on the same bin of the schedule's axis share every step they
+    both cover. Transition `t` of a trial of length `T_n` is transition
+    `t + (L − T_n)` of the longest trial `L` ending on its bin: every trial is
+    aligned at the end of that one horizon, and the M-step visits one block per
+    (end bin, step) rather than one per (offset, length, step) — on reaching
+    data whose trials all end at the target, a handful of horizons in place of
+    one per start time. Without a schedule the offset is invisible and every
+    trial ends "on the same bin".
     =#
-    align = isempty(sm.schedule)
-    L = align ? maximum(t -> size(tfs[t].x_smooth, 2), trials; init=0) : 0
+    function ending(trial)
+        isempty(sm.schedule) && return 0
+        return _trial_cost_offset(data, trial) + size(tfs[trial].x_smooth, 2)
+    end
+    longest = Dict{Int,Int}()
+    for trial in trials
+        e = ending(trial)
+        longest[e] = max(get(longest, e, 0), size(tfs[trial].x_smooth, 2))
+    end
     for trial in trials
         fs = tfs[trial]
         x = fs.x_smooth::Matrix{T}
         p_smooth = fs.p_smooth::Array{T,3}
         p_tt1 = fs.p_smooth_tt1::Array{T,3}
         T_n = size(x, 2)
-        Th = align ? L : T_n
+        e = ending(trial)
+        Th = longest[e]
         shift = Th - T_n
-        key = _causal_key(sm, _trial_cost_offset(data, trial), Th)
+        #= The longest trial's own key, so the horizon is one the entry point
+        registered (the cache's sweep is what the ELBO term reads). =#
+        key = _causal_key(sm, e - Th, Th)
         h = get(index, key, 0)
         if h == 0
             h = _causal_stats_slot!(hs, key, Th, d, reg)
@@ -1146,11 +1161,55 @@ end
 # ============================================================================
 
 """
+    _CausalLane{T}
+
+One chunk's share of a causal unit's per-transition work: the transition's design
+`L`, `Θ` and their adjoints, and the chunk's partial sums of what every
+transition adds into — the scatter `R` and the gradient blocks shared across
+transitions (`A`, `S`, `C̃`). See `_causal_foreach_transition!`.
+"""
+struct _CausalLane{T<:Real}
+    L::Matrix{T}
+    Th::Matrix{T}
+    Lbar::Matrix{T}
+    Thbar::Matrix{T}
+    dd::Matrix{T}
+    dr::Matrix{T}
+    Y::Matrix{T}
+    V::Matrix{T}
+    R::Matrix{T}
+    dA::Matrix{T}
+    dS::Matrix{T}
+    Ctbar::Matrix{T}
+end
+
+function _CausalLane(::Type{T}, n::Int, m::Int) where {T}
+    d = 2n
+    reg = d + 1 + m
+    return _CausalLane{T}(
+        zeros(T, d, d),
+        zeros(T, d, reg),
+        zeros(T, d, d),
+        zeros(T, d, reg),
+        zeros(T, d, d),
+        zeros(T, d, reg),
+        zeros(T, n, 1 + m),
+        zeros(T, n, 1 + m),
+        zeros(T, d, d),
+        zeros(T, n, n),
+        zeros(T, n, n),
+        zeros(T, n, 1 + m),
+    )
+end
+
+"""
     _CausalScratch{T}
 
 A causal unit's sweeps and adjoints per horizon (`keys` matches the unit's
-statistics), plus the per-transition design scratch. A non-causal unit carries an
-empty one.
+statistics), the reverse sweep's scratch, and one `_CausalLane` per
+chunk in flight for the per-transition loops, which thread from `serial_below`
+units of work (`_CAUSAL_SERIAL_WORK`; a test lowers it to reach the threaded
+path on a small model). A non-causal unit carries an empty one.
 """
 struct _CausalScratch{T<:Real}
     keys::Vector{NTuple{2,Int}}
@@ -1160,15 +1219,8 @@ struct _CausalScratch{T<:Real}
     Pbar::Vector{Vector{Matrix{T}}}
     Wbar::Vector{Vector{Matrix{T}}}
     Gbar::Vector{Vector{Matrix{T}}}
-    L::Matrix{T}
-    Th::Matrix{T}
-    Lbar::Matrix{T}
-    Thbar::Matrix{T}
-    dd::Matrix{T}
-    dr::Matrix{T}
     Ct::Matrix{T}
     Ctbar::Matrix{T}
-    Y::Matrix{T}
     V::Matrix{T}
     Vbar::Matrix{T}
     K::Matrix{T}
@@ -1177,16 +1229,17 @@ struct _CausalScratch{T<:Real}
     nn2::Matrix{T}
     Imat::Matrix{T}
     sweep::_SweepBuffers{T}
+    lanes::Vector{_CausalLane{T}}
+    serial_below::Base.RefValue{Int}
 end
 
 function _CausalScratch(
     ::Type{T}, keys::Vector{NTuple{2,Int}}, n::Int, m::Int, K::Int=1
 ) where {T}
-    d = 2n
-    reg = d + 1 + m
     per(f) = [[f() for _ in 1:key[2]] for key in keys]
     nn() = zeros(T, n, n)
     nu() = zeros(T, n, 1 + m)
+    nlanes = clamp(Threads.nthreads(), 1, _REDUCTION_CHUNKS)
     return _CausalScratch{T}(
         copy(keys),
         per(nn),
@@ -1195,13 +1248,6 @@ function _CausalScratch(
         per(nn),
         per(nn),
         per(nu),
-        zeros(T, d, d),
-        zeros(T, d, reg),
-        zeros(T, d, d),
-        zeros(T, d, reg),
-        zeros(T, d, d),
-        zeros(T, d, reg),
-        nu(),
         nu(),
         nu(),
         nu(),
@@ -1212,6 +1258,8 @@ function _CausalScratch(
         nn(),
         Matrix{T}(I, n, n),
         _SweepBuffers(T, n, m, K),
+        [_CausalLane(T, n, m) for _ in 1:nlanes],
+        Ref(_CAUSAL_SERIAL_WORK),
     )
 end
 
@@ -1239,39 +1287,33 @@ function _causal_sweep_scratch!(
 end
 
 """
-    _causal_design!(sc, h, t, A, S, slack)
+    _causal_design!(lane, Ct, Ws, Ps, Gs, A, S, slack)
 
-`L_t` and `Θ_t` of transition `t` of horizon `h` into `sc.L`, `sc.Th`.
+`L_t` and `Θ_t` of the transition whose next step sweeps to `Ws`, `Ps`, `Gs`
+into `lane.L`, `lane.Th`; `Ct` is `C̃ = [h_x  B_{u,x}]`.
 """
 function _causal_design!(
-    sc::_CausalScratch{T}, h::Int, t::Int, A, S, slack::Bool
-) where {T<:Real}
-    s = t + 1
-    return _causal_design!(sc, sc.W[h][s], sc.P[h][s], sc.G[h][s], A, S, slack)
-end
-
-function _causal_design!(
-    sc::_CausalScratch{T}, Ws, Ps, Gs, A, S, slack::Bool
+    lane::_CausalLane{T}, Ct, Ws, Ps, Gs, A, S, slack::Bool
 ) where {T<:Real}
     n = size(A, 1)
     d = 2n
     xr, lr = 1:n, (n + 1):d
-    ur = (d + 1):size(sc.Th, 2)
-    L, Th = sc.L, sc.Th
+    ur = (d + 1):size(lane.Th, 2)
+    L, Th = lane.L, lane.Th
     fill!(L, zero(T))
     fill!(Th, zero(T))
     @views begin
         if slack
             L[xr, xr] .= Ws
             mul!(L[xr, lr], Ws, S)
-            mul!(Th[xr, ur], Ws, sc.Ct)
+            mul!(Th[xr, ur], Ws, Ct)
         else
             for i in 1:n
                 L[i, i] = one(T)
             end
-            copyto!(sc.Y, sc.Ct)
-            mul!(sc.Y, S, Gs, -one(T), one(T))
-            mul!(Th[xr, ur], Ws, sc.Y)
+            copyto!(lane.Y, Ct)
+            mul!(lane.Y, S, Gs, -one(T), one(T))
+            mul!(Th[xr, ur], Ws, lane.Y)
         end
         L[lr, xr] .= .-Ps
         for i in 1:n
@@ -1279,6 +1321,75 @@ function _causal_design!(
         end
         mul!(Th[xr, xr], Ws, A)
         Th[lr, ur] .= Gs
+    end
+    return nothing
+end
+
+#=
+Below this much work (transitions × d³) a per-transition loop runs its chunks on
+the calling task: L-BFGS evaluates the objective a few hundred times per M-step,
+and on a small model waking the worker threads for each would cost more than the
+loop. The chunks and their reduction order are fixed by the transition count
+alone, so both ways give the same bits.
+=#
+const _CAUSAL_SERIAL_WORK = 1 << 22
+
+"""
+    _causal_transitions(hs) -> Vector{NTuple{2,Int}}
+
+The `(horizon, transition)` pairs of a unit's statistics, in order, without the
+horizons no trial reached.
+"""
+function _causal_transitions(hs)
+    items = NTuple{2,Int}[]
+    for (h, key) in enumerate(hs.causal_keys)
+        hs.causal_n[h] > zero(eltype(hs.causal_n)) || continue
+        for t in 1:(key[2] - 1)
+            push!(items, (h, t))
+        end
+    end
+    return items
+end
+
+"""
+    _causal_foreach_transition!(body!, reduce!, sc, items, d)
+
+Run `body!(lane, h, t)` for every `(h, t)` of `items`, threaded over fixed chunks
+of them (`_reduction_chunks`). Each chunk works in its own
+`_CausalLane`, whose accumulators start at zero, and `reduce!(lane)` adds
+them into the totals in chunk order, so the result depends on `items` alone and
+not on the thread count. Besides its lane, `body!` may write only blocks that
+belong to its own transition.
+
+The transitions are the M-step's hot loop: each costs a handful of `d × d` and
+`d × (d + 1 + m)` products, and a fit has one per (end bin, step) per unit.
+"""
+function _causal_foreach_transition!(
+    body!, reduce!, sc::_CausalScratch{T}, items::AbstractVector, d::Int
+) where {T<:Real}
+    chunks = _reduction_chunks(length(items))
+    serial = length(items) * d^3 < sc.serial_below[]
+    nbuf = serial ? 1 : min(length(chunks), length(sc.lanes))
+    function accumulate!(slot, chunk)
+        lane = sc.lanes[slot]
+        fill!(lane.R, zero(T))
+        fill!(lane.dA, zero(T))
+        fill!(lane.dS, zero(T))
+        fill!(lane.Ctbar, zero(T))
+        for i in chunk
+            h, t = items[i]
+            body!(lane, h, t)
+        end
+        return nothing
+    end
+    reduce_slot!(slot) = reduce!(sc.lanes[slot])
+    if nbuf == 1
+        for chunk in chunks
+            accumulate!(1, chunk)
+            reduce_slot!(1)
+        end
+    else
+        _foreach_chunk_wave(accumulate!, reduce_slot!, chunks, nbuf)
     end
     return nothing
 end
@@ -1302,23 +1413,27 @@ function _causal_add_scatter!(
     #= `Wv[h]`, `Pv[h]`, `Gv[h]` are horizon `h`'s sweep, in the order of
     `hs.causal_keys` — the scratch's own (built in that order) in the M-step, the
     cache's in the ELBO. A horizon no trial reached adds nothing and is skipped. =#
-    for (h, key) in enumerate(hs.causal_keys)
-        hs.causal_n[h] > zero(T) || continue
-        for t in 1:(key[2] - 1)
-            s = t + 1
-            _causal_design!(sc, Wv[h][s], Pv[h][s], Gv[h][s], A, S, slack)
-            zz, zy, yy = hs.causal_zz[h][t], hs.causal_zy[h][t], hs.causal_yy[h][t]
-            # R += L Y Lᵀ − (L Zyᵀ Θᵀ + its transpose) + Θ Z Θᵀ
-            mul!(sc.dd, sc.L, yy)
-            mul!(R, sc.dd, transpose(sc.L), one(T), one(T))
-            mul!(sc.dr, sc.L, transpose(zy))
-            mul!(sc.dd, sc.dr, transpose(sc.Th))
-            R .-= sc.dd
-            R .-= transpose(sc.dd)
-            mul!(sc.dr, sc.Th, zz)
-            mul!(R, sc.dr, transpose(sc.Th), one(T), one(T))
-        end
+    function scatter!(lane, h, t)
+        s = t + 1
+        _causal_design!(lane, sc.Ct, Wv[h][s], Pv[h][s], Gv[h][s], A, S, slack)
+        zz, zy, yy = hs.causal_zz[h][t], hs.causal_zy[h][t], hs.causal_yy[h][t]
+        L, Th, dd, dr = lane.L, lane.Th, lane.dd, lane.dr
+        # R += L Y Lᵀ − (L Zyᵀ Θᵀ + its transpose) + Θ Z Θᵀ
+        mul!(dd, L, yy)
+        mul!(lane.R, dd, transpose(L), one(T), one(T))
+        mul!(dr, L, transpose(zy))
+        mul!(dd, dr, transpose(Th))
+        lane.R .-= dd
+        lane.R .-= transpose(dd)
+        mul!(dr, Th, zz)
+        mul!(lane.R, dr, transpose(Th), one(T), one(T))
+        return nothing
     end
+    function add!(lane)
+        R .+= lane.R
+        return nothing
+    end
+    _causal_foreach_transition!(scatter!, add!, sc, _causal_transitions(hs), size(R, 1))
     return R
 end
 
@@ -1354,56 +1469,71 @@ function _causal_unit_gradient!(
     slack = sm.causal.slack_drives_state
     gate = sm.gref_gate
     fill!(sc.Ctbar, zero(T))
+    # The scratch was built in `hs.causal_keys` order, so `h` indexes both.
+    for h in eachindex(sc.keys)
+        hs.causal_n[h] > zero(T) || continue
+        foreach(X -> fill!(X, zero(T)), sc.Pbar[h])
+        foreach(X -> fill!(X, zero(T)), sc.Wbar[h])
+        foreach(X -> fill!(X, zero(T)), sc.Gbar[h])
+    end
+
+    #= Residual pullbacks, transition by transition. Each writes its own step's
+    `W̄_s`, `P̄_s`, `Ḡ_s` and adds into its lane's `Ā`, `S̄`, `C̃̄`. =#
+    function pullback!(lane, h, t)
+        s = t + 1
+        Ws, Ps, Gs = sc.W[h][s], sc.P[h][s], sc.G[h][s]
+        Pbar, Wbar, Gbar = sc.Pbar[h], sc.Wbar[h], sc.Gbar[h]
+        _causal_design!(lane, sc.Ct, Ws, Ps, Gs, A, S, slack)
+        zz, zy, yy = hs.causal_zz[h][t], hs.causal_zy[h][t], hs.causal_yy[h][t]
+        L, Th, dd, dr = lane.L, lane.Th, lane.dd, lane.dr
+        # L̄ = 𝒲 (L Y − Θ Zy),  Θ̄ = 𝒲 (Θ Z − L Zyᵀ)
+        mul!(dd, L, yy)
+        mul!(dd, Th, zy, -one(T), one(T))
+        mul!(lane.Lbar, Wq, dd)
+        mul!(dr, Th, zz)
+        mul!(dr, L, transpose(zy), -one(T), one(T))
+        mul!(lane.Thbar, Wq, dr)
+        @views begin
+            L11, L12, L21 = lane.Lbar[xr, xr], lane.Lbar[xr, lr], lane.Lbar[lr, xr]
+            Txx, Txu, Tlu = lane.Thbar[xr, xr], lane.Thbar[xr, ur], lane.Thbar[lr, ur]
+            if slack
+                # L₁₁ = W, L₁₂ = W S, Θ_xu = W C̃
+                Wbar[s] .+= L11
+                mul!(Wbar[s], L12, S, one(T), one(T))
+                mul!(lane.dS, transpose(Ws), L12, one(T), one(T))
+                mul!(Wbar[s], Txu, transpose(sc.Ct), one(T), one(T))
+                mul!(lane.Ctbar, transpose(Ws), Txu, one(T), one(T))
+            else
+                # Θ_xu = W (C̃ − S G)
+                copyto!(lane.Y, sc.Ct)
+                mul!(lane.Y, S, Gs, -one(T), one(T))
+                mul!(Wbar[s], Txu, transpose(lane.Y), one(T), one(T))
+                mul!(lane.V, transpose(Ws), Txu)          # Wᵀ Θ̄_xu
+                lane.Ctbar .+= lane.V
+                mul!(lane.dS, lane.V, transpose(Gs), -one(T), one(T))
+                mul!(Gbar[s], S, lane.V, -one(T), one(T))
+            end
+            # L₂₁ = −P,  Θ_xx = W A,  Θ_λu = G
+            Pbar[s] .-= L21
+            mul!(Wbar[s], Txx, transpose(A), one(T), one(T))
+            mul!(lane.dA, transpose(Ws), Txx, one(T), one(T))
+            Gbar[s] .+= Tlu
+        end
+        return nothing
+    end
+    function add!(lane)
+        dA .+= lane.dA
+        dS .+= lane.dS
+        sc.Ctbar .+= lane.Ctbar
+        return nothing
+    end
+    _causal_foreach_transition!(pullback!, add!, sc, _causal_transitions(hs), d)
+
     for (h, key) in enumerate(sc.keys)
         off, Tn = key
-        hh = h                  # the scratch was built in `hs.causal_keys` order
         hs.causal_n[h] > zero(T) || continue
         P, W, G = sc.P[h], sc.W[h], sc.G[h]
         Pbar, Wbar, Gbar = sc.Pbar[h], sc.Wbar[h], sc.Gbar[h]
-        foreach(X -> fill!(X, zero(T)), Pbar)
-        foreach(X -> fill!(X, zero(T)), Wbar)
-        foreach(X -> fill!(X, zero(T)), Gbar)
-
-        # Residual pullbacks, transition by transition.
-        for t in 1:(Tn - 1)
-            s = t + 1
-            _causal_design!(sc, h, t, A, S, slack)
-            zz, zy, yy = hs.causal_zz[hh][t], hs.causal_zy[hh][t], hs.causal_yy[hh][t]
-            # L̄ = 𝒲 (L Y − Θ Zy),  Θ̄ = 𝒲 (Θ Z − L Zyᵀ)
-            mul!(sc.dd, sc.L, yy)
-            mul!(sc.dd, sc.Th, zy, -one(T), one(T))
-            mul!(sc.Lbar, Wq, sc.dd)
-            mul!(sc.dr, sc.Th, zz)
-            mul!(sc.dr, sc.L, transpose(zy), -one(T), one(T))
-            mul!(sc.Thbar, Wq, sc.dr)
-            Ws, Gs = W[s], G[s]
-            @views begin
-                L11, L12, L21 = sc.Lbar[xr, xr], sc.Lbar[xr, lr], sc.Lbar[lr, xr]
-                Txx, Txu, Tlu = sc.Thbar[xr, xr], sc.Thbar[xr, ur], sc.Thbar[lr, ur]
-                if slack
-                    # L₁₁ = W, L₁₂ = W S, Θ_xu = W C̃
-                    Wbar[s] .+= L11
-                    mul!(Wbar[s], L12, S, one(T), one(T))
-                    mul!(dS, transpose(Ws), L12, one(T), one(T))
-                    mul!(Wbar[s], Txu, transpose(sc.Ct), one(T), one(T))
-                    mul!(sc.Ctbar, transpose(Ws), Txu, one(T), one(T))
-                else
-                    # Θ_xu = W (C̃ − S G)
-                    copyto!(sc.Y, sc.Ct)
-                    mul!(sc.Y, S, Gs, -one(T), one(T))
-                    mul!(Wbar[s], Txu, transpose(sc.Y), one(T), one(T))
-                    mul!(sc.V, transpose(Ws), Txu)          # Wᵀ Θ̄_xu
-                    sc.Ctbar .+= sc.V
-                    mul!(dS, sc.V, transpose(Gs), -one(T), one(T))
-                    mul!(Gbar[s], S, sc.V, -one(T), one(T))
-                end
-                # L₂₁ = −P,  Θ_xx = W A,  Θ_λu = G
-                Pbar[s] .-= L21
-                mul!(Wbar[s], Txx, transpose(A), one(T), one(T))
-                mul!(dA, transpose(Ws), Txx, one(T), one(T))
-                Gbar[s] .+= Tlu
-            end
-        end
 
         # The sweeps in reverse.
         for s in 2:Tn
