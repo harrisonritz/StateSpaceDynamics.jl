@@ -1201,6 +1201,7 @@ function _build_variants!(
             D=Ds[s[1]],
             R_prior=om.R_prior,
             CD_prior=CD_priors[s[1]],
+            R_diagonal=om.R_diagonal,
         )
     end
     om.variants = variants

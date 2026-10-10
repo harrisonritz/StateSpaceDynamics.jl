@@ -230,6 +230,12 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
 - `variants::Union{Nothing,Vector{GaussianObservationModel{T,M,V}}} = nothing`: Derived
     storage for the per-group parameter sets; populated from `depends_on` by the fitting
     entry points. Parameters that do not vary are shared **by reference** across variants.
+- `R_diagonal::Bool = false`: Constrain `R` to be diagonal. The M-step then keeps only
+    the diagonal of the residual scatter (or of the IW MAP under `R_prior`), which is the
+    exact constrained maximiser — the factor-analysis noise model, where every channel has
+    its own variance and only the latents carry shared variability. With a full `R` a
+    wide emission (many units) can explain shared variance through `R` instead of the
+    latent state.
 """
 Base.@kwdef mutable struct GaussianObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -243,6 +249,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     depends_on::Union{Nothing,NamedTuple} = nothing
     group_seeds::Union{Nothing,AbstractDict} = nothing
     variants::Union{Nothing,Vector{GaussianObservationModel{T,M,V}}} = nothing
+    R_diagonal::Bool = false
 end
 
 # Convenience constructors (State)
@@ -482,18 +489,28 @@ were called `:C` (is it `models.C.kin`, or `models.kin.C`?).
 const _RESERVED_OBS_KEYS = (:models, :C, :d, :D, :R, :depends_on, :group_seeds, :variants)
 
 """
-    CompositeObservationModel(models::NamedTuple)
+    CompositeObservationModel(models::NamedTuple; quadratic=nothing)
 
 Bundle several observation models into one. Called for you by
 `LinearDynamicalSystem(state_model, models::NamedTuple)`; use it directly only
 when you want the composite on its own.
 
+`quadratic` picks the smoother regime (see [`QuadraticEmission`](@ref)). Left at
+`nothing` it is the `AND` over the members, as always. `quadratic=false` sends a
+composite of Gaussian members down the trial-by-trial Laplace path instead of the
+batched exact one: for Gaussian members the Newton smoother still lands on the
+exact posterior (one step), so the likelihood is the same to rounding, but each
+trial is solved on its own. That is what per-trial cost offsets need — the
+batched path shares one covariance per trial length, which assumes every trial
+reads the same stretch of a cost schedule — and it accepts the Newton keywords
+the Laplace path takes. `quadratic=true` with a non-quadratic member is an error.
+
 # Throws
 - `ArgumentError` on an empty `NamedTuple`, a member that is not an
-  `AbstractObservationModel`, a reserved key name, or members with different
-  element types.
+  `AbstractObservationModel`, a reserved key name, members with different
+  element types, or `quadratic=true` over a non-quadratic member.
 """
-function CompositeObservationModel(models::NamedTuple)
+function CompositeObservationModel(models::NamedTuple; quadratic::Union{Nothing,Bool}=nothing)
     isempty(models) && throw(
         ArgumentError(
             "a composite observation model needs at least one member; got an empty " *
@@ -530,6 +547,15 @@ function CompositeObservationModel(models::NamedTuple)
     end
 
     quad = _all_quadratic(values(models))
+    if quadratic !== nothing
+        quadratic && !quad && throw(
+            ArgumentError(
+                "quadratic=true needs every member to be quadratic (Gaussian); this " *
+                "composite has a non-quadratic member, which only the Laplace path fits",
+            ),
+        )
+        quad = quadratic
+    end
     return CompositeObservationModel{T,quad,typeof(models)}(models)
 end
 
