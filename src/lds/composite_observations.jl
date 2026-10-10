@@ -1416,7 +1416,7 @@ function _joint_loglikelihood_total(
     lds::LinearDynamicalSystem{T,S,O},
     x::AbstractMatrix{T},
     y::NamedTuple,
-    lognorms::NamedTuple,
+    lognorms::Union{Nothing,NamedTuple},
     ux::Union{Nothing,AbstractMatrix},
     uy::Union{Nothing,NamedTuple},
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:CompositeObservationModel{T}}
