@@ -717,6 +717,7 @@ using SSDTest
             test_lqr_switches_conditional_gradient()
             test_lqr_switches_grouped()
             test_lqr_switches_rand_forward()
+            test_lqr_switches_conditional_sampler()
             test_lqr_switches_validation()
         end
 

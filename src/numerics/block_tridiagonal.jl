@@ -433,6 +433,52 @@ function block_tridiagonal_inverse!(
 end
 
 """
+    block_tridiagonal_factor!(A, B, C, ws) -> logdet(H)
+
+The forward half of [`block_tridiagonal_inverse_logdet!`](@ref) on its own: the
+block-Thomas elimination `Mᵢ = Bᵢ − Aᵢ₋₁ Dᵢ`, `Dᵢ₊₁ = Mᵢ⁻¹ Cᵢ` of a symmetric
+positive definite block-tridiagonal `H`, with each `Mᵢ`'s upper Cholesky factor
+left in `ws.chol_factors[i]` and `Dᵢ₊₁` in `ws.D[i + 1]`. That is the block
+factorisation `H = Uᵀ blkdiag(M) U`, `U` unit upper block-bidiagonal with
+superdiagonal blocks `Dᵢ₊₁`, which is everything [`block_tridiagonal_backsubst!`](@ref)
+(solves) and [`block_tridiagonal_sample!`](@ref) (draws from `N(0, H⁻¹)`) read.
+
+For a caller that needs those and not the covariance blocks, this skips the
+backward recursion, which costs as much again. `O(n · bs³)` time and no storage
+beyond `ws`, so there is no dense `(n·bs)²` matrix anywhere.
+"""
+function block_tridiagonal_factor!(
+    A::AbstractVector{<:AbstractMatrix{T}},
+    B::AbstractVector{<:AbstractMatrix{T}},
+    C::AbstractVector{<:AbstractMatrix{T}},
+    ws::BlockTridiagonalWorkspace{T},
+) where {T<:Real}
+    n = length(B)
+    bs = ws.block_size
+    D = ws.D
+    Z = ws.Z
+    fill!(D[1], zero(T))
+    logdet_val = zero(T)
+    for i in 1:n
+        Ai = (i == 1) ? Z : A[i - 1]
+        Ci = (i <= length(C)) ? C[i] : Z
+
+        Mi = ws.chol_factors[i]
+        copyto!(Mi, B[i])
+        mul!(Mi, Ai, D[i], -one(T), one(T))
+        F = cholesky!(Symmetric(Mi, :U))
+
+        # log|det(Mᵢ)| = 2·Σ log U[j,j] for the cached upper factor.
+        for j in 1:bs
+            logdet_val += 2 * log(Mi[j, j])
+        end
+
+        ldiv!(D[i + 1], F, Ci)
+    end
+    return logdet_val
+end
+
+"""
     block_tridiagonal_inverse_logdet!(p_smooth, p_smooth_tt1, A, B, C, ws)
 
 Diagonal and first-off-diagonal blocks of `H⁻¹` for a symmetric positive
@@ -469,38 +515,15 @@ function block_tridiagonal_inverse_logdet!(
     ws::BlockTridiagonalWorkspace{T},
 ) where {T<:Real}
     n = length(B)
-    bs = ws.block_size
-
     D = ws.D
     Ibs = ws.Ibs
-    Z = ws.Z
-
-    fill!(D[1], zero(T))
-
-    # Accumulate log-determinant during forward sweep
-    logdet_val = zero(T)
 
     #=
     Forward sweep — caches each Schur complement's Cholesky upper-triangle
     factor into `ws.chol_factors[i]`, which the backward recursion below and
     `block_tridiagonal_backsubst!` both read back.
     =#
-    for i in 1:n
-        Ai = (i == 1) ? Z : A[i - 1]
-        Ci = (i <= length(C)) ? C[i] : Z
-
-        Mi = ws.chol_factors[i]
-        copyto!(Mi, B[i])
-        mul!(Mi, Ai, D[i], -one(T), one(T))
-        F = cholesky!(Symmetric(Mi, :U))
-
-        # log|det(Mᵢ)| = 2·Σ log U[j,j] for the cached upper factor.
-        for j in 1:bs
-            logdet_val += 2 * log(Mi[j, j])
-        end
-
-        ldiv!(D[i + 1], F, Ci)
-    end
+    logdet_val = block_tridiagonal_factor!(A, B, C, ws)
 
     #=
     Backward recursion. Nothing is factorised here: each step solves against a

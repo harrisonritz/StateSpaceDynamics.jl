@@ -68,6 +68,16 @@ end
 # Dense reference for one trial: forward moments of z, then the Gaussian marginal of
 # [y; goals]. Entry transition rebuilt from its definition, not from the cache.
 function _sb_dense_trial(lds, y, u, off; goals_only=false)
+    (; m, C, H, h0, R, v) = _sb_dense_parts(lds, y, u, off; goals_only=goals_only)
+    μo = H * m .+ h0
+    So = Symmetric(H * C * H' .+ R)
+    r = v .- μo
+    return -0.5 * (length(v) * log(2π) + logdet(So) + dot(r, So \ r))
+end
+
+# The pieces of that reference: the prior moments `m`, `C` of the stacked path, and
+# the linear-Gaussian observations `v = H z + h0 + noise(R)` stacked on top of it.
+function _sb_dense_parts(lds, y, u, off; goals_only=false)
     sm0 = lds.state_model
     sm = SSD._with_cost_offset(sm0, off)
     c = sm.cache
@@ -147,10 +157,7 @@ function _sb_dense_trial(lds, y, u, off; goals_only=false)
     h0 = vcat(shift...)
     R = cat(noise...; dims=(1, 2))
     v = vcat(vals...)
-    μo = H * m .+ h0
-    So = Symmetric(H * C * H' .+ R)
-    r = v .- μo
-    return -0.5 * (length(v) * log(2π) + logdet(So) + dot(r, So \ r))
+    return (; m, C, H, h0, R, v)
 end
 
 function test_lqr_switches_dense()
@@ -318,6 +325,73 @@ function test_lqr_switches_rand_forward()
         end
         @test maximum(abs, zbar[:, t + 1] .- m) < 0.05
     end
+    return nothing
+end
+
+"""
+With a terminal factor `rand` draws `z | goals = 0` — the trial end and any
+bridge the trial crosses — through the block-tridiagonal factorisation. Its
+mean and covariance must be the dense Gaussian conditional of the reference
+prior exactly: the sampler is linear in its standard normals, so `ξ = 0` is the
+mean and the unit vectors give a square root of the covariance. Covers entries,
+bridges, the reference gate, schedule offsets and a pinned terminal regime, and
+checks `rand` itself by Monte Carlo on one configuration.
+"""
+function test_lqr_switches_conditional_sampler()
+    configs = (
+        (gate=true, entry=true, bridge=true, pin=false),
+        (gate=false, entry=true, bridge=false, pin=true),
+        (gate=true, entry=false, bridge=true, pin=false),
+        (gate=false, entry=false, bridge=false, pin=false),
+    )
+    for cfg in configs
+        lds, rng = _sb_fixture(; gate=cfg.gate, entry=cfg.entry, bridge=cfg.bridge)
+        sm = lds.state_model
+        if cfg.pin
+            sm.terminal_regime = 2
+            refresh!(sm)
+        end
+        d = lds.latent_dim
+        for (T, off) in ((10, 0), (7, 3), (6, 4), (4, 5))
+            u = randn(rng, 2, T)
+            (; m, C, H, h0, R, v) = _sb_dense_parts(lds, nothing, u, off; goals_only=true)
+            So = Symmetric(H * C * H' .+ R)
+            gain = C * H' / So
+            μ = m .+ gain * (v .- (H * m .+ h0))
+            Σ = Symmetric(C .- gain * H * C)
+
+            SSD._prepare_lqr!(lds, [T], [off])
+            tl = SSD._with_cost_offset(lds, off)
+            z = zeros(d, T)
+            SSD._lqr_conditional_path!(z, tl, u, zeros(d * T))
+            mean_draw = vec(copy(z))
+            @test mean_draw ≈ μ rtol = 1e-8 atol = 1e-10
+            root = zeros(d * T, d * T)
+            for j in 1:(d * T)
+                e = zeros(d * T)
+                e[j] = 1
+                SSD._lqr_conditional_path!(z, tl, u, e)
+                root[:, j] .= vec(z) .- mean_draw
+            end
+            @test root * root' ≈ Σ rtol = 1e-8 atol = 1e-10
+        end
+    end
+
+    # `rand` end to end: the sample moments of many draws match the conditional.
+    lds, rng = _sb_fixture()
+    d = lds.latent_dim
+    T, off, N = 7, 3, 20000
+    u = randn(rng, 2, T)
+    (; m, C, H, h0, R, v) = _sb_dense_parts(lds, nothing, u, off; goals_only=true)
+    So = Symmetric(H * C * H' .+ R)
+    gain = C * H' / So
+    μ = m .+ gain * (v .- (H * m .+ h0))
+    Σ = Symmetric(C .- gain * H * C)
+    zs, _ = rand(StableRNG(11), lds, fill(T, N); ux=fill(u, N), cost_offset=fill(off, N))
+    Z = reduce(hcat, vec.(zs))
+    sd = sqrt.(diag(Σ))
+    @test maximum(abs.(vec(mean(Z; dims=2)) .- μ) ./ sd) < 5 / sqrt(N)
+    @test maximum(abs.(cov(Z; dims=2) .- Σ) ./ (sd * sd')) < 0.06
     return nothing
 end
 

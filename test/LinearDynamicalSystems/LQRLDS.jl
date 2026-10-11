@@ -1889,6 +1889,15 @@ function test_lqr_sampling()
     @test maximum(abs, zt) < 20
 
     @test_throws ArgumentError rand(StableRNG(5), ldst, tsteps; depends_on=(A=[1],))
+
+    # No size cap on the conditioned draw: `d·T` here is past the 4000 the dense
+    # factorisation it replaced refused, and the block factorisation is O(T d³).
+    long = 1100
+    smL, ldsL = lqr_fixture(rng; terminal=true, nregimes=2, tsteps=long)
+    zL, _ = rand(StableRNG(6), ldsL, long)
+    @test size(zL) == (d, long) && all(isfinite, zL)
+    residL = zL[(n + 1):d, end] .- smL.Qc[smL.schedule[end]] * zL[1:n, end] .- smL.hf
+    @test norm(residL) < 5 * sqrt(maximum(diag(smL.Σf))) * sqrt(n)
     return nothing
 end
 
