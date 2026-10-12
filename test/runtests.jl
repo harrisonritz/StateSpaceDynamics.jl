@@ -575,6 +575,14 @@ using SSDTest
             test_cost_offset_shared_suffix_gradient()
         end
 
+        include("LinearDynamicalSystems/GaussianEmissionOptions.jl")
+        @testset "Gaussian emission options" begin
+            test_r_diagonal_is_the_diagonal_of_the_full_update()
+            test_r_diagonal_survives_grouping()
+            test_composite_quadratic_keyword()
+            test_laplace_composite_matches_exact_and_fits_offsets()
+        end
+
         include("LinearDynamicalSystems/HoldLDS.jl")
         @testset "Hold (infinite-horizon LQR)" begin
             test_hold_dare()

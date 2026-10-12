@@ -311,6 +311,14 @@ function _finalize_R!(
         Ψ, ν = lds.obs_model.R_prior.Ψ, lds.obs_model.R_prior.ν
         S_res .= iw_map(Ψ, ν, S_res, N, p)
     end
+    #= A diagonal R's M-step is the diagonal of the unconstrained one: the
+    Gaussian objective in R separates over channels once the off-diagonals are
+    pinned at zero, and each channel's maximiser is its own residual variance. =#
+    if lds.obs_model.R_diagonal
+        for j in 1:p, i in 1:p
+            i == j || (S_res[i, j] = zero(T))
+        end
+    end
     copyto!(lds.obs_model.R, S_res)
     return nothing
 end
