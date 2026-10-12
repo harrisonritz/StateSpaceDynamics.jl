@@ -892,3 +892,34 @@ function test_grouped_show()
 
     return nothing
 end
+
+"""Partial state dependence shares only the unnamed regression blocks."""
+function test_partial_dynamics_dependence()
+    rng = StableRNG(911)
+    labels = repeat([:low, :high], 4)
+    ux = [randn(rng, 1, 40) for _ in labels]
+    y = [randn(rng, PD_OBS_DIM, 40) for _ in labels]
+    for names in ((:A,), (:b, :B), (:A, :b, :B))
+        sm = pd_state_model()
+        sm.B = fill(0.1, PD_LATENT_DIM, 1)
+        sm.depends_on = NamedTuple{names}(ntuple(_ -> labels, length(names)))
+        lds = LinearDynamicalSystem(sm, pd_obs_model();
+            fit_bool=[false, false, true, false, false, false])
+        before = elbo(lds, y; ux=ux)
+        trace = fit!(lds, y; ux=ux, max_iter=3, progress=false)
+        @test elbo(lds, y; ux=ux) >= before - 1e-8
+        @test all(diff(trace) .>= -1e-8)
+        low = group_variant(sm, first(names), :low)
+        high = group_variant(sm, first(names), :high)
+        for name in (:A, :b, :B)
+            if name in names
+                @test getproperty(low, name) !== getproperty(high, name)
+            else
+                @test getproperty(low, name) === getproperty(high, name)
+            end
+        end
+        # Accessors retain partial declarations on a held-out override.
+        @test all(isfinite, smooth(lds, y[1:2]; ux=ux[1:2],
+            depends_on=NamedTuple{names}(ntuple(_ -> labels[1:2], length(names))))[1][1])
+    end
+end

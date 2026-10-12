@@ -27,9 +27,12 @@ because those parameters are fit jointly as one regression:
     :C, :d, :D      -> emission [C d D]        (fit_bool[5])
     :R              -> observation noise       (fit_bool[6], Gaussian only)
 
-A name never stands in for its group: `depends_on = (C = session,)` is an error,
+Gaussian dynamics may name `A`, `b`, or `B` individually: the unnamed blocks
+remain shared and the M-step solves the shared and per-level columns jointly.
+Named dynamics blocks must use the same label vector. Observation regressions
+still require their whole group: `depends_on = (C = session,)` is an error,
 not shorthand for grouping `[C d D]`, because "`C` depends on the session" reads
-as a claim about `C` alone and the regression can only be fitted whole. Name
+as a claim about `C` alone and the observation regression is fitted whole. Name
 every member — `(C = session, d = session, D = session)` — or none. A model with
 no observation input has no `D` to fit, so `(C = session, d = session)` is the
 whole group there. Members given different label vectors are an error too.
@@ -361,6 +364,15 @@ function _require_whole_groups(model::DependentModel, named, context::AbstractSt
                 "$(_join_names(given)).",
             ),
         )
+    end
+    return nothing
+end
+
+# Gaussian dynamics may split individual regression blocks. The grouped M-step
+# solves the shared and per-level columns jointly rather than pooling them.
+function _require_whole_groups(sm::GaussianStateModel, named, context::AbstractString)
+    if :B in named && !(:A in named || :b in named) && size(sm.B, 2) == 0
+        throw(ArgumentError("$context: B alone cannot vary when it has no input columns"))
     end
     return nothing
 end
@@ -1032,22 +1044,23 @@ function _build_variants!(
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
     B0s = _slot_arrays(sm.B0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
-    As = _slot_arrays(sm.A, dep.nslots[3])
-    bs = _slot_arrays(sm.b, dep.nslots[3])
-    Bs = _slot_arrays(sm.B, dep.nslots[3])
+    named = sm.depends_on === nothing ? () : keys(sm.depends_on)
+    As = _slot_arrays(sm.A, :A in named ? dep.nslots[3] : 1)
+    bs = _slot_arrays(sm.b, :b in named ? dep.nslots[3] : 1)
+    Bs = _slot_arrays(sm.B, :B in named ? dep.nslots[3] : 1)
     Qs = _slot_arrays(sm.Q, dep.nslots[4])
 
     variants = Vector{GaussianStateModel{T,M,V}}(undef, ncells)
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
         variants[cell] = GaussianStateModel{T,M,V}(;
-            A=As[s[3]],
+            A=As[:A in named ? s[3] : 1],
             Q=Qs[s[4]],
-            b=bs[s[3]],
+            b=bs[:b in named ? s[3] : 1],
             x0=x0s[s[1]],
             B0=B0s[s[1]],
             P0=P0s[s[2]],
-            B=Bs[s[3]],
+            B=Bs[:B in named ? s[3] : 1],
             Q_prior=sm.Q_prior,
             P0_prior=sm.P0_prior,
             AB_prior=sm.AB_prior,

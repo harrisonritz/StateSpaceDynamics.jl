@@ -874,6 +874,29 @@ function _grouped_update_P0!(
     return nothing
 end
 
+# Identify the columns that alias across dynamics slots. This also works when
+# several emission cells use the same state-parameter version.
+function _grouped_dyn_tied_cols(ldss, slots)
+    reps = _slot_representatives(slots)
+    length(reps) > 1 || return Int[]
+    sm = ldss[first(reps)].state_model
+    sm isa GaussianStateModel || return Int[]
+    shared = Symbol[n for n in (:A, :b, :B)
+                    if all(getproperty(ldss[u].state_model, n) === getproperty(sm, n)
+                           for u in reps)]
+    cols = _tied_dyn_cols(shared, ldss[1].latent_dim, ldss[1].ux_dim)
+    return length(cols) == ldss[1].latent_dim + 1 + ldss[1].ux_dim ? Int[] : cols
+end
+
+function _grouped_dyn_prior_cols(ldss, slots)
+    tied = _grouped_dyn_tied_cols(ldss, slots)
+    isempty(tied) && return nothing
+    width = ldss[1].latent_dim + 1 + ldss[1].ux_dim
+    free = setdiff(1:width, tied)
+    reference = first(slots)
+    return Union{Nothing,Vector{Int}}[s == reference ? nothing : free for s in slots]
+end
+
 function _grouped_update_A_b!(
     ldss::AbstractVector,
     sufs::AbstractVector,
@@ -882,6 +905,26 @@ function _grouped_update_A_b!(
     sws::SmoothWorkspace,
     bufs::GroupedSufBuffers,
 )
+    tied = _grouped_dyn_tied_cols(ldss, slots)
+    if !isempty(tied)
+        ldss[1].fit_bool[_G_AB] || return nothing
+        groups = _units_by_slot(slots)
+        all(_shared_noise(slots_q, units) for units in groups) || throw(ArgumentError(
+            "partial dynamics dependence requires one Q version per dynamics level"
+        ))
+        reps = first.(groups)
+        xx = [copy(_pool_dyn!(bufs, sufs, units).dyn_xx[].mat) for units in groups]
+        xy = [copy(_pool_dyn!(bufs, sufs, units).dyn_xy) for units in groups]
+        W = _partial_tied_regression(
+            xx, xy, [ldss[u].state_model.Q for u in reps],
+            [ldss[u].state_model.AB_prior for u in reps], tied,
+            "partial dynamics depends_on",
+        )
+        for (j, units) in enumerate(groups), u in units
+            _unpack_dyn_W!(ldss[u], W[j])
+        end
+        return nothing
+    end
     for units in _units_by_slot(slots)
         lds = ldss[units[1]]
         if _shared_noise(slots_q, units)
@@ -1299,7 +1342,8 @@ function _grouped_state_mstep!(
     _grouped_update_x0!(ldss, sufs, slots[_G_X0], bufs)
     _grouped_update_P0!(ldss, sufs, slots[_G_P0], slots[_G_X0], sws)
     _grouped_update_A_b!(ldss, sufs, slots[_G_AB], slots[_G_Q], sws, bufs)
-    _grouped_update_Q!(ldss, sufs, slots[_G_Q], slots[_G_AB], sws)
+    _grouped_update_Q!(ldss, sufs, slots[_G_Q], slots[_G_AB], sws;
+                      prior_cols=_grouped_dyn_prior_cols(ldss, slots[_G_AB]))
     return nothing
 end
 
@@ -1371,6 +1415,7 @@ pair.
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}; ab_cols=nothing
 ) where {T<:Real}
+    ab_cols === nothing && (ab_cols = _grouped_dyn_prior_cols(ldss, slots[_G_AB]))
     total = zero(T)
     for u in _slot_representatives(slots[_G_P0])
         sm = ldss[u].state_model

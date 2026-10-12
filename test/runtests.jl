@@ -347,6 +347,7 @@ using SSDTest
             end
 
             @testset "Gaussian fitting" begin
+                test_partial_dynamics_dependence()
                 test_grouped_elbo_increases_and_recovers_noise()
                 test_grouped_smooth_loglikelihood_and_heldout()
                 test_grouped_integer_labels_and_priors()
