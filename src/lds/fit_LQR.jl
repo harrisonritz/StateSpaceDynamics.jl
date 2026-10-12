@@ -1233,20 +1233,22 @@ end
 # ============================================================================
 
 """
-    _sample_lqr_path!(rng, z, sm, ux)
+    _sample_lqr_path!(rng, z, lds, ux; ws=nothing)
 
 Draw one latent state–costate path from the forward form
 `z_{t+1} = M_{k(t)} z_t + b + B u_t + w`. The regime lookup per step is the only
 difference from the Gaussian sampler; the terminal factor is a *conditioning*
 event, not part of the generative chain, so a sampled path satisfies the terminal
 condition only up to `Σf` — draw with a small `Σf` if you want trajectories that
-look terminally constrained.
+look terminally constrained. `ws` is an optional workspace for the conditioned
+draw (see [`_lqr_conditional_path!`](@ref)).
 """
 function _sample_lqr_path!(
     rng::AbstractRNG,
     z::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T,S,O},
-    ux::AbstractMatrix{T},
+    ux::AbstractMatrix{T};
+    ws::Union{Nothing,SmoothWorkspace}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
     _is_causal(sm) && return _sample_causal_path!(rng, z, sm, ux)
@@ -1258,7 +1260,7 @@ function _sample_lqr_path!(
     distribution. The joint is still Gaussian with a block-tridiagonal precision,
     which is what the branch below samples.
     =#
-    sm.terminal && return _sample_lqr_path_conditional!(rng, z, lds, ux)
+    sm.terminal && return _sample_lqr_path_conditional!(rng, z, lds, ux; ws=ws)
 
     c = sm.cache
     tsteps = size(z, 2)
@@ -1292,69 +1294,123 @@ function _sample_lqr_path!(
 end
 
 """
-    _sample_lqr_path_conditional!(rng, z, lds, ux)
+    _sample_lqr_path_conditional!(rng, z, lds, ux; ws=nothing)
 
 Draw a path from the state-factor joint of a model that carries a terminal
 factor, i.e. from
 
 ```math
-p(z_{1:T}) \\propto p(z_1)\\prod_t p(z_{t+1}\\mid z_t)\\, p(y^{\\text{term}} = 0\\mid z_T).
+p(z_{1:T}) \\propto p(z_1)\\prod_t p(z_{t+1}\\mid z_t)\\, p(y^{\\text{term}} = 0\\mid z_T)
 ```
 
-That is Gaussian with a block-tridiagonal precision `H` and linear term `g`,
-both of which the smoother kernels already build: `H` is the negated state-side
-Hessian and `g` is the state-side gradient evaluated at `z = 0` (the gradient is
-affine, `∇ = g − H z`). The path is then `μ = H⁻¹g` plus `U⁻¹ξ` for `H = UᵀU`.
+(times any bridge factors the trial crosses). That is Gaussian with a
+block-tridiagonal precision `H` and linear term `g`, both of which the smoother
+kernels already build: `H` is the negated state-side Hessian and `g` is the
+state-side gradient evaluated at `z = 0` (the gradient is affine, `∇ = g − H z`).
+The path is `μ = H⁻¹g` plus a draw from `N(0, H⁻¹)`; see
+[`_lqr_conditional_path!`](@ref), which this hands its standard normals.
 
 Conditioning on the terminal factor is exactly what removes the transition's
-unstable directions, so unlike the forward roll this stays bounded — the price
-is one `(dT)²` factorization, which is why long trials are refused rather than
-silently attempted.
+unstable directions, so unlike the forward roll this stays bounded.
 """
 function _sample_lqr_path_conditional!(
     rng::AbstractRNG,
     z::AbstractMatrix{T},
     lds::LinearDynamicalSystem{T,S,O},
-    ux::AbstractMatrix{T},
+    ux::AbstractMatrix{T};
+    ws::Union{Nothing,SmoothWorkspace}=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    return _lqr_conditional_path!(z, lds, ux, randn(rng, T, length(z)); ws=ws)
+end
+
+"""
+    _lqr_conditional_path!(z, lds, ux, ξ; ws=nothing) -> z
+
+The terminal-conditioned path for given standard normals `ξ` (length `d·T`):
+`z = μ + U⁻¹ξ`, where `H = Uᵀ U` is the block factorisation of the precision.
+Linear in `ξ`, so `ξ = 0` returns the mean and the unit vectors the columns of
+a square root of the covariance — which is how the tests check it against a
+dense construction.
+
+`ws` is a [`SmoothWorkspace`](@ref) to work in, from
+[`_lqr_sample_workspace`](@ref): sized for the longest trial it will see, it
+serves every shorter one too, since every kernel here reads only its first
+`T` blocks. Building one is most of the cost of a draw at large `d`, so the
+multi-trial `rand` builds one and reuses it; `nothing` builds one for this call.
+"""
+function _lqr_conditional_path!(
+    z::AbstractMatrix{T},
+    lds::LinearDynamicalSystem{T,S,O},
+    ux::AbstractMatrix{T},
+    ξ::AbstractVector{T};
+    ws::Union{Nothing,SmoothWorkspace}=nothing,
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    #=
+    `H` is never formed. Its blocks go through the block-Thomas factorisation
+    ([`block_tridiagonal_factor!`](@ref)), which leaves `H = Uᵀ blkdiag(Mₜ) U` in
+    the workspace; the mean is one back-substitution against it and the draw one
+    triangular solve per block plus one back-substitution
+    ([`block_tridiagonal_sample!`](@ref)). That is `O(T d³)` time and `O(T d²)`
+    memory, where the dense Cholesky this replaced was `O((T d)³)` and had to
+    refuse anything past `d·T = 4000` — 62 bins at a 64-dimensional latent.
+    The two are the same Gaussian; only which square root of `H⁻¹` multiplies
+    `ξ` differs, so a given seed draws a different path than it used to.
+    =#
     sm = lds.state_model
     d = lds.latent_dim
     tsteps = size(z, 2)
     tsteps >= 2 || throw(ArgumentError("sampling an LQR path needs tsteps ≥ 2"))
-    ndof = d * tsteps
-    ndof <= 4000 || throw(
-        ArgumentError(
-            "sampling a terminal-conditioned LQR path of $tsteps steps at latent " *
-            "dimension $d needs a $(ndof)×$(ndof) factorization. Use `simulate_lqr` for " *
-            "long trajectories — it follows the stable manifold directly and costs O(T).",
-        ),
-    )
+    length(ξ) == d * tsteps ||
+        throw(DimensionMismatchError("standard normals for the path", d * tsteps, length(ξ)))
 
-    sws = SmoothWorkspace(
-        T, d, _ws_obs_dim(lds), tsteps; ux_dim=lds.ux_dim, uy_dim=_ws_uy_dim(lds)
-    )
+    sws = if ws === nothing || ws.btd.n_blocks < tsteps || ws.btd.block_size != d
+        _lqr_sample_workspace(lds, tsteps)
+    else
+        ws
+    end
     compute_smooth_constants!(sws, lds)
     btd = sws.btd
     _state_hessian_blocks!(btd, sws.consts, sm, tsteps)
 
-    # Precision = −(log-density Hessian). `H_sub` is the sub-diagonal block, so
-    # it is `block_tridgm`'s `lower_diag` and `H_super` its `upper_diag`.
-    main = [Matrix{T}(-btd.H_diag[t]) for t in 1:tsteps]
-    upper = [Matrix{T}(-btd.H_super[i]) for i in 1:(tsteps - 1)]
-    lower = [Matrix{T}(-btd.H_sub[i]) for i in 1:(tsteps - 1)]
-    H = Matrix(block_tridgm(main, upper, lower))
-    Symmetrize!(H)
+    #= Precision = −(log-density Hessian). `neg_sub` is the sub-diagonal block
+    (the solvers' `A`), `neg_super` the super-diagonal one (their `C`). =#
+    _negate_blocks!(btd, tsteps)
+    lower = view(btd.neg_sub, 1:(tsteps - 1))
+    main = view(btd.neg_diag, 1:tsteps)
+    upper = view(btd.neg_super, 1:(tsteps - 1))
+    #= The kernels write the two off-diagonals as each other's transposes, so the
+    factorisation's symmetry assumption holds; symmetrise the diagonal blocks
+    against round-off, as the dense path did the whole matrix. =#
+    for t in 1:tsteps
+        Symmetrize!(main[t])
+    end
+    block_tridiagonal_factor!(lower, main, upper, btd)
 
     fill!(z, zero(T))
     grad = view(sws.opt.grad_buf, :, 1:tsteps)
     _state_gradient!(grad, sws, lds, z, ux)
 
-    F = cholesky!(Symmetric(H))
-    mean_vec = F \ vec(Matrix(grad))
-    ξ = randn(rng, T, ndof)
-    ldiv!(F.U, ξ)
-    copyto!(z, reshape(mean_vec .+ ξ, d, tsteps))
+    path = vec(z)
+    block_tridiagonal_backsubst!(path, lower, vec(Matrix(grad)), btd, tsteps)
+    noise = copy(ξ)
+    block_tridiagonal_sample!(noise, btd, tsteps)
+    path .+= noise
     return z
+end
+
+"""
+    _lqr_sample_workspace(lds, tsteps) -> SmoothWorkspace
+
+A workspace for [`_lqr_conditional_path!`](@ref) on trials of up to `tsteps`
+bins.
+"""
+function _lqr_sample_workspace(
+    lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
+) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
+    return SmoothWorkspace(
+        T, lds.latent_dim, _ws_obs_dim(lds), tsteps;
+        ux_dim=lds.ux_dim, uy_dim=_ws_uy_dim(lds),
+    )
 end
 
 """
@@ -1495,15 +1551,23 @@ function Random.rand(
     #=
     Sampling stays serial: an LQR draw is a short matrix recursion, and a
     single RNG keeps a given seed reproducible without the child-RNG bookkeeping
-    the Gaussian sampler needs for its parallel chunks.
+    the Gaussian sampler needs for its parallel chunks. A terminal-conditioned
+    draw works in one workspace sized for the longest trial, shared by all of
+    them, since building it costs more than the draw.
     =#
+    sm = lds.state_model
+    ws = if sm.terminal && !_is_causal(sm) && ntrials > 0
+        _lqr_sample_workspace(lds, maximum(lengths))
+    else
+        nothing
+    end
     for i in 1:ntrials
         z[i] = Matrix{T}(undef, lds.latent_dim, lengths[i])
         y[i] = _alloc_obs(lds, lengths[i])
         trial_lds = _with_cost_offset(
             _trial_initial_model(lds, view(u0, :, i)), isempty(offsets) ? 0 : offsets[i]
         )
-        _sample_lqr_path!(rng, z[i], trial_lds, ux_seq[i])
+        _sample_lqr_path!(rng, z[i], trial_lds, ux_seq[i]; ws=ws)
         _sample_lqr_obs!(rng, y[i], z[i], lds.obs_model, obs_params, _trial(uy_seq, i))
     end
     return z, y
