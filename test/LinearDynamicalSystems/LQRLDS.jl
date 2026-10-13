@@ -203,13 +203,25 @@ function lqr_ref_objective(θ::AbstractVector{V}, hs, sm, profile::Bool) where {
     R = (R + transpose(R)) / 2
     N = sum(hs.nk)
     obj = -N * log(abs(det(A)))
+    # `A | Σ ~ MN(M₀, ·, Λ⁻¹)`: `[Wm; 0] Λ [Wm; 0]ᵀ` on the scatter, `n` on the count.
+    Nn = N
+    if sm.A_prior isa RidgePrior
+        Wm = A - sm.A_prior.M₀
+        obj += 0.5 * tr(Wm * sm.A_prior.Λ * transpose(Wm))
+    elseif sm.A_prior !== nothing
+        Wm = A - sm.A_prior.M₀
+        R =
+            R +
+            vcat(hcat(Wm * sm.A_prior.Λ * transpose(Wm), zeros(V, n, n)), zeros(V, n, d))
+        Nn = N + n
+    end
     if profile
         if sm.Σ_prior === nothing
-            obj += 0.5 * N * logdet(R)
+            obj += 0.5 * Nn * logdet(R)
         else
             prior = sm.Σ_prior
             R = R + V.(prior.Ψ)
-            Neff = N + prior.ν + d + 1
+            Neff = Nn + prior.ν + d + 1
             obj += 0.5 * Neff * logdet(R)
         end
     else
@@ -1170,16 +1182,23 @@ function test_lqr_mstep_objective_and_gradient()
         n,
     )
 
+    a_prior = MNPrior(;
+        M₀=0.8 .* Matrix(1.0I, n, n), Λ=Matrix(Symmetric(2I + 0.3 * ones(n, n)))
+    )
     for profile in (true, false)
-        for (sigma_prior, qc_prior) in (
-            (nothing, nothing),
-            (IWPrior(Matrix(0.3I, d, d), 12.0), nothing),
-            (nothing, IWPrior(Matrix(0.4I, n, n), 9.0)),
-            (IWPrior(Matrix(0.3I, d, d), 12.0), IWPrior(Matrix(0.4I, n, n), 9.0)),
-            (IWPrior(Matrix(0.3I, d, d), 12.0), per_epoch_prior),
+        for (sigma_prior, qc_prior, A_prior) in (
+            (nothing, nothing, nothing),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), nothing, nothing),
+            (nothing, IWPrior(Matrix(0.4I, n, n), 9.0), nothing),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), IWPrior(Matrix(0.4I, n, n), 9.0), nothing),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), per_epoch_prior, nothing),
+            (nothing, nothing, a_prior),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), IWPrior(Matrix(0.4I, n, n), 9.0), a_prior),
+            (IWPrior(Matrix(0.3I, d, d), 12.0), nothing, RidgePrior(; M₀=a_prior.M₀, Λ=a_prior.Λ)),
         )
             sm.Σ_prior = sigma_prior
             sm.Qc_prior = qc_prior
+            sm.A_prior = A_prior
             ctx = SSD._LQRMStepCtx(hs, sm, profile)
             θ = zeros(ctx.pack.np)
             SSD._lqr_pack!(θ, ctx)
@@ -1192,6 +1211,7 @@ function test_lqr_mstep_objective_and_gradient()
     end
     sm.Σ_prior = nothing
     sm.Qc_prior = nothing
+    sm.A_prior = nothing
 
     # Arbitrary optimizer iterates must remain valid costs/control authority.
     # Also check the gradient away from the initial square-root factors.
@@ -1305,6 +1325,12 @@ function test_lqr_em_monotone()
         )
         ys = [randn(rng, lds.obs_dim, tsteps) .* 0.4 for _ in 1:ntrials]
         uxs = ux_dim > 0 ? [randn(rng, ux_dim, tsteps) for _ in 1:ntrials] : nothing
+        if ntrials == 4
+            #= The plant-transition prior, here through the terminal-conditioned
+            M-step (Σ inside θ) rather than the profiled one. =#
+            n = size(sm.A, 1)
+            sm.A_prior = MNPrior(; M₀=Matrix(0.9I, n, n), Λ=Matrix(5.0I, n, n))
+        end
         els = fit!(lds, ys; ux=uxs, max_iter=25, progress=false)
         @test length(els) >= 2
         # A generalized M-step: the ELBO may not increase much, but it must never
@@ -1350,23 +1376,33 @@ function test_lqr_conditional_mstep_gradient()
     @test hs.terminal_counts == [2.0, 2.0]
 
     slots = [ones(Int, 1) for _ in 1:4]
-    problem = SSD._lqr_conditional_problem([lds], [hs], slots)
-    θ = copy(problem.theta)
-    @test !isempty(θ)
-    analytic = zeros(length(θ))
-    @test isfinite(problem.evaluate!(analytic, copy(θ)))
+    n = size(sm.A, 1)
+    for A_prior in (
+        nothing,
+        MNPrior(; M₀=Matrix(0.9I, n, n), Λ=[2.0 0.4; 0.4 1.0]),
+        RidgePrior(; M₀=Matrix(0.9I, n, n), Λ=[2.0 0.4; 0.4 1.0]),
+    )
+        sm.A_prior = A_prior
+        problem = SSD._lqr_conditional_problem([lds], [hs], slots)
+        θ = copy(problem.theta)
+        @test !isempty(θ)
+        analytic = zeros(length(θ))
+        @test isfinite(problem.evaluate!(analytic, copy(θ)))
 
-    fd = similar(analytic)
-    for i in eachindex(θ)
-        step = 1e-6 * max(1.0, abs(θ[i]))
-        up, down = copy(θ), copy(θ)
-        up[i] += step
-        down[i] -= step
-        fd[i] =
-            (problem.evaluate!(nothing, up) - problem.evaluate!(nothing, down)) / (2 * step)
+        fd = similar(analytic)
+        for i in eachindex(θ)
+            step = 1e-6 * max(1.0, abs(θ[i]))
+            up, down = copy(θ), copy(θ)
+            up[i] += step
+            down[i] -= step
+            fd[i] =
+                (problem.evaluate!(nothing, up) - problem.evaluate!(nothing, down)) /
+                (2 * step)
+        end
+        problem.write!(θ)          # leave the model where it started
+        @test maximum(abs, analytic .- fd) / max(1.0, maximum(abs, fd)) < 1e-7
     end
-    problem.write!(θ)          # leave the model where it started
-    @test maximum(abs, analytic .- fd) / max(1.0, maximum(abs, fd)) < 1e-7
+    sm.A_prior = nothing
     return nothing
 end
 

@@ -1045,6 +1045,8 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     profile::Bool
     N_A::Vector{T}                   # transitions per `A` copy (Jacobian weight)
     N_q::Vector{T}                   # transitions per noise version
+    A_prior_q::Vector{Int}           # `A` copy -> noise version its prior weighs by (0: none)
+    NA_q::Vector{T}                  # `MNPrior` pseudo-counts per noise version (`n` per prior)
     Nf_q::Vector{T}                  # terminal factors per noise version
     active_q::BitVector              # noise versions with a meaningful effective count
     Sinv::Vector{Matrix{T}}
@@ -1077,6 +1079,8 @@ struct _LQRMStepCtx{T<:Real,HS,SM}
     tmp_nr::Matrix{T}                 # n × reg
     tmp_nr2::Matrix{T}                # n × reg
     tmp_nn::Matrix{T}                 # n × n
+    tmp_nn2::Matrix{T}                # n × n
+    tmp_dn::Matrix{T}                 # d × n
     #=
     Effective transition counts per noise version. Without a `Σ_prior` these are
     `N_q`; with one they are `ν + N + d + 1`, the posterior's count, and the
@@ -1404,6 +1408,23 @@ function _LQRMStepCtx(
         (active_q[u.q] && !u.hold && !u.causal) || continue
         N_A[u.v[_LQR_BLOCK_A]] += u.n
     end
+    #=
+    Each `A` copy's prior is weighed by one noise version: its first owner's, as a
+    cost copy's prior is its first owner's. The prior is counted once per copy, so
+    a tie that shares `A` across states counts it once. See `_lqr_a_prior_scatter!`.
+    =#
+    A_prior_q = zeros(Int, nv[_LQR_BLOCK_A])
+    NA_q = zeros(T, nq)
+    for a in 1:nv[_LQR_BLOCK_A]
+        o = owners[_LQR_BLOCK_A][a]
+        isempty(o) && continue
+        sms[first(o)].A_prior === nothing && continue
+        s = q_slots[first(o)]
+        active_q[s] || continue
+        A_prior_q[a] = s
+        # A ridge is an additive penalty: no scatter, no count.
+        sms[first(o)].A_prior isa MNPrior && (NA_q[s] += n)
+    end
 
     noise_sm = Vector{typeof(sm1)}(undef, nq)
     for (c, q) in enumerate(q_slots)
@@ -1447,6 +1468,8 @@ function _LQRMStepCtx(
         profile,
         N_A,
         N_q,
+        A_prior_q,
+        NA_q,
         Nf_q,
         active_q,
         Sinv,
@@ -1477,6 +1500,8 @@ function _LQRMStepCtx(
         Matrix{T}(undef, n, reg),
         Matrix{T}(undef, n, reg),
         Matrix{T}(undef, n, n),
+        Matrix{T}(undef, n, n),
+        Matrix{T}(undef, d, n),
         zeros(T, nq),
     )
 end
@@ -1987,9 +2012,103 @@ function _lqr_residuals!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             end
         end
     end
+    _lqr_a_prior_scatter!(ctx)
     for s in 1:(ctx.nq)
         Symmetrize!(ctx.R[s])
         terminal && Symmetrize!(ctx.Rf[s])
+    end
+    return ctx
+end
+
+#=============================================================================
+The plant-transition prior.
+
+`A | Σ ~ MN(M₀, Σₓ, Λ⁻¹)` is conjugate to the innovation the structural
+objective profiles, in the same way `GaussianStateModel`'s `AB_prior` is to `Q`:
+its quadratic `tr(Σ⁻¹ [Wm; 0] Λ [Wm; 0]ᵀ)` (`Wm = A − M₀`) is a scatter on the
+plant rows, and its `(n/2) log det Σ` is `n` pseudo-transitions. So the prior is
+folded into the residual scatter `R_s` of the noise version that weighs it,
+inside `_lqr_residuals!`, and `n` into that version's count (`NA_q`). Everything
+downstream — the profiled `½ N_eff log det R`, the fixed-noise `½ tr(Σ⁻¹ R)`, the
+residual weight `𝒲` the gradient reads, the closed-form `Σ = R / N_eff` and a
+causal model's per-block versions of all three — then reads the posterior
+quantities through the names it already uses, and cannot disagree with them.
+Only the plant block of a causal model takes the count; its costate block has
+no prior term.
+
+The gradient is the one term `R` does not carry: `∂/∂A ½ tr(𝒲 [Wm Λ Wmᵀ]ₓₓ) =
+𝒲ₓₓ Wm Λ`, added in `_lqr_a_prior_gradient!`.
+
+A `RidgePrior` is not weighted by anything, so none of that applies: it is the
+additive penalty `½ tr(Wm Λ Wmᵀ)` on the objective (`_lqr_a_ridge_penalty`) with
+gradient `Wm Λ`, and the noise update never sees it.
+=============================================================================#
+
+"""The `A_prior` in force for `A` copy `a` (its first owner's), or `nothing`."""
+@inline function _lqr_a_prior(ctx::_LQRMStepCtx, a::Int)
+    ctx.A_prior_q[a] == 0 && return nothing
+    return ctx.sms[first(ctx.owners[_LQR_BLOCK_A][a])].A_prior
+end
+
+"""Add each `A` copy's `(A − M₀) Λ (A − M₀)ᵀ` to the plant rows of its noise version's `R`."""
+function _lqr_a_prior_scatter!(ctx::_LQRMStepCtx{T}) where {T<:Real}
+    xr = 1:(ctx.pack.n)
+    Wm, WL = ctx.tmp_nn, ctx.tmp_nn2
+    for a in eachindex(ctx.A_prior_q)
+        pr = _lqr_a_prior(ctx, a)
+        pr isa MNPrior || continue
+        Wm .= ctx.A[a] .- pr.M₀
+        mul!(WL, Wm, pr.Λ)
+        @views mul!(ctx.R[ctx.A_prior_q[a]][xr, xr], WL, transpose(Wm), one(T), one(T))
+    end
+    return ctx
+end
+
+"""The `RidgePrior` share of the objective, `Σ_a ½ tr((A_a − M₀) Λ (A_a − M₀)ᵀ)`."""
+function _lqr_a_ridge_penalty(ctx::_LQRMStepCtx{T}) where {T<:Real}
+    total = zero(T)
+    Wm, WL = ctx.tmp_nn, ctx.tmp_nn2
+    for a in eachindex(ctx.A_prior_q)
+        pr = _lqr_a_prior(ctx, a)
+        pr isa RidgePrior || continue
+        Wm .= ctx.A[a] .- pr.M₀
+        mul!(WL, Wm, pr.Λ)
+        total += T(0.5) * dot(WL, Wm)
+    end
+    return total
+end
+
+"""
+    _lqr_a_prior_gradient!(ctx, Fq, Neff)
+
+`∂/∂A_a` of the prior's share of the objective, `𝒲ₓₓ (A_a − M₀) Λ`, into `ctx.dA`.
+`𝒲` is `N_eff R⁻¹` for a profiled mixed-coordinate noise (through its Cholesky
+`Fq[s]`), and the weight already in `ctx.W[s]` otherwise — `Σ⁻¹` for fixed noise,
+or a causal model's block-diagonal weight. A `RidgePrior`'s is plain `Wm Λ`.
+"""
+function _lqr_a_prior_gradient!(
+    ctx::_LQRMStepCtx{T}, Fq::AbstractVector, Neff::AbstractVector{T}
+) where {T<:Real}
+    n = ctx.pack.n
+    xr = 1:n
+    Wm, WL = ctx.tmp_nn, ctx.tmp_nn2
+    for a in eachindex(ctx.A_prior_q)
+        pr = _lqr_a_prior(ctx, a)
+        pr === nothing && continue
+        s = ctx.A_prior_q[a]
+        Wm .= ctx.A[a] .- pr.M₀
+        mul!(WL, Wm, pr.Λ)
+        if pr isa RidgePrior
+            ctx.dA[a] .+= WL
+        elseif ctx.profile && !ctx.causal_q[s]
+            Z = ctx.tmp_dn
+            fill!(Z, zero(T))
+            @views Z[xr, :] .= WL
+            ldiv!(Fq[s], Z)
+            @views ctx.dA[a] .+= Neff[s] .* Z[xr, :]
+        else
+            @views mul!(ctx.dA[a], ctx.W[s][xr, xr], WL, one(T), one(T))
+        end
     end
     return ctx
 end
@@ -2193,14 +2312,14 @@ function _lqr_fg!(
     =#
     Neff = ctx.tmp_neff
     for s in 1:(ctx.nq)
-        Neff[s] = ctx.N_q[s]
+        Neff[s] = ctx.N_q[s] + ctx.NA_q[s]
         ctx.active_q[s] || continue
         ctx.causal_q[s] && continue          # its blocks fold their own priors
         ctx.profile || continue
         pr = _sigma_prior(ctx, s)
         pr === nothing && continue
         ctx.R[s] .+= T.(pr.Ψ)
-        Neff[s] = T(pr.ν) + ctx.N_q[s] + T(size(ctx.R[s], 1)) + one(T)
+        Neff[s] = T(pr.ν) + ctx.N_q[s] + ctx.NA_q[s] + T(size(ctx.R[s], 1)) + one(T)
     end
     for s in 1:(ctx.nq)
         ctx.active_q[s] || continue
@@ -2211,7 +2330,8 @@ function _lqr_fg!(
                 ctx.N_q[s],
                 _noise_owner(ctx, s),
                 ctx.profile,
-                ctx.Sinv[s],
+                ctx.Sinv[s];
+                Nx=ctx.NA_q[s],
             )
             isfinite(fs) || return T(Inf)
             fval += fs
@@ -2254,6 +2374,9 @@ function _lqr_fg!(
             fval += pen
         end
     end
+
+    # The plant ridge's value, before the early return for the same reason.
+    fval += _lqr_a_ridge_penalty(ctx)
 
     grad === nothing && return fval
 
@@ -2390,6 +2513,7 @@ function _lqr_fg!(
         end
     end
 
+    _lqr_a_prior_gradient!(ctx, Fq, Neff)
     for a in 1:nA
         # Jacobian term: ∂(−N_a log|det A_a|)/∂A_a = −N_a A_a⁻ᵀ.
         if ctx.lqrA[a]
@@ -2609,9 +2733,11 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
         for (c, sm) in enumerate(ctx.sms)
             ctx.q_of[c] == s || continue
             if _is_causal(sm)
-                _causal_noise_update!(sm, ctx.R[s], ctx.N_q[s])
+                _causal_noise_update!(sm, ctx.R[s], ctx.N_q[s]; Nx=ctx.NA_q[s])
                 continue
             end
+            # `R` already carries any `A_prior` scatter; its count joins `N`.
+            N = ctx.N_q[s] + ctx.NA_q[s]
             pr = sm.Σ_prior
             fixed_costate = sm.fixed_costate_sigma
             # `isa`, not `!== nothing`: the field's type is a UnionAll, which only
@@ -2619,7 +2745,7 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             if fixed_costate isa Real
                 n = _plant_dim(sm)
                 if ctx.N_q[s] > zero(T)
-                    @views sm.Σ[1:n, 1:n] .= ctx.R[s][1:n, 1:n] ./ ctx.N_q[s]
+                    @views sm.Σ[1:n, 1:n] .= ctx.R[s][1:n, 1:n] ./ N
                 end
                 @views Symmetrize!(view(sm.Σ, 1:n, 1:n))
                 @views sm.Σ[1:n, (n + 1):(2n)] .= zero(T)
@@ -2632,14 +2758,14 @@ function _lqr_noise_mstep!(ctx::_LQRMStepCtx{T}) where {T<:Real}
             elseif pr === nothing
                 if ctx.N_q[s] > zero(T)
                     copyto!(sm.Σ, ctx.R[s])
-                    sm.Σ ./= ctx.N_q[s]
+                    sm.Σ ./= N
                     Symmetrize!(sm.Σ)
                 end
             else
                 d = size(sm.Σ, 1)
                 copyto!(sm.Σ, ctx.R[s])
                 sm.Σ .+= T.(pr.Ψ)
-                sm.Σ ./= T(pr.ν) + ctx.N_q[s] + T(d) + one(T)
+                sm.Σ ./= T(pr.ν) + N + T(d) + one(T)
                 Symmetrize!(sm.Σ)
             end
             if sm.terminal && ctx.Nf_q[s] > zero(T)

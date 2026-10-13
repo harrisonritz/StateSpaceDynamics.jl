@@ -2940,15 +2940,19 @@ function _slds_state_prior_logdensity(
     regime(k) = view(unit_lds, ((k - 1) * ncells + 1):(k * ncells))
     tie_noise = :noise in tied
     tie_cost = :structure in tied || :Qc in tied
+    tie_a = :structure in tied || :A in tied
     first_lqr = findfirst(k -> !_is_free(regime(k)[1].state_model), 1:K)
-    total = _grouped_state_prior_logdensity(unit_lds, slots, T; sigma=false, qc=false)
+    total = _grouped_state_prior_logdensity(
+        unit_lds, slots, T; sigma=false, qc=false, a=false
+    )
     for k in 1:K
         free = _is_free(regime(k)[1].state_model)
         sigma = free || !tie_noise || k == first_lqr
         qc = !free && (!tie_cost || k == first_lqr)
-        (sigma || qc) || continue
+        a = !free && (!tie_a || k == first_lqr)
+        (sigma || qc || a) || continue
         total += _grouped_state_prior_logdensity(
-            regime(k), slots, T; init=false, sigma=sigma, qc=qc
+            regime(k), slots, T; init=false, sigma=sigma, qc=qc, a=a
         )
     end
     return total

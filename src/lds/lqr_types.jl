@@ -840,6 +840,32 @@ Here the middle cost is unregularized, and the last entry applies to the termina
 cost when `schedule[end] == 3`. The vector length must equal `length(Qc)`; its
 meaning follows cost-regime indices, not the number or order of schedule runs.
 
+## Regularizing the plant transition
+
+`A_prior` is an [`MNPrior`](@ref) on `A` (`M₀`, `Λ` both `n × n`), conditional on
+the plant noise as `GaussianStateModel`'s `AB_prior` is on `Q`:
+`log p(A | Σ) = −½[n log det Σₓ + tr(Σₓ⁻¹ (A − M₀) Λ (A − M₀)ᵀ)]`. That makes it
+conjugate to the profiled noise, so it enters the M-step the same way the
+`AB_prior` does: `(A − M₀) Λ (A − M₀)ᵀ` joins the plant rows of the innovation
+scatter and `n` joins the innovation's count, in the structural objective, in
+its gradient and in the closed-form noise update alike. A shrinkage toward `M₀`
+that steepens as the plant noise falls is what the weighting buys; an
+unweighted ridge would not track the scale of the latent.
+
+The flip side is that the weighting can be paid for in noise: a fit far from `M₀`
+can inflate `Σₓ` along `A − M₀` rather than move `A`, and against blocks the
+prior does not touch (a causal model's costate) its pull grows only like
+`log Λ`. Pass a [`RidgePrior`](@ref) instead for a plain penalty
+`½ tr((A − M₀) Λ (A − M₀)ᵀ)` on the structural objective: it pins `A` as `Λ`
+grows whatever the noise does, and leaves the noise update alone.
+
+`Σₓ` is the plant block of a `:causal` model's noise (`Σ` in
+[`causal_state_model`](@ref)). In `:lqr` and `:hold` the innovation is one
+mixed-coordinate `Σ`, so the prior is the same term on `[A − M₀; 0]` against
+all of it — the plant rows of `Σ⁻¹` weight the quadratic, and the `n log det`
+is of the whole `Σ`, which is what keeps the profiled update closed-form. See
+[`_lqr_a_prior_logdensity`](@ref).
+
 # Fields
 - `mode::Symbol`: `:lqr` (the finite-horizon symplectic form documented above),
     `:causal` (the finite-horizon *feedback* controller with plant and costate
@@ -894,6 +920,11 @@ meaning follows cost-regime indices, not the number or order of schedule runs.
   Pass one `IWPrior` to share it across all regimes, or one entry per `Qc`
   regime (each an `IWPrior` or `nothing`) to specify epoch-specific priors,
   including the terminal regime. See below.
+- `A_prior = nothing`: optional matrix-normal prior on the plant transition `A`,
+  `A | Σ ~ MN(M₀, Σₓ, Λ⁻¹)` with `M₀` and `Λ` both `n × n`, weighted by the
+  plant noise as `GaussianStateModel`'s `AB_prior` is by `Q` (see
+  [`_lqr_a_prior_logdensity`](@ref) for what `Σₓ` is in each mode). Not accepted
+  in `:free` mode, which has no plant `A`.
 - `P0_prior`, `x0_prior`: optional priors on the initial state, as on
     [`GaussianStateModel`](@ref).
 - `causal::CausalOptions`: the noise and horizon options of the `:causal` mode
@@ -909,6 +940,9 @@ state slots: `[x0, P0, structure, noise]`, where `structure` gates the
 See also [`lqr_parameters`](@ref), [`riccati_solution`](@ref),
 [`symplectic_matrix`](@ref).
 """
+# The forms `LQRStateModel.A_prior` takes: none, noise-weighted, or a plain ridge.
+const _LQRAPrior{T} = Union{Nothing,MNPrior{T,Matrix{T}},RidgePrior{T,Matrix{T}}}
+
 mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} <:
                AbstractGaussianStateModel{T}
     mode::Symbol
@@ -938,6 +972,7 @@ mutable struct LQRStateModel{T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}} 
     Σ_prior::Union{Nothing,IWPrior{T}}
     fixed_costate_sigma::Union{Nothing,T}
     Qc_prior::Union{Nothing,IWPrior{T},AbstractVector}
+    A_prior::_LQRAPrior{T}
     depends_on::Union{Nothing,NamedTuple}
     variants::Union{Nothing,Vector{LQRStateModel{T,M,V}}}
     qc_scale::Union{Nothing,_QcScaleTag}
@@ -1364,6 +1399,34 @@ function _check_lqr_structure(
 end
 
 """
+    _check_a_prior(T, prior, n) -> MNPrior, RidgePrior or nothing
+
+Validate the plant-transition prior stored by [`LQRStateModel`](@ref): an
+[`MNPrior`](@ref) (noise-weighted) or a [`RidgePrior`](@ref) (unweighted), with
+`M₀` and `Λ` both `n × n` and `Λ` symmetric positive semidefinite (a zero
+precision leaves `A` unregularized, so it is allowed).
+"""
+function _check_a_prior(::Type{T}, prior, n::Int) where {T<:Real}
+    prior === nothing && return nothing
+    prior isa Union{MNPrior{T,Matrix{T}},RidgePrior{T,Matrix{T}}} || throw(
+        ArgumentError(
+            "A_prior must be an MNPrior or RidgePrior with Matrix{$T} fields; " *
+            "got $(typeof(prior))",
+        ),
+    )
+    size(prior.M₀) == (n, n) ||
+        throw(DimensionMismatchError("LQR A_prior mean", (n, n), size(prior.M₀)))
+    size(prior.Λ) == (n, n) ||
+        throw(DimensionMismatchError("LQR A_prior precision", (n, n), size(prior.Λ)))
+    all(isfinite, prior.M₀) && all(isfinite, prior.Λ) ||
+        throw(ArgumentError("A_prior must be finite"))
+    issymmetric(prior.Λ) || throw(ArgumentError("A_prior precision Λ must be symmetric"))
+    minimum(eigvals(Symmetric(prior.Λ))) >= -sqrt(eps(T)) * max(one(T), opnorm(prior.Λ)) ||
+        throw(ArgumentError("A_prior precision Λ must be positive semidefinite"))
+    return prior
+end
+
+"""
     _normalize_qc_prior(T, prior, K, n)
 
 Validate and normalize the cost-prior specification stored by
@@ -1432,6 +1495,8 @@ mixed-coordinate innovation covariance `Σ` (`2n × 2n`, positive definite).
   vector aligned with `Qc` whose entries are inverse-Wishart priors or `nothing`.
   The last scheduled cost can therefore have its own terminal prior. See
   "Regularizing the innovation and the cost" on the type.
+- `A_prior`: matrix-normal prior on the plant transition; see "Regularizing the
+  plant transition" on the type.
 - `gref_gate`: a `length(Qc) × ux_dim` `Bool` matrix giving each cost regime its
   own reference columns; see [`set_gref_gate!`](@ref).
 - `bridges`, `entries`, `entry_gain`, `entry_cov`: boundary factors at the
@@ -1466,6 +1531,7 @@ function LQRStateModel(
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
     fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
+    A_prior::_LQRAPrior{T}=nothing,
     gref_gate::Union{Nothing,AbstractMatrix{Bool}}=nothing,
     bridges=Pair{Int,Int}[],
     entries=Int[],
@@ -1546,6 +1612,7 @@ function LQRStateModel(
         Σ_prior,
         fcs,
         Qc_prior_value,
+        _check_a_prior(T, A_prior, n),
         nothing,
         nothing,
         nothing,
@@ -1696,6 +1763,7 @@ function free_state_model(
         on. It is rejected above rather than silently carried.
         =#
         nothing,
+        nothing,                     # no plant `A` either, so no `A_prior`
         nothing,
         nothing,
         nothing,
@@ -1813,8 +1881,8 @@ likelihood is invariant whenever the emission does not read the costate.
 
 # Keywords
 `h`, `Bu`, `Gref`, `x0`, `B0`, `P0`, `observe_costate`, `fit_flags`,
-`mstep_iters`, `P0_prior`, `x0_prior`, `Σ_prior`, `fixed_costate_sigma` and
-`Qc_prior` as for [`LQRStateModel`](@ref). `fit_flags.terminal` has nothing to
+`mstep_iters`, `P0_prior`, `x0_prior`, `Σ_prior`, `fixed_costate_sigma`,
+`Qc_prior` and `A_prior` as for [`LQRStateModel`](@ref). `fit_flags.terminal` has nothing to
 gate here. `schedule` must be empty and `terminal` false; they are accepted only
 so that a mistaken request fails with a clear message.
 
@@ -1845,6 +1913,7 @@ function hold_state_model(
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
     fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
+    A_prior::_LQRAPrior{T}=nothing,
 ) where {T<:Real}
     n = size(A, 1)
     d = 2n
@@ -1891,6 +1960,7 @@ function hold_state_model(
         Σ_prior,
         fcs,
         Qc_prior_value,
+        _check_a_prior(T, A_prior, n),
         nothing,
         nothing,
         nothing,

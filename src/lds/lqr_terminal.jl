@@ -323,6 +323,7 @@ function _lqr_terminal_probe(sm::LQRStateModel{T}, hs) where {T}
     probe.depends_on = nothing
     probe.variants = nothing
     probe.P0_prior = probe.x0_prior = probe.Σ_prior = probe.Qc_prior = nothing
+    probe.A_prior = nothing
     d = _state_latent_dim(sm)
     lds = LinearDynamicalSystem(
         probe, GaussianObservationModel(zeros(T, 1, d), ones(T, 1, 1), zeros(T, 1))
@@ -969,7 +970,13 @@ function _lqr_conditional_problem(
             case; under switching the two posteriors put different
             responsibilities on the same timesteps and the difference is real.
             =#
-            netN(s) = ctx.N_q[s] - (negative === nothing ? zero(T) : negative.N_q[s])
+            #= `NA_q` is an `A_prior`'s `(n/2) log det Σ`, which only the data side
+            carries (the probe drops every prior); its scatter is already in
+            `ctx.R[s]`, and so in the `R` difference below. =#
+            function netN(s)
+                return ctx.N_q[s] + ctx.NA_q[s] -
+                       (negative === nothing ? zero(T) : negative.N_q[s])
+            end
             netNf(s) = ctx.Nf_q[s] - (negative === nothing ? zero(T) : negative.Nf_q[s])
 
             #=
@@ -987,7 +994,7 @@ function _lqr_conditional_problem(
                 chol_Σ = cholesky(Symmetric(sm.Σ); check=false)
                 chol_Σf = cholesky(Symmetric(sm.Σf); check=false)
                 (issuccess(chol_Σ) && issuccess(chol_Σf)) || return T(Inf)
-                wN = weighted ? netN(s) : ctx.N_q[s]
+                wN = weighted ? netN(s) : ctx.N_q[s] + ctx.NA_q[s]
                 wNf = weighted ? netNf(s) : ctx.Nf_q[s]
                 value += T(0.5) * (wN * logdet(chol_Σ) + wNf * logdet(chol_Σf))
                 sm.Σ_prior === nothing || (value += _iw_penalty(sm.Σ, sm.Σ_prior))

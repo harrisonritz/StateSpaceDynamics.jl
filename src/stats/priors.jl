@@ -100,6 +100,26 @@ Base.@kwdef struct MNPrior{T<:Real,M<:AbstractMatrix{T}}
 end
 
 """
+    RidgePrior(; M₀, Λ)
+
+Gaussian prior on a coefficient matrix `W` with no noise weighting:
+
+```math
+\\log p(W) = -\\tfrac{1}{2} \\operatorname{tr}\\big((W - M_0) Λ (W - M_0)^\\top\\big) + \\text{const}.
+```
+
+The unweighted counterpart of [`MNPrior`](@ref): the same `M₀` and column
+precision `Λ` (symmetric positive semidefinite), but the penalty does not scale
+with any covariance, so it cannot be traded against an inflated noise. Not
+conjugate to anything: it enters an M-step as an additive penalty on the
+objective and its gradient. Currently accepted by `LQRStateModel`'s `A_prior`.
+"""
+Base.@kwdef struct RidgePrior{T<:Real,M<:AbstractMatrix{T}}
+    M₀::M
+    Λ::M
+end
+
+"""
     mn_map(XX, XY, prior) -> Matrix
 
 MAP estimate for the regression coefficient `W` under an `MNPrior`:

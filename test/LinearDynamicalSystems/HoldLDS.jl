@@ -289,13 +289,21 @@ function test_hold_mstep_gradient()
         profile || sigma_prior === nothing || continue
         sm.Σ_prior = sigma_prior
         sm.Qc_prior = qc_prior
-        ctx = SSD._LQRMStepCtx(hs, sm, profile)
-        f, err = hold_gradient_error(ctx, rng)
-        @test isfinite(f)
-        @test err < 1e-7
+        for A_prior in (
+            nothing,
+            MNPrior(; M₀=Matrix(0.8I, n, n), Λ=Matrix(3.0I, n, n)),
+            RidgePrior(; M₀=Matrix(0.8I, n, n), Λ=Matrix(3.0I, n, n)),
+        )
+            sm.A_prior = A_prior
+            ctx = SSD._LQRMStepCtx(hs, sm, profile)
+            f, err = hold_gradient_error(ctx, rng)
+            @test isfinite(f)
+            @test err < 1e-7
+        end
     end
     sm.Σ_prior = nothing
     sm.Qc_prior = nothing
+    sm.A_prior = nothing
 
     # Freezing composes: a frozen block is simply absent from the gradient.
     sm.fit_flags = LQRFitFlags(; S=false, Gref_cols=[2], Bu_rows=1:n)

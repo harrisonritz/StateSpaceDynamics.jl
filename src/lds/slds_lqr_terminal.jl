@@ -268,6 +268,7 @@ function _slqr_terminal_probe(
             sm.depends_on = nothing
             sm.variants = nothing
             sm.P0_prior = sm.x0_prior = sm.Σ_prior = sm.Qc_prior = nothing
+            sm.A_prior = nothing
         end
         return LinearDynamicalSystem(
             sm, GaussianObservationModel(zeros(T, 1, d), ones(T, 1, 1), zeros(T, 1))

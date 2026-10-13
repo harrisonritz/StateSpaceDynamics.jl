@@ -1157,6 +1157,7 @@ function _build_variants!(
             sm.Σ_prior,
             sm.fixed_costate_sigma,
             sm.Qc_prior,
+            sm.A_prior,
             nothing,
             nothing,
             scaled ? _QcScaleTag(tie_id, s[3] == 1) : nothing,

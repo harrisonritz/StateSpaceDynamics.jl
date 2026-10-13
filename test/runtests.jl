@@ -612,6 +612,7 @@ using SSDTest
             test_causal_qc_scale()
             test_causal_invariances()
             test_causal_recovery()
+            test_causal_a_prior()
             test_causal_rejections()
         end
 

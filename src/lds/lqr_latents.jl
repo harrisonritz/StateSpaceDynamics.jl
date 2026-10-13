@@ -337,10 +337,11 @@ end
     _state_prior_logdensity(lds, sws) -> T
 
 `log p(θ)` for an LQR state model: the initial-state priors (`P0_prior`,
-`x0_prior`), plus the inverse-Wishart priors on `Σ` and on each distinct `Qc` when
-they are set (see [`_lqr_structural_logprior`](@ref)). There is no matrix-normal
-prior on the structural block, whose entries are shared between `𝓔`'s (1,1) and
-(2,2) blocks and so do not form a free regression matrix; nor on `Σf`, which the
+`x0_prior`), plus the inverse-Wishart priors on `Σ` and on each distinct `Qc` and
+the matrix-normal prior on the plant `A` when they are set (see
+[`_lqr_structural_logprior`](@ref)). There is no matrix-normal prior on the rest
+of the structural block, whose entries are shared between `𝓔`'s (1,1) and (2,2)
+blocks and so do not form a free regression matrix; nor on `Σf`, which the
 M-step fits by maximum likelihood.
 
 The inverse-Wishart terms omit their normalizing constant, which is fine for a
@@ -360,6 +361,39 @@ function _state_prior_logdensity(
 end
 
 """
+    _lqr_a_prior_logdensity(sm) -> T
+
+`log p(A | Σ)` under `sm.A_prior`, up to the constants `mn_logprior_term` drops:
+`−½[n log det Σₓ + tr(Σₓ⁻¹ (A − M₀) Λ (A − M₀)ᵀ)]`.
+
+- `:causal`: `Σₓ` is the plant block of `blkdiag(Σ, Ω)`.
+- `:lqr` / `:hold`: the innovation is one mixed-coordinate `Σ`, so the term is
+  `mn_logprior_term([A; 0], Σ, ·)` — the plant rows of `Σ⁻¹` weigh the quadratic
+  and the `log det` is of all of `Σ`. Against `Σₓ`'s own inverse the profiled
+  noise update would not be closed-form; this is the form whose `Σ` stationary
+  point is `(R + [Wm Λ Wmᵀ 0; 0 0]) / (N + n)`, which is what the M-step uses.
+
+A [`RidgePrior`](@ref) is `−½ tr((A − M₀) Λ (A − M₀)ᵀ)`, whatever the mode. Zero
+without a prior, and for `:free` models (which refuse one).
+"""
+function _lqr_a_prior_logdensity(sm::LQRStateModel{T}) where {T<:Real}
+    pr = sm.A_prior
+    (pr === nothing || _is_free(sm)) && return zero(T)
+    if pr isa RidgePrior
+        Wm = Matrix{T}(sm.A) .- pr.M₀
+        return -T(0.5) * dot(Wm * pr.Λ, Wm)
+    end
+    n = _plant_dim(sm)
+    if _is_causal(sm)
+        return mn_logprior_term(Matrix{T}(sm.A), Matrix{T}(sm.Σ[1:n, 1:n]), pr)
+    end
+    Z = zeros(T, n, n)
+    return mn_logprior_term(
+        vcat(Matrix{T}(sm.A), Z), Matrix{T}(sm.Σ), MNPrior(; M₀=vcat(pr.M₀, Z), Λ=pr.Λ)
+    )
+end
+
+"""
     _lqr_structural_logprior(sm) -> T
 
 The `Σ` and `Qc` priors' contribution to the objective EM is monotone in.
@@ -375,7 +409,7 @@ every M-step (see `_check_qc_unaliased`), so this is a guard rather than a
 supported way to share a cost: share one by pointing schedule entries at it.
 """
 function _lqr_structural_logprior(sm::LQRStateModel{T}) where {T<:Real}
-    total = zero(T)
+    total = _lqr_a_prior_logdensity(sm)
     if _is_causal(sm)
         total += _causal_noise_logprior(sm)
     elseif sm.Σ_prior !== nothing

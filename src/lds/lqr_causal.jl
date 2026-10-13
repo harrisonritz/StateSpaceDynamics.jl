@@ -128,7 +128,7 @@ the costate. [`rescale_costate!`](@ref) applies it.
   `Σ` and `Ω`. A diagonal block must be passed diagonal, and stays diagonal.
 - `hf`: terminal feedforward offset (`n`), read when `terminal_cost` is set.
 - `h`, `Bu`, `Gref`, `gref_gate`, `x0`, `B0`, `P0`, `observe_costate`,
-  `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`, `Qc_prior`: as for
+  `fit_flags`, `mstep_iters`, `P0_prior`, `x0_prior`, `Qc_prior`, `A_prior`: as for
   [`LQRStateModel`](@ref). `fit_flags.terminal` gates fitting `hf`.
 - `Σ_prior`: an inverse-Wishart `IW(Ψ, ν)` on the `2n × 2n` `blkdiag(Σ, Ω)`.
   Since the two blocks are fitted separately, each takes the prior's *marginal*
@@ -166,6 +166,7 @@ function causal_state_model(
     Σ_prior::Union{Nothing,IWPrior{T}}=nothing,
     fixed_costate_sigma::Union{Nothing,Real}=nothing,
     Qc_prior=nothing,
+    A_prior::_LQRAPrior{T}=nothing,
     gref_gate::Union{Nothing,AbstractMatrix{Bool}}=nothing,
 ) where {T<:Real}
     n = size(A, 1)
@@ -235,6 +236,7 @@ function causal_state_model(
         Σ_prior,
         fcs,
         Qc_prior_value,
+        _check_a_prior(T, A_prior, n),
         nothing,
         nothing,
         nothing,
@@ -1687,7 +1689,7 @@ function _causal_noise_blocks(sm::LQRStateModel{T}) where {T<:Real}
 end
 
 """
-    _causal_noise_objective!(Wq, R, N, sm, profile, Sinv) -> T
+    _causal_noise_objective!(Wq, R, N, sm, profile, Sinv; Nx=0) -> T
 
 The causal noise version's share of the structural objective, and its residual
 weight `𝒲` (block-diagonal) into `Wq`: per block, `½ N_eff log det(Ψ_b + R_bb)`
@@ -1695,6 +1697,9 @@ for a dense profiled block (`N_eff = N`, or `ν_b + N + q + 1` with a prior), th
 same entrywise for a diagonal one, `½ tr(R_λλ)/v` for a pinned costate block, and
 `½ tr(Σ_b⁻¹ R_bb)` when the noise is held fixed. `Inf` when a block is not
 positive definite.
+
+`Nx` is extra count on the plant block alone: an `A_prior`'s `n` pseudo-transitions,
+whose scatter the caller has already added to `R`'s plant rows.
 """
 function _causal_noise_objective!(
     Wq::AbstractMatrix{T},
@@ -1702,11 +1707,13 @@ function _causal_noise_objective!(
     N::T,
     sm::LQRStateModel,
     profile::Bool,
-    Sinv::AbstractMatrix{T},
+    Sinv::AbstractMatrix{T};
+    Nx::T=zero(T),
 ) where {T<:Real}
     fill!(Wq, zero(T))
     fval = zero(T)
-    for b in _causal_noise_blocks(sm)
+    for (ib, b) in enumerate(_causal_noise_blocks(sm))
+        N_b = ib == 1 ? N + Nx : N
         r = b.r
         Rb = view(R, r, r)
         if !profile
@@ -1722,7 +1729,7 @@ function _causal_noise_objective!(
             q = length(r)
             M = Matrix{T}(Rb)
             b.Ψ === nothing || (M .+= b.Ψ)
-            Neff = b.Ψ === nothing ? N : b.ν + N + T(q) + one(T)
+            Neff = b.Ψ === nothing ? N_b : b.ν + N_b + T(q) + one(T)
             chol = cholesky(Symmetric(M); check=false)
             issuccess(chol) || return T(Inf)
             fval += T(0.5) * Neff * logdet(chol)
@@ -1731,7 +1738,7 @@ function _causal_noise_objective!(
             for (j, i) in enumerate(r)
                 v = R[i, i] + (b.Ψ === nothing ? zero(T) : b.Ψ[j, j])
                 v > zero(T) || return T(Inf)
-                Neff = b.Ψ === nothing ? N : b.ν + N + T(2)
+                Neff = b.Ψ === nothing ? N_b : b.ν + N_b + T(2)
                 fval += T(0.5) * Neff * log(v)
                 Wq[i, i] = Neff / v
             end
@@ -1741,37 +1748,39 @@ function _causal_noise_objective!(
 end
 
 """
-    _causal_noise_update!(sm, R, N)
+    _causal_noise_update!(sm, R, N; Nx=0)
 
 Write the noise maximizer given the structure into `sm.Σ = blkdiag(Σ, Ω)` — the
-same per-block formulas the profiled objective assumed, so the two agree.
+same per-block formulas the profiled objective assumed (`Nx` included), so the
+two agree.
 """
 function _causal_noise_update!(
-    sm::LQRStateModel{T}, R::AbstractMatrix{T}, N::T
+    sm::LQRStateModel{T}, R::AbstractMatrix{T}, N::T; Nx::T=zero(T)
 ) where {T<:Real}
     N > zero(T) || return sm
     n = _plant_dim(sm)
     Σ = sm.Σ
     @views fill!(Σ[1:n, (n + 1):(2n)], zero(T))
     @views fill!(Σ[(n + 1):(2n), 1:n], zero(T))
-    for b in _causal_noise_blocks(sm)
+    for (ib, b) in enumerate(_causal_noise_blocks(sm))
+        N_b = ib == 1 ? N + Nx : N
         r = b.r
         q = length(r)
         if b.fixed !== nothing
             @views Σ[r, r] .= Matrix{T}(T(b.fixed) * I, q, q)
         elseif b.form === :dense
             M = Matrix{T}(R[r, r])
-            Neff = N
+            Neff = N_b
             if b.Ψ !== nothing
                 M .+= b.Ψ
-                Neff = b.ν + N + T(q) + one(T)
+                Neff = b.ν + N_b + T(q) + one(T)
             end
             @views Σ[r, r] .= Symmetrize!(M ./ Neff)
         else
             @views fill!(Σ[r, r], zero(T))
             for (j, i) in enumerate(r)
                 v = R[i, i] + (b.Ψ === nothing ? zero(T) : b.Ψ[j, j])
-                Neff = b.Ψ === nothing ? N : b.ν + N + T(2)
+                Neff = b.Ψ === nothing ? N_b : b.ν + N_b + T(2)
                 Σ[i, i] = v / Neff
             end
         end

@@ -19,6 +19,9 @@ test:
 
 const CAUSAL_A = [1.0 0.1; -0.05 0.9]
 const CAUSAL_S = [0.06 0.01; 0.01 0.04]
+# A deliberately non-isotropic plant-transition prior, so the gradient sees `Λ`.
+const CAUSAL_A_PRIOR = MNPrior(; M₀=[0.9 0.0; 0.0 0.8], Λ=[3.0 0.5; 0.5 2.0])
+const CAUSAL_A_RIDGE = RidgePrior(; M₀=CAUSAL_A_PRIOR.M₀, Λ=CAUSAL_A_PRIOR.Λ)
 
 """
 A causal model with every option settable, and a Gaussian LDS around it.
@@ -39,6 +42,8 @@ function causal_fixture(
     gate::Union{Nothing,Matrix{Bool}}=nothing,
     observe_costate::Bool=false,
     affine::Bool=true,
+    a_prior::Bool=false,
+    a_ridge::Bool=false,
 )
     n = 2
     d = 2n
@@ -85,6 +90,8 @@ function causal_fixture(
         )
     end
     fixed === nothing || (kw = merge(kw, (; fixed_costate_sigma=fixed)))
+    a_prior && (kw = merge(kw, (; A_prior=CAUSAL_A_PRIOR)))
+    a_ridge && (kw = merge(kw, (; A_prior=CAUSAL_A_RIDGE)))
     sm = causal_state_model(
         copy(CAUSAL_A), copy(CAUSAL_S), nreg == 1 ? Qs[1] : Qs, Σ, Ω; kw...
     )
@@ -403,6 +410,11 @@ function test_causal_mstep_gradient()
         (; prior=true, plant_noise=:diagonal),
         (; fixed=0.4),
         (; nreg=3, m=2, prior=true, slack=false, costate_noise=:diagonal),
+        (; a_prior=true),
+        (; a_prior=true, prior=true, plant_noise=:diagonal),
+        (; a_prior=true, fixed=0.4, slack=false, nreg=2, m=1),
+        (; a_ridge=true),
+        (; a_ridge=true, prior=true, plant_noise=:diagonal, nreg=2, m=1),
         # Ragged with no schedule: every trial aligned on the longest horizon.
         (; ragged=true, m=1),
         (; ragged=true, nreg=2, m=1),
@@ -753,6 +765,130 @@ function test_causal_recovery()
     Φfit = [Wf[t + 1] * fitm.state_model.A for t in 1:24]
     @test mean(norm(Φfit[t] - Φtrue[t]) / norm(Φtrue[t]) for t in 1:24) < 0.05
     @test norm(fitm.state_model.Σ[1:2, 1:2] - Σtrue) / norm(Σtrue) < 0.5
+    return nothing
+end
+
+"""
+The plant-transition prior: its scatter and count land in the plant block only,
+the fixed-noise objective moves by exactly its quadratic, the reported log
+density is the matrix-normal one, EM stays monotone, and a strong prior pins `A`.
+"""
+function test_causal_a_prior()
+    n = 2
+    xr, lr = 1:n, (n + 1):(2n)
+    pr = CAUSAL_A_PRIOR
+    E(A) = (A - pr.M₀) * pr.Λ * (A - pr.M₀)'
+
+    # The closed-form noise update, against the same statistics without the prior.
+    for (pn, prior) in ((:dense, false), (:diagonal, false), (:dense, true))
+        ctx, hs, sm, = causal_mstep_context(; plant_noise=pn, prior=prior, a_prior=true)
+        StateSpaceDynamics._lqr_structure_mstep!(ctx, false, 1)
+        @test ctx.NA_q[1] == n
+        bare = deepcopy(sm)
+        bare.A_prior = nothing
+        ctx0 = StateSpaceDynamics._LQRMStepCtx(hs, bare, true)
+        StateSpaceDynamics._lqr_structure_mstep!(ctx0, false, 1)
+        @test ctx.R[1][xr, xr] ≈ ctx0.R[1][xr, xr] + E(sm.A) rtol = 1e-12
+        @test ctx.R[1][lr, lr] ≈ ctx0.R[1][lr, lr] rtol = 1e-12
+        N = ctx.N_q[1]
+        StateSpaceDynamics._lqr_noise_mstep!(ctx)
+        StateSpaceDynamics._lqr_noise_mstep!(ctx0)
+        Ψ = prior ? Matrix(0.05I, n, n) : zeros(n, n)
+        Nx = prior ? (8.0 - n) + N + n + 1 : N
+        pn === :diagonal && (Nx = prior ? (8.0 - 2n + 1) + N + 2 : N)
+        expect = (ctx0.R[1][xr, xr] + E(sm.A) + Ψ) ./ (Nx + n)
+        pn === :diagonal && (expect = Diagonal(diag(expect)))
+        @test sm.Σ[xr, xr] ≈ expect rtol = 1e-10
+        @test sm.Σ[lr, lr] ≈ bare.Σ[lr, lr] rtol = 1e-12     # costate untouched
+    end
+
+    # Fixed noise: the objective moves by ½ tr(Σₓ⁻¹ E) and nothing else.
+    ctx, hs, sm, = causal_mstep_context(; profile=false, a_prior=true)
+    bare = deepcopy(sm)
+    bare.A_prior = nothing
+    ctx0 = StateSpaceDynamics._LQRMStepCtx(hs, bare, false)
+    θ = zeros(StateSpaceDynamics._lqr_nparams(ctx))
+    StateSpaceDynamics._lqr_pack!(θ, ctx)
+    θ .+= 0.01 .* randn(StableRNG(70), length(θ))
+    f1 = StateSpaceDynamics._lqr_fg!(nothing, θ, ctx)
+    f0 = StateSpaceDynamics._lqr_fg!(nothing, θ, ctx0)
+    @test f1 - f0 ≈ 0.5 * tr(sm.Σ[xr, xr] \ E(ctx.A[1])) rtol = 1e-10
+
+    # The reported log density.
+    Σx = sm.Σ[xr, xr]
+    @test StateSpaceDynamics._lqr_a_prior_logdensity(sm) ≈
+        -0.5 * (n * logdet(Σx) + tr(Σx \ E(sm.A))) rtol = 1e-12
+    @test StateSpaceDynamics._lqr_a_prior_logdensity(bare) == 0
+
+    # EM is monotone in the bound with the prior in it; a strong prior pins `A`.
+    mono(e) = minimum(diff(collect(e)))
+    for cfg in ((; a_prior=true), (; a_prior=true, nreg=3, tmax=14, prior=true))
+        rng = StableRNG(71)
+        sm, lds = causal_fixture(rng; cfg...)
+        lengths = haskey(cfg, :nreg) ? [14, 11, 14, 12, 14, 13] : fill(12, 6)
+        _, y = rand(rng, lds, lengths)
+        sm.A .+= 0.03
+        refresh!(sm)
+        @test mono(fit!(lds, y; max_iter=6, progress=false)) > -1e-7
+    end
+    rng = StableRNG(72)
+    sm, lds = causal_fixture(rng)
+    _, y = rand(rng, lds, fill(12, 6))
+    M₀ = [0.7 0.0; 0.0 0.6]
+    sm.A_prior = MNPrior(; M₀=M₀, Λ=Matrix(1e8I, n, n))
+    fit!(lds, y; max_iter=4, progress=false)
+    @test norm(sm.A - M₀) < 1e-3
+    @test norm(sm.A - CAUSAL_A) > 0.1
+
+    # Shapes are checked; a free model has no `A` to put a prior on.
+    #=
+    The ridge: an additive penalty and nothing else. No scatter, no count, the
+    noise update untouched, the objective moved by exactly ½ tr(E) under either
+    noise treatment — and, unlike the weighted prior, a strong one pins `A`.
+    =#
+    for profile in (true, false)
+        ctx, hs, sm, = causal_mstep_context(; profile=profile, a_ridge=true)
+        @test ctx.NA_q[1] == 0
+        bare = deepcopy(sm)
+        bare.A_prior = nothing
+        ctx0 = StateSpaceDynamics._LQRMStepCtx(hs, bare, profile)
+        θ = zeros(StateSpaceDynamics._lqr_nparams(ctx))
+        StateSpaceDynamics._lqr_pack!(θ, ctx)
+        θ .+= 0.01 .* randn(StableRNG(74), length(θ))
+        f1 = StateSpaceDynamics._lqr_fg!(nothing, θ, ctx)
+        f0 = StateSpaceDynamics._lqr_fg!(nothing, θ, ctx0)
+        @test f1 - f0 ≈ 0.5 * tr(E(ctx.A[1])) rtol = 1e-10
+        @test ctx.R[1] ≈ ctx0.R[1] rtol = 1e-12
+        if profile
+            StateSpaceDynamics._lqr_structure_mstep!(ctx, false, 1)
+            StateSpaceDynamics._lqr_structure_mstep!(ctx0, false, 1)
+            StateSpaceDynamics._lqr_noise_mstep!(ctx)
+            StateSpaceDynamics._lqr_noise_mstep!(ctx0)
+            @test sm.Σ ≈ bare.Σ rtol = 1e-12
+        end
+        @test StateSpaceDynamics._lqr_a_prior_logdensity(sm) ≈ -0.5 * tr(E(sm.A)) rtol = 1e-12
+    end
+    rng = StableRNG(75)
+    sm, lds = causal_fixture(rng; a_ridge=true, nreg=3, tmax=14)
+    _, y = rand(rng, lds, [14, 11, 14, 12, 14, 13])
+    sm.A .+= 0.03
+    refresh!(sm)
+    @test mono(fit!(lds, y; max_iter=6, progress=false)) > -1e-7
+    rng = StableRNG(72)
+    sm, lds = causal_fixture(rng)
+    _, y = rand(rng, lds, fill(12, 6))
+    sm.A_prior = RidgePrior(; M₀=M₀, Λ=Matrix(1e8I, n, n))
+    fit!(lds, y; max_iter=4, progress=false)
+    @test norm(sm.A - M₀) < 1e-4
+
+    smb, = causal_fixture(StableRNG(73))
+    smb.A_prior = MNPrior(; M₀=zeros(3, 3), Λ=Matrix(1.0I, 3, 3))
+    @test_throws DimensionMismatchError StateSpaceDynamics._validate_state_model(smb, 4)
+    smb.A_prior = MNPrior(; M₀=zeros(2, 2), Λ=[1.0 2.0; 2.0 1.0])     # indefinite
+    @test_throws ArgumentError StateSpaceDynamics._validate_state_model(smb, 4)
+    @test_throws MethodError free_state_model(
+        Matrix(0.9I, 4, 4), Matrix(0.1I, 4, 4); A_prior=CAUSAL_A_PRIOR
+    )
     return nothing
 end
 

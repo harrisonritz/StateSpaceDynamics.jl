@@ -191,6 +191,13 @@ function _validate_state_model(state_model::LQRStateModel{T}, latent_dim::Int) w
         _validate_switches(sm)
         _normalize_qc_prior(T, sm.Qc_prior, length(sm.Qc), n)
     end
+    if _is_free(sm)
+        sm.A_prior === nothing || throw(
+            ArgumentError("A_prior has no meaning in :free mode — there is no plant `A`"),
+        )
+    else
+        _check_a_prior(T, sm.A_prior, n)
+    end
 
     for (name, Σ, dim) in ((:Σ, sm.Σ, 2n), (:Σf, sm.Σf, n), (:P0, sm.P0, 2n))
         if size(Σ) != (dim, dim)

@@ -1064,9 +1064,11 @@ varies structure and noise independently: counting both priors on the `Q` slot
 would under-count a varying `Qc` when `Σ` is shared, and over-count a shared
 `Qc` when `Σ` varies.
 
-`init`, `sigma` and `qc` switch the initial-state, `Σ` and `Qc` terms off, for a
-switching model whose ties share a block across states that do not alias it
-(see `_slds_state_prior_logdensity`).
+`init`, `sigma`, `qc` and `a` switch the initial-state, `Σ`, `Qc` and `A_prior`
+terms off, for a switching model whose ties share a block across states that do
+not alias it (see `_slds_state_prior_logdensity`). The `A_prior` term is counted
+once per distinct `A` array, against the `Σ` of the first model holding it — the
+noise version the M-step weighs that copy's prior by.
 """
 function _grouped_state_prior_logdensity(
     ldss::AbstractVector{<:LinearDynamicalSystem{T,S}},
@@ -1075,6 +1077,7 @@ function _grouped_state_prior_logdensity(
     init::Bool=true,
     sigma::Bool=true,
     qc::Bool=true,
+    a::Bool=true,
 ) where {T<:Real,S<:LQRStateModel{T}}
     total = zero(T)
     if init
@@ -1085,8 +1088,13 @@ function _grouped_state_prior_logdensity(
     end
     seen_sigma = Base.IdSet()
     seen_qc = Base.IdSet()
+    seen_a = Base.IdSet()
     for lds in ldss
         sm = lds.state_model
+        if a && sm.A_prior !== nothing && !_is_free(sm) && !(sm.A in seen_a)
+            push!(seen_a, sm.A)
+            total += _lqr_a_prior_logdensity(sm)
+        end
         if sigma && sm.Σ_prior !== nothing && !(sm.Σ in seen_sigma)
             push!(seen_sigma, sm.Σ)
             total += if _is_causal(sm)
