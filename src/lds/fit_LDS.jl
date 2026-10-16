@@ -1477,6 +1477,8 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
@@ -1492,6 +1494,8 @@ function fit!(
         min_delta=min_delta,
         restore_best=restore_best,
         test_kwargs=test_kwargs,
+        test_diagnostics=test_diagnostics,
+        test_callback=test_callback,
     )
     #= A composite with a warped member runs the ECM driver instead: its
     embedding has to be rebuilt every E-step, and its warps get a second
@@ -1627,7 +1631,7 @@ function _fit_tridiag_grouped!(
         elbos[iter] = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1734,7 +1738,7 @@ function _fit_tridiag!(
         elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)

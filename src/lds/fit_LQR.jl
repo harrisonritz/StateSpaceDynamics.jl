@@ -587,6 +587,8 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:QuadraticEmission{T}}
     _reject_spline_lqr(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
@@ -605,6 +607,8 @@ function fit!(
         min_delta=min_delta,
         restore_best=restore_best,
         test_kwargs=test_kwargs,
+        test_diagnostics=test_diagnostics,
+        test_callback=test_callback,
     )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_tridiag_grouped!(
@@ -859,6 +863,8 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy, cost_offset=cost_offset)
@@ -877,6 +883,8 @@ function fit!(
         min_delta=min_delta,
         restore_best=restore_best,
         test_kwargs=test_kwargs,
+        test_diagnostics=test_diagnostics,
+        test_callback=test_callback,
     )
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     grp === nothing || return _fit_plds_grouped!(

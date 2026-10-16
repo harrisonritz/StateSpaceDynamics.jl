@@ -39,6 +39,15 @@ unaffected — and it carries the held-out trace alongside.
   `restore_best`, when the model is rolled back to `best_iter`'s parameters and
   this is `best_iter`; the held-out score of the returned model is then
   `test[findfirst(==(returned_iter), test_iters)]`.
+- `diagnostics`: compact parameter summaries at each test evaluation, plus an
+  `event="returned"` record describing the parameters actually returned (including
+  early-stop restoration). Each record has its own `iteration`; only `event="test"`
+  records align with `test_iters`. Training posterior summaries reuse the E-step
+  on LDS/PLDS routes; the final return record and SLDS records contain parameters
+  only. `test_diagnostics=false` disables collection. `test_callback=record->...`
+  receives records immediately, including a record if test scoring throws, so
+  callers can persist diagnostics before a fit finishes. Callbacks must not
+  mutate the model or fitting state.
 
 ```julia
 trace = fit!(lds, y_train; y_test=y_test)
@@ -55,7 +64,15 @@ struct FitTrace{T<:Real} <: AbstractVector{T}
     best_iter::Int
     stopped_early::Bool
     returned_iter::Int
+    diagnostics::Vector{Dict{String,Any}}
 end
+
+# Keep the previous positional constructor available to downstream callers.
+FitTrace{T}(train, test, iters, best, stopped, returned) where {T<:Real} =
+    FitTrace{T}(train, test, iters, best, stopped, returned, Dict{String,Any}[])
+FitTrace(train::Vector{T}, test::Vector{T}, iters::Vector{Int}, best::Int,
+         stopped::Bool, returned::Int) where {T<:Real} =
+    FitTrace{T}(train, test, iters, best, stopped, returned)
 
 Base.size(tr::FitTrace) = size(tr.train)
 Base.getindex(tr::FitTrace, i::Int) = tr.train[i]
@@ -103,6 +120,9 @@ mutable struct HoldoutMonitor{T<:Real,Y,UX0,UX,UY,NT<:NamedTuple}
     n_bad::Int
     stopped_early::Bool
     snapshot::Any
+    diagnostics::Vector{Dict{String,Any}}
+    collect_diagnostics::Bool
+    callback::Any
 end
 
 """
@@ -126,6 +146,8 @@ function _holdout_monitor(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
 ) where {T<:Real}
     y_test === nothing && return nothing
     test_every >= 1 || throw(ArgumentError("test_every must be >= 1, got $test_every"))
@@ -158,6 +180,9 @@ function _holdout_monitor(
         0,
         false,
         nothing,
+        Dict{String,Any}[],
+        test_diagnostics,
+        test_callback,
     )
 end
 
@@ -186,11 +211,15 @@ Sets `monitor.stopped_early` when the held-out ELBO has failed to improve on
 the best by more than `min_delta` for `patience` consecutive scored iterations
 and `early_stopping` is on.
 """
-function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Real}
+function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int;
+                          posterior=nothing, train_elbo=nothing) where {T<:Real}
+    record = Dict{String,Any}("iteration" => iter, "event" => "test",
+        "train_elbo" => train_elbo === nothing ? nothing : _diagnostic_finite(train_elbo), "test_elbo" => nothing,
+        "diagnostics" => mon.collect_diagnostics ? parameter_diagnostics(model; posterior) : nothing)
     # Only an LQR model takes `cost_offset`, so it is passed only when one was given.
     offset = mon.cost_offset === nothing ? (;) : (; cost_offset=mon.cost_offset)
-    v = T(
-        elbo(
+    v = try
+        T(elbo(
             model,
             mon.y;
             ux0=mon.ux0,
@@ -199,8 +228,14 @@ function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Re
             depends_on=mon.depends_on,
             offset...,
             mon.kwargs...,
-        ),
-    )
+        ))
+    catch err
+        record["error"] = sprint(showerror, err)
+        _holdout_diagnostic_record!(mon, record)
+        rethrow()
+    end
+    record["test_elbo"] = _diagnostic_finite(v)
+    _holdout_diagnostic_record!(mon, record)
     push!(mon.values, v)
     push!(mon.iters, iter)
 
@@ -220,6 +255,12 @@ function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int) where {T<:Re
         end
     end
     return v
+end
+
+function _holdout_diagnostic_record!(mon, record)
+    mon.collect_diagnostics && push!(mon.diagnostics, record)
+    mon.callback === nothing || mon.callback(record)
+    return nothing
 end
 
 _holdout_record!(::Nothing, ::Any, ::Int) = nothing
@@ -252,8 +293,15 @@ function _fit_result(mon::HoldoutMonitor{T}, elbos::Vector{T}, model) where {T<:
         _restore_params!(model, mon.snapshot)
         returned = mon.best_iter
     end
+    if mon.collect_diagnostics || mon.callback !== nothing
+        # The last M-step can run after the last scored E-step. Do not attach
+        # that earlier likelihood to these returned parameters without rescoring.
+        _holdout_diagnostic_record!(mon, Dict{String,Any}("iteration" => returned,
+            "event" => "returned", "train_elbo" => nothing, "test_elbo" => nothing,
+            "diagnostics" => mon.collect_diagnostics ? parameter_diagnostics(model) : nothing))
+    end
     return FitTrace{T}(
-        elbos, mon.values, mon.iters, mon.best_iter, mon.stopped_early, returned
+        elbos, mon.values, mon.iters, mon.best_iter, mon.stopped_early, returned, mon.diagnostics
     )
 end
 

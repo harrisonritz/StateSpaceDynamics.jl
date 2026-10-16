@@ -4505,6 +4505,8 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
     newton_max_iter::Int=20,
     newton_tol::Real=1e-6,
     discrete_warmup::Int=0,
@@ -4524,6 +4526,8 @@ function fit!(
         patience=patience,
         min_delta=min_delta,
         restore_best=restore_best,
+        test_diagnostics=test_diagnostics,
+        test_callback=test_callback,
         #= The held-out score counts a shared group's prior as the trace does, and
         solves for `q(x)` under the same Newton budget; `test_kwargs` overrides. =#
         test_kwargs=merge(
@@ -4821,7 +4825,7 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
@@ -4920,7 +4924,7 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter)
+            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)

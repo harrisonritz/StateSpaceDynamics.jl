@@ -40,6 +40,7 @@ include("lds/lqr_hold.jl")                          # infinite-horizon (hold) DA
 include("lds/lqr_types.jl")                         # inverse-LQR state model + derived cache
 include("lds/lqr_causal.jl")                        # causal (closed-loop) inverse-LQR mode
 include("lds/parameter_groups.jl")                  # `depends_on` -> per-group parameter variants
+include("lds/fit_diagnostics.jl")                    # read-only checkpoint summaries
 include("lds/holdout.jl")                           # held-out ELBO trace + early stopping
 include("utils/show.jl")
 include("utils/validation.jl")
@@ -110,6 +111,7 @@ export warp_forward, warp_inverse, warp_apply!, warp_unapply!
 export warp_bounds, warp_bins, warp_channels, warp_nparams, is_identity_warp
 export CovUpdateCache
 export FitTrace
+export parameter_diagnostics
 
 # Inverse LQR
 export LQRStateModel, LQRFitFlags, cost_schedule, refresh!

@@ -397,7 +397,7 @@ function _fit_spline!(
             emb.logjac[] +
             _spline_logprior(lds.obs_model)
 
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)

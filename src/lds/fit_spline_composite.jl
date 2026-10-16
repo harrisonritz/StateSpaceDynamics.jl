@@ -323,7 +323,7 @@ function _fit_spline_composite!(
             logjac +
             _spline_sites_logprior(T, sites)
 
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -494,7 +494,7 @@ function _fit_spline_laplace!(
             logjac +
             _spline_sites_logprior(T, sites)
 
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)

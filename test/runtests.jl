@@ -637,6 +637,7 @@ using SSDTest
         end
 
         include("LinearDynamicalSystems/Holdout.jl")
+        include("LinearDynamicalSystems/FitDiagnostics.jl")
         @testset "Held-out ELBO and early stopping" begin
             test_holdout_non_breaking()
             test_holdout_matches_standalone_elbo()

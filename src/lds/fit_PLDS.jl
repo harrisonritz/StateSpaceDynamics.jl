@@ -1011,6 +1011,8 @@ function fit!(
     min_delta::Real=0.0,
     restore_best::Bool=true,
     test_kwargs::NamedTuple=NamedTuple(),
+    test_diagnostics::Bool=true,
+    test_callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
@@ -1026,6 +1028,8 @@ function fit!(
         min_delta=min_delta,
         restore_best=restore_best,
         test_kwargs=test_kwargs,
+        test_diagnostics=test_diagnostics,
+        test_callback=test_callback,
     )
     #= A warped member needs its embedding rebuilt every E-step and its warp a
     second conditional-maximization step; see `fit_spline_composite.jl`. =#
@@ -1149,7 +1153,7 @@ function _fit_laplace!(
         elbos[iter] = elbo!(plds, suf, tfs, data, sws_pool)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1431,7 +1435,7 @@ function _fit_plds_grouped!(
         )
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter)
+        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
