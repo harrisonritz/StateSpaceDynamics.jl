@@ -351,6 +351,8 @@ function _validate_obs_model(
     if length(obs_model.d) != obs_dim
         throw(DimensionMismatchError("observation bias d", obs_dim, length(obs_model.d)))
     end
+    obs_model.d_fixed_zero && !all(iszero, obs_model.d) &&
+        throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
 
     return nothing
 end
@@ -376,6 +378,8 @@ function _validate_obs_model(
     if length(obs_model.d) != obs_dim
         throw(DimensionMismatchError("d vector", obs_dim, length(obs_model.d)))
     end
+    obs_model.d_fixed_zero && !all(iszero, obs_model.d) &&
+        throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
 
     # Check D matrix (observation-input map): (obs_dim × uy_dim). uy_dim is free,
     # but the row count must match obs_dim.

@@ -1197,6 +1197,7 @@ function _build_variants!(
     dims_C = [_slot_dim(spec_C, i, p0, seeds_C[i]) for i in 1:(dep.nslots[1])]
     Cs = [_seed_slot_C(om.C, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
     ds = [_seed_slot_d(om.d, i, dims_C[i], spec_C, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    om.d_fixed_zero && foreach(d -> fill!(d, zero(T)), ds)
     Ds = [_seed_slot_D(om.D, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
     seeds_R = [_group_seed(om, dep, 2, j) for j in 1:(dep.nslots[2])]
     Rs = [
@@ -1216,6 +1217,7 @@ function _build_variants!(
             R_prior=om.R_prior,
             CD_prior=CD_priors[s[1]],
             R_diagonal=om.R_diagonal,
+            d_fixed_zero=om.d_fixed_zero,
         )
     end
     om.variants = variants
@@ -1241,6 +1243,7 @@ function _build_variants!(
     dims_C = [_slot_dim(spec_C, i, p0, seeds_C[i]) for i in 1:(dep.nslots[1])]
     Cs = [_seed_slot_C(om.C, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
     ds = [_seed_slot_d(om.d, i, dims_C[i], spec_C, seeds_C[i]) for i in 1:(dep.nslots[1])]
+    om.d_fixed_zero && foreach(d -> fill!(d, zero(T)), ds)
     Ds = [_seed_slot_D(om.D, i, dims_C[i], seeds_C[i]) for i in 1:(dep.nslots[1])]
     CD_priors = [_slot_obs_prior(om.CD_prior, dims_C[i]) for i in 1:(dep.nslots[1])]
 
@@ -1248,7 +1251,8 @@ function _build_variants!(
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
         variants[cell] = PoissonObservationModel{T,M,V}(;
-            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=CD_priors[s[1]]
+            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=CD_priors[s[1]],
+            d_fixed_zero=om.d_fixed_zero,
         )
     end
     om.variants = variants

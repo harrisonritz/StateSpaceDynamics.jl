@@ -133,6 +133,24 @@ function Q_obs!(
     return T(-0.5) * (T(obs_n) * (const_term + log_det_R) + tr(S_obs))
 end
 
+"""Zero-constrained columns of [C d D], combining a hidden LQR costate and
+an optional fixed-zero intercept. Both form a contiguous block ending at d.
+"""
+function _fixed_obs_cols(lds)
+    mask = _costate_range(lds)
+    om = lds.obs_model
+    if hasproperty(om, :d_fixed_zero) && om.d_fixed_zero
+        return (mask === nothing ? lds.latent_dim+1 : first(mask)):(lds.latent_dim+1)
+    end
+    return mask
+end
+
+function _free_obs_cols(lds, width, cols=nothing)
+    owned = cols === nothing ? collect(1:width) : collect(cols)
+    mask = _fixed_obs_cols(lds)
+    return mask === nothing ? owned : setdiff(owned, mask)
+end
+
 function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
@@ -140,6 +158,17 @@ function update_C_d!(
     D = lds.latent_dim
     uy_dim = lds.uy_dim
     CD_prior = lds.obs_model.CD_prior
+
+    mask = _fixed_obs_cols(lds)
+    if mask !== nothing
+        width = size(suf.obs_xx[].mat, 1)
+        free = _free_obs_cols(lds, width)
+        prior = _restrict_mn_prior(CD_prior, free)
+        V = zeros(T, lds.obs_dim, width)
+        V[:, free] .= mn_map(Matrix(suf.obs_xx[].mat[free,free]), Matrix(suf.obs_xy[free,:]), prior)
+        _unpack_obs_V!(lds, V)
+        return nothing
+    end
 
     if CD_prior === nothing
         #=
@@ -263,6 +292,9 @@ function _accumulate_cd_prior_scatter!(
     CD_prior = lds.obs_model.CD_prior
     CD_prior === nothing && return S_res
     V = _pack_obs_V!(sws.reg.CD, lds)
+    if _fixed_obs_cols(lds) !== nothing
+        cols = _free_obs_cols(lds, size(V,2), cols)
+    end
     if cols === nothing
         Wm = V .- CD_prior.M₀
         S_res .+= Wm * CD_prior.Λ * Wm'
@@ -285,7 +317,7 @@ normalized matrix-normal prior. See [`_x0_prior_width`](@ref).
 function _cd_prior_width(lds::LinearDynamicalSystem, cols=nothing)
     prior = lds.obs_model.CD_prior
     prior === nothing && return 0
-    return cols === nothing ? size(prior.Λ, 1) : length(cols)
+    return length(_free_obs_cols(lds, size(prior.Λ, 1), cols))
 end
 
 """
@@ -358,7 +390,12 @@ function _obs_prior_logdensity(
     if om.CD_prior !== nothing
         W_cd = _obs_pack_scratch(lds, sws)
         _pack_obs_V!(W_cd, lds)
-        total += mn_logprior_term(W_cd, om.R, om.CD_prior)
+        if _fixed_obs_cols(lds) === nothing
+            total += mn_logprior_term(W_cd, om.R, om.CD_prior)
+        else
+            free = _free_obs_cols(lds, size(W_cd,2))
+            total += mn_logprior_term(W_cd[:,free], om.R, _restrict_mn_prior(om.CD_prior, free))
+        end
     end
 
     return total

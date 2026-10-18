@@ -213,6 +213,8 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
     observation space.
 - `R::M`: Observation noise covariance of size `(obs_dim × obs_dim)`.
 - `d::V`: Bias vector of length `(obs_dim)`.
+- `d_fixed_zero::Bool = false`: Keep `d` exactly zero while fitting C/D. Requires
+    zero initial d; applies to every derived parameter-group variant.
 - `R_prior::Union{Nothing, IWPrior{T}} = nothing`: Optional Inverse-Wishart prior for `R`.
 - `CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
     the stacked emission matrix `[C D]`. Pair with `R_prior` for a full MNIW prior on `(CD, R)`.
@@ -250,6 +252,8 @@ Base.@kwdef mutable struct GaussianObservationModel{
     group_seeds::Union{Nothing,AbstractDict} = nothing
     variants::Union{Nothing,Vector{GaussianObservationModel{T,M,V}}} = nothing
     R_diagonal::Bool = false
+    # Constrain the intercept within the coefficient solve; C and D stay free.
+    d_fixed_zero::Bool = false
 end
 
 # Convenience constructors (State)
@@ -322,6 +326,8 @@ model reduces to the canonical `λ_t = exp(C x_t + d)`.
 - `C::AbstractMatrix{T}`: Observation matrix of size `(obs_dim × latent_dim)`. Maps latent
     states into observation space.
 - `d::AbstractVector{T}`: Per-neuron baseline log-rate (length `obs_dim`). Free in ℝ.
+- `d_fixed_zero::Bool = false`: Keep `d` exactly zero while fitting C/D. Requires
+    zero initial d; applies to every derived parameter-group variant.
 - `D::AbstractMatrix{T} = zeros(..., obs_dim, 0)`: Observation-input matrix of size
     `(obs_dim × uy_dim)` mapping the observation input `v_t` (`uy`) into log-rate space.
     Defaults to a zero-column matrix (no inputs).
@@ -355,6 +361,8 @@ Base.@kwdef mutable struct PoissonObservationModel{
     depends_on::Union{Nothing,NamedTuple} = nothing
     group_seeds::Union{Nothing,AbstractDict} = nothing
     variants::Union{Nothing,Vector{PoissonObservationModel{T,M,V}}} = nothing
+    # Requires d=zeros at construction, including all derived session variants.
+    d_fixed_zero::Bool = false
 end
 
 # 2-arg convenience constructor; matches the Gaussian path's positional form

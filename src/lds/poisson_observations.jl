@@ -204,6 +204,8 @@ function _update_observation_model_lbfgs!(
             grad_W_view = reshape(view(grad, 1:n_W), obs_dim, reg_dim)
             grad_W_view .+= (W_view .- CD_prior.M₀) * CD_prior.Λ
         end
+        mask = _fixed_obs_cols(plds)
+        mask === nothing || fill!(view(reshape(grad, obs_dim, reg_dim), :, mask), zero(T))
         return grad
     end
 

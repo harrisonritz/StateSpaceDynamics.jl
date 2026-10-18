@@ -209,7 +209,7 @@ function update_C_d!(
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
     regdim = size(suf.obs_xx[].mat, 1)
-    mask = _costate_range(lds)
+    mask = _fixed_obs_cols(lds)
     free = mask === nothing ? collect(1:regdim) : setdiff(1:regdim, mask)
     prior = _restrict_mn_prior(lds.obs_model.CD_prior, free)
     Vfree = mn_map(Matrix(suf.obs_xx[].mat[free, free]), Matrix(suf.obs_xy[free, :]), prior)
@@ -241,7 +241,7 @@ end
 # (`cols`, all by default) that the costate mask leaves free.
 function _lqr_cd_prior_cols(lds::LinearDynamicalSystem, width::Int, cols)
     owned = cols === nothing ? collect(1:width) : collect(cols)
-    mask = _costate_range(lds)
+    mask = _fixed_obs_cols(lds)
     return mask === nothing ? owned : setdiff(owned, mask)
 end
 
@@ -262,7 +262,7 @@ function _obs_prior_logdensity(
     if om.CD_prior !== nothing
         W = _obs_pack_scratch(lds, sws)
         _pack_obs_V!(W, lds)
-        mask = _costate_range(lds)
+        mask = _fixed_obs_cols(lds)
         free = mask === nothing ? collect(axes(W, 2)) : setdiff(axes(W, 2), mask)
         total += mn_logprior_term(W[:, free], om.R, _restrict_mn_prior(om.CD_prior, free))
     end

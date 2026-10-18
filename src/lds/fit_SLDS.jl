@@ -3637,7 +3637,7 @@ state model may not read them. The statistics arrive with those columns already
 decoupled (see `_mask_costate_gram!`), but a prior does not.
 =#
 _block_mask(::_DynBlock, lds) = nothing
-_block_mask(::_ObsBlock, lds) = _costate_range(lds)
+_block_mask(::_ObsBlock, lds) = _fixed_obs_cols(lds)
 
 _block_group(::_DynBlock) = _G_AB
 _block_group(::_ObsBlock) = _G_CD
@@ -3693,6 +3693,21 @@ function _slds_update_regression!(
 
     stats = [_block_stats(block, sufs[k]) for k in 1:K]
     masks = [_block_mask(block, ldss[k]) for k in 1:K]
+    # A zero intercept, unlike the costate, is not masked in the E-step's
+    # composite-wide statistics. Decouple it here before a partial-tie solve.
+    stats = [if masks[k] === nothing
+        stats[k]
+    else
+        XX, XY = copy(stats[k][1]), copy(stats[k][2])
+        for i in masks[k]
+            diagonal = XX[i,i]
+            XX[i,:] .= 0
+            XX[:,i] .= 0
+            XX[i,i] = max(diagonal, one(T))
+            XY[i,:] .= 0
+        end
+        (XX,XY)
+    end for k in 1:K]
     #=
     The partial-tie solver takes full-width priors, so a masked regime's prior is
     written to hold its masked coefficients at zero; left as it is, a prior mean

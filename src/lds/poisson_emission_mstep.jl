@@ -573,7 +573,7 @@ function update_observation_model!(
         afterwards — keeps this a properly constrained maximization, and so keeps
         the emission M-step monotone. `nothing` for every other model.
         =#
-        _freeze_masked_rows!(grad, H, _costate_range(plds))
+        _freeze_masked_rows!(grad, H, _fixed_obs_cols(plds))
 
         _poisson_newton_direction!(Δ, decrement, H, grad, solving)
 

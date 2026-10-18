@@ -1062,7 +1062,7 @@ function _grouped_update_C_d!(
                 lds, _pool_obs!(bufs, sufs, units), _unit_ws(unit_sws, sws, units[1])
             )
         elseif lds.fit_bool[_G_CD]
-            mask = _costate_range(lds)
+            mask = _fixed_obs_cols(lds)
             free_cols = if mask === nothing
                 nothing
             else
@@ -1471,7 +1471,7 @@ function _grouped_gaussian_obs_prior_logdensity(
         om.CD_prior === nothing && continue
         D = lds.latent_dim
         W_cd = _pack_obs_V!(Matrix{T}(undef, lds.obs_dim, D + 1 + lds.uy_dim), lds)
-        mask = _costate_range(lds)
+        mask = _fixed_obs_cols(lds)
         owned = _unit_prior_cols(cd_cols, u)
         if mask === nothing && owned === nothing
             total += mn_logprior_term(W_cd, om.R, om.CD_prior)
