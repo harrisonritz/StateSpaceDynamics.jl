@@ -70,6 +70,8 @@ include("lds/fit_LDS.jl")
 include("lds/fit_spline_LDS.jl")        # ECM driver for the spline-Gaussian emission
 include("lds/fit_spline_composite.jl")  # ... and for warped members of a composite
 include("lds/fit_PLDS.jl")
+include("lds/gaussian_variational.jl")
+include("lds/affine_gauge.jl")
 include("lds/fit_SLDS.jl")
 include("lds/fit_slds_spline.jl")       # ... and for a warped emission in an SLDS
 

@@ -530,12 +530,35 @@ function smooth!(
     uy::Union{AbstractMatrix{T},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    _check_inference(inference, variational_max_iter, variational_tol)
     tsteps, D = _ntsteps(y), lds.latent_dim
     n_active = D * tsteps
     btd = sws.btd
 
     compute_smooth_constants!(sws, lds)
+
+    #=
+    Full Gaussian VI needs no Laplace mode: when this trial still holds the
+    previous variational posterior (its mean and expected rates), start there.
+    =#
+    if inference === :variational && _vi_can_warm_start(lds, fs, y)
+        return _gaussian_variational!(
+            lds,
+            fs,
+            y,
+            sws,
+            ux,
+            uy;
+            inference,
+            max_iter=variational_max_iter,
+            tol=variational_tol,
+            warm=true,
+        )
+    end
 
     x = fs.x_smooth
 
@@ -641,7 +664,17 @@ function smooth!(
         end
     end
 
-    return fs
+    return _gaussian_variational!(
+        lds,
+        fs,
+        y,
+        sws,
+        ux,
+        uy;
+        inference,
+        max_iter=variational_max_iter,
+        tol=variational_tol,
+    )
 end
 
 # Backward-compatible no-input overload (zero-row ux/uy).
@@ -652,10 +685,23 @@ function smooth!(
     sws::SmoothWorkspace{T};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     ux = zeros(T, 0, _ntsteps(y))
     uy = _zero_uy(lds, _ntsteps(y))
-    return smooth!(lds, fs, y, sws, ux, uy; max_iter=max_iter, tol=tol)
+    return smooth!(
+        lds,
+        fs,
+        y,
+        sws,
+        ux,
+        uy;
+        max_iter=max_iter,
+        tol=tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
 end
 
 """
@@ -673,6 +719,9 @@ function smooth!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     y = data.y
     ux = data.ux
@@ -689,6 +738,7 @@ function smooth!(
             _trial(uy, 1);
             max_iter=max_iter,
             tol=tol,
+            _inference_controls(inference, variational_max_iter, variational_tol)...,
         )
         return tfs
     end
@@ -716,6 +766,7 @@ function smooth!(
                 _trial(uy, trial);
                 max_iter=max_iter,
                 tol=tol,
+                _inference_controls(inference, variational_max_iter, variational_tol)...,
             )
         finally
             put!(free, sws)
@@ -735,8 +786,19 @@ function smooth!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
-    return smooth!(lds, tfs, Data(lds, y), sws_pool; max_iter=max_iter, tol=tol)
+    return smooth!(
+        lds,
+        tfs,
+        Data(lds, y),
+        sws_pool;
+        max_iter=max_iter,
+        tol=tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
 end
 
 """
@@ -750,6 +812,9 @@ function smooth!(
     y::Union{AbstractVector{<:AbstractMatrix{T}},NamedTuple};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(_trial_lengths(y))
     npool = Threads.maxthreadid()
@@ -763,7 +828,15 @@ function smooth!(
             uy_dim=_ws_uy_dim(lds),
         ) for _ in 1:npool
     ]
-    return smooth!(lds, tfs, y, sws_pool; max_iter=max_iter, tol=tol)
+    return smooth!(
+        lds,
+        tfs,
+        y,
+        sws_pool;
+        max_iter=max_iter,
+        tol=tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
 end
 
 """
@@ -781,10 +854,21 @@ function estep!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
 
     # smooth each trial
-    smooth!(lds, tfs, data, sws_pool; max_iter=max_iter, tol=tol)
+    smooth!(
+        lds,
+        tfs,
+        data,
+        sws_pool;
+        max_iter=max_iter,
+        tol=tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
 
     # compute the sufficient statistics
     return _aggregate_td_suff_stats!(suf, tfs, lds, data, sws_pool[1])
@@ -825,8 +909,12 @@ function elbo(
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    _validate_variational_model(plds, inference, variational_max_iter, variational_tol)
     if _warped_route(plds, depends_on)
         return _spline_composite_elbo_laplace(
             plds, y, ux0, ux, uy, newton_max_iter, newton_tol
@@ -838,7 +926,12 @@ function elbo(
         sws_pool = _grouped_sws_pool(plds, data)
         state = _grouped_fit_state(plds, data, grp, sws_pool)
         return _grouped_estep_elbo_poisson!(
-            state, grp, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
+            state,
+            grp,
+            sws_pool;
+            max_iter=newton_max_iter,
+            tol=T(newton_tol),
+            _inference_controls(inference, variational_max_iter, variational_tol)...,
         )
     end
     tfs = initialize_FilterSmooth(
@@ -858,7 +951,16 @@ function elbo(
     suf = _initialize_td_sufficient_statistics(T, plds, data.tsteps)
     _td_init_const_blocks!(sws_pool[1], plds, data)
 
-    estep!(plds, suf, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+    estep!(
+        plds,
+        suf,
+        tfs,
+        data,
+        sws_pool;
+        max_iter=newton_max_iter,
+        tol=T(newton_tol),
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
 
     return elbo!(plds, suf, tfs, data, sws_pool)
 end
@@ -894,8 +996,12 @@ function smooth(
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     depends_on::Union{Nothing,NamedTuple}=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    _validate_variational_model(plds, inference, variational_max_iter, variational_tol)
     if _warped_route(plds, depends_on)
         return _spline_composite_smooth_laplace(
             plds, y, ux0, ux, uy, newton_max_iter, newton_tol
@@ -903,7 +1009,17 @@ function smooth(
     end
     data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
-    grp === nothing || return _grouped_smooth(plds, data, grp, y)
+    grp === nothing || return _grouped_smooth(
+        plds,
+        data,
+        grp,
+        y;
+        newton_max_iter,
+        newton_tol,
+        inference,
+        variational_max_iter,
+        variational_tol,
+    )
     tfs = initialize_FilterSmooth(plds, data.tsteps)::TrialFilterSmooth{T}
     # Cap the pool at the trial count — workspaces beyond ntrials are never
     # touched and each carries O(D²·T) of block-tridiagonal storage.
@@ -918,7 +1034,15 @@ function smooth(
             uy_dim=_ws_uy_dim(plds),
         ) for _ in 1:npool
     ]
-    smooth!(plds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+    smooth!(
+        plds,
+        tfs,
+        data,
+        sws_pool;
+        max_iter=newton_max_iter,
+        tol=T(newton_tol),
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
     return _collect_smooth_output(tfs, y)
 end
 
@@ -953,7 +1077,19 @@ Fit a Poisson LDS via Laplace-EM.
   alone
 - `progress`: show progress bar
 - `newton_max_iter`: Newton iterations per E-step inner solve
-- `newton_tol`: Newton convergence tolerance
+- `newton_tol`: Newton convergence tolerance.
+- `inference`: `:laplace` (default), `:mean_corrected` (optimize the Gaussian
+  mean at fixed Laplace covariance), or `:variational` (optimize both).
+  Nondefault inference requires `GaussianStateModel` and Gaussian/Poisson emissions.
+- `variational_max_iter` / `variational_tol`: refinement cap and tolerance
+  (100 and 1e-4, a per-dimension residual in posterior-scale units).
+  Nonconvergence is diagnosed. Full VI warm-starts each E-step from the
+  previous one's posterior (mean and expected rates), skipping the Laplace solve.
+- `gauge_center` / `gauge_whiten`: exact post-M-step coordinate normalization,
+  with transformed parameter priors. Translation must preserve parameter ties
+  and cannot be used with fixed-zero offsets or initial-state B0 inputs.
+- `gauge_max_condition`: skip Q whitening above this condition (default 1e8);
+  failed covariance SPD/round-trip checks also skip whitening.
 - `depends_on`: optional `NamedTuple` of per-trial label vectors overriding the
   `depends_on` declared on the models for this call (see the ancillary parameter
   dependency docs). Needed when this dataset's trial count differs from the one
@@ -996,8 +1132,14 @@ function fit!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     spline_iters::Int=25,
     depends_on::Union{Nothing,NamedTuple}=nothing,
     y_test=nothing,
@@ -1014,6 +1156,8 @@ function fit!(
     test_diagnostics::Bool=true,
     test_callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
+    _validate_variational_model(plds, inference, variational_max_iter, variational_tol)
+    _validate_gauge(plds, gauge_center, gauge_whiten, gauge_max_condition)
     data = Data(plds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
         T,
@@ -1027,7 +1171,11 @@ function fit!(
         patience=patience,
         min_delta=min_delta,
         restore_best=restore_best,
-        test_kwargs=test_kwargs,
+        test_kwargs=if inference === :laplace
+            test_kwargs
+        else
+            merge((; inference, variational_max_iter, variational_tol), test_kwargs)
+        end,
         test_diagnostics=test_diagnostics,
         test_callback=test_callback,
     )
@@ -1048,6 +1196,7 @@ function fit!(
         )
     end
     grp = parameter_grouping(plds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    _validate_gauge_groups(plds, grp, gauge_center, gauge_whiten)
     grp === nothing || return _fit_plds_grouped!(
         plds,
         data,
@@ -1058,7 +1207,11 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
         monitor=monitor,
+        gauge_center,
+        gauge_whiten,
+        gauge_max_condition,
     )
     return _fit_laplace!(
         plds,
@@ -1069,7 +1222,11 @@ function fit!(
         progress=progress,
         newton_max_iter=newton_max_iter,
         newton_tol=newton_tol,
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
         monitor=monitor,
+        gauge_center,
+        gauge_whiten,
+        gauge_max_condition,
     )
 end
 
@@ -1106,8 +1263,14 @@ function _fit_laplace!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     T_max = maximum(data.tsteps)
@@ -1116,7 +1279,7 @@ function _fit_laplace!(
         plds, data.tsteps; compact=_compact_posteriors(plds)
     )::TrialFilterSmooth{T}
 
-    npool = Threads.maxthreadid()
+    npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
             T,
@@ -1147,13 +1310,23 @@ function _fit_laplace!(
     for iter in 1:max_iter
 
         # E-step: smooth each trial, aggregate state-side suff-stats, compute ELBO
-        estep!(plds, suf, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+        estep!(
+            plds,
+            suf,
+            tfs,
+            data,
+            sws_pool;
+            max_iter=newton_max_iter,
+            tol=T(newton_tol),
+            _inference_controls(inference, variational_max_iter, variational_tol)...,
+        )
 
         # compute the ELBO
         elbos[iter] = elbo!(plds, suf, tfs, data, sws_pool)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter; posterior=tfs, train_elbo=elbos[iter])
+        _holdout_due(monitor, iter) &&
+            _holdout_record!(monitor, plds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1171,6 +1344,15 @@ function _fit_laplace!(
 
         # M-step: update state-side suff-stats from suf, update Poisson emission via LBFGS
         mstep!(plds, suf, tfs, data, sws_pool)
+        _affine_gauge!(
+            plds,
+            [plds],
+            [tfs],
+            nothing;
+            center=gauge_center,
+            whiten=gauge_whiten,
+            max_condition=gauge_max_condition,
+        )
 
         # print progress
         prog !== nothing && next!(prog)
@@ -1194,6 +1376,9 @@ function _grouped_estep_elbo_poisson!(
     sws_pool::Vector{SmoothWorkspace{T}};
     max_iter::Int=20,
     tol::T=T(1e-6),
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {
     T<:Real,
     L<:LinearDynamicalSystem{T,<:AbstractGaussianStateModel{T},<:NonQuadraticEmission{T}},
@@ -1205,7 +1390,14 @@ function _grouped_estep_elbo_poisson!(
         tfs_c = state.cell_tfs[c]
         cell_pool = _prepare_cell!(sws_pool, state, c)
         estep!(
-            lds_c, suf_c, tfs_c, state.cell_data[c], cell_pool; max_iter=max_iter, tol=tol
+            lds_c,
+            suf_c,
+            tfs_c,
+            state.cell_data[c],
+            cell_pool;
+            max_iter=max_iter,
+            tol=tol,
+            _inference_controls(inference, variational_max_iter, variational_tol)...,
         )
 
         compute_smooth_constants!(cell_pool[1], lds_c)
@@ -1410,8 +1602,14 @@ function _fit_plds_grouped!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:NonQuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(plds, data)
@@ -1431,11 +1629,18 @@ function _fit_plds_grouped!(
 
     for iter in 1:max_iter
         elbos[iter] = _grouped_estep_elbo_poisson!(
-            state, grp, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol)
+            state,
+            grp,
+            sws_pool;
+            max_iter=newton_max_iter,
+            tol=T(newton_tol),
+            _inference_controls(inference, variational_max_iter, variational_tol)...,
         )
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, plds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter])
+        _holdout_due(monitor, iter) && _holdout_record!(
+            monitor, plds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter]
+        )
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1459,6 +1664,15 @@ function _fit_plds_grouped!(
             _state_bufs(state.bufs),
         )
         _grouped_update_observation_model!(state, grp, data, sws_pool)
+        _affine_gauge!(
+            plds,
+            state.cell_lds,
+            state.cell_tfs,
+            grp;
+            center=gauge_center,
+            whiten=gauge_whiten,
+            max_condition=gauge_max_condition,
+        )
 
         prog !== nothing && next!(prog)
     end

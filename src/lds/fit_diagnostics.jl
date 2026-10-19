@@ -17,6 +17,16 @@ function parameter_diagnostics(model; posterior=nothing)
     result["latent"] = latent
     ldss = model isa SLDS ? model.LDSs : (model,)
     for (regime, lds) in enumerate(ldss)
+        if lds.state_model isa GaussianStateModel && lds.state_model.gauge !== nothing
+            g = lds.state_model.gauge
+            result["affine_gauge"] = Dict(
+                "whitening_skips" => g.whitening_skips,
+                "last_condition" => _diagnostic_finite(g.last_condition),
+                "reference_map_norm" => _diagnostic_finite(norm(g.map)),
+                "reference_offset_norm" => _diagnostic_finite(norm(g.offset)),
+                "logprior_offset" => _diagnostic_finite(g.logprior_offset),
+            )
+        end
         _diagnostic_variants!(result["states"], lds.state_model, regime, "state", latent)
         if lds.obs_model isa CompositeObservationModel
             for (name, member) in pairs(_models(lds.obs_model))
@@ -56,8 +66,8 @@ end
 function _diagnostic_variants!(rows, root, regime, member, latent)
     variants =
         if hasproperty(root, :variants) &&
-           root.variants !== nothing &&
-           !isempty(root.variants)
+            root.variants !== nothing &&
+            !isempty(root.variants)
             root.variants
         else
             (root,)
@@ -129,6 +139,7 @@ function _diagnostic_latents(posterior)
     n = 0
     squared = 0.0
     maxabs = 0.0
+    inference = Dict{String,Any}[]
     for cell in cells, fs in cell.FilterSmooths
         x = fs.x_smooth
         total === nothing && (total = zeros(size(x, 1)))
@@ -136,6 +147,7 @@ function _diagnostic_latents(posterior)
         n += size(x, 2)
         squared += sum(abs2, x)
         maxabs = max(maxabs, maximum(abs, x))
+        isempty(fs.inference_stats) || push!(inference, fs.inference_stats)
     end
     n == 0 && return nothing
     center = total ./ n
@@ -146,5 +158,21 @@ function _diagnostic_latents(posterior)
         "mean_norm" => _diagnostic_finite(norm(center)),
         "rms" => _diagnostic_finite(sqrt(squared / (n * length(center)))),
         "maxabs" => _diagnostic_finite(maxabs),
+        "inference" => if isempty(inference)
+            nothing
+        else
+            Dict(
+                "method" => first(inference)["method"],
+                "trials" => length(inference),
+                "unconverged" => count(d -> !get(d, "converged", true), inference),
+                "max_iterations" => maximum(get(d, "iterations", 0) for d in inference),
+                "max_mean_residual" => _diagnostic_finite(
+                    maximum(get(d, "mean_residual", 0.0) for d in inference)
+                ),
+                "max_precision_residual" => _diagnostic_finite(
+                    maximum(get(d, "precision_residual", 0.0) for d in inference)
+                ),
+            )
+        end,
     )
 end

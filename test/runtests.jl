@@ -270,6 +270,8 @@ using SSDTest
         end
 
         include("LinearDynamicalSystems/PoissonLDS.jl")
+        include("LinearDynamicalSystems/GaussianVariational.jl")
+        test_gaussian_variational_and_gauge()
         @testset "Poisson LDS" begin
             @testset "Constructors" begin
                 test_PoissonLDS_with_params()
@@ -617,8 +619,10 @@ using SSDTest
         end
 
         include("LinearDynamicalSystems/InitialInputs.jl")
+        include("LinearDynamicalSystems/InitialPriors.jl")
         @testset "Initial inputs" begin
             test_initial_inputs()
+            test_initial_mniw_priors()
             test_lqr_initial_inputs_terminal()
         end
 

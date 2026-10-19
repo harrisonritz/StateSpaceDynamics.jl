@@ -1461,6 +1461,9 @@ function fit!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     spline_iters::Int=25,
     ux0=nothing,
     ux=nothing,
@@ -1480,6 +1483,7 @@ function fit!(
     test_diagnostics::Bool=true,
     test_callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    _validate_gauge(lds, gauge_center, gauge_whiten, gauge_max_condition)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
     monitor = _holdout_monitor(
         T,
@@ -1513,6 +1517,7 @@ function fit!(
         )
     end
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
+    _validate_gauge_groups(lds, grp, gauge_center, gauge_whiten)
     grp === nothing || return _fit_tridiag_grouped!(
         lds,
         data,
@@ -1522,9 +1527,21 @@ function fit!(
         rtol=rtol,
         progress=progress,
         monitor=monitor,
+        gauge_center,
+        gauge_whiten,
+        gauge_max_condition,
     )
     return _fit_tridiag!(
-        lds, data; max_iter=max_iter, tol=tol, rtol=rtol, progress=progress, monitor=monitor
+        lds,
+        data;
+        max_iter=max_iter,
+        tol=tol,
+        rtol=rtol,
+        progress=progress,
+        monitor=monitor,
+        gauge_center,
+        gauge_whiten,
+        gauge_max_condition,
     )
 end
 
@@ -1609,6 +1626,9 @@ function _fit_tridiag_grouped!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     sws_pool = _grouped_sws_pool(lds, data)
@@ -1631,7 +1651,9 @@ function _fit_tridiag_grouped!(
         elbos[iter] = _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter])
+        _holdout_due(monitor, iter) && _holdout_record!(
+            monitor, lds, iter; posterior=state.cell_tfs, train_elbo=elbos[iter]
+        )
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1657,6 +1679,15 @@ function _fit_tridiag_grouped!(
         _grouped_obs_mstep!(
             lds, state.cell_lds, _obs_sufs(state.sufs), grp.cell_slot, cell_ws1, state.bufs
         )
+        _affine_gauge!(
+            lds,
+            state.cell_lds,
+            state.cell_tfs,
+            grp;
+            center=gauge_center,
+            whiten=gauge_whiten,
+            max_condition=gauge_max_condition,
+        )
 
         prog !== nothing && next!(prog)
     end
@@ -1672,6 +1703,9 @@ function _fit_tridiag!(
     tol::Float64=1e-6,
     rtol::Float64=0.0,
     progress::Bool=true,
+    gauge_center::Bool=false,
+    gauge_whiten::Bool=false,
+    gauge_max_condition::Real=1e8,
     monitor=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
@@ -1738,7 +1772,8 @@ function _fit_tridiag!(
         elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 
         # Held-out score at the same parameters the training ELBO just used.
-        _holdout_due(monitor, iter) && _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
+        _holdout_due(monitor, iter) &&
+            _holdout_record!(monitor, lds, iter; posterior=tfs, train_elbo=elbos[iter])
         if _holdout_stop(monitor)
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
@@ -1756,6 +1791,15 @@ function _fit_tridiag!(
 
         # M-step: regression + IW MAP from the aggregated stats. No tfs needed.
         mstep!(lds, suf, sws_pool[1])
+        _affine_gauge!(
+            lds,
+            [lds],
+            [tfs],
+            nothing;
+            center=gauge_center,
+            whiten=gauge_whiten,
+            max_condition=gauge_max_condition,
+        )
 
         # print progress
         prog !== nothing && next!(prog)

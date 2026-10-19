@@ -615,7 +615,7 @@ function _state_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, sws::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
-    total = zero(T)
+    total = sm.gauge === nothing ? zero(T) : sm.gauge.logprior_offset
 
     sm.Q_prior === nothing || (total += iw_logprior_term(sm.Q, sm.Q_prior))
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))

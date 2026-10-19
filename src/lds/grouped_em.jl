@@ -414,6 +414,7 @@ function _cell_workspace(
         nothing,                                   # set by `_prepare_cell!`
         nothing,                                   # batched Poisson scratch, allocated on first use
         nothing,                                   # per-observation-model sub-workspaces
+        base.vi,                                   # shared Gaussian variational scratch
     )
 end
 
@@ -528,7 +529,15 @@ the equal-length fast path aliases every trial's `p_smooth` to the workspace's
 shared covariance cache, which the next cell overwrites.
 """
 function _grouped_smooth(
-    lds::LinearDynamicalSystem{T}, data::Data{T}, grp::ParameterGrouping, y
+    lds::LinearDynamicalSystem{T},
+    data::Data{T},
+    grp::ParameterGrouping,
+    y;
+    newton_max_iter=20,
+    newton_tol=1e-6,
+    inference=:laplace,
+    variational_max_iter=100,
+    variational_tol=1e-4,
 ) where {T<:Real}
     ntrials = length(data.tsteps)
     xs = Vector{Matrix{T}}(undef, ntrials)
@@ -541,7 +550,21 @@ function _grouped_smooth(
         trials = grp.cell_trials[c]
         cell_data = _subset_data(data, trials)
         tfs = initialize_FilterSmooth(cell_lds[c], cell_data.tsteps)::TrialFilterSmooth{T}
-        smooth!(cell_lds[c], tfs, cell_data, cell_pools[c])
+        if cell_lds[c].obs_model isa NonQuadraticEmission
+            smooth!(
+                cell_lds[c],
+                tfs,
+                cell_data,
+                cell_pools[c];
+                max_iter=newton_max_iter,
+                tol=T(newton_tol),
+                inference,
+                variational_max_iter,
+                variational_tol,
+            )
+        else
+            smooth!(cell_lds[c], tfs, cell_data, cell_pools[c])
+        end
         for (i, n) in enumerate(trials)
             xs[n] = copy(tfs[i].x_smooth)
             Ps[n] = copy(tfs[i].p_smooth)
@@ -840,10 +863,38 @@ function _grouped_update_x0!(
     ldss::AbstractVector,
     sufs::AbstractVector,
     slots::AbstractVector{Int},
+    noise_slots::AbstractVector{Int},
     bufs::GroupedSufBuffers,
 )
+    ldss[1].fit_bool[_G_X0] || return nothing
     for units in _units_by_slot(slots)
-        update_initial_state_mean!(ldss[units[1]], _pool_init!(bufs, sufs, units))
+        if _shared_noise(noise_slots, units)
+            update_initial_state_mean!(ldss[units[1]], _pool_init!(bufs, sufs, units))
+            continue
+        end
+        # A shared initial regression with distinct P0s is GLS, just like a
+        # shared dynamics/emission regression with distinct noise covariances.
+        # Match the objective's MN prior once per coefficient/P0 pair, never
+        # once per session cell that happens to reuse that pair.
+        T = eltype(ldss[first(units)].state_model.P0)
+        gram = Matrix{T}[]
+        cross = Matrix{T}[]
+        noise = Matrix{T}[]
+        reps = _distinct_by_slot(noise_slots, units)
+        for u in units
+            sm, suf = ldss[u].state_model, sufs[u]
+            xx = isempty(sm.B0) ? fill(T(suf.init_n), 1, 1) : copy(suf.init_u0u0)
+            xy = isempty(sm.B0) ? copy(suf.init_xy) : copy(suf.init_u0y)
+            if u in reps && sm.x0_prior !== nothing
+                xx .+= sm.x0_prior.Λ
+                xy .+= sm.x0_prior.Λ * sm.x0_prior.M₀'
+            end
+            push!(gram, xx)
+            push!(cross, xy)
+            push!(noise, sm.P0)
+        end
+        W = _tied_gls_regression(gram, cross, noise, nothing, first(noise))
+        _initial_coefficients(ldss[first(units)].state_model) .= W
     end
     return nothing
 end
@@ -881,9 +932,10 @@ function _grouped_dyn_tied_cols(ldss, slots)
     length(reps) > 1 || return Int[]
     sm = ldss[first(reps)].state_model
     sm isa GaussianStateModel || return Int[]
-    shared = Symbol[n for n in (:A, :b, :B)
-                    if all(getproperty(ldss[u].state_model, n) === getproperty(sm, n)
-                           for u in reps)]
+    shared = Symbol[
+        n for n in (:A, :b, :B) if
+        all(getproperty(ldss[u].state_model, n) === getproperty(sm, n) for u in reps)
+    ]
     cols = _tied_dyn_cols(shared, ldss[1].latent_dim, ldss[1].ux_dim)
     return length(cols) == ldss[1].latent_dim + 1 + ldss[1].ux_dim ? Int[] : cols
 end
@@ -909,15 +961,20 @@ function _grouped_update_A_b!(
     if !isempty(tied)
         ldss[1].fit_bool[_G_AB] || return nothing
         groups = _units_by_slot(slots)
-        all(_shared_noise(slots_q, units) for units in groups) || throw(ArgumentError(
-            "partial dynamics dependence requires one Q version per dynamics level"
-        ))
+        all(_shared_noise(slots_q, units) for units in groups) || throw(
+            ArgumentError(
+                "partial dynamics dependence requires one Q version per dynamics level"
+            ),
+        )
         reps = first.(groups)
         xx = [copy(_pool_dyn!(bufs, sufs, units).dyn_xx[].mat) for units in groups]
         xy = [copy(_pool_dyn!(bufs, sufs, units).dyn_xy) for units in groups]
         W = _partial_tied_regression(
-            xx, xy, [ldss[u].state_model.Q for u in reps],
-            [ldss[u].state_model.AB_prior for u in reps], tied,
+            xx,
+            xy,
+            [ldss[u].state_model.Q for u in reps],
+            [ldss[u].state_model.AB_prior for u in reps],
+            tied,
             "partial dynamics depends_on",
         )
         for (j, units) in enumerate(groups), u in units
@@ -1339,11 +1396,17 @@ function _grouped_state_mstep!(
     sws::SmoothWorkspace,
     bufs::GroupedSufBuffers,
 )
-    _grouped_update_x0!(ldss, sufs, slots[_G_X0], bufs)
+    _grouped_update_x0!(ldss, sufs, slots[_G_X0], slots[_G_P0], bufs)
     _grouped_update_P0!(ldss, sufs, slots[_G_P0], slots[_G_X0], sws)
     _grouped_update_A_b!(ldss, sufs, slots[_G_AB], slots[_G_Q], sws, bufs)
-    _grouped_update_Q!(ldss, sufs, slots[_G_Q], slots[_G_AB], sws;
-                      prior_cols=_grouped_dyn_prior_cols(ldss, slots[_G_AB]))
+    _grouped_update_Q!(
+        ldss,
+        sufs,
+        slots[_G_Q],
+        slots[_G_AB],
+        sws;
+        prior_cols=_grouped_dyn_prior_cols(ldss, slots[_G_AB]),
+    )
     return nothing
 end
 
@@ -1416,7 +1479,8 @@ function _grouped_state_prior_logdensity(
     ldss::AbstractVector, slots::AbstractVector{Vector{Int}}, ::Type{T}; ab_cols=nothing
 ) where {T<:Real}
     ab_cols === nothing && (ab_cols = _grouped_dyn_prior_cols(ldss, slots[_G_AB]))
-    total = zero(T)
+    gauge = first(ldss).state_model.gauge
+    total = gauge === nothing ? zero(T) : gauge.logprior_offset
     for u in _slot_representatives(slots[_G_P0])
         sm = ldss[u].state_model
         sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))

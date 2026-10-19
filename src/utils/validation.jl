@@ -351,7 +351,8 @@ function _validate_obs_model(
     if length(obs_model.d) != obs_dim
         throw(DimensionMismatchError("observation bias d", obs_dim, length(obs_model.d)))
     end
-    obs_model.d_fixed_zero && !all(iszero, obs_model.d) &&
+    obs_model.d_fixed_zero &&
+        !all(iszero, obs_model.d) &&
         throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
 
     return nothing
@@ -364,7 +365,7 @@ Validate PoissonObservationModel parameters. Throws exceptions on validation fai
 
 # Throws
 - `DimensionMismatchError`: If dimensions don't match expected values
-- `NumericalStabilityError`: If `d` values are extremely large/small
+- `NumericalStabilityError`: If emission parameters are nonfinite
 """
 function _validate_obs_model(
     obs_model::PoissonObservationModel{T}, obs_dim::Int, latent_dim::Int
@@ -378,7 +379,8 @@ function _validate_obs_model(
     if length(obs_model.d) != obs_dim
         throw(DimensionMismatchError("d vector", obs_dim, length(obs_model.d)))
     end
-    obs_model.d_fixed_zero && !all(iszero, obs_model.d) &&
+    obs_model.d_fixed_zero &&
+        !all(iszero, obs_model.d) &&
         throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
 
     # Check D matrix (observation-input map): (obs_dim × uy_dim). uy_dim is free,
@@ -387,22 +389,13 @@ function _validate_obs_model(
         throw(DimensionMismatchError("D matrix rows", obs_dim, size(obs_model.D, 1)))
     end
 
-    #=
-    Check that d values are reasonable. `d` enters the linear predictor as
-    `λ = exp(C x + d + D v)`; |d| above ~50 risks exp overflow/underflow once Cx
-    is added on top.
-    =#
-    if any(x -> abs(x) > 50, obs_model.d)  # exp(50) ≈ 5e21, exp(-50) ≈ 2e-22
-        max_val = maximum(abs.(obs_model.d))
-        println("WARNING: high d")
-        println("\nd:\n $(obs_model.d)")
-        println("\nD:\n $(obs_model.D)")
-        throw(
-            NumericalStabilityError(
-                "d vector",
-                "contains extremely large/small values (max |d| = $max_val), may cause numerical overflow/underflow",
-            ),
-        )
+    # d alone cannot bound exp(C*x + d + D*v): a large finite intercept can
+    # cancel the latent contribution. Validate parameter finiteness here;
+    # predictor/rate stability depends on states and inputs unavailable here.
+    for (name, values) in
+        (("C matrix", obs_model.C), ("d vector", obs_model.d), ("D matrix", obs_model.D))
+        all(isfinite, values) ||
+            throw(NumericalStabilityError(name, "contains nonfinite values"))
     end
 
     return nothing

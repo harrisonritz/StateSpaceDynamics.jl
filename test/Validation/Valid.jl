@@ -261,12 +261,17 @@ function test_validate_obs_model_poisson_fields()
     @test_throws DimensionMismatchError StateSpaceDynamics._validate_obs_model(om, p, D)
 
     om = good()
-    om.d = [0.0, 0.0, 100.0]                            # extreme d → overflow risk
-    @test_throws NumericalStabilityError StateSpaceDynamics._validate_obs_model(om, p, D)
-
-    om = good()
-    om.d = [50.0, 0.0, 0.0]                             # |d| == 50 is the boundary (check is > 50)
+    om.d = [-1000.0, 0.0, 1000.0]  # C*x can cancel either sign of finite d.
     @test StateSpaceDynamics._validate_obs_model(om, p, D) === nothing
+
+    for value in (NaN, Inf, -Inf), field in (:C, :d, :D)
+        om = good()
+        field == :D && (om.D = zeros(p, 1))
+        getproperty(om, field)[1] = value
+        @test_throws NumericalStabilityError StateSpaceDynamics._validate_obs_model(
+            om, p, D
+        )
+    end
 end
 
 function test_validate_LDS_poisson_fit_bool_length()

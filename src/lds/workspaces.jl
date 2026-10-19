@@ -39,6 +39,11 @@ may differ.
 - `p_packed::Matrix{T}`: `p_smooth` in packed form `(latent_dim(latent_dim+1)/2 ×
   T_trial)` — see "Compact posterior storage" below
 - `xcov_sum::Matrix{T}`: `Σₜ₌₂ p_smooth_tt1[:, :, t]` `(latent_dim × latent_dim)`
+- `inference_stats::Dict{String,Any}`: the last Gaussian refinement's diagnostics
+- `vi_sites::Vector{Matrix{T}}`: one `(obs_dim × T_trial)` matrix per Poisson
+  member, the expected rates `exp(Cm + d + Dv + diag(CSC')/2)` at the last
+  Gaussian variational posterior, or empty. They seed the next variational
+  E-step and, being rates, do not depend on the latent coordinate frame.
 
 `E_zz` / `E_zz_prev` are `(0, 0, 0)` stubs until `sufficient_statistics!` fills
 them: no fit path reads them, and at `latent_dim²·T` each they were the two
@@ -67,6 +72,27 @@ mutable struct FilterSmooth{T<:Real}
     entropy::T
     p_packed::Matrix{T}
     xcov_sum::Matrix{T}
+    inference_stats::Dict{String,Any}
+    vi_sites::Vector{Matrix{T}}
+end
+
+# Preserve the compact-layout constructor used before inference diagnostics.
+function FilterSmooth{T}(
+    x, P, Plag, Ez, Ezz, Ezzprev, entropy, packed, cross
+) where {T<:Real}
+    return FilterSmooth{T}(
+        x,
+        P,
+        Plag,
+        Ez,
+        Ezz,
+        Ezzprev,
+        entropy,
+        packed,
+        cross,
+        Dict{String,Any}(),
+        Matrix{T}[],
+    )
 end
 
 # The full-storage layout, as `FilterSmooth` was constructed before the compact
@@ -630,6 +656,46 @@ function PoissonBatchBuffers(
 end
 
 """
+    VIBuffers{T<:Real}
+
+Per-workspace scratch for the Gaussian variational refinement
+(`gaussian_variational.jl`), sized for `latent_dim` and the longest trial seen:
+the accepted and target precision diagonal blocks, a candidate covariance with
+its lag blocks, and the mean iterate / score / step. Allocating these per trial
+cost tens of gigabytes of churn per E-step at large latent dimensionality.
+"""
+mutable struct VIBuffers{T<:Real}
+    latent_dim::Int
+    tsteps::Int
+    precision::Vector{Matrix{T}}
+    target::Vector{Matrix{T}}
+    P::Array{T,3}
+    Plag::Array{T,3}
+    oldx::Matrix{T}
+    g::Matrix{T}
+    direction::Matrix{T}
+    delta::Matrix{T}
+    work::Matrix{T}
+end
+
+function VIBuffers(::Type{T}, latent_dim::Int, tsteps::Int) where {T<:Real}
+    k = latent_dim
+    return VIBuffers{T}(
+        k,
+        tsteps,
+        [zeros(T, k, k) for _ in 1:tsteps],
+        [zeros(T, k, k) for _ in 1:tsteps],
+        zeros(T, k, k, tsteps),
+        zeros(T, k, k, tsteps),
+        zeros(T, k, tsteps),
+        zeros(T, k, tsteps),
+        zeros(T, k, tsteps),
+        zeros(T, k, k),
+        zeros(T, k, k),
+    )
+end
+
+"""
     SmoothWorkspace{T<:Real}
 
 Pre-allocated workspace for the full LDS smoothing + EM pipeline, grouped by
@@ -650,6 +716,9 @@ concern:
   Attached by [`_attach_obs_workspaces!`](@ref); see there for what is shared.
   Held as a `Vector` rather than a `NamedTuple` so the element type stays
   concrete — the composite's own type parameter already carries the keys.
+- `vi`: a shared holder for [`VIBuffers`](@ref), empty until the first Gaussian
+  variational refinement asks for it (see [`vi_buffers!`](@ref)). A grouped fit's
+  cell workspaces share their base's holder, like `btd`.
 
 Every field except `batched`, `poisson` and `obs` is `const`. `batched` is reassignable so a
 grouped fit (see `parameter_groups.jl`) can swap in the buffers sized for the group of
@@ -666,6 +735,7 @@ mutable struct SmoothWorkspace{T<:Real}
     batched::Union{Nothing,BatchedBuffers{T}}
     poisson::Union{Nothing,PoissonBatchBuffers{T}}
     obs::Union{Nothing,Vector{SmoothWorkspace{T}}}
+    const vi::Base.RefValue{Union{Nothing,VIBuffers{T}}}
 end
 
 """
@@ -709,6 +779,7 @@ function SmoothWorkspace(
         batched,
         nothing,                                                                            # batched Poisson scratch, allocated on first use
         nothing,                                                                            # per-observation-model sub-workspaces, attached for a composite
+        Ref{Union{Nothing,VIBuffers{T}}}(nothing),                                          # Gaussian variational scratch, allocated on first use
     )
 end
 
@@ -1060,6 +1131,21 @@ function poisson_batch!(
         sws.poisson = pb
     end
     return pb
+end
+
+"""
+    vi_buffers!(sws, latent_dim, tsteps) -> VIBuffers
+
+The workspace's Gaussian variational scratch, (re)allocated only when absent or
+too small — the same lazy policy as [`poisson_batch!`](@ref).
+"""
+function vi_buffers!(sws::SmoothWorkspace{T}, latent_dim::Int, tsteps::Int) where {T<:Real}
+    vb = sws.vi[]
+    if vb === nothing || vb.latent_dim != latent_dim || vb.tsteps < tsteps
+        vb = VIBuffers(T, latent_dim, vb === nothing ? tsteps : max(tsteps, vb.tsteps))
+        sws.vi[] = vb
+    end
+    return vb
 end
 
 # =============================================================================

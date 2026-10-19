@@ -142,6 +142,15 @@ Whether any trial starts somewhere other than the schedule's first entry.
 """
 _has_cost_offsets(data::Data) = any(!iszero, data.cost_offset)
 
+"Internal bookkeeping for an exact change of coordinates, z = map*x + offset."
+Base.@kwdef mutable struct AffineGauge{T<:Real}
+    map::Matrix{T}
+    offset::Vector{T}
+    logprior_offset::T = zero(T)
+    whitening_skips::Int = 0
+    last_condition::T = one(T)
+end
+
 """
     GaussianStateModel{T<:Real, M<:AbstractMatrix{T}, V<:AbstractVector{T}}
 
@@ -175,7 +184,12 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
     they match the internal workspaces regardless of how `A` is stored.
 - `x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
     `x0` when `B0` is empty, or on `B0` with a `(latent_dim, ux0_dim)` prior mean
-    when initial inputs are present.
+    when initial inputs are present. Its row covariance is `P0`; its separately
+    supplied column precision is `x0_prior.Λ`. Thus
+    `Cov(vec(B0) | P0) = inv(Λ) ⊗ P0`. Pair with `P0_prior` for a full MNIW
+    prior. A scalar constant input `ux0=ones(1,ntrials)` recovers the legacy
+    initial mean with `B0[:,1]=x0`; a trial identity design instead fits one
+    initial mean per trial.
 - `depends_on::Union{Nothing,NamedTuple} = nothing`: Optional declaration that some
     parameters are estimated separately per group of trials. Keys are parameter names
     (`:x0`, `:P0`, `:A`/`:b`/`:B`, `:Q`), values are per-trial label vectors; `nothing`
@@ -201,6 +215,7 @@ Base.@kwdef mutable struct GaussianStateModel{
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
     depends_on::Union{Nothing,NamedTuple} = nothing
     variants::Union{Nothing,Vector{GaussianStateModel{T,M,V}}} = nothing
+    gauge::Union{Nothing,AffineGauge{T}} = nothing
 end
 
 """
@@ -518,7 +533,9 @@ the Laplace path takes. `quadratic=true` with a non-quadratic member is an error
   `AbstractObservationModel`, a reserved key name, members with different
   element types, or `quadratic=true` over a non-quadratic member.
 """
-function CompositeObservationModel(models::NamedTuple; quadratic::Union{Nothing,Bool}=nothing)
+function CompositeObservationModel(
+    models::NamedTuple; quadratic::Union{Nothing,Bool}=nothing
+)
     isempty(models) && throw(
         ArgumentError(
             "a composite observation model needs at least one member; got an empty " *
@@ -556,12 +573,14 @@ function CompositeObservationModel(models::NamedTuple; quadratic::Union{Nothing,
 
     quad = _all_quadratic(values(models))
     if quadratic !== nothing
-        quadratic && !quad && throw(
-            ArgumentError(
-                "quadratic=true needs every member to be quadratic (Gaussian); this " *
-                "composite has a non-quadratic member, which only the Laplace path fits",
-            ),
-        )
+        quadratic &&
+            !quad &&
+            throw(
+                ArgumentError(
+                    "quadratic=true needs every member to be quadratic (Gaussian); this " *
+                    "composite has a non-quadratic member, which only the Laplace path fits",
+                ),
+            )
         quad = quadratic
     end
     return CompositeObservationModel{T,quad,typeof(models)}(models)

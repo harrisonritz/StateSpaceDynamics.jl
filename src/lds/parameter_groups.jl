@@ -1065,6 +1065,7 @@ function _build_variants!(
             P0_prior=sm.P0_prior,
             AB_prior=sm.AB_prior,
             x0_prior=sm.x0_prior,
+            gauge=sm.gauge,
         )
     end
     sm.variants = variants
@@ -1251,7 +1252,10 @@ function _build_variants!(
     for cell in 1:ncells
         s = _variant_slots(dep.nslots, cell)
         variants[cell] = PoissonObservationModel{T,M,V}(;
-            C=Cs[s[1]], d=ds[s[1]], D=Ds[s[1]], CD_prior=CD_priors[s[1]],
+            C=Cs[s[1]],
+            d=ds[s[1]],
+            D=Ds[s[1]],
+            CD_prior=CD_priors[s[1]],
             d_fixed_zero=om.d_fixed_zero,
         )
     end

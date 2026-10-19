@@ -238,6 +238,9 @@ function trial_elbos(
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:NonQuadraticEmission{T}}
     if _warped_route(plds)
         return _spline_composite_trial_elbos(
@@ -245,7 +248,15 @@ function trial_elbos(
         )
     end
     data, tfs, sws_pool = _trial_elbo_setup(plds, y, ux0, ux, uy)
-    smooth!(plds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+    smooth!(
+        plds,
+        tfs,
+        data,
+        sws_pool;
+        max_iter=newton_max_iter,
+        tol=T(newton_tol),
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
     return _accumulate_trial_elbos(plds, tfs, data, sws_pool[1])
 end
 
@@ -426,11 +437,22 @@ function trial_elbos(
     uy=nothing,
     newton_max_iter::Int=20,
     newton_tol::Float64=1e-6,
+    inference::Symbol=:laplace,
+    variational_max_iter::Int=100,
+    variational_tol::Real=1e-4,
     cost_offset=nothing,
 ) where {T<:Real,S<:LQRStateModel{T},O<:NonQuadraticEmission{T}}
     _reject_spline_lqr(lds)
     data, tfs, sws_pool = _trial_elbo_setup(lds, y, ux0, ux, uy; cost_offset=cost_offset)
     _prepare_lqr!(lds, data)
-    smooth!(lds, tfs, data, sws_pool; max_iter=newton_max_iter, tol=T(newton_tol))
+    smooth!(
+        lds,
+        tfs,
+        data,
+        sws_pool;
+        max_iter=newton_max_iter,
+        tol=T(newton_tol),
+        _inference_controls(inference, variational_max_iter, variational_tol)...,
+    )
     return _accumulate_lqr_trial_elbos(lds, tfs, data, sws_pool[1])
 end
