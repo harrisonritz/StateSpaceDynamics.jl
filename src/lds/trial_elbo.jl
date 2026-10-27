@@ -88,7 +88,9 @@ function _trial_elbo_setup(
         "contributions this returns are under a single set. Split the trials by cell " *
         "and call it once per cell, on that cell's parameters.",
     )
-    tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
+    tfs = initialize_FilterSmooth(
+        lds, data.tsteps; cov_alias=_shares_covariance(lds, data)
+    )::TrialFilterSmooth{T}
     npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(
@@ -131,13 +133,21 @@ function _accumulate_trial_elbos(
     data::Data{T},
     sws::SmoothWorkspace{T},
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:AbstractObservationModel{T}}
-    sufficient_statistics!(tfs)
     compute_smooth_constants!(sws, lds)
     log2π_per_step = T(-0.5) * lds.latent_dim * log(T(2π))
 
+    #= One trial's moments at a time: `E_zz` / `E_zz_prev` are two
+    `(latent_dim, latent_dim, T)` arrays per trial, and filling every trial's at
+    once was the largest allocation of a scoring pass. Each trial borrows the
+    previous trial's buffers (`sufficient_statistics!` replaces them when the
+    length differs) and hands them back. =#
+    stub = zeros(T, 0, 0, 0)
+    E_zz, E_zz_prev = stub, stub
     per_trial = Vector{T}(undef, length(data.tsteps))
     for n in eachindex(per_trial)
         fs = tfs[n]
+        fs.E_zz, fs.E_zz_prev = E_zz, E_zz_prev
+        sufficient_statistics!(fs)
         per_trial[n] =
             Q_state!(
                 sws, _trial_model(lds, data, n), fs.E_z, fs.E_zz, fs.E_zz_prev, data.ux[n]
@@ -145,6 +155,8 @@ function _accumulate_trial_elbos(
             log2π_per_step * data.tsteps[n] +
             _trial_q_obs(sws, lds, fs, data, n) +
             fs.entropy
+        E_zz, E_zz_prev = fs.E_zz, fs.E_zz_prev
+        fs.E_zz, fs.E_zz_prev = stub, stub
     end
     return per_trial
 end

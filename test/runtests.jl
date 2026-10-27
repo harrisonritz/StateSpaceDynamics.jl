@@ -633,6 +633,7 @@ using SSDTest
             test_trial_elbos_single_trial()
             test_trial_elbos_prior_excluded()
             test_trial_elbos_rejects_grouping()
+            test_equal_lengths_share_covariance()
             @testset "LQR latents" begin
                 test_trial_elbos_lqr()
                 test_trial_elbos_lqr_inputs()
