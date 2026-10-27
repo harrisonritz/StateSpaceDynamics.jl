@@ -5767,7 +5767,7 @@ function _mstep_grouped!(
     composite emission's member. The two compose to the identity for a plain
     Gaussian state. =#
     init_sufs = [_state_suf(_slds_init_suf(suf)) for suf in unit_suf]
-    _grouped_update_x0!(unit_lds, init_sufs, slots_x0, _state_bufs(bf))
+    _grouped_update_x0!(unit_lds, init_sufs, slots_x0, slots_P0, _state_bufs(bf))
     _broadcast_initial_state!(cell_slds, K, lds1.fit_bool[_G_X0], false)
     _grouped_update_P0!(unit_lds, init_sufs, slots_P0, slots_x0, sws)
     _broadcast_initial_state!(cell_slds, K, false, lds1.fit_bool[_G_P0])
