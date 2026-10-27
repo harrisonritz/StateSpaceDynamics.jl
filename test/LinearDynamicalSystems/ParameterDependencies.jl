@@ -903,8 +903,9 @@ function test_partial_dynamics_dependence()
         sm = pd_state_model()
         sm.B = fill(0.1, PD_LATENT_DIM, 1)
         sm.depends_on = NamedTuple{names}(ntuple(_ -> labels, length(names)))
-        lds = LinearDynamicalSystem(sm, pd_obs_model();
-            fit_bool=[false, false, true, false, false, false])
+        lds = LinearDynamicalSystem(
+            sm, pd_obs_model(); fit_bool=[false, false, true, false, false, false]
+        )
         before = elbo(lds, y; ux=ux)
         trace = fit!(lds, y; ux=ux, max_iter=3, progress=false)
         @test elbo(lds, y; ux=ux) >= before - 1e-8
@@ -919,7 +920,14 @@ function test_partial_dynamics_dependence()
             end
         end
         # Accessors retain partial declarations on a held-out override.
-        @test all(isfinite, smooth(lds, y[1:2]; ux=ux[1:2],
-            depends_on=NamedTuple{names}(ntuple(_ -> labels[1:2], length(names))))[1][1])
+        @test all(
+            isfinite,
+            smooth(
+                lds,
+                y[1:2];
+                ux=ux[1:2],
+                depends_on=NamedTuple{names}(ntuple(_ -> labels[1:2], length(names))),
+            )[1][1],
+        )
     end
 end

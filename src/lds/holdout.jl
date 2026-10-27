@@ -68,11 +68,19 @@ struct FitTrace{T<:Real} <: AbstractVector{T}
 end
 
 # Keep the previous positional constructor available to downstream callers.
-FitTrace{T}(train, test, iters, best, stopped, returned) where {T<:Real} =
-    FitTrace{T}(train, test, iters, best, stopped, returned, Dict{String,Any}[])
-FitTrace(train::Vector{T}, test::Vector{T}, iters::Vector{Int}, best::Int,
-         stopped::Bool, returned::Int) where {T<:Real} =
-    FitTrace{T}(train, test, iters, best, stopped, returned)
+function FitTrace{T}(train, test, iters, best, stopped, returned) where {T<:Real}
+    return FitTrace{T}(train, test, iters, best, stopped, returned, Dict{String,Any}[])
+end
+function FitTrace(
+    train::Vector{T},
+    test::Vector{T},
+    iters::Vector{Int},
+    best::Int,
+    stopped::Bool,
+    returned::Int,
+) where {T<:Real}
+    return FitTrace{T}(train, test, iters, best, stopped, returned)
+end
 
 Base.size(tr::FitTrace) = size(tr.train)
 Base.getindex(tr::FitTrace, i::Int) = tr.train[i]
@@ -211,24 +219,32 @@ Sets `monitor.stopped_early` when the held-out ELBO has failed to improve on
 the best by more than `min_delta` for `patience` consecutive scored iterations
 and `early_stopping` is on.
 """
-function _holdout_record!(mon::HoldoutMonitor{T}, model, iter::Int;
-                          posterior=nothing, train_elbo=nothing) where {T<:Real}
-    record = Dict{String,Any}("iteration" => iter, "event" => "test",
-        "train_elbo" => train_elbo === nothing ? nothing : _diagnostic_finite(train_elbo), "test_elbo" => nothing,
-        "diagnostics" => mon.collect_diagnostics ? parameter_diagnostics(model; posterior) : nothing)
+function _holdout_record!(
+    mon::HoldoutMonitor{T}, model, iter::Int; posterior=nothing, train_elbo=nothing
+) where {T<:Real}
+    record = Dict{String,Any}(
+        "iteration" => iter,
+        "event" => "test",
+        "train_elbo" => train_elbo === nothing ? nothing : _diagnostic_finite(train_elbo),
+        "test_elbo" => nothing,
+        "diagnostics" =>
+            mon.collect_diagnostics ? parameter_diagnostics(model; posterior) : nothing,
+    )
     # Only an LQR model takes `cost_offset`, so it is passed only when one was given.
     offset = mon.cost_offset === nothing ? (;) : (; cost_offset=mon.cost_offset)
     v = try
-        T(elbo(
-            model,
-            mon.y;
-            ux0=mon.ux0,
-            ux=mon.ux,
-            uy=mon.uy,
-            depends_on=mon.depends_on,
-            offset...,
-            mon.kwargs...,
-        ))
+        T(
+            elbo(
+                model,
+                mon.y;
+                ux0=mon.ux0,
+                ux=mon.ux,
+                uy=mon.uy,
+                depends_on=mon.depends_on,
+                offset...,
+                mon.kwargs...,
+            ),
+        )
     catch err
         record["error"] = sprint(showerror, err)
         _holdout_diagnostic_record!(mon, record)
@@ -296,12 +312,26 @@ function _fit_result(mon::HoldoutMonitor{T}, elbos::Vector{T}, model) where {T<:
     if mon.collect_diagnostics || mon.callback !== nothing
         # The last M-step can run after the last scored E-step. Do not attach
         # that earlier likelihood to these returned parameters without rescoring.
-        _holdout_diagnostic_record!(mon, Dict{String,Any}("iteration" => returned,
-            "event" => "returned", "train_elbo" => nothing, "test_elbo" => nothing,
-            "diagnostics" => mon.collect_diagnostics ? parameter_diagnostics(model) : nothing))
+        _holdout_diagnostic_record!(
+            mon,
+            Dict{String,Any}(
+                "iteration" => returned,
+                "event" => "returned",
+                "train_elbo" => nothing,
+                "test_elbo" => nothing,
+                "diagnostics" =>
+                    mon.collect_diagnostics ? parameter_diagnostics(model) : nothing,
+            ),
+        )
     end
     return FitTrace{T}(
-        elbos, mon.values, mon.iters, mon.best_iter, mon.stopped_early, returned, mon.diagnostics
+        elbos,
+        mon.values,
+        mon.iters,
+        mon.best_iter,
+        mon.stopped_early,
+        returned,
+        mon.diagnostics,
     )
 end
 

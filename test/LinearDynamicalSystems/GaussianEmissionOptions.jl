@@ -55,8 +55,10 @@ end
 
 function test_composite_quadratic_keyword()
     C = randn(StableRNG(14), 3, 2)
-    gauss = (a=GaussianObservationModel(C, Matrix(0.3I, 3, 3), zeros(3)),
-             b=GaussianObservationModel(C[1:2, :], Matrix(0.2I, 2, 2), zeros(2)))
+    gauss = (
+        a=GaussianObservationModel(C, Matrix(0.3I, 3, 3), zeros(3)),
+        b=GaussianObservationModel(C[1:2, :], Matrix(0.2I, 2, 2), zeros(2)),
+    )
     @test SSD._emission_is_quadratic(CompositeObservationModel(gauss))
     @test !SSD._emission_is_quadratic(CompositeObservationModel(gauss; quadratic=false))
     mixed = (a=PoissonObservationModel(C, fill(0.5, 3)), b=gauss.b)
@@ -67,16 +69,20 @@ end
 function test_laplace_composite_matches_exact_and_fits_offsets()
     sm, _ = _co_model(StableRNG(15); poisson=false)
     n = SSD.plant_dim(sm)
-    members() = (
-        spk=GaussianObservationModel(
-            [randn(StableRNG(16), 4, n) zeros(4, n)], Matrix(0.4I, 4, 4), zeros(4)
-        ),
-        kin=GaussianObservationModel(
-            [randn(StableRNG(17), 2, n) zeros(2, n)], Matrix(0.1I, 2, 2), zeros(2)
-        ),
+    function members()
+        return (
+            spk=GaussianObservationModel(
+                [randn(StableRNG(16), 4, n) zeros(4, n)], Matrix(0.4I, 4, 4), zeros(4)
+            ),
+            kin=GaussianObservationModel(
+                [randn(StableRNG(17), 2, n) zeros(2, n)], Matrix(0.1I, 2, 2), zeros(2)
+            ),
+        )
+    end
+    ys = (
+        spk=[randn(StableRNG(18 + i), 4, t) for (i, t) in enumerate(CO_LENGTHS)],
+        kin=[randn(StableRNG(30 + i), 2, t) for (i, t) in enumerate(CO_LENGTHS)],
     )
-    ys = (spk=[randn(StableRNG(18 + i), 4, t) for (i, t) in enumerate(CO_LENGTHS)],
-          kin=[randn(StableRNG(30 + i), 2, t) for (i, t) in enumerate(CO_LENGTHS)])
     uys = (spk=[zeros(0, t) for t in CO_LENGTHS], kin=[zeros(0, t) for t in CO_LENGTHS])
 
     exact = LinearDynamicalSystem(deepcopy(sm), members())
@@ -90,8 +96,11 @@ function test_laplace_composite_matches_exact_and_fits_offsets()
 
     # The batched exact path refuses per-trial offsets; the Laplace one fits them.
     @test_throws ArgumentError fit!(
-        LinearDynamicalSystem(deepcopy(sm), members()), ys;
-        max_iter=1, progress=false, cost_offset=CO_OFFSETS,
+        LinearDynamicalSystem(deepcopy(sm), members()),
+        ys;
+        max_iter=1,
+        progress=false,
+        cost_offset=CO_OFFSETS,
     )
     els = fit!(laplace, ys; uy=uys, max_iter=3, progress=false, cost_offset=CO_OFFSETS)
     @test all(isfinite, els)

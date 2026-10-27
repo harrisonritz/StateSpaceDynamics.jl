@@ -140,7 +140,7 @@ function _fixed_obs_cols(lds)
     mask = _costate_range(lds)
     om = lds.obs_model
     if hasproperty(om, :d_fixed_zero) && om.d_fixed_zero
-        return (mask === nothing ? lds.latent_dim+1 : first(mask)):(lds.latent_dim+1)
+        return (mask === nothing ? lds.latent_dim + 1 : first(mask)):(lds.latent_dim + 1)
     end
     return mask
 end
@@ -165,7 +165,9 @@ function update_C_d!(
         free = _free_obs_cols(lds, width)
         prior = _restrict_mn_prior(CD_prior, free)
         V = zeros(T, lds.obs_dim, width)
-        V[:, free] .= mn_map(Matrix(suf.obs_xx[].mat[free,free]), Matrix(suf.obs_xy[free,:]), prior)
+        V[:, free] .= mn_map(
+            Matrix(suf.obs_xx[].mat[free, free]), Matrix(suf.obs_xy[free, :]), prior
+        )
         _unpack_obs_V!(lds, V)
         return nothing
     end
@@ -293,7 +295,7 @@ function _accumulate_cd_prior_scatter!(
     CD_prior === nothing && return S_res
     V = _pack_obs_V!(sws.reg.CD, lds)
     if _fixed_obs_cols(lds) !== nothing
-        cols = _free_obs_cols(lds, size(V,2), cols)
+        cols = _free_obs_cols(lds, size(V, 2), cols)
     end
     if cols === nothing
         Wm = V .- CD_prior.M₀
@@ -393,8 +395,10 @@ function _obs_prior_logdensity(
         if _fixed_obs_cols(lds) === nothing
             total += mn_logprior_term(W_cd, om.R, om.CD_prior)
         else
-            free = _free_obs_cols(lds, size(W_cd,2))
-            total += mn_logprior_term(W_cd[:,free], om.R, _restrict_mn_prior(om.CD_prior, free))
+            free = _free_obs_cols(lds, size(W_cd, 2))
+            total += mn_logprior_term(
+                W_cd[:, free], om.R, _restrict_mn_prior(om.CD_prior, free)
+            )
         end
     end
 

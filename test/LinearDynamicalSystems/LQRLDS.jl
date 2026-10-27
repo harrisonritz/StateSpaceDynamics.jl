@@ -1194,7 +1194,11 @@ function test_lqr_mstep_objective_and_gradient()
             (IWPrior(Matrix(0.3I, d, d), 12.0), per_epoch_prior, nothing),
             (nothing, nothing, a_prior),
             (IWPrior(Matrix(0.3I, d, d), 12.0), IWPrior(Matrix(0.4I, n, n), 9.0), a_prior),
-            (IWPrior(Matrix(0.3I, d, d), 12.0), nothing, RidgePrior(; M₀=a_prior.M₀, Λ=a_prior.Λ)),
+            (
+                IWPrior(Matrix(0.3I, d, d), 12.0),
+                nothing,
+                RidgePrior(; M₀=a_prior.M₀, Λ=a_prior.Λ),
+            ),
         )
             sm.Σ_prior = sigma_prior
             sm.Qc_prior = qc_prior

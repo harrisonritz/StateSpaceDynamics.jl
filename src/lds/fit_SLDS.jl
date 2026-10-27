@@ -3695,19 +3695,21 @@ function _slds_update_regression!(
     masks = [_block_mask(block, ldss[k]) for k in 1:K]
     # A zero intercept, unlike the costate, is not masked in the E-step's
     # composite-wide statistics. Decouple it here before a partial-tie solve.
-    stats = [if masks[k] === nothing
-        stats[k]
-    else
-        XX, XY = copy(stats[k][1]), copy(stats[k][2])
-        for i in masks[k]
-            diagonal = XX[i,i]
-            XX[i,:] .= 0
-            XX[:,i] .= 0
-            XX[i,i] = max(diagonal, one(T))
-            XY[i,:] .= 0
-        end
-        (XX,XY)
-    end for k in 1:K]
+    stats = [
+        if masks[k] === nothing
+            stats[k]
+        else
+            XX, XY = copy(stats[k][1]), copy(stats[k][2])
+            for i in masks[k]
+                diagonal = XX[i, i]
+                XX[i, :] .= 0
+                XX[:, i] .= 0
+                XX[i, i] = max(diagonal, one(T))
+                XY[i, :] .= 0
+            end
+            (XX, XY)
+        end for k in 1:K
+    ]
     #=
     The partial-tie solver takes full-width priors, so a masked regime's prior is
     written to hold its masked coefficients at zero; left as it is, a prior mean
@@ -4840,7 +4842,8 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
+            _holdout_due(monitor, iter) &&
+                _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
@@ -4939,7 +4942,8 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
+            _holdout_due(monitor, iter) &&
+                _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)

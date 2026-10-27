@@ -1376,8 +1376,9 @@ function _lqr_conditional_path!(
     d = lds.latent_dim
     tsteps = size(z, 2)
     tsteps >= 2 || throw(ArgumentError("sampling an LQR path needs tsteps ≥ 2"))
-    length(ξ) == d * tsteps ||
-        throw(DimensionMismatchError("standard normals for the path", d * tsteps, length(ξ)))
+    length(ξ) == d * tsteps || throw(
+        DimensionMismatchError("standard normals for the path", d * tsteps, length(ξ))
+    )
 
     sws = if ws === nothing || ws.btd.n_blocks < tsteps || ws.btd.block_size != d
         _lqr_sample_workspace(lds, tsteps)
@@ -1424,8 +1425,12 @@ function _lqr_sample_workspace(
     lds::LinearDynamicalSystem{T,S,O}, tsteps::Int
 ) where {T<:Real,S<:LQRStateModel{T},O<:AbstractObservationModel{T}}
     return SmoothWorkspace(
-        T, lds.latent_dim, _ws_obs_dim(lds), tsteps;
-        ux_dim=lds.ux_dim, uy_dim=_ws_uy_dim(lds),
+        T,
+        lds.latent_dim,
+        _ws_obs_dim(lds),
+        tsteps;
+        ux_dim=lds.ux_dim,
+        uy_dim=_ws_uy_dim(lds),
     )
 end
 

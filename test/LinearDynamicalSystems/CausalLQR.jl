@@ -866,7 +866,8 @@ function test_causal_a_prior()
             StateSpaceDynamics._lqr_noise_mstep!(ctx0)
             @test sm.Σ ≈ bare.Σ rtol = 1e-12
         end
-        @test StateSpaceDynamics._lqr_a_prior_logdensity(sm) ≈ -0.5 * tr(E(sm.A)) rtol = 1e-12
+        @test StateSpaceDynamics._lqr_a_prior_logdensity(sm) ≈ -0.5 * tr(E(sm.A)) rtol =
+            1e-12
     end
     rng = StableRNG(75)
     sm, lds = causal_fixture(rng; a_ridge=true, nreg=3, tmax=14)

@@ -1123,8 +1123,9 @@ function _aggregate_causal_stats!(
     #= Block `(h, s)` is a sum over the trials of horizon `h` that cover step
     `s`, taken in trial order, and no two blocks share an array: the blocks run
     in parallel and give the serial sums' bits. =#
-    blocks = NTuple{2,Int}[(h, s) for h in sort!(collect(keys(members))) for
-                           s in 1:(hs.causal_keys[h][2] - 1)]
+    blocks = NTuple{2,Int}[
+        (h, s) for h in sort!(collect(keys(members))) for s in 1:(hs.causal_keys[h][2] - 1)
+    ]
     function fill_block!(w, h, s)
         zz, zy, yy = hs.causal_zz[h][s], hs.causal_zy[h][s], hs.causal_yy[h][s]
         w[d + 1] = one(T)
