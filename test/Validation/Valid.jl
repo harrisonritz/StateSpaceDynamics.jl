@@ -130,22 +130,26 @@ function test_validate_LDS_wrong_fit_bool_length()
 end
 
 function test_validate_LDS_poisson_extreme_d()
-    # Test Poisson with extreme d values
+    # A large finite d is valid (C*x can cancel it); a nonfinite one is not.
     A = Matrix{Float64}(I, 2, 2)
     C = randn(3, 2)
     Q = Matrix{Float64}(I, 2, 2)
-    d = [100.0, 0.0, 0.0]  # Extremely large value
     x0 = zeros(Float64, 2)
     P0 = Matrix{Float64}(I, 2, 2)
     b = zeros(Float64, 2)
 
     gsm = GaussianStateModel(; A=A, Q=Q, x0=x0, P0=P0, b=b)
-    pom = PoissonObservationModel(; C=C, d=d)
-    lds = LinearDynamicalSystem(;
-        state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
-    )
-
-    @test_throws NumericalStabilityError validate_LDS(lds)
+    for (d, valid) in (([100.0, 0.0, 0.0], true), ([Inf, 0.0, 0.0], false))
+        pom = PoissonObservationModel(; C=C, d=d)
+        lds = LinearDynamicalSystem(;
+            state_model=gsm, obs_model=pom, latent_dim=2, obs_dim=3, fit_bool=fill(true, 5)
+        )
+        if valid
+            @test validate_LDS(lds) === nothing
+        else
+            @test_throws NumericalStabilityError validate_LDS(lds)
+        end
+    end
 end
 
 function test_validate_LDS_asymmetric_covariance()

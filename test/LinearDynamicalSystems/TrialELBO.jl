@@ -103,6 +103,46 @@ function test_trial_elbos_sum_to_elbo()
 end
 
 """
+    test_equal_lengths_share_covariance()
+
+Equal-length trials of a Gaussian LDS have one posterior covariance. `smooth`
+returns it once for all of them, and neither `smooth`, `elbo` nor `trial_elbos`
+allocates a `(D, D, T)` array per trial, which at large `D`, `T` and trial
+counts was most of their memory.
+"""
+function test_equal_lengths_share_covariance()
+    # Enough latents that a covariance outweighs a trial's means and data.
+    D, tsteps = 12, 100
+    rng = StableRNG(5)
+    A = 0.9 * Matrix{Float64}(I, D, D)
+    state = GaussianStateModel(;
+        A,
+        Q=Matrix(0.05 * I(D)),
+        b=zeros(D),
+        x0=zeros(D),
+        P0=Matrix(0.1 * I(D)),
+        B=zeros(D, 0),
+    )
+    emission = GaussianObservationModel(;
+        C=randn(rng, TE_N, D), R=Matrix(0.2 * I(TE_N)), d=zeros(TE_N), D=zeros(TE_N, 0)
+    )
+    lds = LinearDynamicalSystem(state, emission)
+    _, y = rand(rng, lds, fill(tsteps, 40))
+    xs, Ps = smooth(lds, y)
+    @test all(P -> P === Ps[1], Ps)
+    x3, P3 = smooth(lds, y[3])
+    @test xs[3] ≈ x3 && Ps[1] ≈ P3
+
+    per_covariance = 8 * D^2 * tsteps
+    for f in (y -> smooth(lds, y), y -> elbo(lds, y), y -> trial_elbos(lds, y))
+        f(y[1:20]), f(y)  # compile
+        extra = (@allocated f(y)) - (@allocated f(y[1:20]))
+        # Less than one covariance's worth per added trial.
+        @test extra < 20 * per_covariance
+    end
+end
+
+"""
     test_trial_elbos_ragged_and_inputs()
 
 Ragged trial lengths and non-empty `ux` / `uy`. The per-timestep constant the

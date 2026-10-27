@@ -127,7 +127,9 @@ For a single-trial (matrix) `y`:
 - `x_smooth::Matrix`: smoothed latent means (latent_dim × tsteps).
 - `p_smooth::Array{T,3}`: smoothed latent covariances (latent_dim × latent_dim × tsteps).
 
-For multi-trial `y`: `Vector`s of the above, one entry per trial.
+For multi-trial `y`: `Vector`s of the above, one entry per trial. Trials whose
+posterior covariance is the same (equal-length trials of a Gaussian LDS) share
+one `p_smooth` array: copy it before changing it in place.
 """
 function smooth(
     lds::LinearDynamicalSystem{T,S,O},
@@ -160,7 +162,9 @@ one carries O(D²·T) of block-tridiagonal storage.
 function _smooth_data(
     lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
-    tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
+    tfs = initialize_FilterSmooth(
+        lds, data.tsteps; cov_alias=_shares_covariance(lds, data)
+    )::TrialFilterSmooth{T}
     npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(T, lds.latent_dim, _ws_obs_dim(lds), maximum(data.tsteps)) for
@@ -169,6 +173,25 @@ function _smooth_data(
     smooth!(lds, tfs, data, sws_pool)
     return tfs
 end
+
+#=
+Whether the multi-trial `smooth!` below will point every trial's `p_smooth` /
+`p_smooth_tt1` at one shared array (its equal-length fast path), so that the
+per-trial arrays need not be allocated (`cov_alias`). Mirrors the branches
+`smooth!` takes before that path; at `latent_dim² · T` numbers per array per
+trial, allocating them anyway dominates the memory of `smooth`, `elbo` and
+`trial_elbos` on many trials.
+=#
+function _shares_covariance(
+    lds::LinearDynamicalSystem{T,S,O}, data::Data{T}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
+    tsteps = data.tsteps
+    return length(tsteps) > 1 &&
+           all(==(tsteps[1]), tsteps) &&
+           !_has_cost_offsets(data) &&
+           !_has_switches(lds)
+end
+_shares_covariance(lds, data) = false
 
 #=
 Public-shape return convention for `smooth`: matrix in → matrix out
@@ -188,10 +211,12 @@ function _collect_smooth_output(tfs::TrialFilterSmooth{T}, y) where {T}
     N = length(tfs)
     xs = Vector{Matrix{T}}(undef, N)
     Ps = Vector{Array{T,3}}(undef, N)
+    # Trials that share a covariance get one copy of it, not one each.
+    copies = IdDict{Array{T,3},Array{T,3}}()
     for n in 1:N
         fs = tfs[n]
         xs[n] = copy(fs.x_smooth)
-        Ps[n] = copy(fs.p_smooth)
+        Ps[n] = get!(() -> copy(fs.p_smooth), copies, fs.p_smooth)
     end
     return xs, Ps
 end
@@ -1345,7 +1370,9 @@ function elbo(
         state = _grouped_fit_state(lds, data, grp, sws_pool; batched=true)
         return _grouped_estep_elbo_gaussian!(state, grp, sws_pool)
     end
-    tfs = initialize_FilterSmooth(lds, data.tsteps)::TrialFilterSmooth{T}
+    tfs = initialize_FilterSmooth(
+        lds, data.tsteps; cov_alias=_shares_covariance(lds, data)
+    )::TrialFilterSmooth{T}
     npool = min(Threads.maxthreadid(), length(data.tsteps))
     sws_pool = [
         SmoothWorkspace(

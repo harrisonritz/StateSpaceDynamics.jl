@@ -143,12 +143,20 @@ Whether any trial starts somewhere other than the schedule's first entry.
 _has_cost_offsets(data::Data) = any(!iszero, data.cost_offset)
 
 "Internal bookkeeping for an exact change of coordinates, z = map*x + offset."
-Base.@kwdef mutable struct AffineGauge{T<:Real}
+mutable struct AffineGauge{T<:Real}
     map::Matrix{T}
     offset::Vector{T}
-    logprior_offset::T = zero(T)
-    whitening_skips::Int = 0
-    last_condition::T = one(T)
+    logprior_offset::T
+    whitening_skips::Int
+    last_condition::T
+end
+
+#= Keyword constructor with the element type given, since the defaults depend
+on it (`Base.@kwdef` would also define an untyped one that cannot work). =#
+function AffineGauge{T}(;
+    map, offset, logprior_offset=zero(T), whitening_skips=0, last_condition=one(T)
+) where {T<:Real}
+    return AffineGauge{T}(map, offset, logprior_offset, whitening_skips, last_condition)
 end
 
 """

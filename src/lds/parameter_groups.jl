@@ -1044,7 +1044,8 @@ function _build_variants!(
     x0s = _slot_arrays(sm.x0, dep.nslots[1])
     B0s = _slot_arrays(sm.B0, dep.nslots[1])
     P0s = _slot_arrays(sm.P0, dep.nslots[2])
-    named = sm.depends_on === nothing ? () : keys(sm.depends_on)
+    depends_on = sm.depends_on
+    named = depends_on === nothing ? () : keys(depends_on)
     As = _slot_arrays(sm.A, :A in named ? dep.nslots[3] : 1)
     bs = _slot_arrays(sm.b, :b in named ? dep.nslots[3] : 1)
     Bs = _slot_arrays(sm.B, :B in named ? dep.nslots[3] : 1)

@@ -3695,19 +3695,21 @@ function _slds_update_regression!(
     masks = [_block_mask(block, ldss[k]) for k in 1:K]
     # A zero intercept, unlike the costate, is not masked in the E-step's
     # composite-wide statistics. Decouple it here before a partial-tie solve.
-    stats = [if masks[k] === nothing
-        stats[k]
-    else
-        XX, XY = copy(stats[k][1]), copy(stats[k][2])
-        for i in masks[k]
-            diagonal = XX[i,i]
-            XX[i,:] .= 0
-            XX[:,i] .= 0
-            XX[i,i] = max(diagonal, one(T))
-            XY[i,:] .= 0
-        end
-        (XX,XY)
-    end for k in 1:K]
+    stats = [
+        if masks[k] === nothing
+            stats[k]
+        else
+            XX, XY = copy(stats[k][1]), copy(stats[k][2])
+            for i in masks[k]
+                diagonal = XX[i, i]
+                XX[i, :] .= 0
+                XX[:, i] .= 0
+                XX[i, i] = max(diagonal, one(T))
+                XY[i, :] .= 0
+            end
+            (XX, XY)
+        end for k in 1:K
+    ]
     #=
     The partial-tie solver takes full-width priors, so a masked regime's prior is
     written to hold its masked coefficients at zero; left as it is, a prior mean
@@ -4840,7 +4842,8 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
+            _holdout_due(monitor, iter) &&
+                _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
@@ -4939,7 +4942,8 @@ function fit!(
             Stopping here, before the M-step, leaves the model exactly at the
             scored parameters when `restore_best` is off.
             =#
-            _holdout_due(monitor, iter) && _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
+            _holdout_due(monitor, iter) &&
+                _holdout_record!(monitor, target, iter; train_elbo=elbos[iter])
             if _holdout_stop(monitor)
                 prog !== nothing && finish!(prog)
                 resize!(elbos, iter)
@@ -5767,7 +5771,7 @@ function _mstep_grouped!(
     composite emission's member. The two compose to the identity for a plain
     Gaussian state. =#
     init_sufs = [_state_suf(_slds_init_suf(suf)) for suf in unit_suf]
-    _grouped_update_x0!(unit_lds, init_sufs, slots_x0, _state_bufs(bf))
+    _grouped_update_x0!(unit_lds, init_sufs, slots_x0, slots_P0, _state_bufs(bf))
     _broadcast_initial_state!(cell_slds, K, lds1.fit_bool[_G_X0], false)
     _grouped_update_P0!(unit_lds, init_sufs, slots_P0, slots_x0, sws)
     _broadcast_initial_state!(cell_slds, K, false, lds1.fit_bool[_G_P0])

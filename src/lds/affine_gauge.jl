@@ -98,13 +98,11 @@ function _validate_gauge(model, center, whiten, max_condition)
                     "centering is incompatible with fixed-zero emission offsets; use whitening alone",
                 ),
             )
+        obs_dep = om.depends_on
         if center &&
-            om.depends_on !== nothing &&
-            haskey(om.depends_on, :C) &&
-            (
-                !haskey(om.depends_on, :d) ||
-                !_gauge_refines(om.depends_on.d, om.depends_on.C)
-            )
+            obs_dep !== nothing &&
+            haskey(obs_dep, :C) &&
+            (!haskey(obs_dep, :d) || !_gauge_refines(obs_dep.d, obs_dep.C))
             throw(ArgumentError("centering requires d to vary wherever C varies"))
         end
     end
@@ -263,11 +261,16 @@ jitter. Unsafe whitening is skipped, while centering still proceeds. Q is
 always transformed by congruence; it is never overwritten with an identity.
 """
 function _affine_gauge!(
-    parent, models, posteriors, grp; center=false, whiten=false, max_condition=1e8
-)
+    parent::LinearDynamicalSystem{R},
+    models,
+    posteriors,
+    grp;
+    center=false,
+    whiten=false,
+    max_condition=1e8,
+) where {R<:Real}
     (center || whiten) || return nothing
     k = parent.latent_dim
-    R = eltype(parent.state_model.A)
     c = zeros(R, k)
     bins = 0
     for tfs in posteriors, fs in tfs.FilterSmooths

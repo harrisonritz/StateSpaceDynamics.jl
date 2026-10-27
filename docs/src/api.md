@@ -130,6 +130,7 @@ IWPrior
 
 ```@docs
 MNPrior
+RidgePrior
 ```
 
 ```@docs
@@ -193,6 +194,7 @@ fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservati
 fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.CompositeObservations{T}) where {T<:Real,S<:LQRStateModel{T},O<:StateSpaceDynamics.NonQuadraticEmission{T}}
 fit!(ppca::ProbabilisticPCA, X::AbstractMatrix{T}, max_iters::Int=100, tol::Float64=1e-6) where {T<:Real}
 FitTrace
+parameter_diagnostics
 ```
 
 ## Likelihoods and ELBO
