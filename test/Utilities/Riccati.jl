@@ -225,9 +225,11 @@ function riccati_unpack(θ, n, m, nq)
 end
 
 """The gradient of a symmetric parameter in upper-triangle coordinates: an
-off-diagonal coordinate moves two entries, so it collects both."""
+off-diagonal coordinate moves two entries, so it collects both. Plain `-`, not
+`.-`: on Julia 1.14.0-alpha2, broadcasting a dense matrix with a `Diagonal`
+returns a `Diagonal` and drops the off-diagonal entries."""
 riccati_pack_grad(A, B, R, Q, r) =
-    riccati_pack(A, B, 2 .* R .- Diagonal(R), [2 .* Qk .- Diagonal(Qk) for Qk in Q], r)
+    riccati_pack(A, B, 2 .* R - Diagonal(R), [2 .* Qk - Diagonal(Qk) for Qk in Q], r)
 
 """`riccati_adjoint!` is the gradient of the sweeps: exactly (to roundoff)
 against `ForwardDiff` through the same kernels run on dual numbers, and against
