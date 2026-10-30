@@ -161,6 +161,8 @@ function update_C_d!(
 
     mask = _fixed_obs_cols(lds)
     if mask !== nothing
+        lds.obs_model.C_basis === nothing ||
+            throw(ArgumentError("C_basis cannot be combined with fixed emission columns"))
         width = size(suf.obs_xx[].mat, 1)
         free = _free_obs_cols(lds, width)
         prior = _restrict_mn_prior(CD_prior, free)
@@ -185,9 +187,37 @@ function update_C_d!(
     else
         V = mn_map(suf.obs_xx[], suf.obs_xy, CD_prior)
     end
+    lds.obs_model.C_basis === nothing || _constrain_to_C_basis!(V, lds, suf)
 
     _unpack_obs_V!(lds, V)
     return nothing
+end
+
+"""
+    _constrain_to_C_basis!(V, lds, suf)
+
+Turn the unconstrained solution `V = [C d D]` into the constrained one with
+`C = A H`, `A = obs_model.C_basis`, given the current `R`. With `[d D]` profiled
+out, the unconstrained `C` is the regression of the residualised `y` on the
+residualised `x` (Frisch–Waugh), and the constrained maximiser is its
+`R⁻¹`-weighted projection `A (A' R⁻¹ A)⁻¹ A' R⁻¹ C`; `[d D]` then solves its own
+normal equations given that `C`.
+"""
+function _constrain_to_C_basis!(
+    V::AbstractMatrix{T}, lds::LinearDynamicalSystem{T}, suf::SufficientStatistics{T}
+) where {T<:Real}
+    A = lds.obs_model.C_basis
+    k = lds.latent_dim
+    weighted = cholesky(Symmetric(lds.obs_model.R)) \ A   # R⁻¹ A
+    C = view(V, :, 1:k)
+    C .= A * (Symmetric(A' * weighted) \ (weighted' * C))
+    width = size(V, 2)
+    width == k && return V
+    G = suf.obs_xx[].mat
+    rest = (k + 1):width
+    V[:, rest] .=
+        (transpose(suf.obs_xy[rest, :]) .- C * G[1:k, rest]) / Symmetric(G[rest, rest])
+    return V
 end
 
 """

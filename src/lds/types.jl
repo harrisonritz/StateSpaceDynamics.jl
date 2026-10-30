@@ -261,6 +261,16 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
     its own variance and only the latents carry shared variability. With a full `R` a
     wide emission (many units) can explain shared variance through `R` instead of the
     latent state.
+- `C_basis::Union{Nothing,Matrix{T}} = nothing`: Constrain the emission to the column
+    span of a fixed `(obs_dim × r)` basis of full column rank, `C = C_basis * H`, with
+    `H` free: for example the leading left singular vectors of a forward model, so that
+    the latents load only on sensor patterns the sources can make. Given the current
+    `R`, the M-step's `C` is then the exact constrained maximiser, the `R⁻¹`-weighted
+    projection of the unconstrained solution onto the span, and `d`/`D` are re-solved
+    given that `C`; with `R`'s own update after it, each EM iteration is an ECM step and
+    the ELBO still never decreases. A square, invertible basis constrains nothing. The
+    starting `C` must lie in the span. Not available with `CD_prior`, `depends_on`,
+    `d_fixed_zero` or a hidden LQR costate.
 """
 Base.@kwdef mutable struct GaussianObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -277,6 +287,8 @@ Base.@kwdef mutable struct GaussianObservationModel{
     R_diagonal::Bool = false
     # Constrain the intercept within the coefficient solve; C and D stay free.
     d_fixed_zero::Bool = false
+    # Constrain C to the column span of a fixed basis: C = C_basis * H.
+    C_basis::Union{Nothing,Matrix{T}} = nothing
 end
 
 # Convenience constructors (State)

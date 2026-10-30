@@ -208,6 +208,8 @@ function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, ::SmoothWorkspace{T}
 ) where {T<:Real,S<:LQRStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
+    lds.obs_model.C_basis === nothing ||
+        throw(ArgumentError("C_basis is not available with an LQR state model"))
     regdim = size(suf.obs_xx[].mat, 1)
     mask = _fixed_obs_cols(lds)
     free = mask === nothing ? collect(1:regdim) : setdiff(1:regdim, mask)
