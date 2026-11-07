@@ -685,8 +685,10 @@ one-component case with `gamma = nothing`, read as `γ ≡ 1`, and then this is
 exactly the single-Gaussian objective of the file header.
 
 Chunked over trials so the objective and its gradient run in parallel: each chunk
-owns a [`WarpGradBuffers`](@ref) and its own `obs_dim` scratch, and the shared
-`warp` is written only between parallel sections.
+owns a [`WarpGradBuffers`](@ref) and its own `(obs_dim × T_max)` scratch, and the
+shared `warp` is written only between parallel sections. A trial's residuals are
+whitened together, as one multi-column solve (a division when `R` is diagonal),
+rather than one timestep at a time.
 
 # Fields
 - `mu::Vector{Vector{Matrix{T}}}`: `mu[c][n]` is component `c`'s smoothed
@@ -699,9 +701,9 @@ owns a [`WarpGradBuffers`](@ref) and its own `obs_dim` scratch, and the shared
 struct _SplineMStepCtx{T<:Real,YV<:AbstractVector{<:AbstractMatrix{T}}}
     warp::MonotonicWarp{T}
     bufs::Vector{WarpGradBuffers{T}}
-    zbuf::Vector{Vector{T}}
-    rbuf::Vector{Vector{T}}
-    wbuf::Vector{Vector{T}}
+    zbuf::Vector{Matrix{T}}
+    rbuf::Vector{Matrix{T}}
+    wbuf::Vector{Matrix{T}}
     partial::Vector{T}
     y::YV
     mu::Vector{Vector{Matrix{T}}}
@@ -736,12 +738,13 @@ function _SplineMStepCtx(
     end
     nc = length(chunks)
     R0 = cholesky(Symmetric(Matrix{T}(om.R)))
+    tmax = maximum(yn -> size(yn, 2), y; init=0)
     return _SplineMStepCtx{T,typeof(y)}(
         om.warp,
         [WarpGradBuffers(om.warp) for _ in 1:nc],
-        [zeros(T, p) for _ in 1:nc],
-        [zeros(T, p) for _ in 1:nc],
-        [zeros(T, p) for _ in 1:nc],
+        [zeros(T, p, tmax) for _ in 1:nc],
+        [zeros(T, p, tmax) for _ in 1:nc],
+        [zeros(T, p, tmax) for _ in 1:nc],
         zeros(T, nc),
         y,
         mu,
@@ -813,52 +816,61 @@ function _spline_fg!(
     nchunks = length(ctx.chunks)
     ncomp = length(ctx.mu)
     gamma = ctx.gamma
-    p = length(ctx.zbuf[1])
+    p = size(ctx.zbuf[1], 1)
+    # A diagonal `R` (its Cholesky factor diagonal) whitens by a division.
+    rdiag = [isdiag(F.factors) ? abs2.(diag(F.factors)) : nothing for F in ctx.Rchol]
 
     tforeach(1:nchunks) do ci
-        zb = ctx.zbuf[ci]
-        rb = ctx.rbuf[ci]
-        wb = ctx.wbuf[ci]
         buf = ctx.bufs[ci]
         acc = zero(T)
         for n in ctx.chunks[ci]
             yn = ctx.y[n]
-            @inbounds for t in axes(yn, 2)
-                # One embedding per sample, scored under every component.
-                for j in 1:p
-                    zj, ℓj = warp_forward(ctx.warp, j, yn[j, t])
-                    zb[j] = zj
-                    acc -= ℓj
+            Tn = size(yn, 2)
+            zb = view(ctx.zbuf[ci], :, 1:Tn)
+            rb = view(ctx.rbuf[ci], :, 1:Tn)
+            wb = view(ctx.wbuf[ci], :, 1:Tn)
+            # One embedding per sample, scored under every component.
+            @inbounds for t in 1:Tn, j in 1:p
+                zj, ℓj = warp_forward(ctx.warp, j, yn[j, t])
+                zb[j, t] = zj
+                acc -= ℓj
+            end
+            #=
+            The change-of-variables term belongs to the sample, not to a
+            component, so exactly one accumulate call per sample carries it:
+            `seeded[t]` tracks it, since a component with zero responsibility
+            is skipped entirely.
+            =#
+            seeded = want_grad ? falses(Tn) : nothing
+            for c in 1:ncomp
+                w = gamma === nothing ? nothing : gamma[c][n]
+                w !== nothing && all(iszero, w) && continue
+                @. rb = zb - ctx.mu[c][n]
+                copyto!(wb, rb)
+                if rdiag[c] === nothing
+                    ldiv!(ctx.Rchol[c], wb)           # wb = R_c⁻¹ r, all of trial n
+                else
+                    wb ./= rdiag[c]
                 end
-                #=
-                The change-of-variables term belongs to the sample, not to a
-                component, so exactly one accumulate call per sample carries it
-                — tracked here rather than keyed to `c == 1`, since a component
-                with zero responsibility is skipped entirely.
-                =#
-                seeded = false
-                for c in 1:ncomp
-                    w = gamma === nothing ? one(T) : gamma[c][n][t]
-                    iszero(w) && continue
-                    mu_c = ctx.mu[c][n]
-                    for j in 1:p
-                        rb[j] = zb[j] - mu_c[j, t]
-                    end
-                    copyto!(wb, rb)
-                    ldiv!(ctx.Rchol[c], wb)           # wb = R_c⁻¹ r
-                    acc += T(0.5) * w * dot(rb, wb)
+                @inbounds for t in 1:Tn
+                    wt = w === nothing ? one(T) : w[t]
+                    iszero(wt) && continue
+                    acc += T(0.5) * wt * dot(view(rb, :, t), view(wb, :, t))
                     if want_grad
                         for j in 1:p
                             warp_accumulate_grad!(
-                                buf, ctx.warp, j, yn[j, t], -w * wb[j], !seeded
+                                buf, ctx.warp, j, yn[j, t], -wt * wb[j, t], !seeded[t]
                             )
                         end
-                        seeded = true
+                        seeded[t] = true
                     end
                 end
-                if want_grad && !seeded
-                    # Every component was skipped; the sample still contributes
-                    # its log-Jacobian gradient.
+            end
+            if want_grad
+                # Every component skipped a sample: it still contributes its
+                # log-Jacobian gradient.
+                @inbounds for t in 1:Tn
+                    seeded[t] && continue
                     for j in 1:p
                         warp_accumulate_grad!(buf, ctx.warp, j, yn[j, t], zero(T), true)
                     end

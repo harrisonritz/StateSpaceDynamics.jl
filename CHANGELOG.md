@@ -138,6 +138,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than automatic differentiation.
 
 ### Changed
+- **The spline-Gaussian warp step whitens a trial at a time.** Its objective
+  solves each trial's residuals against `R` as one multi-column solve (a division
+  when `R` is diagonal) instead of one timestep at a time. Same objective and
+  gradient to round-off; the warp CM-step is about 2.5× faster on 302 channels.
 - **Matrix-normal priors are normalized MNIW priors.** `mn_logprior_term` now
   includes the `-(q/2) log det Σ` of `W | Σ ~ MN(M₀, Σ, Λ⁻¹)`, and every
   covariance M-step that folds a coefficient prior in adds that prior's width `q`
