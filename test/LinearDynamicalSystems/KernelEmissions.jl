@@ -476,7 +476,8 @@ end
     Φ = ke_basis(rng, p, r)
     F = randn(rng, r, 2)
     kernels() = [
-        Kernel(F; name="pattern", factor=true), Kernel(Matrix(1.0I, r, r); name="identity")
+        Kernel(F; name="pattern", factor=true),
+        Kernel(Matrix(1.0I, r, r); name="identity"),
     ]
     # Loadings drawn from the prior: mostly in the span of F.
     H = F * randn(rng, 2, k) + 0.05 .* randn(rng, r, k)
@@ -488,7 +489,9 @@ end
     start = randn(rng, r, k)
     base() = (; basis=Φ, H=copy(start), R=Matrix(1.0I, p, p))
 
-    free = LinearDynamicalSystem(ke_state(k), ConstrainedGaussianObservationModel(; base()...))
+    free = LinearDynamicalSystem(
+        ke_state(k), ConstrainedGaussianObservationModel(; base()...)
+    )
     fit!(free, y; max_iter=200, progress=false)
     fits = map((:bound, :none)) do gauge
         model = LinearDynamicalSystem(
