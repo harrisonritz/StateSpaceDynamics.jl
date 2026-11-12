@@ -862,6 +862,11 @@ using SSDTest
     end
 
     # Conjugate-prior helpers (IW / MN MAP + log-prior terms)
+    @testset verbose = true "Kernel priors" begin
+        include("KernelPrior/KernelPrior.jl")
+        include("KernelPrior/KernelHierarchy.jl")
+    end
+
     @testset verbose = true "Priors" begin
         include("Priors/Priors.jl")
         test_iw_prior_helpers()

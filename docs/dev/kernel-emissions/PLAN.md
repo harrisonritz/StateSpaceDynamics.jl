@@ -138,7 +138,7 @@ posteriors (these stay in dynameg).
 Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
 
 - [x] **M0** Plan committed.
-- [ ] **M1** Sum kernels, flat prior, MAP + Laplace.
+- [x] **M1** Sum kernels, flat prior, MAP + Laplace.
   Tests: gradient and information against ForwardDiff; recovery of known
   weights from Wishart draws; reference fixture against `fit_kernels`
   (`method="laplace"`); every check in §3 that applies.
@@ -150,10 +150,10 @@ Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
   learned); a very wide prior reproduces the constrained ML fit; `Φ = I` and
   a wide prior reproduce `GaussianObservationModel`; the `EmissionBasis` tests
   pass on the new class.
-- [ ] **M3** Trees: `:hierarchical`, `:nested`, hyperpriors.
+- [x] **M3** Trees: `:hierarchical`, `:nested`, hyperpriors.
   Tests: fixture against `Hierarchy.update`; closed-form two-level Gaussian
   case; simulated recovery of group means; small groups do not collapse.
-- [ ] **M4** Correlated types (joint tree, LKJ).
+- [x] **M4** Correlated types (joint tree, LKJ).
   Tests: fixture against `JointHierarchy.update`; recovered sign and size of a
   simulated correlation; unmatched units.
 - [ ] **M5** Scale-correlation structure.
@@ -169,8 +169,8 @@ Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
 - [ ] **Later** dynameg wiring (`run_fit.jl` flags, format), per-latent
   weights, source-side contrast posteriors.
 
-M3, M4 and M5 depend only on the interfaces fixed in M1–M2 and can run in
-parallel (subagents in worktrees).
+M5 depends only on the `AbstractKernelStructure` interface in
+`src/stats/kernel_prior.jl` and can run in parallel with M2.
 
 ## 6. Decisions and log
 
@@ -184,3 +184,15 @@ parallel (subagents in worktrees).
   the per-bin emission kernels, `elbo!` and `mstep!`. Rejected: a Gaussian
   shadow with a surrogate `(C̃, R̃)` (needs `Ĉ'R⁻¹Ĉ` inverted; ill-conditioned
   when a loading shrinks).
+- 2026-11-12: M1, M3, M4 done together. One `WeightTree` covers every case
+  (`d = 1` for a single type, `d > 1` for a correlated set; 0, 1 or 2 levels),
+  so the univariate and joint trees are one implementation
+  (`src/stats/kernel_hierarchy.jl`). The MAP is L-BFGS, the Laplace covariance
+  from the dense whitened derivatives. Agrees with dynameg's `fit_kernels`
+  (MAP, covariance, free energy), `Hierarchy.update` and
+  `JointHierarchy.update` on the fixtures in
+  `test/test_data/kernel_emissions/` (`make_reference.py` regenerates them
+  from a dynameg checkout; numpy and scipy only).
+- Run single test files with a script that includes them under
+  `julia --project=test` after `Pkg.develop(path=".")` there; revert the
+  change that makes to `test/Project.toml` before committing.

@@ -33,6 +33,11 @@ include("numerics/rqspline.jl")            # monotonic rational-quadratic spline
 # in their field type annotations.
 include("stats/priors.jl")
 
+# Kernel priors: weighted-kernel covariances with a multi-level hyperprior on
+# the weights. Model-agnostic; the emissions that use them come later.
+include("stats/kernel_hierarchy.jl")
+include("stats/kernel_prior.jl")
+
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
 include("lds/workspaces.jl")                        # FilterSmooth / SufficientStatistics / workspaces
@@ -105,6 +110,10 @@ export SplineGaussianObservationModel
 export CompositeObservationModel
 export IWPrior, MNPrior, RidgePrior, x0_mean_prior, transition_prior
 export banded_transition, banded_transition_prior, median_dwell_stay
+
+# Kernel priors
+export Kernel, KernelPrior
+export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
 
 # Monotonic rational-quadratic splines (the normalizing-flow layer of a
 # `SplineGaussianObservationModel`; usable on their own).
