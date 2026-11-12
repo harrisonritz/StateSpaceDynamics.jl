@@ -446,3 +446,106 @@ end
     @test occursin("Constrained Kernel", sprint(show, build().obs_model))
     @test occursin("kernel weights", sprint(show, build()))
 end
+
+@testset "kernel-prior emissions: scoring, sampling, refusals" begin
+    rng = MersenneTwister(27)
+    p, k, r = 8, 2, 4
+    Φ = ke_basis(rng, p, r)
+    y = ke_data(rng, Φ, k)
+    lds = ke_model(rng, Φ, k; prior=ke_prior(rng, r))
+    fit!(lds, y; max_iter=10, progress=false)
+    om = lds.obs_model
+
+    # The plug-in likelihood is the Gaussian one at the mean loading.
+    plain = LinearDynamicalSystem(
+        deepcopy(lds.state_model),
+        GaussianObservationModel(; C=copy(om.C), R=copy(om.R), d=copy(om.d)),
+    )
+    @test loglikelihood(lds, y) ≈ loglikelihood(plain, y)
+    x, drawn = rand(MersenneTwister(1), lds, fill(15, 3))
+    @test size(drawn[1]) == (p, 15) && all(isfinite, drawn[1])
+
+    @test_throws ArgumentError SLDS([0.9 0.1; 0.1 0.9], [0.5, 0.5], [lds, deepcopy(lds)])
+end
+
+@testset "kernel-prior emissions: recovery" begin
+    rng = MersenneTwister(28)
+    p, k, r = 30, 3, 20
+    Φ = ke_basis(rng, p, r)
+    F = randn(rng, r, 2)
+    kernels() = [
+        Kernel(F; name="pattern", factor=true), Kernel(Matrix(1.0I, r, r); name="identity")
+    ]
+    # Loadings drawn from the prior: mostly in the span of F.
+    H = F * randn(rng, 2, k) + 0.05 .* randn(rng, r, k)
+    truth = LinearDynamicalSystem(
+        ke_state(k), GaussianObservationModel(; C=Φ * H, R=Matrix(4.0I, p, p), d=zeros(p))
+    )
+    y = rand(rng, truth, fill(25, 3))[2]
+    y_test = rand(rng, truth, fill(25, 40))[2]
+    start = randn(rng, r, k)
+    base() = (; basis=Φ, H=copy(start), R=Matrix(1.0I, p, p))
+
+    free = LinearDynamicalSystem(ke_state(k), ConstrainedGaussianObservationModel(; base()...))
+    fit!(free, y; max_iter=200, progress=false)
+    fits = map((:bound, :none)) do gauge
+        model = LinearDynamicalSystem(
+            ke_state(k),
+            ConstrainedKernelGaussianObservationModel(;
+                base()..., prior=KernelPrior(kernels(); prior_sd=3.0), gauge
+            ),
+        )
+        model, collect(fit!(model, y; max_iter=200, progress=false))
+    end
+    with_prior, trace = fits[1]
+
+    # With few trials the prior helps on held-out data, and its weights say why.
+    @test loglikelihood(with_prior, y_test) > loglikelihood(free, y_test)
+    weights = kernel_weights(with_prior.obs_model)
+    power = [w.value * tr(k.factor * k.factor') for (w, k) in zip(weights, kernels())]
+    @test power[1] > power[2]
+
+    # The gauge step reaches the unassisted fit's bound in fewer iterations.
+    slow = fits[2][2]
+    @test nondecreasing(trace) && nondecreasing(slow)
+    @test something(findfirst(>=(last(slow) - 1e-3), trace), typemax(Int)) <= length(slow)
+    @test last(trace) >= last(slow) - 1e-3
+end
+
+@testset "kernel-prior emissions: structured priors in a fit" begin
+    rng = MersenneTwister(29)
+    p, k, r, n = 12, 2, 6, 9
+    Φ = ke_basis(rng, p, r)
+    y = ke_data(rng, Φ, k)
+    block = repeat(1:3; inner=3)
+    family = CorrelationFamily(
+        [reshape(Float64.(block .== b), n, 1) for b in 1:3];
+        type=:coherence,
+        names=["b1", "b2", "b3"],
+    )
+    structure = ScaleCorrelation(
+        randn(rng, r, n), ones(n), block; names=["b1", "b2", "b3"], families=[family]
+    )
+    prior = KernelPrior(
+        [Kernel(Matrix(1.0I, r, r); name="identity", type=:nuisance)];
+        structure,
+        levels=(scale=:hierarchical, coherence=:hierarchical),
+        correlated=[(:scale, :coherence)],
+    )
+    lds = LinearDynamicalSystem(
+        ke_state(k),
+        ConstrainedKernelGaussianObservationModel(;
+            basis=Φ, prior, H=randn(rng, r, k), R=Matrix(1.0I, p, p), tree_every=5
+        ),
+    )
+    trace = collect(fit!(lds, y; max_iter=40, tol=0.0, progress=false))
+    # Fitted trees can lower the trace a little when they are updated; between
+    # updates it does not decrease.
+    steps = diff(trace)
+    @test all(isfinite, trace)
+    @test count(<(-1e-6), steps) <= length(steps) ÷ 5
+    @test last(trace) > first(trace)
+    table = kernel_weights(lds.obs_model)
+    @test length(table) == 7
+    @test all(0 < row.value < 1 for row in table if row.link === :logit)
+end
