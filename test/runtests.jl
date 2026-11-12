@@ -865,6 +865,7 @@ using SSDTest
     @testset verbose = true "Kernel priors" begin
         include("KernelPrior/KernelPrior.jl")
         include("KernelPrior/KernelHierarchy.jl")
+        include("KernelPrior/ScaleCorrelation.jl")
     end
 
     @testset verbose = true "Priors" begin

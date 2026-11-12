@@ -214,12 +214,14 @@ function KernelPrior(
     lkj_eta::Real=2.0,
     weights::Union{Nothing,AbstractVector{<:Real}}=nothing,
 )
-    isempty(kernels) &&
-        structure === nothing &&
+    T, r = if !isempty(kernels)
+        eltype(first(kernels).factor), size(first(kernels).factor, 1)
+    elseif structure !== nothing
+        _prior_eltype(kernels, structure), _structure_dim(structure)
+    else
         throw(ArgumentError("a KernelPrior needs at least one kernel or a structure"))
-    T = _prior_eltype(kernels, structure)
+    end
     kernels = convert(Vector{Kernel{T}}, collect(kernels))
-    r = isempty(kernels) ? _structure_dim(structure) : size(first(kernels).factor, 1)
     for kernel in kernels
         size(kernel.factor, 1) == r || throw(
             DimensionMismatch(

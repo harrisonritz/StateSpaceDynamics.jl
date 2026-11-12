@@ -37,6 +37,7 @@ include("stats/priors.jl")
 # the weights. Model-agnostic; the emissions that use them come later.
 include("stats/kernel_hierarchy.jl")
 include("stats/kernel_prior.jl")
+include("stats/kernel_scale_correlation.jl")
 
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
@@ -114,7 +115,7 @@ export IWPrior, MNPrior, RidgePrior, x0_mean_prior, transition_prior
 export banded_transition, banded_transition_prior, median_dwell_stay
 
 # Kernel priors
-export Kernel, KernelPrior
+export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily
 export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
 export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
 export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel

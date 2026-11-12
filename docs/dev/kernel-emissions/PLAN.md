@@ -119,8 +119,10 @@ posteriors (these stay in dynameg).
 
 ## 4. Files
 
-- `src/stats/kernel_prior.jl`: `Kernel`, `ScaleCorrelation`, `KernelPrior`,
-  covariance / gradient / information, checks.
+- `src/stats/kernel_prior.jl`: `Kernel`, `KernelPrior`, covariance / gradient /
+  information, checks.
+- `src/stats/kernel_scale_correlation.jl`: `ScaleCorrelation`,
+  `CorrelationFamily`.
 - `src/stats/kernel_hierarchy.jl`: trees, joint tree, hyperpriors.
 - `src/stats/kernel_weights.jl`: MAP + Laplace; exported
   `fit_kernel_weights!` (also the post-hoc lift).
@@ -156,7 +158,7 @@ Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
 - [x] **M4** Correlated types (joint tree, LKJ).
   Tests: fixture against `JointHierarchy.update`; recovered sign and size of a
   simulated correlation; unmatched units.
-- [ ] **M5** Scale-correlation structure.
+- [x] **M5** Scale-correlation structure.
   Tests: covariance against the explicit `G S C S G'`; gradient / information
   against ForwardDiff; stick-breaking keeps `C` a correlation matrix; fixture
   against `ScaleCorrelationPrior`; simulated recovery of `ρ`.
@@ -196,3 +198,12 @@ M5 depends only on the `AbstractKernelStructure` interface in
 - Run single test files with a script that includes them under
   `julia --project=test` after `Pkg.develop(path=".")` there; revert the
   change that makes to `test/Project.toml` before committing.
+- 2026-11-12: M5 done. `ScaleCorrelation` keeps `Z_b`, the distinct `Z_cb`
+  (one shared with `Z_b` when a kernel covers a whole block) and the images
+  `W_cb`; the stick-breaking Jacobian is applied as a backward pass over the
+  kernels rather than formed. A kernel partly inside a kernel of an earlier
+  family is refused, as in dynameg. Agrees with `ScaleCorrelationPrior`
+  (covariance, gradient, information) on the `sc1_` fixture. Open: the default
+  centre of a logit is `logit(0.1)` for every kernel, where dynameg centres a
+  family's tree at the mean of its starting logits, which is higher for a
+  family with ancestors.
