@@ -97,6 +97,14 @@ per-timestep loop of the legacy `Q_obs!(sws, lds, E_z, E_zz, y, uy)`.
 function Q_obs!(
     sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+    return _gaussian_Q_obs!(sws, lds, suf)
+end
+
+# The Gaussian emission term at the model's `C`, `d`, `D`, `R`; shared with the
+# emissions that add to it (`kernel_observations.jl`).
+function _gaussian_Q_obs!(
+    sws::SmoothWorkspace{T}, lds::LinearDynamicalSystem{T}, suf::SufficientStatistics{T}
+) where {T<:Real}
     D = lds.latent_dim
     p = lds.obs_dim
     uy_dim = lds.uy_dim
@@ -161,8 +169,6 @@ function update_C_d!(
 
     mask = _fixed_obs_cols(lds)
     if mask !== nothing
-        lds.obs_model.C_basis === nothing ||
-            throw(ArgumentError("C_basis cannot be combined with fixed emission columns"))
         width = size(suf.obs_xx[].mat, 1)
         free = _free_obs_cols(lds, width)
         prior = _restrict_mn_prior(CD_prior, free)
@@ -187,37 +193,9 @@ function update_C_d!(
     else
         V = mn_map(suf.obs_xx[], suf.obs_xy, CD_prior)
     end
-    lds.obs_model.C_basis === nothing || _constrain_to_C_basis!(V, lds, suf)
 
     _unpack_obs_V!(lds, V)
     return nothing
-end
-
-"""
-    _constrain_to_C_basis!(V, lds, suf)
-
-Turn the unconstrained solution `V = [C d D]` into the constrained one with
-`C = A H`, `A = obs_model.C_basis`, given the current `R`. With `[d D]` profiled
-out, the unconstrained `C` is the regression of the residualised `y` on the
-residualised `x` (Frisch–Waugh), and the constrained maximiser is its
-`R⁻¹`-weighted projection `A (A' R⁻¹ A)⁻¹ A' R⁻¹ C`; `[d D]` then solves its own
-normal equations given that `C`.
-"""
-function _constrain_to_C_basis!(
-    V::AbstractMatrix{T}, lds::LinearDynamicalSystem{T}, suf::SufficientStatistics{T}
-) where {T<:Real}
-    A = lds.obs_model.C_basis
-    k = lds.latent_dim
-    weighted = cholesky(Symmetric(lds.obs_model.R)) \ A   # R⁻¹ A
-    C = view(V, :, 1:k)
-    C .= A * (Symmetric(A' * weighted) \ (weighted' * C))
-    width = size(V, 2)
-    width == k && return V
-    G = suf.obs_xx[].mat
-    rest = (k + 1):width
-    V[:, rest] .=
-        (transpose(suf.obs_xy[rest, :]) .- C * G[1:k, rest]) / Symmetric(G[rest, rest])
-    return V
 end
 
 """
@@ -275,7 +253,7 @@ function _accumulate_obs_scatter!(
     lds::LinearDynamicalSystem{T,S,O},
     suf::SufficientStatistics{T},
     sws::SmoothWorkspace{T},
-) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:_GaussianNoiseEmission{T}}
     # sws.reg.CD is exactly (p × obs_reg_dim); no view needed.
     V = _pack_obs_V!(sws.reg.CD, lds)
 
@@ -363,7 +341,7 @@ folded into `S_res` ([`_cd_prior_width`](@ref)).
 """
 function _finalize_R!(
     lds::LinearDynamicalSystem{T,S,O}, S_res::AbstractMatrix{T}, N::T
-) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:_GaussianNoiseEmission{T}}
     p = lds.obs_dim
     for j in 2:p, i in 1:(j - 1)
         S_res[j, i] = S_res[i, j]

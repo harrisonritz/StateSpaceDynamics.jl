@@ -62,6 +62,7 @@ include("lds/lqr_latents.jl")                       # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
+include("lds/kernel_observations.jl")               # C = Φ H, with or without a kernel prior on H
 include("lds/spline_gaussian_observations.jl")  # Gaussian ∘ monotonic warp (manifold discovery)
 include("lds/poisson_observations.jl")
 include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
@@ -72,6 +73,7 @@ include("lds/grouped_em.jl")
 
 # Fitting Functions
 include("lds/fit_LDS.jl")
+include("lds/fit_kernel_LDS.jl")        # start + gauge step for the kernel-prior emissions
 include("lds/fit_spline_LDS.jl")        # ECM driver for the spline-Gaussian emission
 include("lds/fit_spline_composite.jl")  # ... and for warped members of a composite
 include("lds/fit_PLDS.jl")
@@ -114,6 +116,9 @@ export banded_transition, banded_transition_prior, median_dwell_stay
 # Kernel priors
 export Kernel, KernelPrior
 export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
+export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
+export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel
+export LoadingPosterior, emission_posterior
 
 # Monotonic rational-quadratic splines (the normalizing-flow layer of a
 # `SplineGaussianObservationModel`; usable on their own).

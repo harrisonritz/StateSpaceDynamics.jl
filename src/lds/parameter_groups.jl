@@ -499,6 +499,10 @@ function _same_labels(a::Vector{Any}, b::Vector{Any})
     return length(a) == length(b) && all(isequal(a[i], b[i]) for i in eachindex(a))
 end
 
+# A constrained or kernel-prior emission has one parameter set (its `depends_on`
+# field is always `nothing`).
+_group_names(::StructuredGaussianObservationModel) = (:C, :R)
+
 """
     _resolve_dependence(model) -> ParameterDependence
 

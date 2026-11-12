@@ -6,7 +6,7 @@ function _sample_trial!(
     y_trial,
     state_params,
     obs_params,
-    obs_model::GaussianObservationModel,
+    obs_model::_GaussianNoiseEmission,
     ux_trial::AbstractMatrix,
     uy_trial,
 )
@@ -159,7 +159,7 @@ One observation drawn from an emission at a given latent state. Split out so the
 composite samplers — which walk members, and for an SLDS also regimes — do not
 each need their own copy of the two distributions.
 """
-function _draw_obs(rng, ::GaussianObservationModel, p, x_t, uy_t)
+function _draw_obs(rng, ::_GaussianNoiseEmission, p, x_t, uy_t)
     return rand(rng, MvNormal(p.C * x_t + p.d + p.D * uy_t, p.R))
 end
 

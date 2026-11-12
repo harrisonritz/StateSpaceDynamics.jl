@@ -34,6 +34,15 @@ structure `s` with weights `w` (a view of the prior's weight vector):
 """
 abstract type AbstractKernelStructure{T<:Real} end
 
+function _structure_dim end
+function _structure_labels end
+function _structure_traces end
+function _structure_start end
+function _structure_values end
+function _add_covariance! end
+function _add_gradient! end
+function _derivatives! end
+
 # Eigenvalues below this fraction of the largest are round-off.
 _kernel_rank_tol(::Type{T}, r::Int) where {T<:Real} = r * eps(T)
 
@@ -208,11 +217,7 @@ function KernelPrior(
     isempty(kernels) &&
         structure === nothing &&
         throw(ArgumentError("a KernelPrior needs at least one kernel or a structure"))
-    T = if isempty(kernels)
-        _structure_eltype(structure)
-    else
-        eltype(first(kernels).factor)
-    end
+    T = _prior_eltype(kernels, structure)
     kernels = convert(Vector{Kernel{T}}, collect(kernels))
     r = isempty(kernels) ? _structure_dim(structure) : size(first(kernels).factor, 1)
     for kernel in kernels
@@ -303,7 +308,8 @@ function KernelPrior(
     )
 end
 
-_structure_eltype(::AbstractKernelStructure{T}) where {T} = T
+_prior_eltype(kernels, ::Nothing) = eltype(first(kernels).factor)
+_prior_eltype(kernels, ::AbstractKernelStructure{T}) where {T} = T
 
 # Logits start, and are centred by default, where a correlation weight is this.
 const _START_RHO = 0.1

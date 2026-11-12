@@ -354,35 +354,6 @@ function _validate_obs_model(
     obs_model.d_fixed_zero &&
         !all(iszero, obs_model.d) &&
         throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
-    _validate_C_basis(obs_model, obs_dim)
-
-    return nothing
-end
-
-"""
-    _validate_C_basis(obs_model, obs_dim)
-
-Check a [`GaussianObservationModel`](@ref)'s `C_basis`: `obs_dim` rows, full column
-rank, a starting `C` inside its span, and none of the options its M-step does not
-handle.
-"""
-function _validate_C_basis(obs_model, obs_dim::Int)
-    basis = obs_model.C_basis
-    basis === nothing && return nothing
-    size(basis, 1) == obs_dim ||
-        throw(DimensionMismatchError("C_basis rows", obs_dim, size(basis, 1)))
-    rank(basis) == size(basis, 2) ||
-        throw(ArgumentError("C_basis must have full column rank"))
-    obs_model.CD_prior === nothing ||
-        throw(ArgumentError("C_basis cannot be combined with CD_prior"))
-    obs_model.depends_on === nothing ||
-        throw(ArgumentError("C_basis cannot be combined with depends_on"))
-    obs_model.d_fixed_zero &&
-        throw(ArgumentError("C_basis cannot be combined with d_fixed_zero"))
-    C = obs_model.C
-    outside = C - basis * (basis \ C)
-    norm(outside) <= sqrt(eps(eltype(C))) * max(norm(C), one(eltype(C))) ||
-        throw(ArgumentError("the starting C must lie in the span of C_basis"))
     return nothing
 end
 
@@ -511,6 +482,15 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
 
     # Check observation model dimensions and properties
     _validate_obs_model(lds.obs_model, lds.obs_dim, lds.latent_dim)
+    if lds.obs_model isa StructuredGaussianObservationModel &&
+        !(lds.state_model isa GaussianStateModel)
+        throw(
+            ArgumentError(
+                "a constrained or kernel-prior emission needs a GaussianStateModel; got a " *
+                "$(nameof(typeof(lds.state_model)))",
+            ),
+        )
+    end
 
     #=
     Resolve any ancillary parameter dependencies so a malformed `depends_on`
@@ -606,6 +586,11 @@ positional `LinearDynamicalSystem` constructor already runs, so it is not
 repeated per call.
 """
 function _validate_slds_structure(slds::SLDS)
+    any(lds -> lds.obs_model isa StructuredGaussianObservationModel, slds.LDSs) && throw(
+        ArgumentError(
+            "a constrained or kernel-prior emission is not available in a switching LDS"
+        ),
+    )
     k = size(slds.A, 1)
     D = length(slds.πₖ)
     lds_count = length(slds.LDSs)
@@ -888,7 +873,7 @@ function _check_ux(
 end
 
 @inline function _check_uy(
-    cs, expected_dim::Int, tsteps::Int, ::GaussianObservationModel{T}
+    cs, expected_dim::Int, tsteps::Int, ::_GaussianNoiseEmission{T}
 ) where {T}
     return _check_ux(cs, expected_dim, tsteps, "uy", T)
 end
@@ -970,7 +955,7 @@ function _normalize_multitrial_ux(
 end
 
 @inline function _normalize_multitrial_uy(
-    cs, expected_dim::Int, tsteps_per_trial, ::Type{T}, ::GaussianObservationModel
+    cs, expected_dim::Int, tsteps_per_trial, ::Type{T}, ::_GaussianNoiseEmission
 ) where {T<:Real}
     return _normalize_multitrial_ux(cs, expected_dim, tsteps_per_trial, T, "uy")
 end

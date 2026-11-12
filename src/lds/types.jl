@@ -261,16 +261,6 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
     its own variance and only the latents carry shared variability. With a full `R` a
     wide emission (many units) can explain shared variance through `R` instead of the
     latent state.
-- `C_basis::Union{Nothing,Matrix{T}} = nothing`: Constrain the emission to the column
-    span of a fixed `(obs_dim × r)` basis of full column rank, `C = C_basis * H`, with
-    `H` free: for example the leading left singular vectors of a forward model, so that
-    the latents load only on sensor patterns the sources can make. Given the current
-    `R`, the M-step's `C` is then the exact constrained maximiser, the `R⁻¹`-weighted
-    projection of the unconstrained solution onto the span, and `d`/`D` are re-solved
-    given that `C`; with `R`'s own update after it, each EM iteration is an ECM step and
-    the ELBO still never decreases. A square, invertible basis constrains nothing. The
-    starting `C` must lie in the span. Not available with `CD_prior`, `depends_on`,
-    `d_fixed_zero` or a hidden LQR costate.
 """
 Base.@kwdef mutable struct GaussianObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -287,8 +277,6 @@ Base.@kwdef mutable struct GaussianObservationModel{
     R_diagonal::Bool = false
     # Constrain the intercept within the coefficient solve; C and D stay free.
     d_fixed_zero::Bool = false
-    # Constrain C to the column span of a fixed basis: C = C_basis * H.
-    C_basis::Union{Nothing,Matrix{T}} = nothing
 end
 
 # Convenience constructors (State)
@@ -337,6 +325,8 @@ function GaussianObservationModel(C::M, R::M, D::M) where {T<:Real,M<:AbstractMa
         C=C, R=R, d=zeros(T, size(C, 1)), D=D, R_prior=nothing, CD_prior=nothing
     )
 end
+
+include("kernel_types.jl")
 
 """
     PoissonObservationModel{
@@ -440,6 +430,14 @@ parameter so the choice of smoother is a compile-time dispatch.
 """
 _emission_is_quadratic(::GaussianObservationModel) = true
 _emission_is_quadratic(::PoissonObservationModel) = false
+function _emission_is_quadratic(::StructuredGaussianObservationModel)
+    throw(
+        ArgumentError(
+            "a constrained or kernel-prior emission cannot be a member of a " *
+            "CompositeObservationModel",
+        ),
+    )
+end
 
 # Unrolled over the (heterogeneous, statically-sized) tuple of members so the
 # result is a compile-time constant.
@@ -721,7 +719,9 @@ a composite lands in the right one automatically: its `QUAD` type parameter is
 the `AND` over its members (see `_emission_is_quadratic`).
 """
 const QuadraticEmission{T} = Union{
-    GaussianObservationModel{T},CompositeObservationModel{T,true}
+    GaussianObservationModel{T},
+    StructuredGaussianObservationModel{T},
+    CompositeObservationModel{T,true},
 }
 
 const NonQuadraticEmission{T} = Union{
@@ -928,6 +928,9 @@ and what to call them; `_obs_nblocks`, `_fit_bool_keys` and
 `_write_obs_fit_bool!` all read it.
 """
 _obs_block_names(::GaussianObservationModel) = (:C, :R)
+function _obs_block_names(om::StructuredGaussianObservationModel)
+    return om.prior === nothing ? (:C, :R) : (:C, :R, :weights)
+end
 _obs_block_names(::PoissonObservationModel) = (:C,)
 
 """

@@ -322,6 +322,35 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     return nothing
 end
 
+function Base.show(io::IO, om::StructuredGaussianObservationModel; gap="")
+    title = if om.prior === nothing
+        "Constrained Gaussian Observation Model:"
+    elseif om.basis === nothing
+        "Kernel Gaussian Observation Model:"
+    else
+        "Constrained Kernel Gaussian Observation Model:"
+    end
+    println(io, gap, title)
+    println(io, gap, "-"^length(title))
+    println(io, gap, " size(C) = ($(size(om.C,1)), $(size(om.C,2)))")
+    println(io, gap, " size(R) = ($(size(om.R,1)), $(size(om.R,2)))")
+    println(io, gap, " size(D) = ($(size(om.D,1)), $(size(om.D,2)))")
+    basis = om.basis
+    basis === nothing || println(io, gap, " basis   = $(size(basis,1)) × $(size(basis,2))")
+    prior = om.prior
+    if prior !== nothing
+        types = unique(label.type for label in prior.labels)
+        println(
+            io,
+            gap,
+            " prior   = $(length(prior.labels)) kernel weights of type ",
+            join(string.(":", types), ", "),
+        )
+        println(io, gap, " gauge   = :$(om.gauge)")
+    end
+    return nothing
+end
+
 function Base.show(io::IO, pom::PoissonObservationModel; gap="")
     obs_dim, nstate = size(pom.C)
 
@@ -354,6 +383,11 @@ composite emission prefixes each member's slots with the member name.
 =#
 _obs_fit_labels(::GaussianObservationModel) = ["C (and d, D)", "R"]
 _obs_fit_labels(::PoissonObservationModel) = ["C, d"]
+function _obs_fit_labels(om::StructuredGaussianObservationModel)
+    labels = ["C (and d, D)", "R"]
+    om.prior === nothing || push!(labels, "kernel weights")
+    return labels
+end
 
 function _obs_fit_labels(c::CompositeObservationModel)
     labels = String[]

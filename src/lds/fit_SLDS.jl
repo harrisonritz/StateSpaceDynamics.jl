@@ -3647,9 +3647,6 @@ _block_width(::_ObsBlock, lds) = lds.latent_dim + 1 + lds.uy_dim
 
 _block_write!(::_DynBlock, lds, W) = _unpack_dyn_W!(lds, W)
 function _block_write!(::_ObsBlock, lds, W)
-    lds.obs_model isa GaussianObservationModel &&
-        lds.obs_model.C_basis !== nothing &&
-        throw(ArgumentError("C_basis is not available in a switching LDS"))
     return _unpack_obs_V!(lds, W)
 end
 
