@@ -465,7 +465,9 @@ end
     x, drawn = rand(MersenneTwister(1), lds, fill(15, 3))
     @test size(drawn[1]) == (p, 15) && all(isfinite, drawn[1])
 
-    @test_throws ArgumentError SLDS([0.9 0.1; 0.1 0.9], [0.5, 0.5], [lds, deepcopy(lds)])
+    switching = SLDS([0.9 0.1; 0.1 0.9], [0.5, 0.5], [lds, deepcopy(lds)])
+    @test_throws ArgumentError validate_SLDS(switching)
+    @test_throws ArgumentError fit!(switching, y; max_iter=2, progress=false)
 end
 
 @testset "kernel-prior emissions: recovery" begin

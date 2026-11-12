@@ -144,7 +144,7 @@ Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
   Tests: gradient and information against ForwardDiff; recovery of known
   weights from Wishart draws; reference fixture against `fit_kernels`
   (`method="laplace"`); every check in §3 that applies.
-- [ ] **M2** Vertical slice: the struct, `q(H)`, E-step hook, emission M-step,
+- [x] **M2** Vertical slice: the struct, `q(H)`, E-step hook, emission M-step,
   bound, `fit!`; migrate `C_basis` into `ConstrainedGaussianObservationModel`.
   Tests: `q(H)` and its moments against a dense `vec H` solve; smoother with
   `Δ` against a dense joint Gaussian (single, batched, ragged); bound equals a
@@ -162,7 +162,7 @@ Each ends with its tests green, `JuliaFormatter` clean, a commit and a push.
   Tests: covariance against the explicit `G S C S G'`; gradient / information
   against ForwardDiff; stick-breaking keeps `C` a correlation matrix; fixture
   against `ScaleCorrelationPrior`; simulated recovery of `ρ`.
-- [ ] **M6** PX gauge step, held-out scoring, `rand`, `loglikelihood`
+- [x] **M6** PX gauge step, held-out scoring, `rand`, `loglikelihood`
   (plug-in), `show`, accessors, refusals. Tests: gauge step raises the bound
   and leaves the likelihood terms unchanged; fewer iterations with it on;
   end-to-end recovery from the generative model against the unconstrained fit.
@@ -207,3 +207,18 @@ M5 depends only on the `AbstractKernelStructure` interface in
   centre of a logit is `logit(0.1)` for every kernel, where dynameg centres a
   family's tree at the mean of its starting logits, which is higher for a
   family with ancestors.
+- 2026-11-12: M2, M5, M6 done. The struct is `StructuredGaussianObservationModel`
+  (`src/lds/kernel_types.jl`, included from `types.jl`), a member of
+  `QuadraticEmission`; it carries always-`nothing` `depends_on` / `variants` /
+  `group_seeds` fields because generic entry points read them. Its fit has its
+  own loop (`_fit_structured!`, `src/lds/fit_kernel_LDS.jl`): start
+  (`_start_kernel_fit!`), then E-step, bound, `mstep!`, `_kernel_gauge_step!`.
+  The mean pass runs per trial (`_supports_batched` is false).
+- A wide prior does not reproduce the constrained ML fit: `q(H)` keeps its
+  covariance, so only its mean matches (tested at the M-step level).
+- M7 left: docs text and changelog are written; run the Documenter build
+  (`docs/make.jl`) and the full `test/runtests.jl`, fix what they report.
+  Open: default centre of a logit tree (`logit(0.1)` here; dynameg uses the
+  mean of the starting logits); no batched mean pass; `trial_elbos` has no
+  method for these emissions; refusal with an `LQRStateModel` is in
+  `validate_LDS` but untested.
