@@ -43,6 +43,8 @@ moment:
 ```@docs
 Kernel
 KernelPrior
+ScaleCorrelation
+CorrelationFamily
 fit_kernel_weights!
 kernel_weights
 kernel_covariance

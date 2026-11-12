@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own. Needs a `GaussianStateModel`; not available in an `SLDS`, a
   composite emission, or with `depends_on`.
 
+  A tutorial, *Kernel priors on a parcellated cortex*, builds a full
+  model comparison of sum-of-kernels and scale–correlation priors (parcel,
+  network and global scales; network, parcel and geodesic coherences; nested,
+  pooled and joint trees) on a synthetic surface parcellation.
+
 - **A causal (closed-loop) mode for `LQRStateModel`: `causal_state_model`.** The
   finite-horizon feedback controller of the control problem, as a state model:
   sweeping each trial's stretch of the cost schedule backward gives `P_t`, `W_t`

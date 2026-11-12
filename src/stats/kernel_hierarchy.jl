@@ -18,6 +18,8 @@ the Laplace posterior of the weights (`_update_tree!`).
 
 # No level of a tree collapses below this SD (natural-log or logit units).
 const _TREE_SD_FLOOR = 0.05
+# The bound on a canonical partial correlation's unconstrained value in the Ω-step.
+const _CPC_BOUND = 10.0
 
 """
     WeightLabel
@@ -264,7 +266,7 @@ function _joint_tree(
                 "a correlated type needs one kernel per unit; :$type repeats one"
             ),
         )
-        Dict(zip(units, members[type]))
+        return Dict(zip(units, members[type]))
     end
     common = [
         u for
@@ -292,7 +294,7 @@ function _joint_tree(
                     (isempty(found) ? "none" : join(found, ", ")),
                 ),
             )
-            found[1]
+            return found[1]
         end
         names = unique(groups)
         length(names) >= 2 ||
@@ -404,6 +406,8 @@ end
 function _omega_objective(
     S::AbstractMatrix{T}, n::T, eta::T, logsd::AbstractVector{T}, L::AbstractMatrix{T}
 ) where {T<:Real}
+    # A correlation at ±1 (a zero pivot) is the boundary, not a solution.
+    all(i -> L[i, i] > 0, axes(L, 1)) || return T(Inf)
     scaled = S .* exp.(-logsd) .* exp.(-logsd)'
     half = LowerTriangular(L) \ scaled
     quad = tr(LowerTriangular(L) \ half')
@@ -432,16 +436,16 @@ function _fit_omega(
         end
         return sd, corr
     end
-    p0 = vcat(log.(σ), _cpc_from_corr(R))
-    f =
-        p -> _omega_objective(
-            S, n, eta, view(p, 1:d), _cpc_cholesky(view(p, (d + 1):length(p)), d)
-        )
+    # The partial correlations are held in ±tanh(_CPC_BOUND), as dynameg's
+    # bounded search does: past it `tanh` rounds to one and the factor is singular.
+    cpc(p) = _cpc_cholesky(clamp.(view(p, (d + 1):length(p)), -_CPC_BOUND, _CPC_BOUND), d)
+    p0 = vcat(log.(σ), clamp.(_cpc_from_corr(R), -_CPC_BOUND, _CPC_BOUND))
+    f = p -> _omega_objective(S, n, eta, view(p, 1:d), cpc(p))
     start = f(p0)
     result = optimize(f, p0, LBFGS(), Optim.Options(; iterations=500, g_tol=1e-10))
     p = Optim.minimizer(result)
     (isfinite(Optim.minimum(result)) && Optim.minimum(result) <= start) || return σ, R
-    L = _cpc_cholesky(view(p, (d + 1):length(p)), d)
+    L = cpc(p)
     return max.(exp.(p[1:d]), T(_TREE_SD_FLOOR)), Matrix(Symmetric(L * L'))
 end
 

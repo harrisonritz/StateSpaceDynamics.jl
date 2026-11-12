@@ -220,3 +220,16 @@ end
     @test length(apart.trees) == 2
     @test sum(abs2, joint.weights .- truth) < sum(abs2, apart.weights .- truth)
 end
+
+@testset "weight tree: Ω-step at a perfect correlation" begin
+    # Units whose weights move exactly together put the Ω-step's optimum on the
+    # boundary |ρ| = 1; it must stop there rather than fail on a singular factor.
+    v = [1.0, 2.0, -0.5]
+    S = 50 .* (v * v') + 1e-12 * I
+    σ, R = KHSSD._fit_omega(S, 50.0, 2.0, ones(3), Matrix(1.0I, 3, 3))
+    @test all(isfinite, σ) && all(isfinite, R)
+    @test minimum(eigvals(Symmetric(R))) > -1e-8
+    @test R[1, 2] > 0.99 && R[1, 3] < -0.99
+    ratio = σ ./ abs.(v)                # the SDs keep the units' proportions
+    @test maximum(ratio) / minimum(ratio) < 1.01
+end

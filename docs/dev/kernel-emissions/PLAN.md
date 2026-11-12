@@ -222,3 +222,9 @@ M5 depends only on the `AbstractKernelStructure` interface in
   mean of the starting logits); no batched mean pass; `trial_elbos` has no
   method for these emissions; refusal with an `LQRStateModel` is in
   `validate_LDS` but untested.
+- 2026-11-12: the Ω-step of a joint tree threw a `SingularException` when a
+  canonical partial correlation ran to ±1 (seen with
+  `correlated=[(:parcel_scale, :parcel)]`, `:nested`). It now holds them in
+  ±10 as dynameg's bounded L-BFGS-B does, and scores a zero pivot `Inf`.
+  Tutorial `docs/examples/KernelPriorLDS.jl` added: every model of
+  `constrained_fit.ipynb` as SSD.jl calls, on a synthetic parcellation.

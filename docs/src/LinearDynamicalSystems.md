@@ -305,6 +305,54 @@ variance weight per block of columns of ``G``, and correlation kernels whose
 weights are stick-broken so that ``C`` stays a correlation matrix. Its weights
 take the same hyperpriors, by type.
 
+### A scale–correlation prior on a parcellation
+
+With ``G = \Phi^\top L`` (`r × n`, `n` source columns), `w` the depth variance
+of each column, `block` each column's parcel (`1 … P`, plus one block for the
+columns in no parcel), and one correlation factor per network, per parcel, and
+per parcel for a geodesic kernel (`n × m` each):
+
+```julia
+structure = ScaleCorrelation(G, w, block;
+    names=[parcel_names; "none"], type=:parcel_scale,
+    groups=[parcel_network; "none"],               # the node of each scale, for :nested
+    families=[
+        CorrelationFamily(network_factors; type=:network, names=network_names),
+        CorrelationFamily(parcel_factors; type=:parcel, names=parcel_names,
+                          groups=parcel_network),
+        CorrelationFamily(geo_factors; type=:geo, names=parcel_names,
+                          groups=parcel_network),
+    ])
+prior = KernelPrior([Kernel(Φ' * N * Φ; name="I", type=:nuisance)];
+    structure,
+    levels=(parcel_scale=:hierarchical, network=:hierarchical,
+            parcel=:hierarchical, geo=:hierarchical),
+    correlated=[(:parcel_scale, :parcel, :geo)])  # one joint tree, units matched by name
+```
+
+The families are ordered coarse to fine, and every kernel lies inside one
+kernel of each earlier family (a parcel inside its network). A weight's
+`unit` defaults to its name, so naming the parcel and geodesic kernels by
+their parcel is what lets `correlated` pair them with that parcel's scale.
+One scale per network (`block` = the network) or one for the whole cortex
+(a single block, `:flat`, since one weight has no spread to fit) changes only
+the first three arguments and `names`.
+
+| to get | write |
+|---|---|
+| parcels about their network's mean, networks about a root | `levels=:nested` for that type, and a `group` per weight |
+| all weights of a type about one fitted mean | `:hierarchical` |
+| a fixed Gaussian on each weight | `:flat` (`prior_mean`, `prior_sd`) |
+| a unit's weights of several types to covary | `correlated=[(:a, :b)]`, the types sharing `levels` |
+| the weights held during a fit | `fit_bool=(weights=false,)`, the start given by `weights=` or by a fit with `fit_kernel_weights!` |
+| the weights fitted to a starting loading only | `fit!(lds, y; max_iter=1)` (the start alone), then `lds.fit_bool[7] = false` |
+
+The tutorial [Kernel priors on a parcellated cortex](@ref) builds a whole
+model comparison of this kind, sum-of-kernels and scale–correlation priors
+alike, on a synthetic cortex, and shows how to give a subspace of the
+latents (a frequency band of the dynamics, say) a prior of its own after the
+fit.
+
 ### How it is fitted
 
 `fit!` runs variational Laplace EM. The loading has a Gaussian posterior

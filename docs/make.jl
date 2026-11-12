@@ -16,6 +16,7 @@ tutorials = [
     ("SLDS.jl", "switching_linear_dynamical_system_example"),
     ("LQR.jl", "inverse_lqr_example"),
     ("ProbabilisticPCA.jl", "Probabilistic_PCA_example"),
+    ("KernelPriorLDS.jl", "kernel_prior_example"),
 ]
 
 # Convert all Julia examples to Markdown tutorials
@@ -59,6 +60,7 @@ makedocs(;
             "Probabilistic PCA Example" => "tutorials/Probabilistic_PCA_example.md",
             "Switching Linear Dynamical System Example" => "tutorials/switching_linear_dynamical_system_example.md",
             "Inverse LQR" => "tutorials/inverse_lqr_example.md",
+            "Kernel Priors on a Parcellated Cortex" => "tutorials/kernel_prior_example.md",
         ],
         "API Reference" => "api.md",
     ],
