@@ -239,6 +239,96 @@ copy_warp!
 ```
 
 
+## Emissions with a kernel prior
+
+Three Gaussian emission classes constrain the loading ``C``, put a prior on it,
+or both:
+
+| class | loading | prior |
+|---|---|---|
+| [`ConstrainedGaussianObservationModel`](@ref) | ``C = \Phi H``, ``\Phi`` fixed | none |
+| [`KernelGaussianObservationModel`](@ref) | ``C`` | on the columns of ``C`` |
+| [`ConstrainedKernelGaussianObservationModel`](@ref) | ``C = \Phi H`` | on the columns of ``H`` |
+
+``\Phi`` is an `obs_dim × r` basis of full column rank. The prior is a
+[`KernelPrior`](@ref): each column of ``H`` is a draw from a zero-mean Gaussian
+whose covariance is a weighted sum of kernels,
+
+```math
+\begin{aligned}
+    y_t &\sim \mathcal{N}(\Phi H x_t + d, R) \\
+    h_j &\sim \mathcal{N}(0, \Sigma(w)), \qquad \Sigma(w) = \sum_g e^{w_g} Z_g \\
+    w &\sim \mathcal{N}(\mu, \Lambda^{-1})
+\end{aligned}
+```
+
+and the weights ``w`` are fitted with the model. An example is source
+reconstruction: with ``\Phi`` the leading singular vectors of a forward model
+``L`` and kernels ``Z_g = \Phi^\top L K_g L^\top \Phi`` built from source
+covariances ``K_g``, the model is ``C = L J`` with the columns of ``J`` drawn
+from ``\mathcal{N}(0, \sum_g \theta_g K_g)``. The package takes ``\Phi`` and the
+``Z_g`` as given; it does no projection.
+
+```julia
+kernels = [
+    Kernel(Z_depth; name="depth", type=:cortex),
+    Kernel(Z_smooth; name="smooth", type=:cortex),
+    Kernel(Matrix(1.0I, r, r); name="noise", type=:nuisance),
+]
+prior = KernelPrior(kernels)
+om = ConstrainedKernelGaussianObservationModel(; basis=Φ, prior, C=C0, R=R0)
+lds = LinearDynamicalSystem(state_model, om)
+trace = fit!(lds, y)
+kernel_weights(om)        # one row per kernel: weight, value, posterior SD
+emission_posterior(om)    # q(H)
+```
+
+### The hyperprior on the weights
+
+Every kernel has a `type`, and `KernelPrior(kernels; levels=...)` gives each
+type one of three models for its log weights:
+
+- `:flat`: each weight has its own fixed Gaussian prior.
+- `:hierarchical`: the weights of the type share a normal whose mean and
+  standard deviation are fitted.
+- `:nested`: each kernel also has a `group`; the weights of a group share a
+  mean, and the groups' means share a normal. All of it is fitted.
+
+The fitted means and standard deviations have weakly informative hyperpriors
+by default (`root_sd`, `sd_prior`), which keep a level with few members from
+collapsing. `correlated=[(:a, :b)]` lets the weights that two types give the
+same `unit` covary across units, with an LKJ prior on the correlation.
+
+A [`ScaleCorrelation`](@ref) structure replaces the sum of kernels by a
+covariance ``G S C S G^\top`` factored into scales and correlations: one
+variance weight per block of columns of ``G``, and correlation kernels whose
+weights are stick-broken so that ``C`` stays a correlation matrix. Its weights
+take the same hyperpriors, by type.
+
+### How it is fitted
+
+`fit!` runs variational Laplace EM. The loading has a Gaussian posterior
+``q(H)``, exact given ``R``; the latents are smoothed with the emission
+precision ``\mathbb{E}[C^\top R^{-1} C]``, which the uncertainty of ``H`` makes
+larger than that of its mean; the weights go to their MAP given
+``\mathbb{E}[H H^\top]``; and the hyperprior's means and standard deviations are
+updated from the weights' Laplace posterior. The trace is the variational bound
+at the weights' MAP. It never decreases while the hyperprior is held (`:flat`
+types); an update of a fitted hyperprior uses the weights' posterior
+covariance, which that bound leaves out, and can lower it slightly.
+
+The likelihood does not change under ``x \to T x``, ``H \to H T^{-1}``, but the
+prior on ``H`` does. The emission's `gauge` field says how a fit settles this:
+`:bound` (the default) lets the bound choose and takes the exact step along the
+gauge each iteration, `:moment` rescales the latents to a unit second moment
+each iteration (a constraint, so the trace is not monotone), and `:none` takes
+no step.
+
+`loglikelihood` of these models is the Gaussian one at the mean loading: a
+plug-in score that compares with a `GaussianObservationModel` fit. They need a
+`GaussianStateModel`, and are not available in an `SLDS`, in a composite
+emission, or with `depends_on`.
+
 ## Several observation models at once
 
 One latent process can be measured in more than one way — spike counts *and*

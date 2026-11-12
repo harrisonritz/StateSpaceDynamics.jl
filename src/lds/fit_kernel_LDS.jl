@@ -323,3 +323,47 @@ function _fit_structured!(
     prog !== nothing && finish!(prog)
     return _fit_result(monitor, elbos, lds)
 end
+
+# ----------------------------------------------------------------------------
+# The plug-in likelihood
+# ----------------------------------------------------------------------------
+
+# The Gaussian LDS at the mean loading, sharing every array.
+function _plugin_gaussian(
+    lds::LinearDynamicalSystem{T,S,O}
+) where {T<:Real,S<:GaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
+    om = lds.obs_model
+    plain = GaussianObservationModel(;
+        C=om.C, R=om.R, d=om.d, D=om.D, R_prior=om.R_prior, R_diagonal=om.R_diagonal
+    )
+    return LinearDynamicalSystem{T,S,typeof(plain)}(
+        lds.state_model,
+        plain,
+        lds.latent_dim,
+        lds.obs_dim,
+        lds.ux_dim,
+        lds.uy_dim,
+        lds.fit_bool[1:6],
+    )
+end
+
+"""
+    loglikelihood(lds, y; ux0=nothing, ux=nothing, uy=nothing)
+
+For a constrained or kernel-prior emission: the marginal log-likelihood of the
+Gaussian LDS at the mean loading `obs_model.C`, by the Kalman filter. With a
+kernel prior this is a plug-in score, not the model's evidence: it leaves out
+the uncertainty of the loading and the prior's terms, which the bound that
+`fit!` and [`elbo`](@ref) report includes. It is comparable between models and
+with a `GaussianObservationModel` fit, which is what makes it useful on
+held-out trials.
+"""
+function StatsAPI.loglikelihood(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    y::Observations{T};
+    ux0=nothing,
+    ux=nothing,
+    uy=nothing,
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:StructuredGaussianObservationModel{T}}
+    return loglikelihood(_plugin_gaussian(lds), y; ux0, ux, uy)
+end

@@ -8,6 +8,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Gaussian emissions with a constrained loading, a kernel prior on it, or
+  both.** `ConstrainedGaussianObservationModel` (`C = basis * H`, `H` free),
+  `KernelGaussianObservationModel` (the columns of `C` drawn from a
+  `KernelPrior`) and `ConstrainedKernelGaussianObservationModel` (the columns
+  of `H`). A `KernelPrior` is a zero-mean Gaussian whose covariance is a
+  weighted sum of `Kernel`s, optionally with a `ScaleCorrelation` structure
+  (scales and stick-broken correlations), and a hyperprior on the weights by
+  `type`: `:flat`, `:hierarchical` or `:nested`, with weakly informative
+  hyperpriors on the fitted levels and optional correlation between types.
+
+  `fit!` is variational Laplace EM: an exact Gaussian posterior of the loading,
+  the existing smoother with the loading's uncertainty in the emission
+  precision, the weights' MAP and Laplace covariance, and the hyperprior
+  updated from it. The emission's `gauge` field chooses between the gauge that
+  maximises the bound (a parameter-expansion step, the default), a unit second
+  moment of the latents, and no step. `fit_kernel_weights!`, `kernel_weights`,
+  `kernel_covariance` and `kernel_evidence` fit and inspect a `KernelPrior` on
+  its own. Needs a `GaussianStateModel`; not available in an `SLDS`, a
+  composite emission, or with `depends_on`.
+
 - **A causal (closed-loop) mode for `LQRStateModel`: `causal_state_model`.** The
   finite-horizon feedback controller of the control problem, as a state model:
   sweeping each trial's stretch of the cost schedule backward gives `P_t`, `W_t`
@@ -138,6 +158,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than automatic differentiation.
 
 ### Changed
+- **`GaussianObservationModel` no longer has a `C_basis` field.** Use
+  `ConstrainedGaussianObservationModel(; basis, C, R, ...)`, which fits the
+  same model.
+
 - **The spline-Gaussian warp step whitens a trial at a time.** Its objective
   solves each trial's residuals against `R` as one multi-column solve (a division
   when `R` is diagonal) instead of one timestep at a time. Same objective and

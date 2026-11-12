@@ -20,6 +20,35 @@ PoissonObservationModel
 SplineGaussianObservationModel
 ```
 
+## Constrained and kernel-prior emissions
+
+Gaussian emissions whose loading is `C = basis * H`, with `H` free or drawn from
+a prior built from weighted kernels. See
+[Emissions with a kernel prior](@ref) for the model and how it is fitted.
+
+```@docs
+ConstrainedGaussianObservationModel
+KernelGaussianObservationModel
+ConstrainedKernelGaussianObservationModel
+StructuredGaussianObservationModel
+LoadingPosterior
+emission_posterior
+fit!(lds::LinearDynamicalSystem{T,S,O}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,S<:GaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
+loglikelihood(lds::LinearDynamicalSystem{T,SM,OM}, y::StateSpaceDynamics.Observations{T}) where {T<:Real,SM<:GaussianStateModel{T},OM<:StructuredGaussianObservationModel{T}}
+```
+
+The prior and its weights, usable on their own to fit kernels to a second
+moment:
+
+```@docs
+Kernel
+KernelPrior
+fit_kernel_weights!
+kernel_weights
+kernel_covariance
+kernel_evidence
+```
+
 ## Monotonic splines
 
 The normalizing-flow layer of a [`SplineGaussianObservationModel`](@ref): a
