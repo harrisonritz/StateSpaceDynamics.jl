@@ -17,16 +17,15 @@ vec H ~ N(0, I_k ⊗ Σ(w)),   Σ(w) = Σ_sum + Σ_sc            (r × r)
 w ~ N(μ(η), Λ(η)⁻¹),   η ~ p(η)                            (trees, hyperpriors)
 ```
 
-- `Φ` (p × r): fixed, full column rank. From a user `L` (p × n): `n ≤ p` uses
-  `L` itself; `n > p` (or `rank=`) reduces to an orthonormal basis of the range
-  of `L`, and kernels are projected (`G = Φ'L`, r × n).
-- `Σ_sum = Σ_g θ_g Z_g`, `θ_g = exp(w_g)`. A kernel is a PSD matrix or a
-  factor `F` (`K = F F'`), declared in coefficient space (rows of `H` before
-  reduction, mapped by `G`) or in observation space (mapped by `Φ'`).
-- `Σ_sc = G S C S G'`, `S² = θ_{b(i)} v_i` over a partition of the coefficient
-  rows into scale blocks, `C = I + Σ_c ρ_c (R_c − I_c)`, correlation families
-  ordered coarse to fine, each kernel nested in one kernel of every earlier
-  family, `ρ_c = (1 − Σ_{ancestors} ρ) σ(a_c)` (stick-breaking). As in
+- `Φ` (p × r): fixed, full column rank, given by the caller already reduced
+  (decided 2026-11-12: no wide `L`, no projection inside SSD.jl).
+- `Σ_sum = Σ_g θ_g Z_g`, `θ_g = exp(w_g)`. A kernel is an r × r PSD matrix or
+  a factor `F` (r × m, `Z = F F'`), already in `H`'s coordinates.
+- `Σ_sc = G S C S G'`, with `G` (r × n) given by the caller (`Φ'L`),
+  `S² = θ_{b(i)} v_i` over a partition of the n columns into scale blocks,
+  `C = I + Σ_c ρ_c (R_c − I_c)`, correlation families (n × m factors) ordered
+  coarse to fine, each kernel nested in one kernel of every earlier family,
+  `ρ_c = (1 − Σ_{ancestors} ρ) σ(a_c)` (stick-breaking). As in
   `shared_scale_correlation.py`.
 
 Three exported classes, one parametric struct underneath
@@ -34,7 +33,7 @@ Three exported classes, one parametric struct underneath
 
 | class | basis | prior | notes |
 |---|---|---|---|
-| `ConstrainedGaussianObservationModel` | Φ | none | `H` point estimate; replaces the `C_basis` field |
+| `ConstrainedGaussianObservationModel` | Φ | none | `H` point estimate; replaces the `C_basis` field (removed) |
 | `KernelGaussianObservationModel` | I | kernels (p × p) | `q(C)` |
 | `ConstrainedKernelGaussianObservationModel` | Φ | kernels | `q(H)` |
 
@@ -75,6 +74,9 @@ existing `SufficientStatistics` (`obs_xx`, `obs_xy`; regressors `[x; 1; u]`).
   `_affine_gauge!` that takes `T`. It never lowers the bound. Empirical prior
   centres are computed once at the start (after one unit-moment gauge) and
   frozen. `gauge_center`/`gauge_whiten` are refused for these classes.
+  Option `gauge = :bound` (default, the PX step), `:moment` (dynameg's unit
+  centred second moment each iteration; the trace is then not monotone) or
+  `:none`.
 - **Trace**: `Q_state + E_q(H)[Q_obs] + H[q(x)] + E log p(H) + H[q(H)] +
   log p(ŵ|η) + log p(η) + state/R priors`. Monotone with the trees held; a
   tree update uses `Σ_w`, so it can lower it slightly. The Laplace evidence
@@ -112,7 +114,8 @@ overlap and nest in earlier families; `correlated` types share units.
 Out of scope for this pass (stated, not built): per-latent weights
 (`shared_parcel_prior`), Student-t groups, softplus link, the convex-bound
 update, rotation of the latents, SLDS / LQR / composite / `depends_on`
-(refused with an `ArgumentError`), contrast and region posteriors.
+(refused with an `ArgumentError`), source-space maps, contrast and region
+posteriors (these stay in dynameg).
 
 ## 4. Files
 
@@ -123,7 +126,7 @@ update, rotation of the latents, SLDS / LQR / composite / `depends_on`
   `fit_kernel_weights!` (also the post-hoc lift).
 - `src/lds/kernel_observations.jl`: the struct and aliases, `q(H)`, emission
   M-step, bound terms, E-step constants, accessors
-  (`emission_posterior`, `kernel_weights`, `coefficient_loading`).
+  (`emission_posterior`, `kernel_weights`).
 - `src/lds/fit_kernel_LDS.jl`: `fit!` / `elbo` / `smooth` / `loglikelihood` /
   `rand` methods, PX gauge step, holdout.
 - Tests: `test/KernelPrior/*.jl`, `test/LinearDynamicalSystems/KernelEmissions.jl`,
@@ -171,5 +174,13 @@ parallel (subagents in worktrees).
 
 ## 6. Decisions and log
 
-- 2026-11-12: plan written. Open questions sent to the user: class semantics
-  and the fate of `C_basis`; wide `L`; gauge; extras in the first pass.
+- 2026-11-12: plan written. User decisions: the three classes are as in §1
+  and `C_basis` is replaced by the constrained class; inputs are reduced
+  (`Φ`, r × r kernels or factors, `G` for scale-correlation) and SSD.jl does
+  no projection or source-space maps; both gauges, `:bound` the default; no
+  extras (per-latent weights, Student-t, source maps) in this pass.
+- The new struct joins `QuadraticEmission`, so the existing smoother, E-step
+  and `_fit_tridiag!` loop run on it; it supplies `_compute_obs_constants!`,
+  the per-bin emission kernels, `elbo!` and `mstep!`. Rejected: a Gaussian
+  shadow with a surrogate `(C̃, R̃)` (needs `Ĉ'R⁻¹Ĉ` inverted; ill-conditioned
+  when a loading shrinks).
