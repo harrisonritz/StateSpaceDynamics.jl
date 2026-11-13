@@ -28,6 +28,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its own. Needs a `GaussianStateModel`; not available in an `SLDS`, a
   composite emission, or with `depends_on`.
 
+  The weights' fit stops at a relative decrease of `f_reltol` (default `1e-8`,
+  scipy's `ftol` as in dynameg) as well as at `g_tol`, computes each line-search
+  point's value and gradient together, and builds a scale–correlation
+  covariance and gradient from the kernels' images side by side (one `syrk` and
+  one `gemm` rather than a call per kernel). With BLAS on one thread and Julia
+  on several, those calls and the Laplace covariance are split over Julia's
+  threads. A precompile workload (PrecompileTools, a new dependency) caches
+  the kernel-prior fit's methods in the package image, so that a fresh Julia
+  process does not compile them before its first fit.
+
   A tutorial, *Kernel priors on a parcellated cortex*, builds a full
   model comparison of sum-of-kernels and scale–correlation priors (parcel,
   network and global scales; network, parcel and geodesic coherences; nested,

@@ -214,7 +214,7 @@ end
             Kernel(Z[g, :, :]; name="k$g", own...)
         end
         prior = KernelPrior(kernels)
-        found = fit_kernel_weights!(prior, S, n; max_iter=2000, g_tol=1e-11)
+        found = fit_kernel_weights!(prior, S, n; max_iter=2000, g_tol=1e-11, f_reltol=0.0)
         @test found.converged
         @test KPSSD._weight_prior(prior)[1] ≈ centre
         @test exp.(prior.weights) ≈ vec(ref["$(case)_map_theta"]) rtol = 1e-7

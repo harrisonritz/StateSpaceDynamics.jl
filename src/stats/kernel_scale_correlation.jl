@@ -218,6 +218,10 @@ struct ScaleCorrelation{T<:Real} <: AbstractKernelStructure{T}
     Z::Vector{Matrix{T}}
     # per correlation kernel: its image on each scale block it touches
     images::Vector{Vector{_BlockImage{T}}}
+    # the Z side by side, each as a column (r² × length(Z)), for one gemv
+    Zstack::Matrix{T}
+    # per correlation kernel: its columns in the kernels' images side by side
+    columns::Vector{UnitRange{Int}}
 end
 
 function ScaleCorrelation(
@@ -228,7 +232,7 @@ function ScaleCorrelation(
     type::Symbol=:scale,
     groups=nothing,
     units=names,
-    families::AbstractVector{<:CorrelationFamily}=CorrelationFamily[],
+    families::AbstractVector=CorrelationFamily[],
 )
     T = float(eltype(gain))
     r, n = size(gain)
@@ -267,7 +271,7 @@ function ScaleCorrelation(
     Gw = Matrix{T}(gain) .* sqrt.(T.(variance))'
     Z = map(members) do cols
         half = Gw[:, cols]
-        half * half'
+        return half * half'
     end
     powerless = findall(z -> !(tr(z) > 0), Z)
     isempty(powerless) || throw(
@@ -278,6 +282,14 @@ function ScaleCorrelation(
         ),
     )
 
+    # Any vector of families, so that `families=[]` (a `Vector{Any}`) is no family.
+    for family in families
+        family isa CorrelationFamily || throw(
+            ArgumentError(
+                "families must hold CorrelationFamily values; got $(typeof(family))"
+            ),
+        )
+    end
     fams = CorrelationFamily{T}[_family_as(T, family) for family in families]
     types = Symbol[family.type for family in fams]
     allunique(types) || throw(
@@ -306,6 +318,15 @@ function ScaleCorrelation(
     for family in fams, (B, cols) in zip(family.factors, family.covered)
         push!(images, _block_images!(Z, slot, Gw, B, cols, block))
     end
+    widths = [size(first(parts).image, 2) for parts in images]
+    stops = cumsum(widths)
+    columns = [(stop - width + 1):stop for (stop, width) in zip(stops, widths)]
+    # Filled in place: `reduce(hcat, …)` over a generator copies pairwise,
+    # quadratic in the number of `Z` (gigabytes for a parcellation).
+    Zstack = Matrix{T}(undef, r * r, length(Z))
+    for (j, z) in enumerate(Z)
+        Zstack[:, j] .= vec(z)
+    end
     return ScaleCorrelation{T}(
         Matrix{T}(gain),
         Vector{T}(variance),
@@ -318,6 +339,8 @@ function ScaleCorrelation(
         ancestors,
         Z,
         images,
+        Zstack,
+        columns,
     )
 end
 
@@ -383,9 +406,9 @@ function _block_images!(
         z = get!(slot, (b, within[k])) do
             half = Gw[:, within[k]]
             push!(Z, half * half')
-            length(Z)
+            return length(Z)
         end
-        _BlockImage{T}(b, W[k], z)
+        return _BlockImage{T}(b, W[k], z)
     end
 end
 
@@ -418,7 +441,7 @@ end
 function _structure_start(s::ScaleCorrelation{T}, logscale::Real) where {T<:Real}
     logits = map(s.ancestors) do enclosing
         rest = max(1 - _START_RHO * length(enclosing), 1e-6)
-        T(_logit(_START_RHO / rest))
+        return T(_logit(_START_RHO / rest))
     end
     return vcat(fill(T(logscale), _scale_count(s)), logits)
 end
@@ -459,23 +482,109 @@ function _kernel_image(images::Vector{_BlockImage{T}}, rootθ::Vector{T}) where 
     return A
 end
 
+#= Splitting large BLAS calls over Julia's threads. Only when BLAS itself runs
+on one thread (as when it is pinned to avoid nesting under Julia threads) and
+Julia has several: otherwise the call is left whole, to BLAS. =#
+_split_blas() = Threads.nthreads() > 1 && BLAS.get_num_threads() == 1
+
+# The shortest block a split call is given (a `Ref` so that tests can lower it).
+const _SPLIT_LEAST = Ref(256)
+
+# `n` indices in about one contiguous range per thread, none shorter than `least`.
+function _chunks(n::Int; least::Int=_SPLIT_LEAST[])
+    parts = clamp(n ÷ least, 1, Threads.nthreads())
+    edges = round.(Int, range(0, n; length=parts + 1))
+    return [(edges[i] + 1):edges[i + 1] for i in 1:parts]
+end
+
+# `out = X v` (`transpose=false`) or `X' v`, by blocks of rows or columns of `X`.
+function _split_gemv!(
+    out::AbstractVector{T},
+    X::AbstractMatrix{T},
+    v::AbstractVector{T};
+    transpose::Bool=false,
+    add::Bool=false,
+) where {T<:Real}
+    β = add ? one(T) : zero(T)
+    if !_split_blas()
+        transpose ? mul!(out, X', v, one(T), β) : mul!(out, X, v, one(T), β)
+        return out
+    end
+    tforeach(_chunks(length(out))) do part
+        if transpose
+            mul!(view(out, part), view(X, :, part)', v, one(T), β)
+        else
+            mul!(view(out, part), view(X, part, :), v, one(T), β)
+        end
+    end
+    return out
+end
+
+# Every kernel's `scale[c] A_c`, side by side (r × total width), in `s.columns`.
+function _stacked_images(
+    s::ScaleCorrelation{T}, rootθ::Vector{T}, scale::AbstractVector{T}
+) where {T<:Real}
+    r = size(s.gain, 1)
+    width = isempty(s.columns) ? 0 : last(last(s.columns))
+    A = zeros(T, r, width)
+    fill_kernel = c -> begin
+        Ac = view(A, :, s.columns[c])
+        for part in s.images[c]
+            axpy!(scale[c] * rootθ[part.block], part.image, Ac)
+        end
+    end
+    if _split_blas()
+        tforeach(fill_kernel, eachindex(s.images))
+    else
+        foreach(fill_kernel, eachindex(s.images))
+    end
+    return A
+end
+
+# The lower triangle of `A A'`, by blocks of columns of `A` when split.
+function _split_syrk(A::AbstractMatrix{T}) where {T<:Real}
+    _split_blas() || return BLAS.syrk('L', 'N', one(T), A)
+    return tmapreduce(+, _chunks(size(A, 2))) do part
+        return BLAS.syrk('L', 'N', one(T), view(A, :, part))
+    end
+end
+
+# `M A`, by blocks of columns of `A` when split.
+function _split_mul(M::AbstractMatrix{T}, A::AbstractMatrix{T}) where {T<:Real}
+    _split_blas() || return M * A
+    out = similar(A, size(M, 1), size(A, 2))
+    tforeach(_chunks(size(A, 2))) do part
+        return mul!(view(out, :, part), M, view(A, :, part))
+    end
+    return out
+end
+
+# The coefficient of each `Z` in `Σ_sc`: `θ_b` on the blocks, `−Σ ρ_c θ_b` on
+# the `Z_cb`.
+function _z_coefficients(s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T}) where {T<:Real}
+    coefficient = zeros(T, length(s.Z))
+    coefficient[1:length(θ)] .= θ
+    for (c, images) in enumerate(s.images)
+        for part in images
+            coefficient[part.z] -= ρ[c] * θ[part.block]
+        end
+    end
+    return coefficient
+end
+
+#= `Σ_sc` is one `syrk` of the stacked images `√ρ_c A_c` and one `gemv` of the
+stacked `Z`: a call per kernel would spend most of its time checking and
+copying triangles of `r × r` matrices. =#
 function _add_covariance!(
     Σ::AbstractMatrix{T}, s::ScaleCorrelation{T}, w::AbstractVector
 ) where {T<:Real}
     θ, ρ, _, _ = _scale_correlation_weights(s, w)
     rootθ = sqrt.(θ)
-    coefficient = zeros(T, length(s.Z))
-    coefficient[1:length(θ)] .= θ
-    for (c, images) in enumerate(s.images)
-        A = _kernel_image(images, rootθ)
-        mul!(Σ, A, A', ρ[c], one(T))
-        for part in images
-            coefficient[part.z] -= ρ[c] * θ[part.block]
-        end
+    if !isempty(s.columns)
+        A = _stacked_images(s, rootθ, sqrt.(max.(ρ, zero(T))))
+        Σ .+= Symmetric(_split_syrk(A), :L)
     end
-    for (z, Z) in enumerate(s.Z)
-        Σ .+= coefficient[z] .* Z
-    end
+    _split_gemv!(vec(Σ), s.Zstack, _z_coefficients(s, θ, ρ); add=true)
     return Σ
 end
 
@@ -504,17 +613,21 @@ function _add_gradient!(
     θ, ρ, rest, σ = _scale_correlation_weights(s, w)
     g = length(θ)
     rootθ = sqrt.(θ)
-    traces = T[dot(Z, M) for Z in s.Z]
+    traces = _split_gemv!(zeros(T, length(s.Z)), s.Zstack, vec(M); transpose=true)
     slope_θ = traces[1:g]
     slope_ρ = zeros(T, length(ρ))
-    for (c, images) in enumerate(s.images)
-        A = _kernel_image(images, rootθ)
-        MA = M * A
-        slope_ρ[c] = dot(A, MA)
-        for part in images
-            b = part.block
-            slope_θ[b] += ρ[c] * (dot(part.image, MA) / rootθ[b] - traces[part.z])
-            slope_ρ[c] -= θ[b] * traces[part.z]
+    if !isempty(s.columns)
+        A = _stacked_images(s, rootθ, ones(T, length(ρ)))
+        MA = _split_mul(M, A)
+        for (c, images) in enumerate(s.images)
+            cols = s.columns[c]
+            MAc = view(MA, :, cols)
+            slope_ρ[c] = dot(view(A, :, cols), MAc)
+            for part in images
+                b = part.block
+                slope_θ[b] += ρ[c] * (dot(part.image, MAc) / rootθ[b] - traces[part.z])
+                slope_ρ[c] -= θ[b] * traces[part.z]
+            end
         end
     end
     for b in 1:g

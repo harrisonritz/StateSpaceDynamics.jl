@@ -17,6 +17,7 @@ using StatsAPI: StatsAPI
 import StatsAPI: loglikelihood, fit!, nobs, nullloglikelihood, r2
 
 using OhMyThreads: tforeach, tmapreduce
+using PrecompileTools: @setup_workload, @compile_workload
 using Base.Iterators: partition
 using Base: show
 
@@ -153,5 +154,7 @@ export rand, smooth, fit!, loglikelihood, elbo, elbo!, trial_elbos
 
 export AffineNullModel
 export r2, nobs, nullloglikelihood
+
+include("precompile.jl")
 
 end

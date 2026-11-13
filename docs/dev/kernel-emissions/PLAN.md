@@ -228,3 +228,20 @@ M5 depends only on the `AbstractKernelStructure` interface in
   ±10 as dynameg's bounded L-BFGS-B does, and scores a zero pivot `Inf`.
   Tutorial `docs/examples/KernelPriorLDS.jl` added: every model of
   `constrained_fit.ipynb` as SSD.jl calls, on a synthetic parcellation.
+- 2026-11-12: speed, measured on the audvis `sc_npg-joint-pooled` fit (r = 75,
+  1516 weights, k = 8, 20 iterations; dynameg 54 s). SSD took 74.5 s warm
+  (89 s cold): ~99% in the weights' fit, not the smoother. Causes: no relative
+  stopping rule (about 5× dynameg's evaluations), value and gradient computed
+  separately at each line-search point, a call per kernel in `Σ_sc` (half of it
+  Julia's symmetry checks), one-thread OpenBLAS for the Laplace `X'X` and
+  inverse (the adapter pins BLAS to one thread). Now 13.2 s warm, 30.7 s cold
+  with 8 Julia threads (26.9 s warm on one); held-out score unchanged.
+- 2026-11-12: precompile workload (`src/precompile.jl`): a cold worker fit is
+  17-18 s (was 30.7 s), 23 s wall. About 1 s of SSD compilation is left; the
+  adapter's own `main` (`dynameg/validate/constrained_ssd.jl`) compiles for
+  about 3 s. SSD's own precompile takes about 22 s.
+- 2026-11-12: two fixes found running dynameg's notebooks on SSD. `Zstack` was
+  built by `reduce(hcat, generator)`, which copies pairwise: 21 GB of garbage
+  and a 4 GB peak per process on audvis (now 1.9 GB; `KernelPrior.U` had the
+  same pattern). `ScaleCorrelation(...; families=[])` failed on the
+  `Vector{Any}` an empty list makes; any vector of families is now accepted.

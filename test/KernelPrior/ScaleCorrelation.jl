@@ -49,7 +49,7 @@ function sc_problem(rng; r=5)
     G = randn(rng, r, n)
     v = 0.5 .+ rand(rng, n)
     block = [1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1, 3]
-    factor(cols, m) = (F = zeros(n, m); F[cols, :] .= randn(rng, length(cols), m); F)
+    factor(cols, m) = (F=zeros(n, m); F[cols, :].=randn(rng, length(cols), m); F)
     coarse = [factor(1:6, 1), factor(7:12, 1)]
     fine = [factor(1:3, 2), factor(4:6, 2), factor(7:9, 2), factor(13:14, 1)]
     finer = [factor(1:3, 3), factor(7:9, 3)]
@@ -223,7 +223,61 @@ end
     @test SCSSD._kernel_information(prior, w) ≈ expected rtol = 1e-8
 end
 
+@testset "scale-correlation: calls split over threads" begin
+    # With BLAS on one thread and Julia on several, the covariance, gradient,
+    # information and Laplace covariance split their BLAS calls over Julia's
+    # threads. A lowered split size makes this small problem split too; the
+    # results must match the unsplit ones. (Without threads both paths are one.)
+    rng = MersenneTwister(31)
+    p = sc_problem(rng)
+    prior = KernelPrior(
+        [Kernel(randn(rng, 5, 5); name="noise", factor=true)]; structure=p.sc
+    )
+    w = 0.5 .* randn(rng, 12)
+    X = randn(rng, 5, 30)
+    S = X * X' / 30
+    μ, Λ = zeros(12), Matrix(2.0I, 12, 12)
+    function results()
+        grad = zeros(12)
+        value = SCSSD._kernel_objective!(grad, prior, w, S, 7.0, μ, Λ)
+        info = SCSSD._kernel_information(prior, w)
+        F = cholesky(Symmetric(7 .* info .+ Λ))
+        return (;
+            Σ=kernel_covariance(prior, w),
+            value,
+            grad,
+            info,
+            inverse=SCSSD._cholesky_inverse(F),
+        )
+    end
+    blas, least = BLAS.get_num_threads(), SCSSD._SPLIT_LEAST[]
+    try
+        BLAS.set_num_threads(max(blas, 2))
+        whole = results()
+        BLAS.set_num_threads(1)
+        SCSSD._SPLIT_LEAST[] = 1
+        @test SCSSD._split_blas() == (Threads.nthreads() > 1)
+        split = results()
+        for key in keys(whole)
+            @test split[key] ≈ whole[key] rtol = 1e-10
+        end
+        @test split.inverse ≈ inv(cholesky(Symmetric(7 .* whole.info .+ Λ))) rtol = 1e-10
+    finally
+        BLAS.set_num_threads(blas)
+        SCSSD._SPLIT_LEAST[] = least
+    end
+end
+
 @testset "scale-correlation: checks" begin
+    # an untyped empty vector (`families=[]`, or one built from an empty list)
+    # is no family
+    let rng = MersenneTwister(5), G = randn(rng, 3, 4)
+        sc = ScaleCorrelation(G, ones(4), [1, 1, 2, 2]; names=["a", "b"], families=[])
+        @test isempty(sc.families) && length(SCSSD._structure_labels(sc)) == 2
+        @test_throws ArgumentError ScaleCorrelation(
+            G, ones(4), [1, 1, 2, 2]; names=["a", "b"], families=Any[1]
+        )
+    end
     rng = MersenneTwister(13)
     r, n = 4, 8
     G = randn(rng, r, n)

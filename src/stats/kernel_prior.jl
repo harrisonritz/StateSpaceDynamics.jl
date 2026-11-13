@@ -283,7 +283,7 @@ function KernelPrior(
     widths = [size(k.factor, 2) for k in kernels]
     stops = cumsum(widths)
     cols = [(stop - width + 1):stop for (stop, width) in zip(stops, widths)]
-    U = isempty(kernels) ? zeros(T, r, 0) : reduce(hcat, (k.factor for k in kernels))
+    U = isempty(kernels) ? zeros(T, r, 0) : reduce(hcat, [k.factor for k in kernels])
     owner = reduce(vcat, (fill(g, w) for (g, w) in enumerate(widths)); init=Int[])
     nw = length(labels)
     w = fill(T(NaN), nw)
@@ -529,14 +529,55 @@ function _kernel_information(prior::KernelPrior{T}, w::AbstractVector{T}) where 
     s = prior.structure
     s === nothing ||
         _derivatives!(view(D, :, :, (ng + 1):nw), s, _structure_weights(prior, w))
-    X = Matrix{T}(undef, r * r, nw)
-    L = F.L
-    for i in 1:nw
-        whitened = L \ view(D, :, :, i) / L'
-        X[:, i] .= vec(whitened)
+    # L⁻¹ ∂Σ L⁻ᵀ for every weight at once: two triangular solves on the
+    # derivatives side by side, with a transpose of each block between them
+    # (the derivatives are symmetric).
+    L = LowerTriangular(F.L)
+    _split_ldiv!(L, reshape(D, r, r * nw))
+    X = permutedims(D, (2, 1, 3))
+    _split_ldiv!(L, reshape(X, r, r * nw))
+    return _gram(reshape(X, r * r, nw)) ./ 2
+end
+
+# `(L L')⁻¹ = L⁻ᵀ L⁻¹` from a Cholesky factorization, as a triangular solve and a
+# Gram product, which `_split_ldiv!` and `_gram` spread over Julia's threads
+# when BLAS runs on one (LAPACK's `potri` would run on one core).
+function _cholesky_inverse(F::Cholesky{T}) where {T<:Real}
+    _split_blas() || return Matrix(Symmetric(inv(F)))
+    Linv = _split_ldiv!(LowerTriangular(F.L), Matrix{T}(I, size(F)...))
+    return _gram(Linv)
+end
+
+# `L \ B` in place, by blocks of columns of `B` when split (see `_split_blas`).
+function _split_ldiv!(L::LowerTriangular, B::AbstractMatrix)
+    _split_blas() || return ldiv!(L, B)
+    tforeach(part -> ldiv!(L, view(B, :, part)), _chunks(size(B, 2)))
+    return B
+end
+
+#= `X'X`. With BLAS on one thread and Julia on several, the blocks of the
+product are spread over Julia's threads (each a single-threaded BLAS call);
+otherwise it is one `syrk`, threaded by BLAS itself if at all. =#
+function _gram(X::AbstractMatrix{T}) where {T<:Real}
+    n = size(X, 2)
+    tasks = Threads.nthreads()
+    if !_split_blas() || n < min(64, _SPLIT_LEAST[])
+        return Matrix(Symmetric(BLAS.syrk('U', 'T', one(T), X), :U))
     end
-    info = X' * X
-    return (info .+ info') ./ 4
+    q = ceil(Int, sqrt(4 * tasks))
+    edges = round.(Int, range(0, n; length=q + 1))
+    blocks = [(edges[i] + 1):edges[i + 1] for i in 1:q]
+    pairs = [(i, j) for j in 1:q for i in 1:j]
+    G = zeros(T, n, n)
+    tforeach(pairs) do (i, j)
+        bi, bj = blocks[i], blocks[j]
+        if i == j
+            G[bi, bi] .= BLAS.syrk('U', 'T', one(T), view(X, :, bi))
+        else
+            mul!(view(G, bi, bj), view(X, :, bi)', view(X, :, bj))
+        end
+    end
+    return Matrix(Symmetric(G, :U))
 end
 
 # The prior's Gaussian on the weights, from its trees.
@@ -561,11 +602,13 @@ function _check_moment(prior::KernelPrior{T}, S::AbstractMatrix, n::Real) where 
 end
 
 """
-    _kernel_map!(prior, S, n, μ, Λ; max_iter, g_tol) -> (value, converged)
+    _kernel_map!(prior, S, n, μ, Λ; max_iter, g_tol, f_reltol) -> (value, converged)
 
 Move `prior.weights` to the MAP given the Gaussian prior `(μ, Λ)`, by L-BFGS
-from the current weights. The weights are left alone if the search does not
-improve on them.
+from the current weights. It stops at a gradient below `g_tol`, or once a step
+lowers the objective by less than `f_reltol` of its value (scipy's `ftol`, as
+dynameg's fit uses). The weights are left alone if the search does not improve
+on them.
 """
 function _kernel_map!(
     prior::KernelPrior{T},
@@ -575,6 +618,7 @@ function _kernel_map!(
     Λ::Matrix{T};
     max_iter::Int,
     g_tol::Real,
+    f_reltol::Real,
 ) where {T<:Real}
     w0 = copy(prior.weights)
     start = _kernel_objective!(nothing, prior, w0, S, n, μ, Λ)
@@ -583,11 +627,15 @@ function _kernel_map!(
             "the kernels' covariance is not positive definite at the current weights"
         ),
     )
+    # The value and gradient share Σ, its factor and inverse: `fg!` computes
+    # them together, so that a line search does not form them twice per point.
     f = w -> _kernel_objective!(nothing, prior, w, S, n, μ, Λ)
     g! = (G, w) -> (_kernel_objective!(G, prior, w, S, n, μ, Λ); G)
-    options = Optim.Options(; iterations=max_iter, g_tol=g_tol)
+    fg! = (G, w) -> _kernel_objective!(G, prior, w, S, n, μ, Λ)
+    objective = Optim.OnceDifferentiable(f, g!, fg!, w0)
+    options = Optim.Options(; iterations=max_iter, g_tol=g_tol, f_reltol=f_reltol)
     result = try
-        optimize(f, g!, w0, LBFGS(; linesearch=HagerZhang()), options)
+        optimize(objective, w0, LBFGS(; linesearch=HagerZhang()), options)
     catch err
         err isa LineSearchException || rethrow()
         nothing
@@ -604,7 +652,7 @@ end
 function _kernel_laplace!(prior::KernelPrior{T}, n::T, Λ::Matrix{T}) where {T<:Real}
     curvature = n .* _kernel_information(prior, prior.weights) .+ Λ
     F = cholesky(Symmetric(curvature); check=false)
-    prior.weights_cov = issuccess(F) ? Matrix(Symmetric(inv(F))) : pinv(curvature)
+    prior.weights_cov = issuccess(F) ? _cholesky_inverse(F) : pinv(curvature)
     return prior.weights_cov
 end
 
@@ -612,12 +660,13 @@ _has_fitted_trees(prior::KernelPrior) = any(tree -> tree.levels > 0, prior.trees
 
 """
     fit_kernel_weights!(prior, S, n; max_iter=200, rounds=1, update_trees=true,
-                        laplace=true, g_tol=1e-6, tree_tol=1e-4)
+                        laplace=true, g_tol=1e-6, f_reltol=1e-8, tree_tol=1e-4)
 
 Fit a [`KernelPrior`](@ref)'s weights to the second moment `S` (`r × r`) of
 `n` draws from `N(0, Σ)`, by variational Laplace: the weights are moved to
 their MAP given the hyperprior (at most `max_iter` L-BFGS steps from the
-current ones), their Laplace covariance is computed, and the trees of the
+current ones, stopping at a gradient below `g_tol` or a relative decrease below
+`f_reltol`), their Laplace covariance is computed, and the trees of the
 `:hierarchical` and `:nested` types are updated from it. That is one round;
 `rounds` is the most to run, stopping once the trees move by less than
 `tree_tol`.
@@ -639,6 +688,7 @@ function fit_kernel_weights!(
     update_trees::Bool=true,
     laplace::Bool=true,
     g_tol::Real=1e-6,
+    f_reltol::Real=1e-8,
     tree_tol::Real=1e-4,
 ) where {T<:Real}
     S = _check_moment(prior, S, n)
@@ -651,7 +701,7 @@ function fit_kernel_weights!(
     for round in 1:max(rounds, 1)
         done = round
         _weight_prior!(μ, Λ, prior.trees)
-        value, found = _kernel_map!(prior, S, T(n), μ, Λ; max_iter, g_tol)
+        value, found = _kernel_map!(prior, S, T(n), μ, Λ; max_iter, g_tol, f_reltol)
         (laplace || update_trees) && _kernel_laplace!(prior, T(n), Λ)
         if !update_trees
             converged = found
@@ -727,7 +777,7 @@ function kernel_weights(prior::KernelPrior{T}) where {T<:Real}
         (values[(ng + 1):end] .= _structure_values(s, _structure_weights(prior, w)))
     return map(enumerate(prior.labels)) do (i, label)
         variance = prior.weights_cov[i, i]
-        (;
+        return (;
             name=label.name,
             type=label.type,
             group=label.group,
