@@ -49,7 +49,7 @@ function sc_problem(rng; r=5)
     G = randn(rng, r, n)
     v = 0.5 .+ rand(rng, n)
     block = [1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1, 3]
-    factor(cols, m) = (F=zeros(n, m); F[cols, :].=randn(rng, length(cols), m); F)
+    factor(cols, m) = (F = zeros(n, m); F[cols, :] .= randn(rng, length(cols), m); F)
     coarse = [factor(1:6, 1), factor(7:12, 1)]
     fine = [factor(1:3, 2), factor(4:6, 2), factor(7:9, 2), factor(13:14, 1)]
     finer = [factor(1:3, 3), factor(7:9, 3)]

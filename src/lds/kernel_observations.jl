@@ -315,8 +315,12 @@ function _update_loading!(lds::_StructuredLDS{T}, suf::SufficientStatistics{T}) 
     A1, weighted = _basis_precision(om)
     rhs = weighted * Sxy_c'                                       # Φ'R⁻¹Syx_c
     prior = om.prior
+    kq, ka = _projected_q_prior(lds), _projected_a_prior(lds)
     if prior === nothing
         H = (Symmetric(A1) \ rhs) / Symmetric(Sxx_c)
+        if kq !== nothing || ka !== nothing
+            H = _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c)
+        end
     else
         q = _loading_posterior(kernel_covariance(prior), A1, rhs, Sxx_c, Sxx)
         om.posterior = q
@@ -328,7 +332,151 @@ function _update_loading!(lds::_StructuredLDS{T}, suf::SufficientStatistics{T}) 
     V = (transpose(suf.obs_xy[rest, :]) .- om.C * G[1:k, rest]) / Symmetric(G[rest, rest])
     copyto!(om.d, view(V, :, 1))
     lds.uy_dim > 0 && copyto!(om.D, view(V, :, 2:(1 + lds.uy_dim)))
+    kq === nothing || _set_loading!(kq, H)
+    ka === nothing || (ka.loading = Matrix{T}(H))
     return nothing
+end
+
+# ----------------------------------------------------------------------------
+# A kernel prior on Q seen through the learned loading
+# ----------------------------------------------------------------------------
+
+function _projected_q_prior(lds::_StructuredLDS)
+    prior = lds.state_model.Q_prior
+    return prior isa KernelIWPrior && _is_projected(prior) ? prior : nothing
+end
+
+function _projected_a_prior(lds::_StructuredLDS)
+    prior = lds.state_model.A_prior
+    ok = prior isa KernelMNPrior && !isempty(prior.loading) && prior.posterior !== nothing
+    return ok ? prior : nothing
+end
+
+"""
+    _projected_dynamics_term(H, ka, FU, FV) -> (g, ∂g/∂H)
+
+The part of `E_q[log p(A | U, V, m)]` that involves the loading `H`, with the
+row covariance `U` and the column covariance `V` the kernels' (`FU'FU`, `FV'FV`)
+projected through `H` (by the prior's projection and the sandwich):
+`g = −k/2 (log|U| + log|V|) − ½ tr(U⁻¹ E[(A − mI) V⁻¹ (A − mI)'])`, and its
+gradient. `(-Inf, 0)` where either is not positive definite.
+"""
+function _projected_dynamics_term(
+    H::AbstractMatrix{T}, ka::KernelMNPrior{T}, FU::Cholesky{T}, FV::Cholesky{T}
+) where {T<:Real}
+    k = size(H, 2)
+    pu, pv = _Projection(ka.projection, H), _Projection(:sandwich, H)
+    U, _ = _project(FU, pu)
+    V, _ = _project(FV, pv)
+    FUk = cholesky(Symmetric(U); check=false)
+    FVk = cholesky(Symmetric(V); check=false)
+    (issuccess(FUk) && issuccess(FVk)) || return T(-Inf), zeros(T, size(H))
+    Ui, Vi = inv(FUk), inv(FVk)
+    qc = _mn_centred(ka)
+    SU = _loading_moment(qc, Vi)
+    SV = qc.mean' * Ui * qc.mean + _loading_excess(qc, Ui)
+    g = -k / 2 * (logdet(FUk) + logdet(FVk)) - dot(Ui, SU) / 2
+    sym(X) = (X .+ X') ./ 2
+    GU = sym(-k / 2 .* Ui .+ Ui * SU * Ui ./ 2)
+    GV = sym(-k / 2 .* Vi .+ Vi * SV * Vi ./ 2)
+    grad = _projection_gradient(pu, FU, U, GU) .+ _projection_gradient(pv, FV, V, GV)
+    return g, grad
+end
+
+"""
+    _projected_loading_term(H, Fz, P, ν, projection) -> (g, ∂g/∂H)
+
+The part of `E_q[log p(Q | w, H)]` that involves the loading `H` (`r × k`),
+`g = ν/2 log|K̃| − (ν − k − 1)/2 tr(K̃ P)` with `K̃` the kernels' covariance
+`Z = Fz'Fz` projected through `H` and `P = E[Q⁻¹]`, and its gradient.
+`(-Inf, 0)` where `K̃` is not positive definite.
+"""
+function _projected_loading_term(
+    H::AbstractMatrix{T}, Fz::Cholesky{T}, P::AbstractMatrix{T}, ν::T, projection::Symbol
+) where {T<:Real}
+    c = ν - size(H, 2) - 1
+    proj = _Projection(projection, H)
+    K̃, _ = _project(Fz, proj)
+    Fk = cholesky(Symmetric(K̃); check=false)
+    issuccess(Fk) || return T(-Inf), zeros(T, size(H))
+    g = ν / 2 * logdet(Fk) - c / 2 * dot(K̃, P)
+    G̃ = (ν / 2) .* inv(Fk) .- (c / 2) .* P               # ∂g/∂K̃
+    return g, _projection_gradient(proj, Fz, K̃, (G̃ .+ G̃') ./ 2)
+end
+
+"""
+    _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c) -> H
+
+With kernel priors on `Q` (`kq`) and/or `A` (`ka`) projected through the
+loading, the loading's part of the bound is `tr(H'rhs) − ½ tr(H'A1 H Sxx_c)`
+(`[d D]` profiled out, `R` held) plus those priors' terms in `H`. Starting from
+the better of the current loading and the closed-form `H` (the first term's
+maximiser), at most `loading_iters` (`kq`'s, else 20) L-BFGS steps on the sum;
+the result is never worse than the current loading, so the bound does not
+decrease.
+"""
+function _polish_loading(
+    lds::_StructuredLDS{T},
+    kq::Union{Nothing,KernelIWPrior{T}},
+    ka::Union{Nothing,KernelMNPrior{T}},
+    H_closed::AbstractMatrix{T},
+    A1::AbstractMatrix{T},
+    rhs::AbstractMatrix{T},
+    Sxx_c::AbstractMatrix{T},
+) where {T<:Real}
+    om = lds.obs_model
+    if kq !== nothing
+        Fz = cholesky(Symmetric(kernel_covariance(kq.prior)))
+        P = _symmetric_inverse(lds.state_model.Q)
+    end
+    if ka !== nothing
+        FU = cholesky(Symmetric(kernel_covariance(ka.rows)))
+        FV = cholesky(Symmetric(kernel_covariance(ka.cols)))
+    end
+    iters = kq === nothing ? 20 : kq.loading_iters
+    shape = size(H_closed)
+    function objective!(grad, h)
+        H = reshape(h, shape)
+        AHS = A1 * H * Sxx_c
+        value = dot(H, rhs) - dot(H, AHS) / 2
+        slope = rhs .- AHS
+        if kq !== nothing
+            g, ∂g = _projected_loading_term(H, Fz, P, kq.dof, kq.projection)
+            value += g
+            slope .+= ∂g
+        end
+        if ka !== nothing
+            g, ∂g = _projected_dynamics_term(H, ka, FU, FV)
+            value += g
+            slope .+= ∂g
+        end
+        grad === nothing || (grad .= .-vec(slope))
+        return isfinite(value) ? -value : T(Inf)
+    end
+    H_now = _loading_coefficients(om.basis, om.C)
+    candidates = (Matrix{T}(H_closed), Matrix{T}(H_now))
+    values = [objective!(nothing, vec(H)) for H in candidates]
+    best = argmin(values)
+    h0 = vec(copy(candidates[best]))
+    iters == 0 && return candidates[best]
+    f = h -> objective!(nothing, h)
+    g! = (G, h) -> (objective!(G, h); G)
+    fg! = (G, h) -> objective!(G, h)
+    result = try
+        optimize(
+            Optim.OnceDifferentiable(f, g!, fg!, h0),
+            h0,
+            LBFGS(; linesearch=HagerZhang()),
+            Optim.Options(; iterations=iters, g_tol=1e-8, f_reltol=1e-10),
+        )
+    catch err
+        err isa LineSearchException || rethrow()
+        nothing
+    end
+    result === nothing && return candidates[best]
+    h = Optim.minimizer(result)
+    (all(isfinite, h) && Optim.minimum(result) <= values[best]) || return candidates[best]
+    return reshape(h, shape)
 end
 
 """
@@ -433,7 +581,7 @@ function _obs_prior_logdensity(
     lds::LinearDynamicalSystem{T,S,O}, ::Union{Nothing,SmoothWorkspace{T}}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
     om = lds.obs_model
-    total = om.R_prior === nothing ? zero(T) : iw_logprior_term(om.R, om.R_prior)
+    total = om.R_prior === nothing ? zero(T) : _covariance_prior_term(om.R, om.R_prior)
     prior, q = om.prior, om.posterior
     if prior !== nothing && q !== nothing
         total += _loading_bound(q, kernel_covariance(prior)) + _kernel_logprior(prior)

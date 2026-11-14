@@ -866,6 +866,8 @@ using SSDTest
         include("KernelPrior/KernelPrior.jl")
         include("KernelPrior/KernelHierarchy.jl")
         include("KernelPrior/ScaleCorrelation.jl")
+        include("KernelPrior/KernelCovariancePrior.jl")
+        include("KernelPrior/KernelDynamicsPrior.jl")
     end
 
     @testset verbose = true "Priors" begin

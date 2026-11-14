@@ -377,6 +377,156 @@ plug-in score that compares with a `GaussianObservationModel` fit. They need a
 `GaussianStateModel`, and are not available in an `SLDS`, in a composite
 emission, or with `depends_on`.
 
+### Kernel priors on the noise covariances
+
+A [`KernelIWPrior`](@ref) puts the same kind of prior on `Q` or `R`: an
+inverse-Wishart whose mean is the covariance of a [`KernelPrior`](@ref),
+
+```math
+\Sigma \sim \mathcal{IW}\big(\nu, (\nu - d - 1) K(w)\big), \qquad
+\mathbb{E}[\Sigma] = K(w) = \sum_g e^{w_g} Z_g \;(+\text{structure}),
+```
+
+with the weights fitted alongside the model. The covariance becomes a latent
+variable: `fit!` keeps its variational posterior
+``q(\Sigma) = \mathcal{IW}(\nu + N, \Psi + S)`` (``S`` the expected residual
+scatter of the ``N`` transitions or bins), stores ``\mathbb{E}[\Sigma^{-1}]^{-1}``
+in the model so that the smoother sees the posterior precision, and moves the
+weights to their MAP given ``\mathbb{E}[\Sigma^{-1}]`` each iteration. `dof`
+(``\nu > d + 1``, by default ``d + 2``) sets how hard ``\Sigma`` is pulled to ``K(w)``. The trace is
+the variational bound; it never decreases while the hyperprior is held.
+
+The two are independent; use either or both.
+
+- **`R`** is in sensor space, so its kernels need no care about the latents:
+  for example the sensor image of a cortical covariance (an unmodelled brain
+  background) beside a nuisance kernel for the sensor noise. It works with any
+  Gaussian emission, including the kernel-prior ones above.
+- **`Q`** is anatomical only if its kernels are expressed in the latents'
+  coordinates, which any invertible change of coordinates would otherwise
+  scramble. Two ways:
+  - a **fixed basis**: hold `C = Φ` (`C_fixed=true`); the latents are the
+    basis's coordinates and `Q`'s kernels are given in them;
+  - a **learned loading** in a basis (a
+    [`ConstrainedGaussianObservationModel`](@ref), `C = Φ H` with `H` fitted):
+    `Q`'s kernels are given in the basis's coordinates (`r × r`) and projected
+    onto the latents through the current `H`. `projection=:noise_weighted`
+    (the default) uses `K̃ = (H'Z⁻¹H)⁻¹`, the covariance of the least-squares
+    latent image of noise distributed as `Z`; `projection=:euclidean` uses the
+    orthogonal projection `H⁺ Z H⁺'`. The projection moves with the latents,
+    so the fit needs no choice of coordinates. Because the prior now depends on
+    `H`, each iteration takes the closed-form `H` and then up to
+    `loading_iters` gradient steps on the bound with the prior's term in `H`,
+    never ending below the current loading.
+
+  A `Q` prior is refused with a kernel prior on the loading, and with a free
+  `C`.
+
+Together with the kernel prior on the loading, this gives a set of models that
+put the anatomy in different places, each with `H` (or `C`) estimated:
+
+| anatomy in | emission | `R_prior` | `Q_prior` |
+|---|---|---|---|
+| `R` | `ConstrainedGaussianObservationModel` | `KernelIWPrior` | — |
+| `Q` | `ConstrainedGaussianObservationModel` | — | `KernelIWPrior` (projected) |
+| `Q` and `R` | `ConstrainedGaussianObservationModel` | `KernelIWPrior` | `KernelIWPrior` (projected) |
+| `H` (and optionally `R`) | `ConstrainedKernelGaussianObservationModel` | optional | — |
+| `Q`, `R`, fixed basis | `GaussianObservationModel(; C=Φ, C_fixed=true)` | optional | `KernelIWPrior` |
+
+A projected `Q` is `k × k`, so its prior has only `k(k + 1)/2` numbers to learn
+its weights from: a few kernels, not a parcel-by-parcel structure.
+
+```julia
+# kernels in the basis's coordinates (r × r); Φ (p × r), the sources' gain L
+Z(K) = Φ' * L * K * L' * Φ
+Q_prior = KernelIWPrior(
+    KernelPrior([Kernel(Z(K_geo); name="geo", type=:cortex),
+                 Kernel(Matrix(1.0I, r, r); name="local", type=:nuisance)]),
+)                                            # dof = k + 2, noise-weighted projection
+R_prior = KernelIWPrior(
+    KernelPrior([Kernel(L * K_depth * L'; name="brain", type=:cortex),
+                 Kernel(N_sensor; name="sensor", type=:nuisance)]);
+    dof=2p,
+)
+state_model = GaussianStateModel(; A, Q, b, x0, P0, Q_prior)
+emission = ConstrainedGaussianObservationModel(; basis=Φ, H=H0, R, R_prior)
+lds = LinearDynamicalSystem(state_model, emission)
+fit!(lds, y)
+kernel_weights(Q_prior), kernel_weights(R_prior)
+
+# or a fixed basis: the latents are Φ's r coordinates, the kernels the same Z(K)
+fixed = GaussianObservationModel(; C=Φ, C_fixed=true, R, d, R_prior)
+```
+
+`C_fixed=true` holds `C` while `d` and `D` are fitted. With a fixed basis, the
+part of `d` inside the basis's span trades with the latents' mean (`b`,
+`x0`); only the rest is identified. A `KernelIWPrior` needs a
+`GaussianStateModel` and is not available in an `SLDS`, in a composite
+emission, with `depends_on`, with the `gauge_*` options of `fit!` (on `Q`), or
+with `R_diagonal` (on `R`).
+
+### A kernel prior on the transitions
+
+A [`KernelMNPrior`](@ref) puts a matrix-normal prior on `A` whose row and column
+covariances are kernel covariances:
+
+```math
+A \sim \mathcal{MN}(m I, U, V), \qquad
+\operatorname{Cov}(A_{ij}, A_{kl}) = U_{ik} V_{jl}, \qquad
+\operatorname{Var}(A_{ij}) = U_{ii} V_{jj}.
+```
+
+Row ``i`` of `A` receives and column ``j`` sends, so `U` is a **receiver**
+kernel and `V` a **sender** one: with a scale weight per region, the spread of a
+coupling factors into the receiver's gain times the sender's, and the fitted
+weights are receiver and sender profiles. It expresses separable structure only
+("`j` is a strong sender", not "`j` drives `i`"), and one overall scale moves
+freely between `U` and `V`, so the profiles are relative.
+
+`A` becomes a latent variable with a Gaussian posterior ``q(A)``, exact given
+``\mathbb{E}[Q^{-1}]`` and the point `b`, `B` (the same two-Kronecker solve as
+the loading's). The smoother sees ``\mathbb{E}[A^\top Q^{-1} A]``, `Q`'s update
+includes `A`'s uncertainty, and each iteration fits `m` and the weights of `U`
+and `V` in turn. [`dynamics_posterior`](@ref) returns ``q(A)``;
+`kernel_weights(prior)` the receiver (`rows`) and sender (`cols`) weights.
+
+The kernels are a source-space transition seen in the latents' coordinates:
+with ``J`` the map from latents to sources, ``U = J^{+} K_{\text{recv}} J^{+\top}``
+and ``V = J^\top K_{\text{send}} J``. So the `rows` kernels are covariance-type
+(``G K G^\top``, ``G = \Phi^\top L``, as for `Q`) and the `cols` kernels
+reconstruction-type (``G^{+\top} K G^{+}``, with ``G^{+}`` a source estimate's
+operator). With a fixed basis they are given in the latents' coordinates; with
+a learned loading in the basis's, and projected through `H` (the rows as `Q`'s
+are, the columns by ``H^\top Z H``), with the loading's polish taking the
+prior's term too.
+
+```julia
+A_prior = KernelMNPrior(
+    KernelPrior([Kernel(Z_recv(K); name=n, type=:receiver) for (n, K) in regions]),
+    KernelPrior([Kernel(Z_send(K); name=n, type=:sender) for (n, K) in regions]),
+)
+state_model = GaussianStateModel(; A, Q, b, x0, P0, A_prior, Q_prior)
+lds = LinearDynamicalSystem(state_model,
+                            ConstrainedGaussianObservationModel(; basis=Φ, H=H0, R, R_prior))
+fit!(lds, y)
+kernel_weights(A_prior).cols      # the sender profile
+```
+
+Which priors combine, with `H` (or `C`) estimated in every case:
+
+| | fixed basis (`C_fixed`) | learned loading, no `H` prior | `H` prior |
+|---|---|---|---|
+| `R` | ✓ | ✓ | ✓ |
+| `Q` | ✓ | ✓ (projected) | — |
+| `A` | ✓ | ✓ (projected) | — |
+| `A` + `R`, `A` + `Q`, `A` + `Q` + `R` | ✓ | ✓ | — |
+
+An `A` prior is refused with an `AB_prior` (two priors on `A`), a kernel prior
+on the loading, a free `C`, the `gauge_*` options, `depends_on`, an `SLDS` and a
+composite emission. `loglikelihood` is the plug-in one at the mean `A`, and
+these fits use the per-trial mean pass (the batched one has no term for `A`'s
+uncertainty).
+
 ## Several observation models at once
 
 One latent process can be measured in more than one way — spike counts *and*

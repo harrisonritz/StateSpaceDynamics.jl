@@ -1388,6 +1388,7 @@ function elbo(
     _td_init_const_blocks!(sws_pool[1], lds, data)
 
     estep!(lds, suf, tfs, data, sws_pool)
+    _start_covariance_priors!(lds, suf; fit=false)
 
     total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
     return elbo!(lds, suf, sws_pool[1], total_entropy)
@@ -1793,6 +1794,8 @@ function _fit_tridiag!(
 
         # E-step: smooth + aggregate sufficient statistics
         estep!(lds, suf, tfs, data, sws_pool)
+        # kernel priors on Q, R: their posteriors start from the first E-step's counts
+        iter == 1 && _start_covariance_priors!(lds, suf)
 
         # compute the ELBO
         total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))

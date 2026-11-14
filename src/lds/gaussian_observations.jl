@@ -163,6 +163,7 @@ function update_C_d!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
     lds.fit_bool[5] || return nothing
+    lds.obs_model.C_fixed && return _update_d_D_given_C!(lds, suf)
     D = lds.latent_dim
     uy_dim = lds.uy_dim
     CD_prior = lds.obs_model.CD_prior
@@ -194,6 +195,27 @@ function update_C_d!(
         V = mn_map(suf.obs_xx[], suf.obs_xy, CD_prior)
     end
 
+    _unpack_obs_V!(lds, V)
+    return nothing
+end
+
+#= With `C_fixed`: `[d D]` by least squares of `y − C x` on `[1; uy]`, from the
+same moments (`[x; 1; uy]` against `y`), `C` held. `d` stays zero under
+`d_fixed_zero`. =#
+function _update_d_D_given_C!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+    D = lds.latent_dim
+    XX, XY = suf.obs_xx[].mat, suf.obs_xy
+    width = size(XX, 1)
+    first_free = lds.obs_model.d_fixed_zero ? D + 2 : D + 1
+    first_free > width && return nothing
+    free = first_free:width
+    C = lds.obs_model.C
+    target = XY[free, :] .- XX[free, 1:D] * C'
+    V = zeros(T, lds.obs_dim, width)
+    _pack_obs_V!(V, lds)
+    V[:, free] .= (Symmetric(Matrix(XX[free, free])) \ target)'
     _unpack_obs_V!(lds, V)
     return nothing
 end
@@ -334,7 +356,8 @@ end
     _finalize_R!(lds, S_res, N)
 
 Symmetrize an accumulated emission residual scatter and turn it into `R`:
-`S_res / N`, or the IW MAP under an `R_prior`.
+`S_res / N`, the IW MAP under an `IWPrior`, or `E[R⁻¹]⁻¹` of the variational
+posterior under a [`KernelIWPrior`](@ref) (which also moves its weights).
 
 `N` is the effective count: bins plus the width of every distinct `CD_prior`
 folded into `S_res` ([`_cd_prior_width`](@ref)).
@@ -347,11 +370,15 @@ function _finalize_R!(
         S_res[j, i] = S_res[i, j]
     end
 
-    if lds.obs_model.R_prior === nothing
+    R_prior = lds.obs_model.R_prior
+    if R_prior === nothing
         S_res ./= N
+    elseif R_prior isa KernelIWPrior
+        # q(R) = IW(ν + N, Ψ + S); the model holds E[R⁻¹]⁻¹, then the weights move
+        _kernel_iw_posterior!(lds.obs_model.R, R_prior, S_res, N)
+        return nothing
     else
-        Ψ, ν = lds.obs_model.R_prior.Ψ, lds.obs_model.R_prior.ν
-        S_res .= iw_map(Ψ, ν, S_res, N, p)
+        S_res .= iw_map(R_prior.Ψ, R_prior.ν, S_res, N, p)
     end
     #= A diagonal R's M-step is the diagonal of the unconstrained one: the
     Gaussian objective in R separates over channels once the off-diagonals are
@@ -396,7 +423,7 @@ function _obs_prior_logdensity(
     om = lds.obs_model
     total = zero(T)
 
-    om.R_prior === nothing || (total += iw_logprior_term(om.R, om.R_prior))
+    om.R_prior === nothing || (total += _covariance_prior_term(om.R, om.R_prior))
     if om.CD_prior !== nothing
         W_cd = _obs_pack_scratch(lds, sws)
         _pack_obs_V!(W_cd, lds)

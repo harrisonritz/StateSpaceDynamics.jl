@@ -501,6 +501,7 @@ function validate_LDS(lds::LinearDynamicalSystem{T,S,O}) where {T,S,O}
     =#
     _resolve_dependence(lds.state_model)
     _resolve_dependence(lds.obs_model)
+    _validate_covariance_priors(lds)
 
     #=
     Check fit_bool length: four state groups, then one block per observation
@@ -586,6 +587,11 @@ positional `LinearDynamicalSystem` constructor already runs, so it is not
 repeated per call.
 """
 function _validate_slds_structure(slds::SLDS)
+    any(_uses_kernel_noise_or_fixed_loading, slds.LDSs) && throw(
+        ArgumentError(
+            "kernel priors on Q, R or A, and C_fixed, are not available in a switching LDS",
+        ),
+    )
     any(lds -> lds.obs_model isa StructuredGaussianObservationModel, slds.LDSs) && throw(
         ArgumentError(
             "a constrained or kernel-prior emission is not available in a switching LDS"
@@ -968,3 +974,151 @@ end
 
 # The public `Data(lds, y; ux, uy)` constructors that consume the multitrial
 # normalization helpers above live next to the `Data` struct in `lds/types.jl`.
+
+# A kernel inverse-Wishart prior on Q or R, or a held loading, anywhere in `lds`.
+function _uses_kernel_noise_or_fixed_loading(lds::LinearDynamicalSystem)
+    sm, om = lds.state_model, lds.obs_model
+    hasproperty(sm, :Q_prior) && sm.Q_prior isa KernelIWPrior && return true
+    hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior && return true
+    members = om isa CompositeObservationModel ? values(_models(om)) : (om,)
+    for m in members
+        hasproperty(m, :R_prior) && m.R_prior isa KernelIWPrior && return true
+        m isa GaussianObservationModel && m.C_fixed && return true
+    end
+    return false
+end
+
+"""
+    _validate_covariance_priors(lds)
+
+The cases a [`KernelIWPrior`](@ref) on `Q` or `R`, a [`KernelMNPrior`](@ref) on
+`A` (not with an `AB_prior`), and `C_fixed` support: a
+`GaussianStateModel`, one (non-composite) Gaussian emission, no `depends_on`,
+dimensions that match, `dof` above the dimension plus one, and no `R_diagonal`
+(with a kernel `R` prior) or `CD_prior` (with `C_fixed`). A `Q` prior needs a
+fixed basis (kernels in the latents' coordinates) or a learned loading without a
+kernel prior (kernels in its basis's coordinates, projected through `H`); so
+does an `A` prior.
+"""
+function _validate_covariance_priors(lds::LinearDynamicalSystem)
+    _uses_kernel_noise_or_fixed_loading(lds) || return nothing
+    sm, om = lds.state_model, lds.obs_model
+    om isa CompositeObservationModel && throw(
+        ArgumentError(
+            "a KernelIWPrior on R, and C_fixed, are not available in a composite emission",
+        ),
+    )
+    sm isa GaussianStateModel || throw(
+        ArgumentError(
+            "a KernelIWPrior on Q or R, and C_fixed, need a GaussianStateModel; got a " *
+            "$(nameof(typeof(sm)))",
+        ),
+    )
+    if sm.Q_prior isa KernelIWPrior
+        sm.depends_on === nothing ||
+            throw(ArgumentError("a KernelIWPrior on Q is not available with depends_on"))
+        kernels = sm.Q_prior.prior.dim
+        if om isa StructuredGaussianObservationModel
+            # a learned loading: the kernels are in its basis's coordinates,
+            # projected onto the latents through H
+            om.prior === nothing || throw(
+                ArgumentError(
+                    "a KernelIWPrior on Q is not available with a kernel prior on the " *
+                    "loading; use a ConstrainedGaussianObservationModel (H learned, no " *
+                    "prior) or a fixed basis",
+                ),
+            )
+            kernels == _loading_dim(om) || throw(
+                DimensionMismatchError(
+                    "the Q_prior's kernels (in the loading's basis coordinates)",
+                    _loading_dim(om),
+                    kernels,
+                ),
+            )
+        elseif om isa GaussianObservationModel && om.C_fixed
+            kernels == lds.latent_dim || throw(
+                DimensionMismatchError("the Q_prior's kernels", lds.latent_dim, kernels)
+            )
+        else
+            throw(
+                ArgumentError(
+                    "a KernelIWPrior on Q needs latent coordinates its kernels can be " *
+                    "expressed in: a fixed basis (GaussianObservationModel(; C=Φ, " *
+                    "C_fixed=true)) or a learned loading in a basis " *
+                    "(ConstrainedGaussianObservationModel), through which it is projected",
+                ),
+            )
+        end
+        _check_dof(sm.Q_prior, lds.latent_dim, "Q")
+    end
+    if sm.A_prior isa KernelMNPrior
+        sm.AB_prior === nothing || throw(
+            ArgumentError(
+                "a KernelMNPrior on A and an AB_prior are two priors on A; drop the AB_prior",
+            ),
+        )
+        sm.depends_on === nothing ||
+            throw(ArgumentError("a KernelMNPrior on A is not available with depends_on"))
+        kernels = sm.A_prior.rows.dim
+        if om isa StructuredGaussianObservationModel
+            om.prior === nothing || throw(
+                ArgumentError(
+                    "a KernelMNPrior on A is not available with a kernel prior on the " *
+                    "loading; use a ConstrainedGaussianObservationModel (H learned, no " *
+                    "prior) or a fixed basis",
+                ),
+            )
+            kernels == _loading_dim(om) || throw(
+                DimensionMismatchError(
+                    "the A_prior's kernels (in the loading's basis coordinates)",
+                    _loading_dim(om),
+                    kernels,
+                ),
+            )
+        elseif om isa GaussianObservationModel && om.C_fixed
+            kernels == lds.latent_dim || throw(
+                DimensionMismatchError("the A_prior's kernels", lds.latent_dim, kernels)
+            )
+        else
+            throw(
+                ArgumentError(
+                    "a KernelMNPrior on A needs latent coordinates its kernels can be " *
+                    "expressed in: a fixed basis (GaussianObservationModel(; C=Φ, " *
+                    "C_fixed=true)) or a learned loading in a basis " *
+                    "(ConstrainedGaussianObservationModel), through which it is projected",
+                ),
+            )
+        end
+    end
+    if hasproperty(om, :R_prior) && om.R_prior isa KernelIWPrior
+        om.R_prior.prior.dim == lds.obs_dim || throw(
+            DimensionMismatchError(
+                "the R_prior's kernels", lds.obs_dim, om.R_prior.prior.dim
+            ),
+        )
+        _check_dof(om.R_prior, lds.obs_dim, "R")
+        om.R_diagonal &&
+            throw(ArgumentError("a KernelIWPrior on R needs a full R, not R_diagonal"))
+        om.depends_on === nothing ||
+            throw(ArgumentError("a KernelIWPrior on R is not available with depends_on"))
+    end
+    if om isa GaussianObservationModel && om.C_fixed
+        om.CD_prior === nothing ||
+            throw(ArgumentError("C_fixed is not available with a CD_prior"))
+        om.depends_on === nothing ||
+            throw(ArgumentError("C_fixed is not available with depends_on"))
+    end
+    return nothing
+end
+
+function _check_dof(prior::KernelIWPrior, d::Int, name::String)
+    isnan(prior.dof) ||
+        prior.dof > d + 1 ||
+        throw(
+            ArgumentError(
+                "the KernelIWPrior on $name needs dof > $(d + 1) (its dimension plus one), so " *
+                "that it has a mean; got $(prior.dof)",
+            ),
+        )
+    return nothing
+end

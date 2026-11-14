@@ -463,20 +463,167 @@ function _kernel_cholesky(prior::KernelPrior{T}, w::AbstractVector{T}) where {T<
     return issuccess(F) ? F : nothing
 end
 
+#= How a target sees the kernels' covariance `Z(w)` (`r × r`): as it is, or as
+a `k × k` matrix through a loading `H` (`r × k`):
+
+- `:identity`: `Z` itself;
+- `:noise_weighted`: `(H'Z⁻¹H)⁻¹`, the covariance of the least-squares (GLS)
+  latent image of noise with covariance `Z`;
+- `:euclidean`: `H⁺ Z H⁺'`, `H⁺ = (H'H)⁻¹H'`, its orthogonal projection;
+- `:sandwich`: `H'ZH`, how a matrix acting on the latents' images transforms
+  (the column covariance of a transition matrix).
+
+Each has `dK̃ = W dZ W'` (`W = K̃H'Z⁻¹`, `H⁺`, `H'`). Under `x → T x`,
+`H → H T⁻¹`, the first two take `K̃` to `T K̃ T'` and the sandwich to
+`T⁻ᵀ K̃ T⁻¹`, as the matrices they are priors for transform. =#
+struct _Projection{T<:Real}
+    kind::Symbol
+    H::Matrix{T}
+    pinv::Matrix{T}         # H⁺ for :euclidean and :sandwich, else empty
+end
+
+const _LOADING_PROJECTIONS = (:noise_weighted, :euclidean, :sandwich)
+
+function _identity_projection(::Type{T}) where {T<:Real}
+    return _Projection{T}(:identity, zeros(T, 0, 0), zeros(T, 0, 0))
+end
+
+function _Projection(kind::Symbol, H::AbstractMatrix{T}) where {T<:Real}
+    kind in _LOADING_PROJECTIONS || throw(
+        ArgumentError(
+            "a projection is :noise_weighted, :euclidean or :sandwich; got :$kind"
+        ),
+    )
+    Hm = Matrix{T}(H)
+    pinv = kind === :noise_weighted ? zeros(T, 0, 0) : Matrix((Hm' * Hm) \ Hm')
+    return _Projection{T}(kind, Hm, pinv)
+end
+
+_is_identity(p::_Projection) = p.kind === :identity
+
+# `K̃` and `W` from the factor `F` of `Z` (`W` is `nothing` for the identity).
+function _project(F::Cholesky{T}, p::_Projection{T}) where {T<:Real}
+    sym(X) = Matrix(Symmetric((X .+ X') ./ 2))
+    if p.kind === :identity
+        return sym(Matrix(F)), nothing
+    elseif p.kind === :euclidean
+        return sym(p.pinv * Matrix(F) * p.pinv'), p.pinv
+    elseif p.kind === :sandwich
+        return sym(p.H' * Matrix(F) * p.H), Matrix(p.H')
+    end
+    X = F.L \ p.H
+    K̃ = Matrix(Symmetric(inv(cholesky(Symmetric(X' * X)))))
+    return K̃, K̃ * (F \ p.H)'
+end
+
+# A matrix in `Z`'s coordinates whose projection is `M`, for the empirical
+# centres (its power is what matters).
+function _unproject(M::AbstractMatrix{T}, p::_Projection{T}) where {T<:Real}
+    _is_identity(p) && return Matrix{T}(M)
+    X = p.kind === :sandwich ? p.pinv' * M * p.pinv : p.H * M * p.H'
+    return Matrix(Symmetric((X .+ X') ./ 2))
+end
+
+#= `∂/∂H ⟨G̃, K̃(H)⟩` at fixed `Z` (`G̃` symmetric, `Fz` the factor of `Z`): how
+a scalar with `∂g/∂K̃ = G̃` changes with the loading. =#
+function _projection_gradient(
+    p::_Projection{T}, Fz::Cholesky{T}, K̃::AbstractMatrix{T}, G̃::AbstractMatrix{T}
+) where {T<:Real}
+    H = p.H
+    if p.kind === :euclidean
+        # K̃ = A Z A', A = (H'H)⁻¹H': dA = (H'H)⁻¹dH'(I − HA) − A dH A
+        A = p.pinv
+        outside = I - H * A
+        return 2 .* (outside * Matrix(Fz) * A' * G̃ / Symmetric(H' * H) .- A' * G̃ * K̃)
+    elseif p.kind === :sandwich
+        return 2 .* (Matrix(Fz) * H * G̃)
+    elseif p.kind === :noise_weighted
+        # K̃ = (H'Z⁻¹H)⁻¹: dK̃ = −K̃ (dH'Z⁻¹H + H'Z⁻¹dH) K̃
+        return -2 .* ((Fz \ H) * K̃ * G̃ * K̃)
+    end
+    throw(ArgumentError("the identity projection has no loading"))
+end
+
+#= What the weights are fitted to, each through a projection of `Z(w)`
+(`K̃ = Z` for the identity):
+
+- `_Draws(S, n[, proj])`: the second moment `S` of `n` draws from `N(0, K̃)`
+  (the loading of a kernel-prior emission; the rows or columns of a transition
+  matrix);
+- `_IWMean(P, ν[, proj])`: a covariance with the prior `IW(ν, (ν − d − 1) K̃)`,
+  whose mean is `K̃`, seen through `P = E[Σ⁻¹]` under its variational posterior
+  (a `KernelIWPrior` on `Q` or `R`).
+
+`_target_terms` gives, for `F` the Cholesky factor of `Z(w)`, the part of the
+objective (minus the log density) that involves `w` and the symmetric `G` with
+`∂value/∂w_i = tr(G ∂_iZ)`. `_information_scale` is the multiple of the
+per-draw Fisher information of `K̃` the target carries (`n`; `ν` for the
+Wishart, whose expected curvature is that of `ν` draws). `_target_moment` is
+the matrix whose power resolves the prior's empirical centres. =#
+struct _Draws{T<:Real}
+    S::Matrix{T}
+    n::T
+    proj::_Projection{T}
+end
+_Draws(S::Matrix{T}, n::T) where {T<:Real} = _Draws{T}(S, n, _identity_projection(T))
+
+struct _IWMean{T<:Real}
+    P::Matrix{T}
+    ν::T
+    proj::_Projection{T}
+end
+_IWMean(P::Matrix{T}, ν::T) where {T<:Real} = _IWMean{T}(P, ν, _identity_projection(T))
+
+const _KernelTarget{T} = Union{_Draws{T},_IWMean{T}}
+
+# value and ∂value/∂K̃ of each target, from K̃'s factor
+function _value_and_slope(Fk::Cholesky{T}, K̃, target::_Draws{T}) where {T<:Real}
+    Ki = inv(Fk)
+    KiS = Ki * target.S
+    G̃ = Ki .- KiS * Ki
+    return target.n / 2 * (logdet(Fk) + tr(KiS)), (target.n / 4) .* (G̃ .+ G̃')
+end
+
+function _value_and_slope(Fk::Cholesky{T}, K̃, target::_IWMean{T}) where {T<:Real}
+    ν, c = target.ν, target.ν - size(Fk, 1) - 1
+    G̃ = (c / 2) .* target.P .- (ν / 2) .* inv(Fk)
+    return -ν / 2 * logdet(Fk) + c / 2 * dot(K̃, target.P), (G̃ .+ G̃') ./ 2
+end
+
+function _target_terms(F::Cholesky{T}, target::_KernelTarget{T}) where {T<:Real}
+    if _is_identity(target.proj)
+        # the draws' terms need no `Z` itself; the Wishart's need it once
+        return _value_and_slope(F, target isa _IWMean ? Matrix(F) : nothing, target)
+    end
+    K̃, W = _project(F, target.proj)
+    Fk = cholesky(Symmetric(K̃); check=false)
+    issuccess(Fk) || return T(Inf), zeros(T, size(F))
+    value, G̃ = _value_and_slope(Fk, K̃, target)
+    G = W' * Symmetric(G̃) * W
+    return value, Matrix(Symmetric((G .+ G') ./ 2))
+end
+
+_information_scale(target::_Draws) = target.n
+_information_scale(target::_IWMean) = target.ν
+_target_moment(target::_Draws) = _unproject(target.S, target.proj)
+function _target_moment(target::_IWMean)
+    return _unproject(Matrix(Symmetric(inv(cholesky(Symmetric(target.P))))), target.proj)
+end
+
 """
+    _kernel_objective!(grad, prior, w, target, μ, Λ) -> T
     _kernel_objective!(grad, prior, w, S, n, μ, Λ) -> T
 
-`n/2 [log|Σ(w)| + tr(Σ(w)⁻¹S)] + ½ (w − μ)'Λ(w − μ)`, minus the log posterior
-of the weights up to a constant, and its gradient (skipped when `grad` is
-`nothing`). `Inf` where `Σ` is not positive definite, so that a line search
-backs off.
+Minus the log posterior of the weights up to a constant: the target's term
+(for `n` draws with second moment `S`, `n/2 [log|Σ(w)| + tr(Σ(w)⁻¹S)]`) plus
+`½ (w − μ)'Λ(w − μ)`, and its gradient (skipped when `grad` is `nothing`).
+`Inf` where `Σ` is not positive definite, so that a line search backs off.
 """
 function _kernel_objective!(
     grad::Union{Nothing,AbstractVector{T}},
     prior::KernelPrior{T},
     w::AbstractVector{T},
-    S::AbstractMatrix{T},
-    n::T,
+    target::_KernelTarget{T},
     μ::Vector{T},
     Λ::Matrix{T},
 ) where {T<:Real}
@@ -485,14 +632,11 @@ function _kernel_objective!(
         grad === nothing || fill!(grad, zero(T))
         return T(Inf)
     end
-    Σi = inv(F)
-    ΣiS = Σi * S
     resid = w .- μ
     Λr = Λ * resid
-    value = n / 2 * (logdet(F) + tr(ΣiS)) + dot(resid, Λr) / 2
+    term, G = _target_terms(F, target)
+    value = term + dot(resid, Λr) / 2
     grad === nothing && return value
-    G = Σi .- ΣiS * Σi
-    G .= (G .+ G') ./ 2
     fill!(grad, zero(T))
     if !isempty(prior.kernels)
         GU = G * prior.U
@@ -505,8 +649,20 @@ function _kernel_objective!(
         ng = length(prior.kernels)
         _add_gradient!(view(grad, (ng + 1):length(w)), s, _structure_weights(prior, w), G)
     end
-    grad .= (n / 2) .* grad .+ Λr
+    grad .+= Λr
     return value
+end
+
+function _kernel_objective!(
+    grad::Union{Nothing,AbstractVector{T}},
+    prior::KernelPrior{T},
+    w::AbstractVector{T},
+    S::AbstractMatrix{T},
+    n::T,
+    μ::Vector{T},
+    Λ::Matrix{T},
+) where {T<:Real}
+    return _kernel_objective!(grad, prior, w, _Draws(Matrix{T}(S), n), μ, Λ)
 end
 
 """
@@ -520,6 +676,20 @@ function _kernel_information(prior::KernelPrior{T}, w::AbstractVector{T}) where 
     F = _kernel_cholesky(prior, w)
     F === nothing &&
         throw(ArgumentError("the kernels' covariance is not positive definite"))
+    r, nw = prior.dim, length(w)
+    D = _kernel_derivatives(prior, w)
+    # L⁻¹ ∂Σ L⁻ᵀ for every weight at once: two triangular solves on the
+    # derivatives side by side, with a transpose of each block between them
+    # (the derivatives are symmetric).
+    L = LowerTriangular(F.L)
+    _split_ldiv!(L, reshape(D, r, r * nw))
+    X = permutedims(D, (2, 1, 3))
+    _split_ldiv!(L, reshape(X, r, r * nw))
+    return _gram(reshape(X, r * r, nw)) ./ 2
+end
+
+# `∂Σ/∂w_i` of every weight, `r × r × n_weights`.
+function _kernel_derivatives(prior::KernelPrior{T}, w::AbstractVector{T}) where {T<:Real}
     r, nw, ng = prior.dim, length(w), length(prior.kernels)
     D = zeros(T, r, r, nw)
     for (g, cols) in enumerate(prior.cols)
@@ -529,14 +699,32 @@ function _kernel_information(prior::KernelPrior{T}, w::AbstractVector{T}) where 
     s = prior.structure
     s === nothing ||
         _derivatives!(view(D, :, :, (ng + 1):nw), s, _structure_weights(prior, w))
-    # L⁻¹ ∂Σ L⁻ᵀ for every weight at once: two triangular solves on the
-    # derivatives side by side, with a transpose of each block between them
-    # (the derivatives are symmetric).
-    L = LowerTriangular(F.L)
-    _split_ldiv!(L, reshape(D, r, r * nw))
-    X = permutedims(D, (2, 1, 3))
-    _split_ldiv!(L, reshape(X, r, r * nw))
-    return _gram(reshape(X, r * r, nw)) ./ 2
+    return D
+end
+
+#= The Fisher information per draw of the weights of a projected `K̃`,
+`½ tr(K̃⁻¹ ∂_iK̃ K̃⁻¹ ∂_jK̃)` with `∂_iK̃ = W ∂_iZ W'`: each derivative is whitened
+by `B = L̃⁻¹W` (`k × r`), `L̃` the factor of `K̃`. =#
+function _projected_information(
+    prior::KernelPrior{T}, w::AbstractVector{T}, proj::_Projection{T}
+) where {T<:Real}
+    F = _kernel_cholesky(prior, w)
+    F === nothing &&
+        throw(ArgumentError("the kernels' covariance is not positive definite"))
+    K̃, W = _project(F, proj)
+    B = cholesky(Symmetric(K̃)).L \ W
+    r, nw, k = prior.dim, length(w), size(B, 1)
+    D = _kernel_derivatives(prior, w)
+    Y = B * reshape(D, r, r * nw)                      # blocks B ∂Z
+    Yt = permutedims(reshape(Y, k, r, nw), (2, 1, 3))  # blocks ∂Z B'
+    X = B * reshape(Yt, r, k * nw)                     # blocks B ∂Z B'
+    return _gram(reshape(X, k * k, nw)) ./ 2
+end
+
+function _target_information(prior, w, target::_KernelTarget)
+    scale = _information_scale(target)
+    _is_identity(target.proj) && return scale .* _kernel_information(prior, w)
+    return scale .* _projected_information(prior, w, target.proj)
 end
 
 # `(L L')⁻¹ = L⁻ᵀ L⁻¹` from a Cholesky factorization, as a triangular solve and a
@@ -602,7 +790,7 @@ function _check_moment(prior::KernelPrior{T}, S::AbstractMatrix, n::Real) where 
 end
 
 """
-    _kernel_map!(prior, S, n, μ, Λ; max_iter, g_tol, f_reltol) -> (value, converged)
+    _kernel_map!(prior, target, μ, Λ; max_iter, g_tol, f_reltol) -> (value, converged)
 
 Move `prior.weights` to the MAP given the Gaussian prior `(μ, Λ)`, by L-BFGS
 from the current weights. It stops at a gradient below `g_tol`, or once a step
@@ -612,8 +800,7 @@ on them.
 """
 function _kernel_map!(
     prior::KernelPrior{T},
-    S::Matrix{T},
-    n::T,
+    target::_KernelTarget{T},
     μ::Vector{T},
     Λ::Matrix{T};
     max_iter::Int,
@@ -621,7 +808,7 @@ function _kernel_map!(
     f_reltol::Real,
 ) where {T<:Real}
     w0 = copy(prior.weights)
-    start = _kernel_objective!(nothing, prior, w0, S, n, μ, Λ)
+    start = _kernel_objective!(nothing, prior, w0, target, μ, Λ)
     isfinite(start) || throw(
         ArgumentError(
             "the kernels' covariance is not positive definite at the current weights"
@@ -629,9 +816,9 @@ function _kernel_map!(
     )
     # The value and gradient share Σ, its factor and inverse: `fg!` computes
     # them together, so that a line search does not form them twice per point.
-    f = w -> _kernel_objective!(nothing, prior, w, S, n, μ, Λ)
-    g! = (G, w) -> (_kernel_objective!(G, prior, w, S, n, μ, Λ); G)
-    fg! = (G, w) -> _kernel_objective!(G, prior, w, S, n, μ, Λ)
+    f = w -> _kernel_objective!(nothing, prior, w, target, μ, Λ)
+    g! = (G, w) -> (_kernel_objective!(G, prior, w, target, μ, Λ); G)
+    fg! = (G, w) -> _kernel_objective!(G, prior, w, target, μ, Λ)
     objective = Optim.OnceDifferentiable(f, g!, fg!, w0)
     options = Optim.Options(; iterations=max_iter, g_tol=g_tol, f_reltol=f_reltol)
     result = try
@@ -648,9 +835,17 @@ function _kernel_map!(
     return value, Optim.converged(result)
 end
 
-# The Laplace covariance of the weights, (n I + Λ)⁻¹.
-function _kernel_laplace!(prior::KernelPrior{T}, n::T, Λ::Matrix{T}) where {T<:Real}
-    curvature = n .* _kernel_information(prior, prior.weights) .+ Λ
+function _kernel_map!(
+    prior::KernelPrior{T}, S::Matrix{T}, n::T, μ::Vector{T}, Λ::Matrix{T}; kwargs...
+) where {T<:Real}
+    return _kernel_map!(prior, _Draws(S, n), μ, Λ; kwargs...)
+end
+
+# The Laplace covariance of the weights, (n I + Λ)⁻¹ for `n` draws' information `n I`.
+function _kernel_laplace!(
+    prior::KernelPrior{T}, target::_KernelTarget{T}, Λ::Matrix{T}
+) where {T<:Real}
+    curvature = _target_information(prior, prior.weights, target) .+ Λ
     F = cholesky(Symmetric(curvature); check=false)
     prior.weights_cov = issuccess(F) ? _cholesky_inverse(F) : pinv(curvature)
     return prior.weights_cov
@@ -680,9 +875,16 @@ them. Returns `(; converged, objective, rounds)`: `objective` is
 they were fitted with.
 """
 function fit_kernel_weights!(
+    prior::KernelPrior{T}, S::AbstractMatrix{<:Real}, n::Real; kwargs...
+) where {T<:Real}
+    S = _check_moment(prior, S, n)
+    return _fit_kernel_weights!(prior, _Draws(S, T(n)); kwargs...)
+end
+
+# The rounds of `fit_kernel_weights!` for any target.
+function _fit_kernel_weights!(
     prior::KernelPrior{T},
-    S::AbstractMatrix{<:Real},
-    n::Real;
+    target::_KernelTarget{T};
     max_iter::Int=200,
     rounds::Int=1,
     update_trees::Bool=true,
@@ -691,9 +893,8 @@ function fit_kernel_weights!(
     f_reltol::Real=1e-8,
     tree_tol::Real=1e-4,
 ) where {T<:Real}
-    S = _check_moment(prior, S, n)
     max_iter >= 1 || throw(ArgumentError("max_iter must be at least 1"))
-    prior.initialized || _initialize_prior!(prior, S)
+    prior.initialized || _initialize_prior!(prior, _target_moment(target))
     update_trees = update_trees && _has_fitted_trees(prior)
     nw = length(prior.labels)
     μ, Λ = zeros(T, nw), zeros(T, nw, nw)
@@ -701,8 +902,8 @@ function fit_kernel_weights!(
     for round in 1:max(rounds, 1)
         done = round
         _weight_prior!(μ, Λ, prior.trees)
-        value, found = _kernel_map!(prior, S, T(n), μ, Λ; max_iter, g_tol, f_reltol)
-        (laplace || update_trees) && _kernel_laplace!(prior, T(n), Λ)
+        value, found = _kernel_map!(prior, target, μ, Λ; max_iter, g_tol, f_reltol)
+        (laplace || update_trees) && _kernel_laplace!(prior, target, Λ)
         if !update_trees
             converged = found
             break

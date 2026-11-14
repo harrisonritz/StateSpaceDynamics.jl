@@ -38,6 +38,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the kernel-prior fit's methods in the package image, so that a fresh Julia
   process does not compile them before its first fit.
 
+- **Kernel priors on the noise covariances: `KernelIWPrior`.** An
+  inverse-Wishart prior on `Q` (of a `GaussianStateModel`) or `R` (of a Gaussian
+  or kernel-prior emission) whose mean is a `KernelPrior`'s covariance, with the
+  weights fitted. The covariance becomes a latent variable with the variational
+  posterior `IW(ν + N, Ψ + S)`; the model holds `E[Σ⁻¹]⁻¹`, so the smoother is
+  unchanged, and the bound gains the expected log-determinant and the prior's
+  terms. The weights' objective is a new inverse-Wishart target beside the
+  Gaussian-draws one. `GaussianObservationModel(; C_fixed=true)` holds `C`
+  while `d` and `D` are fitted, for latents in a fixed basis's coordinates
+  (needed for an anatomical prior on `Q`). Not in an `SLDS`, a composite
+  emission or with `depends_on`.
+
+  With a learned loading (`ConstrainedGaussianObservationModel`, no prior on
+  `H`), a `Q` prior's kernels are given in the basis's coordinates and projected
+  onto the latents through `H`: `projection=:noise_weighted` (default,
+  `(H'Z⁻¹H)⁻¹`) or `:euclidean` (`H⁺ZH⁺'`). The projection moves with the
+  latents, so no choice of coordinates is needed; `H` takes its closed form and
+  then up to `loading_iters` gradient steps on the bound with the prior's term.
+  `dof` defaults to the covariance's dimension plus two.
+
+- **A kernel prior on the transition matrix: `KernelMNPrior`.** A matrix-normal
+  prior `A ~ MN(m I, U, V)` whose row (receiver) and column (sender) covariances
+  are `KernelPrior` covariances, with `m` and the weights fitted: a coupling's
+  spread factors into a receiver's and a sender's gain. `A` becomes a latent
+  variable with an exact Gaussian `q(A)` (given `E[Q⁻¹]` and the point `b`, `B`);
+  the smoother gets `E[A'Q⁻¹A]` (the uncertainty adds `Δ_A` to every state with a
+  successor), `Q`'s scatter gets `A`'s spread, and the bound `E log p(A) + H[q(A)]`.
+  With a fixed basis the kernels are in the latents' coordinates; with a
+  learned loading they are projected through `H` (rows like `Q`, columns by the
+  sandwich `H'ZH`) and the loading's polish includes them. Combines with the
+  `Q` and `R` priors; not with an `AB_prior`, a kernel prior on `H` or a free
+  `C`. `dynamics_posterior` returns `q(A)`.
+
   A tutorial, *Kernel priors on a parcellated cortex*, builds a full
   model comparison of sum-of-kernels and scale–correlation priors (parcel,
   network and global scales; network, parcel and geodesic coherences; nested,

@@ -184,8 +184,13 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
 - `P0::M`: Initial state covariance (size `latent_dim × latent_dim`).
 - `B::M`: Optional dynamics input matrix (`latent_dim × ux_dim`).
     When supplied, inputs `ux` must be passed to `fit!`/`smooth!` via a keyword argument.
-- `Q_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `Q`. If set, MAP updates use its mode.
+- `Q_prior::Union{Nothing,IWPrior{T},KernelIWPrior{T}} = nothing`: Optional prior on `Q`.
+    An [`IWPrior`](@ref) gives MAP updates at its mode; a [`KernelIWPrior`](@ref) makes `Q`
+    a latent variable whose inverse-Wishart prior has a kernel mean with fitted weights.
 - `P0_prior::Union{Nothing,IWPrior{T}} = nothing`: Optional Inverse-Wishart prior on `P0`. If set, MAP updates use its mode.
+- `A_prior::Union{Nothing,KernelMNPrior{T}} = nothing`: Optional kernel prior on `A` with
+    receiver (row) and sender (column) kernel covariances ([`KernelMNPrior`](@ref)); `A`
+    becomes a latent variable and `A` holds its posterior mean. Not with `AB_prior`.
 - `AB_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
     the stacked dynamics matrix `[A B]`. Pair with `Q_prior` for a full MNIW prior on `(AB, Q)`.
     Prior matrices are stored as plain `Matrix{T}` (decoupled from `A`'s storage type `M`) so
@@ -217,10 +222,12 @@ Base.@kwdef mutable struct GaussianStateModel{
     P0::M
     B0::Matrix{T} = zeros(eltype(A), size(A, 1), 0)
     B::M = zeros(eltype(A), size(A, 1), 0)
-    Q_prior::Union{Nothing,IWPrior{T}} = nothing
+    Q_prior::Union{Nothing,IWPrior{T},KernelIWPrior{T}} = nothing
     P0_prior::Union{Nothing,IWPrior{T}} = nothing
     AB_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
+    # A kernel prior on A, which makes it a latent variable (q(A))
+    A_prior::Union{Nothing,KernelMNPrior{T}} = nothing
     depends_on::Union{Nothing,NamedTuple} = nothing
     variants::Union{Nothing,Vector{GaussianStateModel{T,M,V}}} = nothing
     gauge::Union{Nothing,AffineGauge{T}} = nothing
@@ -238,7 +245,12 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
 - `d::V`: Bias vector of length `(obs_dim)`.
 - `d_fixed_zero::Bool = false`: Keep `d` exactly zero while fitting C/D. Requires
     zero initial d; applies to every derived parameter-group variant.
-- `R_prior::Union{Nothing, IWPrior{T}} = nothing`: Optional Inverse-Wishart prior for `R`.
+- `R_prior::Union{Nothing,IWPrior{T},KernelIWPrior{T}} = nothing`: Optional prior on `R`:
+    an Inverse-Wishart ([`IWPrior`](@ref), MAP updates) or a kernel-mean one with fitted
+    weights ([`KernelIWPrior`](@ref), `R` a latent variable).
+- `C_fixed::Bool = false`: Hold `C` at its value while `d` and `D` are fitted (a fixed
+    basis, the latents in its coordinates). Not with `CD_prior`, `depends_on`, an `SLDS`,
+    a composite emission or an `LQRStateModel`.
 - `CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
     the stacked emission matrix `[C D]`. Pair with `R_prior` for a full MNIW prior on `(CD, R)`.
     Prior matrices are stored as plain `Matrix{T}` (decoupled from `C`'s storage type `M`) so
@@ -269,7 +281,7 @@ Base.@kwdef mutable struct GaussianObservationModel{
     R::M
     d::V
     D::M = zeros(eltype(C), size(C, 1), 0)  # eltype-preserving default
-    R_prior::Union{Nothing,IWPrior{T}} = nothing
+    R_prior::Union{Nothing,IWPrior{T},KernelIWPrior{T}} = nothing
     CD_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
     depends_on::Union{Nothing,NamedTuple} = nothing
     group_seeds::Union{Nothing,AbstractDict} = nothing
@@ -277,6 +289,8 @@ Base.@kwdef mutable struct GaussianObservationModel{
     R_diagonal::Bool = false
     # Constrain the intercept within the coefficient solve; C and D stay free.
     d_fixed_zero::Bool = false
+    # Hold C at its value while d and D are fitted (a fixed basis).
+    C_fixed::Bool = false
 end
 
 # Convenience constructors (State)
@@ -431,7 +445,7 @@ parameter so the choice of smoother is a compile-time dispatch.
 _emission_is_quadratic(::GaussianObservationModel) = true
 _emission_is_quadratic(::PoissonObservationModel) = false
 function _emission_is_quadratic(::StructuredGaussianObservationModel)
-    throw(
+    return throw(
         ArgumentError(
             "a constrained or kernel-prior emission cannot be a member of a " *
             "CompositeObservationModel",
@@ -857,7 +871,7 @@ end
 # `lqr_types.jl`. Any other model can only be given the offset it already has.
 function _with_cost_offset(lds::LinearDynamicalSystem, offset::Int)
     iszero(offset) && return lds
-    throw(ArgumentError("a cost-schedule offset applies to an LQR state model only"))
+    return throw(ArgumentError("a cost-schedule offset applies to an LQR state model only"))
 end
 
 """
@@ -870,7 +884,7 @@ rejects a non-zero one rather than ignoring it.
 function _normalize_cost_offset(offset, ::AbstractStateModel, ntrials::Int)
     offset === nothing && return Int[]
     all(iszero, offset) && return Int[]
-    throw(
+    return throw(
         ArgumentError(
             "`cost_offset` shifts where a trial starts on an LQR cost schedule, and " *
             "this state model has no cost schedule",

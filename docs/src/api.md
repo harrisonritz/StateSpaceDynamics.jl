@@ -45,6 +45,9 @@ Kernel
 KernelPrior
 ScaleCorrelation
 CorrelationFamily
+KernelIWPrior
+KernelMNPrior
+dynamics_posterior
 fit_kernel_weights!
 kernel_weights
 kernel_covariance

@@ -11,7 +11,7 @@ using SparseArrays
 using Optim: Optim, optimize, LBFGS
 using LineSearches: HagerZhang, LineSearchException
 using ProgressMeter: Progress, next!, finish!
-using SpecialFunctions: loggamma
+using SpecialFunctions: loggamma, digamma
 using Statistics: mean
 using StatsAPI: StatsAPI
 import StatsAPI: loglikelihood, fit!, nobs, nullloglikelihood, r2
@@ -39,6 +39,8 @@ include("stats/priors.jl")
 include("stats/kernel_hierarchy.jl")
 include("stats/kernel_prior.jl")
 include("stats/kernel_scale_correlation.jl")
+include("stats/kernel_covariance_prior.jl")      # kernel-mean inverse-Wishart priors on Q, R
+include("stats/kernel_dynamics_prior.jl")       # kernel row/column matrix-normal prior on A
 
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
@@ -116,7 +118,8 @@ export IWPrior, MNPrior, RidgePrior, x0_mean_prior, transition_prior
 export banded_transition, banded_transition_prior, median_dwell_stay
 
 # Kernel priors
-export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily
+export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily, KernelIWPrior
+export KernelMNPrior, dynamics_posterior
 export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
 export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
 export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel

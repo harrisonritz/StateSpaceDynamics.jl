@@ -294,6 +294,7 @@ function _fit_structured!(
 
     for iter in 1:max_iter
         estep!(lds, suf, tfs, data, sws_pool)
+        iter == 1 && _start_covariance_priors!(lds, suf)
         total_entropy = sum(fs.entropy for fs in tfs.FilterSmooths; init=zero(T))
         elbos[iter] = elbo!(lds, suf, sws_pool[1], total_entropy)
 

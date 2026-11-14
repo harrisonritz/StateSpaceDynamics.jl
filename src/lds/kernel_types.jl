@@ -7,22 +7,8 @@ the emission unions are defined; the methods are in `kernel_observations.jl` and
 `fit_kernel_LDS.jl`.
 =============================================================================#
 
-"""
-    LoadingPosterior{T}
-
-The Gaussian posterior `q(H)` of a kernel-prior emission's loading (`r × k`):
-
-    H = mean + left * E * right',    E_lj independent, Var E_lj = var[l, j]
-
-so that `Cov(vec H) = (right ⊗ left) diag(vec var) (right ⊗ left)'`. `left` is
-`r × r` and `right` `k × k`, both invertible. See [`emission_posterior`](@ref).
-"""
-struct LoadingPosterior{T<:Real}
-    mean::Matrix{T}
-    left::Matrix{T}
-    right::Matrix{T}
-    var::Matrix{T}
-end
+# `LoadingPosterior` is defined in `stats/kernel_dynamics_prior.jl`, which a
+# transition matrix's kernel prior also uses.
 
 """
     StructuredGaussianObservationModel{T,M,V,B,P}
@@ -61,7 +47,7 @@ Base.@kwdef mutable struct StructuredGaussianObservationModel{
     R::M
     d::V
     D::M = zeros(eltype(C), size(C, 1), 0)
-    R_prior::Union{Nothing,IWPrior{T}} = nothing
+    R_prior::Union{Nothing,IWPrior{T},KernelIWPrior{T}} = nothing
     R_diagonal::Bool = false
     # Read by the generic entry points; parameter grouping is not supported here.
     depends_on::Nothing = nothing
@@ -178,7 +164,7 @@ function _structured_model(;
     R::AbstractMatrix{T},
     d::Union{Nothing,AbstractVector}=nothing,
     D::Union{Nothing,AbstractMatrix}=nothing,
-    R_prior::Union{Nothing,IWPrior}=nothing,
+    R_prior::Union{Nothing,IWPrior,KernelIWPrior}=nothing,
     R_diagonal::Bool=false,
     gauge::Symbol=:bound,
     weight_iters::Int=50,

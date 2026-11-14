@@ -68,6 +68,18 @@ function _validate_gauge(model, center, whiten, max_condition)
     (center || whiten) || return nothing
     model.state_model isa GaussianStateModel ||
         throw(ArgumentError("post-M-step gauge normalization requires GaussianStateModel"))
+    model.state_model.A_prior isa KernelMNPrior && throw(
+        ArgumentError(
+            "the gauge_* options transform A, whose KernelMNPrior is fixed in the " *
+            "latents' coordinates; fit without them",
+        ),
+    )
+    model.state_model.Q_prior isa KernelIWPrior && throw(
+        ArgumentError(
+            "the gauge_* options transform Q, whose KernelIWPrior is fixed in the " *
+            "latents' coordinates; fit without them",
+        ),
+    )
     if center
         isempty(model.state_model.B0) || throw(
             ArgumentError(

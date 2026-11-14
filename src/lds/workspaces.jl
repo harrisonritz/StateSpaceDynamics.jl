@@ -835,6 +835,9 @@ function _compute_state_constants!(
     # xt1_given_xt = -A' * (Q^{-1} A)
     mul!(cc.xt1_given_xt, A', cc.tmp_QA)
     cc.xt1_given_xt .*= -one(T)
+    # an uncertain A (a KernelMNPrior): -E[A'Q⁻¹A] = -(Â'Q⁻¹Â + Δ_A)
+    Δ = _dynamics_excess(sm)
+    Δ === nothing || (cc.xt1_given_xt .-= Δ)
 
     # x_t = -P0^{-1}
     copyto!(cc.x_t, cc.I_mat)
