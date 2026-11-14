@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the kernel-prior fit's methods in the package image, so that a fresh Julia
   process does not compile them before its first fit.
 
+  `KernelPrior(...; unit_structure)` adds group-level structure across the
+  units of a fitted type (or correlated set): unit kernels on their covariance,
+  `Cov = K_w ⊗ Ω` with `K_w = w₀ I + Σ_k w_k K_k` (softmax weights with a
+  Gaussian prior on their logits, each kernel's width chosen from a grid), and
+  covariates on their mean with fitted slopes. Units match by name. Without it
+  the prior and its fits are unchanged.
+
 - **Kernel priors on the noise covariances: `KernelIWPrior`.** An
   inverse-Wishart prior on `Q` (of a `GaussianStateModel`) or `R` (of a Gaussian
   or kernel-prior emission) whose mean is a `KernelPrior`'s covariance, with the

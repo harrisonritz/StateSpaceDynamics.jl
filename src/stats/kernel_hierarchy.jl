@@ -41,6 +41,34 @@ end
 _label_text(label::WeightLabel) = string(label.type, ":", label.name)
 
 """
+    UnitStructure{T}
+
+**Internal.** Group-level structure across the units of a fitted tree:
+optional unit kernels on their covariance and covariates on their mean,
+
+    η = Z μ + X B + E,   Cov(E) = K_w ⊗ Ω (unit-major),
+    K_w = w₀ I + Σ_k w_k K_k,   (w₀, w₁, …) = softmax(0, z₁, …),
+    z_k ~ N(0, kernel_sd²),
+
+`η` the `units × d` weights, `Z` each unit's node, `X` (`units × p`) the
+covariates centred and scaled to unit SD over the tree's units, `B` (`p × d`)
+their slopes (fitted where `flags`, else zero). Each kernel is a grid of
+widths (`U × U` matrices with unit diagonal, aligned to the tree's units);
+`width` is the one in use.
+"""
+mutable struct UnitStructure{T<:Real}
+    const kernel_names::Vector{String}
+    const kernels::Vector{Vector{Matrix{T}}}    # kernel → width → (U, U)
+    const covariate_names::Vector{String}
+    const X::Matrix{T}                          # (U, p)
+    const flags::Matrix{Bool}                   # (p, d)
+    const kernel_sd::T
+    z::Vector{T}                                # (kernels)
+    width::Vector{Int}                          # (kernels)
+    beta::Matrix{T}                             # (p, d)
+end
+
+"""
     WeightTree{T}
 
 **Internal.** The hyperprior of the weights of one type (`d = 1`) or of a set of
@@ -69,6 +97,8 @@ mutable struct WeightTree{T<:Real}
     const sd_prior::Union{Nothing,Tuple{T,T}}
     const root_sd::Union{Nothing,T}
     const lkj_eta::T
+    # levels > 0: optional unit kernels and covariates (`_attach_unit_structure!`)
+    unit_structure::Union{Nothing,UnitStructure{T}}
 end
 
 _tree_dim(tree::WeightTree) = length(tree.types)
@@ -210,6 +240,7 @@ function _empty_tree(
         sd_prior,
         root_sd,
         lkj_eta,
+        nothing,
     )
 end
 
@@ -334,14 +365,19 @@ function _weight_prior!(
         end
         Ω = _tree_omega(tree)
         Ωi = inv(Symmetric(Ω))
-        for u in axes(tree.idx, 1)
-            rows = view(tree.idx, u, :)
-            for (a, i) in enumerate(rows)
-                μ[i] = tree.node_mean[tree.node[u], a]
-                for (b, j) in enumerate(rows)
-                    Λ[i, j] = Ωi[a, b]
+        structure = tree.unit_structure
+        if structure === nothing
+            for u in axes(tree.idx, 1)
+                rows = view(tree.idx, u, :)
+                for (a, i) in enumerate(rows)
+                    μ[i] = tree.node_mean[tree.node[u], a]
+                    for (b, j) in enumerate(rows)
+                        Λ[i, j] = Ωi[a, b]
+                    end
                 end
             end
+        else
+            _unit_prior!(μ, Λ, tree, structure, Ωi)
         end
         # Unmatched weights of a correlated type keep its marginal prior.
         for (a, rows) in enumerate(tree.leftover), i in rows
@@ -462,6 +498,8 @@ function _update_tree!(
     tree::WeightTree{T}, w::Vector{T}, Σw::Matrix{T}; sweeps::Int=200, tol::Real=1e-8
 ) where {T<:Real}
     tree.levels == 0 && return true
+    structure = tree.unit_structure
+    structure === nothing || return _update_unit_tree!(tree, structure, w, Σw; sweeps, tol)
     idx = tree.idx
     units, d = size(idx)
     nodes = length(tree.node_names)
@@ -512,37 +550,41 @@ function _update_tree!(
         tree.sds, tree.corr = _fit_omega(
             Matrix(Symmetric(S)), n_eff, tree.lkj_eta, tree.sds, tree.corr
         )
-        if tree.levels == 2
-            for j in 1:d
-                precision = nodes / tree.psi[j]^2 + root_precision
-                tree.root[j] =
-                    (
-                        sum(view(tree.node_mean, :, j)) / tree.psi[j]^2 +
-                        root_precision * m0[j]
-                    ) / precision
-                root_var = tree.root_sd === nothing ? zero(T) : inv(precision)
-                total = zero(T)
-                for n in 1:nodes
-                    total +=
-                        (tree.node_mean[n, j] - tree.root[j])^2 +
-                        tree.node_cov[j, j, n] +
-                        root_var
-                end
-                tree.psi[j] = max(
-                    sqrt(_level_variance(total, nodes, tree.sd_prior)), T(_TREE_SD_FLOOR)
-                )
-            end
-        end
+        tree.levels == 2 && _update_root!(tree, root_precision)
         new = vcat(tree.root, tree.sds, vec(tree.corr), tree.psi, vec(tree.node_mean))
         maximum(abs, new .- old) < tol && return true
     end
     return false
 end
 
+# The root and ψ of a nested tree given its nodes' Gaussian posteriors.
+function _update_root!(tree::WeightTree{T}, root_precision::T) where {T<:Real}
+    nodes = length(tree.node_names)
+    m0 = tree.root_centre
+    for j in 1:_tree_dim(tree)
+        precision = nodes / tree.psi[j]^2 + root_precision
+        tree.root[j] =
+            (sum(view(tree.node_mean, :, j)) / tree.psi[j]^2 + root_precision * m0[j]) /
+            precision
+        root_var = tree.root_sd === nothing ? zero(T) : inv(precision)
+        total = zero(T)
+        for n in 1:nodes
+            total +=
+                (tree.node_mean[n, j] - tree.root[j])^2 + tree.node_cov[j, j, n] + root_var
+        end
+        tree.psi[j] = max(
+            sqrt(_level_variance(total, nodes, tree.sd_prior)), T(_TREE_SD_FLOOR)
+        )
+    end
+    return tree
+end
+
 # The state a tree's convergence is judged by.
 function _tree_state(tree::WeightTree{T}) where {T<:Real}
     tree.levels == 0 && return T[]
-    return vcat(tree.root, tree.sds, vec(tree.corr), tree.psi)
+    state = vcat(tree.root, tree.sds, vec(tree.corr), tree.psi)
+    s = tree.unit_structure
+    return s === nothing ? state : vcat(state, s.z, vec(s.beta))
 end
 
 """
@@ -579,5 +621,539 @@ function _tree_logdensity(tree::WeightTree{T}) where {T<:Real}
         end
     end
     d > 1 && (total += (tree.lkj_eta - 1) * logdet(Symmetric(tree.corr)))
+    s = tree.unit_structure
+    s === nothing || (total -= sum(abs2, s.z; init=zero(T)) / (2s.kernel_sd^2))
     return total
+end
+
+# ----------------------------------------------------------------------------
+# Unit kernels and covariates (`UnitStructure`)
+# ----------------------------------------------------------------------------
+
+# The bound on a unit kernel's logit in the w-step.
+const _UNIT_Z_BOUND = 10.0
+# The w-step's prior term on the logits is Σ z² / (_UNIT_PENALTY kernel_sd²): −2 log of
+# their N(0, kernel_sd²) prior, on the scale of the objective (−2 log p).
+const _UNIT_PENALTY = 1.0
+const _UNIT_STRUCTURE_KEYS = (
+    :kernels, :kernel_types, :covariates, :covariate_types, :kernel_sd
+)
+
+_spec_get(spec, key::Symbol, default) = haskey(spec, key) ? spec[key] : default
+
+# The entries of a name → value collection, in a stable order: as given, unless
+# it is a `Dict` (unordered), whose entries are sorted by name.
+function _named_entries(x)
+    entries = if x isa AbstractVector
+        [string(first(e)) => last(e) for e in x]
+    else
+        [string(k) => v for (k, v) in pairs(x)]
+    end
+    x isa Dict && sort!(entries; by=first)
+    names = first.(entries)
+    allunique(names) || throw(ArgumentError("unit_structure repeats a name"))
+    return entries
+end
+
+# A unit kernel as its grid of widths, each checked: symmetric, unit diagonal, PSD.
+function _kernel_grid(::Type{T}, name::String, value) where {T<:Real}
+    names = String[string(n) for n in value[1]]
+    K = value[2]
+    grid = if ndims(K) == 2
+        [Matrix{T}(K)]
+    elseif ndims(K) == 3
+        [Matrix{T}(K[i, :, :]) for i in axes(K, 1)]
+    else
+        throw(ArgumentError("the unit kernel $name must be (widths, U, U) or (U, U)"))
+    end
+    n = length(names)
+    allunique(names) || throw(ArgumentError("the unit kernel $name repeats a unit name"))
+    isempty(grid) && throw(ArgumentError("the unit kernel $name has no widths"))
+    for (j, Kj) in enumerate(grid)
+        label = "the unit kernel $name (width $j)"
+        size(Kj) == (n, n) ||
+            throw(DimensionMismatch("$label is $(size(Kj)); it has $n unit names"))
+        all(isfinite, Kj) || throw(ArgumentError("$label has non-finite entries"))
+        scale = max(one(T), maximum(abs, Kj))
+        maximum(abs, Kj .- Kj'; init=zero(T)) <= sqrt(eps(T)) * scale ||
+            throw(ArgumentError("$label is not symmetric"))
+        all(i -> abs(Kj[i, i] - 1) <= 1e-6, 1:n) ||
+            throw(ArgumentError("$label needs a unit diagonal"))
+        issuccess(cholesky(Symmetric(Kj) + sqrt(eps(T)) * I; check=false)) ||
+            throw(ArgumentError("$label is not positive semidefinite"))
+    end
+    return names, grid
+end
+
+"""
+    _attach_unit_structure!(trees, labels, spec)
+
+Give the fitted trees the unit kernels and covariates of `spec` (see
+[`KernelPrior`](@ref)'s `unit_structure`), aligned by unit name to each tree's
+units: a unit a kernel does not name gets an identity row; a covariate is
+centred and scaled over the units with a value, and a unit without one raises,
+except `"none"`, which gets zero (the others' mean).
+"""
+function _attach_unit_structure!(
+    trees::Vector{WeightTree{T}}, labels::Vector{WeightLabel}, spec
+) where {T<:Real}
+    spec === nothing && return trees
+    for key in keys(spec)
+        Symbol(key) in _UNIT_STRUCTURE_KEYS || throw(
+            ArgumentError(
+                "unit_structure has the unknown field $key; it takes " *
+                join(_UNIT_STRUCTURE_KEYS, ", "),
+            ),
+        )
+    end
+    kernel_sd = T(_spec_get(spec, :kernel_sd, 2.0))
+    isfinite(kernel_sd) && kernel_sd > 0 ||
+        throw(ArgumentError("unit_structure's kernel_sd must be positive and finite"))
+    grids = Dict(
+        name => _kernel_grid(T, name, value) for
+        (name, value) in _named_entries(_spec_get(spec, :kernels, Pair{String,Any}[]))
+    )
+    covariates = Dict{String,Tuple{Vector{String},Vector{T}}}()
+    for (name, value) in _named_entries(_spec_get(spec, :covariates, Pair{String,Any}[]))
+        names = String[string(n) for n in value[1]]
+        values = Vector{T}(vec(value[2]))
+        length(names) == length(values) || throw(
+            DimensionMismatch(
+                "the covariate $name has $(length(names)) names and " *
+                "$(length(values)) values",
+            ),
+        )
+        allunique(names) || throw(ArgumentError("the covariate $name repeats a unit"))
+        all(isfinite, values) ||
+            throw(ArgumentError("the covariate $name has non-finite values"))
+        covariates[name] = (names, values)
+    end
+    function types_of(x, what, known)
+        map(_named_entries(x)) do (name, members)
+            haskey(known, name) || throw(
+                ArgumentError("unit_structure gives types for the unknown $what $name")
+            )
+            return name => Symbol[Symbol(m) for m in members]
+        end
+    end
+    kernel_types = types_of(
+        _spec_get(spec, :kernel_types, Pair{String,Any}[]), "kernel", grids
+    )
+    covariate_types = types_of(
+        _spec_get(spec, :covariate_types, Pair{String,Any}[]), "covariate", covariates
+    )
+    tree_of = Dict(type => tree for tree in trees for type in tree.types)
+    for (name, members) in vcat(kernel_types, covariate_types), type in members
+        haskey(tree_of, type) || throw(
+            ArgumentError(
+                "unit_structure names the type :$type ($name), which no kernel has"
+            ),
+        )
+        tree_of[type].levels >= 1 || throw(
+            ArgumentError(
+                "unit_structure names the type :$type ($name), whose weights are " *
+                ":flat; unit kernels and covariates need a fitted tree",
+            ),
+        )
+    end
+    for tree in trees
+        tree.levels >= 1 || continue
+        sets = [
+            [k for (k, members) in kernel_types if type in members] for type in tree.types
+        ]
+        all(==(sets[1]), sets) || throw(
+            ArgumentError(
+                "the correlated types $(join(string.(":", tree.types), ", ")) need one " *
+                "set of unit kernels; they have " *
+                join(("[" * join(set, ", ") * "]" for set in sets), ", "),
+            ),
+        )
+        flags = [type in members for (_, members) in covariate_types, type in tree.types]
+        used = [any(view(flags, c, :)) for c in axes(flags, 1)]
+        kernels = sets[1]
+        (isempty(kernels) && !any(used)) && continue
+        units = [labels[i].unit for i in view(tree.idx, :, 1)]
+        aligned = [_align_kernel(T, k, grids[k]..., units) for k in kernels]
+        cnames = [first(covariate_types[c]) for c in eachindex(used) if used[c]]
+        X = reduce(
+            hcat,
+            (_align_covariate(T, c, covariates[c]..., units) for c in cnames);
+            init=zeros(T, length(units), 0),
+        )
+        nk, p, d = length(kernels), length(cnames), _tree_dim(tree)
+        tree.unit_structure = UnitStructure{T}(
+            kernels,
+            aligned,
+            cnames,
+            X,
+            Matrix{Bool}(flags[used, :]),
+            kernel_sd,
+            zeros(T, nk),
+            [length(grid) ÷ 2 + 1 for grid in aligned],
+            zeros(T, p, d),
+        )
+    end
+    return trees
+end
+
+# A kernel's widths on the tree's units: identity rows for the units it does not name.
+function _align_kernel(
+    ::Type{T}, name::String, names::Vector{String}, grid::Vector{Matrix{T}}, units
+) where {T<:Real}
+    position = Dict(n => i for (i, n) in enumerate(names))
+    known = [u for u in eachindex(units) if haskey(position, units[u])]
+    length(known) >= 2 || throw(
+        ArgumentError(
+            "the unit kernel $name names $(length(known)) of the tree's units; it " *
+            "needs at least two (units match by name)",
+        ),
+    )
+    at = [position[units[u]] for u in known]
+    return map(grid) do K
+        aligned = Matrix{T}(I, length(units), length(units))
+        aligned[known, known] .= view(K, at, at)
+        return aligned
+    end
+end
+
+# A covariate on the tree's units, centred and scaled to unit SD over the units
+# with a value; a unit without one raises, except `"none"`, which gets zero.
+function _align_covariate(
+    ::Type{T}, name::String, names::Vector{String}, values::Vector{T}, units
+) where {T<:Real}
+    position = Dict(n => i for (i, n) in enumerate(names))
+    missing_units = [u for u in units if u != "none" && !haskey(position, u)]
+    isempty(missing_units) || throw(
+        ArgumentError(
+            "the covariate $name has no value for the units " *
+            join(first(missing_units, 5), ", "),
+        ),
+    )
+    known = [haskey(position, u) for u in units]
+    raw = T[values[position[u]] for u in units[known]]
+    centre = sum(raw) / length(raw)
+    sd = sqrt(sum(abs2, raw .- centre) / length(raw))
+    sd > sqrt(eps(T)) ||
+        throw(ArgumentError("the covariate $name is constant over the tree's units"))
+    x = zeros(T, length(units))
+    x[known] .= (raw .- centre) ./ sd
+    return x
+end
+
+# softmax(0, z): the weight of the identity, then of each kernel.
+function _unit_weights(z::AbstractVector{T}) where {T<:Real}
+    top = max(zero(T), maximum(z; init=zero(T)))
+    e = exp.(vcat(zero(T), z) .- top)
+    return e ./ sum(e)
+end
+
+# K_w at the logits `z` and the structure's widths, and the weights.
+function _unit_kernel(s::UnitStructure{T}, z::AbstractVector{T}, n::Int) where {T<:Real}
+    w = _unit_weights(z)
+    K = Matrix{T}(w[1] * I, n, n)
+    for k in eachindex(s.kernels)
+        K .+= w[k + 1] .* s.kernels[k][s.width[k]]
+    end
+    return K, w
+end
+
+function _unit_kernel_inverse(s::UnitStructure{T}, n::Int) where {T<:Real}
+    K, _ = _unit_kernel(s, s.z, n)
+    return _cholesky_inverse(cholesky(Symmetric(K)))
+end
+
+# The prior of a structured tree's units: mean Z μ + X B, precision K_w⁻¹ ⊗ Ω⁻¹.
+function _unit_prior!(
+    μ::Vector{T},
+    Λ::Matrix{T},
+    tree::WeightTree{T},
+    s::UnitStructure{T},
+    Ωi::AbstractMatrix{T},
+) where {T<:Real}
+    idx = tree.idx
+    units, d = size(idx)
+    Kinv = _unit_kernel_inverse(s, units)
+    M = tree.node_mean[tree.node, :] .+ s.X * s.beta
+    for v in 1:units, b in 1:d
+        j = idx[v, b]
+        μ[j] = M[v, b]
+        for u in 1:units, a in 1:d
+            Λ[idx[u, a], j] = Kinv[u, v] * Ωi[a, b]
+        end
+    end
+    return μ, Λ
+end
+
+"""
+    _unit_objective!(G, s, z, F, d; profile=nothing) -> T
+
+The w-step objective `d log|K_w| + tr(K_w⁻¹ F) + Σ z²/kernel_sd²` at the
+logits `z` (and the structure's widths), and its gradient in `z` into `G`
+unless `nothing`.
+
+With `profile = (m, e)` the scale `c` of `Ω` is profiled out instead: `F` is
+taken at the current `Ω`, the objective over `(z, cΩ)` is minimal at
+`c = (tr(K_w⁻¹F) + e) / m` (`m = d (n + ν₀)`, `e = ν₀ s₀² tr Ω⁻¹`), and the
+objective is `d log|K_w| + m log(tr(K_w⁻¹F) + e) + Σ z²/kernel_sd²`.
+"""
+function _unit_objective!(
+    G,
+    s::UnitStructure{T},
+    z::AbstractVector{T},
+    F::Matrix{T},
+    d::Int;
+    profile::Union{Nothing,Tuple{T,T}}=nothing,
+) where {T<:Real}
+    n = size(F, 1)
+    K, w = _unit_kernel(s, z, n)
+    C = cholesky!(Symmetric(K); check=false)
+    if !issuccess(C)
+        G === nothing || fill!(G, T(NaN))
+        return T(Inf)
+    end
+    Kinv = _cholesky_inverse(C)
+    t = dot(Kinv, F)
+    penalty = _UNIT_PENALTY * s.kernel_sd^2
+    fit, factor = if profile === nothing
+        t, one(T)
+    else
+        m, e = profile
+        m * log(t + e), m / (t + e)
+    end
+    value = d * logdet(C) + fit + sum(abs2, z; init=zero(T)) / penalty
+    G === nothing && return value
+    M = Kinv * F * Kinv
+    slope = zeros(T, length(w))
+    slope[1] = d * tr(Kinv) - factor * tr(M)
+    for k in eachindex(s.kernels)
+        Kk = s.kernels[k][s.width[k]]
+        slope[k + 1] = d * dot(Kinv, Kk) - factor * dot(M, Kk)
+    end
+    mean_slope = dot(slope, w)
+    for k in eachindex(z)
+        G[k] = w[k + 1] * (slope[k + 1] - mean_slope) + 2z[k] / penalty
+    end
+    return value
+end
+
+"""
+    _fit_unit_weights!(s, F, d; profile=nothing) -> T
+
+Move `s.z` to the minimizer of [`_unit_objective!`](@ref) in [−10, 10] by
+L-BFGS from the current logits; never worse. Returns `tr(K_w⁻¹ F)` at the
+logits it leaves.
+"""
+function _fit_unit_weights!(
+    s::UnitStructure{T}, F::Matrix{T}, d::Int; profile::Union{Nothing,Tuple{T,T}}=nothing
+) where {T<:Real}
+    if !isempty(s.z)
+        f = z -> _unit_objective!(nothing, s, z, F, d; profile)
+        g! = (G, z) -> (_unit_objective!(G, s, z, F, d; profile); G)
+        fg! = (G, z) -> _unit_objective!(G, s, z, F, d; profile)
+        z0 = copy(s.z)
+        start = f(z0)
+        options = Optim.Options(; iterations=200, g_tol=1e-9, f_reltol=1e-14)
+        objective = Optim.OnceDifferentiable(f, g!, fg!, z0)
+        bound = T(_UNIT_Z_BOUND)
+        result = try
+            optimize(objective, z0, LBFGS(), options)
+        catch err
+            err isa LineSearchException || rethrow()
+            nothing
+        end
+        z = result === nothing ? z0 : Optim.minimizer(result)
+        if any(x -> abs(x) > bound, z)
+            # The bound binds: L-BFGS in the box from the clamped point.
+            inside = clamp.(z, -bound + T(1e-6), bound - T(1e-6))
+            boxed = optimize(
+                objective,
+                fill(-bound, length(z)),
+                fill(bound, length(z)),
+                inside,
+                Optim.Fminbox(LBFGS()),
+                options,
+            )
+            z = clamp.(Optim.minimizer(boxed), -bound, bound)
+        end
+        value = f(z)
+        (all(isfinite, z) && isfinite(value) && value <= start) && (s.z .= z)
+    end
+    K, _ = _unit_kernel(s, s.z, size(F, 1))
+    return dot(_cholesky_inverse(cholesky(Symmetric(K))), F)
+end
+
+# For each kernel with several widths, the width with the lowest w-step
+# objective at the current logits (the others held).
+function _choose_widths!(s::UnitStructure{T}, F::Matrix{T}, d::Int) where {T<:Real}
+    for k in eachindex(s.kernels)
+        length(s.kernels[k]) > 1 || continue
+        best, lowest = s.width[k], T(Inf)
+        for j in eachindex(s.kernels[k])
+            s.width[k] = j
+            value = _unit_objective!(nothing, s, s.z, F, d)
+            value < lowest && ((best, lowest) = (j, value))
+        end
+        s.width[k] = best
+    end
+    return s
+end
+
+# The (d, d) blocks of a unit-major (or node-major) covariance: `B[a, b][u, v]`
+# is the covariance of member `a` of unit `u` with member `b` of unit `v`.
+function _member_blocks(V::AbstractMatrix{T}, d::Int) where {T<:Real}
+    return [V[a:d:end, b:d:end] for a in 1:d, b in 1:d]
+end
+
+"""
+    _unit_nodes!(tree, s, a, Z, Kinv, Oi) -> (Cμ, ZKZ)
+
+The nodes' joint Gaussian posterior given `B` (step 2): precision
+`kron(Z'K⁻¹Z, Ω⁻¹)` plus the nodes' own prior. Writes the means and the
+diagonal blocks of the covariance into the tree; returns the full covariance
+(node-major) and `Z'K⁻¹Z`.
+"""
+function _unit_nodes!(
+    tree::WeightTree{T},
+    s::UnitStructure{T},
+    a::Matrix{T},
+    Z::Matrix{T},
+    Kinv::Matrix{T},
+    Oi::Matrix{T},
+) where {T<:Real}
+    d, nodes = size(a, 2), size(Z, 2)
+    ZK = Z' * Kinv
+    ZKZ = Matrix(Symmetric(ZK * Z))
+    P = kron(ZKZ, Oi)
+    linear = vec(permutedims(ZK * (a .- s.X * s.beta) * Oi))
+    root_precision = tree.root_sd === nothing ? zero(T) : inv(tree.root_sd^2)
+    for n in 1:nodes
+        r = ((n - 1) * d + 1):(n * d)
+        if tree.levels == 2
+            for j in 1:d
+                P[r[j], r[j]] += inv(tree.psi[j]^2)
+                linear[r[j]] += tree.root[j] / tree.psi[j]^2
+            end
+        else
+            for j in 1:d
+                P[r[j], r[j]] += root_precision
+                linear[r[j]] += root_precision * tree.root_centre[j]
+            end
+        end
+    end
+    Cμ = Matrix(Symmetric(inv(Symmetric(P))))
+    tree.node_mean .= permutedims(reshape(Cμ * linear, d, nodes))
+    for n in 1:nodes
+        r = ((n - 1) * d + 1):(n * d)
+        tree.node_cov[:, :, n] .= view(Cμ, r, r)
+    end
+    return Cμ, ZKZ
+end
+
+# The slopes of the flagged covariates given the nodes (step 3): GLS.
+function _unit_slopes!(
+    s::UnitStructure{T}, resid::Matrix{T}, Kinv::Matrix{T}, Oi::Matrix{T}
+) where {T<:Real}
+    p, d = size(s.beta)
+    p == 0 && return s
+    KX = Kinv * s.X
+    b = vec(permutedims(KX' * resid * Oi))          # (covariate, member), row-major
+    H = kron(s.X' * KX, Oi)
+    f = findall(vec(permutedims(s.flags)))
+    beta = zeros(T, p * d)
+    beta[f] .= Symmetric(H[f, f]) \ b[f]
+    s.beta .= permutedims(reshape(beta, d, p))
+    return s
+end
+
+# F = R Ω⁻¹ R' + Σ_ab Ω⁻¹[a, b] (V_ab + Z Cμ_ab Z') (units × units).
+function _unit_moment(
+    R::Matrix{T}, Vb::Matrix{Matrix{T}}, Cb::Matrix{Matrix{T}}, Z::Matrix{T}, Oi::Matrix{T}
+) where {T<:Real}
+    F = R * Oi * R'
+    G = zeros(T, size(Z, 2), size(Z, 2))
+    for a in axes(Oi, 1), b in axes(Oi, 2)
+        F .+= Oi[a, b] .* Vb[a, b]
+        G .+= Oi[a, b] .* Cb[a, b]
+    end
+    F .+= Z * G * Z'
+    return Matrix(Symmetric(F))
+end
+
+"""
+    _update_unit_tree!(tree, s, w, Σw; sweeps, tol) -> Bool
+
+[`_update_tree!`](@ref) for a tree with unit kernels or covariates: given the
+mode `w` and the full covariance `Σw` of the weights, coordinate ascent over
+the nodes (jointly, step 2), the covariates' slopes (3), `Ω` (4), the kernels'
+logits jointly with the scale of `Ω` (5; on the first sweep each kernel's width
+is chosen first, at the current logits) and the root and `ψ` (6).
+"""
+function _update_unit_tree!(
+    tree::WeightTree{T},
+    s::UnitStructure{T},
+    w::Vector{T},
+    Σw::Matrix{T};
+    sweeps::Int=200,
+    tol::Real=1e-8,
+) where {T<:Real}
+    idx = tree.idx
+    units, d = size(idx)
+    nodes = length(tree.node_names)
+    a = w[idx]
+    order = vec(permutedims(idx))
+    Vb = _member_blocks(Σw[order, order], d)
+    Z = zeros(T, units, nodes)
+    for u in 1:units
+        Z[u, tree.node[u]] = one(T)
+    end
+    root_precision = tree.root_sd === nothing ? zero(T) : inv(tree.root_sd^2)
+    resid(B) = a .- view(tree.node_mean, tree.node, :) .- s.X * B
+    function state()
+        return vcat(
+            tree.root,
+            tree.sds,
+            vec(tree.corr),
+            tree.psi,
+            vec(tree.node_mean),
+            s.z,
+            vec(s.beta),
+        )
+    end
+    for sweep in 1:sweeps
+        old = state()
+        Kinv = _unit_kernel_inverse(s, units)
+        Oi = Matrix(inv(Symmetric(_tree_omega(tree))))
+        Cμ, ZKZ = _unit_nodes!(tree, s, a, Z, Kinv, Oi)
+        _unit_slopes!(s, resid(zero(s.beta)), Kinv, Oi)
+        R = resid(s.beta)
+        Cb = _member_blocks(Cμ, d)
+        S = R' * Kinv * R
+        for i in 1:d, j in 1:d
+            S[i, j] += dot(Kinv, Vb[i, j]) + dot(ZKZ, Cb[i, j])
+        end
+        n_eff, n_eff_prior = T(units), zero(T)
+        if tree.sd_prior !== nothing
+            s0, nu0 = tree.sd_prior
+            S .+= nu0 * s0^2 .* Matrix{T}(I, d, d)
+            n_eff += nu0
+            n_eff_prior = nu0 * s0^2
+        end
+        tree.sds, tree.corr = _fit_omega(
+            Matrix(Symmetric(S)), n_eff, tree.lkj_eta, tree.sds, tree.corr
+        )
+        if !isempty(s.z)
+            # The logits jointly with the scale of Ω (the slow direction of
+            # alternating the two): the same fixed point, in far fewer sweeps.
+            Oi = Matrix(inv(Symmetric(_tree_omega(tree))))
+            F = _unit_moment(R, Vb, Cb, Z, Oi)
+            sweep == 1 && _choose_widths!(s, F, d)
+            e = tree.sd_prior === nothing ? zero(T) : n_eff_prior * tr(Oi)
+            m = d * n_eff
+            t = _fit_unit_weights!(s, F, d; profile=(m, e))
+            tree.sds .= max.(tree.sds .* sqrt((t + e) / m), T(_TREE_SD_FLOOR))
+        end
+        tree.levels == 2 && _update_root!(tree, root_precision)
+        maximum(abs, state() .- old) < tol && return true
+    end
+    return false
 end

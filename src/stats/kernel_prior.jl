@@ -138,7 +138,7 @@ end
 """
     KernelPrior(kernels; structure=nothing, levels=:flat, correlated=(),
                 prior_sd=1.0, prior_mean=nothing, sd_prior=(0.5, 4.0),
-                root_sd=3.0, lkj_eta=2.0, weights=nothing)
+                root_sd=3.0, lkj_eta=2.0, unit_structure=nothing, weights=nothing)
 
 A zero-mean Gaussian prior whose `r × r` covariance is a weighted sum of
 [`Kernel`](@ref)s, `Σ = Σ_g θ_g Z_g`, plus an optional `structure` (a
@@ -173,6 +173,34 @@ about their node, with a fitted covariance whose correlation has an
 `LKJ(lkj_eta)` prior. The types of a set need the same `levels`
 (`:hierarchical` or `:nested`); kernels of a unit that is missing from one of
 them keep their type's marginal prior.
+
+# Unit kernels and covariates
+
+`unit_structure` adds group-level structure across the units of fitted
+(`:hierarchical` / `:nested`) types. With `η` the `U × d` weights of a tree's
+units (`d` its correlated types),
+
+    η = Z μ + X B + E,   Cov(E) = K_w ⊗ Ω,   K_w = w₀ I + Σ_k w_k K_k,
+
+`Z` each unit's node, `(w₀, w₁, …) = softmax(0, z₁, …)` with
+`z_k ~ N(0, kernel_sd²)`, and `X` covariates centred and scaled to unit SD over
+the tree's units, with ML slopes `B`. It is a `NamedTuple` with any of
+
+- `kernels`: unit kernel name → `(unit_names, K)`, `K` a `(n_widths, U₀, U₀)`
+  grid of widths (or one `U₀ × U₀`), symmetric PSD with unit diagonal. A
+  kernel starts at its middle width (`n_widths ÷ 2 + 1`) and `z = 0`; each
+  tree update picks the width with the best fit at the current weights;
+- `kernel_types`: kernel name → the types it applies to;
+- `covariates`: covariate name → `(unit_names, values)`, raw;
+- `covariate_types`: covariate name → the types whose mean it enters (the
+  slopes of the other types of a correlated set stay zero);
+- `kernel_sd` (default 2).
+
+Names are a `Dict` (sorted by name) or an ordered collection of pairs. Units
+match by name; a unit a kernel does not name gets an identity row, a unit
+without a covariate value raises, except `"none"`, which gets zero after the
+covariate is centred and scaled over the units with a value. The types of a correlated set need the same kernels. Leftover weights
+of a correlated set keep their marginal prior.
 
 `weights` (unconstrained, one per weight, kernels first) sets the starting
 weights; by default every variance weight starts where the kernels together
@@ -212,6 +240,7 @@ function KernelPrior(
     sd_prior::Union{Nothing,Tuple{Real,Real}}=(0.5, 4.0),
     root_sd::Union{Nothing,Real}=3.0,
     lkj_eta::Real=2.0,
+    unit_structure=nothing,
     weights::Union{Nothing,AbstractVector{<:Real}}=nothing,
 )
     T, r = if !isempty(kernels)
@@ -270,6 +299,7 @@ function KernelPrior(
         root_sd=root_sd === nothing ? nothing : T(root_sd),
         lkj_eta=T(lkj_eta),
     )
+    _attach_unit_structure!(trees, labels, unit_structure)
     for spec in (prior_sd, prior_mean)
         spec isa Union{NamedTuple,AbstractDict} || continue
         for type in keys(spec)

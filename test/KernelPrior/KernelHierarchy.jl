@@ -233,3 +233,325 @@ end
     ratio = σ ./ abs.(v)                # the SDs keep the units' proportions
     @test maximum(ratio) / minimum(ratio) < 1.01
 end
+
+# ----------------------------------------------------------------------------
+# Unit kernels and covariates
+# ----------------------------------------------------------------------------
+
+# A grid of squared-exponential kernels (unit diagonal) over positions `x`.
+function kh_grid(x, lengths)
+    K = zeros(length(lengths), length(x), length(x))
+    for (i, ℓ) in enumerate(lengths)
+        K[i, :, :] .= exp.(-(x .- x') .^ 2 ./ (2ℓ^2))
+    end
+    return K
+end
+
+# A tree over `labels` with the unit structure `spec`, started at `m0`.
+function kh_unit_tree(labels, levels, m0, spec; correlated=(), kwargs...)
+    tree = kh_tree(labels, levels, m0; correlated, kwargs...)
+    KHSSD._attach_unit_structure!([tree], labels, spec)
+    return tree
+end
+
+# Draw the `U × d` weights of a tree from the model: Z μ + x βᵀ + (K_w ⊗ Ω)^½ e.
+function kh_draw(rng, Kw, Ω, M)
+    U, d = size(M)
+    E = cholesky(Symmetric(Kw)).L * randn(rng, U, d) * cholesky(Symmetric(Ω)).U
+    return M .+ E
+end
+
+@testset "unit structure: none leaves the trees as they were" begin
+    rng = MersenneTwister(21)
+    labels = kh_labels(:a, 6)
+    trees = KHSSD._build_trees(
+        Float64, labels, Dict(:a => 1), (); sd_prior=(0.5, 4.0), root_sd=3.0, lkj_eta=2.0
+    )
+    KHSSD._attach_unit_structure!(trees, labels, (;))
+    @test only(trees).unit_structure === nothing
+    r = 6
+    kernels = [
+        Kernel(reshape(Float64.(1:r .== i), r, 1); factor=true, name="u$i") for i in 1:r
+    ]
+    S = Matrix(Diagonal(exp.(randn(rng, r))))
+    plain = KernelPrior(kernels; levels=:hierarchical)
+    empty = KernelPrior(kernels; levels=:hierarchical, unit_structure=(;))
+    fit_kernel_weights!(plain, S, 10; rounds=20)
+    fit_kernel_weights!(empty, S, 10; rounds=20)
+    @test plain.weights == empty.weights && plain.weights_cov == empty.weights_cov
+    @test KHSSD._tree_state(only(plain.trees)) == KHSSD._tree_state(only(empty.trees))
+
+    # A structure without kernels or covariates (K_w = I, B = 0) is the plain model.
+    for (levels, groups) in ((1, fill(nothing, 30)), (2, [string(i % 3) for i in 1:30]))
+        a = randn(rng, 30) .+ [i % 3 for i in 1:30]
+        V = Matrix(Diagonal(0.1 .+ rand(rng, 30)))
+        plain = kh_tree(kh_labels(:a, 30; groups), levels, [0.0])
+        structured = kh_tree(kh_labels(:a, 30; groups), levels, [0.0])
+        structured.unit_structure = KHSSD.UnitStructure{Float64}(
+            String[],
+            Vector{Matrix{Float64}}[],
+            String[],
+            zeros(30, 0),
+            zeros(Bool, 0, 1),
+            2.0,
+            Float64[],
+            Int[],
+            zeros(0, 1),
+        )
+        @test KHSSD._update_tree!(plain, a, V; sweeps=5000, tol=1e-12)
+        @test KHSSD._update_tree!(structured, a, V; sweeps=5000, tol=1e-12)
+        @test KHSSD._tree_state(structured) ≈ KHSSD._tree_state(plain) rtol = 1e-8
+        @test structured.node_mean ≈ plain.node_mean rtol = 1e-8
+        @test structured.node_cov ≈ plain.node_cov rtol = 1e-8
+        μp, Λp = KHSSD._weight_prior!(zeros(30), zeros(30, 30), [plain])
+        μs, Λs = KHSSD._weight_prior!(zeros(30), zeros(30, 30), [structured])
+        @test μs ≈ μp && Λs ≈ Λp
+    end
+end
+
+@testset "unit structure: alignment and checks" begin
+    labels = vcat(kh_labels(:a, 4), [KHSSD.WeightLabel("none", :a, nothing, "none", :log)])
+    K = kh_grid([0.0, 1.0, 2.0], [1.0, 2.0])
+    spec = (;
+        kernels=Dict("near" => (["u3", "u1", "u2"], K)),
+        kernel_types=Dict("near" => (:a,)),
+        covariates=Dict("depth" => (["u1", "u2", "u3", "u4"], [1.0, 2.0, 3.0, 6.0])),
+        covariate_types=Dict("depth" => [:a]),
+    )
+    tree = kh_unit_tree(labels, 1, [0.0], spec)
+    s = tree.unit_structure
+    @test s.kernel_names == ["near"] && s.covariate_names == ["depth"]
+    @test length(s.kernels[1]) == 2 && s.width == [2] && s.z == [0.0]
+    # u1, u2, u3 at 1, 2, 0; u4 and "none" unknown to the kernel
+    @test s.kernels[1][2][1:3, 1:3] ≈ K[2, [2, 3, 1], [2, 3, 1]]
+    @test s.kernels[1][1][4:5, :] == [0 0 0 1 0; 0 0 0 0 1]
+    # centred and scaled over the units with a value; "none" gets zero
+    x = [1.0, 2.0, 3.0, 6.0]
+    @test s.X[1:4] ≈ (x .- mean(x)) ./ std(x; corrected=false)
+    @test s.X[5] == 0
+    @test s.flags == reshape([true], 1, 1) && s.beta == zeros(1, 1)
+
+    @test_throws ArgumentError kh_unit_tree(
+        labels,
+        1,
+        [0.0],
+        (;
+            covariates=Dict("depth" => (["u1", "u2"], [1.0, 2.0])),
+            covariate_types=Dict("depth" => [:a]),
+        ),
+    )
+    @test_throws ArgumentError kh_unit_tree(
+        labels, 1, [0.0], (; kernel_types=Dict("far" => [:a]))
+    )
+    @test_throws ArgumentError kh_unit_tree(labels, 1, [0.0], (; widths=1))
+    flat = kh_tree(labels, 0, [0.0])
+    @test_throws ArgumentError KHSSD._attach_unit_structure!([flat], labels, spec)
+    bad = (;
+        kernels=Dict("near" => (["u1", "u2"], [1.0 0.5; 0.4 1.0])),
+        kernel_types=Dict("near" => [:a]),
+    )
+    @test_throws ArgumentError kh_unit_tree(labels, 1, [0.0], bad)
+
+    # The types of a correlated set share their kernels.
+    pair = vcat(kh_labels(:a, 3), kh_labels(:b, 3))
+    one_sided = (;
+        kernels=Dict("near" => (["u1", "u2", "u3"], K[1, :, :])),
+        kernel_types=Dict("near" => [:a]),
+    )
+    @test_throws ArgumentError kh_unit_tree(
+        pair, 1, [0.0, 0.0], one_sided; correlated=[(:a, :b)]
+    )
+    shared = (; kernels=one_sided.kernels, kernel_types=Dict("near" => [:a, :b]))
+    joint = kh_unit_tree(pair, 1, [0.0, 0.0], shared; correlated=[(:a, :b)])
+    @test joint.unit_structure.kernel_names == ["near"]
+
+    # The w-step gradient.
+    rng = MersenneTwister(22)
+    s = KHSSD.UnitStructure{Float64}(
+        ["a", "b"],
+        [
+            [kh_grid(randn(rng, 7), [1.0])[1, :, :]],
+            [kh_grid(randn(rng, 7), [0.5])[1, :, :]],
+        ],
+        String[],
+        zeros(7, 0),
+        zeros(Bool, 0, 2),
+        2.0,
+        [0.3, -0.4],
+        [1, 1],
+        zeros(0, 2),
+    )
+    A = randn(rng, 7, 7)
+    F = A * A' + I
+    G = zeros(2)
+    KHSSD._unit_objective!(G, s, [0.3, -0.4], F, 2)
+    h = 1e-6
+    numeric = map(1:2) do k
+        e = h .* (1:2 .== k)
+        (
+            KHSSD._unit_objective!(nothing, s, [0.3, -0.4] .+ e, F, 2) -
+            KHSSD._unit_objective!(nothing, s, [0.3, -0.4] .- e, F, 2)
+        ) / 2h
+    end
+    @test G ≈ numeric rtol = 1e-5
+end
+
+@testset "unit structure: the prior it puts on the weights" begin
+    rng = MersenneTwister(23)
+    U = 5
+    labels = vcat(kh_labels(:a, U), kh_labels(:b, U + 1))
+    K = kh_grid(randn(rng, U), [0.7])
+    spec = (;
+        kernels=[("near" => (["u$i" for i in 1:U], K))],
+        kernel_types=["near" => (:a, :b)],
+        covariates=["depth" => (["u$i" for i in 1:U], randn(rng, U))],
+        covariate_types=["depth" => (:b,)],
+    )
+    trees = KHSSD._build_trees(
+        Float64,
+        labels,
+        Dict(:a => 1, :b => 1),
+        [(:a, :b)];
+        sd_prior=(0.5, 4.0),
+        root_sd=3.0,
+        lkj_eta=2.0,
+    )
+    KHSSD._attach_unit_structure!(trees, labels, spec)
+    tree = only(trees)
+    s = tree.unit_structure
+    @test s.flags == [false true]
+    tree.root_centre .= 0
+    tree.node_mean .= [0.3 -0.7]
+    tree.sds .= [0.5, 2.0]
+    tree.corr .= [1.0 0.6; 0.6 1.0]
+    s.z .= [0.8]
+    s.beta .= [0.0 0.4]
+    nw = length(labels)
+    μ, Λ = KHSSD._weight_prior!(zeros(nw), zeros(nw, nw), trees)
+    w = KHSSD._unit_weights([0.8])
+    Kw = w[1] * I + w[2] * K[1, :, :]
+    Ω = KHSSD._tree_omega(tree)
+    order = vec(permutedims(tree.idx))
+    @test Λ[order, order] ≈ kron(inv(Kw), inv(Ω))
+    @test μ[tree.idx[:, 1]] ≈ fill(0.3, U)
+    @test μ[tree.idx[:, 2]] ≈ -0.7 .+ 0.4 .* s.X[:, 1]
+    # the leftover unit of :b keeps its marginal prior
+    @test tree.leftover == [Int[], [nw]]
+    @test Λ[nw, nw] ≈ 1 / 4.0 && μ[nw] ≈ -0.7
+    @test count(!iszero, Λ[nw, :]) == 1
+    s.z .= 0
+    base = KHSSD._tree_logdensity(tree)
+    s.z .= [0.8]
+    @test KHSSD._tree_logdensity(tree) ≈ base - 0.8^2 / 8
+end
+
+@testset "unit structure: the update recovers a kernel and a slope" begin
+    rng = MersenneTwister(24)
+    U = 300
+    positions = sort(rand(rng, U))
+    lengths = [0.01, 0.03, 0.1, 0.3]
+    K = kh_grid(positions, lengths)
+    x = randn(rng, U)
+    x = (x .- mean(x)) ./ std(x; corrected=false)
+    groups = [string(1 + i % 3) for i in 1:U]
+    names = ["u$i" for i in 1:U]
+    spec = (;
+        kernels=Dict("near" => (names, K)),
+        kernel_types=Dict("near" => [:a]),
+        covariates=Dict("depth" => (names, 3 .* x .+ 1)),
+        covariate_types=Dict("depth" => [:a]),
+    )
+    z, β, σ = 1.5, 0.8, 0.5
+    w = KHSSD._unit_weights([z])
+    Kw = w[1] * I + w[2] * K[2, :, :]   # the grid starts at its third width
+    centres = Dict("1" => -1.0, "2" => 0.0, "3" => 1.0)
+    M = reshape([centres[g] for g in groups] .+ β .* x, U, 1)
+    η = vec(kh_draw(rng, Kw, fill(σ^2, 1, 1), M))
+    tree = kh_unit_tree(kh_labels(:a, U; groups), 2, [0.0], spec)
+    converged = KHSSD._update_tree!(tree, η, Matrix(1e-4I, U, U))
+    @test converged
+    s = tree.unit_structure
+    @test s.width == [2]
+    @test KHSSD._unit_weights(s.z)[2] ≈ w[2] atol = 0.1
+    @test s.beta[1] ≈ β atol = 0.15
+    @test tree.sds[1] ≈ σ rtol = 0.2
+    # the field's own mean shifts every node alike
+    found = vec(tree.node_mean)
+    @test found .- mean(found) ≈ [centres[n] for n in tree.node_names] atol = 0.25
+
+    # Without the kernel the units look independent, with a smaller spread.
+    plain = kh_unit_tree(
+        kh_labels(:a, U; groups),
+        2,
+        [0.0],
+        (; covariates=spec.covariates, covariate_types=spec.covariate_types),
+    )
+    @test KHSSD._update_tree!(plain, η, Matrix(1e-4I, U, U))
+    @test plain.unit_structure.beta[1] ≈ β atol = 0.2
+end
+
+@testset "unit structure: a correlated set with a shared kernel" begin
+    rng = MersenneTwister(25)
+    U = 200
+    positions = sort(rand(rng, U))
+    K = kh_grid(positions, [0.05])
+    x = randn(rng, U)
+    x = (x .- mean(x)) ./ std(x; corrected=false)
+    names = ["u$i" for i in 1:U]
+    spec = (;
+        kernels=Dict("near" => (names, K)),
+        kernel_types=Dict("near" => [:a, :b]),
+        covariates=Dict("depth" => (names, x)),
+        covariate_types=Dict("depth" => [:a]),
+    )
+    z, β = 1.0, [0.6, 0.0]
+    sds, ρ = [0.5, 0.8], 0.5
+    Ω = sds .* [1 ρ; ρ 1] .* sds'
+    w = KHSSD._unit_weights([z])
+    Kw = w[1] * I + w[2] * K[1, :, :]
+    η = kh_draw(rng, Kw, Ω, [0.5 -1.0] .+ x * β')
+    labels = vcat(kh_labels(:a, U), kh_labels(:b, U))
+    tree = kh_unit_tree(labels, 1, [0.0, 0.0], spec; correlated=[(:a, :b)])
+    V = Matrix(1e-4I, 2U, 2U)
+    @test KHSSD._update_tree!(tree, vec(η), V; sweeps=500)
+    s = tree.unit_structure
+    @test s.flags == reshape([true, false], 1, 2)
+    @test s.beta[2] == 0
+    @test s.beta[1] ≈ β[1] atol = 0.15
+    @test KHSSD._unit_weights(s.z)[2] ≈ w[2] atol = 0.15
+    @test tree.sds ≈ sds rtol = 0.25
+    @test tree.corr[1, 2] ≈ ρ atol = 0.2
+    @test vec(tree.node_mean) ≈ [0.5, -1.0] atol = 0.4
+
+    # Through KernelPrior: the trees get the structure, and a fit runs.
+    U = 30
+    names = ["u$i" for i in 1:U]
+    spec = (;
+        kernels=Dict("near" => (names, kh_grid(positions[1:U], [0.05, 0.2]))),
+        kernel_types=Dict("near" => [:a, :b]),
+        covariates=Dict("depth" => (names, x[1:U])),
+        covariate_types=Dict("depth" => [:a]),
+    )
+    r = 2U
+    axis(i; kwargs...) = Kernel(reshape(Float64.(1:r .== i), r, 1); factor=true, kwargs...)
+    kernels = vcat(
+        [axis(i; name="u$i", type=:a) for i in 1:U],
+        [axis(U + i; name="u$i", type=:b) for i in 1:U],
+    )
+    prior = KernelPrior(
+        kernels; levels=:hierarchical, correlated=[(:a, :b)], unit_structure=spec
+    )
+    @test only(prior.trees).unit_structure.kernel_names == ["near"]
+    truth = vec(η[1:U, :])
+    S = Matrix(Diagonal(exp.(truth) .* [sum(abs2, randn(rng, 50)) / 50 for _ in 1:r]))
+    fit = fit_kernel_weights!(prior, S, 50; rounds=5)
+    @test fit.rounds >= 1 && isfinite(KHSSD._kernel_logprior(prior))
+    @test all(isfinite, prior.weights) && all(isfinite, only(prior.trees).unit_structure.z)
+    @test_throws ArgumentError KernelPrior(kernels; levels=:flat, unit_structure=spec)
+    @test_throws ArgumentError KernelPrior(
+        kernels;
+        levels=:hierarchical,
+        correlated=[(:a, :b)],
+        unit_structure=(; kernels=spec.kernels, kernel_types=Dict("near" => [:a])),
+    )
+end
