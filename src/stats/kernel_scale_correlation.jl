@@ -19,6 +19,19 @@ covers), `W_cb = Gw[:, cols] B_c[cols, :]` and `Z_cb = Gw[:, cols] Gw[:, cols]'`
     Σ_sc = Σ_b θ_b Z_b + Σ_c ρ_c (A_c A_c' − Σ_b θ_b Z_cb),   A_c = Σ_b √θ_b W_cb
 
 The weights are `[u ; a of family 1 ; a of family 2 ; …]`.
+
+A family may instead be one dense kernel shared by its units, each unit with its
+own weight (`SharedCorrelationFamily`): a kernel that crosses the units'
+borders, such as a surface Matérn kernel with a weight per parcel. On a block
+`h` of columns with the dense correlation `M_h`, unit `u(i)` and scale block
+`b(i)` of each column, with `c_i = √(θ_{b(i)} ρ_{u(i)})`:
+
+    E_h = diag(c) Gw[:, cols_h]',   F_h = M_h E_h
+    Σ_sc += Σ_h E_h' F_h − Σ_{u,b} ρ_u θ_b Z_ub
+
+(the identity part `Z_ub` is a unit's image of zero width, handled with the
+factor kernels' `Z_cb`); `E` and `F` are the `n_h² r` part, kept between the
+covariance and the gradient at the same weights.
 =============================================================================#
 
 # The first few of a list of names, for an error message.
@@ -76,6 +89,17 @@ function _unit_rows(::Type{T}, factor::AbstractMatrix{<:Real}) where {T<:Real}
 end
 
 """
+    AbstractCorrelationFamily{T}
+
+A family of correlation kernels of a [`ScaleCorrelation`](@ref): a
+[`CorrelationFamily`](@ref) (one sparse factor per kernel) or a
+`SharedCorrelationFamily` (one dense kernel, a weight per unit). Each has
+`type`, `names`, `groups`, `units` (the labels of its weights) and `covered`
+(the columns each weight's kernel covers).
+"""
+abstract type AbstractCorrelationFamily{T<:Real} end
+
+"""
     CorrelationFamily(factors; type, names, groups=nothing, units=names)
 
 One family of correlation kernels of a [`ScaleCorrelation`](@ref): kernels of
@@ -97,7 +121,7 @@ The labels are those of a [`Kernel`](@ref), one per factor:
 - `units`: match the kernels with the weights of other types (default: the
   names).
 """
-struct CorrelationFamily{T<:Real}
+struct CorrelationFamily{T<:Real} <: AbstractCorrelationFamily{T}
     type::Symbol
     names::Vector{String}
     groups::Vector{Union{Nothing,String}}
@@ -158,12 +182,152 @@ function _family_as(::Type{T}, family::CorrelationFamily) where {T<:Real}
     )
 end
 
+# One block of a shared kernel: the columns, the unit of each, and the dense
+# correlation matrix on them.
+struct _SharedBlock{T<:Real}
+    cols::Vector{Int}
+    owner::Vector{Int}
+    M::Matrix{T}
+end
+
+"""
+    SharedCorrelationFamily(blocks; type, names, groups=nothing, units=names, label="")
+
+One dense correlation kernel shared by the units of a family, each unit with
+its own weight `ρ_u`: a kernel that crosses the units' borders (a surface
+Matérn kernel with a weight per parcel, say), where a
+[`CorrelationFamily`](@ref) has one sparse kernel per weight.
+
+`blocks` holds one `(cols, owner, M)` tuple per block of columns (a hemisphere,
+say): `cols` the columns of the structure's gain, `owner` the unit (an index
+into `names`) of each, and `M` their dense correlation matrix (symmetric, unit
+diagonal; positive semidefinite, not checked). The blocks must not share a
+column and every unit needs a column. The kernel's part of the correlation
+matrix is `D^½ M D^½ − D` on those columns, `D = diag(ρ_{u(i)})`, so that a
+column's variance is untouched and the weights covering it keep their
+stick-broken sum below one.
+
+`type`, `names` (the units), `groups` and `units` are the labels of the
+weights, as for a [`CorrelationFamily`](@ref); `label` names the kernel (its
+range, say). A unit's kernel covers its columns, so ancestors and descendants
+follow from them as for any family: the units must lie inside one kernel of
+every earlier family, and later kernels inside one unit.
+"""
+struct SharedCorrelationFamily{T<:Real} <: AbstractCorrelationFamily{T}
+    type::Symbol
+    names::Vector{String}
+    groups::Vector{Union{Nothing,String}}
+    units::Vector{String}
+    blocks::Vector{_SharedBlock{T}}
+    covered::Vector{Vector{Int}}                # the columns each unit covers
+    label::String
+end
+
+function SharedCorrelationFamily(
+    blocks::AbstractVector; type::Symbol, names, groups=nothing, units=names, label=""
+)
+    isempty(blocks) &&
+        throw(ArgumentError("the shared correlation family :$type has no block"))
+    count = length(names)
+    labels, nodes, matched = _weight_labels(type, count, names, groups, units)
+    T = float(mapreduce(block -> eltype(block[3]), promote_type, blocks))
+    parts = _SharedBlock{T}[]
+    seen = Set{Int}()
+    for (h, block) in enumerate(blocks)
+        length(block) == 3 || throw(
+            ArgumentError("a block is a (cols, owner, M) tuple; got $(length(block))")
+        )
+        cols, owner, M = Vector{Int}(block[1]), Vector{Int}(block[2]), block[3]
+        tag = "block $h of the shared correlation family :$type"
+        isempty(cols) && throw(ArgumentError("$tag has no column"))
+        size(M) == (length(cols), length(cols)) || throw(
+            DimensionMismatch(
+                "$tag: M is $(size(M)); its $(length(cols)) columns need a square matrix",
+            ),
+        )
+        length(owner) == length(cols) || throw(
+            DimensionMismatch(
+                "$tag: owner needs one unit per column ($(length(cols))); got " *
+                "$(length(owner))",
+            ),
+        )
+        all(>(0), cols) || throw(ArgumentError("$tag: cols are 1-based column indices"))
+        all(u -> 1 <= u <= count, owner) || throw(
+            ArgumentError(
+                "$tag: owner indexes the $count names; got " *
+                "$(minimum(owner)) to $(maximum(owner))",
+            ),
+        )
+        all(isfinite, M) || throw(ArgumentError("$tag: M has non-finite entries"))
+        maximum(abs, diag(M) .- 1) <= 1e-8 && maximum(abs, M .- M') <= 1e-8 ||
+            throw(ArgumentError("$tag: M must be a symmetric correlation matrix"))
+        length(unique(cols)) == length(cols) ||
+            throw(ArgumentError("$tag: cols repeats a column"))
+        any(in(seen), cols) && throw(
+            ArgumentError("the blocks of the shared correlation family :$type overlap")
+        )
+        union!(seen, cols)
+        push!(parts, _SharedBlock{T}(cols, owner, Matrix{T}((M .+ M') ./ 2)))
+    end
+    covered = [sort!(reduce(vcat, [b.cols[b.owner .== u] for b in parts])) for u in 1:count]
+    empty = findall(isempty, covered)
+    isempty(empty) || throw(
+        ArgumentError("every unit needs a column; none for " * _first_few(labels[empty])),
+    )
+    return SharedCorrelationFamily{T}(
+        type, labels, nodes, matched, parts, covered, string(label)
+    )
+end
+
+function _family_as(::Type{T}, family::SharedCorrelationFamily) where {T<:Real}
+    return SharedCorrelationFamily{T}(
+        family.type,
+        family.names,
+        family.groups,
+        family.units,
+        [_SharedBlock{T}(b.cols, b.owner, Matrix{T}(b.M)) for b in family.blocks],
+        family.covered,
+        family.label,
+    )
+end
+
+# The columns a family's kernels reach: for a check against the gain's width.
+_family_rows(family::CorrelationFamily) = size(first(family.factors), 1)
+function _family_rows(family::SharedCorrelationFamily)
+    return maximum(maximum(b.cols) for b in family.blocks)
+end
+
 # What a correlation kernel adds on one scale block: the block, `W_cb`, and the
 # index of `Z_cb` in the structure's `Z`.
 struct _BlockImage{T<:Real}
     block::Int
     image::Matrix{T}
     z::Int
+end
+
+# A block of a shared kernel as a structure uses it: `M`, the rows `W` of
+# `Gw[:, cols]'`, the kernel (flat, over all families) and scale block of each
+# row, and the rows of each unit and of each scale block.
+struct _SharedPart{T<:Real}
+    M::Matrix{T}
+    W::Matrix{T}
+    kernel::Vector{Int}
+    scale::Vector{Int}
+    by_kernel::Vector{Pair{Int,Vector{Int}}}
+    by_scale::Vector{Pair{Int,Vector{Int}}}
+end
+
+# `E = diag(√(θρ)) W` and `F = M E` of every shared block, for the weights
+# `key = [θ ; ρ]` they were last computed at.
+mutable struct _SharedTerms{T<:Real}
+    key::Vector{T}
+    E::Vector{Matrix{T}}
+    F::Vector{Matrix{T}}
+    const lock::ReentrantLock
+end
+
+function _SharedTerms{T}() where {T<:Real}
+    return _SharedTerms{T}(T[], Matrix{T}[], Matrix{T}[], ReentrantLock())
 end
 
 """
@@ -182,7 +346,9 @@ matrix, the `structure` of a [`KernelPrior`](@ref):
   variance weight `θ_b = exp(u_b)`;
 - `names`, `groups`, `units`: the labels of the `g` scale weights, of the type
   `type` (see [`Kernel`](@ref));
-- `families`: the [`CorrelationFamily`](@ref)s, ordered coarse to fine.
+- `families`: the [`CorrelationFamily`](@ref)s, ordered coarse to fine; a
+  `SharedCorrelationFamily` (one dense kernel, a weight per unit) may stand
+  among them.
 
 A correlation kernel `c` has a correlation matrix `R_c` on the columns it
 covers (`I_c` is their identity) and a weight `ρ_c`: a column's variance is
@@ -211,7 +377,7 @@ struct ScaleCorrelation{T<:Real} <: AbstractKernelStructure{T}
     names::Vector{String}
     groups::Vector{Union{Nothing,String}}
     units::Vector{String}
-    families::Vector{CorrelationFamily{T}}
+    families::Vector{AbstractCorrelationFamily{T}}
     # per correlation kernel, families in order: the kernels enclosing it
     ancestors::Vector{Vector{Int}}
     # Z_b of each scale block, then the distinct Z_cb
@@ -221,7 +387,11 @@ struct ScaleCorrelation{T<:Real} <: AbstractKernelStructure{T}
     # the Z side by side, each as a column (r² × length(Z)), for one gemv
     Zstack::Matrix{T}
     # per correlation kernel: its columns in the kernels' images side by side
+    # (none for a shared family's unit: its image has no width)
     columns::Vector{UnitRange{Int}}
+    # the blocks of the shared families, and their `E`, `F` at the last weights
+    shared::Vector{_SharedPart{T}}
+    terms::_SharedTerms{T}
 end
 
 function ScaleCorrelation(
@@ -284,13 +454,14 @@ function ScaleCorrelation(
 
     # Any vector of families, so that `families=[]` (a `Vector{Any}`) is no family.
     for family in families
-        family isa CorrelationFamily || throw(
+        family isa AbstractCorrelationFamily || throw(
             ArgumentError(
-                "families must hold CorrelationFamily values; got $(typeof(family))"
+                "families must hold CorrelationFamily or SharedCorrelationFamily " *
+                "values; got $(typeof(family))",
             ),
         )
     end
-    fams = CorrelationFamily{T}[_family_as(T, family) for family in families]
+    fams = AbstractCorrelationFamily{T}[_family_as(T, family) for family in families]
     types = Symbol[family.type for family in fams]
     allunique(types) || throw(
         ArgumentError(
@@ -302,21 +473,43 @@ function ScaleCorrelation(
         ArgumentError("a correlation family has the type of the scale blocks, :$type")
     )
     for family in fams
-        rows = size(first(family.factors), 1)
-        rows == n || throw(
-            DimensionMismatch(
-                "the factors of the correlation family :$(family.type) have $rows " *
-                "rows; gain has $n columns",
-            ),
-        )
+        rows = _family_rows(family)
+        if family isa SharedCorrelationFamily
+            rows <= n || throw(
+                DimensionMismatch(
+                    "the shared correlation family :$(family.type) has a column " *
+                    "$rows; gain has $n columns",
+                ),
+            )
+        else
+            rows == n || throw(
+                DimensionMismatch(
+                    "the factors of the correlation family :$(family.type) have " *
+                    "$rows rows; gain has $n columns",
+                ),
+            )
+        end
     end
     ancestors = _correlation_ancestors(fams, n)
 
     block = Vector{Int}(block)
     slot = Dict{Tuple{Int,Vector{Int}},Int}((b, members[b]) => b for b in 1:g)
     images = Vector{_BlockImage{T}}[]
-    for family in fams, (B, cols) in zip(family.factors, family.covered)
-        push!(images, _block_images!(Z, slot, Gw, B, cols, block))
+    shared = _SharedPart{T}[]
+    for family in fams
+        before = length(images)
+        if family isa CorrelationFamily
+            for (B, cols) in zip(family.factors, family.covered)
+                push!(images, _block_images!(Z, slot, Gw, B, cols, block))
+            end
+        else
+            for cols in family.covered
+                push!(images, _block_images!(Z, slot, Gw, nothing, cols, block))
+            end
+            for part in family.blocks
+                push!(shared, _shared_part(part, before, Gw, block))
+            end
+        end
     end
     widths = [size(first(parts).image, 2) for parts in images]
     stops = cumsum(widths)
@@ -341,13 +534,17 @@ function ScaleCorrelation(
         images,
         Zstack,
         columns,
+        shared,
+        _SharedTerms{T}(),
     )
 end
 
 # For each correlation kernel (families in order), the kernels of the earlier
 # families that enclose it. A kernel must lie inside one kernel of an earlier
 # family or outside all of them.
-function _correlation_ancestors(families::Vector{<:CorrelationFamily}, n::Int)
+function _correlation_ancestors(
+    families::AbstractVector{<:AbstractCorrelationFamily}, n::Int
+)
     ancestors = Vector{Int}[]
     labels = String[]
     owners = Vector{Int}[]      # per family: the kernel covering each column, or 0
@@ -379,24 +576,53 @@ function _correlation_ancestors(families::Vector{<:CorrelationFamily}, n::Int)
     return ancestors
 end
 
+# The rows of each distinct value of `ids`, as `value => rows`, by value.
+function _group_rows(ids::Vector{Int})
+    rows = Dict{Int,Vector{Int}}()
+    for (i, id) in enumerate(ids)
+        push!(get!(rows, id, Int[]), i)
+    end
+    return sort!(collect(rows); by=first)
+end
+
+# A shared block's `W = Gw[:, cols]'` and the groupings of its rows; `before` is
+# the number of kernels before the family's first unit.
+function _shared_part(
+    part::_SharedBlock{T}, before::Int, Gw::Matrix{T}, block::Vector{Int}
+) where {T<:Real}
+    kernel = before .+ part.owner
+    scale = block[part.cols]
+    return _SharedPart{T}(
+        part.M,
+        Matrix{T}(transpose(Gw[:, part.cols])),
+        kernel,
+        scale,
+        _group_rows(kernel),
+        _group_rows(scale),
+    )
+end
+
 # The images of one kernel (unit-row factor `B`, covering `cols`) on the scale
 # blocks it touches. A `Z_cb` not yet in `Z` is appended; `slot` finds those
-# already there by their block and columns.
+# already there by their block and columns. A shared family's unit has no
+# factor (`B = nothing`): its images have no width, only the `Z_cb`.
 function _block_images!(
     Z::Vector{Matrix{T}},
     slot::Dict{Tuple{Int,Vector{Int}},Int},
     Gw::Matrix{T},
-    B::SparseMatrixCSC{T,Int},
+    B::Union{Nothing,SparseMatrixCSC{T,Int}},
     cols::Vector{Int},
     block::Vector{Int},
 ) where {T<:Real}
     touched = sort!(unique(view(block, cols)))
     position = Dict(b => k for (k, b) in enumerate(touched))
-    W = [zeros(T, size(Gw, 1), size(B, 2)) for _ in touched]
-    rows, values = rowvals(B), nonzeros(B)
-    for j in axes(B, 2), k in nzrange(B, j)
-        i = rows[k]
-        axpy!(values[k], view(Gw, :, i), view(W[position[block[i]]], :, j))
+    W = [zeros(T, size(Gw, 1), B === nothing ? 0 : size(B, 2)) for _ in touched]
+    if B !== nothing
+        rows, values = rowvals(B), nonzeros(B)
+        for j in axes(B, 2), k in nzrange(B, j)
+            i = rows[k]
+            axpy!(values[k], view(Gw, :, i), view(W[position[block[i]]], :, j))
+        end
     end
     within = [Int[] for _ in touched]
     for i in cols
@@ -559,6 +785,33 @@ function _split_mul(M::AbstractMatrix{T}, A::AbstractMatrix{T}) where {T<:Real}
     return out
 end
 
+# `M E`, by blocks of rows of `M` when split (a shared block is `n_h² r`).
+function _split_row_mul(M::AbstractMatrix{T}, E::AbstractMatrix{T}) where {T<:Real}
+    _split_blas() || return M * E
+    out = similar(E, size(M, 1), size(E, 2))
+    tforeach(_chunks(size(M, 1))) do part
+        return mul!(view(out, part, :), view(M, part, :), E)
+    end
+    return out
+end
+
+# `E` and `F = M E` of every shared block at the weights `θ`, `ρ`: the costly
+# part (`n_h² r` a block), kept for the covariance and the gradient that follow
+# at the same weights.
+function _shared_terms(s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T}) where {T<:Real}
+    key = vcat(θ, ρ)
+    cache = s.terms
+    return lock(cache.lock) do
+        if cache.key != key
+            root = sqrt.(max.(ρ, zero(T)))
+            E = [part.W .* (sqrt.(θ[part.scale]) .* root[part.kernel]) for part in s.shared]
+            F = [_split_row_mul(part.M, e) for (part, e) in zip(s.shared, E)]
+            cache.E, cache.F, cache.key = E, F, key
+        end
+        return cache.E, cache.F
+    end
+end
+
 # The coefficient of each `Z` in `Σ_sc`: `θ_b` on the blocks, `−Σ ρ_c θ_b` on
 # the `Z_cb`.
 function _z_coefficients(s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T}) where {T<:Real}
@@ -585,6 +838,14 @@ function _add_covariance!(
         Σ .+= Symmetric(_split_syrk(A), :L)
     end
     _split_gemv!(vec(Σ), s.Zstack, _z_coefficients(s, θ, ρ); add=true)
+    if !isempty(s.shared)
+        E, F = _shared_terms(s, θ, ρ)
+        X = zeros(T, size(Σ))
+        for (e, f) in zip(E, F)
+            mul!(X, e', f, one(T), one(T))
+        end
+        Σ .+= (X .+ X') ./ 2
+    end
     return Σ
 end
 
@@ -630,6 +891,18 @@ function _add_gradient!(
             end
         end
     end
+    if !isempty(s.shared)
+        # ∂ tr(G E'ME)/∂E_i = 2 (F G)_i, and E_i ∝ √(θ_b ρ_u): with
+        # p_i = (F G)_i · E_i, ∂/∂ρ_u = Σ_{i∈u} p_i/ρ_u and ∂/∂θ_b alike
+        E, F = _shared_terms(s, θ, ρ)
+        for (part, e, f) in zip(s.shared, E, F)
+            p = vec(sum((f * M) .* e; dims=2))
+            for (i, value) in enumerate(p)
+                slope_ρ[part.kernel[i]] += value / max(ρ[part.kernel[i]], 1e-300)
+                slope_θ[part.scale[i]] += value / max(θ[part.scale[i]], 1e-300)
+            end
+        end
+    end
     for b in 1:g
         grad[b] += θ[b] * slope_θ[b]
     end
@@ -650,13 +923,28 @@ function _derivatives!(
     for (c, images) in enumerate(s.images)
         A = _kernel_image(images, rootθ)
         Dρ = view(D, :, :, g + c)
-        mul!(Dρ, A, A')
+        size(A, 2) == 0 ? fill!(Dρ, zero(T)) : mul!(Dρ, A, A')
         for part in images
             b = part.block
             Zcb = s.Z[part.z]
             WA = part.image * A'
             view(D, :, :, b) .+= ρ[c] .* ((WA .+ WA') ./ (2 * rootθ[b]) .- Zcb)
             Dρ .-= θ[b] .* Zcb
+        end
+    end
+    if !isempty(s.shared)
+        # ∂(E'ME)/∂w = Σ_{i∈w} (E_i F_i' + F_i E_i') / 2w, for a unit's ρ and a
+        # scale block's θ alike
+        E, F = _shared_terms(s, θ, ρ)
+        X = zeros(T, size(D, 1), size(D, 2))
+        for (part, e, f) in zip(s.shared, E, F)
+            for (groups, weights, offset) in ((part.by_kernel, ρ, g), (part.by_scale, θ, 0))
+                for (id, rows) in groups
+                    mul!(X, view(e, rows, :)', view(f, rows, :))
+                    scale = 1 / (2 * max(weights[id], 1e-300))
+                    view(D, :, :, offset + id) .+= scale .* (X .+ X')
+                end
+            end
         end
     end
     # to (u, a): as `_stick_adjoint!`, on matrices

@@ -460,3 +460,304 @@ end
         haskey(options, :correlated) && @test tree.idx == hcat(2:7, 10:15)
     end
 end
+
+#=== A shared kernel with a weight per unit ===================================#
+
+# An exponential kernel on `m` ordered columns, positive definite.
+sc_exp_kernel(m, length) = [exp(-abs(i - j) / length) for i in 1:m, j in 1:m]
+
+# Σ_sc from the definition for a structure with shared families: `layout` lists
+# the families in order, `(:factors, F, count)` (one factor per kernel) or
+# `(:shared, blocks, count)` (`blocks` of `(cols, owner, M)`). Dense, any
+# element type of `w`.
+function sc_shared_sigma(w, G, v, block, layout, ancestors)
+    g = maximum(block)
+    n = length(block)
+    θ = exp.(w[1:g])
+    ρ = sc_rho(w[(g + 1):end], ancestors)
+    C = Matrix{eltype(w)}(I, n, n)
+    flat = 0
+    for (kind, spec, count) in layout
+        if kind === :factors
+            C += sc_correlation(ρ[(flat + 1):(flat + count)], spec) - I
+        else
+            for (cols, owner, M) in spec
+                d = sqrt.(ρ[flat .+ owner])
+                C[cols, cols] .+= d .* M .* d' .- Diagonal(d .^ 2)
+            end
+        end
+        flat += count
+    end
+    scale = sqrt.(θ[block] .* v)
+    return G * (scale .* C .* scale') * G'
+end
+
+# 14 columns in 3 scale blocks. Networks 1:6 and 7:12; a shared kernel over two
+# blocks of columns (1:9 and 10:14, so its unit 3 sits in network 2 and unit 5
+# in none) with five units; two fine kernels, each inside one unit.
+function sc_shared_problem(rng, order; r=5)
+    n = 14
+    G = randn(rng, r, n)
+    v = 0.5 .+ rand(rng, n)
+    block = [1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 1, 3]
+    factor(cols, m) = (F = zeros(n, m); F[cols, :] .= randn(rng, length(cols), m); F)
+    nets = [factor(1:6, 1), factor(7:12, 1)]
+    fine = [factor(1:3, 2), factor(7:9, 3)]
+    blocks = [
+        (collect(1:9), [1, 1, 1, 2, 2, 2, 3, 3, 3], sc_exp_kernel(9, 2.0)),
+        (collect(10:14), [4, 4, 4, 5, 5], sc_exp_kernel(5, 1.5)),
+    ]
+    units = ["u$i" for i in 1:5]
+    make = Dict(
+        :coarse => () -> CorrelationFamily(nets; type=:coarse, names=["c1", "c2"]),
+        :matern =>
+            () -> SCSSD.SharedCorrelationFamily(
+                blocks;
+                type=:matern,
+                names=units,
+                groups=["a", "a", "b", "b", nothing],
+                label="range 2",
+            ),
+        :fine => () -> CorrelationFamily(fine; type=:fine, names=["f1", "f3"]),
+    )
+    ancestors_in = Dict(
+        (:coarse, :matern, :fine) =>
+            [Int[], Int[], [1], [1], [2], [2], Int[], [1, 3], [2, 5]],
+        (:matern, :fine) => [Int[], Int[], Int[], Int[], Int[], [1], [3]],
+        (:matern,) => [Int[] for _ in 1:5],
+        (:coarse, :matern) => [Int[], Int[], [1], [1], [2], [2], Int[]],
+    )
+    layouts = Dict(
+        :coarse => (:factors, nets, 2),
+        :matern => (:shared, blocks, 5),
+        :fine => (:factors, fine, 2),
+    )
+    families = [make[name]() for name in order]
+    layout = [layouts[name] for name in order]
+    ancestors = ancestors_in[order]
+    sc = ScaleCorrelation(G, v, block; names=["b1", "b2", "b3"], families)
+    return (; G, v, block, layout, ancestors, families, sc, n_weights=3 + length(ancestors))
+end
+
+const SC_SHARED_ORDERS = [
+    (:coarse, :matern, :fine), (:matern, :fine), (:matern,), (:coarse, :matern)
+]
+
+@testset "scale-correlation: a shared kernel" begin
+    rng = MersenneTwister(21)
+    for order in SC_SHARED_ORDERS
+        p = sc_shared_problem(rng, order)
+        sc = p.sc
+        nw = p.n_weights
+        @test sc.ancestors == p.ancestors
+        @test SCSSD._structure_dim(sc) == 5
+        labels = SCSSD._structure_labels(sc)
+        @test length(labels) == nw
+        shared = findfirst(f -> f isa SCSSD.SharedCorrelationFamily, p.families)
+        fam = p.families[shared]
+        @test fam.covered == [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12], [13, 14]]
+        start = 3 + sum(length(f.names) for f in p.families[1:(shared - 1)]; init=0)
+        mine = labels[(start + 1):(start + 5)]
+        @test [l.name for l in mine] == ["u1", "u2", "u3", "u4", "u5"]
+        @test all(l.type === :matern && l.link === :logit && l.unit == l.name for l in mine)
+        @test [l.group for l in mine] == ["a", "a", "b", "b", nothing]
+        @test all(isnan, SCSSD._structure_traces(sc)[4:end])
+
+        for scale in (0.5, 2.0, 50.0)
+            w = scale .* randn(rng, nw)
+            Σ = zeros(5, 5)
+            SCSSD._add_covariance!(Σ, sc, w)
+            expected = sc_shared_sigma(w, p.G, p.v, p.block, p.layout, p.ancestors)
+            @test Σ ≈ expected rtol = 1e-10
+            @test SCSSD._add_covariance!(copy(Σ), sc, w) ≈ 2 .* expected rtol = 1e-10
+            @test issymmetric(Σ)
+            @test eigmin(Symmetric(Σ)) > -1e-9 * norm(Σ)
+        end
+
+        # ∂Σ/∂w and tr(G ∂Σ/∂w) against the dense reference
+        reference = x -> sc_shared_sigma(x, p.G, p.v, p.block, p.layout, p.ancestors)
+        for scale in (0.5, 3.0)
+            w = scale .* randn(rng, nw)
+            Gm = randn(rng, 5, 5)
+            Gm = Gm + Gm'
+            grad = ones(nw)
+            SCSSD._add_gradient!(grad, sc, w, Gm)
+            @test grad .- 1 ≈ ForwardDiff.gradient(x -> dot(Gm, reference(x)), w) rtol =
+                1e-9
+            D = fill(NaN, 5, 5, nw)
+            SCSSD._derivatives!(D, sc, w)
+            @test reshape(D, 25, nw) ≈ ForwardDiff.jacobian(x -> vec(reference(x)), w) rtol =
+                1e-9
+        end
+    end
+
+    # the cached E and F follow the weights: the covariance, then the gradient
+    # at the same weights (a hit), then at others (a miss)
+    p = sc_shared_problem(rng, (:coarse, :matern, :fine))
+    reference = x -> sc_shared_sigma(x, p.G, p.v, p.block, p.layout, p.ancestors)
+    w1, w2 = randn(rng, p.n_weights), randn(rng, p.n_weights)
+    Gm = Matrix(Symmetric(randn(rng, 5, 5)))
+    SCSSD._add_covariance!(zeros(5, 5), p.sc, w1)
+    for w in (w1, w2, w1)
+        grad = zeros(p.n_weights)
+        SCSSD._add_gradient!(grad, p.sc, w, Gm)
+        @test grad ≈ ForwardDiff.gradient(x -> dot(Gm, reference(x)), w) rtol = 1e-9
+    end
+
+    # a single-precision structure
+    single = ScaleCorrelation(
+        Float32.(p.G), p.v, p.block; names=["b1", "b2", "b3"], families=p.families
+    )
+    @test single isa ScaleCorrelation{Float32}
+    Σ = zeros(Float32, 5, 5)
+    SCSSD._add_covariance!(Σ, single, Float32.(w1))
+    @test Σ ≈ reference(w1) rtol = 1e-3
+end
+
+@testset "scale-correlation: a shared kernel is checked" begin
+    rng = MersenneTwister(22)
+    M = sc_exp_kernel(4, 2.0)
+    ok = [(1:4, [1, 1, 2, 2], M)]
+    shared(blocks; kwargs...) =
+        SCSSD.SharedCorrelationFamily(blocks; type=:matern, names=["a", "b"], kwargs...)
+    @test shared(ok).covered == [[1, 2], [3, 4]]
+    @test shared(ok; units=["x", "y"]).units == ["x", "y"]
+    @test_throws ArgumentError shared([])
+    @test_throws ArgumentError shared([(1:4, [1, 1, 2, 2], M), (4:5, [1, 2], M[1:2, 1:2])])  # overlap
+    @test_throws ArgumentError shared([(1:4, [1, 1, 1, 1], M)])             # unit b: no column
+    @test_throws ArgumentError shared([(1:4, [1, 1, 2, 3], M)])             # owner out of range
+    @test_throws ArgumentError shared([(1:4, [1, 1, 2, 2], 2 .* M)])        # not a correlation
+    @test_throws ArgumentError shared([(1:4, [1, 1, 2, 2], M .+ [0 0 0 0.1; zeros(3, 4)])])
+    @test_throws ArgumentError shared([(1:4, [1, 1, 2, 2], fill(NaN, 4, 4))])
+    @test_throws ArgumentError shared([(0:3, [1, 1, 2, 2], M)])
+    @test_throws ArgumentError shared([([1, 1, 2, 3], [1, 1, 2, 2], M)])    # repeated column
+    @test_throws DimensionMismatch shared([(1:4, [1, 1, 2, 2], M[1:3, 1:3])])
+    @test_throws DimensionMismatch shared([(1:4, [1, 2, 2], M)])
+    @test_throws ArgumentError SCSSD.SharedCorrelationFamily(
+        ok; type=:matern, names=["a", "a"]
+    )
+
+    G, v, block = randn(rng, 3, 6), ones(6), [1, 1, 1, 2, 2, 2]
+    family = shared(ok)
+    # a column beyond the gain
+    @test_throws DimensionMismatch ScaleCorrelation(
+        G[:, 1:3], v[1:3], [1, 1, 2]; names=["s", "t"], families=[family]
+    )
+    # families need distinct types, whichever kind
+    other = CorrelationFamily([ones(6, 1)]; type=:matern, names=["x"])
+    @test_throws ArgumentError ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[family, other]
+    )
+    # units must nest: a later kernel across two units; an earlier kernel holding
+    # both units, or cutting across them
+    across = CorrelationFamily([[1.0 1 1 1 0 0]']; type=:wide, names=["w"])
+    @test_throws ArgumentError ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[family, across]
+    )
+    @test ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[across, family]
+    ).ancestors == [Int[], [1], [1]]                    # both units inside `across`
+    straddle = CorrelationFamily([[0.0 1 1 0 0 0]']; type=:mid, names=["m"])
+    @test_throws ArgumentError ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[straddle, family]
+    )
+    inside = CorrelationFamily([[1.0 1 0 0 0 0]']; type=:inner, names=["i"])
+    @test ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[family, inside]
+    ).ancestors == [Int[], Int[], [1]]
+    @test_throws ArgumentError ScaleCorrelation(
+        G, v, block; names=["s", "t"], families=[family, 3]
+    )
+end
+
+@testset "scale-correlation: a shared kernel, fit" begin
+    rng = MersenneTwister(23)
+    r, per, g = 10, 6, 6
+    n = per * g
+    G = randn(rng, r, n)
+    v = 0.5 .+ rand(rng, n)
+    block = repeat(1:g; inner=per)
+    names = ["p$b" for b in 1:g]
+    groups = ["n1", "n1", "n1", "n2", "n2", "n2"]
+    net = map(1:2) do k
+        F = zeros(n, 1)
+        F[findall(b -> groups[b] == "n$k", block), :] .= 1
+        F
+    end
+    # one dense kernel over the whole cortex (two "hemispheres"), a weight per parcel
+    half = n ÷ 2
+    blocks = [
+        (collect(1:half), block[1:half], sc_exp_kernel(half, 4.0)),
+        (collect((half + 1):n), block[(half + 1):n], sc_exp_kernel(n - half, 6.0)),
+    ]
+    families = [
+        CorrelationFamily(net; type=:net, names=["n1", "n2"]),
+        SCSSD.SharedCorrelationFamily(blocks; type=:matern, names, groups),
+    ]
+    sc = ScaleCorrelation(G, v, block; names, groups, families)
+    @test sc.ancestors == vcat([Int[], Int[]], [[1], [1], [1], [2], [2], [2]])
+    noise = [Kernel(Matrix(1.0I, r, r); name="I", type=:nuisance)]
+
+    ν, θ = 0.5, [1.0, 2.0, 0.5, 1.5, 0.8, 1.2]
+    ρ_net = [0.2, 0.1]
+    ρ_mat = [0.5, 0.6, 0.4, 0.6, 0.5, 0.7]
+    rest = 1 .- ρ_net[[1, 1, 1, 2, 2, 2]]
+    truth = vcat(log(ν), log.(θ), sc_logit.(ρ_net), sc_logit.(ρ_mat ./ rest))
+    prior = KernelPrior(noise; structure=sc, prior_sd=5.0)
+    Σ = kernel_covariance(prior, truth)
+    draws = 200_000
+    X = cholesky(Symmetric(Σ)).L * randn(rng, r, draws)
+    S = X * X' / draws
+
+    found = fit_kernel_weights!(prior, S, draws; max_iter=1000)
+    @test found.converged
+    table = kernel_weights(prior)
+    @test [row.link for row in table] == vcat(fill(:log, 7), fill(:logit, 8))
+    @test [row.type for row in table][10:15] == fill(:matern, 6)
+    values = [row.value for row in table]
+    @test values[1:7] ≈ vcat(ν, θ) rtol = 0.15
+    @test values[10:15] ≈ ρ_mat atol = 0.1
+    @test all(row.sd > 0 for row in table)
+    @test all(abs(truth[i] - table[i].weight) < 4 * table[i].sd for i in 1:15)
+    μ, Λ = SCSSD._weight_prior(prior)
+    grad = zeros(15)
+    value = SCSSD._kernel_objective!(grad, prior, prior.weights, S, Float64(draws), μ, Λ)
+    @test value ≈ found.objective
+    @test norm(grad) < 1e-5 * abs(value)
+
+    # trees over the family, nested or pooled, alone or correlated with the
+    # scales by unit; and unit kernels on its units
+    X = cholesky(Symmetric(Σ)).L * randn(rng, r, 500)
+    S = X * X' / 500
+    for options in (
+        (; levels=(scale=:hierarchical, matern=:hierarchical)),
+        (; levels=(scale=:nested, matern=:nested)),
+        (; levels=(scale=:nested, matern=:nested), correlated=[(:scale, :matern)]),
+        (; levels=(scale=:hierarchical, matern=:flat)),
+    )
+        pooled = KernelPrior(noise; structure=sc, options...)
+        found = fit_kernel_weights!(pooled, S, 500; rounds=200)
+        @test found.converged
+        @test all(isfinite, pooled.weights)
+        @test isposdef(Symmetric(pooled.weights_cov))
+        @test isposdef(Symmetric(kernel_covariance(pooled)))
+        if haskey(options, :correlated)
+            tree = pooled.trees[findfirst(t -> :matern in t.types, pooled.trees)]
+            @test tree.idx == hcat(2:7, 10:15)
+        end
+    end
+    near = reshape([exp(-abs(i - j) / 2.0) for i in 1:g, j in 1:g], 1, g, g)
+    unit_structure = (;
+        kernels=["near" => (names, near)],
+        kernel_types=["near" => [:matern]],
+        covariates=Pair{String,Tuple{Vector{String},Vector{Float64}}}[],
+        covariate_types=Pair{String,Vector{Symbol}}[],
+        kernel_sd=2.0,
+    )
+    grouped = KernelPrior(
+        noise; structure=sc, levels=(scale=:hierarchical, matern=:nested), unit_structure
+    )
+    found = fit_kernel_weights!(grouped, S, 500; rounds=200)
+    @test found.converged
+    @test all(isfinite, grouped.weights)
+end

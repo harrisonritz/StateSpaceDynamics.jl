@@ -78,6 +78,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Q` and `R` priors; not with an `AB_prior`, a kernel prior on `H` or a free
   `C`. `dynamics_posterior` returns `q(A)`.
 
+  A `ScaleCorrelation` family can instead be one dense kernel shared by its
+  units, each unit with its own stick-broken weight:
+  `SSD.SharedCorrelationFamily(blocks; type, names, groups, units, label)` (not
+  exported), for a kernel that crosses the units' borders, such as a surface
+  Matérn kernel with a weight per parcel. A block is a `(cols, owner, M)` tuple
+  (columns of the gain, the unit of each, their dense correlation `M`); a
+  unit's part of the correlation matrix is `D^½ M D^½ − D` with
+  `D = diag(ρ_unit)`. Units are nested among the other families like any
+  kernel (earlier families enclose them, later kernels sit inside one unit),
+  and their weights take the same trees, joint structure and unit kernels. The
+  `n_h² r` product `M E` of each block is computed once for the covariance and
+  the gradient at the same weights and split over Julia's threads.
+
   A tutorial, *Kernel priors on a parcellated cortex*, builds a full
   model comparison of sum-of-kernels and scale–correlation priors (parcel,
   network and global scales; network, parcel and geodesic coherences; nested,
