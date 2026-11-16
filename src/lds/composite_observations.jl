@@ -1219,7 +1219,9 @@ Whether the BLAS-3 batched mean pass applies to this model. False for a
 composite emission — see [`_batched_ntrials`](@ref) for why, and for what it
 does and does not cost.
 """
-_supports_batched(::LinearDynamicalSystem) = true
+# An uncertain A adds `Δ_A x` to the gradient, which the batched pass has not.
+_supports_batched(lds::LinearDynamicalSystem) = !_has_dynamics_prior(lds.state_model)
+_has_dynamics_prior(sm) = hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior
 
 function _supports_batched(
     ::LinearDynamicalSystem{T,S,O}

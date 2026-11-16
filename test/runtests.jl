@@ -644,7 +644,7 @@ using SSDTest
         include("LinearDynamicalSystems/Holdout.jl")
         include("LinearDynamicalSystems/FitDiagnostics.jl")
         include("LinearDynamicalSystems/FixedObservationIntercept.jl")
-        include("LinearDynamicalSystems/EmissionBasis.jl")
+        include("LinearDynamicalSystems/KernelEmissions.jl")
         @testset "Held-out ELBO and early stopping" begin
             test_holdout_non_breaking()
             test_holdout_matches_standalone_elbo()
@@ -862,6 +862,14 @@ using SSDTest
     end
 
     # Conjugate-prior helpers (IW / MN MAP + log-prior terms)
+    @testset verbose = true "Kernel priors" begin
+        include("KernelPrior/KernelPrior.jl")
+        include("KernelPrior/KernelHierarchy.jl")
+        include("KernelPrior/ScaleCorrelation.jl")
+        include("KernelPrior/KernelCovariancePrior.jl")
+        include("KernelPrior/KernelDynamicsPrior.jl")
+    end
+
     @testset verbose = true "Priors" begin
         include("Priors/Priors.jl")
         test_iw_prior_helpers()

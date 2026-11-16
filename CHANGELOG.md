@@ -8,6 +8,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Gaussian emissions with a constrained loading, a kernel prior on it, or
+  both.** `ConstrainedGaussianObservationModel` (`C = basis * H`, `H` free),
+  `KernelGaussianObservationModel` (the columns of `C` drawn from a
+  `KernelPrior`) and `ConstrainedKernelGaussianObservationModel` (the columns
+  of `H`). A `KernelPrior` is a zero-mean Gaussian whose covariance is a
+  weighted sum of `Kernel`s, optionally with a `ScaleCorrelation` structure
+  (scales and stick-broken correlations), and a hyperprior on the weights by
+  `type`: `:flat`, `:hierarchical` or `:nested`, with weakly informative
+  hyperpriors on the fitted levels and optional correlation between types.
+
+  `fit!` is variational Laplace EM: an exact Gaussian posterior of the loading,
+  the existing smoother with the loading's uncertainty in the emission
+  precision, the weights' MAP and Laplace covariance, and the hyperprior
+  updated from it. The emission's `gauge` field chooses between the gauge that
+  maximises the bound (a parameter-expansion step, the default), a unit second
+  moment of the latents, and no step. `fit_kernel_weights!`, `kernel_weights`,
+  `kernel_covariance` and `kernel_evidence` fit and inspect a `KernelPrior` on
+  its own. Needs a `GaussianStateModel`; not available in an `SLDS`, a
+  composite emission, or with `depends_on`.
+
+  The weights' fit stops at a relative decrease of `f_reltol` (default `1e-8`,
+  scipy's `ftol` as in dynameg) as well as at `g_tol`, computes each line-search
+  point's value and gradient together, and builds a scale–correlation
+  covariance and gradient from the kernels' images side by side (one `syrk` and
+  one `gemm` rather than a call per kernel). With BLAS on one thread and Julia
+  on several, those calls and the Laplace covariance are split over Julia's
+  threads. A precompile workload (PrecompileTools, a new dependency) caches
+  the kernel-prior fit's methods in the package image, so that a fresh Julia
+  process does not compile them before its first fit.
+
+  `KernelPrior(...; unit_structure)` adds group-level structure across the
+  units of a fitted type (or correlated set): unit kernels on their covariance,
+  `Cov = K_w ⊗ Ω` with `K_w = w₀ I + Σ_k w_k K_k` (softmax weights with a
+  Gaussian prior on their logits, each kernel's width chosen from a grid), and
+  covariates on their mean with fitted slopes. Units match by name. Without it
+  the prior and its fits are unchanged.
+
+- **Kernel priors on the noise covariances: `KernelIWPrior`.** An
+  inverse-Wishart prior on `Q` (of a `GaussianStateModel`) or `R` (of a Gaussian
+  or kernel-prior emission) whose mean is a `KernelPrior`'s covariance, with the
+  weights fitted. The covariance becomes a latent variable with the variational
+  posterior `IW(ν + N, Ψ + S)`; the model holds `E[Σ⁻¹]⁻¹`, so the smoother is
+  unchanged, and the bound gains the expected log-determinant and the prior's
+  terms. The weights' objective is a new inverse-Wishart target beside the
+  Gaussian-draws one. `GaussianObservationModel(; C_fixed=true)` holds `C`
+  while `d` and `D` are fitted, for latents in a fixed basis's coordinates
+  (needed for an anatomical prior on `Q`). Not in an `SLDS`, a composite
+  emission or with `depends_on`.
+
+  With a learned loading (`ConstrainedGaussianObservationModel`, no prior on
+  `H`), a `Q` prior's kernels are given in the basis's coordinates and projected
+  onto the latents through `H`: `projection=:noise_weighted` (default,
+  `(H'Z⁻¹H)⁻¹`) or `:euclidean` (`H⁺ZH⁺'`). The projection moves with the
+  latents, so no choice of coordinates is needed; `H` takes its closed form and
+  then up to `loading_iters` gradient steps on the bound with the prior's term.
+  `dof` defaults to the covariance's dimension plus two.
+
+- **A kernel prior on the transition matrix: `KernelMNPrior`.** A matrix-normal
+  prior `A ~ MN(m I, U, V)` whose row (receiver) and column (sender) covariances
+  are `KernelPrior` covariances, with `m` and the weights fitted: a coupling's
+  spread factors into a receiver's and a sender's gain. `A` becomes a latent
+  variable with an exact Gaussian `q(A)` (given `E[Q⁻¹]` and the point `b`, `B`);
+  the smoother gets `E[A'Q⁻¹A]` (the uncertainty adds `Δ_A` to every state with a
+  successor), `Q`'s scatter gets `A`'s spread, and the bound `E log p(A) + H[q(A)]`.
+  With a fixed basis the kernels are in the latents' coordinates; with a
+  learned loading they are projected through `H` (rows like `Q`, columns by the
+  sandwich `H'ZH`) and the loading's polish includes them. Combines with the
+  `Q` and `R` priors; not with an `AB_prior`, a kernel prior on `H` or a free
+  `C`. `dynamics_posterior` returns `q(A)`.
+
+  A `ScaleCorrelation` family can instead be one dense kernel shared by its
+  units, each unit with its own stick-broken weight:
+  `SSD.SharedCorrelationFamily(blocks; type, names, groups, units, label)` (not
+  exported), for a kernel that crosses the units' borders, such as a surface
+  Matérn kernel with a weight per parcel. A block is a `(cols, owner, M)` tuple
+  (columns of the gain, the unit of each, their dense correlation `M`); a
+  unit's part of the correlation matrix is `D^½ M D^½ − D` with
+  `D = diag(ρ_unit)`. Units are nested among the other families like any
+  kernel (earlier families enclose them, later kernels sit inside one unit),
+  and their weights take the same trees, joint structure and unit kernels. The
+  `n_h² r` product `M E` of each block is computed once for the covariance and
+  the gradient at the same weights and split over Julia's threads.
+
+  A family can also be a surface kernel from Laplace–Beltrami eigenmodes whose
+  spectrum is fitted with the weights: `SSD.SpectralCorrelationFamily(blocks,
+  spectrum; type, names, groups, units, start, free, per_unit, label, lower,
+  upper)` (not
+  exported). A block is `(cols, owner, U, lam)` (the modes at the columns'
+  dipoles and their eigenvalues); the correlation is `D^(−½)(V V' + diag t)
+  D^(−½)` with `V = U √s(λ)` and `t` Weyl's tail. `SSD.SurfaceSpectrum(kind;
+  alpha, omega, weight, lam_max)` is the Whittle–Matérn spectrum at any `α`
+  (`:matern`), the exact damped-wave neural field averaged over temporal
+  frequencies (`:field`), or its Matérn approximation (`:field_matern`), with
+  closed-form tails and analytic derivatives. The spectrum's parameters (log
+  range, log γ) are weights of their own after the logits, of the type
+  `Symbol(type, "_", parameter)` with the new link `:identity`: `free` ones
+  once for the family (`:flat`), `per_unit` one per unit (a range per parcel,
+  `:nested` or `:hierarchical`). An `:identity` weight needs its
+  `prior_mean` by type. `KernelPrior` takes `type_sd_prior` and
+  `type_root_sd`, the hyperpriors of chosen types (an informative prior on
+  how far parcels' ranges spread). `lower`/`upper` bound each parameter: past
+  a bound the spectrum is held there, with no slope, so the prior brings the
+  search back.
+
+  A tutorial, *Kernel priors on a parcellated cortex*, builds a full
+  model comparison of sum-of-kernels and scale–correlation priors (parcel,
+  network and global scales; network, parcel and geodesic coherences; nested,
+  pooled and joint trees) on a synthetic surface parcellation.
+
 - **A causal (closed-loop) mode for `LQRStateModel`: `causal_state_model`.** The
   finite-horizon feedback controller of the control problem, as a state model:
   sweeping each trial's stretch of the cost schedule backward gives `P_t`, `W_t`
@@ -138,6 +247,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than automatic differentiation.
 
 ### Changed
+- **`GaussianObservationModel` no longer has a `C_basis` field.** Use
+  `ConstrainedGaussianObservationModel(; basis, C, R, ...)`, which fits the
+  same model.
+
 - **The spline-Gaussian warp step whitens a trial at a time.** Its objective
   solves each trial's residuals against `R` as one multi-column solve (a division
   when `R` is diagonal) instead of one timestep at a time. Same objective and

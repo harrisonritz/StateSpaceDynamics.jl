@@ -11,12 +11,13 @@ using SparseArrays
 using Optim: Optim, optimize, LBFGS
 using LineSearches: HagerZhang, LineSearchException
 using ProgressMeter: Progress, next!, finish!
-using SpecialFunctions: loggamma
+using SpecialFunctions: loggamma, digamma
 using Statistics: mean
 using StatsAPI: StatsAPI
 import StatsAPI: loglikelihood, fit!, nobs, nullloglikelihood, r2
 
 using OhMyThreads: tforeach, tmapreduce
+using PrecompileTools: @setup_workload, @compile_workload
 using Base.Iterators: partition
 using Base: show
 
@@ -32,6 +33,15 @@ include("numerics/rqspline.jl")            # monotonic rational-quadratic spline
 # Conjugate priors — defined first because model structs reference IWPrior/MNPrior
 # in their field type annotations.
 include("stats/priors.jl")
+
+# Kernel priors: weighted-kernel covariances with a multi-level hyperprior on
+# the weights. Model-agnostic; the emissions that use them come later.
+include("stats/kernel_hierarchy.jl")
+include("stats/kernel_prior.jl")
+include("stats/kernel_spectral.jl")                # eigenmode spectra (Matérn, neural field)
+include("stats/kernel_scale_correlation.jl")
+include("stats/kernel_covariance_prior.jl")      # kernel-mean inverse-Wishart priors on Q, R
+include("stats/kernel_dynamics_prior.jl")       # kernel row/column matrix-normal prior on A
 
 # Model definitions + inference-state containers.
 include("lds/types.jl")                             # abstract types, model structs, SLDS
@@ -57,6 +67,7 @@ include("lds/lqr_latents.jl")                       # inverse-LQR E-step kernels
 
 # Observation models + composite / standalone models.
 include("lds/gaussian_observations.jl")
+include("lds/kernel_observations.jl")               # C = Φ H, with or without a kernel prior on H
 include("lds/spline_gaussian_observations.jl")  # Gaussian ∘ monotonic warp (manifold discovery)
 include("lds/poisson_observations.jl")
 include("lds/poisson_emission_mstep.jl")            # row-wise Newton emission M-step
@@ -67,6 +78,7 @@ include("lds/grouped_em.jl")
 
 # Fitting Functions
 include("lds/fit_LDS.jl")
+include("lds/fit_kernel_LDS.jl")        # start + gauge step for the kernel-prior emissions
 include("lds/fit_spline_LDS.jl")        # ECM driver for the spline-Gaussian emission
 include("lds/fit_spline_composite.jl")  # ... and for warped members of a composite
 include("lds/fit_PLDS.jl")
@@ -106,6 +118,14 @@ export CompositeObservationModel
 export IWPrior, MNPrior, RidgePrior, x0_mean_prior, transition_prior
 export banded_transition, banded_transition_prior, median_dwell_stay
 
+# Kernel priors
+export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily, KernelIWPrior
+export KernelMNPrior, dynamics_posterior
+export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
+export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
+export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel
+export LoadingPosterior, emission_posterior
+
 # Monotonic rational-quadratic splines (the normalizing-flow layer of a
 # `SplineGaussianObservationModel`; usable on their own).
 export MonotonicWarp, refresh_knots!, copy_warp!
@@ -138,5 +158,7 @@ export rand, smooth, fit!, loglikelihood, elbo, elbo!, trial_elbos
 
 export AffineNullModel
 export r2, nobs, nullloglikelihood
+
+include("precompile.jl")
 
 end

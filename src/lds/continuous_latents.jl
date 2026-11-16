@@ -85,7 +85,11 @@ function state_loglikelihood!(
     else
         _transition_residual!(tmp, lds, x, t, ux)
         _whiten!(cc.Q_PD.chol, tmp)
-        return cc.cQ - T(0.5) * sum(abs2, tmp)
+        value = cc.cQ - T(0.5) * sum(abs2, tmp)
+        # an uncertain A: E over q(A) adds −½ x_{t−1}'Δ_A x_{t−1}
+        Δ = _dynamics_excess(lds.state_model)
+        Δ === nothing || (value -= @views dot(x[:, t - 1], Δ, x[:, t - 1]) / 2)
+        return value
     end
 end
 
@@ -254,6 +258,14 @@ function _state_gradient!(
     _transition_residual!(dxt, lds, x, tsteps, ux)
     mul!(tmp3, neg_Q_inv, dxt)
     @views grad[:, tsteps] .= tmp3
+
+    # an uncertain A (a KernelMNPrior): −Δ_A x_t for every state with a successor
+    Δ = _dynamics_excess(lds.state_model)
+    if Δ !== nothing
+        @views for t in 1:(tsteps - 1)
+            mul!(grad[:, t], Δ, x[:, t], -one(T), one(T))
+        end
+    end
 
     return grad
 end
@@ -513,6 +525,10 @@ function Q_state!(
     ldiv!(Q_U, temp)
     Q_val += T(-0.5) * ((tstep - 1) * log_det_Q + tr(temp))
 
+    # an uncertain A: −½ tr(Δ_A Σ_{t<T} E[x_t x_t'])
+    Δ = _dynamics_excess(lds.state_model)
+    Δ === nothing || (Q_val -= dot(Δ, sum_E_zzm1) / 2)
+
     return Q_val
 end
 
@@ -592,6 +608,10 @@ function Q_state!(
     ldiv!(Q_U, S_trans)
     Q_val += T(-0.5) * (const_trans + T(dyn_n) * log_det_Q + tr(S_trans))
 
+    # an uncertain A: −½ tr(Δ_A Σ_{t<T} E[x_t x_t'])
+    Δ = _dynamics_excess(lds.state_model)
+    Δ === nothing || (Q_val -= dot(Δ, view(suf.dyn_xx[].mat, 1:D, 1:D)) / 2)
+
     return Q_val
 end
 
@@ -617,7 +637,8 @@ function _state_prior_logdensity(
     sm = lds.state_model
     total = sm.gauge === nothing ? zero(T) : sm.gauge.logprior_offset
 
-    sm.Q_prior === nothing || (total += iw_logprior_term(sm.Q, sm.Q_prior))
+    sm.Q_prior === nothing || (total += _covariance_prior_term(sm.Q, sm.Q_prior))
+    sm.A_prior === nothing || (total += _mn_bound(sm.A_prior))
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
     if sm.x0_prior !== nothing
         total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
@@ -837,6 +858,8 @@ function update_A_b!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
+    lds.state_model.A_prior isa KernelMNPrior &&
+        return _update_dynamics_posterior!(lds, suf)
     D = lds.latent_dim
     ux_dim = lds.ux_dim
     AB_prior = lds.state_model.AB_prior
@@ -858,6 +881,43 @@ function update_A_b!(
     end
 
     _unpack_dyn_W!(lds, W)
+    return nothing
+end
+
+# The transitions' moments with the regressors `[1; u]` partialled out:
+# `Σ x_{t+1} x_t'` and `Σ x_t x_t'` (t < T), and the uncentred `Σ x_t x_t'`.
+function _transition_statistics(lds::LinearDynamicalSystem, suf::SufficientStatistics)
+    D = lds.latent_dim
+    G = suf.dyn_xx[].mat
+    XY = suf.dyn_xy
+    rest = (D + 1):size(G, 1)
+    Sxx = Matrix(Symmetric(G[1:D, 1:D]))
+    coupling = G[1:D, rest] / Symmetric(G[rest, rest])
+    Sxx_c = Matrix(Symmetric(Sxx - coupling * G[rest, 1:D]))
+    Syx_c = Matrix((XY[1:D, :] - coupling * XY[rest, :])')
+    return Syx_c, Sxx_c, Sxx
+end
+
+#= With a `KernelMNPrior`: `q(A)` given `E[Q⁻¹]` (the model's `Q`), `A` its mean,
+`[b B]` from their normal equations given it, then the prior's mean and weights,
+and `Δ_A` for the next E-step. =#
+function _update_dynamics_posterior!(
+    lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
+) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
+    sm = lds.state_model
+    kp = sm.A_prior
+    D = lds.latent_dim
+    Qinv = _symmetric_inverse(sm.Q)
+    q = _mn_posterior!(kp, Qinv, _transition_statistics(lds, suf)...)
+    copyto!(sm.A, q.mean)
+    G = suf.dyn_xx[].mat
+    rest = (D + 1):size(G, 1)
+    W = (transpose(suf.dyn_xy[rest, :]) .- sm.A * G[1:D, rest]) / Symmetric(G[rest, rest])
+    copyto!(sm.b, view(W, :, 1))
+    lds.ux_dim > 0 && copyto!(sm.B, view(W, :, 2:(1 + lds.ux_dim)))
+    kp.iteration += 1
+    _mn_update_hyper!(kp; update_trees=kp.iteration % kp.tree_every == 0)
+    _mn_refresh_excess!(kp, sm.Q)
     return nothing
 end
 
@@ -997,7 +1057,9 @@ end
     _finalize_Q!(lds, S_res, N)
 
 Symmetrize an accumulated dynamics residual scatter and turn it into `Q`:
-`S_res / N`, or the IW MAP `(Ψ + S_res) / (ν + N + D + 1)` under a `Q_prior`.
+`S_res / N`, the IW MAP `(Ψ + S_res) / (ν + N + D + 1)` under an `IWPrior`,
+or, under a [`KernelIWPrior`](@ref), `E[Q⁻¹]⁻¹` of the variational posterior
+(which also moves the prior's weights).
 
 `N` is the effective count: transitions plus the width of every distinct
 `AB_prior` folded into `S_res` ([`_ab_prior_width`](@ref)).
@@ -1019,6 +1081,10 @@ function _finalize_Q!(
     Q_prior = lds.state_model.Q_prior
     if Q_prior === nothing
         S_res ./= N
+    elseif Q_prior isa KernelIWPrior
+        # q(Q) = IW(ν + N, Ψ + S); the model holds E[Q⁻¹]⁻¹, then the weights move
+        _kernel_iw_posterior!(lds.state_model.Q, Q_prior, S_res, N)
+        return nothing
     else
         #=
         iw_map(Ψ, ν, S, N, d) = (Ψ + S) / (ν + N + d + 1), inlined to
@@ -1041,11 +1107,18 @@ function update_Q!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[4] || return nothing
+    D = lds.latent_dim
 
     S_res = sws.reg.Q_sum                      # D × D scratch
     fill!(S_res, zero(T))
     _accumulate_dyn_scatter!(S_res, lds, suf, sws)
     _accumulate_ab_prior_scatter!(S_res, lds, sws)
+    kp = lds.state_model.A_prior
+    # an uncertain A: E[(A − Â) x x' (A − Â)'] summed over the transitions
+    if kp isa KernelMNPrior && kp.posterior !== nothing
+        S_res .+= _mn_spread(kp, Matrix(Symmetric(suf.dyn_xx[].mat[1:D, 1:D])))
+    end
     _finalize_Q!(lds, S_res, T(suf.dyn_n) + T(_ab_prior_width(lds)))
+    kp isa KernelMNPrior && _mn_refresh_excess!(kp, lds.state_model.Q)
     return nothing
 end
