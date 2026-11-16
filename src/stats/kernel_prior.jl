@@ -138,7 +138,8 @@ end
 """
     KernelPrior(kernels; structure=nothing, levels=:flat, correlated=(),
                 prior_sd=1.0, prior_mean=nothing, sd_prior=(0.5, 4.0),
-                root_sd=3.0, lkj_eta=2.0, unit_structure=nothing, weights=nothing)
+                root_sd=3.0, lkj_eta=2.0, unit_structure=nothing, weights=nothing,
+                type_sd_prior=Dict(), type_root_sd=Dict())
 
 A zero-mean Gaussian prior whose `r × r` covariance is a weighted sum of
 [`Kernel`](@ref)s, `Σ = Σ_g θ_g Z_g`, plus an optional `structure` (a
@@ -202,6 +203,12 @@ without a covariate value raises, except `"none"`, which gets zero after the
 covariate is centred and scaled over the units with a value. The types of a correlated set need the same kernels. Leftover weights
 of a correlated set keep their marginal prior.
 
+`type_sd_prior` and `type_root_sd` (`Dict`s by type) override `sd_prior` and
+`root_sd` for the trees of those types (an informative spread for a
+`SpectralCorrelationFamily`'s per-unit range, say). A weight with the
+link `:identity` (a spectral parameter) needs its `prior_mean` by type, and its
+`prior_sd` when its type is `:flat`.
+
 `weights` (unconstrained, one per weight, kernels first) sets the starting
 weights; by default every variance weight starts where the kernels together
 carry the power.
@@ -242,6 +249,8 @@ function KernelPrior(
     lkj_eta::Real=2.0,
     unit_structure=nothing,
     weights::Union{Nothing,AbstractVector{<:Real}}=nothing,
+    type_sd_prior::AbstractDict=Dict{Symbol,Any}(),
+    type_root_sd::AbstractDict=Dict{Symbol,Any}(),
 )
     T, r = if !isempty(kernels)
         eltype(first(kernels).factor), size(first(kernels).factor, 1)
@@ -298,6 +307,13 @@ function KernelPrior(
         sd_prior=sd_prior === nothing ? nothing : (T(sd_prior[1]), T(sd_prior[2])),
         root_sd=root_sd === nothing ? nothing : T(root_sd),
         lkj_eta=T(lkj_eta),
+        type_sd_prior=Dict{Symbol,Union{Nothing,Tuple{T,T}}}(
+            Symbol(k) => (v === nothing ? nothing : (T(v[1]), T(v[2]))) for
+            (k, v) in pairs(type_sd_prior)
+        ),
+        type_root_sd=Dict{Symbol,Union{Nothing,T}}(
+            Symbol(k) => (v === nothing ? nothing : T(v)) for (k, v) in pairs(type_root_sd)
+        ),
     )
     _attach_unit_structure!(trees, labels, unit_structure)
     for spec in (prior_sd, prior_mean)
@@ -420,12 +436,23 @@ function _initialize_prior!(prior::KernelPrior{T}, S::AbstractMatrix{T}) where {
         if tree.levels == 0
             for (u, i) in enumerate(view(tree.idx, :, 1))
                 isnan(tree.centre[u]) || continue
+                labels[i].link === :identity && throw(
+                    ArgumentError(
+                        "the weight $(_label_text(labels[i])) (link :identity) needs " *
+                        "its prior_mean by type",
+                    ),
+                )
                 tree.centre[u] = is_log[i] ? log(power / traces[i]) : T(_logit(_START_RHO))
             end
         else
             for (j, type) in enumerate(tree.types)
                 if isnan(tree.root_centre[j])
                     rows = findall(l -> l.type === type, labels)
+                    labels[first(rows)].link === :identity && throw(
+                        ArgumentError(
+                            "the type :$type (link :identity) needs its prior_mean"
+                        ),
+                    )
                     tree.root_centre[j] = if is_log[first(rows)]
                         log(power / sum(traces[rows]))
                     else

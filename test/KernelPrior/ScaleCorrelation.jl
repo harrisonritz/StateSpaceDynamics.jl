@@ -761,3 +761,146 @@ end
     @test found.converged
     @test all(isfinite, grouped.weights)
 end
+
+# --------------------------------------------------------------------------
+# A spectral family: an eigenmode kernel whose spectrum is fitted
+# --------------------------------------------------------------------------
+
+function sc_modes(rng, n_rows, N=7)
+    lam = sort(exp.(range(log(1e3), log(2e5); length=N)) .* (0.8 .+ 0.4 .* rand(rng, N)))
+    area = 4π * N / lam[end]  # Weyl's: ψ² ≈ 1/area, as the tail assumes
+    return randn(rng, n_rows, N) ./ sqrt(area), lam
+end
+
+const SC_SPECTRAL_CASES = [
+    (SCSSD.SurfaceSpectrum(:matern; alpha=2.0), [log(0.016)], [:log_range], nothing),
+    (SCSSD.SurfaceSpectrum(:matern; alpha=3.0), [log(0.016)], Symbol[], :log_range),
+    (SCSSD.SurfaceSpectrum(:field; omega=2π .* [5.0, 20.0, 35.0], weight=ones(3)),
+     [log(0.02), log(60.0)], [:log_range, :log_gamma], nothing),
+    (SCSSD.SurfaceSpectrum(:field; omega=2π .* [5.0, 20.0, 35.0], weight=ones(3)),
+     [log(0.02), log(60.0)], [:log_gamma], :log_range),
+    (SCSSD.SurfaceSpectrum(:field_matern; omega=2π .* [5.0, 20.0], weight=[1.0, 2.0]),
+     [log(0.02), log(60.0)], [:log_gamma], :log_range),
+]
+
+@testset "scale-correlation: a spectral family" begin
+    rng = MersenneTwister(31)
+    r, n = 5, 14
+    G = randn(rng, r, n)
+    v = rand(rng, n) .+ 0.5
+    block = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]
+    for (spec, start, free, per_unit) in SC_SPECTRAL_CASES
+        c1, c2 = collect(1:7), collect(8:14)
+        (U1, l1), (U2, l2) = sc_modes(rng, 7), sc_modes(rng, 7)
+        o1, o2 = [1, 1, 2, 2, 2, 3, 3], [3, 4, 4, 4, 5, 5, 5]
+        fam = SCSSD.SpectralCorrelationFamily(
+            [(c1, o1, U1, l1), (c2, o2, U2, l2)], spec; type=:surf,
+            names=["u1", "u2", "u3", "u4", "u5"], groups=["a", "a", "b", "b", "b"],
+            start, free, per_unit,
+        )
+        sc = ScaleCorrelation(G, v, block; names=["b1", "b2", "b3"], families=[fam])
+        labels = SCSSD._structure_labels(sc)
+        nw = length(labels)
+        n_hyper = length(free) + (per_unit === nothing ? 0 : 5)
+        @test nw == 3 + 5 + n_hyper
+        @test all(l.link === :identity for l in labels[9:end])
+        @test all(startswith(string(l.type), "surf_log_") for l in labels[9:end])
+        w = vcat(0.3 .* randn(rng, 8), sc.hyper_start .+ 0.2 .* randn(rng, n_hyper))
+        Σ = zeros(r, r)
+        SCSSD._add_covariance!(Σ, sc, w)
+        # the dense twin: M = D^(−½)(VV' + diag t)D^(−½) on each block
+        θ, ρ, _, _ = SCSSD._scale_correlation_weights(sc, w)
+        φ = SCSSD._hyper_weights(sc, w)
+        C = Matrix(1.0I, n, n)
+        for (part, b) in zip(sc.spectral, fam.blocks)
+            P, uniform = SCSSD._part_params(part, φ)
+            row = uniform ? ones(Int, length(b.owner)) : b.owner
+            sq = reduce(vcat, (sqrt.(SCSSD._spectrum(spec, b.lam, P[k, :])[1])' for k in row))
+            t = [SCSSD._spectrum_tail(spec, b.lam[end], P[k, :])[1] for k in row]
+            V = b.U .* sq
+            K = V * V' + Diagonal(t)
+            M = K ./ sqrt.(diag(K) * diag(K)')
+            @test diag(M) ≈ ones(length(t))
+            dd = sqrt.(ρ[b.owner])
+            C[b.cols, b.cols] .+= dd .* M .* dd' - Diagonal(dd .^ 2)
+        end
+        s = sqrt.(θ[block] .* v)
+        @test Σ ≈ G * (s .* C .* s') * G' rtol = 1e-10
+        # the gradient and the derivatives against finite differences
+        A = randn(rng, r, r)
+        Msym = (A + A') / 2
+        cov(w) = (X = zeros(r, r); SCSSD._add_covariance!(X, sc, w); X)
+        gr = zeros(nw)
+        SCSSD._add_gradient!(gr, sc, w, Msym)
+        e(i) = 1e-6 .* (1:nw .== i)
+        fd = [(dot(Msym, cov(w .+ e(i))) - dot(Msym, cov(w .- e(i)))) / 2e-6 for i in 1:nw]
+        @test gr ≈ fd rtol = 1e-6
+        D = zeros(r, r, nw)
+        SCSSD._derivatives!(D, sc, w)
+        fdD = cat([(cov(w .+ e(i)) - cov(w .- e(i))) / 2e-6 for i in 1:nw]...; dims=3)
+        @test D ≈ fdD rtol = 1e-6
+        @test SCSSD._structure_values(sc, w)[(end - n_hyper + 1):end] == w[9:end]
+    end
+end
+
+@testset "scale-correlation: spectral tails in closed form" begin
+    for (kind, p) in ((:matern, [log(0.016)]), (:field, [log(0.02), log(80.0)]),
+                      (:field_matern, [log(0.02), log(80.0)]))
+        spec = SCSSD.SurfaceSpectrum(kind; omega=2π .* [3.0, 30.0], weight=[1.0, 1.0])
+        lam_n = 2.0e5
+        t, dt = SCSSD._spectrum_tail(spec, lam_n, p)
+        # a trapezoid on a log grid, far enough out
+        grid = exp.(range(log(lam_n), log(lam_n * 1e7); length=200_001))
+        vals = SCSSD._spectrum(spec, grid, p)[1]
+        numeric = sum((vals[1:(end - 1)] .+ vals[2:end]) ./ 2 .* diff(grid)) / (4π)
+        @test t ≈ numeric rtol = 1e-4
+        for j in eachindex(p)
+            h = 1e-6 .* (eachindex(p) .== j)
+            fd = (SCSSD._spectrum_tail(spec, lam_n, p .+ h)[1] -
+                  SCSSD._spectrum_tail(spec, lam_n, p .- h)[1]) / 2e-6
+            @test dt[j] ≈ fd rtol = 1e-6
+        end
+    end
+    @test_throws ArgumentError SCSSD.SurfaceSpectrum(:matern; alpha=1.0)
+    @test_throws ArgumentError SCSSD.SurfaceSpectrum(:other)
+end
+
+@testset "KernelPrior: spectral parameters as typed weights" begin
+    rng = MersenneTwister(32)
+    r, n = 5, 14
+    G = randn(rng, r, n)
+    v = rand(rng, n) .+ 0.5
+    block = repeat(1:7; inner=2)
+    (U, lam) = sc_modes(rng, n)
+    fam = SCSSD.SpectralCorrelationFamily(
+        [(collect(1:n), repeat(1:7; inner=2), U, lam)], SCSSD.SurfaceSpectrum(:matern);
+        type=:surf, names=["u$i" for i in 1:7], groups=["a", "a", "a", "b", "b", "b", "b"],
+        start=[log(0.016)], per_unit=:log_range,
+    )
+    sc = ScaleCorrelation(G, v, block; names=["b$i" for i in 1:7], families=[fam])
+    X = randn(rng, r, 50)
+    S = X * X' ./ 50
+    prior = KernelPrior(Kernel[]; structure=sc, levels=Dict(:surf_log_range => :nested),
+                        prior_mean=Dict(:surf_log_range => log(0.016)),
+                        type_root_sd=Dict(:surf_log_range => 0.5),
+                        type_sd_prior=Dict(:surf_log_range => (0.3, 10.0)))
+    found = fit_kernel_weights!(prior, S, 50; rounds=3)
+    @test all(isfinite, prior.weights)
+    tree = only(t for t in prior.trees if t.types == [:surf_log_range])
+    @test tree.root_sd == 0.5 && tree.sd_prior == (0.3, 10.0)
+    # an :identity weight without its centre is an error
+    bare = KernelPrior(Kernel[]; structure=sc, levels=Dict(:surf_log_range => :nested))
+    @test_throws ArgumentError fit_kernel_weights!(bare, S, 50; rounds=1)
+end
+
+@testset "scale-correlation: the field's tail past the resonance" begin
+    # γ so low that the fast nodes resonate far beyond the cutoff: positive tail
+    spec = SCSSD.SurfaceSpectrum(:field; omega=2π .* [10.0, 30.0], weight=[1.0, 1.0])
+    p = [log(0.016), log(0.01)]
+    t, dt = SCSSD._spectrum_tail(spec, 2.3e5, p)
+    r2 = 0.016^2 / 8
+    expect = sum(0.5 * atan(2om / 0.01, 1 - om^2 / 0.01^2 + r2 * 2.3e5) / (2om / 0.01)
+                 for om in 2π .* [10.0, 30.0]) / r2 / (4π)
+    @test t > 0
+    @test t ≈ expect rtol = 1e-10
+end

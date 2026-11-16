@@ -128,6 +128,8 @@ function _build_trees(
     sd_prior::Union{Nothing,Tuple{T,T}},
     root_sd::Union{Nothing,T},
     lkj_eta::T,
+    type_sd_prior::AbstractDict=Dict{Symbol,Any}(),
+    type_root_sd::AbstractDict=Dict{Symbol,Any}(),
 ) where {T<:Real}
     types = unique(label.type for label in labels)
     for type in keys(levels)
@@ -180,7 +182,9 @@ function _build_trees(
         push!(
             trees,
             _single_tree(
-                T, labels, members[type], type, get(levels, type, 0); sd_prior, root_sd
+                T, labels, members[type], type, get(levels, type, 0);
+                sd_prior=get(type_sd_prior, type, sd_prior),
+                root_sd=get(type_root_sd, type, root_sd),
             ),
         )
     end

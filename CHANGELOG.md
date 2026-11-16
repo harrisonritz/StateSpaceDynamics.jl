@@ -91,6 +91,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `n_h² r` product `M E` of each block is computed once for the covariance and
   the gradient at the same weights and split over Julia's threads.
 
+  A family can also be a surface kernel from Laplace–Beltrami eigenmodes whose
+  spectrum is fitted with the weights: `SSD.SpectralCorrelationFamily(blocks,
+  spectrum; type, names, groups, units, start, free, per_unit, label, lower,
+  upper)` (not
+  exported). A block is `(cols, owner, U, lam)` (the modes at the columns'
+  dipoles and their eigenvalues); the correlation is `D^(−½)(V V' + diag t)
+  D^(−½)` with `V = U √s(λ)` and `t` Weyl's tail. `SSD.SurfaceSpectrum(kind;
+  alpha, omega, weight, lam_max)` is the Whittle–Matérn spectrum at any `α`
+  (`:matern`), the exact damped-wave neural field averaged over temporal
+  frequencies (`:field`), or its Matérn approximation (`:field_matern`), with
+  closed-form tails and analytic derivatives. The spectrum's parameters (log
+  range, log γ) are weights of their own after the logits, of the type
+  `Symbol(type, "_", parameter)` with the new link `:identity`: `free` ones
+  once for the family (`:flat`), `per_unit` one per unit (a range per parcel,
+  `:nested` or `:hierarchical`). An `:identity` weight needs its
+  `prior_mean` by type. `KernelPrior` takes `type_sd_prior` and
+  `type_root_sd`, the hyperpriors of chosen types (an informative prior on
+  how far parcels' ranges spread). `lower`/`upper` bound each parameter: past
+  a bound the spectrum is held there, with no slope, so the prior brings the
+  search back.
+
   A tutorial, *Kernel priors on a parcellated cortex*, builds a full
   model comparison of sum-of-kernels and scale–correlation priors (parcel,
   network and global scales; network, parcel and geodesic coherences; nested,

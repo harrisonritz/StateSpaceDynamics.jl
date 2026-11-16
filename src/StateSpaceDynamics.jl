@@ -38,6 +38,7 @@ include("stats/priors.jl")
 # the weights. Model-agnostic; the emissions that use them come later.
 include("stats/kernel_hierarchy.jl")
 include("stats/kernel_prior.jl")
+include("stats/kernel_spectral.jl")                # eigenmode spectra (Matérn, neural field)
 include("stats/kernel_scale_correlation.jl")
 include("stats/kernel_covariance_prior.jl")      # kernel-mean inverse-Wishart priors on Q, R
 include("stats/kernel_dynamics_prior.jl")       # kernel row/column matrix-normal prior on A

@@ -297,6 +297,155 @@ function _family_rows(family::SharedCorrelationFamily)
     return maximum(maximum(b.cols) for b in family.blocks)
 end
 
+# One block of a spectral kernel: the columns, the unit of each, the modes at
+# the columns' dipoles and their eigenvalues.
+struct _SpectralBlock{T<:Real}
+    cols::Vector{Int}
+    owner::Vector{Int}
+    U::Matrix{T}
+    lam::Vector{T}
+end
+
+"""
+    SpectralCorrelationFamily(blocks, spectrum; type, names, groups=nothing,
+                              units=names, start, free=Symbol[], per_unit=nothing,
+                              label="", lower=nothing, upper=nothing)
+
+A surface kernel from the Laplace–Beltrami eigenmodes, shared by the units of a
+family as a `SharedCorrelationFamily` is (a weight `ρ_u` per unit, `D^½ M D^½ −
+D` on its columns), whose `SurfaceSpectrum` parameters are fitted with
+the weights. `blocks` holds one `(cols, owner, U, lam)` per block of columns: the
+columns, the unit of each, the modes at the columns' dipoles (`n_h × N`) and
+their eigenvalues. The block's correlation is `M = D^(−½)(V V' + diag t)D^(−½)`,
+`V_ik = U_ik √s(λ_k; p_u(i))`, `t` Weyl's tail and `d` the diagonal (see
+`kernel_spectral.jl`).
+
+`start` holds the spectrum's parameters (log scale, in the order of the kind:
+`log_range`, then `log_gamma`); those in `free` are fitted once for the family
+and `per_unit` (one parameter) once per unit, as weights of their own after the
+logits: of the type `Symbol(type, "_", parameter)`, link `:identity`. A
+[`KernelPrior`](@ref) then needs their `prior_mean` (and `prior_sd` when
+`:flat`) by type; a per-unit type may be `:nested` in the units' `groups`.
+`lower` and `upper` (one per parameter, default unbounded) bound them: past a
+bound the spectrum is held at it and the weight has no slope, so its prior
+brings the search back. This is dynameg's `SpectralKernel`
+(`validate/shared_scale_correlation.py`).
+"""
+struct SpectralCorrelationFamily{T<:Real} <: AbstractCorrelationFamily{T}
+    type::Symbol
+    names::Vector{String}
+    groups::Vector{Union{Nothing,String}}
+    units::Vector{String}
+    blocks::Vector{_SpectralBlock{T}}
+    covered::Vector{Vector{Int}}
+    label::String
+    spectrum::SurfaceSpectrum{T}
+    start::Vector{T}
+    free::Vector{Symbol}
+    per_unit::Union{Nothing,Symbol}
+    lower::Vector{T}
+    upper::Vector{T}
+end
+
+function SpectralCorrelationFamily(
+    blocks::AbstractVector,
+    spectrum::SurfaceSpectrum;
+    type::Symbol,
+    names,
+    groups=nothing,
+    units=names,
+    start,
+    free=Symbol[],
+    per_unit=nothing,
+    label="",
+    lower=nothing,
+    upper=nothing,
+)
+    isempty(blocks) &&
+        throw(ArgumentError("the spectral correlation family :$type has no block"))
+    count = length(names)
+    labels, nodes, matched = _weight_labels(type, count, names, groups, units)
+    T = typeof(spectrum.alpha)
+    params = _spectrum_params(spectrum)
+    length(start) == length(params) || throw(
+        DimensionMismatch("start needs $(length(params)) values ($params); got $(length(start))"),
+    )
+    free = Symbol[Symbol(q) for q in free]
+    per_unit = per_unit === nothing ? nothing : Symbol(per_unit)
+    for q in (free..., (per_unit === nothing ? () : (per_unit,))...)
+        q in params ||
+            throw(ArgumentError(":$(spectrum.kind) has the parameters $params; got :$q"))
+    end
+    allunique(free) && !(per_unit in free) ||
+        throw(ArgumentError("a parameter is free twice, or both free and per unit"))
+    parts = _SpectralBlock{T}[]
+    seen = Set{Int}()
+    for (h, block) in enumerate(blocks)
+        length(block) == 4 || throw(
+            ArgumentError("a block is a (cols, owner, U, lam) tuple; got $(length(block))")
+        )
+        cols, owner = Vector{Int}(block[1]), Vector{Int}(block[2])
+        U, lam = Matrix{T}(block[3]), Vector{T}(block[4])
+        tag = "block $h of the spectral correlation family :$type"
+        size(U) == (length(cols), length(lam)) && length(owner) == length(cols) ||
+            throw(DimensionMismatch("$tag: U, lam, cols and owner do not match"))
+        all(>(0), cols) && all(u -> 1 <= u <= count, owner) ||
+            throw(ArgumentError("$tag: cols are 1-based, owner indexes the names"))
+        all(isfinite, U) && all(>=(0), lam) ||
+            throw(ArgumentError("$tag: U must be finite and lam non-negative"))
+        any(in(seen), cols) && throw(
+            ArgumentError("the blocks of the spectral correlation family :$type overlap")
+        )
+        union!(seen, cols)
+        push!(parts, _SpectralBlock{T}(cols, owner, U, lam))
+    end
+    covered = [sort!(reduce(vcat, [b.cols[b.owner .== u] for b in parts])) for u in 1:count]
+    empty = findall(isempty, covered)
+    isempty(empty) || throw(
+        ArgumentError("every unit needs a column; none for " * _first_few(labels[empty])),
+    )
+    return SpectralCorrelationFamily{T}(
+        type, labels, nodes, matched, parts, covered, string(label), spectrum,
+        Vector{T}(start), free, per_unit,
+        lower === nothing ? fill(T(-Inf), length(params)) : Vector{T}(lower),
+        upper === nothing ? fill(T(Inf), length(params)) : Vector{T}(upper),
+    )
+end
+
+function _family_as(::Type{T}, family::SpectralCorrelationFamily) where {T<:Real}
+    sp = family.spectrum
+    return SpectralCorrelationFamily{T}(
+        family.type, family.names, family.groups, family.units,
+        [_SpectralBlock{T}(b.cols, b.owner, Matrix{T}(b.U), Vector{T}(b.lam)) for b in family.blocks],
+        family.covered, family.label,
+        SurfaceSpectrum{T}(sp.kind, T(sp.alpha), Vector{T}(sp.omega), Vector{T}(sp.weight), T(sp.lam_max)),
+        Vector{T}(family.start), family.free, family.per_unit,
+        Vector{T}(family.lower), Vector{T}(family.upper),
+    )
+end
+
+function _family_rows(family::SpectralCorrelationFamily)
+    return maximum(maximum(b.cols) for b in family.blocks)
+end
+
+# The weights a spectral family adds after the logits: `(param index, type,
+# names, groups, units)` of its free parameters (one weight each), then of its
+# per-unit parameter (one weight per unit).
+function _hyper_types(family::SpectralCorrelationFamily)
+    params = _spectrum_params(family.spectrum)
+    out = Tuple{Int,Symbol,Vector{String},Vector{Union{Nothing,String}},Vector{String}}[]
+    for q in family.free
+        push!(out, (findfirst(==(q), params)::Int, Symbol(family.type, "_", q),
+                    [string(q)], Union{Nothing,String}[nothing], [string(q)]))
+    end
+    if family.per_unit !== nothing
+        q = family.per_unit
+        push!(out, (findfirst(==(q), params)::Int, Symbol(family.type, "_", q),
+                    family.names, family.groups, family.units))
+    end
+    return out
+end
+
 # What a correlation kernel adds on one scale block: the block, `W_cb`, and the
 # index of `Z_cb` in the structure's `Z`.
 struct _BlockImage{T<:Real}
@@ -317,17 +466,64 @@ struct _SharedPart{T<:Real}
     by_scale::Vector{Pair{Int,Vector{Int}}}
 end
 
-# `E = diag(√(θρ)) W` and `F = M E` of every shared block, for the weights
-# `key = [θ ; ρ]` they were last computed at.
+# A block of a spectral family as a structure uses it: its modes, the rows `W`
+# of `Gw[:, cols]'`, the kernel (flat) and scale block of each row, the unit of
+# each row and the rows of each unit, and where the family's parameters are:
+# `start` (all of them), `free` `(param, slot)` and `unit` `(param, first slot)`
+# (`(0, 0)`: none), slots counted in the structure's parameter weights.
+struct _SpectralPart{T<:Real}
+    spectrum::SurfaceSpectrum{T}
+    U::Matrix{T}
+    U2::Matrix{T}
+    lam::Vector{T}
+    W::Matrix{T}
+    kernel::Vector{Int}
+    scale::Vector{Int}
+    owner::Vector{Int}
+    n_units::Int
+    by_kernel::Vector{Pair{Int,Vector{Int}}}
+    by_scale::Vector{Pair{Int,Vector{Int}}}
+    by_owner::Vector{Pair{Int,Vector{Int}}}
+    start::Vector{T}
+    free::Vector{Tuple{Int,Int}}
+    unit::Tuple{Int,Int}
+    lower::Vector{T}
+    upper::Vector{T}
+end
+
+# A spectral block's terms at one set of parameters: the unit spectra `S` and
+# their roots (one row when no parameter varies by unit), `V = U √s`, the tail
+# `t`, the diagonal `d` and `rd = d^(−½)`, `Ẽ = D^(−½) E` and `B = V' Ẽ`.
+struct _SpectralAux{T<:Real}
+    P::Matrix{T}
+    sq::Matrix{T}
+    V::Matrix{T}
+    t::Vector{T}
+    d::Vector{T}
+    rd::Vector{T}
+    Et::Matrix{T}
+    B::Matrix{T}
+    uniform::Bool
+end
+
+# `E = diag(√(θρ)) W` and `F = M E` of every shared block (and spectral block,
+# with its `_SpectralAux`), for the weights `key = [θ ; ρ ; φ]` they were last
+# computed at.
 mutable struct _SharedTerms{T<:Real}
     key::Vector{T}
     E::Vector{Matrix{T}}
     F::Vector{Matrix{T}}
+    SE::Vector{Matrix{T}}
+    SF::Vector{Matrix{T}}
+    aux::Vector{_SpectralAux{T}}
     const lock::ReentrantLock
 end
 
 function _SharedTerms{T}() where {T<:Real}
-    return _SharedTerms{T}(T[], Matrix{T}[], Matrix{T}[], ReentrantLock())
+    return _SharedTerms{T}(
+        T[], Matrix{T}[], Matrix{T}[], Matrix{T}[], Matrix{T}[], _SpectralAux{T}[],
+        ReentrantLock(),
+    )
 end
 
 """
@@ -391,6 +587,11 @@ struct ScaleCorrelation{T<:Real} <: AbstractKernelStructure{T}
     columns::Vector{UnitRange{Int}}
     # the blocks of the shared families, and their `E`, `F` at the last weights
     shared::Vector{_SharedPart{T}}
+    # the blocks of the spectral families, and the labels and starting values of
+    # their parameter weights (after the logits)
+    spectral::Vector{_SpectralPart{T}}
+    hyper_labels::Vector{WeightLabel}
+    hyper_start::Vector{T}
     terms::_SharedTerms{T}
 end
 
@@ -474,7 +675,7 @@ function ScaleCorrelation(
     )
     for family in fams
         rows = _family_rows(family)
-        if family isa SharedCorrelationFamily
+        if family isa SharedCorrelationFamily || family isa SpectralCorrelationFamily
             rows <= n || throw(
                 DimensionMismatch(
                     "the shared correlation family :$(family.type) has a column " *
@@ -496,11 +697,34 @@ function ScaleCorrelation(
     slot = Dict{Tuple{Int,Vector{Int}},Int}((b, members[b]) => b for b in 1:g)
     images = Vector{_BlockImage{T}}[]
     shared = _SharedPart{T}[]
+    spectral = _SpectralPart{T}[]
+    hyper_labels = WeightLabel[]
+    hyper_start = T[]
     for family in fams
         before = length(images)
         if family isa CorrelationFamily
             for (B, cols) in zip(family.factors, family.covered)
                 push!(images, _block_images!(Z, slot, Gw, B, cols, block))
+            end
+        elseif family isa SpectralCorrelationFamily
+            for cols in family.covered
+                push!(images, _block_images!(Z, slot, Gw, nothing, cols, block))
+            end
+            free, unit = Tuple{Int,Int}[], (0, 0)
+            for (j, htype, hnames, hgroups, hunits) in _hyper_types(family)
+                first_slot = length(hyper_labels) + 1
+                for (name, group, u) in zip(hnames, hgroups, hunits)
+                    push!(hyper_labels, WeightLabel(name, htype, group, u, :identity))
+                    push!(hyper_start, family.start[j])
+                end
+                if Symbol(family.type, "_", family.per_unit) === htype
+                    unit = (j, first_slot)
+                else
+                    push!(free, (j, first_slot))
+                end
+            end
+            for part in family.blocks
+                push!(spectral, _spectral_part(part, family, before, Gw, block, free, unit))
             end
         else
             for cols in family.covered
@@ -535,6 +759,9 @@ function ScaleCorrelation(
         Zstack,
         columns,
         shared,
+        spectral,
+        hyper_labels,
+        hyper_start,
         _SharedTerms{T}(),
     )
 end
@@ -602,6 +829,20 @@ function _shared_part(
     )
 end
 
+function _spectral_part(
+    part::_SpectralBlock{T}, family::SpectralCorrelationFamily{T}, before::Int,
+    Gw::Matrix{T}, block::Vector{Int}, free::Vector{Tuple{Int,Int}}, unit::Tuple{Int,Int},
+) where {T<:Real}
+    kernel = before .+ part.owner
+    scale = block[part.cols]
+    return _SpectralPart{T}(
+        family.spectrum, part.U, part.U .^ 2, part.lam,
+        Matrix{T}(transpose(Gw[:, part.cols])), kernel, scale, part.owner,
+        length(family.names), _group_rows(kernel), _group_rows(scale),
+        _group_rows(part.owner), family.start, free, unit, family.lower, family.upper,
+    )
+end
+
 # The images of one kernel (unit-row factor `B`, covering `cols`) on the scale
 # blocks it touches. A `Z_cb` not yet in `Z` is appended; `slot` finds those
 # already there by their block and columns. A shared family's unit has no
@@ -642,6 +883,8 @@ _scale_count(s::ScaleCorrelation) = length(s.names)
 
 _structure_dim(s::ScaleCorrelation) = size(s.gain, 1)
 
+_hyper_count(s::ScaleCorrelation) = length(s.hyper_labels)
+
 function _structure_labels(s::ScaleCorrelation)
     labels = [
         WeightLabel(s.names[b], s.type, s.groups[b], s.units[b], :log) for
@@ -655,12 +898,14 @@ function _structure_labels(s::ScaleCorrelation)
             ),
         )
     end
-    return labels
+    return append!(labels, s.hyper_labels)
 end
 
 function _structure_traces(s::ScaleCorrelation{T}) where {T<:Real}
     g = _scale_count(s)
-    return vcat(T[tr(s.Z[b]) for b in 1:g], fill(T(NaN), length(s.ancestors)))
+    return vcat(
+        T[tr(s.Z[b]) for b in 1:g], fill(T(NaN), length(s.ancestors) + _hyper_count(s))
+    )
 end
 
 # The logits start where every correlation weight is `_START_RHO`.
@@ -669,7 +914,7 @@ function _structure_start(s::ScaleCorrelation{T}, logscale::Real) where {T<:Real
         rest = max(1 - _START_RHO * length(enclosing), 1e-6)
         return T(_logit(_START_RHO / rest))
     end
-    return vcat(fill(T(logscale), _scale_count(s)), logits)
+    return vcat(fill(T(logscale), _scale_count(s)), logits, s.hyper_start)
 end
 
 _sigmoid(a::Real) = (1 + tanh(a / 2)) / 2
@@ -680,8 +925,9 @@ function _scale_correlation_weights(
     s::ScaleCorrelation{T}, w::AbstractVector
 ) where {T<:Real}
     g, nc = _scale_count(s), length(s.ancestors)
-    length(w) == g + nc ||
-        throw(DimensionMismatch("the structure has $(g + nc) weights; got $(length(w))"))
+    nw = g + nc + _hyper_count(s)
+    length(w) == nw ||
+        throw(DimensionMismatch("the structure has $nw weights; got $(length(w))"))
     θ = T[exp(w[b]) for b in 1:g]
     σ = T[_sigmoid(w[g + c]) for c in 1:nc]
     ρ, rest = zeros(T, nc), ones(T, nc)
@@ -696,7 +942,13 @@ end
 
 function _structure_values(s::ScaleCorrelation, w::AbstractVector)
     θ, ρ, _, _ = _scale_correlation_weights(s, w)
-    return vcat(θ, ρ)
+    return vcat(θ, ρ, _hyper_weights(s, w))
+end
+
+# The spectral parameters: the weights after the logits.
+function _hyper_weights(s::ScaleCorrelation{T}, w::AbstractVector) where {T<:Real}
+    offset = _scale_count(s) + length(s.ancestors)
+    return T[w[i] for i in (offset + 1):length(w)]
 end
 
 # `A_c = Σ_b √θ_b W_cb` of one kernel.
@@ -798,18 +1050,107 @@ end
 # `E` and `F = M E` of every shared block at the weights `θ`, `ρ`: the costly
 # part (`n_h² r` a block), kept for the covariance and the gradient that follow
 # at the same weights.
-function _shared_terms(s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T}) where {T<:Real}
-    key = vcat(θ, ρ)
+function _shared_terms(
+    s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T}, φ::Vector{T}=T[]
+) where {T<:Real}
+    key = vcat(θ, ρ, φ)
     cache = s.terms
     return lock(cache.lock) do
         if cache.key != key
             root = sqrt.(max.(ρ, zero(T)))
             E = [part.W .* (sqrt.(θ[part.scale]) .* root[part.kernel]) for part in s.shared]
             F = [_split_row_mul(part.M, e) for (part, e) in zip(s.shared, E)]
+            SE = [part.W .* (sqrt.(θ[part.scale]) .* root[part.kernel]) for part in s.spectral]
+            aux = [_spectral_aux(part, φ, e) for (part, e) in zip(s.spectral, SE)]
+            SF = [(_spectral_v(part, a, a.B) .+ a.t .* a.Et) .* a.rd
+                  for (part, a) in zip(s.spectral, aux)]
             cache.E, cache.F, cache.key = E, F, key
+            cache.SE, cache.SF, cache.aux = SE, SF, aux
         end
         return cache.E, cache.F
     end
+end
+
+# The parameter rows of a spectral part's units (one row when none varies by unit).
+function _part_params(part::_SpectralPart{T}, φ::AbstractVector) where {T<:Real}
+    uniform = part.unit[1] == 0
+    P = repeat(reshape(part.start, 1, :), uniform ? 1 : part.n_units, 1)
+    for (j, slot) in part.free
+        P[:, j] .= clamp(φ[slot], part.lower[j], part.upper[j])
+    end
+    if !uniform
+        j, first_slot = part.unit
+        for u in 1:part.n_units
+            P[u, j] = clamp(φ[first_slot + u - 1], part.lower[j], part.upper[j])
+        end
+    end
+    return P, uniform
+end
+
+# Whether a parameter weight is inside its bounds (outside, the spectrum is held
+# at the bound: no slope).
+_inside(part::_SpectralPart, j::Int, value::Real) = part.lower[j] < value < part.upper[j]
+
+function _spectral_aux(part::_SpectralPart{T}, φ::AbstractVector, E::Matrix{T}) where {T<:Real}
+    P, uniform = _part_params(part, φ)
+    N = length(part.lam)
+    sq = zeros(T, size(P, 1), N)
+    t_u = zeros(T, size(P, 1))
+    for r in axes(P, 1)
+        values, _ = _spectrum(part.spectrum, part.lam, view(P, r, :))
+        sq[r, :] .= sqrt.(values)
+        t_u[r] = first(_spectrum_tail(part.spectrum, part.lam[end], view(P, r, :)))
+    end
+    rd_of(d) = 1 ./ sqrt.(d)
+    if uniform  # V = U diag(√s), never formed: products through U
+        s0 = vec(sq[1, :])
+        t = fill(t_u[1], length(part.owner))
+        d = part.U2 * (s0 .^ 2) .+ t
+        rd = rd_of(d)
+        Et = E .* rd
+        return _SpectralAux{T}(P, sq, zeros(T, 0, 0), t, d, rd, Et, s0 .* (part.U' * Et), true)
+    end
+    V = part.U .* view(sq, part.owner, :)
+    t = t_u[part.owner]
+    d = vec(sum(abs2, V; dims=2)) .+ t
+    rd = rd_of(d)
+    Et = E .* rd
+    return _SpectralAux{T}(P, sq, V, t, d, rd, Et, V' * Et, false)
+end
+
+# `V Y` of a spectral block.
+function _spectral_v(part::_SpectralPart, aux::_SpectralAux, Y::AbstractMatrix)
+    aux.uniform && return part.U * (vec(aux.sq[1, :]) .* Y)
+    return aux.V * Y
+end
+
+# Per unit row, `∂√s/∂p` (N × n_p), `∂s/∂p` and `∂t/∂p` of a spectral part.
+function _spectral_slopes(part::_SpectralPart{T}, aux::_SpectralAux{T}) where {T<:Real}
+    half, dS, dt = Matrix{T}[], Matrix{T}[], Vector{T}[]
+    for r in axes(aux.P, 1)
+        _, ds = _spectrum(part.spectrum, part.lam, view(aux.P, r, :); grad=true)
+        push!(dS, ds)
+        push!(half, ds ./ (2 .* max.(view(aux.sq, r, :), floatmin(T))))
+        push!(dt, last(_spectrum_tail(part.spectrum, part.lam[end], view(aux.P, r, :))))
+    end
+    return half, dS, dt
+end
+
+# `(param, slot, rows)` of every fitted parameter weight of a spectral part:
+# a free one over all its rows, a per-unit one over each unit's rows.
+function _hyper_slots(part::_SpectralPart)
+    out = Tuple{Int,Int,Vector{Int},Int}[]
+    all_rows = collect(1:length(part.owner))
+    for (j, slot) in part.free
+        push!(out, (j, slot, all_rows, 0))
+    end
+    if part.unit[1] != 0
+        j, first_slot = part.unit
+        for (u, rows) in part.by_owner
+            push!(out, (j, first_slot + u - 1, rows, u))
+        end
+    end
+    return out
 end
 
 # The coefficient of each `Z` in `Σ_sc`: `θ_b` on the blocks, `−Σ ρ_c θ_b` on
@@ -832,16 +1173,20 @@ function _add_covariance!(
     Σ::AbstractMatrix{T}, s::ScaleCorrelation{T}, w::AbstractVector
 ) where {T<:Real}
     θ, ρ, _, _ = _scale_correlation_weights(s, w)
+    φ = _hyper_weights(s, w)
     rootθ = sqrt.(θ)
     if !isempty(s.columns)
         A = _stacked_images(s, rootθ, sqrt.(max.(ρ, zero(T))))
         Σ .+= Symmetric(_split_syrk(A), :L)
     end
     _split_gemv!(vec(Σ), s.Zstack, _z_coefficients(s, θ, ρ); add=true)
-    if !isempty(s.shared)
-        E, F = _shared_terms(s, θ, ρ)
+    if !isempty(s.shared) || !isempty(s.spectral)
+        E, F = _shared_terms(s, θ, ρ, φ)
         X = zeros(T, size(Σ))
         for (e, f) in zip(E, F)
+            mul!(X, e', f, one(T), one(T))
+        end
+        for (e, f) in zip(s.terms.SE, s.terms.SF)
             mul!(X, e', f, one(T), one(T))
         end
         Σ .+= (X .+ X') ./ 2
@@ -872,6 +1217,7 @@ function _add_gradient!(
     grad::AbstractVector{T}, s::ScaleCorrelation{T}, w::AbstractVector, M::AbstractMatrix{T}
 ) where {T<:Real}
     θ, ρ, rest, σ = _scale_correlation_weights(s, w)
+    φ = _hyper_weights(s, w)
     g = length(θ)
     rootθ = sqrt.(θ)
     traces = _split_gemv!(zeros(T, length(s.Z)), s.Zstack, vec(M); transpose=true)
@@ -894,7 +1240,7 @@ function _add_gradient!(
     if !isempty(s.shared)
         # ∂ tr(G E'ME)/∂E_i = 2 (F G)_i, and E_i ∝ √(θ_b ρ_u): with
         # p_i = (F G)_i · E_i, ∂/∂ρ_u = Σ_{i∈u} p_i/ρ_u and ∂/∂θ_b alike
-        E, F = _shared_terms(s, θ, ρ)
+        E, F = _shared_terms(s, θ, ρ, φ)
         for (part, e, f) in zip(s.shared, E, F)
             p = vec(sum((f * M) .* e; dims=2))
             for (i, value) in enumerate(p)
@@ -903,11 +1249,103 @@ function _add_gradient!(
             end
         end
     end
+    if !isempty(s.spectral)
+        _shared_terms(s, θ, ρ, φ)
+        offset = g + length(ρ)
+        for (part, e, f, aux) in zip(s.spectral, s.terms.SE, s.terms.SF, s.terms.aux)
+            p = vec(sum((f * M) .* e; dims=2))
+            for (i, value) in enumerate(p)
+                slope_ρ[part.kernel[i]] += value / max(ρ[part.kernel[i]], 1e-300)
+                slope_θ[part.scale[i]] += value / max(θ[part.scale[i]], 1e-300)
+            end
+            slots = _hyper_slots(part)
+            isempty(slots) && continue
+            # M = D^(−½)(VV' + T)D^(−½): through V and t at fixed d, then d
+            EtG = aux.Et * M
+            pd = p ./ aux.d
+            gt = vec(sum(EtG .* aux.Et; dims=2)) .- pd
+            half, _, dt = _spectral_slopes(part, aux)
+            if aux.uniform  # free parameters only: Σ_i gV_ik U_ik by BLAS
+                s0 = vec(aux.sq[1, :])
+                a = 2 .* vec(sum(aux.B .* (part.U' * EtG); dims=2)) .- 2 .* s0 .* (part.U2' * pd)
+                for (j, slot, _, _) in slots
+                    _inside(part, j, φ[slot]) || continue
+                    grad[offset + slot] += dot(a, view(half[1], :, j)) + sum(gt) * dt[1][j]
+                end
+                continue
+            end
+            gV = 2 .* (EtG * aux.B') .- 2 .* aux.V .* pd
+            gVU = gV .* part.U
+            for (j, slot, rows, u) in slots
+                _inside(part, j, φ[slot]) || continue
+                r = aux.uniform ? 1 : u
+                if u == 0 && !aux.uniform  # a free parameter, per-unit spectra
+                    for (unit, urows) in part.by_owner
+                        a = vec(sum(view(gVU, urows, :); dims=1))
+                        grad[offset + slot] += dot(a, view(half[unit], :, j)) +
+                                               sum(view(gt, urows)) * dt[unit][j]
+                    end
+                else
+                    a = vec(sum(view(gVU, rows, :); dims=1))
+                    grad[offset + slot] += dot(a, view(half[r], :, j)) +
+                                           sum(view(gt, rows)) * dt[r][j]
+                end
+            end
+        end
+    end
     for b in 1:g
         grad[b] += θ[b] * slope_θ[b]
     end
     _stick_adjoint!(view(grad, (g + 1):(g + length(ρ))), s, slope_ρ, rest, σ)
     return grad
+end
+
+# A spectral family's part of `∂Σ/∂(θ, ρ)` (as a shared family's) and its
+# `∂Σ/∂φ`: with `Q = ∂V B` and `Δ = ∂d/d` on the rows that move,
+# `Q'Ẽ + Ẽ'Q + Ẽ' ∂T Ẽ − ½ (E'ΔF + F'ΔE)`.
+function _spectral_derivatives!(
+    D::AbstractArray{T,3}, s::ScaleCorrelation{T}, θ::Vector{T}, ρ::Vector{T},
+    φ::Vector{T},
+) where {T<:Real}
+    g = length(θ)
+    offset = g + length(ρ)
+    for k in (offset + 1):(offset + _hyper_count(s))
+        fill!(view(D, :, :, k), zero(T))
+    end
+    _shared_terms(s, θ, ρ, φ)
+    X = zeros(T, size(D, 1), size(D, 2))
+    for (part, e, f, aux) in zip(s.spectral, s.terms.SE, s.terms.SF, s.terms.aux)
+        for (groups, weights, off) in ((part.by_kernel, ρ, g), (part.by_scale, θ, 0))
+            for (id, rows) in groups
+                mul!(X, view(e, rows, :)', view(f, rows, :))
+                scale = 1 / (2 * max(weights[id], 1e-300))
+                view(D, :, :, off + id) .+= scale .* (X .+ X')
+            end
+        end
+        slots = _hyper_slots(part)
+        isempty(slots) && continue
+        half, dS, dt = _spectral_slopes(part, aux)
+        for (j, slot, rows, _) in slots
+            _inside(part, j, φ[slot]) || continue
+            if aux.uniform  # one spectrum: through BLAS
+                dti = fill(dt[1][j], length(rows))
+                Q = view(part.U, rows, :) * (view(half[1], :, j) .* aux.B)
+                delta = (view(part.U2, rows, :) * view(dS[1], :, j) .+ dti) ./ aux.d[rows]
+            else
+                row = part.owner[rows]
+                H = reduce(vcat, (view(half[r], :, j)' for r in row))
+                dSj = reduce(vcat, (view(dS[r], :, j)' for r in row))
+                dti = T[dt[r][j] for r in row]
+                Q = (view(part.U, rows, :) .* H) * aux.B
+                delta = (vec(sum(view(part.U2, rows, :) .* dSj; dims=2)) .+ dti) ./ aux.d[rows]
+            end
+            Et = aux.Et[rows, :]
+            XQ = Q' * Et
+            Y = (e[rows, :] .* delta)' * f[rows, :]
+            view(D, :, :, offset + slot) .+= XQ .+ XQ' .+ (Et .* dti)' * Et .- (Y .+ Y') ./ 2
+        end
+    end
+    return D
 end
 
 function _derivatives!(
@@ -935,7 +1373,7 @@ function _derivatives!(
     if !isempty(s.shared)
         # ∂(E'ME)/∂w = Σ_{i∈w} (E_i F_i' + F_i E_i') / 2w, for a unit's ρ and a
         # scale block's θ alike
-        E, F = _shared_terms(s, θ, ρ)
+        E, F = _shared_terms(s, θ, ρ, _hyper_weights(s, w))
         X = zeros(T, size(D, 1), size(D, 2))
         for (part, e, f) in zip(s.shared, E, F)
             for (groups, weights, offset) in ((part.by_kernel, ρ, g), (part.by_scale, θ, 0))
@@ -946,6 +1384,9 @@ function _derivatives!(
                 end
             end
         end
+    end
+    if !isempty(s.spectral)
+        _spectral_derivatives!(D, s, θ, ρ, _hyper_weights(s, w))
     end
     # to (u, a): as `_stick_adjoint!`, on matrices
     for b in 1:g
