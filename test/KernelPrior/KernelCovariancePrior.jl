@@ -242,9 +242,10 @@ end
     with_h_prior = ConstrainedKernelGaussianObservationModel(;
         basis=Φ, prior=kc_prior(rng, r), H=randn(rng, r, r), R=Matrix(1.0I, p, p)
     )
-    @test_throws ArgumentError LinearDynamicalSystem(
+    # beside a kernel prior on the loading, projected through its posterior mean
+    @test LinearDynamicalSystem(
         kc_model(Φ, r, p; Q_prior=KernelIWPrior(kc_prior(rng, r))).state_model, with_h_prior
-    )
+    ) isa LinearDynamicalSystem
     free_C = GaussianObservationModel(; C=Φ, R=Matrix(1.0I, p, p), d=zeros(p))
     @test_throws ArgumentError LinearDynamicalSystem(
         kc_model(Φ, r, p; Q_prior=KernelIWPrior(kc_prior(rng, r))).state_model, free_C

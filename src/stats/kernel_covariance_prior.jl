@@ -57,8 +57,10 @@ variational bound, which never decreases while the trees are held.
 
 Needs a `GaussianStateModel`. Not available in an `SLDS`, a composite emission,
 with `depends_on`, with the affine `gauge_*` options of `fit!` (on `Q`), with
-`R_diagonal` (on `R`), or on `Q` with a kernel prior on the loading or a free
-`C` (`C_fixed=false`). See [`kernel_weights`](@ref) for the fitted weights.
+`R_diagonal` (on `R`), or on `Q` with a free `C` (`C_fixed=false`). Beside a
+kernel prior on the loading, a `Q` prior is seen through the posterior mean of
+`H` (a plug-in: it does not inform `q(H)`, and the bound may dip as `H` moves).
+See [`kernel_weights`](@ref) for the fitted weights.
 """
 mutable struct KernelIWPrior{T<:Real,P<:KernelPrior{T}}
     const prior::P
@@ -292,8 +294,10 @@ function _start_covariance_priors!(lds, suf; fit::Bool=true)
         prior isa KernelIWPrior || continue
         current = Σ isa AbstractObservationModel ? Σ.R : Σ.Q
         # a Q prior seen through a learned loading follows its current H
-        if !(Σ isa AbstractObservationModel) && om isa StructuredGaussianObservationModel
-            _set_loading!(prior, _loading_coefficients(om.basis, om.C))
+        if !(Σ isa AbstractObservationModel) &&
+            om isa StructuredGaussianObservationModel &&
+            !_latent_coordinates(om)
+            _set_loading!(prior, _loading_coefficients(om))
         end
         N = count(lds, suf)
         if fit || !isfinite(prior.posterior_dof)
@@ -302,14 +306,27 @@ function _start_covariance_priors!(lds, suf; fit::Bool=true)
             prior.count = N
         end
     end
+    # a kernel prior on B: its weights centred on the starting B and a first
+    # q(B) given the starting A, after Q's (it uses E[Q⁻¹]); then A's
+    kb = hasproperty(sm, :B_prior) ? sm.B_prior : nothing
+    projected = om isa StructuredGaussianObservationModel && !_latent_coordinates(om)
+    if kb isa KernelInputPrior
+        projected && (kb.loading = Matrix(_loading_coefficients(om)))
+        if fit || isempty(kb.mean)
+            _input_start!(kb, lds, suf)
+            copyto!(sm.B, kb.mean)
+        end
+    end
     # a kernel prior on A: its first q(A), after Q's (it uses E[Q⁻¹])
     kp = hasproperty(sm, :A_prior) ? sm.A_prior : nothing
     if kp isa KernelMNPrior
-        if om isa StructuredGaussianObservationModel
-            kp.loading = Matrix(_loading_coefficients(om.basis, om.C))
-        end
+        projected && (kp.loading = Matrix(_loading_coefficients(om)))
         if fit || kp.posterior === nothing
-            stats = _transition_statistics(lds, suf)
+            stats = if kb isa KernelInputPrior
+                _transition_statistics(lds, suf, kb.mean)
+            else
+                _transition_statistics(lds, suf)
+            end
             _mn_start!(kp, sm.A, _symmetric_inverse(sm.Q), stats...)
             copyto!(sm.A, kp.posterior.mean)
         end

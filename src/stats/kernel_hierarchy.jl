@@ -14,6 +14,15 @@ unless the types are correlated), `Ω = diag(σ) R diag(σ)` with `R ~ LKJ(η)`,
 and every variance has a scaled-inverse-χ² hyperprior entering as `ν₀`
 pseudo-observations of `s₀²`. The tree is updated by coordinate ascent given
 the Laplace posterior of the weights (`_update_tree!`).
+
+A tree with `df = ν < ∞` makes the units' law a multivariate Student t,
+`η_u ~ t_ν(μ, Ω)`, as the scale mixture `η_u | λ_u ~ N(μ, Ω/λ_u)`,
+`λ_u ~ Gamma(ν/2, ν/2)`, with `q(λ_u) = Gamma((ν + d)/2, (ν + q_u)/2)` (`q_u` the
+expected Mahalanobis distance of the unit's deviation): a unit far from the
+rest gets a small `E[λ_u]` and is shrunk less, without widening the prior of
+the others. With unit kernels the scale mixture is on the nugget alone,
+`K_w = w₀ D_λ⁻¹ + Σ w_k K_k` (`D_λ = diag(E[λ])`), so the deviation a unit
+shares with its neighbours stays Gaussian.
 =============================================================================#
 
 # No level of a tree collapses below this SD (natural-log or logit units).
@@ -66,6 +75,17 @@ mutable struct UnitStructure{T<:Real}
     z::Vector{T}                                # (kernels)
     width::Vector{Int}                          # (kernels)
     beta::Matrix{T}                             # (p, d)
+    # the identity's share per unit, 1/E[λ_u] of a Student-t tree (else ones)
+    nugget::Vector{T}                           # (U)
+end
+
+# Without a nugget: ones (a Gaussian tree's).
+function UnitStructure{T}(
+    names, kernels, cnames, X, flags, kernel_sd, z, width, beta
+) where {T<:Real}
+    return UnitStructure{T}(
+        names, kernels, cnames, X, flags, kernel_sd, z, width, beta, ones(T, size(X, 1))
+    )
 end
 
 """
@@ -99,7 +119,14 @@ mutable struct WeightTree{T<:Real}
     const lkj_eta::T
     # levels > 0: optional unit kernels and covariates (`_attach_unit_structure!`)
     unit_structure::Union{Nothing,UnitStructure{T}}
+    # a Student-t tree (`df < Inf`): q(λ_u) = Gamma((ν + d)/2, rate), E[λ], E[log λ]
+    const df::T
+    rate::Vector{T}
+    lambda::Vector{T}
+    loglambda::Vector{T}
 end
+
+_is_student(tree::WeightTree) = tree.levels > 0 && isfinite(tree.df)
 
 _tree_dim(tree::WeightTree) = length(tree.types)
 _tree_omega(tree::WeightTree) = tree.sds .* tree.corr .* tree.sds'
@@ -130,8 +157,13 @@ function _build_trees(
     lkj_eta::T,
     type_sd_prior::AbstractDict=Dict{Symbol,Any}(),
     type_root_sd::AbstractDict=Dict{Symbol,Any}(),
+    type_df::AbstractDict=Dict{Symbol,Any}(),
 ) where {T<:Real}
     types = unique(label.type for label in labels)
+    for type in keys(type_df)
+        type in types ||
+            throw(ArgumentError("df names the type :$type, which no kernel has"))
+    end
     for type in keys(levels)
         type in types || throw(
             ArgumentError(
@@ -172,9 +204,14 @@ function _build_trees(
             ),
         )
         append!(joined, set)
+        dfs = unique(T(get(type_df, type, Inf)) for type in set)
+        length(dfs) == 1 ||
+            throw(ArgumentError("correlated types need one df; got $(join(dfs, ", "))"))
         push!(
             trees,
-            _joint_tree(T, labels, members, set, depth[1]; sd_prior, root_sd, lkj_eta),
+            _joint_tree(
+                T, labels, members, set, depth[1]; sd_prior, root_sd, lkj_eta, df=dfs[1]
+            ),
         )
     end
     for type in types
@@ -182,9 +219,14 @@ function _build_trees(
         push!(
             trees,
             _single_tree(
-                T, labels, members[type], type, get(levels, type, 0);
+                T,
+                labels,
+                members[type],
+                type,
+                get(levels, type, 0);
                 sd_prior=get(type_sd_prior, type, sd_prior),
                 root_sd=get(type_root_sd, type, root_sd),
+                df=T(get(type_df, type, Inf)),
             ),
         )
     end
@@ -221,10 +263,16 @@ function _empty_tree(
     sd_prior,
     root_sd,
     lkj_eta::T,
+    df::T=T(Inf),
 ) where {T<:Real}
     d = length(types)
     nodes = length(node_names)
     nflat = levels == 0 ? size(idx, 1) : 0
+    df > 0 || throw(ArgumentError("a tree's df must be positive (Inf: Gaussian); got $df"))
+    levels == 0 &&
+        isfinite(df) &&
+        throw(ArgumentError("a Student-t tree (df = $df) needs fitted levels"))
+    units = levels == 0 ? 0 : size(idx, 1)
     return WeightTree{T}(
         types,
         levels,
@@ -245,6 +293,10 @@ function _empty_tree(
         root_sd,
         lkj_eta,
         nothing,
+        df,
+        ones(T, units),
+        ones(T, units),
+        zeros(T, units),
     )
 end
 
@@ -256,6 +308,7 @@ function _single_tree(
     levels::Int;
     sd_prior,
     root_sd,
+    df::T=T(Inf),
 ) where {T<:Real}
     if levels >= 1 && length(rows) < 2
         throw(
@@ -281,6 +334,7 @@ function _single_tree(
         sd_prior,
         root_sd,
         lkj_eta=one(T),
+        df,
     )
 end
 
@@ -293,6 +347,7 @@ function _joint_tree(
     sd_prior,
     root_sd,
     lkj_eta::T,
+    df::T=T(Inf),
 ) where {T<:Real}
     lookup = map(set) do type
         units = [labels[i].unit for i in members[type]]
@@ -339,7 +394,7 @@ function _joint_tree(
         ones(Int, length(common)), ["all"]
     end
     return _empty_tree(
-        T, set, levels, idx, node, names, leftover; sd_prior, root_sd, lkj_eta
+        T, set, levels, idx, node, names, leftover; sd_prior, root_sd, lkj_eta, df
     )
 end
 
@@ -376,7 +431,7 @@ function _weight_prior!(
                 for (a, i) in enumerate(rows)
                     μ[i] = tree.node_mean[tree.node[u], a]
                     for (b, j) in enumerate(rows)
-                        Λ[i, j] = Ωi[a, b]
+                        Λ[i, j] = tree.lambda[u] * Ωi[a, b]
                     end
                 end
             end
@@ -395,6 +450,36 @@ function _weight_prior!(
         end
     end
     return μ, Λ
+end
+
+# q(λ_u) of a Student-t tree from each unit's expected Mahalanobis distance `q`.
+function _student_scales!(tree::WeightTree{T}, q::AbstractVector{T}) where {T<:Real}
+    ν, d = tree.df, _tree_dim(tree)
+    shape = (ν + d) / 2
+    for u in eachindex(q)
+        tree.rate[u] = (ν + max(q[u], zero(T))) / 2
+        tree.lambda[u] = shape / tree.rate[u]
+        tree.loglambda[u] = digamma(shape) - log(tree.rate[u])
+    end
+    s = tree.unit_structure
+    s === nothing || (s.nugget .= inv.(tree.lambda))
+    return tree
+end
+
+# `E[log p(λ)] + H[q(λ)]`, and the gap `d/2 (E[log λ] − log E[λ])` between the
+# variational and the plug-in Gaussian prior of the weights, of a Student-t tree.
+function _student_logdensity(tree::WeightTree{T}) where {T<:Real}
+    _is_student(tree) || return zero(T)
+    ν, d = tree.df, _tree_dim(tree)
+    shape = (ν + d) / 2
+    total = zero(T)
+    for u in eachindex(tree.lambda)
+        Eλ, Elog, rate = tree.lambda[u], tree.loglambda[u], tree.rate[u]
+        total += ν / 2 * log(ν / 2) - loggamma(ν / 2) + (ν / 2 - 1) * Elog - ν / 2 * Eλ
+        total -= shape * log(rate) - loggamma(shape) + (shape - 1) * Elog - rate * Eλ
+        total += d / 2 * (Elog - log(Eλ))
+    end
+    return total
 end
 
 # ----------------------------------------------------------------------------
@@ -508,22 +593,28 @@ function _update_tree!(
     units, d = size(idx)
     nodes = length(tree.node_names)
     a = w[idx]
-    Vsum = zeros(T, d, d)
-    for u in 1:units
-        rows = view(idx, u, :)
-        Vsum .+= view(Σw, rows, rows)
-    end
+    V = [Matrix(view(Σw, view(idx, u, :), view(idx, u, :))) for u in 1:units]
+    student = _is_student(tree)
     counts = zeros(T, nodes)
     sums = zeros(T, nodes, d)
-    for u in 1:units
-        counts[tree.node[u]] += 1
-        sums[tree.node[u], :] .+= view(a, u, :)
-    end
+    Vsum = zeros(T, d, d)
     m0 = tree.root_centre
     root_precision = tree.root_sd === nothing ? zero(T) : inv(tree.root_sd^2)
     S = zeros(T, d, d)
     for _ in 1:sweeps
-        old = vcat(tree.root, tree.sds, vec(tree.corr), tree.psi, vec(tree.node_mean))
+        old = vcat(
+            tree.root, tree.sds, vec(tree.corr), tree.psi, vec(tree.node_mean), tree.lambda
+        )
+        # the units weighted by E[λ_u] (all one for a Gaussian tree)
+        fill!(counts, zero(T))
+        fill!(sums, zero(T))
+        fill!(Vsum, zero(T))
+        for u in 1:units
+            λ = tree.lambda[u]
+            counts[tree.node[u]] += λ
+            sums[tree.node[u], :] .+= λ .* view(a, u, :)
+            Vsum .+= λ .* V[u]
+        end
         Ωi = inv(Symmetric(_tree_omega(tree)))
         for n in 1:nodes
             # the node's own prior: the root's (levels = 2) or the hyperprior's
@@ -541,7 +632,7 @@ function _update_tree!(
             tree.node_mean[n, :] .= cov * rhs
         end
         resid = a .- view(tree.node_mean, tree.node, :)
-        S .= resid' * resid .+ Vsum
+        S .= resid' * Diagonal(tree.lambda) * resid .+ Vsum
         for n in 1:nodes
             S .+= counts[n] .* view(tree.node_cov, :, :, n)
         end
@@ -555,7 +646,17 @@ function _update_tree!(
             Matrix(Symmetric(S)), n_eff, tree.lkj_eta, tree.sds, tree.corr
         )
         tree.levels == 2 && _update_root!(tree, root_precision)
-        new = vcat(tree.root, tree.sds, vec(tree.corr), tree.psi, vec(tree.node_mean))
+        if student
+            Ωi = inv(Symmetric(_tree_omega(tree)))
+            q = [
+                dot(Ωi, view(resid, u, :) * view(resid, u, :)' .+ V[u]) +
+                dot(Ωi, view(tree.node_cov, :, :, tree.node[u])) for u in 1:units
+            ]
+            _student_scales!(tree, q)
+        end
+        new = vcat(
+            tree.root, tree.sds, vec(tree.corr), tree.psi, vec(tree.node_mean), tree.lambda
+        )
         maximum(abs, new .- old) < tol && return true
     end
     return false
@@ -587,6 +688,7 @@ end
 function _tree_state(tree::WeightTree{T}) where {T<:Real}
     tree.levels == 0 && return T[]
     state = vcat(tree.root, tree.sds, vec(tree.corr), tree.psi)
+    _is_student(tree) && (state = vcat(state, tree.lambda))
     s = tree.unit_structure
     return s === nothing ? state : vcat(state, s.z, vec(s.beta))
 end
@@ -627,7 +729,7 @@ function _tree_logdensity(tree::WeightTree{T}) where {T<:Real}
     d > 1 && (total += (tree.lkj_eta - 1) * logdet(Symmetric(tree.corr)))
     s = tree.unit_structure
     s === nothing || (total -= sum(abs2, s.z; init=zero(T)) / (2s.kernel_sd^2))
-    return total
+    return total + _student_logdensity(tree)
 end
 
 # ----------------------------------------------------------------------------
@@ -795,6 +897,7 @@ function _attach_unit_structure!(
             zeros(T, nk),
             [length(grid) ÷ 2 + 1 for grid in aligned],
             zeros(T, p, d),
+            ones(T, length(units)),
         )
     end
     return trees
@@ -854,7 +957,7 @@ end
 # K_w at the logits `z` and the structure's widths, and the weights.
 function _unit_kernel(s::UnitStructure{T}, z::AbstractVector{T}, n::Int) where {T<:Real}
     w = _unit_weights(z)
-    K = Matrix{T}(w[1] * I, n, n)
+    K = Matrix{T}(Diagonal(w[1] .* s.nugget))
     for k in eachindex(s.kernels)
         K .+= w[k + 1] .* s.kernels[k][s.width[k]]
     end
@@ -1121,8 +1224,10 @@ function _update_unit_tree!(
             vec(tree.node_mean),
             s.z,
             vec(s.beta),
+            tree.lambda,
         )
     end
+    student = _is_student(tree)
     for sweep in 1:sweeps
         old = state()
         Kinv = _unit_kernel_inverse(s, units)
@@ -1157,6 +1262,23 @@ function _update_unit_tree!(
             tree.sds .= max.(tree.sds .* sqrt((t + e) / m), T(_TREE_SD_FLOOR))
         end
         tree.levels == 2 && _update_root!(tree, root_precision)
+        if student
+            # the nugget e_n of the deviation e = e_s + e_n, e_n,u ~ N(0, w₀ Ω/λ_u):
+            # its second moment given e's, Σ_n Σ⁻¹ E[ee'] Σ⁻¹ Σ_n + Σ_n − Σ_n Σ⁻¹ Σ_n
+            Oi = Matrix(inv(Symmetric(_tree_omega(tree))))
+            F = _unit_moment(R, Vb, Cb, Z, Oi)
+            K, w = _unit_kernel(s, s.z, units)
+            Kinv = _cholesky_inverse(cholesky(Symmetric(K)))
+            nug = w[1] .* s.nugget
+            B = Diagonal(nug) * Kinv
+            q = [
+                (
+                    dot(view(B, u, :), F, view(B, u, :)) +
+                    d * (nug[u] - nug[u]^2 * Kinv[u, u])
+                ) / w[1] for u in 1:units
+            ]
+            _student_scales!(tree, q)
+        end
         maximum(abs, state() .- old) < tol && return true
     end
     return false

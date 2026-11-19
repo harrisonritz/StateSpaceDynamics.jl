@@ -611,6 +611,10 @@ function Q_state!(
     # an uncertain A: −½ tr(Δ_A Σ_{t<T} E[x_t x_t'])
     Δ = _dynamics_excess(lds.state_model)
     Δ === nothing || (Q_val -= dot(Δ, view(suf.dyn_xx[].mat, 1:D, 1:D)) / 2)
+    # an uncertain B: −½ tr(Q⁻¹ E[(B − B̂) Σ u u' (B − B̂)'])
+    u = (D + 2):size(suf.dyn_xx[].mat, 1)
+    ΔB = _input_excess(lds.state_model, Symmetric(suf.dyn_xx[].mat[u, u]))
+    ΔB === nothing || (Q_val -= tr(cholesky(Symmetric(Matrix(lds.state_model.Q))) \ ΔB) / 2)
 
     return Q_val
 end
@@ -639,6 +643,7 @@ function _state_prior_logdensity(
 
     sm.Q_prior === nothing || (total += _covariance_prior_term(sm.Q, sm.Q_prior))
     sm.A_prior === nothing || (total += _mn_bound(sm.A_prior))
+    sm.B_prior === nothing || (total += _input_bound(sm.B_prior))
     sm.P0_prior === nothing || (total += iw_logprior_term(sm.P0, sm.P0_prior))
     if sm.x0_prior !== nothing
         total += mn_logprior_term(_initial_coefficients(sm), sm.P0, sm.x0_prior)
@@ -858,8 +863,10 @@ function update_A_b!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}, sws::SmoothWorkspace{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     lds.fit_bool[3] || return nothing
-    lds.state_model.A_prior isa KernelMNPrior &&
-        return _update_dynamics_posterior!(lds, suf)
+    (
+        lds.state_model.A_prior isa KernelMNPrior ||
+        lds.state_model.B_prior isa KernelInputPrior
+    ) && return _update_dynamics_posterior!(lds, suf)
     D = lds.latent_dim
     ux_dim = lds.ux_dim
     AB_prior = lds.state_model.AB_prior
@@ -898,26 +905,92 @@ function _transition_statistics(lds::LinearDynamicalSystem, suf::SufficientStati
     return Syx_c, Sxx_c, Sxx
 end
 
-#= With a `KernelMNPrior`: `q(A)` given `E[Q⁻¹]` (the model's `Q`), `A` its mean,
-`[b B]` from their normal equations given it, then the prior's mean and weights,
-and `Δ_A` for the next E-step. =#
+# The transitions' moments given the inputs' term `B u_t` (only the intercept
+# partialled out): `Σ (x_{t+1} − B u_t) x_t'` and `Σ x_t x_t'` (t < T) centred,
+# and the uncentred `Σ x_t x_t'`.
+function _transition_statistics(
+    lds::LinearDynamicalSystem, suf::SufficientStatistics, B::AbstractMatrix
+)
+    D = lds.latent_dim
+    G = suf.dyn_xx[].mat
+    XY = suf.dyn_xy
+    x, one_, u = 1:D, D + 1, (D + 2):size(G, 1)
+    n1 = G[one_, one_]
+    gx = G[x, one_]
+    Sxx = Matrix(Symmetric(G[x, x]))
+    Sxx_c = Matrix(Symmetric(Sxx - gx * gx' ./ n1))
+    Syx = Matrix(transpose(XY[x, :])) .- B * G[u, x]
+    sy = XY[one_, :] .- B * G[u, one_]
+    return Syx .- sy * gx' ./ n1, Sxx_c, Sxx
+end
+
+# The inputs' moments given `A` (the intercept partialled out): `Σ u u'` and
+# `Σ (x_{t+1} − A x_t) u'`.
+function _input_statistics(
+    lds::LinearDynamicalSystem, suf::SufficientStatistics, A::AbstractMatrix
+)
+    D = lds.latent_dim
+    G = suf.dyn_xx[].mat
+    XY = suf.dyn_xy
+    x, one_, u = 1:D, D + 1, (D + 2):size(G, 1)
+    n1 = G[one_, one_]
+    gu = G[u, one_]
+    Suu_c = Matrix(Symmetric(G[u, u] - gu * gu' ./ n1))
+    Sru = Matrix(transpose(XY[u, :])) .- A * G[x, u]
+    sr = XY[one_, :] .- A * G[x, one_]
+    return Suu_c, Sru .- sr * gu' ./ n1
+end
+
+#= With a `KernelMNPrior` on `A` and/or a `KernelInputPrior` on `B`: `q(A)` (or
+the point `A`) and `q(B)` (or the point `B`), each given the other's mean and
+`E[Q⁻¹]` (the model's `Q`), `b` from its normal equation given both, then the
+priors' means and weights, and `Δ_A` for the next E-step. Without a `B` prior
+`[b B]` are profiled out of `q(A)`, as their flat prior integrates them out. =#
 function _update_dynamics_posterior!(
     lds::LinearDynamicalSystem{T,S,O}, suf::SufficientStatistics{T}
 ) where {T<:Real,S<:GaussianStateModel{T},O<:AbstractObservationModel{T}}
     sm = lds.state_model
-    kp = sm.A_prior
+    kp, kb = sm.A_prior, sm.B_prior
     D = lds.latent_dim
     Qinv = _symmetric_inverse(sm.Q)
-    q = _mn_posterior!(kp, Qinv, _transition_statistics(lds, suf)...)
-    copyto!(sm.A, q.mean)
     G = suf.dyn_xx[].mat
-    rest = (D + 1):size(G, 1)
-    W = (transpose(suf.dyn_xy[rest, :]) .- sm.A * G[1:D, rest]) / Symmetric(G[rest, rest])
-    copyto!(sm.b, view(W, :, 1))
-    lds.ux_dim > 0 && copyto!(sm.B, view(W, :, 2:(1 + lds.ux_dim)))
-    kp.iteration += 1
-    _mn_update_hyper!(kp; update_trees=kp.iteration % kp.tree_every == 0)
-    _mn_refresh_excess!(kp, sm.Q)
+    if !(kb isa KernelInputPrior)
+        q = _mn_posterior!(kp, Qinv, _transition_statistics(lds, suf)...)
+        copyto!(sm.A, q.mean)
+        rest = (D + 1):size(G, 1)
+        W =
+            (transpose(suf.dyn_xy[rest, :]) .- sm.A * G[1:D, rest]) /
+            Symmetric(G[rest, rest])
+        copyto!(sm.b, view(W, :, 1))
+        lds.ux_dim > 0 && copyto!(sm.B, view(W, :, 2:(1 + lds.ux_dim)))
+    else
+        A = Matrix{T}(sm.A)
+        B = isempty(kb.mean) ? Matrix{T}(sm.B) : kb.mean
+        for _ in 1:(kb.sweeps)
+            Syx_c, Sxx_c, Sxx = _transition_statistics(lds, suf, B)
+            A = if kp isa KernelMNPrior
+                _mn_posterior!(kp, Qinv, Syx_c, Sxx_c, Sxx).mean
+            else
+                Syx_c / Symmetric(Sxx_c)
+            end
+            _input_posterior!(kb, Qinv, _input_statistics(lds, suf, A)...)
+            B = kb.mean
+        end
+        copyto!(sm.A, A)
+        copyto!(sm.B, B)
+        one_, u = D + 1, (D + 2):size(G, 1)
+        copyto!(
+            sm.b,
+            (suf.dyn_xy[one_, :] .- A * G[1:D, one_] .- B * G[u, one_]) ./ G[one_, one_],
+        )
+        kb.iteration += 1
+        _input_update_hyper!(kb; update_trees=kb.iteration % kb.tree_every == 0)
+    end
+    if kp isa KernelMNPrior
+        kp.iteration += 1
+        _mn_update_hyper!(kp; update_trees=kp.iteration % kp.tree_every == 0)
+        _mn_refresh_excess!(kp, sm.Q)
+    end
     return nothing
 end
 
@@ -1118,6 +1191,10 @@ function update_Q!(
     if kp isa KernelMNPrior && kp.posterior !== nothing
         S_res .+= _mn_spread(kp, Matrix(Symmetric(suf.dyn_xx[].mat[1:D, 1:D])))
     end
+    # an uncertain B: E[(B − B̂) u u' (B − B̂)'] summed over the transitions
+    u = (D + 2):size(suf.dyn_xx[].mat, 1)
+    ΔB = _input_excess(lds.state_model, Symmetric(suf.dyn_xx[].mat[u, u]))
+    ΔB === nothing || (S_res .+= ΔB)
     _finalize_Q!(lds, S_res, T(suf.dyn_n) + T(_ab_prior_width(lds)))
     kp isa KernelMNPrior && _mn_refresh_excess!(kp, lds.state_model.Q)
     return nothing

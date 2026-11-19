@@ -74,6 +74,12 @@ function _validate_gauge(model, center, whiten, max_condition)
             "latents' coordinates; fit without them",
         ),
     )
+    model.state_model.B_prior isa KernelInputPrior && throw(
+        ArgumentError(
+            "the gauge_* options transform B, whose KernelInputPrior is fixed in the " *
+            "latents' coordinates; fit without them",
+        ),
+    )
     model.state_model.Q_prior isa KernelIWPrior && throw(
         ArgumentError(
             "the gauge_* options transform Q, whose KernelIWPrior is fixed in the " *
@@ -145,6 +151,8 @@ end
 
 _gauge_iw(::Nothing, T) = nothing
 _gauge_iw(p::IWPrior, T) = IWPrior(; Ψ=Matrix(Symmetric(T * p.Ψ * T')), ν=p.ν)
+# a kernel prior seen through the loading moves with it (`_gauge_projected_priors!`)
+_gauge_iw(p::KernelIWPrior, T) = p
 _gauge_mn(::Nothing, L, T, shift) = nothing
 function _gauge_mn(p::MNPrior, L, T, shift)
     M = Matrix(T * p.M₀ / L)
@@ -235,7 +243,7 @@ function _gauge_prior_shift(models, grp, logdetT)
     k = first(models).latent_dim
     if grp === nothing
         sm = first(models).state_model
-        sm.Q_prior === nothing || (weight += sm.Q_prior.ν + k + 1)
+        sm.Q_prior isa IWPrior && (weight += sm.Q_prior.ν + k + 1)
         sm.P0_prior === nothing || (weight += sm.P0_prior.ν + k + 1)
         sm.AB_prior === nothing || (weight += size(sm.AB_prior.M₀, 2))
         sm.x0_prior === nothing || (weight += size(sm.x0_prior.M₀, 2))
