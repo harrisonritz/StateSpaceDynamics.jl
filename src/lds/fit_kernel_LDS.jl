@@ -88,6 +88,10 @@ function _gauge_projected_priors!(
     kq = sm.Q_prior
     kq isa KernelIWPrior && _is_projected(kq) && _set_loading!(kq, H)
     ka = sm.A_prior
+    if ka isa KernelMNPrior && ka.latent_scale > 0
+        ridge = _mn_latent_ridge(ka, size(H, 2))
+        ka.latent_ridge = Matrix(Symmetric(Ti' * ridge * Ti))
+    end
     if ka isa KernelMNPrior && !isempty(ka.loading)
         ka.loading = H
         q = ka.posterior

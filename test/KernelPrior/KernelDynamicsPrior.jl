@@ -378,14 +378,16 @@ end
 
 @testset "a mean basis: A's term in the loading and its gradient" begin
     rng = MersenneTwister(42)
-    r, k = 6, 3
-    H = randn(rng, r, k)
-    E(i) = 1e-6 .* reshape(1:(r * k) .== i, r, k)
-    for projection in (:noise_weighted, :euclidean)
+    for (projection, r, k, latent_scale) in (
+        (:noise_weighted, 6, 3, 0.0), (:euclidean, 6, 3, 0.0), (:noise_weighted, 3, 5, 0.05)
+    )
+        H = randn(rng, r, k)
+        E(i) = 1e-6 .* reshape(1:(r * k) .== i, r, k)
         kp = KernelMNPrior(
             kd_kernels(rng, r),
             kd_kernels(rng, r);
             projection,
+            latent_scale,
             mean_basis=kd_network_basis(r),
         )
         KDSSD._initialize_prior!(kp.rows, kd_spd(rng, r))
@@ -412,6 +414,40 @@ end
             -k / 2 * (logdet(U) + logdet(V)) - tr(U \ KDSSD._mn_row_moment(kp, V)) / 2 rtol =
             1e-10
     end
+end
+
+@testset "a projected A prior with more latents than loading-basis dimensions" begin
+    rng = MersenneTwister(45)
+    r, k = 3, 5
+    Φ, H, truth = kd_system(rng; r, k)
+    y = rand(rng, truth, fill(20, 4))[2]
+    prior = kd_prior(rng, r; latent_scale=0.05, start_rounds=2, weight_iters=4,
+                     mean_basis=kd_network_basis(r))
+    lds = kd_model(rng, Φ, H; learned=true, A_prior=prior)
+    T = Matrix(Diagonal(range(0.7, 1.4; length=k)))
+    Ti = inv(T)
+    @test isempty(prior.loading)
+    @test size(KDSSD._mn_mean(prior)) == (r, r)
+    @test prior.latent_ridge === nothing
+    KDSSD._apply_latent_gauge!(lds, T)
+    @test prior.latent_ridge ≈ 0.05 * Ti' * Ti
+    trace = fit!(lds, y; max_iter=4, progress=false)
+    @test all(isfinite, trace)
+    @test isfinite(loglikelihood(lds, y))
+    @test size(dynamics_posterior(lds.state_model).mean) == (k, k)
+    U, V = KDSSD._mn_covariances(prior)
+    @test isposdef(Symmetric(U)) && isposdef(Symmetric(V))
+    @test isfinite(KDSSD._mn_bound(prior))
+
+    # The ridge is expressed in the starting coordinates, including for the mean.
+    M = KDSSD._mn_mean(prior)
+    ridge = copy(prior.latent_ridge)
+    KDSSD._apply_latent_gauge!(lds, T)
+    @test prior.latent_ridge ≈ Ti' * ridge * Ti
+    Un, Vn = KDSSD._mn_covariances(prior)
+    @test Un ≈ T * U * T'
+    @test Vn ≈ Ti' * V * Ti
+    @test KDSSD._mn_mean(prior) ≈ T * M * Ti
 end
 
 @testset "a mean basis: a fit finds the network coupling, a t prior the outlier" begin

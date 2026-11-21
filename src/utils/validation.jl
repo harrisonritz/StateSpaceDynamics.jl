@@ -1062,6 +1062,14 @@ function _validate_covariance_priors(lds::LinearDynamicalSystem)
         )
         sm.depends_on === nothing ||
             throw(ArgumentError("a KernelMNPrior on A is not available with depends_on"))
+        projected = om isa StructuredGaussianObservationModel && !_latent_coordinates(om)
+        scale = sm.A_prior.latent_scale
+        if scale > 0 && !projected
+            throw(ArgumentError("A_prior.latent_scale requires a learned loading"))
+        end
+        if projected && lds.latent_dim > _loading_dim(om) && scale == 0
+            throw(ArgumentError("a projected A prior with more states than loading-basis dimensions needs latent_scale > 0"))
+        end
         kernels = sm.A_prior.rows.dim
         if om isa StructuredGaussianObservationModel
             want = _latent_coordinates(om) ? lds.latent_dim : _loading_dim(om)

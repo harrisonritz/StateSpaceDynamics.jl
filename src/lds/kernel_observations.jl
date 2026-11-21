@@ -449,7 +449,7 @@ The part of `E_q[log p(A | U, V, M)] (+ the mean's own terms)` that involves the
 loading `H`, with the row covariance `U` and the column covariance `V` the
 kernels' (`FU'FU`, `FV'FV`) projected through `H` (by the prior's projection and
 the sandwich), and the mean `M = m I + P L diag(β) R' H` of a mean basis seen
-through `H` (`P = (H'H)⁻¹H'`):
+through `H` (`P = (H'H + ridge)⁻¹H'`):
 `g = −k/2 (log|U| + log|V|) − ½ tr(U⁻¹ E[(A − M) V⁻¹ (A − M)'])`, the
 expectation over `q(A) q(β)`, and its gradient. `(-Inf, 0)` where either is not
 positive definite.
@@ -458,7 +458,7 @@ function _projected_dynamics_term(
     H::AbstractMatrix{T}, ka::KernelMNPrior{T}, FU::Cholesky{T}, FV::Cholesky{T}
 ) where {T<:Real}
     k = size(H, 2)
-    pu, pv = _Projection(ka.projection, H), _Projection(:sandwich, H)
+    pu, pv = _mn_projections(ka, H)
     U, _ = _project(FU, pu)
     V, _ = _project(FV, pv)
     FUk = cholesky(Symmetric(U); check=false)
@@ -466,7 +466,7 @@ function _projected_dynamics_term(
     (issuccess(FUk) && issuccess(FVk)) || return T(-Inf), zeros(T, size(H))
     Ui, Vi = inv(FUk), inv(FVk)
     mb = ka.mean_basis
-    cols = mb === nothing ? nothing : _mean_columns(mb, Matrix{T}(H))
+    cols = mb === nothing ? nothing : _mean_columns(mb, H, pu.ridge)
     qc = _mn_centred(ka, _mn_mean(ka, cols))
     SU = _loading_moment(qc, Vi)
     SV = qc.mean' * Ui * qc.mean + _loading_excess(qc, Ui)
@@ -479,7 +479,7 @@ function _projected_dynamics_term(
     GU = sym(-k / 2 .* Ui .+ Ui * SU * Ui ./ 2)
     GV = sym(-k / 2 .* Vi .+ Vi * SV * Vi ./ 2)
     grad = _projection_gradient(pu, FU, U, GU) .+ _projection_gradient(pv, FV, V, GV)
-    mb === nothing || (grad .+= _mean_loading_gradient(H, mb, cols, Ui, Vi, qc.mean))
+    mb === nothing || (grad .+= _mean_loading_gradient(H, mb, cols, Ui, Vi, qc.mean, pu.ridge))
     return g, grad
 end
 
@@ -490,7 +490,7 @@ The part of `_projected_dynamics_term`'s gradient through the mean's columns
 `a = P L` and `b = H' R` at fixed `U`, `V` (`D = Â − M`): with `X = U⁻¹ D V⁻¹`
 and `C̃` the coefficients' covariance on the columns, `∂g/∂a = X b diag(β) −
 U⁻¹ a (C̃ ∘ b'V⁻¹b)` and `∂g/∂b = X' a diag(β) − V⁻¹ b (C̃ ∘ a'U⁻¹a)`, pulled back
-through `P = (H'H)⁻¹H'` and `H'`.
+through `P = (H'H + ridge)⁻¹H'` and `H'`.
 """
 function _mean_loading_gradient(
     H::AbstractMatrix{T},
@@ -499,6 +499,7 @@ function _mean_loading_gradient(
     Ui::AbstractMatrix{T},
     Vi::AbstractMatrix{T},
     D::AbstractMatrix{T},
+    ridge=nothing,
 ) where {T<:Real}
     a, b = cols
     β = Diagonal(mb.mean[mb.coef])
@@ -506,10 +507,10 @@ function _mean_loading_gradient(
     X = Ui * D * Vi
     Ga = X * b * β .- Ui * a * (C̃ .* (b' * Vi * b))
     Gb = X' * a * β .- Vi * b * (C̃ .* (a' * Ui * a))
-    HtH = Symmetric(Matrix(H' * H))
-    P = HtH \ Matrix(H')
+    gram = _projection_gram(H, ridge)
+    P = gram \ Matrix(H')
     Z = Ga * mb.left'                                   # ⟨Z, dP⟩, (k × r)
-    pull = .-(P' * Z * P') .+ (I - H * P) * Z' / HtH
+    pull = .-(P' * Z * P') .+ (I - H * P) * Z' / gram
     return mb.right * Gb' .+ pull
 end
 

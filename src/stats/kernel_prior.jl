@@ -548,24 +548,29 @@ Each has `dK̃ = W dZ W'` (`W = K̃H'Z⁻¹`, `H⁺`, `H'`). Under `x → T x`,
 struct _Projection{T<:Real}
     kind::Symbol
     H::Matrix{T}
-    pinv::Matrix{T}         # H⁺ for :euclidean and :sandwich, else empty
+    pinv::Matrix{T}         # regularized H⁺ for :euclidean and :sandwich, else empty
+    ridge::Union{Nothing,Matrix{T}}
 end
 
 const _LOADING_PROJECTIONS = (:noise_weighted, :euclidean, :sandwich)
 
 function _identity_projection(::Type{T}) where {T<:Real}
-    return _Projection{T}(:identity, zeros(T, 0, 0), zeros(T, 0, 0))
+    return _Projection{T}(:identity, zeros(T, 0, 0), zeros(T, 0, 0), nothing)
 end
 
-function _Projection(kind::Symbol, H::AbstractMatrix{T}) where {T<:Real}
+_projection_gram(H, ridge) = Symmetric(ridge === nothing ? H' * H : H' * H + ridge)
+
+function _Projection(
+    kind::Symbol, H::AbstractMatrix{T}, ridge::Union{Nothing,Matrix{T}}=nothing
+) where {T<:Real}
     kind in _LOADING_PROJECTIONS || throw(
         ArgumentError(
             "a projection is :noise_weighted, :euclidean or :sandwich; got :$kind"
         ),
     )
     Hm = Matrix{T}(H)
-    pinv = kind === :noise_weighted ? zeros(T, 0, 0) : Matrix((Hm' * Hm) \ Hm')
-    return _Projection{T}(kind, Hm, pinv)
+    pinv = kind === :noise_weighted ? zeros(T, 0, 0) : Matrix(_projection_gram(Hm, ridge) \ Hm')
+    return _Projection{T}(kind, Hm, pinv, ridge)
 end
 
 _is_identity(p::_Projection) = p.kind === :identity
@@ -578,10 +583,12 @@ function _project(F::Cholesky{T}, p::_Projection{T}) where {T<:Real}
     elseif p.kind === :euclidean
         return sym(p.pinv * Matrix(F) * p.pinv'), p.pinv
     elseif p.kind === :sandwich
-        return sym(p.H' * Matrix(F) * p.H), Matrix(p.H')
+        K̃ = sym(p.H' * Matrix(F) * p.H)
+        p.ridge === nothing || (K̃ .+= p.ridge)
+        return K̃, Matrix(p.H')
     end
     X = F.L \ p.H
-    K̃ = Matrix(Symmetric(inv(cholesky(Symmetric(X' * X)))))
+    K̃ = Matrix(Symmetric(inv(cholesky(_projection_gram(X, p.ridge)))))
     return K̃, K̃ * (F \ p.H)'
 end
 
@@ -607,7 +614,7 @@ function _projection_gradient(
     elseif p.kind === :sandwich
         return 2 .* (Matrix(Fz) * H * G̃)
     elseif p.kind === :noise_weighted
-        # K̃ = (H'Z⁻¹H)⁻¹: dK̃ = −K̃ (dH'Z⁻¹H + H'Z⁻¹dH) K̃
+        # K̃ = (H'Z⁻¹H + ridge)⁻¹: dK̃ = −K̃ (dH'Z⁻¹H + H'Z⁻¹dH) K̃
         return -2 .* ((Fz \ H) * K̃ * G̃ * K̃)
     end
     throw(ArgumentError("the identity projection has no loading"))

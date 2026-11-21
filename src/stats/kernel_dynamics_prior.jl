@@ -199,6 +199,15 @@ reconstruction-type ones (`G⁺' K G⁺`, `G⁺` a source estimate's operator).
   latents (`x → T x` takes it to that of `T A T⁻¹`), and `H` gets a gradient
   polish with the prior's term each iteration.
 
+For a learned loading with `projection=:noise_weighted`, `latent_scale > 0`
+adds a ridge to the receiver precision and to the sender covariance in
+latent coordinates: `U = (H'Z_rows⁻¹H + D)⁻¹`, `V = H'Z_cols H + D`.
+The same `D` regularizes the solve that lifts the structured mean.
+`D = latent_scale * I` in the starting coordinates and transforms with the
+latents when the fitter changes gauge. This allows more latent states than
+loading-basis dimensions. The default `latent_scale=0` uses the full-column-rank
+projection.
+
 Needs a `GaussianStateModel` without an `AB_prior` (one prior on `A`). Not
 available in an `SLDS`, a composite emission, with `depends_on`, with the
 affine `gauge_*` options of `fit!` or with a free `C`. Beside a kernel prior on
@@ -213,6 +222,7 @@ mutable struct KernelMNPrior{T<:Real,PU<:KernelPrior{T},PV<:KernelPrior{T}}
     const mean::Symbol
     m::T
     const projection::Symbol
+    const latent_scale::T
     const weight_iters::Int
     const tree_every::Int
     const start_rounds::Int
@@ -220,6 +230,7 @@ mutable struct KernelMNPrior{T<:Real,PU<:KernelPrior{T},PV<:KernelPrior{T}}
     const mean_basis::Union{Nothing,MNMeanBasis{T}}
     # the loading `H` (r × k) a projected prior is seen through; empty otherwise
     loading::Matrix{T}
+    latent_ridge::Union{Nothing,Matrix{T}}
     posterior::Union{Nothing,LoadingPosterior{T}}
     # Δ_A = E[A'Q⁻¹A] − Â'Q⁻¹Â, what the smoother adds to each state with a
     # successor; empty until the posterior exists
@@ -232,6 +243,7 @@ function KernelMNPrior(
     cols::KernelPrior{T};
     mean::Symbol=:identity,
     projection::Symbol=:noise_weighted,
+    latent_scale::Real=0,
     weight_iters::Int=50,
     tree_every::Int=1,
     start_rounds::Int=30,
@@ -247,6 +259,10 @@ function KernelMNPrior(
     projection in (:noise_weighted, :euclidean) || throw(
         ArgumentError("projection must be :noise_weighted or :euclidean; got :$projection"),
     )
+    scale = T(latent_scale)
+    isfinite(scale) && scale >= 0 || throw(ArgumentError("latent_scale must be finite and nonnegative"))
+    (scale == 0 || projection === :noise_weighted) ||
+        throw(ArgumentError("latent_scale needs projection=:noise_weighted"))
     weight_iters >= 1 || throw(ArgumentError("weight_iters must be at least 1"))
     tree_every >= 1 || throw(ArgumentError("tree_every must be at least 1"))
     start_rounds >= 1 || throw(ArgumentError("start_rounds must be at least 1"))
@@ -263,11 +279,13 @@ function KernelMNPrior(
         mean,
         zero(T),
         projection,
+        scale,
         weight_iters,
         tree_every,
         start_rounds,
         mean_basis === nothing ? nothing : deepcopy(mean_basis),
         zeros(T, 0, 0),
+        nothing,
         nothing,
         zeros(T, 0, 0),
         0,
@@ -285,14 +303,22 @@ function _mean_onehot(mb::MNMeanBasis{T}) where {T<:Real}
     return S
 end
 
+function _mn_latent_ridge(kp::KernelMNPrior{T}, k=size(kp.loading, 2)) where {T<:Real}
+    (kp.latent_scale == 0 || k == 0) && return nothing
+    if kp.latent_ridge === nothing
+        kp.latent_ridge = Matrix{T}(kp.latent_scale * I, k, k)
+    end
+    return kp.latent_ridge
+end
+
 # The columns in the latents' coordinates at the loading `H` (empty: as given):
-# `P l_c` and `H' r_c`, `P = (H'H)⁻¹H'`.
-function _mean_columns(mb::MNMeanBasis{T}, H::AbstractMatrix{T}) where {T<:Real}
+# `P l_c` and `H' r_c`, `P = (H'H + ridge)⁻¹H'`.
+function _mean_columns(mb::MNMeanBasis{T}, H::AbstractMatrix{T}, ridge=nothing) where {T<:Real}
     isempty(H) && return mb.left, mb.right
-    P = (H' * H) \ H'
+    P = _projection_gram(H, ridge) \ H'
     return P * mb.left, H' * mb.right
 end
-_mean_columns(kp::KernelMNPrior) = _mean_columns(kp.mean_basis, kp.loading)
+_mean_columns(kp::KernelMNPrior) = _mean_columns(kp.mean_basis, kp.loading, _mn_latent_ridge(kp))
 
 # The prior mean `m I + a diag(β_c) b'` at the columns `cols` (default: the
 # current loading's).
@@ -513,9 +539,10 @@ end
 
 _mn_dim(kp::KernelMNPrior) = isempty(kp.loading) ? kp.rows.dim : size(kp.loading, 2)
 
-function _mn_projections(kp::KernelMNPrior{T}) where {T<:Real}
-    isempty(kp.loading) && return _identity_projection(T), _identity_projection(T)
-    return _Projection(kp.projection, kp.loading), _Projection(:sandwich, kp.loading)
+function _mn_projections(kp::KernelMNPrior{T}, H=kp.loading) where {T<:Real}
+    isempty(H) && return _identity_projection(T), _identity_projection(T)
+    ridge = _mn_latent_ridge(kp, size(H, 2))
+    return _Projection(kp.projection, H, ridge), _Projection(:sandwich, H, ridge)
 end
 
 # U and V at the current weights, in the latents' coordinates.
