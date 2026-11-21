@@ -120,7 +120,8 @@ export banded_transition, banded_transition_prior, median_dwell_stay
 
 # Kernel priors
 export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily, KernelIWPrior
-export KernelMNPrior, dynamics_posterior
+export KernelMNPrior, MNMeanBasis, dynamics_posterior, mean_coefficients
+export KernelInputPrior, input_posterior
 export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
 export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
 export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel

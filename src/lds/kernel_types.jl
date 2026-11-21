@@ -35,6 +35,8 @@ with `Φ` a fixed basis (or the identity) and `H` either free or drawn from a
   (see [`KernelGaussianObservationModel`](@ref)).
 - `weight_iters`: the most L-BFGS steps the kernel weights take per EM iteration.
 - `tree_every`: the prior's trees are updated every this many EM iterations.
+- `H_mask`: which entries of `H` are free (`r × k`; `nothing`: all). Only without a
+  kernel prior ([`ConstrainedGaussianObservationModel`](@ref)).
 """
 Base.@kwdef mutable struct StructuredGaussianObservationModel{
     T<:Real,
@@ -61,11 +63,13 @@ Base.@kwdef mutable struct StructuredGaussianObservationModel{
     weight_iters::Int = 50
     tree_every::Int = 1
     iteration::Int = 0
+    # which entries of `H` are free (`r × k`); nothing: all
+    H_mask::Union{Nothing,BitMatrix} = nothing
 end
 
 """
     ConstrainedGaussianObservationModel(; basis, C or H, R, d, D, R_prior,
-                                        R_diagonal=false)
+                                        R_diagonal=false, H_mask=nothing)
 
 A Gaussian emission whose loading lies in the column span of a fixed basis:
 `C = basis * H` with `basis` (`obs_dim × r`, full column rank) fixed and `H`
@@ -76,6 +80,12 @@ Give the start as `H`, or as a `C` in the span. Given the current `R`, the
 M-step's `H` is the exact constrained maximiser (with `d` and `D` profiled
 out), and `R`'s own update follows it, so each EM iteration is an ECM step and
 the ELBO never decreases. A square, invertible basis constrains nothing.
+
+`H_mask` (`r × latent_dim`, `true` where free) holds the other entries of `H` at
+zero: each latent loads only on its own basis columns, for example the modes of
+one region (a block-diagonal `H`). The M-step is then the exact maximiser over
+the free entries, and the basis needs full column rank only within each
+latent's columns (`H` is recovered from `C` column by column).
 
 `d` defaults to zero, `D` to no observation inputs. Not available in a
 switching model, with an `LQRStateModel`, as a member of a composite emission,
@@ -169,6 +179,7 @@ function _structured_model(;
     gauge::Symbol=:bound,
     weight_iters::Int=50,
     tree_every::Int=1,
+    H_mask::Union{Nothing,AbstractMatrix{Bool}}=nothing,
 ) where {T<:Real}
     (C === nothing) == (H === nothing) &&
         throw(ArgumentError("give the starting loading as exactly one of C and H"))
@@ -176,6 +187,19 @@ function _structured_model(;
         C === nothing && (C = H)
     else
         C === nothing && (C = basis * H)
+    end
+    if H_mask !== nothing
+        basis === nothing && throw(ArgumentError("an H_mask needs a basis"))
+        prior === nothing ||
+            throw(ArgumentError("an H_mask is for a loading without a kernel prior"))
+        size(H_mask) == (size(basis, 2), size(C === nothing ? H : C, 2)) || throw(
+            DimensionMismatch(
+                "H_mask must be r × latent_dim = $((size(basis, 2), size(C === nothing ? H : C, 2))); got $(size(H_mask))",
+            ),
+        )
+        H === nothing ||
+            all(iszero, H[.!H_mask]) ||
+            throw(ArgumentError("the starting H is nonzero outside H_mask"))
     end
     Cm = Matrix{T}(C)
     p = size(Cm, 1)
@@ -193,6 +217,7 @@ function _structured_model(;
         gauge,
         weight_iters,
         tree_every,
+        H_mask=H_mask === nothing ? nothing : BitMatrix(H_mask),
     )
 end
 

@@ -29,6 +29,40 @@ _basis_tmul(::Nothing, X::AbstractMatrix) = X
 _basis_tmul(Φ::AbstractMatrix, X::AbstractMatrix) = Φ' * X
 _loading_coefficients(::Nothing, C::AbstractMatrix) = Matrix(C)
 _loading_coefficients(Φ::AbstractMatrix, C::AbstractMatrix) = Φ \ C
+# With a mask, column by column over its free rows.
+function _loading_coefficients(om::StructuredGaussianObservationModel{T}) where {T<:Real}
+    om.H_mask === nothing && return _loading_coefficients(om.basis, om.C)
+    H = zeros(T, size(om.basis, 2), size(om.C, 2))
+    for j in axes(H, 2)
+        rows = findall(view(om.H_mask, :, j))
+        isempty(rows) || (H[rows, j] = om.basis[:, rows] \ om.C[:, j])
+    end
+    return H
+end
+_loading_coefficients(om) = _loading_coefficients(om.basis, om.C)
+
+# Whether priors on Q and A see this emission's latents directly (a masked
+# loading: each latent is its block's state) rather than through H.
+_latent_coordinates(om::StructuredGaussianObservationModel) = om.H_mask !== nothing
+_latent_coordinates(om) = false
+
+# The maximiser of `tr(H'rhs) − ½ tr(H'A1 H Sxx_c)` over the free entries of `H`.
+function _masked_loading(
+    mask::BitMatrix, A1::AbstractMatrix{T}, rhs::AbstractMatrix{T}, Sxx_c::AbstractMatrix{T}
+) where {T<:Real}
+    free = findall(vec(mask))
+    r = size(mask, 1)
+    row(f) = (f - 1) % r + 1
+    col(f) = (f - 1) ÷ r + 1
+    n = length(free)
+    G = Matrix{T}(undef, n, n)
+    for (b, g) in enumerate(free), (a, f) in enumerate(free)
+        G[a, b] = Sxx_c[col(f), col(g)] * A1[row(f), row(g)]
+    end
+    H = zeros(T, size(mask))
+    H[free] = Symmetric((G .+ G') ./ 2) \ vec(rhs)[free]
+    return H
+end
 
 """
     emission_posterior(obs_model) -> LoadingPosterior or nothing
@@ -89,11 +123,27 @@ function _validate_obs_model(
         size(basis, 1) == obs_dim ||
             throw(DimensionMismatchError("basis rows", obs_dim, size(basis, 1)))
         all(isfinite, basis) || throw(ArgumentError("the basis has non-finite entries"))
-        rank(basis) == size(basis, 2) ||
-            throw(ArgumentError("the basis must have full column rank"))
-        outside = om.C - basis * (basis \ om.C)
-        norm(outside) <= sqrt(eps(T)) * max(norm(om.C), one(T)) ||
-            throw(ArgumentError("the starting C must lie in the span of the basis"))
+        if om.H_mask === nothing
+            rank(basis) == size(basis, 2) ||
+                throw(ArgumentError("the basis must have full column rank"))
+        else
+            # full column rank within each latent's free columns
+            for j in axes(om.H_mask, 2)
+                rows = findall(view(om.H_mask, :, j))
+                rank(basis[:, rows]) == length(rows) || throw(
+                    ArgumentError(
+                        "the basis must have full column rank within latent $j's free columns",
+                    ),
+                )
+            end
+        end
+        outside = om.C - basis * _loading_coefficients(om)
+        norm(outside) <= sqrt(eps(T)) * max(norm(om.C), one(T)) || throw(
+            ArgumentError(
+                "the starting C must lie in the span of the basis" *
+                (om.H_mask === nothing ? "" : " (within H_mask)"),
+            ),
+        )
     end
     prior = om.prior
     if prior !== nothing
@@ -315,11 +365,15 @@ function _update_loading!(lds::_StructuredLDS{T}, suf::SufficientStatistics{T}) 
     A1, weighted = _basis_precision(om)
     rhs = weighted * Sxy_c'                                       # Φ'R⁻¹Syx_c
     prior = om.prior
-    kq, ka = _projected_q_prior(lds), _projected_a_prior(lds)
+    kq, ka, kb = _projected_q_prior(lds), _projected_a_prior(lds), _projected_b_prior(lds)
     if prior === nothing
-        H = (Symmetric(A1) \ rhs) / Symmetric(Sxx_c)
-        if kq !== nothing || ka !== nothing
-            H = _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c)
+        H = if om.H_mask === nothing
+            (Symmetric(A1) \ rhs) / Symmetric(Sxx_c)
+        else
+            _masked_loading(om.H_mask, A1, rhs, Sxx_c)
+        end
+        if kq !== nothing || ka !== nothing || kb !== nothing
+            H = _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c; kb)
         end
     else
         q = _loading_posterior(kernel_covariance(prior), A1, rhs, Sxx_c, Sxx)
@@ -332,8 +386,11 @@ function _update_loading!(lds::_StructuredLDS{T}, suf::SufficientStatistics{T}) 
     V = (transpose(suf.obs_xy[rest, :]) .- om.C * G[1:k, rest]) / Symmetric(G[rest, rest])
     copyto!(om.d, view(V, :, 1))
     lds.uy_dim > 0 && copyto!(om.D, view(V, :, 2:(1 + lds.uy_dim)))
-    kq === nothing || _set_loading!(kq, H)
-    ka === nothing || (ka.loading = Matrix{T}(H))
+    if !_latent_coordinates(om)
+        kq === nothing || _set_loading!(kq, H)
+        ka === nothing || (ka.loading = Matrix{T}(H))
+        kb === nothing || (kb.loading = Matrix{T}(H))
+    end
     return nothing
 end
 
@@ -346,6 +403,39 @@ function _projected_q_prior(lds::_StructuredLDS)
     return prior isa KernelIWPrior && _is_projected(prior) ? prior : nothing
 end
 
+function _projected_b_prior(lds::_StructuredLDS)
+    prior = lds.state_model.B_prior
+    ok = prior isa KernelInputPrior && _input_projected(prior) && !isempty(prior.mean)
+    return ok ? prior : nothing
+end
+
+"""
+    _projected_input_term(H, kb, Fs) -> (g, ∂g/∂H)
+
+The part of `E_q[log p(B | U)]` that involves the loading `H`: each group's
+covariance `U_g` its kernels' (`Fs[g]'Fs[g]`) projected through `H`,
+`g = Σ_g −n_g/2 log|U_g| − ½ tr(U_g⁻¹ E[B_g B_g'])`, and its gradient.
+`(-Inf, 0)` where a `U_g` is not positive definite.
+"""
+function _projected_input_term(
+    H::AbstractMatrix{T}, kb::KernelInputPrior{T}, Fs::Vector{<:Cholesky{T}}
+) where {T<:Real}
+    proj = _Projection(kb.projection, H)
+    value, grad = zero(T), zeros(T, size(H))
+    for (g, cols) in enumerate(kb.groups)
+        U, _ = _project(Fs[g], proj)
+        FU = cholesky(Symmetric(U); check=false)
+        issuccess(FU) || return T(-Inf), zeros(T, size(H))
+        Ui = inv(FU)
+        M = _input_moment(kb, g)
+        n = length(cols)
+        value += -n / 2 * logdet(FU) - dot(Ui, M) / 2
+        GU = -n / 2 .* Ui .+ Ui * M * Ui ./ 2
+        grad .+= _projection_gradient(proj, Fs[g], U, (GU .+ GU') ./ 2)
+    end
+    return value, grad
+end
+
 function _projected_a_prior(lds::_StructuredLDS)
     prior = lds.state_model.A_prior
     ok = prior isa KernelMNPrior && !isempty(prior.loading) && prior.posterior !== nothing
@@ -355,11 +445,14 @@ end
 """
     _projected_dynamics_term(H, ka, FU, FV) -> (g, ∂g/∂H)
 
-The part of `E_q[log p(A | U, V, m)]` that involves the loading `H`, with the
-row covariance `U` and the column covariance `V` the kernels' (`FU'FU`, `FV'FV`)
-projected through `H` (by the prior's projection and the sandwich):
-`g = −k/2 (log|U| + log|V|) − ½ tr(U⁻¹ E[(A − mI) V⁻¹ (A − mI)'])`, and its
-gradient. `(-Inf, 0)` where either is not positive definite.
+The part of `E_q[log p(A | U, V, M)] (+ the mean's own terms)` that involves the
+loading `H`, with the row covariance `U` and the column covariance `V` the
+kernels' (`FU'FU`, `FV'FV`) projected through `H` (by the prior's projection and
+the sandwich), and the mean `M = m I + P L diag(β) R' H` of a mean basis seen
+through `H` (`P = (H'H)⁻¹H'`):
+`g = −k/2 (log|U| + log|V|) − ½ tr(U⁻¹ E[(A − M) V⁻¹ (A − M)'])`, the
+expectation over `q(A) q(β)`, and its gradient. `(-Inf, 0)` where either is not
+positive definite.
 """
 function _projected_dynamics_term(
     H::AbstractMatrix{T}, ka::KernelMNPrior{T}, FU::Cholesky{T}, FV::Cholesky{T}
@@ -372,15 +465,52 @@ function _projected_dynamics_term(
     FVk = cholesky(Symmetric(V); check=false)
     (issuccess(FUk) && issuccess(FVk)) || return T(-Inf), zeros(T, size(H))
     Ui, Vi = inv(FUk), inv(FVk)
-    qc = _mn_centred(ka)
+    mb = ka.mean_basis
+    cols = mb === nothing ? nothing : _mean_columns(mb, Matrix{T}(H))
+    qc = _mn_centred(ka, _mn_mean(ka, cols))
     SU = _loading_moment(qc, Vi)
     SV = qc.mean' * Ui * qc.mean + _loading_excess(qc, Ui)
+    if mb !== nothing
+        SU += _mean_row_extra(mb, cols, Vi)
+        SV += _mean_col_extra(mb, cols, Ui)
+    end
     g = -k / 2 * (logdet(FUk) + logdet(FVk)) - dot(Ui, SU) / 2
     sym(X) = (X .+ X') ./ 2
     GU = sym(-k / 2 .* Ui .+ Ui * SU * Ui ./ 2)
     GV = sym(-k / 2 .* Vi .+ Vi * SV * Vi ./ 2)
     grad = _projection_gradient(pu, FU, U, GU) .+ _projection_gradient(pv, FV, V, GV)
+    mb === nothing || (grad .+= _mean_loading_gradient(H, mb, cols, Ui, Vi, qc.mean))
     return g, grad
+end
+
+"""
+    _mean_loading_gradient(H, mb, cols, Ui, Vi, D) -> ∂g/∂H
+
+The part of `_projected_dynamics_term`'s gradient through the mean's columns
+`a = P L` and `b = H' R` at fixed `U`, `V` (`D = Â − M`): with `X = U⁻¹ D V⁻¹`
+and `C̃` the coefficients' covariance on the columns, `∂g/∂a = X b diag(β) −
+U⁻¹ a (C̃ ∘ b'V⁻¹b)` and `∂g/∂b = X' a diag(β) − V⁻¹ b (C̃ ∘ a'U⁻¹a)`, pulled back
+through `P = (H'H)⁻¹H'` and `H'`.
+"""
+function _mean_loading_gradient(
+    H::AbstractMatrix{T},
+    mb::MNMeanBasis{T},
+    cols,
+    Ui::AbstractMatrix{T},
+    Vi::AbstractMatrix{T},
+    D::AbstractMatrix{T},
+) where {T<:Real}
+    a, b = cols
+    β = Diagonal(mb.mean[mb.coef])
+    C̃ = _column_cov(mb)
+    X = Ui * D * Vi
+    Ga = X * b * β .- Ui * a * (C̃ .* (b' * Vi * b))
+    Gb = X' * a * β .- Vi * b * (C̃ .* (a' * Ui * a))
+    HtH = Symmetric(Matrix(H' * H))
+    P = HtH \ Matrix(H')
+    Z = Ga * mb.left'                                   # ⟨Z, dP⟩, (k × r)
+    pull = .-(P' * Z * P') .+ (I - H * P) * Z' / HtH
+    return mb.right * Gb' .+ pull
 end
 
 """
@@ -405,9 +535,9 @@ function _projected_loading_term(
 end
 
 """
-    _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c) -> H
+    _polish_loading(lds, kq, ka, H, A1, rhs, Sxx_c; kb=nothing) -> H
 
-With kernel priors on `Q` (`kq`) and/or `A` (`ka`) projected through the
+With kernel priors on `Q` (`kq`), `A` (`ka`) and/or `B` (`kb`) projected through the
 loading, the loading's part of the bound is `tr(H'rhs) − ½ tr(H'A1 H Sxx_c)`
 (`[d D]` profiled out, `R` held) plus those priors' terms in `H`. Starting from
 the better of the current loading and the closed-form `H` (the first term's
@@ -422,9 +552,13 @@ function _polish_loading(
     H_closed::AbstractMatrix{T},
     A1::AbstractMatrix{T},
     rhs::AbstractMatrix{T},
-    Sxx_c::AbstractMatrix{T},
+    Sxx_c::AbstractMatrix{T};
+    kb::Union{Nothing,KernelInputPrior{T}}=nothing,
 ) where {T<:Real}
     om = lds.obs_model
+    if kb !== nothing
+        Fs = [cholesky(Symmetric(kernel_covariance(p))) for p in kb.priors]
+    end
     if kq !== nothing
         Fz = cholesky(Symmetric(kernel_covariance(kq.prior)))
         P = _symmetric_inverse(lds.state_model.Q)
@@ -450,10 +584,16 @@ function _polish_loading(
             value += g
             slope .+= ∂g
         end
+        if kb !== nothing
+            g, ∂g = _projected_input_term(H, kb, Fs)
+            value += g
+            slope .+= ∂g
+        end
+        om.H_mask === nothing || (slope[.!om.H_mask] .= 0)
         grad === nothing || (grad .= .-vec(slope))
         return isfinite(value) ? -value : T(Inf)
     end
-    H_now = _loading_coefficients(om.basis, om.C)
+    H_now = _loading_coefficients(om)
     candidates = (Matrix{T}(H_closed), Matrix{T}(H_now))
     values = [objective!(nothing, vec(H)) for H in candidates]
     best = argmin(values)

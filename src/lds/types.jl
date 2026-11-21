@@ -191,6 +191,9 @@ where `B·ux_t` is present only when `B` is supplied (i.e., has nonzero columns)
 - `A_prior::Union{Nothing,KernelMNPrior{T}} = nothing`: Optional kernel prior on `A` with
     receiver (row) and sender (column) kernel covariances ([`KernelMNPrior`](@ref)); `A`
     becomes a latent variable and `A` holds its posterior mean. Not with `AB_prior`.
+- `B_prior::Union{Nothing,KernelInputPrior{T}} = nothing`: Optional kernel prior on the
+    columns of `B` by groups of inputs ([`KernelInputPrior`](@ref)); `B` becomes a latent
+    variable and `B` holds its posterior mean. Not with `AB_prior`.
 - `AB_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing`: Optional matrix-normal prior on
     the stacked dynamics matrix `[A B]`. Pair with `Q_prior` for a full MNIW prior on `(AB, Q)`.
     Prior matrices are stored as plain `Matrix{T}` (decoupled from `A`'s storage type `M`) so
@@ -228,6 +231,8 @@ Base.@kwdef mutable struct GaussianStateModel{
     x0_prior::Union{Nothing,MNPrior{T,Matrix{T}}} = nothing
     # A kernel prior on A, which makes it a latent variable (q(A))
     A_prior::Union{Nothing,KernelMNPrior{T}} = nothing
+    # A kernel prior on B, which makes it a latent variable (q(B))
+    B_prior::Union{Nothing,KernelInputPrior{T}} = nothing
     depends_on::Union{Nothing,NamedTuple} = nothing
     variants::Union{Nothing,Vector{GaussianStateModel{T,M,V}}} = nothing
     gauge::Union{Nothing,AffineGauge{T}} = nothing

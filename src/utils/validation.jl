@@ -980,6 +980,7 @@ function _uses_kernel_noise_or_fixed_loading(lds::LinearDynamicalSystem)
     sm, om = lds.state_model, lds.obs_model
     hasproperty(sm, :Q_prior) && sm.Q_prior isa KernelIWPrior && return true
     hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior && return true
+    hasproperty(sm, :B_prior) && sm.B_prior isa KernelInputPrior && return true
     members = om isa CompositeObservationModel ? values(_models(om)) : (om,)
     for m in members
         hasproperty(m, :R_prior) && m.R_prior isa KernelIWPrior && return true
@@ -996,9 +997,12 @@ The cases a [`KernelIWPrior`](@ref) on `Q` or `R`, a [`KernelMNPrior`](@ref) on
 `GaussianStateModel`, one (non-composite) Gaussian emission, no `depends_on`,
 dimensions that match, `dof` above the dimension plus one, and no `R_diagonal`
 (with a kernel `R` prior) or `CD_prior` (with `C_fixed`). A `Q` prior needs a
-fixed basis (kernels in the latents' coordinates) or a learned loading without a
-kernel prior (kernels in its basis's coordinates, projected through `H`); so
-does an `A` prior.
+fixed basis (kernels in the latents' coordinates) or a learned loading (kernels
+in its basis's coordinates, projected through `H`, its posterior mean under a
+kernel prior on the loading; with an `H_mask`, in the latents' coordinates: each
+latent is its own block's state); so do an `A` prior and a `B` prior
+([`KernelInputPrior`](@ref), whose groups' `rows` need the latents' own
+coordinates).
 """
 function _validate_covariance_priors(lds::LinearDynamicalSystem)
     _uses_kernel_noise_or_fixed_loading(lds) || return nothing
@@ -1021,17 +1025,16 @@ function _validate_covariance_priors(lds::LinearDynamicalSystem)
         if om isa StructuredGaussianObservationModel
             # a learned loading: the kernels are in its basis's coordinates,
             # projected onto the latents through H
-            om.prior === nothing || throw(
-                ArgumentError(
-                    "a KernelIWPrior on Q is not available with a kernel prior on the " *
-                    "loading; use a ConstrainedGaussianObservationModel (H learned, no " *
-                    "prior) or a fixed basis",
-                ),
-            )
-            kernels == _loading_dim(om) || throw(
+            want = _latent_coordinates(om) ? lds.latent_dim : _loading_dim(om)
+            kernels == want || throw(
                 DimensionMismatchError(
-                    "the Q_prior's kernels (in the loading's basis coordinates)",
-                    _loading_dim(om),
+                    if _latent_coordinates(om)
+                        "the Q_prior's kernels (in the latents' " *
+                        "coordinates: a masked loading)"
+                    else
+                        "the Q_prior's kernels (in the loading's basis coordinates)"
+                    end,
+                    want,
                     kernels,
                 ),
             )
@@ -1061,17 +1064,16 @@ function _validate_covariance_priors(lds::LinearDynamicalSystem)
             throw(ArgumentError("a KernelMNPrior on A is not available with depends_on"))
         kernels = sm.A_prior.rows.dim
         if om isa StructuredGaussianObservationModel
-            om.prior === nothing || throw(
-                ArgumentError(
-                    "a KernelMNPrior on A is not available with a kernel prior on the " *
-                    "loading; use a ConstrainedGaussianObservationModel (H learned, no " *
-                    "prior) or a fixed basis",
-                ),
-            )
-            kernels == _loading_dim(om) || throw(
+            want = _latent_coordinates(om) ? lds.latent_dim : _loading_dim(om)
+            kernels == want || throw(
                 DimensionMismatchError(
-                    "the A_prior's kernels (in the loading's basis coordinates)",
-                    _loading_dim(om),
+                    if _latent_coordinates(om)
+                        "the A_prior's kernels (in the latents' " *
+                        "coordinates: a masked loading)"
+                    else
+                        "the A_prior's kernels (in the loading's basis coordinates)"
+                    end,
+                    want,
                     kernels,
                 ),
             )
@@ -1086,6 +1088,61 @@ function _validate_covariance_priors(lds::LinearDynamicalSystem)
                     "expressed in: a fixed basis (GaussianObservationModel(; C=Φ, " *
                     "C_fixed=true)) or a learned loading in a basis " *
                     "(ConstrainedGaussianObservationModel), through which it is projected",
+                ),
+            )
+        end
+    end
+    if sm.B_prior isa KernelInputPrior
+        kb = sm.B_prior
+        sm.AB_prior === nothing || throw(
+            ArgumentError(
+                "a KernelInputPrior on B and an AB_prior are two priors on B; drop the AB_prior",
+            ),
+        )
+        sm.depends_on === nothing ||
+            throw(ArgumentError("a KernelInputPrior on B is not available with depends_on"))
+        m = lds.ux_dim
+        m > 0 || throw(ArgumentError("a KernelInputPrior on B needs inputs (ux_dim > 0)"))
+        all(c -> c <= m, reduce(vcat, kb.groups)) || throw(
+            ArgumentError("the KernelInputPrior's groups index columns beyond ux_dim = $m"),
+        )
+        projected = om isa StructuredGaussianObservationModel && !_latent_coordinates(om)
+        if projected
+            all(isnothing, kb.rows) || throw(
+                ArgumentError(
+                    "a KernelInputPrior's rows link inputs to latents in their own " *
+                    "coordinates (a fixed basis or a masked loading); with a learned " *
+                    "loading give the group a kernel over the linked sources instead",
+                ),
+            )
+            for p in kb.priors
+                p.dim == _loading_dim(om) || throw(
+                    DimensionMismatchError(
+                        "the B_prior's kernels (in the loading's basis coordinates)",
+                        _loading_dim(om),
+                        p.dim,
+                    ),
+                )
+            end
+        elseif _latent_coordinates(om) || (om isa GaussianObservationModel && om.C_fixed)
+            k = lds.latent_dim
+            for (g, p) in enumerate(kb.priors)
+                r = kb.rows[g]
+                r === nothing ||
+                    all(<=(k), r) ||
+                    throw(ArgumentError("rows[$g] of the B_prior index latents beyond $k"))
+                want = r === nothing ? k : length(r)
+                p.dim == want || throw(
+                    DimensionMismatchError(
+                        "the B_prior's kernels of group $g", want, p.dim
+                    ),
+                )
+            end
+        else
+            throw(
+                ArgumentError(
+                    "a KernelInputPrior on B needs latent coordinates its kernels can be " *
+                    "expressed in: a fixed basis or a learned loading in a basis",
                 ),
             )
         end

@@ -555,3 +555,76 @@ end
         unit_structure=(; kernels=spec.kernels, kernel_types=Dict("near" => [:a])),
     )
 end
+
+@testset "Student-t trees: an outlying unit is shrunk less" begin
+    rng = MersenneTwister(91)
+    n = 30
+    # weights about a common centre, one far from it
+    w = 0.3 .* randn(rng, n)
+    w[7] = 3.0
+    Σw = Matrix(0.01I, n, n)
+    labels = [KHSSD.WeightLabel("u$i", :scale, nothing, "u$i", :log) for i in 1:n]
+    function tree(df)
+        t = only(
+            KHSSD._build_trees(
+                Float64, labels, Dict(:scale => 1), ();
+                sd_prior=nothing, root_sd=nothing, lkj_eta=2.0,
+                type_df=Dict(:scale => df),
+            ),
+        )
+        t.node_mean .= 0.0
+        t.root .= 0.0
+        t.root_centre .= 0.0
+        KHSSD._update_tree!(t, w, Σw)
+        return t
+    end
+    gauss, t3 = tree(Inf), tree(3.0)
+    @test all(==(1.0), gauss.lambda)
+    @test argmin(t3.lambda) == 7 && t3.lambda[7] < 0.2
+    # the outlier widens the Gaussian tree; the t tree's scale follows the rest
+    @test t3.sds[1] < gauss.sds[1]
+    @test abs(t3.sds[1] - std(w[setdiff(1:n, 7)])) < 0.1
+    # the prior precision of each weight is E[λ_u] / σ²
+    μ, Λ = KHSSD._weight_prior!(zeros(n), zeros(n, n), [t3])
+    @test diag(Λ) ≈ t3.lambda ./ t3.sds[1]^2
+    @test isfinite(KHSSD._tree_logdensity(t3))
+    # df = Inf is the Gaussian tree exactly
+    g2 = tree(Inf)
+    @test g2.sds ≈ gauss.sds && g2.node_mean ≈ gauss.node_mean
+    @test_throws ArgumentError KHSSD._build_trees(
+        Float64, labels, Dict(:scale => 0), ();
+        sd_prior=nothing, root_sd=nothing, lkj_eta=2.0, type_df=Dict(:scale => 3.0),
+    )
+end
+
+@testset "Student-t trees with unit kernels: the nugget follows λ" begin
+    rng = MersenneTwister(92)
+    n, d = 24, 1
+    D = [abs(i - j) for i in 1:n, j in 1:n]
+    K = exp.(-D ./ 3)
+    smooth = cholesky(Symmetric(K + 1e-9I)).L * randn(rng, n)
+    w = 0.5 .* smooth .+ 0.1 .* randn(rng, n)
+    w[12] += 3.0
+    labels = [KHSSD.WeightLabel("u$i", :scale, nothing, "u$i", :log) for i in 1:n]
+    names = ["u$i" for i in 1:n]
+    spec = (; kernels=["near" => (names, reshape(K, 1, n, n))], kernel_types=["near" => [:scale]])
+    fits = map((Inf, 3.0)) do df
+        trees = KHSSD._build_trees(
+            Float64, labels, Dict(:scale => 1), ();
+            sd_prior=(0.5, 4.0), root_sd=3.0, lkj_eta=2.0, type_df=Dict(:scale => df),
+        )
+        t = only(trees)
+        KHSSD._attach_unit_structure!(trees, labels, spec)
+        t.node_mean .= 0.0
+        t.root .= 0.0
+        t.root_centre .= 0.0
+        KHSSD._update_tree!(t, w, Matrix(0.01I, n, n))
+        t
+    end
+    gauss, t3 = fits
+    @test all(==(1.0), gauss.unit_structure.nugget)
+    @test argmin(t3.lambda) == 12
+    @test t3.unit_structure.nugget ≈ 1 ./ t3.lambda
+    μ, Λ = KHSSD._weight_prior!(zeros(n), zeros(n, n), [t3])
+    @test isposdef(Symmetric(Λ))
+end

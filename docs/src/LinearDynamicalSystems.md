@@ -512,18 +512,48 @@ fit!(lds, y)
 kernel_weights(A_prior).cols      # the sender profile
 ```
 
+The prior says how much couplings vary, not where they are. An
+[`MNMeanBasis`](@ref) (`KernelMNPrior(...; mean_basis)`) says where:
+``\mathbb{E}[A] = m I + \sum_c \beta_{p(c)} l_c r_c^\top``, rank-one terms in
+the kernels' coordinates (for example a region receiving from the others of its
+network), each coefficient in a group whose coefficients share a fitted
+location and scale, Gaussian or Student t (`df`), or a fixed `N(0, sd²)`. The
+fit keeps ``q(\beta)`` Gaussian and the t's scales ``q(\lambda)`` Gamma, and
+updates them with `m`; with a learned loading the terms are seen through `H`
+(``P l_c`` and ``H^\top r_c``, ``P = (H^\top H)^{-1} H^\top``), and the
+loading's polish takes the mean's term. [`mean_coefficients`](@ref) returns
+them.
+
+A [`ConstrainedGaussianObservationModel`](@ref) with an `H_mask` holds `H` at
+zero outside the mask (each latent on its own block of basis columns); priors
+on `Q` and `A` then see its latents directly, in their own coordinates.
+
+A [`KernelInputPrior`](@ref) (`B_prior`) puts kernel priors on the columns of
+`B` by groups of inputs: each input of a group is a draw of its footprint on the
+latents, ``B_{:,c} \sim N(0, U_g)``, with `U_g` in the receivers' coordinates
+(as `A`'s rows), and `rows` links a group to some latents (zero elsewhere), with
+latents in their own coordinates. `q(B)` is Gaussian over the free entries,
+mean-field with `q(A)`, and [`input_posterior`](@ref) returns it.
+
 Which priors combine, with `H` (or `C`) estimated in every case:
 
 | | fixed basis (`C_fixed`) | learned loading, no `H` prior | `H` prior |
 |---|---|---|---|
 | `R` | ✓ | ✓ | ✓ |
-| `Q` | ✓ | ✓ (projected) | — |
-| `A` | ✓ | ✓ (projected) | — |
-| `A` + `R`, `A` + `Q`, `A` + `Q` + `R` | ✓ | ✓ | — |
+| `Q` | ✓ | ✓ (projected) | ✓ (projected, plug-in) |
+| `A` | ✓ | ✓ (projected) | ✓ (projected, plug-in) |
+| `B` | ✓ | ✓ (projected) | ✓ (projected, plug-in) |
+| any of `A`, `B`, `Q` with `R` | ✓ | ✓ | ✓ |
 
-An `A` prior is refused with an `AB_prior` (two priors on `A`), a kernel prior
-on the loading, a free `C`, the `gauge_*` options, `depends_on`, an `SLDS` and a
-composite emission. `loglikelihood` is the plug-in one at the mean `A`, and
+With a kernel prior on the loading the latent-side priors are seen through the
+posterior mean of `H`: they shape `q(A)`, `q(B)` and `Q` but not `q(H)` (a
+plug-in, so the bound may dip as `H` moves), and the emission's gauge step
+carries their posteriors along. Without a prior on the loading its polish takes
+their terms.
+
+An `A` prior is refused with an `AB_prior` (two priors on `A`), a free `C`, the
+`gauge_*` options, `depends_on`, an `SLDS` and a composite emission; so is a `B`
+prior. `loglikelihood` is the plug-in one at the mean `A`, and
 these fits use the per-trial mean pass (the batched one has no term for `A`'s
 uncertainty).
 

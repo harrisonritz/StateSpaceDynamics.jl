@@ -1221,7 +1221,10 @@ does and does not cost.
 """
 # An uncertain A adds `Δ_A x` to the gradient, which the batched pass has not.
 _supports_batched(lds::LinearDynamicalSystem) = !_has_dynamics_prior(lds.state_model)
-_has_dynamics_prior(sm) = hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior
+function _has_dynamics_prior(sm)
+    return (hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior) ||
+           (hasproperty(sm, :B_prior) && sm.B_prior isa KernelInputPrior)
+end
 
 function _supports_batched(
     ::LinearDynamicalSystem{T,S,O}

@@ -71,6 +71,42 @@ function _apply_latent_gauge!(lds::_StructuredLDS{R}, T::AbstractMatrix{R}) wher
         om.posterior = LoadingPosterior{R}(q.mean * Ti, q.left, Ti' * q.right, q.var)
     end
     om.excess .= Symmetric(Ti' * om.excess * Ti)
+    _gauge_projected_priors!(lds, T, Ti)
+    return nothing
+end
+
+#= Kernel priors on Q, A and B seen through the loading move with the latents:
+their loading is the new `H T⁻¹` (`P → T P`), and `q(A)`, `q(B)` are carried to
+`T A T⁻¹`, `T B`. Their part of the bound does not change (the prior and the
+posterior move together). =#
+function _gauge_projected_priors!(
+    lds::_StructuredLDS{R}, T::AbstractMatrix{R}, Ti::AbstractMatrix{R}
+) where {R<:Real}
+    sm, om = lds.state_model, lds.obs_model
+    _latent_coordinates(om) && return nothing
+    H = Matrix{R}(_loading_coefficients(om))
+    kq = sm.Q_prior
+    kq isa KernelIWPrior && _is_projected(kq) && _set_loading!(kq, H)
+    ka = sm.A_prior
+    if ka isa KernelMNPrior && !isempty(ka.loading)
+        ka.loading = H
+        q = ka.posterior
+        if q !== nothing
+            ka.posterior = LoadingPosterior{R}(
+                T * q.mean * Ti, T * q.left, Ti' * q.right, q.var
+            )
+        end
+        isempty(ka.excess) || (ka.excess = Matrix(Symmetric(Ti' * ka.excess * Ti)))
+    end
+    kb = sm.B_prior
+    if kb isa KernelInputPrior && _input_projected(kb)
+        kb.loading = H
+        if !isempty(kb.mean)
+            L = kron(Matrix{R}(I, size(kb.mean, 2), size(kb.mean, 2)), T)
+            kb.mean = T * kb.mean
+            kb.cov = Matrix(Symmetric(L * kb.cov * L'))
+        end
+    end
     return nothing
 end
 
@@ -158,7 +194,7 @@ function _start_kernel_fit!(
             estep!(lds, suf, tfs, data, sws_pool)
         end
     end
-    H = _loading_coefficients(om.basis, om.C)
+    H = _loading_coefficients(om)
     S = H * H' ./ k
     if lds.fit_bool[7]
         prior.initialized ||

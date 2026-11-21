@@ -139,7 +139,7 @@ end
     KernelPrior(kernels; structure=nothing, levels=:flat, correlated=(),
                 prior_sd=1.0, prior_mean=nothing, sd_prior=(0.5, 4.0),
                 root_sd=3.0, lkj_eta=2.0, unit_structure=nothing, weights=nothing,
-                type_sd_prior=Dict(), type_root_sd=Dict())
+                type_sd_prior=Dict(), type_root_sd=Dict(), df=Inf)
 
 A zero-mean Gaussian prior whose `r × r` covariance is a weighted sum of
 [`Kernel`](@ref)s, `Σ = Σ_g θ_g Z_g`, plus an optional `structure` (a
@@ -203,6 +203,12 @@ without a covariate value raises, except `"none"`, which gets zero after the
 covariate is centred and scaled over the units with a value. The types of a correlated set need the same kernels. Leftover weights
 of a correlated set keep their marginal prior.
 
+`df` (one number, or one per type) makes the trees of `:hierarchical` and
+`:nested` types Student t at the leaves: a unit's weights `η_u ~ t_ν(μ, Ω)`,
+`ν = df` (`Inf`, the default: Gaussian), so a few units may stand far from the
+rest without widening the prior of all of them (with unit kernels, on the
+nugget alone; see the file header of `kernel_hierarchy.jl`).
+
 `type_sd_prior` and `type_root_sd` (`Dict`s by type) override `sd_prior` and
 `root_sd` for the trees of those types (an informative spread for a
 `SpectralCorrelationFamily`'s per-unit range, say). A weight with the
@@ -251,6 +257,7 @@ function KernelPrior(
     weights::Union{Nothing,AbstractVector{<:Real}}=nothing,
     type_sd_prior::AbstractDict=Dict{Symbol,Any}(),
     type_root_sd::AbstractDict=Dict{Symbol,Any}(),
+    df::Union{Real,NamedTuple,AbstractDict}=Inf,
 )
     T, r = if !isempty(kernels)
         eltype(first(kernels).factor), size(first(kernels).factor, 1)
@@ -314,6 +321,11 @@ function KernelPrior(
         type_root_sd=Dict{Symbol,Union{Nothing,T}}(
             Symbol(k) => (v === nothing ? nothing : T(v)) for (k, v) in pairs(type_root_sd)
         ),
+        type_df=if df isa Real
+            Dict{Symbol,T}(type => T(df) for type in types if get(depth, type, 0) > 0)
+        else
+            Dict{Symbol,T}(Symbol(k) => T(v) for (k, v) in pairs(df))
+        end,
     )
     _attach_unit_structure!(trees, labels, unit_structure)
     for spec in (prior_sd, prior_mean)

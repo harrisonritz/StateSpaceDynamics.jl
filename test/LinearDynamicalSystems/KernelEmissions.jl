@@ -554,3 +554,64 @@ end
     @test length(table) == 7
     @test all(0 < row.value < 1 for row in table if row.link === :logit)
 end
+
+@testset "constrained emission with a loading mask" begin
+    rng = MersenneTwister(219)
+    p, k = 8, 3
+    # each latent its own two basis columns; nine columns in all, more than p
+    Φ = randn(rng, p, 9)
+    mask = falses(9, k)
+    for j in 1:k
+        mask[(3j - 2):(3j - 1), j] .= true
+    end
+    H0 = zeros(9, k)
+    H0[mask] .= randn(rng, count(mask))
+    R = Matrix(1.0I, p, p)
+    lds = LinearDynamicalSystem(
+        ke_state(k), ConstrainedGaussianObservationModel(; basis=Φ, H=H0, R, H_mask=mask)
+    )
+    # the M-step against the masked least squares solved directly
+    sw = KESSD.SmoothWorkspace(Float64, k, p, 8)
+    suf = KESSD._initialize_td_sufficient_statistics(Float64, lds, [8])
+    width = k + 1
+    Z = randn(rng, width, 3width)
+    G, XY = Z * Z', randn(rng, width, p)
+    suf.obs_xx[] = KESSD.pd_gram(G; name="mask fixture")
+    suf.obs_xy .= XY
+    KESSD._update_loading!(lds, suf)
+    Ri = inv(lds.obs_model.R)
+    J = cat(kron(Matrix(1.0I, k, k), Φ)[:, findall(vec(mask))], Matrix(1.0I, p, p); dims=(1, 2))
+    θ = (J' * kron(G, Ri) * J) \ (J' * vec(Ri * XY'))
+    @test hcat(lds.obs_model.C, lds.obs_model.d) ≈ reshape(J * θ, p, width)
+    @test KESSD._loading_coefficients(lds.obs_model)[.!mask] == zeros(count(.!mask))
+    # a fit keeps the mask, never lowers the ELBO, and finds a masked truth
+    truth = LinearDynamicalSystem(
+        ke_state(k), GaussianObservationModel(; C=Φ * H0, R=Matrix(0.05I, p, p), d=zeros(p))
+    )
+    y = rand(rng, truth, fill(60, 10))[2]
+    start = zeros(9, k)
+    start[mask] .= randn(rng, count(mask))
+    lds = LinearDynamicalSystem(
+        ke_state(k), ConstrainedGaussianObservationModel(; basis=Φ, H=start, R, H_mask=mask)
+    )
+    elbos = collect(fit!(lds, y; max_iter=40, progress=false))
+    @test nondecreasing(elbos)
+    H = KESSD._loading_coefficients(lds.obs_model)
+    @test all(iszero, H[.!mask])
+    # each latent's pattern, up to its sign and scale
+    for j in 1:k
+        rows = findall(mask[:, j])
+        @test abs(dot(normalize(H[rows, j]), normalize(H0[rows, j]))) > 0.95
+    end
+    @test_throws ArgumentError ConstrainedGaussianObservationModel(;
+        basis=Φ, H=randn(rng, 9, k), R, H_mask=mask
+    )
+    @test_throws DimensionMismatch ConstrainedGaussianObservationModel(;
+        basis=Φ, H=H0, R, H_mask=mask[1:8, :]
+    )
+    bad = copy(Φ)
+    bad[:, 2] = bad[:, 1]
+    @test_throws ArgumentError LinearDynamicalSystem(
+        ke_state(k), ConstrainedGaussianObservationModel(; basis=bad, H=H0, R, H_mask=mask)
+    )
+end

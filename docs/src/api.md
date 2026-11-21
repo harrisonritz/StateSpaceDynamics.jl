@@ -47,6 +47,10 @@ ScaleCorrelation
 CorrelationFamily
 KernelIWPrior
 KernelMNPrior
+MNMeanBasis
+mean_coefficients
+KernelInputPrior
+input_posterior
 dynamics_posterior
 fit_kernel_weights!
 kernel_weights
