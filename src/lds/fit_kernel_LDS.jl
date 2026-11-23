@@ -238,6 +238,15 @@ keywords are those of the Gaussian `fit!`, without `depends_on` and the
 `start_rounds`: the most rounds of weights and trees the kernel prior takes on
 the starting loading before the first iteration.
 
+`callback(lds, iter)`, if given, is called at every scored iterate: after the
+E-step and the bound of iteration `iter` (the parameters after `iter - 1`
+M-steps), before its M-step. Returning `true` stops the fit there, with those
+parameters, as meeting `tol` would. It may read the model (to score other
+data, say) but must not change it. A caller that scores the fit on its own
+schedule runs one `fit!` with a callback rather than many short fits: each
+`fit!` builds its workspaces and starts the covariance priors again, and the
+first E-step of each repeats the last of the one before.
+
 Returns the trace of the bound, one value per iteration (a [`FitTrace`](@ref)
 with `y_test`). With a kernel prior the held-out score is the same bound on the
 held-out trials at the fitted `q(H)` and weights; the terms that do not involve
@@ -268,6 +277,7 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
     test_diagnostics::Bool=true,
     test_callback=nothing,
+    callback=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
     _reject_structured_grouping(depends_on, depends_on_test)
     _has_parameter_dependence(lds.state_model) && throw(
@@ -291,7 +301,9 @@ function fit!(
         test_diagnostics=test_diagnostics,
         test_callback=test_callback,
     )
-    return _fit_structured!(lds, data; max_iter, tol, rtol, progress, start_rounds, monitor)
+    return _fit_structured!(
+        lds, data; max_iter, tol, rtol, progress, start_rounds, monitor, callback
+    )
 end
 
 function _fit_structured!(
@@ -303,6 +315,7 @@ function _fit_structured!(
     progress::Bool=true,
     start_rounds::Int=30,
     monitor=nothing,
+    callback=nothing,
 ) where {T<:Real,S<:GaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
@@ -313,11 +326,23 @@ function _fit_structured!(
     tfs = initialize_FilterSmooth(
         lds, tsteps_per_trial; cov_alias=cov_alias
     )::TrialFilterSmooth{T}
-    pool_size = Threads.maxthreadid()
+    #= The first workspace carries the BLAS-3 mean-pass buffers (as in the
+    Gaussian `fit!`); the others serve the per-trial fallback, so with the batched
+    pass (equal lengths, no initial-state inputs) the pool is that one workspace:
+    each is several k²T blocks, a GB or more per thread at k = 256. =#
+    batched =
+        _batched_ntrials(lds, ntrials_total) > 1 && cov_alias && isempty(lds.state_model.B0)
+    pool_size = batched ? 1 : Threads.maxthreadid()
     sws_pool = [
         SmoothWorkspace(
-            T, lds.latent_dim, lds.obs_dim, T_max; ux_dim=lds.ux_dim, uy_dim=lds.uy_dim
-        ) for _ in 1:pool_size
+            T,
+            lds.latent_dim,
+            lds.obs_dim,
+            T_max;
+            ux_dim=lds.ux_dim,
+            uy_dim=lds.uy_dim,
+            ntrials=i == 1 ? _batched_ntrials(lds, ntrials_total) : 1,
+        ) for i in 1:pool_size
     ]
     suf = _initialize_td_sufficient_statistics(
         T, lds, tsteps_per_trial
@@ -347,9 +372,10 @@ function _fit_structured!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
+        stop = callback !== nothing && callback(lds, iter) === true
         #= Return a scored iterate: the trace's last entry is always the score of
         the parameters handed back, so no M-step runs after it. =#
-        if converged || iter == max_iter
+        if converged || stop || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)

@@ -239,6 +239,7 @@ using SSDTest
                 test_obs_model_parameter_updates(3)
                 test_EM()
                 test_EM(3)
+                test_EM_callback()
                 test_gaussian_public_elbo()
                 test_gaussian_iw_priors_shape_map_and_R_sanity()
                 test_x0_niw_prior_map_and_degradation()
@@ -266,6 +267,7 @@ using SSDTest
             test_marginal_ll_matches_naive_filter()
             test_marginal_ll_with_inputs()
             test_marginal_ll_ragged_trials()
+            test_marginal_ll_batched_matches_per_trial()
             test_marginal_loglikelihood_aliases()
         end
 
@@ -836,6 +838,7 @@ using SSDTest
     @testset verbose = true "Utilities" begin
         include("Utilities/Utilities.jl")
         test_block_tridgm()
+        test_block_tridgm_workspace()
         test_gaussian_entropy()
         test_valid_Σ()
 

@@ -94,11 +94,11 @@ function _extract_obs_params(om::StructuredGaussianObservationModel)
     return (C=om.C, R=om.R, d=om.d, D=om.D)
 end
 
-# The mean pass runs per trial: the batched one has no `Δ x` term.
-function _supports_batched(
-    ::LinearDynamicalSystem{T,S,O}
-) where {T<:Real,S<:AbstractStateModel{T},O<:StructuredGaussianObservationModel{T}}
-    return false
+# The batched mean pass (`gradient_batched!`) subtracts `Δ x` for every trial at
+# once, as `observation_gradient!` does per trial (and `Δ_A x` for a kernel prior
+# on `A`, as the state-side `gradient!` does).
+function _subtract_excess!(out, om::StructuredGaussianObservationModel, x)
+    return mul!(out, om.excess, x, -one(eltype(out)), one(eltype(out)))
 end
 
 function _validate_obs_model(

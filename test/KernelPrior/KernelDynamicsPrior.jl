@@ -115,6 +115,19 @@ end
             @test all(P[i][:, :, t] ≈ P_ref[t] for t in axes(Y, 2))
         end
     end
+    # the batched (BLAS-3) mean pass carries Δ_A as well
+    @test KDSSD._supports_batched(lds)
+    y = [randn(rng, p, 7) for _ in 1:4]
+    data = KDSSD.Data(lds, y)
+    tfs = KDSSD.initialize_FilterSmooth(lds, data.tsteps; cov_alias=true)
+    pool = [
+        KDSSD.SmoothWorkspace(Float64, k, p, 7; ntrials=i == 1 ? length(y) : 1) for i in 1:2
+    ]
+    KDSSD.smooth!(lds, tfs, data, pool)
+    @test pool[1].batched !== nothing
+    for (i, Y) in enumerate(y)
+        @test tfs[i].x_smooth ≈ dense(Y)[1] rtol = 1e-8
+    end
 end
 
 @testset "the sandwich projection and A's term in the loading" begin

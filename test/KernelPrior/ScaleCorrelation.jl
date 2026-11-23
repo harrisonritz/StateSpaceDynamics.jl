@@ -843,6 +843,53 @@ const SC_SPECTRAL_CASES = [
     end
 end
 
+@testset "scale-correlation: spectral parameters at and past their bounds" begin
+    rng = MersenneTwister(33)
+    r, n = 5, 14
+    G = randn(rng, r, n)
+    v = rand(rng, n) .+ 0.5
+    block = [1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3]
+    spec, start = SC_SPECTRAL_CASES[4][1:2]
+    (U1, l1), (U2, l2) = sc_modes(rng, 7), sc_modes(rng, 7)
+    lo = log(5.0)
+    fam = SCSSD.SpectralCorrelationFamily(
+        [
+            (collect(1:7), [1, 1, 2, 2, 2, 3, 3], U1, l1),
+            (collect(8:14), [3, 4, 4, 4, 5, 5, 5], U2, l2),
+        ],
+        spec;
+        type=:surf,
+        names=["u1", "u2", "u3", "u4", "u5"],
+        start,
+        free=[:log_gamma],
+        per_unit=:log_range,
+        lower=[log(0.004), lo],
+        upper=[log(0.128), log(5000.0)],
+    )
+    sc = ScaleCorrelation(G, v, block; names=["b1", "b2", "b3"], families=[fam])
+    nw = length(SCSSD._structure_labels(sc))
+    w = vcat(0.3 .* randn(rng, 8), sc.hyper_start)
+    slot = 9  # log_gamma, the free parameter, first after the logits
+    A = randn(rng, r, r)
+    Msym = (A + A') / 2
+    cov(w) = (X = zeros(r, r); SCSSD._add_covariance!(X, sc, w); X)
+    slope(w) = (gr = zeros(nw); SCSSD._add_gradient!(gr, sc, w, Msym); gr[slot])
+    D(w) = (X = zeros(r, r, nw); SCSSD._derivatives!(X, sc, w); X[:, :, slot])
+    # past the bound: held there, no slope
+    w[slot] = lo - 1
+    past = copy(w)
+    past[slot] = lo - 2
+    @test cov(past) ≈ cov(w)
+    @test slope(w) == 0 && all(iszero, D(w))
+    # on the bound: the slope from inside
+    w[slot] = lo
+    up = copy(w)
+    up[slot] += 1e-6
+    inward = (dot(Msym, cov(up)) - dot(Msym, cov(w))) / 1e-6
+    @test slope(w) ≈ inward rtol = 1e-4
+    @test D(w) ≈ (cov(up) - cov(w)) ./ 1e-6 rtol = 1e-4
+end
+
 @testset "scale-correlation: spectral tails in closed form" begin
     for (kind, p) in ((:matern, [log(0.016)]), (:field, [log(0.02), log(80.0)]),
                       (:field_matern, [log(0.02), log(80.0)]))

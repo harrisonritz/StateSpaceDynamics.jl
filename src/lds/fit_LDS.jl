@@ -1098,6 +1098,15 @@ function _smooth_mean_only!(
     return fs
 end
 
+# The emissions with a batched mean pass: one `C`, `d`, `D` for every trial.
+const _BatchedEmission{T} = Union{
+    GaussianObservationModel{T},StructuredGaussianObservationModel{T}
+}
+
+# `−Δ x` of a constrained or kernel-prior emission (`kernel_observations.jl`);
+# a plain Gaussian emission has none.
+_subtract_excess!(out, ::GaussianObservationModel, x) = out
+
 """
     gradient_batched!(ws, lds, x_batched, y_batched, u_batched, v_batched)
 
@@ -1110,6 +1119,8 @@ dispatch overhead is paid once instead of N times.
 
 Writes the result into `ws.batched.grad_buf` (shape `(D, T, N)`); the affine
 bias subtractions (`-b`, `-d_obs`, `-x0`) broadcast across the trial axis.
+A constrained or kernel-prior emission also subtracts its `Δ x` term
+(`_subtract_excess!`), as its per-trial `observation_gradient!` does.
 """
 function gradient_batched!(
     ws::SmoothWorkspace{T},
@@ -1118,7 +1129,7 @@ function gradient_batched!(
     y::AbstractArray{T,3},
     ux::AbstractArray{T,3},
     uy::AbstractArray{T,3},
-) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:_BatchedEmission{T}}
     tsteps = size(x, 2)
     A = lds.state_model.A
     b = lds.state_model.b
@@ -1154,6 +1165,7 @@ function gradient_batched!(
     end
 
     mul!(tmp1, C_inv_R, dyt)
+    @views _subtract_excess!(tmp1, lds.obs_model, x[:, 1, :])
     mul!(tmp2, A_inv_Q, dxt_next)
     mul!(tmp3, neg_P0_inv, dxt)
     @views grad[:, 1, :] .= tmp1 .+ tmp2 .+ tmp3
@@ -1173,6 +1185,7 @@ function gradient_batched!(
         dyt .= y[:, t, :] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
+        _subtract_excess!(tmp1, lds.obs_model, x[:, t, :])
         mul!(tmp2, A_inv_Q, dxt_next)
         mul!(tmp3, neg_Q_inv, dxt)
 
@@ -1189,9 +1202,19 @@ function gradient_batched!(
         dyt .= y[:, tsteps, :] .- dyt .- d_obs
 
         mul!(tmp1, C_inv_R, dyt)
+        _subtract_excess!(tmp1, lds.obs_model, x[:, tsteps, :])
         mul!(tmp3, neg_Q_inv, dxt)
 
         grad[:, tsteps, :] .= tmp1 .+ tmp3
+    end
+
+    # an uncertain A (a KernelMNPrior): −Δ_A x_t for every state with a
+    # successor, as in the per-trial `gradient!`
+    Δ = _dynamics_excess(lds.state_model)
+    if Δ !== nothing
+        @views for t in 1:(tsteps - 1)
+            mul!(grad[:, t, :], Δ, x[:, t, :], -one(T), one(T))
+        end
     end
 
     return grad
@@ -1238,7 +1261,7 @@ cache and `sws.batched.data_valid[] == true` (data was stacked at fit entry).
 """
 function _smooth_mean_only_batched!(
     lds::LinearDynamicalSystem{T,S,O}, tfs::TrialFilterSmooth{T}, sws::SmoothWorkspace{T}
-) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:GaussianObservationModel{T}}
+) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:_BatchedEmission{T}}
     ntrials = length(tfs)
     D = lds.latent_dim
     tsteps = size(tfs[1].x_smooth, 2)
@@ -1478,6 +1501,12 @@ Fit a Gaussian Linear Dynamical System via Expectation-Maximization.
 - `test_kwargs::NamedTuple=(;)`: extra keywords forwarded to the scoring
   [`elbo`](@ref) call, e.g. `(smoothing_iters=20,)` for an SLDS or
   `(newton_max_iter=10,)` for a Poisson emission.
+- `callback=nothing`: `callback(lds, iter)` runs at every scored iterate, after
+  the E-step and the ELBO of iteration `iter` and before its M-step; returning
+  `true` stops the fit there, with those parameters. It may read the model but
+  must not change it. One fit with a callback replaces many short fits, each
+  of which builds its workspaces and repeats an E-step. Not with `depends_on`
+  grouping or a warped composite emission.
 
 Returns a `Vector{T}` of ELBO values, one per iteration — or a
 [`FitTrace`](@ref) when `y_test` is given, which behaves as that same vector.
@@ -1510,6 +1539,7 @@ function fit!(
     test_kwargs::NamedTuple=NamedTuple(),
     test_diagnostics::Bool=true,
     test_callback=nothing,
+    callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     _validate_gauge(lds, gauge_center, gauge_whiten, gauge_max_condition)
     data = Data(lds, y; ux0=ux0, ux=ux, uy=uy)
@@ -1533,6 +1563,9 @@ function fit!(
     embedding has to be rebuilt every E-step, and its warps get a second
     conditional-maximization step. =#
     if _warped_route(lds, depends_on, depends_on_test)
+        callback === nothing || throw(
+            ArgumentError("`callback` is not supported for a warped composite emission")
+        )
         return _fit_spline_composite!(
             lds,
             data;
@@ -1546,6 +1579,9 @@ function fit!(
     end
     grp = parameter_grouping(lds, length(data.tsteps); depends_on=depends_on, y=data.y)
     _validate_gauge_groups(lds, grp, gauge_center, gauge_whiten)
+    grp === nothing ||
+        callback === nothing ||
+        throw(ArgumentError("`callback` is not supported with `depends_on` grouping"))
     grp === nothing || return _fit_tridiag_grouped!(
         lds,
         data,
@@ -1567,6 +1603,7 @@ function fit!(
         rtol=rtol,
         progress=progress,
         monitor=monitor,
+        callback=callback,
         gauge_center,
         gauge_whiten,
         gauge_max_condition,
@@ -1735,6 +1772,7 @@ function _fit_tridiag!(
     gauge_whiten::Bool=false,
     gauge_max_condition::Real=1e8,
     monitor=nothing,
+    callback=nothing,
 ) where {T<:Real,S<:AbstractGaussianStateModel{T},O<:QuadraticEmission{T}}
     tsteps_per_trial = data.tsteps
     T_max = maximum(tsteps_per_trial)
@@ -1811,9 +1849,10 @@ function _fit_tridiag!(
         end
 
         converged = _em_converged(elbos, iter, tol, rtol)
+        stop = callback !== nothing && callback(lds, iter) === true
         #= Return a scored iterate: the trace's last entry is always the score of
         the parameters handed back, so no M-step runs after it. =#
-        if converged || iter == max_iter
+        if converged || stop || iter == max_iter
             prog !== nothing && finish!(prog)
             resize!(elbos, iter)
             return _fit_result(monitor, elbos, lds)
@@ -1967,6 +2006,99 @@ function _filter_ll_trial(
     return ll
 end
 
+#=
+The mean half of the filter for every trial of `trials`, which must share one
+length: the trials are the columns of one matrix, so each step is a handful of
+matrix products instead of matrix-vector products per trial (the same filter,
+summed in a different order). The covariance pass (`S_chol`, `K`) is shared.
+=#
+function _filter_ll_batched(
+    lds::LinearDynamicalSystem{T,SM,OM},
+    data::Data,
+    trials::AbstractVector{<:Integer},
+    S_chol::Vector{Cholesky{T,Matrix{T}}},
+    K::Vector{Matrix{T}},
+) where {T<:Real,SM<:GaussianStateModel{T},OM<:GaussianObservationModel{T}}
+    sm, om = lds.state_model, lds.obs_model
+    A, b, B, C, d, Dm = sm.A, sm.b, sm.B, om.C, om.d, om.D
+    D, p, n = lds.latent_dim, lds.obs_dim, length(trials)
+    tsteps = data.tsteps[first(trials)]
+    all(i -> data.tsteps[i] == tsteps, trials) ||
+        throw(ArgumentError("_filter_ll_batched needs trials of one length"))
+    m, q = size(B, 2), size(Dm, 2)
+    log2πp = T(p) * log(T(2π))
+
+    X_p = Matrix{T}(undef, D, n)
+    X_f = Matrix{T}(undef, D, n)
+    Y = Matrix{T}(undef, p, n)
+    E = Matrix{T}(undef, p, n)
+    W = Matrix{T}(undef, p, n)
+    U = Matrix{T}(undef, m, n)
+    V = Matrix{T}(undef, q, n)
+    # each trial's initial mean (its own with initial-state inputs)
+    if isempty(sm.B0)
+        X_p .= sm.x0
+    else
+        for (j, i) in enumerate(trials)
+            X_p[:, j] .= _trial_model(lds, data, i).state_model.x0
+        end
+    end
+
+    ll = zero(T)
+    @views for t in 1:tsteps
+        if t > 1
+            mul!(X_p, A, X_f)
+            X_p .+= b
+            if m > 0
+                for (j, i) in enumerate(trials)
+                    U[:, j] .= data.ux[i][:, t - 1]
+                end
+                mul!(X_p, B, U, one(T), one(T))
+            end
+        end
+        for (j, i) in enumerate(trials)
+            Y[:, j] .= data.y[i][:, t]
+        end
+        mul!(E, C, X_p)
+        E .= Y .- E .- d
+        if q > 0
+            for (j, i) in enumerate(trials)
+                V[:, j] .= data.uy[i][:, t]
+            end
+            mul!(E, Dm, V, -one(T), one(T))
+        end
+        W .= E
+        ldiv!(S_chol[t], W)
+        ll -= T(0.5) * (n * (log2πp + logdet(S_chol[t])) + dot(E, W))
+        mul!(X_f, K[t], E)
+        X_f .+= X_p
+    end
+    return ll
+end
+
+# The filter log-likelihood of `trials`: batched over the trials of each length.
+function _filter_ll_trials(
+    lds::LinearDynamicalSystem{T},
+    data::Data,
+    trials::AbstractVector{<:Integer},
+    S_chol::Vector{Cholesky{T,Matrix{T}}},
+    K::Vector{Matrix{T}},
+) where {T<:Real}
+    total = zero(T)
+    for len in unique(data.tsteps[trials])
+        group = [i for i in trials if data.tsteps[i] == len]
+        if length(group) == 1
+            i = only(group)
+            total += _filter_ll_trial(
+                _trial_model(lds, data, i), data.y[i], data.ux[i], data.uy[i], S_chol, K
+            )
+        else
+            total += _filter_ll_batched(lds, data, group, S_chol, K)
+        end
+    end
+    return total
+end
+
 """
     loglikelihood(lds, y; ux=nothing, uy=nothing)
 
@@ -1977,7 +2109,8 @@ any fitted model with a `GaussianObservationModel`.
 
 The covariance half of the filter (innovation covariances and gains) is
 observation-independent and computed once, then shared across all trials
-see `_filter_cov_pass`. Trial lengths may differ.
+(see `_filter_cov_pass`); the mean half runs over all trials of one length at
+once, as matrix products. Trial lengths may differ.
 
 # Arguments
 - `y`: observations — `(obs_dim, T)` matrix, `(obs_dim, T, ntrials)` array, or
@@ -2018,29 +2151,13 @@ function StatsAPI.loglikelihood(
             trials = grp.cell_trials[c]
             lds_c = _cell_lds(lds, grp, c)
             S_chol, K = _filter_cov_pass(lds_c, maximum(data.tsteps[n] for n in trials))
-            for n in trials
-                total_ll += _filter_ll_trial(
-                    _trial_model(lds_c, data, n),
-                    data.y[n],
-                    data.ux[n],
-                    data.uy[n],
-                    S_chol,
-                    K,
-                )
-            end
+            total_ll += _filter_ll_trials(lds_c, data, trials, S_chol, K)
         end
         return total_ll
     end
 
     S_chol, K = _filter_cov_pass(lds, maximum(data.tsteps))
-
-    total_ll = zero(T)
-    for n in eachindex(data.y)
-        total_ll += _filter_ll_trial(
-            _trial_model(lds, data, n), data.y[n], data.ux[n], data.uy[n], S_chol, K
-        )
-    end
-    return total_ll
+    return _filter_ll_trials(lds, data, eachindex(data.y), S_chol, K)
 end
 
 #=

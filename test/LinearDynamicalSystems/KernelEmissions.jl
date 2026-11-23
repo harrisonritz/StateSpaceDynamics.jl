@@ -135,6 +135,65 @@ end
     end
 end
 
+@testset "the batched mean pass with an uncertain loading" begin
+    rng = MersenneTwister(24)
+    p, k, r, q, n, tsteps = 6, 3, 4, 2, 5, 15
+    Φ = ke_basis(rng, p, r)
+    om = ConstrainedKernelGaussianObservationModel(;
+        basis=Φ, prior=ke_prior(rng, r), H=randn(rng, r, k), R=Matrix(1.0I, p, p)
+    )
+    lds = LinearDynamicalSystem(ke_state(k; rng, q), om)
+    root = randn(rng, k, k)
+    om.excess .= root * root'
+    @test KESSD._supports_batched(lds)
+    y = [randn(rng, p, tsteps) for _ in 1:n]
+    ux = [randn(rng, q, tsteps) for _ in 1:n]
+    data = KESSD.Data(lds, y; ux)
+    smoothed(ntrials) = begin
+        tfs = KESSD.initialize_FilterSmooth(lds, data.tsteps; cov_alias=true)
+        pool = [
+            KESSD.SmoothWorkspace(
+                Float64, k, p, tsteps; ux_dim=q, ntrials=i == 1 ? ntrials : 1
+            ) for i in 1:2
+        ]
+        KESSD.smooth!(lds, tfs, data, pool)
+        @test (pool[1].batched !== nothing) == (ntrials == n)
+        [fs.x_smooth for fs in tfs.FilterSmooths]
+    end
+    batched, per_trial = smoothed(n), smoothed(1)
+    @test all(isapprox.(batched, per_trial; rtol=1e-10, atol=1e-12))
+    # Without the `Δ x` term the batched means would differ.
+    @test maximum(maximum(abs, x) for x in batched) > 0
+    om.excess .= 0
+    @test !all(isapprox.(smoothed(n), batched; rtol=1e-6))
+end
+
+@testset "a callback stops the fit at a scored iterate" begin
+    rng = MersenneTwister(25)
+    p, k, r = 6, 2, 4
+    Φ = ke_basis(rng, p, r)
+    y = ke_data(rng, Φ, k)
+    start = ke_model(rng, Φ, k; prior=ke_prior(rng, r))
+    seen = Int[]
+    stopped = deepcopy(start)
+    trace = fit!(
+        stopped,
+        y;
+        max_iter=8,
+        tol=-Inf,
+        progress=false,
+        callback=(model, iter) -> (push!(seen, iter); model === stopped && iter == 4),
+    )
+    @test seen == 1:4 && length(trace) == 4
+    # the same parameters as a fit of three M-steps, and one fit is several
+    short = deepcopy(start)
+    @test fit!(short, y; max_iter=4, tol=-Inf, progress=false) ≈ trace
+    @test stopped.obs_model.C ≈ short.obs_model.C &&
+        stopped.state_model.A ≈ short.state_model.A
+    @test emission_posterior(stopped.obs_model).var ≈
+        emission_posterior(short.obs_model).var
+end
+
 @testset "the emission term of the bound" begin
     rng = MersenneTwister(23)
     p, k, r = 6, 2, 4

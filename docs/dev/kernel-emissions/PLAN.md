@@ -222,6 +222,21 @@ M5 depends only on the `AbstractKernelStructure` interface in
   mean of the starting logits); no batched mean pass; `trial_elbos` has no
   method for these emissions; refusal with an `LQRStateModel` is in
   `validate_LDS` but untested.
+- 2026-11-21: the batched mean pass now covers these emissions and the kernel
+  priors on `A`/`B`. `gradient_batched!` subtracts `Δ x` (`_subtract_excess!`)
+  and `Δ_A x`; `ΔB` has no state-dependent gradient term. `_fit_structured!`
+  builds its first workspace with the batched buffers. On dynameg's recovery
+  benchmark (560 trials × 200 bins, p = 102) one fit drops from 55.5 to 26.9 s
+  at k = 128 and from 84.1 to 39.9 s at k = 256 (OpenBLAS, one thread).
+  Tests: batched against per-trial (`KernelEmissions.jl`) and against the dense
+  uncertain-A posterior (`KernelDynamicsPrior.jl`).
+- 2026-11-22: `fit!` takes `callback(lds, iter)` (stop with `true`), so dynameg's
+  worker runs one fit per phase instead of `score_every`-long fits, each of which
+  rebuilt the workspaces and repeated an E-step (results bit-identical).
+  `loglikelihood` batches the filter's mean pass over equal-length trials; the
+  workspace builds its sparse Hessian on first use and `Hb` only for small
+  blocks; a batched fit has one workspace, not one per thread. Recovery fit,
+  Accelerate: k = 256 13.7 → 9.6 s, peak 8.2 → 4.4 GB at two threads.
 - 2026-11-12: the Ω-step of a joint tree threw a `SingularException` when a
   canonical partial correlation ran to ±1 (seen with
   `correlated=[(:parcel_scale, :parcel)]`, `:nested`). It now holds them in
@@ -245,3 +260,10 @@ M5 depends only on the `AbstractKernelStructure` interface in
   and a 4 GB peak per process on audvis (now 1.9 GB; `KernelPrior.U` had the
   same pattern). `ScaleCorrelation(...; families=[])` failed on the
   `Vector{Any}` an empty list makes; any vector of families is now accepted.
+- 2026-11-23: spectral families audited against dynameg (formulas, tails,
+  gradients: they agree). The Laplace step's `_spectral_derivatives!` stacked
+  per-unit slope rows by `reduce(vcat, generator)` (pairwise copies, 96% of the
+  time) and multiplied by views with an index vector (no BLAS); each block
+  evaluated every unit's spectrum. A range per parcel at 942 dipoles a
+  hemisphere, 2000 modes, r = 128: 5.0 s → 0.26 s. A parameter on its bound now
+  has the slope from inside (it had none).

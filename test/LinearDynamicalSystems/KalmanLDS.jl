@@ -629,3 +629,47 @@ function test_marginal_loglikelihood_aliases()
     @test SSD.marginal_loglikelihood(lds, y_vec) ≈ ll_ref
     @test SSD.marginal_loglikelihood(lds, y[:, :, 1]) ≈ SSD.loglikelihood(lds, y[:, :, 1])
 end
+
+#=
+The filter's mean pass runs over every trial of one length at once
+(`_filter_ll_batched`); it must sum to the per-trial filter's value, with ragged
+lengths, both kinds of input and initial-state inputs.
+=#
+function test_marginal_ll_batched_matches_per_trial()
+    rng = MersenneTwister(31)
+    SSD = StateSpaceDynamics
+    D, p, m, q = 4, 6, 2, 3
+    function per_trial(lds, y; kw...)
+        data = SSD.Data(lds, y; kw...)
+        S, K = SSD._filter_cov_pass(lds, maximum(data.tsteps))
+        return sum(
+            SSD._filter_ll_trial(
+                SSD._trial_model(lds, data, n), data.y[n], data.ux[n], data.uy[n], S, K
+            ) for n in eachindex(data.y)
+        )
+    end
+    A = Matrix(0.8I + 0.05 * randn(rng, D, D))
+    Q, P0 = Matrix(0.1I, D, D), Matrix(1.0I, D, D)
+    sm = GaussianStateModel(;
+        A, Q, B=randn(rng, D, m), b=randn(rng, D), x0=randn(rng, D), P0
+    )
+    om = GaussianObservationModel(;
+        C=randn(rng, p, D), R=Matrix(0.3I, p, p), d=randn(rng, p), D=randn(rng, p, q)
+    )
+    lds = LinearDynamicalSystem(sm, om)
+    lens = [30, 30, 17, 30, 17, 9]
+    y = [randn(rng, p, t) for t in lens]
+    ux = [randn(rng, m, t) for t in lens]
+    uy = [randn(rng, q, t) for t in lens]
+    @test loglikelihood(lds, y; ux, uy) ≈ per_trial(lds, y; ux, uy) rtol = 1e-12
+
+    sm0 = GaussianStateModel(;
+        A, Q, B=zeros(D, 0), b=zeros(D), x0=zeros(D), P0, B0=randn(rng, D, 2)
+    )
+    lds0 = LinearDynamicalSystem(
+        sm0,
+        GaussianObservationModel(; C=randn(rng, p, D), R=Matrix(0.3I, p, p), d=zeros(p)),
+    )
+    y3, u0 = randn(rng, p, 20, 7), randn(rng, 2, 7)
+    @test loglikelihood(lds0, y3; ux0=u0) ≈ per_trial(lds0, y3; ux0=u0) rtol = 1e-12
+end

@@ -479,6 +479,27 @@ function test_EM(n_trials::Int=1)
     @test all(diff(ml_total) .>= 0)
 end
 
+# `callback` sees every scored iterate and stops the fit at one: the stopped
+# model is the fit of that many iterations.
+function test_EM_callback()
+    lds, _, y = toy_lds(3)
+    start = deepcopy(lds)
+    seen = Int[]
+    trace = fit!(
+        lds,
+        y;
+        max_iter=10,
+        tol=-Inf,
+        progress=false,
+        callback=(model, iter) -> (push!(seen, iter); iter == 3),
+    )
+    @test seen == 1:3 && length(trace) == 3
+    short = deepcopy(start)
+    @test fit!(short, y; max_iter=3, tol=-Inf, progress=false) ≈ trace
+    @test lds.state_model.A ≈ short.state_model.A && lds.obs_model.C ≈ short.obs_model.C
+    return nothing
+end
+
 function test_gaussian_iw_priors_shape_map_and_R_sanity(; rng=MersenneTwister(2025))
     @testset "GaussianLDS: IW priors shape MAP + R update sanity" begin
         D, P, Tt, N = 3, 4, 60, 4

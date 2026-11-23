@@ -1217,14 +1217,11 @@ _batched_ntrials(lds::LinearDynamicalSystem, ntrials::Int) =
 
 Whether the BLAS-3 batched mean pass applies to this model. False for a
 composite emission — see [`_batched_ntrials`](@ref) for why, and for what it
-does and does not cost.
+does and does not cost. The batched gradient carries an uncertain loading's
+`Δ x` and an uncertain `A`'s `Δ_A x` (`gradient_batched!`); an uncertain `B`
+adds no term that depends on the states.
 """
-# An uncertain A adds `Δ_A x` to the gradient, which the batched pass has not.
-_supports_batched(lds::LinearDynamicalSystem) = !_has_dynamics_prior(lds.state_model)
-function _has_dynamics_prior(sm)
-    return (hasproperty(sm, :A_prior) && sm.A_prior isa KernelMNPrior) ||
-           (hasproperty(sm, :B_prior) && sm.B_prior isa KernelInputPrior)
-end
+_supports_batched(lds::LinearDynamicalSystem) = true
 
 function _supports_batched(
     ::LinearDynamicalSystem{T,S,O}

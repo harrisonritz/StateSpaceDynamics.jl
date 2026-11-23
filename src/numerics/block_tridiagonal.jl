@@ -23,10 +23,13 @@ struct BlockTridiagonalWorkspace{T<:Real}
     H_sub::Vector{Matrix{T}}
     H_super::Vector{Matrix{T}}
 
-    # Sparse matrix with fixed sparsity pattern
-    H_sparse::SparseMatrixCSC{T,Int}
-    # Precomputed map from block (k, i, j) to nzval index for zero-allocation writes
-    nzval_map::Vector{Int}
+    #=
+    The sparse form of the Hessian for `block_tridgm!`: the matrix with its fixed
+    pattern and the map from block (k, i, j) to its `nzval` index. Built on first
+    use (`ws.H_sparse`, `ws.nzval_map`): the two hold about 3 k²T integers, more
+    than every dense block together, and the smoothers never read them.
+    =#
+    sparse::Base.RefValue{Union{Nothing,Tuple{SparseMatrixCSC{T,Int},Vector{Int}}}}
 
     # block_tridiagonal_inverse buffers
     D::Vector{Matrix{T}}
@@ -58,7 +61,7 @@ struct BlockTridiagonalWorkspace{T<:Real}
     — `ldab = 2D` (one row past `kd+1 = 2D-1+1 = 2D`), one column per
     global matrix column. `pbsv` overwrites this with the Cholesky
     factor on each call, so it gets refilled from the block storage
-    every BT solve.
+    every BT solve. Empty for larger blocks, which never take that path.
     =#
     Hb::Matrix{T}
 end
@@ -76,9 +79,6 @@ function BlockTridiagonalWorkspace(
     H_sub = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
     H_super = [zeros(T, block_size, block_size) for _ in 1:(n_blocks - 1)]
 
-    H_sparse = _build_block_tridiag_pattern(T, block_size, n_blocks)
-    nzval_map = _build_nzval_map(H_sparse, block_size, n_blocks)
-
     D = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
     E = [zeros(T, block_size, block_size) for _ in 1:(n_blocks + 1)]
     M = zeros(T, block_size, block_size)
@@ -94,7 +94,11 @@ function BlockTridiagonalWorkspace(
 
     chol_factors = [zeros(T, block_size, block_size) for _ in 1:n_blocks]
     lu_ipiv = Vector{LinearAlgebra.BlasInt}(undef, block_size)
-    Hb = zeros(T, 2 * block_size, block_size * n_blocks)
+    Hb = if block_size <= _PBSV_MAX_BLOCK_SIZE
+        zeros(T, 2 * block_size, block_size * n_blocks)
+    else
+        zeros(T, 0, 0)
+    end
 
     return BlockTridiagonalWorkspace{T}(
         block_size,
@@ -102,8 +106,7 @@ function BlockTridiagonalWorkspace(
         H_diag,
         H_sub,
         H_super,
-        H_sparse,
-        nzval_map,
+        Base.RefValue{Union{Nothing,Tuple{SparseMatrixCSC{T,Int},Vector{Int}}}}(nothing),
         D,
         E,
         M,
@@ -119,6 +122,27 @@ function BlockTridiagonalWorkspace(
         lu_ipiv,
         Hb,
     )
+end
+
+# `ws.H_sparse` and `ws.nzval_map`: the sparse Hessian, built on first use.
+function Base.getproperty(ws::BlockTridiagonalWorkspace, name::Symbol)
+    name === :H_sparse && return _sparse_hessian(ws)[1]
+    name === :nzval_map && return _sparse_hessian(ws)[2]
+    return getfield(ws, name)
+end
+
+function Base.propertynames(ws::BlockTridiagonalWorkspace, private::Bool=false)
+    return (filter(!=(:sparse), fieldnames(typeof(ws)))..., :H_sparse, :nzval_map)
+end
+
+function _sparse_hessian(ws::BlockTridiagonalWorkspace{T}) where {T<:Real}
+    cache = getfield(ws, :sparse)
+    if cache[] === nothing
+        bs, n = getfield(ws, :block_size), getfield(ws, :n_blocks)
+        H = _build_block_tridiag_pattern(T, bs, n)
+        cache[] = (H, _build_nzval_map(H, bs, n))
+    end
+    return cache[]
 end
 
 """

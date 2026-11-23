@@ -245,6 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handed straight to that package, but no dependency is added: the M-step uses
   hand-derived analytic gradients (checked against `ForwardDiff` in the tests)
   rather than automatic differentiation.
+- **`fit!` takes a `callback`** (the Gaussian LDS, and constrained or
+  kernel-prior emissions; not with `depends_on` grouping or a warped composite).
+  `callback(lds, iter)` runs at every scored iterate, after the E-step and the
+  bound, before the M-step; returning `true` stops the fit there with those
+  parameters. A caller that scores on its own schedule (a held-out plug-in
+  likelihood, a tolerance of its own) runs one fit instead of many short ones,
+  each of which rebuilt the workspaces and repeated an E-step.
 
 ### Changed
 - **`GaussianObservationModel` no longer has a `C_basis` field.** Use
@@ -316,7 +323,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   updates; the fitted values are the MAP under an inverse-Wishart prior with
   `ν − q` degrees of freedom, not the stated `MN × IW` pair.
 
+### Performance
+- **Kernel-prior and constrained emissions, and kernel priors on `A` or `B`,
+  use the batched (BLAS-3) mean pass.** Equal-length trials already shared
+  one covariance pass. The mean pass then ran trial by trial (BLAS-2), because
+  the batched gradient lacked the loading's `Δ x` and the transition's `Δ_A x`
+  terms. `gradient_batched!` now has both (`ΔB` adds no state-dependent term),
+  and `fit!` for these emissions builds its workspace with the batched
+  buffers. The posterior is unchanged. On 560 trials × 200 steps (p = 102)
+  one fit is about 2× faster at k = 128 and k = 256.
+- **`loglikelihood` of a Gaussian LDS filters every trial of one length at
+  once.** The covariance pass was already shared; the mean pass now stacks the
+  trials as the columns of one matrix (`_filter_ll_batched`), the same filter
+  summed in a different order. On 560 trials × 200 steps it is 4–5× faster at
+  k = 128 and k = 256 (0.87 → 0.16 s and 1.16 → 0.32 s on Accelerate).
+- **A `BlockTridiagonalWorkspace` builds its sparse Hessian on first use.**
+  `H_sparse` and `nzval_map` (about 3 k²T integers, more than every dense
+  block together) were built with every workspace and read only by
+  `block_tridgm!`; `ws.H_sparse` and `ws.nzval_map` still return them. The
+  banded `pbsv` scratch `Hb` is allocated only for blocks of at most
+  `_PBSV_MAX_BLOCK_SIZE`. At k = 256 and T = 200 a workspace builds in 0.17 s
+  instead of 0.8 s and holds 0.9 GB instead of 2.0 GB.
+- **A kernel-prior or constrained fit with the batched mean pass builds one
+  workspace,** not one per thread: the others serve only the per-trial
+  fallback. With two Julia threads (four thread ids) a k = 256 recovery fit
+  peaked at 8.2 GB and now peaks at 4.4 GB.
+- **A `SpectralCorrelationFamily`'s derivatives are 2–19× faster.** In the
+  Laplace step (`_spectral_derivatives!`), a per-unit parameter's slope rows
+  were stacked by `reduce(vcat, generator)`, which copies pairwise (96% of the
+  time), and a free parameter's products took a view by an index vector,
+  which is not strided and so missed BLAS. Each block also evaluated the
+  spectra of every unit of the family rather than its own. With 942 dipoles a
+  hemisphere, 2000 modes, r = 128 and 200 parcels, `_derivatives!` takes
+  0.26 s instead of 5.0 s with a range per parcel, and 0.10–0.16 s instead of
+  0.24–0.43 s with global parameters.
+
 ### Fixed
+- **A spectral parameter on its bound keeps its slope.** Past a bound the
+  spectrum is held there with no slope, as before; on the bound the slope is
+  now the one from inside (it was zero), as in dynameg, whose L-BFGS-B leaves
+  a parameter exactly on a bound.
 - **Shared-covariance aggregation is per bucket.** The sufficient-statistics
   aggregator took the shared-covariance shortcut for *every* trial whenever the
   first two trials shared storage, so a ragged dataset whose first two trials had

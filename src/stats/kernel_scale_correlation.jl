@@ -1087,16 +1087,20 @@ function _part_params(part::_SpectralPart{T}, φ::AbstractVector) where {T<:Real
     return P, uniform
 end
 
-# Whether a parameter weight is inside its bounds (outside, the spectrum is held
-# at the bound: no slope).
-_inside(part::_SpectralPart, j::Int, value::Real) = part.lower[j] < value < part.upper[j]
+# Whether a parameter weight is within its bounds (past one, the spectrum is held
+# at the bound: no slope; on one, the slope from inside).
+_inside(part::_SpectralPart, j::Int, value::Real) = part.lower[j] <= value <= part.upper[j]
+
+# The parameter rows a spectral part evaluates: the one row, or its own units'
+# (a block holds one hemisphere's units; the others' rows stay unused).
+_part_rows(part::_SpectralPart, uniform::Bool) = uniform ? (1:1) : first.(part.by_owner)
 
 function _spectral_aux(part::_SpectralPart{T}, φ::AbstractVector, E::Matrix{T}) where {T<:Real}
     P, uniform = _part_params(part, φ)
     N = length(part.lam)
     sq = zeros(T, size(P, 1), N)
     t_u = zeros(T, size(P, 1))
-    for r in axes(P, 1)
+    for r in _part_rows(part, uniform)
         values, _ = _spectrum(part.spectrum, part.lam, view(P, r, :))
         sq[r, :] .= sqrt.(values)
         t_u[r] = first(_spectrum_tail(part.spectrum, part.lam[end], view(P, r, :)))
@@ -1124,14 +1128,18 @@ function _spectral_v(part::_SpectralPart, aux::_SpectralAux, Y::AbstractMatrix)
     return aux.V * Y
 end
 
-# Per unit row, `∂√s/∂p` (N × n_p), `∂s/∂p` and `∂t/∂p` of a spectral part.
+# Per unit row, `∂√s/∂p` (N × n_p), `∂s/∂p` and `∂t/∂p` of a spectral part (empty
+# for the units of other parts).
 function _spectral_slopes(part::_SpectralPart{T}, aux::_SpectralAux{T}) where {T<:Real}
-    half, dS, dt = Matrix{T}[], Matrix{T}[], Vector{T}[]
-    for r in axes(aux.P, 1)
+    n = size(aux.P, 1)
+    half = [zeros(T, 0, 0) for _ in 1:n]
+    dS = [zeros(T, 0, 0) for _ in 1:n]
+    dt = [T[] for _ in 1:n]
+    for r in _part_rows(part, aux.uniform)
         _, ds = _spectrum(part.spectrum, part.lam, view(aux.P, r, :); grad=true)
-        push!(dS, ds)
-        push!(half, ds ./ (2 .* max.(view(aux.sq, r, :), floatmin(T))))
-        push!(dt, last(_spectrum_tail(part.spectrum, part.lam[end], view(aux.P, r, :))))
+        dS[r] = ds
+        half[r] = ds ./ (2 .* max.(view(aux.sq, r, :), floatmin(T)))
+        dt[r] = last(_spectrum_tail(part.spectrum, part.lam[end], view(aux.P, r, :)))
     end
     return half, dS, dt
 end
@@ -1327,14 +1335,24 @@ function _spectral_derivatives!(
         half, dS, dt = _spectral_slopes(part, aux)
         for (j, slot, rows, _) in slots
             _inside(part, j, φ[slot]) || continue
-            if aux.uniform  # one spectrum: through BLAS
-                dti = fill(dt[1][j], length(rows))
-                Q = view(part.U, rows, :) * (view(half[1], :, j) .* aux.B)
-                delta = (view(part.U2, rows, :) * view(dS[1], :, j) .+ dti) ./ aux.d[rows]
-            else
-                row = part.owner[rows]
-                H = reduce(vcat, (view(half[r], :, j)' for r in row))
-                dSj = reduce(vcat, (view(dS[r], :, j)' for r in row))
+            row = part.owner[rows]
+            if aux.uniform || all(==(row[1]), row)  # one spectrum: through BLAS
+                r = aux.uniform ? 1 : row[1]
+                dti = fill(dt[r][j], length(rows))
+                # a copy of the rows (a view by an index vector is not strided,
+                # so its product would not reach BLAS); none for all of them
+                whole = length(rows) == size(part.U, 1)
+                Ur = whole ? part.U : part.U[rows, :]
+                U2r = whole ? part.U2 : part.U2[rows, :]
+                Q = Ur * (view(half[r], :, j) .* aux.B)
+                delta = (U2r * view(dS[r], :, j) .+ dti) ./ aux.d[rows]
+            else  # a free parameter over per-unit spectra
+                H = Matrix{T}(undef, length(rows), size(part.U, 2))
+                dSj = similar(H)
+                for (i, r) in enumerate(row)
+                    H[i, :] .= view(half[r], :, j)
+                    dSj[i, :] .= view(dS[r], :, j)
+                end
                 dti = T[dt[r][j] for r in row]
                 Q = (view(part.U, rows, :) .* H) * aux.B
                 delta = (vec(sum(view(part.U2, rows, :) .* dSj; dims=2)) .+ dti) ./ aux.d[rows]

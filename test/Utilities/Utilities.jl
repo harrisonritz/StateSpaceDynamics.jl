@@ -41,6 +41,30 @@ function test_block_tridgm()
     end
 end
 
+# The workspace's sparse Hessian (`ws.H_sparse`), built on first use, holds the
+# blocks `block_tridgm!` copies in, as `block_tridgm` assembles them.
+function test_block_tridgm_workspace()
+    rng = MersenneTwister(7)
+    bs, n = 3, 4
+    ws = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, bs, n)
+    @test getfield(ws, :sparse)[] === nothing
+    @test size(ws.Hb) == (2bs, bs * n)
+    for i in 1:n
+        ws.H_diag[i] .= randn(rng, bs, bs)
+    end
+    for i in 1:(n - 1)
+        ws.H_sub[i] .= randn(rng, bs, bs)
+        ws.H_super[i] .= randn(rng, bs, bs)
+    end
+    H = StateSpaceDynamics.block_tridgm!(ws)
+    @test H === ws.H_sparse && length(ws.nzval_map) == (3n - 2) * bs^2
+    @test Matrix(H) == Matrix(block_tridgm(ws.H_diag, ws.H_super, ws.H_sub))
+    @test :H_sparse in propertynames(ws)
+    # the banded scratch only for blocks small enough to use it
+    big = StateSpaceDynamics.BlockTridiagonalWorkspace(Float64, 40, 2)
+    @test isempty(big.Hb) && getfield(big, :sparse)[] === nothing
+end
+
 function test_gaussian_entropy()
     n = 3
     A = sprandn(n, n, 0.6)
