@@ -252,6 +252,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameters. A caller that scores on its own schedule (a held-out plug-in
   likelihood, a tolerance of its own) runs one fit instead of many short ones,
   each of which rebuilt the workspaces and repeated an E-step.
+- **`kernel_unit_steps(prior)`** counts a kernel prior's unit-kernel weight
+  steps since it was built: the L-BFGS runs, those that reached their
+  iteration cap (in the box, an inner run at its cap) and those whose result
+  was not taken. It takes a `KernelPrior` or a wrapper (`KernelIWPrior`,
+  `KernelMNPrior`, `KernelInputPrior`: the sum over its kernel priors).
+  `fit_kernel_weights!`, and the M-steps that fit a wrapper's weights, warn
+  once when a call adds to either failure count.
 
 ### Changed
 - **`GaussianObservationModel` no longer has a `C_basis` field.** Use
@@ -359,6 +366,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.24–0.43 s with global parameters.
 
 ### Fixed
+- **The unit-kernel weight step of a Student-t tree has the right gradient.**
+  With unit kernels, `K_w = w₀ diag(nugget) + Σ_k w_k K_k`, the nugget
+  `1/E[λ_u]` of a Student-t tree; the gradient in the logits took
+  `∂K_w/∂w₀ = I`, right only for a Gaussian tree (nugget ones). Once the first
+  sweep had set the nugget, every L-BFGS run of the step used its 200
+  iterations, ended above its start and was discarded: the logits stayed at
+  their first-sweep values and each sweep cost seconds rather than
+  milliseconds. Gaussian trees are unchanged (to round-off); Student-t trees
+  with unit kernels now reach a stationary point of the same objective, so
+  their fits change. The step's runs are now counted (`kernel_unit_steps`,
+  under Added), and a call whose steps reach their cap or are not taken
+  warns.
 - **A spectral parameter on its bound keeps its slope.** Past a bound the
   spectrum is held there with no slope, as before; on the bound the slope is
   now the one from inside (it was zero), as in dynameg, whose L-BFGS-B leaves

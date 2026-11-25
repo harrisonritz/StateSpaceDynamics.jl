@@ -537,6 +537,14 @@ function kernel_weights(kp::KernelMNPrior)
     )
 end
 
+# The receivers' and senders' w-step counts (`kernel_unit_steps`), once when the
+# two are one prior.
+function kernel_unit_steps(kp::KernelMNPrior)
+    rows = kernel_unit_steps(kp.rows)
+    kp.rows === kp.cols && return rows
+    return _add_unit_steps(rows, kernel_unit_steps(kp.cols))
+end
+
 _mn_dim(kp::KernelMNPrior) = isempty(kp.loading) ? kp.rows.dim : size(kp.loading, 2)
 
 function _mn_projections(kp::KernelMNPrior{T}, H=kp.loading) where {T<:Real}
@@ -854,6 +862,11 @@ end
 The fitted weights of each input group's kernel prior.
 """
 kernel_weights(kb::KernelInputPrior) = [kernel_weights(p) for p in kb.priors]
+
+# The groups' w-step counts summed (`kernel_unit_steps`).
+function kernel_unit_steps(kb::KernelInputPrior)
+    return reduce(_add_unit_steps, (kernel_unit_steps(p) for p in kb.priors))
+end
 
 _input_projected(kb::KernelInputPrior) = !isempty(kb.loading)
 

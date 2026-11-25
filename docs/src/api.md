@@ -56,6 +56,7 @@ fit_kernel_weights!
 kernel_weights
 kernel_covariance
 kernel_evidence
+kernel_unit_steps
 ```
 
 ## Monotonic splines
