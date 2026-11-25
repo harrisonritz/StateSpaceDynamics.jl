@@ -123,6 +123,7 @@ export Kernel, KernelPrior, ScaleCorrelation, CorrelationFamily, KernelIWPrior
 export KernelMNPrior, MNMeanBasis, dynamics_posterior, mean_coefficients
 export KernelInputPrior, input_posterior
 export fit_kernel_weights!, kernel_weights, kernel_covariance, kernel_evidence
+export kernel_unit_steps
 export ConstrainedGaussianObservationModel, KernelGaussianObservationModel
 export ConstrainedKernelGaussianObservationModel, StructuredGaussianObservationModel
 export LoadingPosterior, emission_posterior

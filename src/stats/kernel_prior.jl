@@ -948,7 +948,8 @@ current ones, stopping at a gradient below `g_tol` or a relative decrease below
 The first call resolves the prior's empirical centres against `S` and keeps
 them. Returns `(; converged, objective, rounds)`: `objective` is
 `n/2 [log|Σ| + tr(Σ⁻¹S)] + ½ (w − μ)'Λ(w − μ)` at the weights, under the trees
-they were fitted with.
+they were fitted with. Warns when a tree's unit-kernel weight step reached its
+iteration cap or was not taken during the call ([`kernel_unit_steps`](@ref)).
 """
 function fit_kernel_weights!(
     prior::KernelPrior{T}, S::AbstractMatrix{<:Real}, n::Real; kwargs...
@@ -975,6 +976,7 @@ function _fit_kernel_weights!(
     nw = length(prior.labels)
     μ, Λ = zeros(T, nw), zeros(T, nw, nw)
     value, converged, done = T(NaN), false, 0
+    steps = _unit_step_counts(prior.trees)
     for round in 1:max(rounds, 1)
         done = round
         _weight_prior!(μ, Λ, prior.trees)
@@ -994,8 +996,40 @@ function _fit_kernel_weights!(
             break
         end
     end
+    _warn_unit_steps(steps, _unit_step_counts(prior.trees))
     return (; converged, objective=value, rounds=done)
 end
+
+# One warning for the unit-kernel w-steps of a call that hit their cap or were
+# not taken: their logits stalled (`kernel_unit_steps`).
+function _warn_unit_steps(before, after)
+    capped = after.capped - before.capped
+    rejected = after.rejected - before.rejected
+    (capped > 0 || rejected > 0) || return nothing
+    @warn(
+        "fit_kernel_weights!: unit-kernel weight steps reached their iteration cap " *
+            "or were not taken, so the kernels' logits may have stalled " *
+            "(see `kernel_unit_steps`)",
+        steps = after.steps - before.steps,
+        capped,
+        rejected,
+        maxlog = 3,
+    )
+    return nothing
+end
+
+"""
+    kernel_unit_steps(prior) -> (; steps, capped, rejected)
+
+How the unit-kernel weight steps of a [`KernelPrior`](@ref)'s trees have gone
+since it was built, summed over the trees with a `unit_structure` (zeros
+without one): `steps` L-BFGS runs over the kernels' logits, `capped` of them
+reached their iteration cap without converging, and `rejected` were not taken
+(worse than their start by more than round-off, not finite, or a failed line
+search; the logits are then left where they were). Both stay at zero when the
+steps work; [`fit_kernel_weights!`](@ref) warns when a call adds to either.
+"""
+kernel_unit_steps(prior::KernelPrior) = _unit_step_counts(prior.trees)
 
 """
     kernel_evidence(prior, S, n) -> Real

@@ -1,4 +1,4 @@
-using Test, StateSpaceDynamics, LinearAlgebra, Random, Statistics, MAT
+using Test, StateSpaceDynamics, LinearAlgebra, Random, Statistics, MAT, Optim
 const KHSSD = StateSpaceDynamics
 
 function kh_reference()
@@ -394,6 +394,20 @@ end
         ) / 2h
     end
     @test G ≈ numeric rtol = 1e-5
+    # ... and with a Student-t tree's nugget (1/E[λ_u] ≠ 1, so ∂K_w/∂w₀ ≠ I),
+    # with and without the profiled scale
+    s.nugget .= exp.(randn(rng, 7))
+    for profile in (nothing, (14.0, 0.7))
+        KHSSD._unit_objective!(G, s, [0.3, -0.4], F, 2; profile)
+        numeric = map(1:2) do k
+            e = h .* (1:2 .== k)
+            (
+                KHSSD._unit_objective!(nothing, s, [0.3, -0.4] .+ e, F, 2; profile) -
+                KHSSD._unit_objective!(nothing, s, [0.3, -0.4] .- e, F, 2; profile)
+            ) / 2h
+        end
+        @test G ≈ numeric rtol = 1e-5
+    end
 end
 
 @testset "unit structure: the prior it puts on the weights" begin
@@ -627,4 +641,114 @@ end
     @test t3.unit_structure.nugget ≈ 1 ./ t3.lambda
     μ, Λ = KHSSD._weight_prior!(zeros(n), zeros(n, n), [t3])
     @test isposdef(Symmetric(Λ))
+end
+
+@testset "Student-t trees with unit kernels: the w-step is taken" begin
+    #=
+    With a nugget ≠ 1 a gradient that took ∂K_w/∂w₀ = I sent every L-BFGS run
+    of the w-step to its 200-iteration cap, above its start, and the run was
+    discarded: the logits never left their first-sweep values. The step must
+    now be taken, converge well inside the cap, and leave a stationary point.
+    =#
+    rng = MersenneTwister(93)
+    U, d = 50, 20
+    x = sort(rand(rng, U))
+    near, broad = kh_grid(x, [0.05])[1, :, :], kh_grid(x, [0.3])[1, :, :]
+    nugget = exp.(2 .* randn(rng, U))
+    w = KHSSD._unit_weights([1.0, -0.5])
+    Kw = w[1] * Diagonal(nugget) + w[2] * near + w[3] * broad
+    E = cholesky(Symmetric(Kw)).L * randn(rng, U, d)
+    F = E * E'
+    for profile in (nothing, (d * U + 4.0, 0.7))
+        s = KHSSD.UnitStructure{Float64}(
+            ["near", "broad"],
+            [[near], [broad]],
+            String[],
+            zeros(U, 0),
+            zeros(Bool, 0, d),
+            2.0,
+            zeros(2),
+            [1, 1],
+            zeros(0, d),
+            copy(nugget),
+        )
+        f = z -> KHSSD._unit_objective!(nothing, s, z, F, d; profile)
+        g! = (G, z) -> (KHSSD._unit_objective!(G, s, z, F, d; profile); G)
+        z0 = copy(s.z)
+        run = optimize(
+            f, g!, z0, LBFGS(), Optim.Options(; iterations=200, g_tol=1e-9, f_reltol=1e-14)
+        )
+        @test Optim.converged(run) && Optim.iterations(run) < 50
+        KHSSD._fit_unit_weights!(s, F, d; profile)
+        @test (s.steps, s.capped, s.rejected) == (1, 0, 0)
+        @test s.z != z0 && f(s.z) < f(z0)
+        # stationary in the objective itself (central differences), not only
+        # in the analytic gradient the step followed
+        h = 1e-5
+        bump(k) = h .* (1:2 .== k)
+        slope = [(f(s.z .+ bump(k)) - f(s.z .- bump(k))) / 2h for k in 1:2]
+        @test norm(slope) < 1e-4
+        @test norm(g!(zeros(2), s.z)) < 1e-6
+        # from its own optimum the step stays and is still taken
+        z1 = copy(s.z)
+        KHSSD._fit_unit_weights!(s, F, d; profile)
+        @test (s.steps, s.capped, s.rejected) == (2, 0, 0)
+        @test s.z ≈ z1 atol = 1e-6
+    end
+
+    # A df = 1 tree: after the first sweep the nugget is 1/E[λ_u], far from
+    # ones, and every later sweep's w-step is taken.
+    labels = [KHSSD.WeightLabel("u$i", :scale, nothing, "u$i", :log) for i in 1:U]
+    names = ["u$i" for i in 1:U]
+    spec = (;
+        kernels=[
+            "near" => (names, kh_grid(x, [0.02, 0.05])),
+            "broad" => (names, kh_grid(x, [0.3])),
+        ],
+        kernel_types=["near" => [:scale], "broad" => [:scale]],
+    )
+    a = vec(cholesky(Symmetric(Kw)).L * randn(rng, U))
+    a[[5, 25, 40]] .+= [4.0, -3.0, 5.0]
+    trees = KHSSD._build_trees(
+        Float64,
+        labels,
+        Dict(:scale => 1),
+        ();
+        sd_prior=(0.5, 4.0),
+        root_sd=3.0,
+        lkj_eta=2.0,
+        type_df=Dict(:scale => 1.0),
+    )
+    tree = only(trees)
+    KHSSD._attach_unit_structure!(trees, labels, spec)
+    tree.node_mean .= 0.0
+    tree.root .= 0.0
+    tree.root_centre .= 0.0
+    s = tree.unit_structure
+    @test KHSSD._update_tree!(tree, a, Matrix(0.01I, U, U))
+    @test s.steps > 2 && s.capped == 0 && s.rejected == 0
+    @test maximum(s.nugget) / minimum(s.nugget) > 10
+    @test s.nugget ≈ 1 ./ tree.lambda
+    @test all(!iszero, s.z)
+
+    # Through KernelPrior: the counts, and no warning from a fit whose steps work.
+    r = U
+    kernels = map(1:r) do i
+        Kernel(reshape(Float64.(1:r .== i), r, 1); factor=true, name="u$i", type=:scale)
+    end
+    plain = KernelPrior(kernels; levels=:hierarchical)
+    @test kernel_unit_steps(plain) == (; steps=0, capped=0, rejected=0)
+    prior = KernelPrior(kernels; levels=:hierarchical, df=1.0, unit_structure=spec)
+    @test kernel_unit_steps(prior) == (; steps=0, capped=0, rejected=0)
+    S = Matrix(Diagonal(exp.(a) .* [sum(abs2, randn(rng, 50)) / 50 for _ in 1:r]))
+    @test_logs min_level = Base.CoreLogging.Warn fit_kernel_weights!(prior, S, 50; rounds=5)
+    counts = kernel_unit_steps(prior)
+    @test counts.steps > 0 && counts.capped == 0 && counts.rejected == 0
+    # and a warning when a call adds to either count
+    @test_logs (:warn, r"iteration cap") KHSSD._warn_unit_steps(
+        (; steps=0, capped=0, rejected=0), (; steps=4, capped=1, rejected=2)
+    )
+    @test_logs KHSSD._warn_unit_steps(
+        (; steps=0, capped=0, rejected=0), (; steps=4, capped=0, rejected=0)
+    )
 end

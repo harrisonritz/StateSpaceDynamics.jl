@@ -56,14 +56,20 @@ _label_text(label::WeightLabel) = string(label.type, ":", label.name)
 optional unit kernels on their covariance and covariates on their mean,
 
     η = Z μ + X B + E,   Cov(E) = K_w ⊗ Ω (unit-major),
-    K_w = w₀ I + Σ_k w_k K_k,   (w₀, w₁, …) = softmax(0, z₁, …),
+    K_w = w₀ diag(nugget) + Σ_k w_k K_k,   (w₀, w₁, …) = softmax(0, z₁, …),
     z_k ~ N(0, kernel_sd²),
 
 `η` the `units × d` weights, `Z` each unit's node, `X` (`units × p`) the
 covariates centred and scaled to unit SD over the tree's units, `B` (`p × d`)
 their slopes (fitted where `flags`, else zero). Each kernel is a grid of
 widths (`U × U` matrices with unit diagonal, aligned to the tree's units);
-`width` is the one in use.
+`width` is the one in use. The nugget is `1/E[λ_u]` of a Student-t tree (else
+ones).
+
+`steps`, `capped` and `rejected` count the w-step's L-BFGS runs
+([`_fit_unit_weights!`](@ref)), those that reached the iteration cap
+without converging, and those whose result was not taken (see
+[`kernel_unit_steps`](@ref)).
 """
 mutable struct UnitStructure{T<:Real}
     const kernel_names::Vector{String}
@@ -77,6 +83,19 @@ mutable struct UnitStructure{T<:Real}
     beta::Matrix{T}                             # (p, d)
     # the identity's share per unit, 1/E[λ_u] of a Student-t tree (else ones)
     nugget::Vector{T}                           # (U)
+    # w-step diagnostics: runs, runs at the iteration cap, results not taken
+    steps::Int
+    capped::Int
+    rejected::Int
+end
+
+# Without counts: none yet.
+function UnitStructure{T}(
+    names, kernels, cnames, X, flags, kernel_sd, z, width, beta, nugget
+) where {T<:Real}
+    return UnitStructure{T}(
+        names, kernels, cnames, X, flags, kernel_sd, z, width, beta, nugget, 0, 0, 0
+    )
 end
 
 # Without a nugget: ones (a Gaussian tree's).
@@ -1031,7 +1050,8 @@ function _unit_objective!(
     G === nothing && return value
     M = Kinv * F * Kinv
     slope = zeros(T, length(w))
-    slope[1] = d * tr(Kinv) - factor * tr(M)
+    # ∂K_w/∂w₀ = diag(nugget), not I: the nugget is 1/E[λ_u] in a Student-t tree
+    slope[1] = d * dot(diag(Kinv), s.nugget) - factor * dot(diag(M), s.nugget)
     for k in eachindex(s.kernels)
         Kk = s.kernels[k][s.width[k]]
         slope[k + 1] = d * dot(Kinv, Kk) - factor * dot(M, Kk)
@@ -1049,6 +1069,12 @@ end
 Move `s.z` to the minimizer of [`_unit_objective!`](@ref) in [−10, 10] by
 L-BFGS from the current logits; never worse. Returns `tr(K_w⁻¹ F)` at the
 logits it leaves.
+
+Counts each run in `s.steps`; a run that reached its iteration cap without
+converging in `s.capped`, and one whose result was not taken in `s.rejected`:
+worse than the start by more than round-off (`√eps` relative; a run from the
+optimum can end a few ulps above it), not finite, or a failed line search. The
+counts do not change the step.
 """
 function _fit_unit_weights!(
     s::UnitStructure{T}, F::Matrix{T}, d::Int; profile::Union{Nothing,Tuple{T,T}}=nothing
@@ -1059,7 +1085,8 @@ function _fit_unit_weights!(
         fg! = (G, z) -> _unit_objective!(G, s, z, F, d; profile)
         z0 = copy(s.z)
         start = f(z0)
-        options = Optim.Options(; iterations=200, g_tol=1e-9, f_reltol=1e-14)
+        cap = 200
+        options = Optim.Options(; iterations=cap, g_tol=1e-9, f_reltol=1e-14)
         objective = Optim.OnceDifferentiable(f, g!, fg!, z0)
         bound = T(_UNIT_Z_BOUND)
         result = try
@@ -1068,7 +1095,9 @@ function _fit_unit_weights!(
             err isa LineSearchException || rethrow()
             nothing
         end
-        z = result === nothing ? z0 : Optim.minimizer(result)
+        failed = result === nothing
+        capped = !failed && _capped(result, cap)
+        z = failed ? z0 : Optim.minimizer(result)
         if any(x -> abs(x) > bound, z)
             # The bound binds: L-BFGS in the box from the clamped point.
             inside = clamp.(z, -bound + T(1e-6), bound - T(1e-6))
@@ -1080,13 +1109,41 @@ function _fit_unit_weights!(
                 Optim.Fminbox(LBFGS()),
                 options,
             )
+            capped = _capped(boxed, cap)
             z = clamp.(Optim.minimizer(boxed), -bound, bound)
         end
         value = f(z)
-        (all(isfinite, z) && isfinite(value) && value <= start) && (s.z .= z)
+        taken = all(isfinite, z) && isfinite(value) && value <= start
+        taken && (s.z .= z)
+        # a result above its start by round-off only (at the optimum) is no failure
+        tie = isfinite(value) && value - start <= sqrt(eps(T)) * max(one(T), abs(start))
+        s.steps += 1
+        s.capped += capped
+        s.rejected += failed || !(taken || tie)
     end
     K, _ = _unit_kernel(s, s.z, size(F, 1))
     return dot(_cholesky_inverse(cholesky(Symmetric(K))), F)
+end
+
+# An Optim run that used its `cap` iterations without converging.
+_capped(result, cap::Int) = Optim.iterations(result) >= cap && !Optim.converged(result)
+
+"""
+    _unit_step_counts(trees) -> (; steps, capped, rejected)
+
+**Internal.** The w-step counts of [`UnitStructure`](@ref), summed over the
+trees that have one.
+"""
+function _unit_step_counts(trees)
+    steps, capped, rejected = 0, 0, 0
+    for tree in trees
+        s = tree.unit_structure
+        s === nothing && continue
+        steps += s.steps
+        capped += s.capped
+        rejected += s.rejected
+    end
+    return (; steps, capped, rejected)
 end
 
 # For each kernel with several widths, the width with the lowest w-step

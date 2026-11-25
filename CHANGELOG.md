@@ -359,6 +359,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   0.24–0.43 s with global parameters.
 
 ### Fixed
+- **The unit-kernel weight step of a Student-t tree has the right gradient.**
+  With unit kernels, `K_w = w₀ diag(nugget) + Σ_k w_k K_k`, the nugget
+  `1/E[λ_u]` of a Student-t tree; the gradient in the logits took
+  `∂K_w/∂w₀ = I`, right only for a Gaussian tree (nugget ones). Once the first
+  sweep had set the nugget, every L-BFGS run of the step used its 200
+  iterations, ended above its start and was discarded: the logits stayed at
+  their first-sweep values and each sweep cost seconds rather than
+  milliseconds. Gaussian trees are unchanged (to round-off); Student-t trees
+  with unit kernels now reach a stationary point of the same objective, so
+  their fits change. `kernel_unit_steps(prior)` counts the step's runs, those
+  that reached the iteration cap and those not taken, and
+  `fit_kernel_weights!` warns when a call adds to either.
 - **A spectral parameter on its bound keeps its slope.** Past a bound the
   spectrum is held there with no slope, as before; on the bound the slope is
   now the one from inside (it was zero), as in dynameg, whose L-BFGS-B leaves
