@@ -751,4 +751,64 @@ end
     @test_logs KHSSD._warn_unit_steps(
         (; steps=0, capped=0, rejected=0), (; steps=4, capped=0, rejected=0)
     )
+
+    # The wrappers report their kernel priors' counts, summed.
+    fresh() = KernelPrior(kernels; levels=:hierarchical, df=1.0, unit_structure=spec)
+    function tally!(p, counts)
+        s = only(t.unit_structure for t in p.trees if t.unit_structure !== nothing)
+        s.steps, s.capped, s.rejected = counts
+        return p
+    end
+    iw = KernelIWPrior(fresh(); dof=r + 4)
+    tally!(iw.prior, (5, 1, 2))
+    @test kernel_unit_steps(iw) == (; steps=5, capped=1, rejected=2)
+    mn = KernelMNPrior(fresh(), fresh())
+    tally!(mn.rows, (5, 1, 2))
+    tally!(mn.cols, (3, 0, 1))
+    @test kernel_unit_steps(mn) == (; steps=8, capped=1, rejected=3)
+    one_prior = tally!(fresh(), (5, 1, 2))
+    @test kernel_unit_steps(KernelMNPrior(one_prior, one_prior)) ==
+        (; steps=5, capped=1, rejected=2)
+    kb = KernelInputPrior([fresh(), fresh()], [[1], [2]])
+    tally!(kb.priors[1], (5, 1, 2))
+    tally!(kb.priors[2], (3, 0, 1))
+    @test kernel_unit_steps(kb) == (; steps=8, capped=1, rejected=3)
+end
+
+@testset "Unit-kernel w-step: a run in the box counts its inner cap" begin
+    #=
+    Data drawn from one kernel put its logit's optimum past the bound (about
+    19 for kernel_sd = 100), so the step ends in Fminbox. Fminbox's
+    `iterations` count its outer rounds (one here) while its inner L-BFGS run
+    reaches the 200-iteration cap on the barrier; that run is counted capped,
+    and the step is still taken, at the bound.
+    =#
+    rng = MersenneTwister(1)
+    U, d = 30, 3
+    x = sort(rand(rng, U))
+    K1 = [exp(-(x[i] - x[j])^2 / 0.02) + (i == j ? 1e-6 : 0.0) for i in 1:U, j in 1:U]
+    E = cholesky(Symmetric(K1)).L * randn(rng, U, 200)
+    F = Matrix(Symmetric(E * E' ./ 200 .* d))
+    s = KHSSD.UnitStructure{Float64}(
+        ["k1"],
+        [[K1]],
+        String[],
+        zeros(U, 0),
+        zeros(Bool, 0, d),
+        100.0,
+        zeros(1),
+        [1],
+        zeros(0, d),
+        ones(U),
+    )
+    f = z -> KHSSD._unit_objective!(nothing, s, z, F, d)
+    g! = (G, z) -> (KHSSD._unit_objective!(G, s, z, F, d); G)
+    options = Optim.Options(; iterations=200, g_tol=1e-9, f_reltol=1e-14)
+    free = optimize(f, g!, zeros(1), LBFGS(), options)
+    @test Optim.converged(free) && only(Optim.minimizer(free)) > KHSSD._UNIT_Z_BOUND
+    boxed = optimize(f, g!, [-10.0], [10.0], [10 - 1e-6], Fminbox(LBFGS()), options)
+    @test Optim.iterations(boxed) < 200 && Optim.iteration_limit_reached(boxed)
+    KHSSD._fit_unit_weights!(s, F, d)
+    @test (s.steps, s.capped, s.rejected) == (1, 1, 0)
+    @test only(s.z) ≈ KHSSD._UNIT_Z_BOUND atol = 1e-6
 end

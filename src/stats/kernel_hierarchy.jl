@@ -1071,7 +1071,9 @@ L-BFGS from the current logits; never worse. Returns `tr(K_w⁻¹ F)` at the
 logits it leaves.
 
 Counts each run in `s.steps`; a run that reached its iteration cap without
-converging in `s.capped`, and one whose result was not taken in `s.rejected`:
+converging in `s.capped` (when the bound binds, also one whose Fminbox run in
+the box did not converge or whose last inner L-BFGS run reached the cap, even
+if it then converged), and one whose result was not taken in `s.rejected`:
 worse than the start by more than round-off (`√eps` relative; a run from the
 optimum can end a few ulps above it), not finite, or a failed line search. The
 counts do not change the step.
@@ -1109,7 +1111,8 @@ function _fit_unit_weights!(
                 Optim.Fminbox(LBFGS()),
                 options,
             )
-            capped = _capped(boxed, cap)
+            # an inner run at its cap counts too, and the first run's flag stays
+            capped |= _box_capped(boxed)
             z = clamp.(Optim.minimizer(boxed), -bound, bound)
         end
         value = f(z)
@@ -1127,6 +1130,12 @@ end
 
 # An Optim run that used its `cap` iterations without converging.
 _capped(result, cap::Int) = Optim.iterations(result) >= cap && !Optim.converged(result)
+
+# An Fminbox run whose last inner L-BFGS run reached its iteration cap, or that
+# did not converge. Its `iterations` count the outer (barrier) rounds, so the
+# inner cap is read from `iteration_limit_reached`; it can be hit even when the
+# run converges to the right point, at some hundreds of evaluations.
+_box_capped(result) = Optim.iteration_limit_reached(result) || !Optim.converged(result)
 
 """
     _unit_step_counts(trees) -> (; steps, capped, rejected)

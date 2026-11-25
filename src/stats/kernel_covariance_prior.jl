@@ -119,6 +119,7 @@ function KernelIWPrior(
 end
 
 kernel_weights(kp::KernelIWPrior) = kernel_weights(kp.prior)
+kernel_unit_steps(kp::KernelIWPrior) = kernel_unit_steps(kp.prior)
 kernel_covariance(kp::KernelIWPrior, args...) = kernel_covariance(kp.prior, args...)
 
 _is_projected(kp::KernelIWPrior) = !isempty(kp.loading)

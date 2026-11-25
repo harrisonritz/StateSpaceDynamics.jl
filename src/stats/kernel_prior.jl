@@ -1007,7 +1007,7 @@ function _warn_unit_steps(before, after)
     rejected = after.rejected - before.rejected
     (capped > 0 || rejected > 0) || return nothing
     @warn(
-        "fit_kernel_weights!: unit-kernel weight steps reached their iteration cap " *
+        "Unit-kernel weight steps reached their iteration cap " *
             "or were not taken, so the kernels' logits may have stalled " *
             "(see `kernel_unit_steps`)",
         steps = after.steps - before.steps,
@@ -1027,9 +1027,24 @@ without one): `steps` L-BFGS runs over the kernels' logits, `capped` of them
 reached their iteration cap without converging, and `rejected` were not taken
 (worse than their start by more than round-off, not finite, or a failed line
 search; the logits are then left where they were). Both stay at zero when the
-steps work; [`fit_kernel_weights!`](@ref) warns when a call adds to either.
+steps work; [`fit_kernel_weights!`](@ref), and the M-steps that fit a wrapped
+prior's weights, warn when a call adds to either.
+
+For a [`KernelIWPrior`](@ref) the counts are its kernel prior's; for a
+[`KernelMNPrior`](@ref) the sum over its receiver (`rows`) and sender (`cols`)
+priors (once when they are one object); for a [`KernelInputPrior`](@ref) the
+sum over its groups' priors.
 """
 kernel_unit_steps(prior::KernelPrior) = _unit_step_counts(prior.trees)
+
+# The sum of two sets of w-step counts.
+function _add_unit_steps(a, b)
+    return (;
+        steps=a.steps + b.steps,
+        capped=a.capped + b.capped,
+        rejected=a.rejected + b.rejected,
+    )
+end
 
 """
     kernel_evidence(prior, S, n) -> Real
