@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **A block-diagonal observation noise**: `R_blocks` (index vectors
+  partitioning the observations) on `GaussianObservationModel` and on the
+  constrained and kernel-prior Gaussian emissions, beside `R_diagonal`. The `R`
+  M-step keeps the within-block entries of the unconstrained update (or of the
+  `IWPrior` MAP), the exact maximiser once the entries between blocks are
+  zero, so EM stays monotone. It is the model of a `CompositeObservationModel`
+  with one Gaussian member per block (the two take the same EM steps), with one
+  loading for every block where the emission is constrained (`C = Φ H`). The
+  starting `R` must be zero between blocks. Not with `R_diagonal`, a
+  `KernelIWPrior` on `R` or `depends_on`; the spline emission has no
+  `R_blocks`.
 - **Gaussian emissions with a constrained loading, a kernel prior on it, or
   both.** `ConstrainedGaussianObservationModel` (`C = basis * H`, `H` free),
   `KernelGaussianObservationModel` (the columns of `C` drawn from a

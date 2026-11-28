@@ -114,6 +114,7 @@ function _validate_obs_model(
         throw(DimensionMismatchError("observation bias d", obs_dim, length(om.d)))
     size(om.D, 1) == obs_dim ||
         throw(DimensionMismatchError("D rows", obs_dim, size(om.D, 1)))
+    _validate_R_blocks(om, obs_dim)
     om.gauge in (:bound, :moment, :none) ||
         throw(ArgumentError("gauge must be :bound, :moment or :none; got :$(om.gauge)"))
     om.weight_iters >= 1 || throw(ArgumentError("weight_iters must be at least 1"))
@@ -479,7 +480,8 @@ function _projected_dynamics_term(
     GU = sym(-k / 2 .* Ui .+ Ui * SU * Ui ./ 2)
     GV = sym(-k / 2 .* Vi .+ Vi * SV * Vi ./ 2)
     grad = _projection_gradient(pu, FU, U, GU) .+ _projection_gradient(pv, FV, V, GV)
-    mb === nothing || (grad .+= _mean_loading_gradient(H, mb, cols, Ui, Vi, qc.mean, pu.ridge))
+    mb === nothing ||
+        (grad .+= _mean_loading_gradient(H, mb, cols, Ui, Vi, qc.mean, pu.ridge))
     return g, grad
 end
 

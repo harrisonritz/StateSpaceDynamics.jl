@@ -354,6 +354,7 @@ function _validate_obs_model(
     obs_model.d_fixed_zero &&
         !all(iszero, obs_model.d) &&
         throw(ArgumentError("d_fixed_zero requires an exactly zero observation intercept"))
+    _validate_R_blocks(obs_model, obs_dim)
     return nothing
 end
 
@@ -1068,7 +1069,11 @@ function _validate_covariance_priors(lds::LinearDynamicalSystem)
             throw(ArgumentError("A_prior.latent_scale requires a learned loading"))
         end
         if projected && lds.latent_dim > _loading_dim(om) && scale == 0
-            throw(ArgumentError("a projected A prior with more states than loading-basis dimensions needs latent_scale > 0"))
+            throw(
+                ArgumentError(
+                    "a projected A prior with more states than loading-basis dimensions needs latent_scale > 0",
+                ),
+            )
         end
         kernels = sm.A_prior.rows.dim
         if om isa StructuredGaussianObservationModel

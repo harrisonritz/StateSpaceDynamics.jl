@@ -278,6 +278,14 @@ Represents the observation model of a Linear Dynamical System with Gaussian nois
     its own variance and only the latents carry shared variability. With a full `R` a
     wide emission (many units) can explain shared variance through `R` instead of the
     latent state.
+- `R_blocks::Union{Nothing,Vector{Vector{Int}}} = nothing`: Constrain `R` to be block
+    diagonal: the index vectors partition `1:obs_dim`, and `R` is zero between channels
+    of different blocks. The M-step keeps the within-block entries of the unconstrained
+    update (or of the IW MAP under an `IWPrior`), the exact constrained maximiser: the
+    model of a [`CompositeObservationModel`](@ref) with one Gaussian member per block,
+    where only the latents carry covariance between the blocks. The starting `R` must
+    already be zero between blocks. Not with `R_diagonal`, a [`KernelIWPrior`](@ref) on
+    `R`, or `depends_on`.
 """
 Base.@kwdef mutable struct GaussianObservationModel{
     T<:Real,M<:AbstractMatrix{T},V<:AbstractVector{T}
@@ -296,6 +304,8 @@ Base.@kwdef mutable struct GaussianObservationModel{
     d_fixed_zero::Bool = false
     # Hold C at its value while d and D are fitted (a fixed basis).
     C_fixed::Bool = false
+    # A block-diagonal R: index vectors partitioning the channels; nothing: no constraint.
+    R_blocks::Union{Nothing,Vector{Vector{Int}}} = nothing
 end
 
 # Convenience constructors (State)

@@ -401,7 +401,13 @@ function _plugin_gaussian(
 ) where {T<:Real,S<:GaussianStateModel{T},O<:StructuredGaussianObservationModel{T}}
     om = lds.obs_model
     plain = GaussianObservationModel(;
-        C=om.C, R=om.R, d=om.d, D=om.D, R_prior=om.R_prior, R_diagonal=om.R_diagonal
+        C=om.C,
+        R=om.R,
+        d=om.d,
+        D=om.D,
+        R_prior=om.R_prior,
+        R_diagonal=om.R_diagonal,
+        R_blocks=om.R_blocks,
     )
     return LinearDynamicalSystem{T,S,typeof(plain)}(
         lds.state_model,

@@ -301,6 +301,15 @@ function Base.show(io::IO, lqr_sm::LQRStateModel; gap="")
     return nothing
 end
 
+# A block-diagonal R's line: how many blocks, and their sizes.
+function _show_R_blocks(io::IO, blocks, gap)
+    blocks === nothing && return nothing
+    println(
+        io, gap, " R_blocks = $(length(blocks)) blocks of ", join(length.(blocks), ", ")
+    )
+    return nothing
+end
+
 function Base.show(io::IO, gom::GaussianObservationModel; gap="")
     println(io, gap, "Gaussian Observation Model:")
     println(io, gap, "---------------------------")
@@ -316,6 +325,7 @@ function Base.show(io::IO, gom::GaussianObservationModel; gap="")
         println(io, gap, " d = $(round.(gom.d, digits=2))")
         println(io, gap, " D = $(round.(gom.D, digits=2))")
     end
+    _show_R_blocks(io, gom.R_blocks, gap)
 
     _show_depends_on(io, gom; gap=gap)
 
@@ -335,6 +345,7 @@ function Base.show(io::IO, om::StructuredGaussianObservationModel; gap="")
     println(io, gap, " size(C) = ($(size(om.C,1)), $(size(om.C,2)))")
     println(io, gap, " size(R) = ($(size(om.R,1)), $(size(om.R,2)))")
     println(io, gap, " size(D) = ($(size(om.D,1)), $(size(om.D,2)))")
+    _show_R_blocks(io, om.R_blocks, gap)
     basis = om.basis
     basis === nothing || println(io, gap, " basis   = $(size(basis,1)) × $(size(basis,2))")
     prior = om.prior

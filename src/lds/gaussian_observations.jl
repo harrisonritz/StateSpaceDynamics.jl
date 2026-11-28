@@ -353,6 +353,76 @@ function _cd_prior_width(lds::LinearDynamicalSystem, cols=nothing)
 end
 
 """
+    _project_R_blocks!(R, blocks) -> R
+
+Zero the entries of `R` between channels of different `blocks` (index vectors
+partitioning its rows), in place.
+"""
+function _project_R_blocks!(R::AbstractMatrix{T}, blocks) where {T}
+    p = size(R, 1)
+    owner = zeros(Int, p)
+    for (b, block) in enumerate(blocks), i in block
+        owner[i] = b
+    end
+    @inbounds for j in 1:p, i in 1:p
+        owner[i] == owner[j] || (R[i, j] = zero(T))
+    end
+    return R
+end
+
+"""
+    _validate_R_blocks(om, obs_dim)
+
+Check an emission's `R_blocks`: a partition of `1:obs_dim` into non-empty
+blocks, a starting `R` that is zero between them, and none of the options whose
+`R` update is not the blocks of the unconstrained one.
+"""
+function _validate_R_blocks(om, obs_dim::Int)
+    blocks = om.R_blocks
+    blocks === nothing && return nothing
+    om.R_diagonal &&
+        throw(ArgumentError("R_blocks and R_diagonal are two constraints on R; give one"))
+    om.R_prior isa KernelIWPrior && throw(
+        ArgumentError(
+            "R_blocks is not available with a KernelIWPrior on R: its q(R) is one " *
+            "inverse-Wishart over every channel",
+        ),
+    )
+    om.depends_on === nothing ||
+        throw(ArgumentError("R_blocks is not available with depends_on"))
+    isempty(blocks) && throw(ArgumentError("R_blocks is empty"))
+    seen = falses(obs_dim)
+    for (b, block) in enumerate(blocks)
+        isempty(block) && throw(ArgumentError("R_blocks[$b] is empty"))
+        for i in block
+            1 <= i <= obs_dim ||
+                throw(ArgumentError("R_blocks[$b] holds $i, outside 1:$obs_dim (obs_dim)"))
+            seen[i] && throw(ArgumentError("R_blocks names observation $i twice"))
+            seen[i] = true
+        end
+    end
+    all(seen) || throw(
+        ArgumentError(
+            "R_blocks must partition 1:$obs_dim; observation $(findfirst(!, seen)) " *
+            "is in no block",
+        ),
+    )
+    owner = zeros(Int, obs_dim)
+    for (b, block) in enumerate(blocks), i in block
+        owner[i] = b
+    end
+    for j in 1:obs_dim, i in 1:obs_dim
+        (owner[i] == owner[j] || iszero(om.R[i, j])) || throw(
+            ArgumentError(
+                "the starting R is nonzero between R_blocks (entry ($i, $j)); " *
+                "zero those entries first",
+            ),
+        )
+    end
+    return nothing
+end
+
+"""
     _finalize_R!(lds, S_res, N)
 
 Symmetrize an accumulated emission residual scatter and turn it into `R`:
@@ -388,6 +458,15 @@ function _finalize_R!(
             i == j || (S_res[i, j] = zero(T))
         end
     end
+    #= A block-diagonal R, likewise: with the entries between blocks pinned at
+    zero, `log det R` and `tr(R⁻¹ S)` are sums over the blocks, so the objective
+    separates and each block's maximiser is its own block of the unconstrained
+    one. The IW MAP keeps that form, `tr(Ψ R⁻¹) = Σ_b tr(Ψ_bb R_b⁻¹)` with the
+    count `ν + N + p + 1` shared by the blocks, and so does a `CD_prior`, whose
+    `Wm Λ Wm'` and count are already in `S_res` and `N`. (A `KernelIWPrior`
+    returned above; it is refused with `R_blocks`.) =#
+    blocks = lds.obs_model.R_blocks
+    blocks === nothing || _project_R_blocks!(S_res, blocks)
     copyto!(lds.obs_model.R, S_res)
     return nothing
 end

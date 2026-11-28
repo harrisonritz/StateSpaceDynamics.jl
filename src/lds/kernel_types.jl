@@ -22,7 +22,7 @@ with `Φ` a fixed basis (or the identity) and `H` either free or drawn from a
 - [`ConstrainedKernelGaussianObservationModel`](@ref): both.
 
 # Fields
-- `C`, `R`, `d`, `D`, `R_prior`, `R_diagonal`: as in
+- `C`, `R`, `d`, `D`, `R_prior`, `R_diagonal`, `R_blocks`: as in
   [`GaussianObservationModel`](@ref). `C` is the posterior mean `Φ Ĥ`.
 - `depends_on`, `group_seeds`, `variants`: always `nothing`; these emissions have
   one parameter set for every trial.
@@ -65,11 +65,14 @@ Base.@kwdef mutable struct StructuredGaussianObservationModel{
     iteration::Int = 0
     # which entries of `H` are free (`r × k`); nothing: all
     H_mask::Union{Nothing,BitMatrix} = nothing
+    # a block-diagonal R: index vectors partitioning the channels; nothing: none
+    R_blocks::Union{Nothing,Vector{Vector{Int}}} = nothing
 end
 
 """
     ConstrainedGaussianObservationModel(; basis, C or H, R, d, D, R_prior,
-                                        R_diagonal=false, H_mask=nothing)
+                                        R_diagonal=false, R_blocks=nothing,
+                                        H_mask=nothing)
 
 A Gaussian emission whose loading lies in the column span of a fixed basis:
 `C = basis * H` with `basis` (`obs_dim × r`, full column rank) fixed and `H`
@@ -87,6 +90,12 @@ one region (a block-diagonal `H`). The M-step is then the exact maximiser over
 the free entries, and the basis needs full column rank only within each
 latent's columns (`H` is recovered from `C` column by column).
 
+`R_blocks` (index vectors partitioning the observations) makes `R` block
+diagonal, as in [`GaussianObservationModel`](@ref): `R`'s update keeps the
+within-block entries of its unconstrained one, which is its exact maximiser
+given `H`, so the iteration is still an ECM step. One loading `H` is then
+shared by the blocks, and only the latents carry covariance between them.
+
 `d` defaults to zero, `D` to no observation inputs. Not available in a
 switching model, with an `LQRStateModel`, as a member of a composite emission,
 or with `depends_on`.
@@ -97,7 +106,8 @@ const ConstrainedGaussianObservationModel{T,M,V} = StructuredGaussianObservation
 
 """
     KernelGaussianObservationModel(; prior, C, R, d, D, R_prior, R_diagonal=false,
-                                   gauge=:bound, weight_iters=50, tree_every=1)
+                                   R_blocks=nothing, gauge=:bound, weight_iters=50,
+                                   tree_every=1)
 
 A Gaussian emission whose loading has a kernel prior: each column of `C`
 (`obs_dim × latent_dim`) is a draw from `N(0, Σ)`, `Σ` the covariance of
@@ -149,7 +159,8 @@ const KernelGaussianObservationModel{T,M,V,P<:KernelPrior{T}} = StructuredGaussi
 
 """
     ConstrainedKernelGaussianObservationModel(; basis, prior, C or H, R, d, D,
-        R_prior, R_diagonal=false, gauge=:bound, weight_iters=50, tree_every=1)
+        R_prior, R_diagonal=false, R_blocks=nothing, gauge=:bound, weight_iters=50,
+        tree_every=1)
 
 A Gaussian emission `C = basis * H` whose coefficients have a kernel prior:
 each column of `H` (`r × latent_dim`) is a draw from `N(0, Σ)`, `Σ` the
@@ -176,6 +187,7 @@ function _structured_model(;
     D::Union{Nothing,AbstractMatrix}=nothing,
     R_prior::Union{Nothing,IWPrior,KernelIWPrior}=nothing,
     R_diagonal::Bool=false,
+    R_blocks::Union{Nothing,AbstractVector}=nothing,
     gauge::Symbol=:bound,
     weight_iters::Int=50,
     tree_every::Int=1,
@@ -212,6 +224,11 @@ function _structured_model(;
         D=D === nothing ? zeros(T, p, 0) : Matrix{T}(D),
         R_prior,
         R_diagonal,
+        R_blocks=if R_blocks === nothing
+            nothing
+        else
+            [Vector{Int}(block) for block in R_blocks]
+        end,
         basis=basis === nothing ? nothing : Matrix{T}(basis),
         prior,
         gauge,
